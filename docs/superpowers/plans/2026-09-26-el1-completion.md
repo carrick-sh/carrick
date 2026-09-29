@@ -287,8 +287,15 @@ at eventfd8, showing two enrolled zone continuations and one remaining
 shared eventfd pair (two tables, fd9/10, exact descriptions301/302).
 Capture is untruncated, cleanup zero; see adapter `processes-capture/`.
 Counter values and saved IPC operation payloads are absent from this graph.
-Next is bounded LLDB inspection of those existing values, to distinguish
-missed notification from consumed/replayed progress before another edit. This qualifies
+LLDB capture now reproduces pipe8, with both pipes empty, request sequences
+113/113 and response112/112, and two live zero-progress read operations.
+The captured ABI hash matches the decoder. See adapter `resumption-core/`;
+core retained outside Git, scoped cleanup zero. This suggests lost/replayed
+progress rather than unread bytes stranded by a missing wake; exact cause
+remains unproven. Two supporting intervals trigger reassessment: stop live
+captures. Next is one deterministic completed-operation resumption/handback
+reduction; if nondiscriminating, advance independent descriptor lifetime
+while preserving this acceptance blocker. This qualifies
 as a direct dependency, unlike the stopped historical capture investigation.
 Do not label the counters a diagnosis or reopen unrelated lifecycle work.
 
