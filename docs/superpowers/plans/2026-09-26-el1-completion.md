@@ -157,6 +157,10 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   and reuse that slot; the old producer then removes the replacement waiter's
   queue entry while it remains Parked (deterministic count 0 instead of 1).
   Two VM-free reds are retained in the branch receipt's `host-publication/`.
+  Implementation census/order: `2026-09-29-el1-handback-publication.md`.
+  The guest placement preparation now moves futex unlinking before target
+  queue-lock release; its 1/8/32-waiter witness was red and is green. This
+  does not repair the host-transfer red or close this checklist item.
   RecordRef preserves identity but does not grant exclusive field access.
   Close all producer publication/cancellation boundaries and then audit
   scheduler handback wakes; historical crash attribution remains separate.
