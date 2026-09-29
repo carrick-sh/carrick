@@ -932,7 +932,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 363,
+      "line": 366,
       "categories": [
         "table_guard"
       ],
@@ -941,7 +941,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 370,
+      "line": 373,
       "categories": [
         "table_guard"
       ],
@@ -950,7 +950,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/close_dup.rs",
-      "line": 387,
+      "line": 390,
       "categories": [
         "table_guard"
       ],
