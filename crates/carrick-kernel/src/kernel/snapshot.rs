@@ -1572,16 +1572,37 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
             return invariant("zombie parent join is missing");
         }
     }
+    let zombie_by_key: BTreeMap<_, _> = snapshot
+        .zombies
+        .iter()
+        .map(|row| (row.zombie.key, &row.zombie))
+        .collect();
     for group in &snapshot.process_groups {
         if has_duplicates(&group.members)
             || !session_ids.contains(&group.session)
-            || group.members.iter().any(|member| {
-                task_by_key.get(member).is_none_or(|task| {
-                    task.class != ObjectSnapshotClass::Live
-                        || task.process_group != group.id
-                        || task.session != group.session
+            || group
+                .members
+                .iter()
+                .any(|member| match task_by_key.get(member) {
+                    // A live member must be the exact live registry row, and it
+                    // must actually claim this group/session — the row that
+                    // orphaned-process-group's own leader check depends on.
+                    Some(task) => {
+                        task.class != ObjectSnapshotClass::Live
+                            || task.process_group != group.id
+                            || task.session != group.session
+                    }
+                    // Linux leaves a zombie's process-group membership untouched
+                    // until `wait`/`waitpid` reaps it — `getpgid(2)` and
+                    // `kill(-pgrp)` both still see it. A `multiprocessing.Pool`
+                    // worker that exited while its parent keeps running is
+                    // exactly this shape, not a corrupt graph: only a zombie row
+                    // that itself disagrees about the group/session is a real
+                    // dangling join.
+                    None => zombie_by_key.get(member).is_none_or(|zombie| {
+                        zombie.process_group != group.id || zombie.session != group.session
+                    }),
                 })
-            })
         {
             return invariant("process-group join is missing");
         }
@@ -2824,6 +2845,141 @@ mod tests {
                 .iter()
                 .any(|row| row.key.thread == child_thread)
         );
+    }
+
+    /// `getpgid(2)`/`kill(-pgrp)` on an unreaped child must keep working: Linux
+    /// leaves a zombie's process-group membership intact until it is reaped, so
+    /// the same shape a `multiprocessing.Pool` worker leaves behind (exited,
+    /// still owned by its parent's wait queue, group membership untouched) is
+    /// routine kernel-graph state, not a corrupt one.
+    ///
+    /// A served snapshot must accept it: the group's member set legitimately
+    /// names a task that only resolves in `zombies`, not `tasks`.
+    #[test]
+    fn served_snapshot_accepts_a_zombie_still_named_by_its_process_group() {
+        let (kernel, root) = bootstrap(TestBackend::new(BackendMode::Good));
+        let child = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "child".to_owned(),
+                None,
+            )
+            .expect("reserve fork")
+            .prepare_with_mm_backend(
+                TestBackend::new(BackendMode::Good),
+                ThreadId::synthetic_for_tests(7004),
+            )
+            .expect("prepare fork")
+            .commit()
+            .expect("commit fork")
+            .into_parts()
+            .expect("start child")
+            .0;
+        let child_key = child.task().key();
+        let group = root.task().process_group();
+        // Drop every strong reference this test itself holds so the exited
+        // task survives ONLY as a `zombies` row, matching the shape a real
+        // runtime leaves behind once nothing but the wait queue remembers the
+        // child — not the "still-observed Draining bundle" shape the
+        // bundle-draining tests above deliberately keep alive.
+        drop(child);
+
+        kernel
+            .exit_task(child_key.id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit child without reaping it");
+
+        let snapshot = kernel
+            .snapshot(deadline())
+            .expect("a zombie group member is a legitimate transient, not a refusal");
+        assert!(
+            snapshot
+                .zombies
+                .iter()
+                .any(|row| row.zombie.key == child_key),
+            "the exited child must still be addressable as a zombie"
+        );
+        let group_row = snapshot
+            .process_groups
+            .iter()
+            .find(|row| row.id == group)
+            .expect("the inherited process group row");
+        assert!(
+            group_row.members.contains(&child_key),
+            "getpgid/kill(-pgrp) on the zombie still depend on this membership"
+        );
+
+        assert!(matches!(
+            kernel.wait_child(root.task().key().id, Some(child_key.id), WaitMode::Consume),
+            Ok(WaitOutcome::Exited(_))
+        ));
+    }
+
+    /// The zombie carve-out above must not swallow a REAL dangling member: a
+    /// process group can only excuse a member that resolves to a zombie row
+    /// which itself agrees about the group and session.
+    #[test]
+    fn a_group_member_with_no_matching_task_or_zombie_still_fails_closed() {
+        let (kernel, root) = bootstrap(TestBackend::new(BackendMode::Good));
+        let child = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "child".to_owned(),
+                None,
+            )
+            .expect("reserve fork")
+            .prepare_with_mm_backend(
+                TestBackend::new(BackendMode::Good),
+                ThreadId::synthetic_for_tests(7005),
+            )
+            .expect("prepare fork")
+            .commit()
+            .expect("commit fork")
+            .into_parts()
+            .expect("start child")
+            .0;
+        let child_key = child.task().key();
+        drop(child);
+        kernel
+            .exit_task(child_key.id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit child without reaping it");
+        let snapshot = kernel.snapshot(deadline()).expect("clean zombie snapshot");
+
+        // A dangling member: the zombie row that legitimizes it is gone
+        // entirely, so nothing joins it any more.
+        let mut orphaned_member = snapshot.clone();
+        orphaned_member
+            .zombies
+            .retain(|row| row.zombie.key != child_key);
+        assert!(matches!(
+            validate_snapshot(&orphaned_member),
+            Err(AttemptError::Public(
+                KernelSnapshotError::InvariantViolation(_)
+            ))
+        ));
+
+        // A zombie that disagrees with the group naming it: still corrupt,
+        // not a legitimate transient.
+        let mut disagreeing_zombie = snapshot;
+        let other_group = disagreeing_zombie
+            .process_groups
+            .iter()
+            .find(|row| !row.members.contains(&child_key))
+            .map(|row| row.id)
+            .unwrap_or_else(|| ProcessGroupId::from_leader(child_key.id));
+        let zombie_row = disagreeing_zombie
+            .zombies
+            .iter_mut()
+            .find(|row| row.zombie.key == child_key)
+            .expect("child zombie row");
+        zombie_row.zombie.process_group = other_group;
+        assert!(matches!(
+            validate_snapshot(&disagreeing_zombie),
+            Err(AttemptError::Public(
+                KernelSnapshotError::InvariantViolation(_)
+            ))
+        ));
     }
 
     #[test]
