@@ -3744,6 +3744,22 @@
       "fingerprint": "b45f2e0792f4c7c840555bdf52882bf567b1f7f35998d77b3e2084e080d8479d",
       "classification": "test_only",
       "rationale": "Test-only mutex serializing crash-capture unit tests that install a synthetic EL1 region (record_el1_region_host_ptr, el1_zone::enable) to prove the crash quorum reads a parked thread's authoritative EL1 save area; absent from production builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+      "symbol": "INSTALLED_IPC_WINDOW",
+      "fingerprint": "6abad667bc7b813220dfc516d5b7d7dae08e066b7c42560acd02574beab1bacd",
+      "classification": "carrier_infra",
+      "rationale": "Process-global installation of the host IPC authority's memory in the live carrier VM's IPC window (one carrier per process); retains the memory owner until a new carrier VM maps the window."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+      "symbol": "IPC_WINDOW_BACKING",
+      "fingerprint": "b68e8a880e18b3ff27c942aefc072ed53953de8ef3a1a2608edf1b7135f1c36b",
+      "classification": "carrier_infra",
+      "rationale": "Process-global registration of the host IPC authority's memory for the carrier; the first persistent root maps it into the IPC window."
     }
   ]
 }
