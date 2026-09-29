@@ -142,7 +142,7 @@ impl SyscallDispatcher {
         let maps = mem::project_core_maps(&mem);
         let file_mappings = mem.core_file_mappings.clone();
         let dump_omitted = mem
-            .semantic_vmas
+            .semantic_vmas_snapshot()
             .iter()
             .filter(|vma| vma.dump_policy == carrick_abi::VmaDumpPolicy::Omit)
             .map(|vma| (vma.start, vma.end))

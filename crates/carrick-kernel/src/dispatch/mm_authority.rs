@@ -465,7 +465,7 @@ impl MmExecutorParticipation {
     ) -> Option<crate::kernel::AddressSpacePublication> {
         let (brk_current, mmap_next) = {
             let state = self.authority.mem.lock();
-            (state.brk_current, state.mmap_next)
+            (state.brk_current(), state.mmap_next)
         };
         crate::kernel::publish_address_space_with_layout(
             self.mm_id(),

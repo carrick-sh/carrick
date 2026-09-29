@@ -62,6 +62,8 @@ pub(crate) mod madvise;
 pub(crate) mod vma;
 pub use self::vma::*;
 pub mod el1_reservations;
+mod host_first_touch;
+pub use host_first_touch::{HostFirstTouchDescriptorReceipt, HostFirstTouchIntent};
 pub mod fault;
 pub(crate) use self::fault::*;
 pub(crate) use madvise::MadviseCoveredSegment;
@@ -332,9 +334,9 @@ pub struct MemState {
     pub(super) deferred_anonymous: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
     pub layout: MemoryLayout,
     /// Canonical semantic VMAs owned by this address space.
-    pub semantic_vmas: VmaMap,
+    semantic_vmas: VmaMap,
     /// Current program break (`brk`/`sbrk`).
-    pub brk_current: u64,
+    brk_current: u64,
     /// Bump cursor for the anonymous mmap arena.
     pub mmap_next: u64,
     /// MONOTONIC high-water of the arena: the highest address the guest could
@@ -546,9 +548,28 @@ impl MemState {
         self.linux_auxv_image = linux_auxv_image;
     }
 
-    #[allow(dead_code)]
-    pub(super) fn semantic_vmas(&self) -> &[SemanticVma] {
-        self.semantic_vmas.as_slice()
+    /// Owned observation of the current host authority. Shared-root admission
+    /// remains refused until the internal mutation paths relinquish these facts.
+    pub(super) fn semantic_vmas_snapshot(&self) -> Vec<SemanticVma> {
+        self.semantic_vmas.as_slice().to_vec()
+    }
+
+    pub(super) fn seed_semantic_vmas(&mut self, vmas: VmaMap) {
+        self.semantic_vmas = vmas;
+    }
+
+    pub(super) fn brk_current(&self) -> u64 {
+        self.brk_current
+    }
+
+    #[cfg(test)]
+    pub(super) fn seed_brk_current_for_test(&mut self, value: u64) {
+        self.brk_current = value;
+    }
+
+    #[cfg(test)]
+    pub(super) fn semantic_vmas_seed_for_test(&mut self) -> &mut VmaMap {
+        &mut self.semantic_vmas
     }
 }
 
@@ -2277,37 +2298,6 @@ impl SyscallDispatcher {
     #[inline]
     pub fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
         self.mem_view().commit_resident_fault(plan);
-    }
-
-    /// Publish a host copyout's first touch through the same resident-fault
-    /// plan as an EL0 translation fault. The caller holds exact-MM stage-1
-    /// exclusion; an unarmed page needs no publication.
-    pub fn commit_host_first_touch(
-        &self,
-        authority: &mut super::mm_quiesce::FrameCowExactMmGuard,
-        address: u64,
-        protect: &mut dyn FnMut(u64, u64) -> Result<(), String>,
-    ) -> Result<bool, String> {
-        let mutation = super::mm_mutation::from_frame_cow(authority);
-        // The descriptor may have been observed prepared before this guard
-        // excluded an EL1 editor. Its guest commit wins that race; the caller
-        // rechecks the live descriptor instead of validating it a second time.
-        if carrick_el1_abi::frame_grant_residency_host()
-            .is_some_and(|table| table.is_guest_committed(mutation.mm_id().raw(), address))
-        {
-            return Ok(false);
-        }
-        let permit = mutation.host_alias_permit();
-        let Some(plan) = self.resident_fault_plan(&permit, address) else {
-            return Ok(false);
-        };
-        let prot = plan.prot();
-        if prot & carrick_abi::LINUX_PROT_WRITE == 0 {
-            return Err("armed host write page lacks Linux write permission".to_owned());
-        }
-        protect(plan.page(), prot)?;
-        self.commit_resident_fault(plan);
-        Ok(true)
     }
 
     #[inline]
