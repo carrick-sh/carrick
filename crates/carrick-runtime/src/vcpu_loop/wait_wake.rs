@@ -1080,6 +1080,7 @@ impl HvpatchRuntimeDirectory {
                 return;
             }
         };
+        let _ = graph.auditors().child_exit_notification_captured(parent);
         let signal_context = signal_snapshot.context();
         // Child waitability is independent of SIGCHLD disposition. The Kernel
         // zombie is durable, but a parent can be between its initial wait query

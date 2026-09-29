@@ -2589,12 +2589,61 @@ fn metadata_allocator_mode(phase: &str) -> i32 {
     0
 }
 
+/// Parent pauses at an intercepted marker until its child's notification
+/// snapshot is captured. It then reaps the child and exits; the root reaps
+/// that parent before the auditor permits the saved notification to continue.
+fn delayed_parent_notification() -> i32 {
+    unsafe {
+        libc::alarm(10);
+    }
+    let parent = unsafe { libc::fork() };
+    if parent < 0 {
+        return 70;
+    }
+    if parent == 0 {
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            unsafe {
+                libc::_exit(71);
+            }
+        }
+        if child == 0 {
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+        // sched_yield ignores arguments; the marker is a test rendezvous,
+        // and ordinary Linux still executes the same valid syscall.
+        unsafe {
+            libc::syscall(libc::SYS_sched_yield, 0x454c314e_u64);
+        }
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        let code = if waited == child && status == 0 {
+            0
+        } else {
+            72
+        };
+        unsafe {
+            libc::_exit(code);
+        }
+    }
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(parent, &mut status, 0) };
+    if waited != parent || status != 0 {
+        return 73;
+    }
+    println!("delayed-parent-notification reaped=1");
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("pingpong");
     let code = match mode {
         "pingpong" => pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
         "signal" => signal_mode(),
+        "delayed-parent-notification" => delayed_parent_notification(),
         "exit-group" => exit_group_mode(),
         "exec" => exec_mode(&args[0]),
         "pinned-pingpong" => pinned_pingpong(
