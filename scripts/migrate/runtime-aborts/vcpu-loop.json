@@ -1773,6 +1773,28 @@
       "rationale": "An executor was owed a second zone adoption before claiming the first. One vCPU exit takes at most one thread (the one EL1 ran there) off the vCPU, and the executor claims it before its next run; a second means the first thread's only owner, this executor, would be overwritten and that thread never run again.",
       "sink": "fatal",
       "domain": "vcpu_loop::el1_zone"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "function": "apply_guest_fork_arm",
+      "ordinal_in_function": 1,
+      "fingerprint": "acb2767418a70ca10574e9d79aeb8fc0fb10b9128fc5d740d270f16c6763c8b2",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_fork_arm",
+      "rationale": "Guest fork parent arm has no descriptor transaction slots: the fork already built a child that shares the parent's frames, so continuing would let the parent write them unarmed.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_fork_arm"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "function": "apply_guest_fork_arm",
+      "ordinal_in_function": 2,
+      "fingerprint": "1c1cd5f9a3449e645ff457cb1e089149b205956193497ade1f2c901aa609c100",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_fork_arm",
+      "rationale": "Guest fork parent arm refused, blocked or produced an unauthenticated receipt after the child was built: the parent's shared frames cannot be proven armed.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_fork_arm"
     }
   ]
 }
