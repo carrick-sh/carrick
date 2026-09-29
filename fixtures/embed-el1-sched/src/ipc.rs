@@ -37,6 +37,23 @@ impl Channel {
         );
         u64::from_ne_bytes(bytes)
     }
+    fn send_vector(&self, value: u64) {
+        let mut bytes = value.to_ne_bytes();
+        let iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: 8,
+        };
+        assert_eq!(unsafe { libc::writev(self.write, &iov, 1) }, 8, "writev");
+    }
+    fn receive_vector(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        let iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: 8,
+        };
+        assert_eq!(unsafe { libc::readv(self.read, &iov, 1) }, 8, "readv");
+        u64::from_ne_bytes(bytes)
+    }
 }
 impl Drop for Channel {
     fn drop(&mut self) {
@@ -206,5 +223,46 @@ pub fn lifetime() -> i32 {
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 0);
     println!("ipc-lifetime completed=128 reused=1 eof=1 child_exit=0");
+    0
+}
+
+/// Vector I/O crosses the host dispatcher; scalar I/O uses the EL1 adapter.
+/// Alternate both venues on each shared object, checking every transferred value.
+pub fn mixed(kind: &str) -> i32 {
+    assert!(matches!(kind, "pipe" | "eventfd"));
+    let request = Arc::new(Channel::new(kind == "eventfd"));
+    let response = Arc::new(Channel::new(kind == "eventfd"));
+    let peer_request = Arc::clone(&request);
+    let peer_response = Arc::clone(&response);
+    let peer = std::thread::spawn(move || {
+        for round in 1u64..=128 {
+            let value = if round % 2 == 0 {
+                peer_request.receive_vector()
+            } else {
+                peer_request.receive()
+            };
+            assert_eq!(value, round, "mixed request");
+            if round % 2 == 0 {
+                peer_response.send(value ^ 0x1000);
+            } else {
+                peer_response.send_vector(value ^ 0x1000);
+            }
+        }
+    });
+    for round in 1u64..=128 {
+        if round % 2 == 0 {
+            request.send(round);
+        } else {
+            request.send_vector(round);
+        }
+        let value = if round % 2 == 0 {
+            response.receive_vector()
+        } else {
+            response.receive()
+        };
+        assert_eq!(value, round ^ 0x1000, "mixed response");
+    }
+    peer.join().expect("mixed IPC peer");
+    println!("ipc-mixed kind={kind} completed=128");
     0
 }
