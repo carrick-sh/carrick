@@ -394,6 +394,7 @@ where
             let quorum = carrick_kernel::kernel::CrashQuorum::open(
                 std::sync::Arc::clone(context.task()),
                 generation,
+                context.shared().mm().id().raw(),
             );
             // Structural fix: no wall-clock deadline; quorum blocks.
             let mut threads = loop {

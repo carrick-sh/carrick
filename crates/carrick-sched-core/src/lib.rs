@@ -363,6 +363,31 @@ impl ThreadCtx {
     };
 }
 
+/// Outcome of [`ZoneTables::read_parked_context`]: a thread's EL1 save area
+/// is data no host code owns while `Claim::Parked` (see the crate docs), so a
+/// post-mortem reader that is not the claim protocol's next owner must be
+/// explicit about which of the three things it found.
+///
+/// This is a cold, rare post-mortem path (crash capture), never a per-switch
+/// hot one: boxing `Found` would add an allocation this `no_std` crate's
+/// guest side cannot make on every call solely to shrink the two empty
+/// variants, for a type read at most once per thread per crash generation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy, Debug)]
+pub enum ParkedContextRead {
+    /// No record matching that exact thread identity is `Parked` right now:
+    /// it is running (`Queued`/`OnCpu`), host-owned, or its record is gone.
+    /// The caller's own safe-point protocol owns the answer instead.
+    NotParked,
+    /// The save area, read and re-validated unchanged across the read.
+    Found(ThreadCtx),
+    /// A record matched the identity when the scan reached it, but its
+    /// identity or claim had changed by the time the read completed: the
+    /// bytes just read cannot be trusted to belong to that thread. Never
+    /// silently attribute them; report the gap instead.
+    Unauthenticated,
+}
+
 /// The identity a parked thread carries so the host can find its kernel
 /// thread and EL1 can publish it as the running task after a switch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2993,6 +3018,64 @@ impl ZoneTables {
 }
 
 impl ZoneTables {
+    /// The EL1 save area of the thread named by `(mm, tid, serial)`, if EL1
+    /// currently holds it `Parked` (queued on a futex wait queue or a vCPU
+    /// run queue, not itself running and not host-claimed).
+    ///
+    /// This is a POST-MORTEM reader, not a claim-protocol party: it does not
+    /// take ownership of the record and never mutates it. It exists for a
+    /// crash-capture-shaped caller that already knows, by a mechanism outside
+    /// this crate, that nothing can be concurrently mutating this exact
+    /// record right now.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have authenticated, before calling this, that no vCPU
+    /// of address space `mm` can be executing guest code (every one of its
+    /// vCPUs has force-exited to the host and its execution-lease set is
+    /// drained) — e.g. the crash-capture quiesce barrier immediately before
+    /// it polls its register-file quorum. Under that authentication, the
+    /// context this call reads cannot be written concurrently: EL1 writes a
+    /// `Parked` record of `mm` only while running one of `mm`'s own vCPUs
+    /// (stopped for the whole call), and the host writes a live record only
+    /// by first winning its claim (also stalled for `mm`, whose every thread
+    /// is either at the barrier already or is the exact thread this call is
+    /// reading). Calling this without that authentication is a data race:
+    /// [`ZoneRecord::ctx_mut`] is otherwise exclusive to the claim owner.
+    pub unsafe fn read_parked_context(&self, mm: u64, tid: u64, serial: u64) -> ParkedContextRead {
+        for raw in 1..ZONE_RECORDS as u32 {
+            let Some(id) = RecordId::from_raw(raw) else {
+                continue;
+            };
+            let record = self.record(id);
+            if !matches!(record.claim(), Claim::Parked { .. }) {
+                continue;
+            }
+            let identity = record.identity();
+            if identity.tid != tid || identity.serial != serial || identity.mm != mm {
+                continue;
+            }
+            // SAFETY: forwarded by the caller (see the doc comment above).
+            let ctx = unsafe { *record.ctx_mut() };
+            // Re-validate after the read: a change here means this exact
+            // record was freed and reused between the identity check and the
+            // read (impossible for a genuinely quiesced `mm`, since only that
+            // `mm`'s own EL1/host could do it) -- refuse rather than
+            // attribute a foreign register file to this thread.
+            let identity_after = record.identity();
+            let still_matches = identity_after.tid == tid
+                && identity_after.serial == serial
+                && identity_after.mm == mm
+                && matches!(record.claim(), Claim::Parked { .. });
+            return if still_matches {
+                ParkedContextRead::Found(ctx)
+            } else {
+                ParkedContextRead::Unauthenticated
+            };
+        }
+        ParkedContextRead::NotParked
+    }
+
     /// A lock-free census of every live slot and every record in use, for a
     /// wedge post-mortem (a watchdog, a debug endpoint): what each vCPU slot
     /// runs and queues, and who owns each parked thread. Values may be torn
