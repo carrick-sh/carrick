@@ -991,6 +991,28 @@ impl GuestMemory for LinearMemory {
         self.bytes[offset..end].copy_from_slice(bytes);
         Ok(())
     }
+
+    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        let offset = address.checked_sub(self.base)?;
+        let offset = usize::try_from(offset).ok()?;
+        let end = offset.checked_add(len)?;
+        if end <= self.bytes.len() {
+            Some(self.bytes[offset..end].as_ptr())
+        } else {
+            None
+        }
+    }
+
+    fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        let offset = address.checked_sub(self.base)?;
+        let offset = usize::try_from(offset).ok()?;
+        let end = offset.checked_add(len)?;
+        if end <= self.bytes.len() {
+            Some(self.bytes[offset..end].as_mut_ptr())
+        } else {
+            None
+        }
+    }
 }
 
 impl CurrentMmMemory for LinearMemory {}

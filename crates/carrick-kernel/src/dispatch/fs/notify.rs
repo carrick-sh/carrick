@@ -46,6 +46,9 @@ impl<'a> FsView<'a> {
         let mut registry = self.fs.dnotify_registry.lock();
         if mask.is_empty() {
             registry.retain(|entry| entry.fd != fd);
+            self.fs
+                .dnotify_active
+                .store(!registry.is_empty(), std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         if open_file.description.common().owner().owner_pid == 0 {
@@ -73,14 +76,25 @@ impl<'a> FsView<'a> {
                 mask: effective_mask,
             });
         }
+        self.fs
+            .dnotify_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     pub(in crate::dispatch) fn dnotify_close_fd(&self, fd: i32) {
+        if !self
+            .fs
+            .dnotify_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut registry = self.fs.dnotify_registry.lock();
+        registry.retain(|entry| entry.fd != fd);
         self.fs
-            .dnotify_registry
-            .lock()
-            .retain(|entry| entry.fd != fd);
+            .dnotify_active
+            .store(!registry.is_empty(), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(in crate::dispatch) fn normalize_dnotify_path(&self, path: &str) -> String {

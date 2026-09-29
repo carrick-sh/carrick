@@ -394,25 +394,38 @@ impl<'a> FsView<'a> {
             };
             let raw_fd = host_io.raw();
             host_io.record_sequential_io();
-            let Some(wait_authority) = slot_authority
-                .or_else(|| self.captured_slot_authority(fd))
-                .map(WaitFdAuthority::logical)
-            else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
             let host_wait_runner = self.host_wait_runner_for_ctx(cx);
             let host_wait_ref = host_wait_runner
                 .as_ref()
                 .map(|runner| runner as &dyn HostWaitRunner);
-            let target = HostPipeWriteTarget::new(
-                raw_fd,
-                None,
-                nonblocking,
-                HostWriteKind::RegularFile,
-                tid,
-                wait_authority,
-                self.cross.host_signal(),
-            )
+            let target = match slot_authority {
+                Some(slot) => HostPipeWriteTarget::new(
+                    raw_fd,
+                    None,
+                    nonblocking,
+                    HostWriteKind::RegularFile,
+                    tid,
+                    slot,
+                    self.cross.host_signal(),
+                ),
+                None => {
+                    let Some(wait_authority) = self
+                        .captured_slot_authority(fd)
+                        .map(WaitFdAuthority::logical)
+                    else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    HostPipeWriteTarget::new(
+                        raw_fd,
+                        None,
+                        nonblocking,
+                        HostWriteKind::RegularFile,
+                        tid,
+                        wait_authority,
+                        self.cross.host_signal(),
+                    )
+                }
+            }
             .with_host_wait(host_wait_ref);
             let out = write_host_pipe(bytes, target)?;
             let mut punch = Ok(());
@@ -851,14 +864,60 @@ impl<'a> FsView<'a> {
         }
 
         fn read(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
+            let fd: Fd = fd;
+            if this.stdio_is_closed(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+
+            let Ok(number) = FileSlotNumber::for_open_fd(fd.0) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let files = this.captured_file_table();
+            let (open_file, slot_authority) = match files.capture_open_slot_authority(number) {
+                Some(pair) => pair,
+                None if fd.0 == 0 => {
+                    let address = buf.0;
+                    let length =
+                        usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
+                    let memory = &mut *cx.memory;
+                    let mut host_wait_releaser = SyscallHostWaitReleaser::new(
+                        cx.kernel,
+                        cx.host_wait,
+                        cx.execution_lease,
+                        cx.mm_executor.as_deref_mut(),
+                    );
+                    let host_wait_runner = host_wait_releaser.as_mut().map(|r| this.host_wait_runner(r));
+                    let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                    crate::dispatch::net::set_host_nonblocking(0);
+                    if host_wait_ref.is_some() {
+                        super::resources::stage_io_rearm(
+                            cx.kernel,
+                            super::net::IoRearm::read(None),
+                        )?;
+                    }
+                    return read_host_pipe(
+                        memory,
+                        address,
+                        length,
+                        HostPipeReadTarget::new(
+                            0,
+                            None,
+                            false,
+                            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                        )
+                        .with_host_wait(host_wait_ref),
+                    );
+                }
+                None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+            };
+
             // A delegated file's forwarded operation is served on the host
             // against the delegated object, with the code EL1 runs; the object
             // stays delegated. Only what that cannot serve exactly falls
             // through to the path below, whose accessor recalls first.
-            if let Some(delegated) = this.open_file(fd.0)
-                && delegated.description.delegation_handle() != 0
+            if open_file.description.delegation_handle() != 0
                 && let Some(outcome) = crate::el1_delegation::serve_on_host(
-                    &delegated.description,
+                    &open_file.description,
                     63,
                     [buf.raw(), count, 0],
                     &mut *cx.memory,
@@ -867,19 +926,20 @@ impl<'a> FsView<'a> {
                 return Ok(outcome);
             }
 
-            let fd: Fd = fd;
+            let status_flags = open_file.description.common().status_flags();
             // An O_PATH descriptor is not open for I/O (open13 → EBADF).
-            if this.fd_is_o_path(fd.0) {
+            if LinuxOpenFlags::from_bits_truncate(status_flags).contains(LinuxOpenFlags::PATH) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            if this.io_uring_description(fd.0).is_some() {
+            if open_file.is_io_uring_backing() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // memfd_secret: no file read method → EINVAL (memfdsecret probe).
-            if this.fd_is_secretmem(fd.0) {
+            if open_file.description.common().secretmem() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if this.fd_is_controlling_tty(cx.kernel, fd.0)
+            if (is_stdio_fd(fd.0) || open_file.is_pty())
+                && this.fd_is_controlling_tty(cx.kernel, fd.0)
                 && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
             {
                 let tid = Self::ctx_tid(cx);
@@ -913,61 +973,16 @@ impl<'a> FsView<'a> {
             );
             let host_wait_runner = host_wait_releaser.as_mut().map(|r| this.host_wait_runner(r));
             let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-            // Guest's intended blocking mode for this fd; passed to the host-fd
-            // read helper so a blocking-mode fd hands off to the lockless kqueue
-            // wait on EAGAIN instead of blocking under the dispatcher lock. (read has no
-            // per-call non-blocking flag.) Computed before the open_files borrow.
-            let nonblocking = this.io_is_nonblocking(fd.0, 0);
-            // inotify IN_ACCESS: a read(2) against a watched regular file emits
-            // IN_ACCESS on that file. The kernel reports it per read syscall,
-            // independent of bytes returned. Fast-exits when nothing is watched.
-            this.inotify_emit_for_fd(fd.0, carrick_abi::LINUX_IN_ACCESS);
-            // fanotify FAN_ACCESS: same operation, one event. fanotify has no
-            // self/child split — the registry decides whether an inode mark or
-            // an FAN_EVENT_ON_CHILD directory mark receives it.
-            this.fanotify_emit_for_fd(
+            let nonblocking = LinuxOpenFlags::from_bits_truncate(status_flags)
+                .contains(LinuxOpenFlags::NONBLOCK);
+            this.inotify_emit_for_open_file(fd.0, &open_file, carrick_abi::LINUX_IN_ACCESS);
+            this.fanotify_emit_for_open_file(
                 cx.kernel,
                 fd.0,
+                &open_file,
                 carrick_abi::LinuxFanotifyEvents::ACCESS,
             );
-            // A stdio fd the guest explicitly closed (and did not reopen) is a
-            // genuinely closed descriptor: read is EBADF, not a host-stdin read.
-            if this.stdio_is_closed(fd.0) {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            // fd 0 with no explicit OpenDescription: read from host stdin.
-            // This is what makes `read` against the guest's stdin pick up
-            // input from the user's terminal (or whatever the carrick host
-            // process's stdin is — file, pipe, or terminal).
-            if fd.0 == 0 && !this.fd_table_contains(0) {
-                crate::dispatch::net::set_host_nonblocking(0);
-                if host_wait_ref.is_some() {
-                    super::resources::stage_io_rearm(
-                        cx.kernel,
-                        super::net::IoRearm::read(None),
-                    )?;
-                }
-                return read_host_pipe(
-                    memory,
-                    address,
-                    length,
-                    HostPipeReadTarget::new(
-                        0,
-                        None,
-                        nonblocking,
-                        WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
-                    )
-                    .with_host_wait(host_wait_ref),
-                );
-            }
-            let Ok(number) = FileSlotNumber::for_open_fd(fd.0) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            let files = this.captured_file_table();
-            let Some((open_file, slot_authority)) = files.capture_open_slot_authority(number)
-            else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
+
             if host_wait_ref.is_some() {
                 super::resources::stage_io_rearm(
                     cx.kernel,
@@ -1123,9 +1138,7 @@ impl<'a> FsView<'a> {
                         &state,
                         semaphore,
                         nonblocking,
-                        WaitFdAuthority::logical(
-                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                        ),
+                        WaitFdAuthority::logical(slot_authority),
                     ));
                 }
                 OpenDescription::TimerFd { state, .. } => {
@@ -1167,9 +1180,7 @@ impl<'a> FsView<'a> {
                             libc::POLLIN,
                             nonblocking,
                             None,
-                            WaitFdAuthority::logical(
-                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                            ),
+                            WaitFdAuthority::logical(slot_authority),
                         ),
                         Ok(bytes) => {
                             if memory.write_bytes(address, &bytes).is_err() {
@@ -1208,12 +1219,7 @@ impl<'a> FsView<'a> {
                     let pipe = Arc::clone(pipe);
                     let flags = open_file.description.common().status_flags();
                     drop(open);
-                    let Some(wait_authority) = this
-                        .captured_slot_authority(fd.0)
-                        .map(WaitFdAuthority::logical)
-                    else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
+                    let wait_authority = WaitFdAuthority::logical(slot_authority);
                     return Ok(read_pipe(
                         memory,
                         address,
@@ -1256,9 +1262,7 @@ impl<'a> FsView<'a> {
                             host_fd_raw,
                             Some(host_fd_owner),
                             nonblocking,
-                            WaitFdAuthority::logical(
-                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                            ),
+                            slot_authority,
                         )
                         .with_host_wait(host_wait_ref),
                     )?;
@@ -1323,9 +1327,7 @@ impl<'a> FsView<'a> {
                             host_fd_raw,
                             Some(host_fd_owner),
                             nonblocking,
-                            WaitFdAuthority::logical(
-                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                            ),
+                            slot_authority,
                         )
                         .with_socket_flow(flows.as_ref().map(|f| &f.inbound), is_stream)
                         .with_host_wait(host_wait_ref),
@@ -1391,9 +1393,7 @@ impl<'a> FsView<'a> {
                             host_fd_raw,
                             None,
                             nonblocking,
-                            WaitFdAuthority::logical(
-                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                            ),
+                            slot_authority,
                         )
                         .with_host_wait(host_wait_ref),
                     );
@@ -2688,11 +2688,17 @@ impl<'a> FsView<'a> {
         }
 
         fn write(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
+            let fd = fd.0;
+            let (open_file, slot_authority) = match this.open_file_with_authority(fd) {
+                Some((of, auth)) => (Some(of), Some(auth)),
+                None => (this.open_file(fd), None),
+            };
+
             // A delegated file's forwarded operation is served on the host
             // against the delegated object, with the code EL1 runs; the object
             // stays delegated. Only what that cannot serve exactly falls
             // through to the path below, whose accessor recalls first.
-            if let Some(delegated) = this.open_file(fd.0)
+            if let Some(ref delegated) = open_file
                 && delegated.description.delegation_handle() != 0
                 && let Some(outcome) = crate::el1_delegation::serve_on_host(
                     &delegated.description,
@@ -2704,11 +2710,6 @@ impl<'a> FsView<'a> {
                 return Ok(outcome);
             }
 
-            let fd = fd.0;
-            let (open_file, slot_authority) = match this.open_file_with_authority(fd) {
-                Some((of, auth)) => (Some(of), Some(auth)),
-                None => (this.open_file(fd), None),
-            };
             if let Some(ref of) = open_file {
                 let common = of.description.common();
                 // An O_PATH descriptor is not open for I/O (open13 → EBADF).
@@ -2768,8 +2769,15 @@ impl<'a> FsView<'a> {
             const STACK_WRITE_LIMIT: usize = 4096;
             let mut stack_buf = [0u8; STACK_WRITE_LIMIT];
             let heap_buf;
+            let direct_slice = if length > 0 {
+                (*cx.memory).host_ptr_for_read(address, length)
+            } else {
+                None
+            };
             let bytes: &[u8] = if length == 0 {
                 &[]
+            } else if let Some(ptr) = direct_slice {
+                unsafe { std::slice::from_raw_parts(ptr, length) }
             } else if length <= STACK_WRITE_LIMIT {
                 match (*cx.memory).read_into(address, &mut stack_buf[..length]) {
                     Ok(()) => &stack_buf[..length],

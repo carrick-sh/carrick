@@ -639,6 +639,10 @@ impl<'a> FsView<'a> {
         self.cross.detach_fd_from_epolls(fd);
     }
 
+    pub(in crate::dispatch) fn detach_open_file_from_epolls(&self, fd: i32, open_file: &OpenFile) {
+        self.cross.detach_open_file_from_epolls(fd, open_file);
+    }
+
     pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
         self.cross.close_open_file_and_free_pty(open_file);
     }
@@ -3005,3 +3009,7 @@ impl SyscallDispatcher {
 #[cfg(test)]
 #[path = "fs/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fs/rw_close_budget_tests.rs"]
+mod rw_close_budget_tests;
