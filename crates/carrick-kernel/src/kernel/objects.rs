@@ -2005,6 +2005,160 @@ impl Hasher for FileSlotHasher {
 
 pub type FileSlotMap = HashMap<i32, FileSlot, BuildHasherDefault<FileSlotHasher>>;
 
+/// Descriptor paths indexed both by fd (for `/proc/self/fd`) and by exact
+/// pathname (for namespace mutation). Every insertion/removal keeps the two
+/// views coherent, including the direct map writes used by open and close.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FdOpenPaths {
+    by_fd: HashMap<i32, String>,
+    by_path: BTreeMap<String, Vec<i32>>,
+    description_by_fd: HashMap<i32, String>,
+    by_description_path: BTreeMap<String, Vec<i32>>,
+}
+
+impl FdOpenPaths {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_fd.is_empty()
+    }
+
+    pub(crate) fn get(&self, fd: &i32) -> Option<&String> {
+        self.by_fd.get(fd)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, fd: &i32) -> bool {
+        self.by_fd.contains_key(fd)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&i32, &String)> {
+        self.by_fd.iter()
+    }
+
+    pub(crate) fn insert(&mut self, fd: i32, path: String) -> Option<String> {
+        self.remove_description_index(fd);
+        self.replace_recorded_path(fd, path)
+    }
+
+    fn replace_recorded_path(&mut self, fd: i32, path: String) -> Option<String> {
+        let previous = self.by_fd.insert(fd, path.clone());
+        if let Some(ref old) = previous {
+            self.remove_index(old, fd);
+        }
+        self.by_path.entry(path).or_default().push(fd);
+        previous
+    }
+
+    pub(crate) fn insert_with_description_path(
+        &mut self,
+        fd: i32,
+        path: String,
+        description_path: Option<String>,
+    ) -> Option<String> {
+        let description_path = description_path.filter(|description| description != &path);
+        let previous = self.insert(fd, path);
+        if let Some(description_path) = description_path {
+            self.by_description_path
+                .entry(description_path.clone())
+                .or_default()
+                .push(fd);
+            self.description_by_fd.insert(fd, description_path);
+        }
+        previous
+    }
+
+    pub(crate) fn remove(&mut self, fd: &i32) -> Option<String> {
+        let path = self.by_fd.remove(fd)?;
+        self.remove_index(&path, *fd);
+        self.remove_description_index(*fd);
+        Some(path)
+    }
+
+    fn remove_description_index(&mut self, fd: i32) {
+        if let Some(path) = self.description_by_fd.remove(&fd)
+            && let Some(fds) = self.by_description_path.get_mut(&path)
+        {
+            fds.retain(|recorded| *recorded != fd);
+            if fds.is_empty() {
+                self.by_description_path.remove(&path);
+            }
+        }
+    }
+
+    fn remove_index(&mut self, path: &str, fd: i32) {
+        if let Some(fds) = self.by_path.get_mut(path) {
+            fds.retain(|recorded| *recorded != fd);
+            if fds.is_empty() {
+                self.by_path.remove(path);
+            }
+        }
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> (Vec<i32>, usize) {
+        let prefix = format!("{old}/");
+        let mut matches = Vec::new();
+        let mut affected_fds = std::collections::HashSet::new();
+        if let Some(fds) = self.by_path.get(old) {
+            for fd in fds {
+                affected_fds.insert(*fd);
+                matches.push((*fd, old.to_owned()));
+            }
+        }
+        for (path, fds) in self
+            .by_path
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+        {
+            for fd in fds {
+                affected_fds.insert(*fd);
+                matches.push((*fd, path.clone()));
+            }
+        }
+        if let Some(fds) = self.by_description_path.get(old) {
+            affected_fds.extend(fds.iter().copied());
+        }
+        for (_, fds) in self
+            .by_description_path
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+        {
+            affected_fds.extend(fds.iter().copied());
+        }
+        let visited = affected_fds.len();
+        for (fd, path) in matches {
+            let updated = format!("{new}{}", &path[old.len()..]);
+            self.replace_recorded_path(fd, updated);
+        }
+        // Re-key canonical description paths independently of the guest's
+        // recorded spelling. A symlinked open may have two different names.
+        for fd in &affected_fds {
+            if let Some(path) = self.description_by_fd.get(fd).cloned()
+                && (path == old || path.starts_with(&prefix))
+            {
+                self.remove_description_index(*fd);
+                let updated = format!("{new}{}", &path[old.len()..]);
+                self.by_description_path
+                    .entry(updated.clone())
+                    .or_default()
+                    .push(*fd);
+                self.description_by_fd.insert(*fd, updated);
+            }
+        }
+        let mut affected = affected_fds.into_iter().collect::<Vec<_>>();
+        affected.sort_unstable();
+        (affected, visited)
+    }
+}
+
+impl FromIterator<(i32, String)> for FdOpenPaths {
+    fn from_iter<T: IntoIterator<Item = (i32, String)>>(iter: T) -> Self {
+        let mut paths = Self::default();
+        for (fd, path) in iter {
+            paths.insert(fd, path);
+        }
+        paths
+    }
+}
+
 #[derive(Debug)]
 pub struct FileTable {
     id: FileTableId,
@@ -2015,7 +2169,7 @@ pub struct FileTable {
     next_reservation_id: AtomicU64,
     stdio_cloexec: Mutex<[bool; 3]>,
     closed_stdio: Mutex<[bool; 3]>,
-    fd_open_paths: RwLock<HashMap<i32, String>>,
+    fd_open_paths: RwLock<FdOpenPaths>,
     epoll_fds: RwLock<BTreeSet<i32>>,
     epoll_wake_registry: crate::dispatch::EpollWakeRegistry,
     functional_gate: Arc<FileTableFunctionalGate>,
@@ -2039,7 +2193,7 @@ impl FileTable {
             next_reservation_id: AtomicU64::new(0),
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new([false; 3]),
-            fd_open_paths: RwLock::new(HashMap::new()),
+            fd_open_paths: RwLock::new(FdOpenPaths::default()),
             epoll_fds: RwLock::new(BTreeSet::new()),
             epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
@@ -2069,7 +2223,7 @@ impl FileTable {
         let fd_open_paths = {
             let guard = parent.fd_open_paths.read();
             if guard.is_empty() {
-                HashMap::new()
+                FdOpenPaths::default()
             } else {
                 guard.clone()
             }
@@ -2134,16 +2288,14 @@ impl FileTable {
             next_fd = next;
         }
         let _ = *caller.next_fd.lock();
-        let fd_open_paths = caller
-            .fd_open_paths
-            .read()
+        let mut fd_open_paths = caller.fd_open_paths.read().clone();
+        let retired_paths = fd_open_paths
             .iter()
-            .filter_map(|(number, path)| {
-                open_files
-                    .contains_key(number)
-                    .then_some((*number, path.clone()))
-            })
-            .collect();
+            .filter_map(|(number, _)| (!open_files.contains_key(number)).then_some(*number))
+            .collect::<Vec<_>>();
+        for fd in retired_paths {
+            fd_open_paths.remove(&fd);
+        }
         let epoll_fds = caller
             .epoll_fds
             .read()
@@ -2666,11 +2818,11 @@ impl FileTable {
         self.reserved_slots.lock()
     }
 
-    pub(crate) fn read_fd_open_paths(&self) -> RwLockReadGuard<'_, HashMap<i32, String>> {
+    pub(crate) fn read_fd_open_paths(&self) -> RwLockReadGuard<'_, FdOpenPaths> {
         self.fd_open_paths.read()
     }
 
-    pub(crate) fn write_fd_open_paths(&self) -> FileTableRwWriteGuard<'_, HashMap<i32, String>> {
+    pub(crate) fn write_fd_open_paths(&self) -> FileTableRwWriteGuard<'_, FdOpenPaths> {
         self.rw_write(&self.fd_open_paths)
     }
 
@@ -2678,18 +2830,13 @@ impl FileTable {
         self.write_fd_open_paths().insert(fd, path);
     }
 
-    pub(crate) fn rename_fd_open_paths(&self, resolved_old: &str, resolved_new: &str) {
-        let mut fd_open_paths = self.write_fd_open_paths();
-        for (_, open_path) in fd_open_paths.iter_mut() {
-            if *open_path == resolved_old {
-                *open_path = resolved_new.to_string();
-            } else if open_path.starts_with(resolved_old)
-                && open_path.as_bytes().get(resolved_old.len()) == Some(&b'/')
-            {
-                let rest = &open_path[resolved_old.len() + 1..];
-                *open_path = format!("{resolved_new}/{rest}");
-            }
-        }
+    pub(crate) fn rename_fd_open_paths(
+        &self,
+        resolved_old: &str,
+        resolved_new: &str,
+    ) -> (Vec<i32>, usize) {
+        self.write_fd_open_paths()
+            .rename(resolved_old, resolved_new)
     }
 
     pub(crate) fn read_epoll_fds(&self) -> RwLockReadGuard<'_, BTreeSet<i32>> {
@@ -3277,6 +3424,73 @@ mod tests {
         Arc::new(FileDescription::regular(
             ids.file_description_id().expect("description ID"),
         ))
+    }
+
+    #[test]
+    fn rename_recorded_paths_visits_only_matching_names() {
+        let ids = ObjectIdRegistry::new();
+        let table = FileTable::new(ids.file_table_id().expect("table ID"));
+        for fd in 3..259 {
+            table.record_fd_open_path(fd, format!("/unrelated/file{fd}"));
+        }
+        table.record_fd_open_path(300, "/old/file".to_owned());
+
+        let (affected, visited) = table.rename_fd_open_paths("/old", "/new");
+        assert_eq!(affected, vec![300]);
+        assert!(visited <= 1, "rename visited {visited} unrelated FD paths");
+        assert_eq!(
+            table.read_fd_open_paths().get(&300).map(String::as_str),
+            Some("/new/file")
+        );
+    }
+
+    #[test]
+    fn recorded_path_index_tracks_replacement_removal_and_fork_copy() {
+        let ids = ObjectIdRegistry::new();
+        let table = FileTable::new(ids.file_table_id().expect("table ID"));
+        table.record_fd_open_path(7, "/old/first".to_owned());
+        table.record_fd_open_path(7, "/new/second".to_owned());
+        assert_eq!(table.rename_fd_open_paths("/old", "/moved"), (vec![], 0));
+        assert_eq!(table.rename_fd_open_paths("/new", "/moved"), (vec![7], 1));
+        assert_eq!(
+            table.read_fd_open_paths().get(&7).map(String::as_str),
+            Some("/moved/second")
+        );
+
+        let child = FileTable::for_fork_copy(ids.file_table_id().expect("child ID"), &table);
+        assert_eq!(child.rename_fd_open_paths("/moved", "/child"), (vec![7], 1));
+        assert_eq!(
+            table.read_fd_open_paths().get(&7).map(String::as_str),
+            Some("/moved/second")
+        );
+        assert_eq!(
+            child.write_fd_open_paths().remove(&7),
+            Some("/child/second".to_owned())
+        );
+        assert_eq!(child.rename_fd_open_paths("/child", "/gone"), (vec![], 0));
+    }
+
+    #[test]
+    fn exec_copy_retains_description_alias_for_inherited_fd() {
+        let ids = ObjectIdRegistry::new();
+        let table = FileTable::new(ids.file_table_id().expect("table ID"));
+        let fd = FileSlotNumber::for_open_fd(7).expect("fd");
+        table.install(fd, regular_description(&ids), false);
+        table.write_fd_open_paths().insert_with_description_path(
+            7,
+            "/alias/file".to_owned(),
+            Some("/real/file".to_owned()),
+        );
+
+        let child = FileTable::for_exec(ids.file_table_id().expect("exec ID"), &table);
+        assert_eq!(
+            child.rename_fd_open_paths("/real/file", "/real/renamed"),
+            (vec![7], 1)
+        );
+        assert_eq!(
+            child.read_fd_open_paths().get(&7).map(String::as_str),
+            Some("/alias/file")
+        );
     }
 
     #[test]

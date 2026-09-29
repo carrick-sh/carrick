@@ -48,12 +48,94 @@ struct ExecutableDisplay {
 
 #[derive(Debug, Default)]
 pub(in crate::dispatch) struct ExecutableAuthorityRegistry {
-    displays: parking_lot::Mutex<
-        std::collections::HashMap<
-            ExecutableObjectId,
-            Vec<std::sync::Weak<parking_lot::RwLock<ExecutableDisplay>>>,
-        >,
-    >,
+    displays: parking_lot::Mutex<ExecutableDisplayIndex>,
+    #[cfg(test)]
+    lookup_visited: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    prefix_visited: std::sync::atomic::AtomicU64,
+}
+
+type DisplayWeak = std::sync::Weak<parking_lot::RwLock<ExecutableDisplay>>;
+
+#[derive(Debug, Default)]
+struct ExecutableDisplayIndex {
+    by_object: std::collections::HashMap<ExecutableObjectId, Vec<DisplayWeak>>,
+    // Ordered paths bound directory-rename work to displays beneath that
+    // directory. Exact file rename/unlink probes one key.
+    by_path: std::collections::BTreeMap<String, Vec<DisplayWeak>>,
+}
+
+impl ExecutableDisplayIndex {
+    fn move_display(&mut self, old: &str, new: &str, display: &DisplayWeak) {
+        if let Some(entries) = self.by_path.get_mut(old) {
+            entries.retain(|entry| entry.strong_count() != 0 && !entry.ptr_eq(display));
+            if entries.is_empty() {
+                self.by_path.remove(old);
+            }
+        }
+        self.by_path
+            .entry(new.to_owned())
+            .or_default()
+            .push(display.clone());
+    }
+
+    fn rewrite_prefixes(
+        &mut self,
+        first: &str,
+        first_to: &str,
+        second: Option<(&str, &str)>,
+    ) -> usize {
+        let prefix = |path: &str| format!("{}/", path.trim_end_matches('/'));
+        let first_prefix = prefix(first);
+        let second_prefix = second.map(|(from, to)| (prefix(from), to));
+        let keys = self
+            .by_path
+            .range(first_prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&first_prefix))
+            .map(|(path, _)| path.clone())
+            .chain(second_prefix.iter().flat_map(|(prefix, _)| {
+                self.by_path
+                    .range(prefix.clone()..)
+                    .take_while(move |(path, _)| path.starts_with(prefix))
+                    .map(|(path, _)| path.clone())
+            }))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut moved = Vec::new();
+        for old in keys {
+            if let Some(entries) = self.by_path.remove(&old) {
+                moved.push((old, entries));
+            }
+        }
+        let mut visited = 0;
+        for (old, entries) in moved {
+            let to = if old.starts_with(&first_prefix) {
+                Some(format!("{first_to}{}", &old[first.len()..]))
+            } else {
+                second_prefix.as_ref().and_then(|(prefix, to)| {
+                    old.starts_with(prefix)
+                        .then(|| format!("{to}{}", &old[prefix.len() - 1..]))
+                })
+            };
+            for entry in entries {
+                visited += 1;
+                let Some(display) = entry.upgrade() else {
+                    continue;
+                };
+                let mut live = display.write();
+                let next = if live.deleted || live.path != old {
+                    live.path.clone()
+                } else if let Some(ref to) = to {
+                    live.path = to.clone();
+                    to.clone()
+                } else {
+                    old.clone()
+                };
+                drop(live);
+                self.by_path.entry(next).or_default().push(entry);
+            }
+        }
+        visited
+    }
 }
 
 impl ExecutableAuthorityRegistry {
@@ -63,23 +145,37 @@ impl ExecutableAuthorityRegistry {
         display: &Arc<parking_lot::RwLock<ExecutableDisplay>>,
     ) {
         let mut displays = self.displays.lock();
-        let entries = displays.entry(object_id).or_default();
+        let entries = displays.by_object.entry(object_id).or_default();
         entries.retain(|entry| entry.strong_count() != 0);
         entries.push(Arc::downgrade(display));
+        displays
+            .by_path
+            .entry(display.read().path.clone())
+            .or_default()
+            .push(Arc::downgrade(display));
     }
 
     fn visit(&self, object_id: ExecutableObjectId, mut update: impl FnMut(&mut ExecutableDisplay)) {
         let mut displays = self.displays.lock();
-        let Some(entries) = displays.get_mut(&object_id) else {
+        let Some(entries) = displays.by_object.get_mut(&object_id) else {
             return;
         };
+        let mut changed = Vec::new();
         entries.retain(|entry| {
             let Some(display) = entry.upgrade() else {
                 return false;
             };
-            update(&mut display.write());
+            let mut display = display.write();
+            let old = display.path.clone();
+            update(&mut display);
+            if display.path != old {
+                changed.push((old, display.path.clone(), entry.clone()));
+            }
             true
         });
+        for (old, new, entry) in changed {
+            displays.move_display(&old, &new, &entry);
+        }
     }
 
     /// Whether any live display currently names exactly `path`.
@@ -89,68 +185,46 @@ impl ExecutableAuthorityRegistry {
     /// either side of a namespace operation, the object identity of that name
     /// cannot affect any display and need not be read from the host.
     fn has_display_path(&self, path: &str) -> bool {
-        let displays = self.displays.lock();
-        displays.values().flatten().any(|entry| {
-            entry
-                .upgrade()
-                .is_some_and(|display| display.read().path == path)
-        })
+        let mut displays = self.displays.lock();
+        let Some(entries) = displays.by_path.get_mut(path) else {
+            return false;
+        };
+        let mut found = false;
+        entries.retain(|entry| {
+            #[cfg(test)]
+            self.lookup_visited
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(display) = entry.upgrade() else {
+                return false;
+            };
+            found |= display.read().path == path;
+            true
+        });
+        if entries.is_empty() {
+            displays.by_path.remove(path);
+        }
+        found
     }
 
     fn rename_prefix(&self, from: &str, to: &str) {
-        let mut displays = self.displays.lock();
-        for entries in displays.values_mut() {
-            entries.retain(|entry| {
-                let Some(display) = entry.upgrade() else {
-                    return false;
-                };
-                let mut display = display.write();
-                if !display.deleted
-                    && display.path.starts_with(from)
-                    && display
-                        .path
-                        .as_bytes()
-                        .get(from.len())
-                        .is_some_and(|byte| *byte == b'/')
-                {
-                    display.path = format!("{to}{}", &display.path[from.len()..]);
-                }
-                true
-            });
-        }
+        let visited = self.displays.lock().rewrite_prefixes(from, to, None);
+        #[cfg(test)]
+        self.prefix_visited
+            .fetch_add(visited as u64, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = visited;
     }
 
     fn exchange_prefixes(&self, first: &str, second: &str) {
-        let mut displays = self.displays.lock();
-        for entries in displays.values_mut() {
-            entries.retain(|entry| {
-                let Some(display) = entry.upgrade() else {
-                    return false;
-                };
-                let mut display = display.write();
-                if display.deleted {
-                    return true;
-                }
-                if display.path.starts_with(first)
-                    && display
-                        .path
-                        .as_bytes()
-                        .get(first.len())
-                        .is_some_and(|byte| *byte == b'/')
-                {
-                    display.path = format!("{second}{}", &display.path[first.len()..]);
-                } else if display.path.starts_with(second)
-                    && display
-                        .path
-                        .as_bytes()
-                        .get(second.len())
-                        .is_some_and(|byte| *byte == b'/')
-                {
-                    display.path = format!("{first}{}", &display.path[second.len()..]);
-                }
-                true
-            });
-        }
+        let visited = self
+            .displays
+            .lock()
+            .rewrite_prefixes(first, second, Some((second, first)));
+        #[cfg(test)]
+        self.prefix_visited
+            .fetch_add(visited as u64, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = visited;
     }
 }
 
@@ -844,6 +918,69 @@ mod tests {
         });
         assert_eq!(first.display_path(), "/renamed");
         assert_eq!(second.display_path(), "/second");
+        assert!(!registry.has_display_path("/first"));
+        assert!(registry.has_display_path("/renamed"));
+        assert!(registry.has_display_path("/second"));
+    }
+
+    #[test]
+    fn unrelated_executable_displays_do_not_cost_per_name_lookup() {
+        use std::sync::atomic::Ordering;
+
+        let registry = ExecutableAuthorityRegistry::default();
+        let displays: Vec<_> = (0..256)
+            .map(|i| {
+                ExecSource::shared(
+                    Arc::from(&b"elf"[..]),
+                    carrick_vfs::fs_backend::fresh_file_object_id(),
+                    format!("/retained/image{i}"),
+                    0o755,
+                    carrick_abi::NsUid::ROOT,
+                    carrick_abi::NsGid::ROOT,
+                )
+                .into_current(&registry)
+            })
+            .collect();
+        assert!(!registry.has_display_path("/unrelated/leaf"));
+        assert!(
+            registry.lookup_visited.load(Ordering::Relaxed) <= 1,
+            "an unrelated rename/unlink must not inspect retained displays"
+        );
+        assert_eq!(displays.len(), 256);
+    }
+
+    #[test]
+    fn directory_rename_visits_only_descendant_displays() {
+        use std::sync::atomic::Ordering;
+
+        let registry = ExecutableAuthorityRegistry::default();
+        let unrelated: Vec<_> = (0..256)
+            .map(|i| {
+                ExecSource::shared(
+                    Arc::from(&b"elf"[..]),
+                    carrick_vfs::fs_backend::fresh_file_object_id(),
+                    format!("/other/image{i}"),
+                    0o755,
+                    carrick_abi::NsUid::ROOT,
+                    carrick_abi::NsGid::ROOT,
+                )
+                .into_current(&registry)
+            })
+            .collect();
+        let child = ExecSource::shared(
+            Arc::from(&b"elf"[..]),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
+            "/old/bin/app".into(),
+            0o755,
+            carrick_abi::NsUid::ROOT,
+            carrick_abi::NsGid::ROOT,
+        )
+        .into_current(&registry);
+
+        registry.rename_prefix("/old", "/new");
+        assert_eq!(child.display_path(), "/new/bin/app");
+        assert_eq!(registry.prefix_visited.load(Ordering::Relaxed), 1);
+        assert_eq!(unrelated.len(), 256);
     }
 
     #[test]
@@ -870,9 +1007,14 @@ mod tests {
 
         registry.rename_prefix("/a", "/b");
         assert_eq!(first.display_path(), "/b/bin/app");
+        assert!(!registry.has_display_path("/a/bin/app"));
+        assert!(registry.has_display_path("/b/bin/app"));
         registry.exchange_prefixes("/b", "/c");
         assert_eq!(first.display_path(), "/c/bin/app");
         assert_eq!(second.display_path(), "/b/tool");
+        assert!(!registry.has_display_path("/b/bin/app"));
+        assert!(registry.has_display_path("/c/bin/app"));
+        assert!(registry.has_display_path("/b/tool"));
     }
 
     #[test]

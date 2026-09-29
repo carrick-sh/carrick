@@ -2545,6 +2545,70 @@ mod serial_host {
         );
     }
 
+    /// Ordinary file rename and unlink change leaf names, not the directory
+    /// topology. A cached lexicographic successor makes an unnecessary subtree
+    /// range walk visible even when no key is actually removed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_rename_and_unlink_do_not_scan_directory_cache() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let backend = HostFsBackend::new_in(scratch.path()).unwrap();
+        backend.make_dir("/work").unwrap();
+        backend.make_dir("/work/zz_successor").unwrap();
+        backend.dir_fd_for(Path::new("work/zz_successor")).unwrap();
+        backend.create_file("/work/a").unwrap();
+
+        backend.reset_cache_eviction_visited_keys();
+        assert!(matches!(
+            backend.rename_overlay_entry("/work/a", "/work/b"),
+            Ok(crate::fs_backend::OverlayRenameOutcome::Renamed)
+        ));
+        assert_eq!(
+            backend.cache_eviction_visited_keys(),
+            0,
+            "regular-file rename must not walk cached directories"
+        );
+
+        let parent = backend.dir_fd_for(Path::new("work")).unwrap();
+        let leaf = std::ffi::CString::new("b").unwrap();
+        let rel = crate::fs_backend::NormalizedRelPath::from_normalized_str("/work/b");
+        backend.reset_cache_eviction_visited_keys();
+        assert!(
+            backend
+                .remove_entry_at(Some(&parent), Some(&leaf), &rel, false, false)
+                .unwrap()
+        );
+        assert_eq!(
+            backend.cache_eviction_visited_keys(),
+            0,
+            "regular-file unlink must not walk cached directories"
+        );
+        assert!(!scratch.path().join("work/b").exists());
+
+        backend.symlink("zz_successor", "/work/alias").unwrap();
+        backend.dir_fd_for(Path::new("work/alias")).unwrap();
+        assert!(
+            backend
+                .dir_cache
+                .lock()
+                .contains_key(Path::new("work/alias"))
+        );
+        let alias = std::ffi::CString::new("alias").unwrap();
+        let alias_rel = crate::fs_backend::NormalizedRelPath::from_normalized_str("/work/alias");
+        assert!(
+            backend
+                .remove_entry_at(Some(&parent), Some(&alias), &alias_rel, false, true)
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .dir_cache
+                .lock()
+                .contains_key(Path::new("work/alias")),
+            "symlink unlink must invalidate cached resolution through that name"
+        );
+    }
+
     /// THE MEASURED INVARIANT: on a warm `dir_cache`, one guest-level
     /// `mkdirat` / `unlinkat` / `openat` under an already-resolved parent costs
     /// at most 2 host `openat` calls spent walking the path — and in practice
