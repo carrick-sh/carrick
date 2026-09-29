@@ -1038,6 +1038,30 @@ fn stealing_takes_only_what_the_thief_may_run() {
     assert_eq!(zone.counters.foreign_adoptions.load(Ordering::Relaxed), 0);
 }
 
+/// A service thread the host placed on a stopped slot (its vCPU out of the
+/// guest, its executor on the host) must not wait there for an executor that
+/// may not come back to that vCPU: an idle vCPU takes it onto its own queue
+/// and leaves for its executor. Every vCPU was busy on the host when the
+/// thread became runnable, so it went to a live stopped slot; the vCPUs
+/// that then came back idle are the only ones that can reach it.
+#[test]
+fn an_idle_vcpu_rescues_service_work_from_a_stopped_slot() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    zone.leave_guest(SLOT, &HostWait);
+    let service = service_record(&zone, 5);
+    let placed = zone.place_from_host(service).unwrap();
+    assert_eq!(placed.slot, SLOT, "the only live slot is stopped");
+    assert!(!placed.resched);
+    enter(&zone, OTHER, 1);
+    assert!(!zone.enter_idle(OTHER, false));
+    assert_eq!(zone.steal(OTHER), None, "EL1 never runs a service thread");
+    assert_eq!(zone.runnable_head(SLOT), None);
+    assert_eq!(zone.runnable_head(OTHER), Some(service));
+    assert!(zone.head_needs_host(OTHER));
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
+}
+
 /// The executor sweeps records of retired threads off its run queue at an
 /// exit, and takes a service thread from the head.
 #[test]
