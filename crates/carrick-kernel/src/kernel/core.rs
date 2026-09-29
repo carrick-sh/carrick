@@ -1260,6 +1260,10 @@ impl std::fmt::Debug for TaskExitSubscribers {
 }
 
 impl Kernel {
+    pub(crate) fn existing_ipc(&self) -> Option<Arc<crate::el1_ipc::HostIpc>> {
+        self.ipc.lock().clone()
+    }
+
     /// Deliver only this kernel's pending IPC notifications. A boundary with
     /// no IPC authority does not allocate one just to discover there is no work.
     pub(crate) fn deliver_ipc_host_wakes(&self) {

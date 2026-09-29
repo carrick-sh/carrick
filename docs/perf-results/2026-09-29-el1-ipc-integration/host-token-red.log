@@ -1,0 +1,24 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.39s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 1 test
+test kernel::continuation::ipc::tests::serial_host_el1_ipc_finish_releases_host_forwarding_token ... FAILED
+
+failures:
+
+---- kernel::continuation::ipc::tests::serial_host_el1_ipc_finish_releases_host_forwarding_token stdout ----
+
+thread 'kernel::continuation::ipc::tests::serial_host_el1_ipc_finish_releases_host_forwarding_token' (34330284) panicked at crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs:37:5:
+assertion `left == right` failed: final handback must retire its host token
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    kernel::continuation::ipc::tests::serial_host_el1_ipc_finish_releases_host_forwarding_token
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2333 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

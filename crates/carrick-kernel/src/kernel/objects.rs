@@ -17,6 +17,8 @@ use super::ids::{
 };
 use carrick_fatal::carrick_fatal;
 
+mod ipc;
+pub use ipc::FileTableStdioGuard;
 pub mod credentials;
 pub mod process;
 pub mod session;
@@ -807,6 +809,9 @@ impl SocketCork {
 pub struct DescriptionCommon {
     status_flags: AtomicU64,
     ipc_status_flags: std::sync::OnceLock<Arc<crate::el1_ipc::HostDescriptionFlags>>,
+    /// A shared routing record for descriptions whose effects remain host-owned.
+    /// This pin ends with functional fd ownership, never diagnostic Arc lifetime.
+    ipc_forwarding: Mutex<Option<crate::el1_ipc::HostDescription>>,
     /// Number of Linux fd-table entries naming this description across every
     /// process namespace. Deliberately excludes transient Rust `Arc` clones
     /// held by in-flight syscalls: Linux removes an event-poll interest only after
@@ -841,6 +846,7 @@ impl DescriptionCommon {
         Self {
             status_flags: AtomicU64::new(status_flags),
             ipc_status_flags: std::sync::OnceLock::new(),
+            ipc_forwarding: Mutex::new(None),
             fd_refs: AtomicUsize::new(0),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
@@ -861,6 +867,7 @@ impl DescriptionCommon {
         Self {
             status_flags: AtomicU64::new(status_flags),
             ipc_status_flags: std::sync::OnceLock::new(),
+            ipc_forwarding: Mutex::new(None),
             fd_refs: AtomicUsize::new(0),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
@@ -1121,6 +1128,60 @@ pub struct FileDescription {
 }
 
 impl FileDescription {
+    pub(crate) fn ipc_description(
+        &self,
+        owner: &Arc<crate::el1_ipc::HostIpc>,
+    ) -> Result<Arc<crate::el1_ipc::HostDescriptionFlags>, crate::el1_ipc::AdmissionError> {
+        use carrick_el1_abi::ipc::{IpcBacking, fd};
+        let _lifecycle = self.lifecycle_transition.lock();
+        if self.common.fd_refs() == 0 {
+            return Err(fd::Error::StalePin.into());
+        }
+        if let Some(flags) = self.common.ipc_status_flags.get() {
+            return if flags.belongs_to(owner) {
+                Ok(Arc::clone(flags))
+            } else {
+                Err(fd::Error::StalePin.into())
+            };
+        }
+        let mut forwarding = self.common.ipc_forwarding.lock();
+        // Restored views can share DescriptionCommon while carrying distinct
+        // wrapper lifecycle locks. Recheck under the same cell final close
+        // takes, so a queued admission cannot recreate a retired host pin.
+        if self.common.fd_refs() == 0 {
+            return Err(fd::Error::StalePin.into());
+        }
+        if let Some(description) = &*forwarding {
+            let flags = description.flags();
+            return if flags.belongs_to(owner) {
+                Ok(flags)
+            } else {
+                Err(fd::Error::StalePin.into())
+            };
+        }
+        // EL1 forwards Host backing before interpreting its access/flag words.
+        // This record identifies routing and lifetime; Linux file semantics and
+        // the actual host resource remain in this FileDescription authority.
+        let token = owner.retain_host_resource(Box::new(self.id))?;
+        let backing = IpcBacking::Host(token).encode();
+        let description = match owner.admit_description(fd::Description::new(
+            backing,
+            fd::AccessMode::ReadWrite,
+            fd::StatusFlags::default(),
+        )) {
+            Ok(description) => description,
+            Err(error) => {
+                owner.release(backing).unwrap_or_else(|_| {
+                    carrick_fatal!("ipc::description", "forwarding admission rollback failed")
+                });
+                return Err(error.into());
+            }
+        };
+        let flags = description.flags();
+        *forwarding = Some(description);
+        Ok(flags)
+    }
+
     pub(crate) fn common(&self) -> &DescriptionCommon {
         &self.common
     }
@@ -1468,11 +1529,13 @@ impl FileDescription {
             crate::el1_delegation::release_description(self);
         }
         let released_last;
+        let mut retired_ipc = None;
         let terminal_finalizers = {
             let mut lifecycle = self.lifecycle_transition.lock();
             let count = self.common.release_fd_ref();
             released_last = count == 0;
             if count == 0 {
+                retired_ipc = self.common.ipc_forwarding.lock().take();
                 if let FileDescriptionKind::Concrete(backing) = &self.kind {
                     backing.0.on_last_fd_ref();
                     if lifecycle.mapping_refs == 0 {
@@ -1484,6 +1547,7 @@ impl FileDescription {
                 Vec::new()
             }
         };
+        drop(retired_ipc);
         // Two releases that both saw another reference outstanding can reach
         // zero together; the description (and its host fd) is still alive, so
         // write the delegation back now.
@@ -2235,6 +2299,7 @@ pub struct FileTable {
     id: FileTableId,
     fd_ceiling: Arc<FdCeilingAuthority>,
     open_files: RwLock<FileSlotMap>,
+    ipc: Mutex<Option<Result<ipc::Binding, crate::el1_ipc::AdmissionError>>>,
     next_fd: Mutex<i32>,
     reserved_slots: Mutex<HashMap<i32, u64>>,
     next_reservation_id: AtomicU64,
@@ -2259,6 +2324,7 @@ impl FileTable {
             id,
             fd_ceiling,
             open_files: RwLock::new(FileSlotMap::default()),
+            ipc: Mutex::new(None),
             next_fd: Mutex::new(3),
             reserved_slots: Mutex::new(HashMap::new()),
             next_reservation_id: AtomicU64::new(0),
@@ -2311,6 +2377,7 @@ impl FileTable {
             id,
             fd_ceiling: Arc::clone(&parent.fd_ceiling),
             open_files: RwLock::new(open_files),
+            ipc: Mutex::new(None),
             next_fd: Mutex::new(child_next_fd),
             reserved_slots: Mutex::new(HashMap::new()),
             next_reservation_id: AtomicU64::new(0),
@@ -2377,6 +2444,7 @@ impl FileTable {
             id,
             fd_ceiling: Arc::clone(&caller.fd_ceiling),
             open_files: RwLock::new(open_files),
+            ipc: Mutex::new(None),
             next_fd: Mutex::new(next_fd),
             reserved_slots: Mutex::new(HashMap::new()),
             next_reservation_id: AtomicU64::new(0),
@@ -2665,20 +2733,14 @@ impl FileTable {
         description: Arc<FileDescription>,
         close_on_exec: bool,
     ) -> Option<FileSlot> {
-        let _mutation = self.mutation_lease();
-        let mut open_files = self.open_files.write();
-        self.fd_ceiling.publish(number.raw());
-        let replaced = open_files.insert(
+        let mut open_files = self.write_open_files();
+        open_files.insert(
             number.raw(),
             FileSlot::new(
                 description,
                 u64::from(close_on_exec) * crate::linux_abi::LINUX_FD_CLOEXEC,
             ),
-        );
-        self.revision.publish();
-        self.slot_subscriptions
-            .publish_changes(self.id, &open_files, &[number.raw()]);
-        replaced
+        )
     }
 
     pub fn capture_slot_authority(&self, number: FileSlotNumber) -> Option<FileSlotAuthority> {
@@ -2901,6 +2963,7 @@ impl FileTable {
             table: self.id,
             subscriptions: &self.slot_subscriptions,
             touched: TouchedSlots::new(),
+            owner: self,
         }
     }
 
@@ -2912,12 +2975,12 @@ impl FileTable {
         self.mutex_write(&self.next_fd)
     }
 
-    pub(crate) fn lock_stdio_cloexec(&self) -> FileTableMutexGuard<'_, [bool; 3]> {
-        self.mutex_write(&self.stdio_cloexec)
+    pub(crate) fn lock_stdio_cloexec(&self) -> FileTableStdioGuard<'_> {
+        self.stdio_guard(ipc::StdioField::Cloexec)
     }
 
-    pub(crate) fn lock_closed_stdio(&self) -> FileTableMutexGuard<'_, [bool; 3]> {
-        self.mutex_write(&self.closed_stdio)
+    pub(crate) fn lock_closed_stdio(&self) -> FileTableStdioGuard<'_> {
+        self.stdio_guard(ipc::StdioField::Closed)
     }
 
     pub(crate) fn lock_reserved_slots(&self) -> MutexGuard<'_, HashMap<i32, u64>> {
@@ -2985,6 +3048,7 @@ impl FileTable {
         if !self.functional_gate.retire() {
             return Vec::new();
         }
+        self.retire_ipc();
         let slots = self
             .open_files
             .read()
@@ -3083,6 +3147,7 @@ impl Drop for FileTable {
             return;
         }
         self.functional_refs_active.store(false, Ordering::Release);
+        self.retire_ipc();
         for slot in self.open_files.get_mut().values() {
             // Model-only descriptions and tests that install observational
             // slots directly carry no functional dispatch reference.
@@ -3154,6 +3219,7 @@ impl TouchedSlots {
 }
 
 pub struct FileTableWriteGuard<'a> {
+    owner: &'a FileTable,
     guard: RwLockWriteGuard<'a, FileSlotMap>,
     _mutation: FileTableMutationLease,
     fd_ceiling: &'a FdCeilingAuthority,
@@ -3230,6 +3296,7 @@ impl Drop for FileTableWriteGuard<'_> {
         };
 
         for (number, before) in self.touched.take() {
+            self.owner.sync_ipc_slot(number, self.guard.get(&number));
             match before {
                 None => push_changed(number),
                 Some(before) => {
@@ -4074,6 +4141,59 @@ mod tests {
         assert!(
             table.retain_slot_lease(authority).is_none(),
             "a stale authority must never retain the old alias or replacement"
+        );
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_host_description_alias_and_functional_retirement() {
+        use carrick_el1_abi::ipc::{IpcBacking, fd};
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let description = Arc::new(FileDescription::regular(ids.file_description_id().unwrap()));
+        description.retain_fd_ref();
+        let first = description
+            .ipc_description(&owner)
+            .expect("host descriptor admission");
+        let second = description.ipc_description(&owner).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "aliases must share one forwarding OFD"
+        );
+        let table = crate::el1_ipc::HostTable::create(Arc::clone(&owner), 64, 4).unwrap();
+        let slot = FileSlot::new(Arc::clone(&description), carrick_abi::LINUX_FD_CLOEXEC);
+        table.replace_slot(fd::Fd(0), &slot).unwrap();
+        table.replace(fd::Fd(1), &second, false).unwrap();
+        let region = owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        assert_eq!(authority.getfd(table.id(), fd::Fd(0)), Ok(true));
+        let foreign = Arc::new(crate::el1_ipc::HostIpc::new(16384).unwrap());
+        assert!(
+            description.ipc_description(&foreign).is_err(),
+            "a description must not acquire a second kernel's forwarding identity"
+        );
+        assert!(matches!(
+            IpcBacking::decode(authority.get(table.id(), fd::Fd(0)).unwrap().backing),
+            Some(IpcBacking::Host(_))
+        ));
+        let (pin, _) = authority.pin(table.id(), fd::Fd(0)).unwrap();
+        assert_eq!(authority.holds(&pin).unwrap(), (2, 2));
+        table.close(fd::Fd(0)).unwrap();
+        table.close(fd::Fd(1)).unwrap();
+        description.release_fd_ref();
+        assert_eq!(
+            authority.holds(&pin).unwrap(),
+            (0, 1),
+            "retained description and flag observations must not keep the host pin alive"
+        );
+        assert!(
+            description.ipc_description(&owner).is_err(),
+            "no resurrection after final close"
+        );
+        let released = authority.unpin(pin).unwrap().unwrap();
+        owner.release(released.backing).unwrap();
+        assert!(
+            owner.release(released.backing).is_err(),
+            "routing token is retired exactly once"
         );
     }
 

@@ -58,6 +58,35 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn serial_host_el1_ipc_production_eventfd_table_shares_data_with_guest_view() {
+        use carrick_el1_abi::ipc::{fd, IpcBacking};
+        use carrick_el1_abi::ipc_tables::IpcTableMap;
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let owner = context.kernel().ipc().unwrap();
+        // SAFETY: zero is the empty atomic map; retained for this test process.
+        let map = unsafe { &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<IpcTableMap>()).cast::<IpcTableMap>() };
+        let files = context.resources().files();
+        files.publish_ipc(Arc::clone(&owner), map).unwrap();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
+        let reporter = CompatReporter::default();
+        let create = dispatcher.dispatch(&context, SyscallRequest::new(19, SyscallArgs([7, 0, 0, 0, 0, 0])), &mut memory, &reporter).unwrap();
+        let DispatchOutcome::Returned { value: number } = create else { panic!("eventfd creation: {create:?}"); };
+        let table = fd::TableId::from_raw(map.lookup(files.id().raw()).unwrap());
+        let region = owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let description = authority.get(table, fd::Fd(number as i32)).unwrap();
+        let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(description.backing) else { panic!("production eventfd must route to its shared object"); };
+        assert_eq!(region.lock(object, &crate::el1_zone::HostLockWait).unwrap().eventfd().unwrap().try_read().result, Ok(7));
+        memory.write_bytes(0x4000, &9u64.to_ne_bytes()).unwrap();
+        assert_eq!(dispatcher.dispatch(&context, SyscallRequest::new(64, SyscallArgs([number as u64, 0x4000, 8, 0, 0, 0])), &mut memory, &reporter).unwrap(), DispatchOutcome::Returned { value: 8 });
+        assert_eq!(region.lock(object, &crate::el1_zone::HostLockWait).unwrap().eventfd().unwrap().try_read().result, Ok(9));
+        assert_eq!(dispatcher.dispatch(&context, SyscallRequest::new(57, SyscallArgs([number as u64, 0, 0, 0, 0, 0])), &mut memory, &reporter).unwrap(), DispatchOutcome::Returned { value: 0 });
+        assert_eq!(authority.get(table, fd::Fd(number as i32)), Err(fd::Error::BadFd));
+        assert!(region.lock(object, &crate::el1_zone::HostLockWait).is_err());
+    }
+
+    #[test]
     fn serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity() {
         blocking_eventfd_owned_write(false, false);
     }
@@ -4218,11 +4247,12 @@ mod overlay_dispatch_tests {
             .set_status_flags(carrick_abi::LINUX_O_NONBLOCK);
         assert_eq!(
             description.common().status_flags(),
-            carrick_abi::LINUX_O_NONBLOCK
+            carrick_abi::LINUX_O_RDWR | carrick_abi::LINUX_O_NONBLOCK
         );
 
         description.common().set_status_flags(0);
-        assert_eq!(description.common().status_flags(), 0);
+        // F_SETFL changes mutable flags, never the eventfd access mode.
+        assert_eq!(description.common().status_flags(), carrick_abi::LINUX_O_RDWR);
     }
 
     #[test]

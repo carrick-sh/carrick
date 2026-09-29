@@ -772,6 +772,7 @@ fn run_address_space_with_hvf_and_dispatcher(
         let boot_context = dispatcher.capture_one_task_context().map_err(|error| {
             RuntimeError::Configuration(format!("capture boot identity Kernel context: {error}"))
         })?;
+        carrick_kernel::kernel::continuation::ipc::publish_file_table(&boot_context);
         let _ = stamp_identity_page(&mut trap, &dispatcher, &boot_context);
         drop(boot_context);
         let mut completion = run_threaded_hvf_loop(trap, dispatcher, max_traps, &carrier);

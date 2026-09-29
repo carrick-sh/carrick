@@ -725,7 +725,8 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
         IpcMmKey(zone_mm.unwrap_or(0)),
         engine,
         None,
-        &host_ipc::ZoneHostWake,
+        &host_ipc::ZoneHostServices::new(context.kernel())
+            .map_err(|error| ipc_error("IPC owner", error))?,
     )
     .map_err(|error| ipc_error("handback completion", error))?;
     ipc_route(&kernel.dispatcher, context, tid, outcome, snapshots)
@@ -884,7 +885,8 @@ where
             IpcMmKey(self.state.zone_mm.unwrap_or(0)),
             engine,
             None,
-            &host_ipc::ZoneHostWake,
+            &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
+                .map_err(|error| ipc_error("IPC owner", error))?,
         )
         .map_err(|error| ipc_error("continuation", error))?;
         let context = self
@@ -993,8 +995,14 @@ where
         };
         let mut route = match cause {
             Some(cause) => {
-                let outcome = host_ipc::interrupt(&region, token, cause, &host_ipc::ZoneHostWake)
-                    .map_err(|error| ipc_error("interrupt", error))?;
+                let outcome = host_ipc::interrupt(
+                    &region,
+                    token,
+                    cause,
+                    &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
+                        .map_err(|error| ipc_error("IPC owner", error))?,
+                )
+                .map_err(|error| ipc_error("interrupt", error))?;
                 let context = self
                     .kernel
                     .dispatcher

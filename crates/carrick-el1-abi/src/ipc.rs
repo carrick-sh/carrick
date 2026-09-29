@@ -633,6 +633,14 @@ unsafe impl Send for IpcRegion<'_> {}
 unsafe impl Sync for IpcRegion<'_> {}
 
 impl<'a> IpcRegion<'a> {
+    /// Host views of the same registered directory and pool mapping. Reject
+    /// mismatched owners before consuming an operation or releasing a host token.
+    pub fn same_mapping(&self, other: &IpcRegion<'_>) -> bool {
+        core::ptr::eq(self.dir, other.dir)
+            && self.pool == other.pool
+            && self.pool_len == other.pool_len
+    }
+
     fn checked(dir: *mut IpcDirectory, pool: *mut u8) -> Result<(), IpcError> {
         if dir.is_null()
             || !(dir as usize).is_multiple_of(core::mem::align_of::<IpcDirectory>())

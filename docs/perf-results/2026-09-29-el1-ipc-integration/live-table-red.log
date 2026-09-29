@@ -1,0 +1,22 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.90s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 1 test
+test kernel::objects::ipc::tests::serial_host_el1_ipc_file_table_publishes_mutations_and_functional_retirement ... FAILED
+
+failures:
+
+---- kernel::objects::ipc::tests::serial_host_el1_ipc_file_table_publishes_mutations_and_functional_retirement stdout ----
+
+thread 'kernel::objects::ipc::tests::serial_host_el1_ipc_file_table_publishes_mutations_and_functional_retirement' (34344198) panicked at crates/carrick-kernel/src/kernel/objects/ipc.rs:33:52:
+publish complete live FileTable: NoMemory
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    kernel::objects::ipc::tests::serial_host_el1_ipc_file_table_publishes_mutations_and_functional_retirement
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2334 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

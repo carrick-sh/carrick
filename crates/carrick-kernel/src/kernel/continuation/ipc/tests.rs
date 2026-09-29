@@ -17,6 +17,89 @@ const MM: IpcMmKey = IpcMmKey(7);
 const BUF: u64 = 0x10_0000;
 
 #[test]
+fn serial_host_el1_ipc_finish_releases_host_forwarding_token() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Released(Arc<AtomicUsize>);
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    assert!(ZoneHostServices::new(context.kernel()).is_err());
+    assert!(
+        context.kernel().existing_ipc().is_none(),
+        "owner lookup must not allocate"
+    );
+    let owner = context.kernel().ipc().unwrap();
+    let released = Arc::new(AtomicUsize::new(0));
+    let backing = owner
+        .retain_host_resource(Box::new(Released(Arc::clone(&released))))
+        .unwrap();
+    let region = owner.region();
+    let pin = region
+        .fd(HostIpcWait)
+        .create_pinned(Description::new(
+            IpcBacking::Host(backing).encode(),
+            AccessMode::ReadWrite,
+            StatusFlags::default(),
+        ))
+        .unwrap();
+    let token = region
+        .begin_operation(IpcOperation {
+            pin: pin.into_raw(),
+            ..IpcOperation::EMPTY
+        })
+        .unwrap();
+    let raw = token.into_raw();
+    let foreign_dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let foreign_context = foreign_dispatcher.capture_one_task_context().unwrap();
+    let foreign_owner = foreign_context.kernel().ipc().unwrap();
+    let foreign_released = Arc::new(AtomicUsize::new(0));
+    let foreign_backing = foreign_owner
+        .retain_host_resource(Box::new(Released(Arc::clone(&foreign_released))))
+        .unwrap();
+    assert_eq!(
+        backing.get(),
+        foreign_backing.get(),
+        "control uses colliding kernel-local token numbers"
+    );
+    assert!(matches!(
+        finish(
+            &region,
+            IpcOpToken::from_raw(raw),
+            &ZoneHostServices::for_dispatcher(&foreign_dispatcher).unwrap()
+        ),
+        Err(IpcError::BadRegion)
+    ));
+    assert!(
+        region.operation(&IpcOpToken::from_raw(raw)).is_ok(),
+        "foreign owner must not consume the operation"
+    );
+    let service = ZoneHostServices::for_dispatcher(&dispatcher).unwrap();
+    finish(&region, IpcOpToken::from_raw(raw), &service).unwrap();
+    assert_eq!(
+        released.load(Ordering::Relaxed),
+        1,
+        "final handback must retire its host token"
+    );
+    assert!(matches!(
+        finish(&region, IpcOpToken::from_raw(raw), &service),
+        Err(IpcError::Stale)
+    ));
+    assert_eq!(released.load(Ordering::Relaxed), 1);
+    assert_eq!(foreign_released.load(Ordering::Relaxed), 0);
+    foreign_owner
+        .release(IpcBacking::Host(foreign_backing).encode())
+        .unwrap();
+    assert_eq!(foreign_released.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn serial_host_el1_ipc_runtime_backing_retains_the_kernel_authority() {
     let dispatcher = crate::dispatch::SyscallDispatcher::new();
     let context = dispatcher.capture_one_task_context().unwrap();
@@ -54,7 +137,16 @@ struct World {
 
 #[derive(Default)]
 struct Wakes(RefCell<Vec<(IpcObjectHandle, WakeSet)>>);
-impl IpcHostWake for Wakes {
+impl IpcHostServices for Wakes {
+    fn validate_region(&self, _region: &IpcRegion<'_>) -> Result<(), IpcError> {
+        Ok(())
+    }
+    fn release_host(
+        &self,
+        _token: carrick_el1_abi::ipc::HostResourceToken,
+    ) -> Result<(), IpcError> {
+        Err(IpcError::Corrupt)
+    }
     fn wake(&self, object: IpcObjectHandle, lanes: WakeSet) {
         self.0.borrow_mut().push((object, lanes));
     }
