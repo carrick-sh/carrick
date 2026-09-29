@@ -1081,6 +1081,64 @@ impl<'a> IpcObjectGuard<'a> {
         let (state, bytes, slots) = self.pipe_parts()?;
         Pipe::attach(&mut state.pipe, bytes, slots).map_err(|_| IpcError::Corrupt)
     }
+
+    /// Replace a live pipe's storage with an independently owned pool extent.
+    /// The host provisions it before locking; on success `replacement` receives
+    /// the old extent for reclamation after unlocking. The capacity is unchanged
+    /// until the caller authorizes it through `Pipe::set_capacity`.
+    /// No record layout changes and no allocation occurs here.
+    pub fn replace_pipe_storage(
+        &mut self,
+        replacement: &mut IpcPipeStorage,
+    ) -> Result<(), IpcError> {
+        if self.kind() != Some(IpcObjectKind::Pipe) {
+            return Err(IpcError::WrongKind);
+        }
+        let old = self.storage();
+        let new = *replacement;
+        let footprint = new
+            .pages
+            .checked_mul(core::mem::size_of::<Page>() as u64)
+            .and_then(|n| new.ring_bytes.checked_add(n))
+            .ok_or(IpcError::BadStorage)?;
+        let end = new
+            .offset
+            .checked_add(footprint)
+            .ok_or(IpcError::BadStorage)?;
+        let old_end = old
+            .offset
+            .checked_add(old.footprint())
+            .ok_or(IpcError::Corrupt)?;
+        if new.ring_bytes == 0
+            || !new.ring_bytes.is_multiple_of(IPC_PIPE_PAGE_SIZE as u64)
+            || (new.offset < old_end && old.offset < end)
+        {
+            return Err(IpcError::BadStorage);
+        }
+        let base = self
+            .region
+            .pool_range(new.offset, footprint, IPC_POOL_ALIGN)
+            .ok_or(IpcError::BadStorage)?;
+        // SAFETY: checked pool bounds, page alignment and disjointness from
+        // this object's live extent. As for creation, the host allocator owns
+        // the supplied extent exclusively and never assigns it to two objects.
+        let (new_bytes, new_slots) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(base, new.ring_bytes as usize),
+                core::slice::from_raw_parts_mut(
+                    base.add(new.ring_bytes as usize).cast::<Page>(),
+                    new.pages as usize,
+                ),
+            )
+        };
+        self.pipe()?
+            .replace_storage(new_bytes, new_slots)
+            .map_err(IpcError::Object)?;
+        // Already authenticated above. Publish only after the complete copy.
+        self.set_storage(new)?;
+        *replacement = old;
+        Ok(())
+    }
     /// The eventfd counter, in place.
     pub fn eventfd(&mut self) -> Result<&mut EventFd, IpcError> {
         if self.kind() != Some(IpcObjectKind::EventFd) {
