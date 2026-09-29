@@ -221,7 +221,7 @@ fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
 fn el1_ipc_layout_is_frozen_and_fits_one_metadata_extent() {
     assert_ne!(IPC_LAYOUT_HASH, 0);
     assert_eq!(core::mem::size_of::<IpcObjectRecord>() % 64, 0);
-    assert_eq!(core::mem::size_of::<IpcOperation>(), 128);
+    assert_eq!(core::mem::size_of::<IpcOperation>(), 88);
     assert_eq!(core::mem::size_of::<IpcPipeStorage>(), 24);
     assert!(
         core::mem::size_of::<IpcDirectory>() <= crate::EL1_DYNAMIC_METADATA_EXTENT_SIZE,
@@ -713,5 +713,52 @@ fn el1_ipc_steady_state_transfers_scale_linearly_without_allocation() {
         let (bytes2, allocs2) = pairs_steady_state(&fx, pairs, 32);
         assert_eq!(bytes2, 2 * bytes);
         assert_eq!(allocs2, 0);
+    }
+}
+
+#[test]
+fn el1_ipc_operation_tokens_own_their_record_and_reject_stale_copies() {
+    let fx = fixture(1 << 20);
+    let t = fx.table();
+    let (r, _w, object) = fx.pipe(t);
+    let (pin, _) = fx.el1().pin(t, r).unwrap();
+    let mut op = IpcOperation::EMPTY;
+    op.kind = IpcOpKind::PipeRead;
+    op.object = object.to_raw();
+    op.progress = WriteProgress::new(10);
+    op.pin = pin.into_raw();
+    let token = fx.region.begin_operation(op).unwrap();
+    // Parked: the scheduler keeps only the raw token.
+    let raw = token.into_raw();
+    let token = IpcOpToken::from_raw(raw);
+    let mut current = fx.region.operation(&token).unwrap();
+    current.progress.written = 4;
+    fx.region.update_operation(&token, current).unwrap();
+    let done = fx.region.finish_operation(token).unwrap();
+    assert_eq!(done.progress.written, 4);
+    assert_eq!(fx.el1().unpin(OfdPin::from_raw(done.pin)), Ok(None));
+    // A copied raw token is not a second owner.
+    let stale = IpcOpToken::from_raw(raw);
+    assert_eq!(fx.region.operation(&stale), Err(IpcError::Stale));
+    assert_eq!(fx.region.finish_operation(stale), Err(IpcError::Stale));
+    let reused = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+    assert_eq!(
+        fx.region.operation(&IpcOpToken::from_raw(raw)),
+        Err(IpcError::Stale),
+        "a reused record never answers to the old generation"
+    );
+    assert_eq!(reused.into_raw().index, raw.index);
+    // Exhaustion refuses before effects.
+    let mut held = Vec::new();
+    while let Ok(t) = fx.region.begin_operation(IpcOperation::EMPTY) {
+        held.push(t);
+    }
+    assert_eq!(held.len(), IPC_OPERATIONS - 1);
+    assert_eq!(
+        fx.region.begin_operation(IpcOperation::EMPTY),
+        Err(IpcError::NoOperations)
+    );
+    for t in held {
+        fx.region.finish_operation(t).unwrap();
     }
 }
