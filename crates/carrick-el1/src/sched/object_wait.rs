@@ -5,11 +5,15 @@
 //! Re-entering resumes that owned operation, including its byte progress. It
 //! must never replay the operation from its original numeric descriptor.
 
-use super::*;
+use crate::substrate::sched::{
+    EL1_ZONE_LOCK_SPINS, Sched, Served, ThreadCpu, UserWord, identity_of,
+};
+use carrick_el1_abi::{SlotId, TrapFrame};
 use carrick_sched_core::object_wait::{
     ObjectWaitError, ObjectWaitKey, ObjectWaitSnapshot, ObjectWakeReport, OperationToken,
 };
-use carrick_sched_core::{Claim, RecordId};
+use carrick_sched_core::{BoundedSpin, Claim, RecordId, WakeEffects, ZoneTables};
+use core::sync::atomic::Ordering;
 
 /// Adapter-selected guest re-entry PC, distinct from a syscall return value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,13 +31,13 @@ impl OperationResumePc {
 
 /// A published park. Consuming this ticket switches only after all object
 /// and queue guards have been released by the caller.
-#[derive(Debug)]
 #[must_use = "a published park must be followed by scheduling another thread"]
-pub struct ObjectParked {
+pub struct ObjectParked<'a> {
+    zone: &'a ZoneTables,
     slot: SlotId,
 }
 
-impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
+impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     /// Snapshot before checking the object predicate. The object authority
     /// retains its endpoint pin throughout check, enrollment and resumption.
     pub fn observe_object(
@@ -56,7 +60,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         snapshot: ObjectWaitSnapshot,
         resume: OperationResumePc,
         operation: OperationToken,
-    ) -> Result<ObjectParked, (ObjectWaitError, OperationToken)> {
+    ) -> Result<ObjectParked<'a>, (ObjectWaitError, OperationToken)> {
         let zone = self.zone;
         let guard = match zone.object_wait(key, &BoundedSpin(EL1_ZONE_LOCK_SPINS)) {
             Ok(guard) => guard,
@@ -83,7 +87,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         drop(guard);
         zone.clear_current(self.slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
-        Ok(ObjectParked { slot: self.slot })
+        Ok(ObjectParked {
+            zone,
+            slot: self.slot,
+        })
     }
 
     /// All caller locks must be released before consuming the park ticket.
@@ -91,10 +98,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     pub fn resume_after_object_park(
         &mut self,
         frame: &mut TrapFrame,
-        parked: ObjectParked,
+        parked: ObjectParked<'_>,
         timeout_result: u64,
     ) -> Option<Served> {
-        if parked.slot != self.slot {
+        if parked.slot != self.slot || !core::ptr::eq(parked.zone, self.zone) {
             return None;
         }
         Some(self.run_next(frame, timeout_result))
@@ -103,19 +110,21 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Called at the adapter's re-entry before looking up its numeric fd.
     /// The exact identity and MM were installed by `load`, then authenticated
     /// here before ownership is transferred out of the record.
-    pub fn take_object_operation(&self) -> Option<OperationToken> {
-        let record: RecordId = self.zone.slot(self.slot).current()?;
+    pub fn take_object_operation(&self) -> Result<Option<OperationToken>, ObjectWaitError> {
+        let Some(record): Option<RecordId> = self.zone.slot(self.slot).current() else {
+            return Ok(None);
+        };
         let rec = self.zone.record(record);
         let id = rec.identity();
         if !matches!(rec.claim(), Claim::OnCpu { slot, .. } if slot == self.slot)
             || id != identity_of(self.task, id.affinity)
             || self.zone.installed_space(self.slot) != id.mm
         {
-            return None;
+            return Err(ObjectWaitError::Stale);
         }
         // SAFETY: this slot owns the OnCpu record, load restored its exact
         // MM/task, and the waker detached its registration before queueing.
-        unsafe { rec.take_object_operation() }
+        Ok(unsafe { rec.take_object_operation() })
     }
 
     /// Notify under the caller's object lock, then drop ALL locks before

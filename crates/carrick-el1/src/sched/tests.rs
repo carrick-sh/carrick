@@ -1245,8 +1245,18 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     assert_eq!(frame.elr, b_ctx.pc);
     assert_eq!(sched.cpu.ttbr, (TTBR_OTHER, TTBR_OTHER));
     assert_eq!(task.zone_mm.load(Ordering::Acquire), OTHER_MM);
-    assert_eq!(sched.take_object_operation(), OperationToken::new(202, 4));
-    assert_eq!(sched.take_object_operation(), None);
+    task.zone_mm.store(MM, Ordering::Release);
+    assert_eq!(
+        sched.take_object_operation(),
+        Err(carrick_sched_core::object_wait::ObjectWaitError::Stale)
+    );
+    assert!(zone.record(b).has_object_operation());
+    task.zone_mm.store(OTHER_MM, Ordering::Release);
+    assert_eq!(
+        sched.take_object_operation().unwrap(),
+        OperationToken::new(202, 4)
+    );
+    assert_eq!(sched.take_object_operation().unwrap(), None);
     let (report, effects) = sched.notify_object(key_a).unwrap();
     assert_eq!(report.queued, 1);
     sched.finish_object_wake(effects);
@@ -1268,7 +1278,10 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     assert_eq!(frame.elr, 0x9000);
     assert_eq!(sched.cpu.ttbr, (TTBR_MM, TTBR_MM));
     assert_eq!(task.task_id.load(Ordering::Acquire), 101);
-    assert_eq!(sched.take_object_operation(), OperationToken::new(101, 4));
+    assert_eq!(
+        sched.take_object_operation().unwrap(),
+        OperationToken::new(101, 4)
+    );
     assert_eq!(
         zone.counters
             .host_service_placements

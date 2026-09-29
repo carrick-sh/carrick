@@ -482,7 +482,17 @@ impl ZoneRecord {
     pub fn needs_host(&self) -> bool {
         self.handback() == Some(Handback::Service)
             || self.host_wanted()
-            || (self.is_cancelled() && self.has_object_operation())
+            || (self.has_object_operation()
+                && (self.is_cancelled()
+                    || matches!(
+                        self.handback(),
+                        Some(
+                            Handback::Signal
+                                | Handback::Control
+                                | Handback::Cancelled
+                                | Handback::Timeout
+                        )
+                    )))
     }
 
     /// The host asked for the thread back while EL1 held its record.
