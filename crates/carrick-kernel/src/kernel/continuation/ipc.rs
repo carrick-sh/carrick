@@ -22,23 +22,12 @@ use carrick_el1::substrate::ipc::{PrefixCopy, StepStatus, transfer};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
     IpcError, IpcHandback, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
-    IpcRegion, IpcReleased, LockWait, OfdPin, RawIpcOpToken,
+    IpcRegion, IpcReleased, OfdPin, RawIpcOpToken,
 };
 
 /// The host waits for the short sections other parties hold object and
-/// descriptor-table locks for.
-pub struct HostIpcWait;
-
-impl LockWait for HostIpcWait {
-    fn wait(&self, attempt: u32) -> bool {
-        if attempt < 128 {
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
-        }
-        true
-    }
-}
+/// descriptor-table locks for (the zone's host lock policy).
+pub use crate::el1_zone::HostLockWait as HostIpcWait;
 
 /// How the host wakes an object's waiters after a state change it made (the
 /// guest venue notifies under the object lock; the host uses its own
