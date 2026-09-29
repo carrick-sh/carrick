@@ -16,6 +16,9 @@
 
 #![no_std]
 
+mod reservations;
+pub use reservations::*;
+
 use core::cell::UnsafeCell;
 
 /// Guest VA/IPA base of the 64 MiB EL1 kernel region.
