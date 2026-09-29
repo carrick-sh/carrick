@@ -1,5 +1,5 @@
 //! Linux syscall dispatch and completion mapping.
-use super::{file, inotify, sched};
+use super::{file, inotify, ipc, sched};
 use crate::fault::dispatch_fault;
 #[cfg(target_os = "none")]
 use crate::memory;
@@ -41,7 +41,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         };
         let name_cache = unsafe { &*(EL1_NAME_CACHE_BASE as *const InotifyNameCache) };
         let zone = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
-        dispatch_syscall_with_regions(
+        dispatch_syscall_with_ipc(
             frame,
             counters,
             current_tasks,
@@ -55,6 +55,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 cpu: &mut sched::HardwareCpu,
                 user: &sched::HardwareUserWord,
             }),
+            ipc::guest_venue().as_ref(),
             |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
         )
     }
@@ -167,6 +168,42 @@ where
     C: sched::ThreadCpu,
     U: sched::UserWord,
 {
+    dispatch_syscall_with_ipc(
+        frame,
+        counters,
+        current_tasks,
+        fd_map,
+        object_table,
+        open_table,
+        inotify_table,
+        name_cache,
+        zone,
+        None,
+        cache_lookup,
+    )
+}
+
+/// [`dispatch_syscall_with_regions`] with the shared IPC authority, when
+/// this venue has one: read/write on pipes and eventfds are served in EL1.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_syscall_with_ipc<F, C, U>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    fd_map: &[FdMapSlot],
+    object_table: &[DelegatedFile],
+    open_table: &[DelegatedOpenFile],
+    inotify_table: &[DelegatedInotify],
+    name_cache: &InotifyNameCache,
+    mut zone: Option<Zone<'_, C, U>>,
+    ipc: Option<&ipc::IpcVenue<'_>>,
+    cache_lookup: F,
+) -> Action
+where
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+{
     let slot = frame.slot as usize;
     let cur_task = current_tasks.get(slot);
     let nr = frame.x[8] as usize;
@@ -224,6 +261,49 @@ where
                     task.served_with_work.store(1, Ordering::Release);
                     return Action::ServedWithWork;
                 }
+            }
+        }
+    }
+
+    // Pipe and eventfd read/write on the shared IPC objects, served (and
+    // blocked) in EL1; host-backed descriptions fall through unchanged.
+    if matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE)
+        && let (Some(venue), Some(zone), Some(task), Some(zslot)) =
+            (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
+    {
+        let orig_x0 = frame.x[0];
+        let mut sched = sched::Sched {
+            zone: zone.tables,
+            slot: zslot,
+            task,
+            cpu: &mut *zone.cpu,
+            user: zone.user,
+            counters,
+        };
+        let mut user = file::ValidatedCopy {
+            task,
+            validator: &file::HardwareValidator,
+        };
+        match ipc::serve_ipc(&mut sched, frame, venue, &mut user) {
+            ipc::IpcServed::Forward => {}
+            ipc::IpcServed::Returned { switched } => {
+                counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                if !switched {
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                }
+                if task.has_pending_host_work() {
+                    task.served_with_work.store(1, Ordering::Release);
+                    return Action::ServedWithWork;
+                }
+                return Action::Served;
+            }
+            ipc::IpcServed::Idle => {
+                counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                return Action::Idle;
+            }
+            ipc::IpcServed::Handback => {
+                counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+                return Action::Forward;
             }
         }
     }
