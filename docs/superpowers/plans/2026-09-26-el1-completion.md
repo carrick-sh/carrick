@@ -6,9 +6,8 @@
 > status changes; the director maintains this file.
 
 **Updated:** 2026-09-29, from local Git state, source inspection and retained
-receipts. The user explicitly requested this controller refresh. This is a
-planning/documentation update, not authorization to start another implementation
-slice in this turn.
+receipts. After requesting the refresh, the user explicitly said "Set the
+goal and go." The end-to-end goal is active; execution is in task A below.
 
 **Goal:** Complete the accepted EL1 migration through the x86 ring-0 venue,
 with one authoritative owner and one semantic implementation per object,
@@ -38,9 +37,11 @@ status/order statements where explicitly corrected below.
 At refresh, the implementation baseline on local `main` and local
 remote-tracking `origin/main` is `a70b40466`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
-Batch 3 is on `integ/batch3`
-at `11e8c6a29`, unlanded. All twelve active batch/memory/IPC/sigsuspend
-worktrees inventoried below were clean at inspection.
+Batch 3 is on `integ/batch3`, unlanded. Its current implementation correction
+is `3981c0366`; the signed scheduler regression source is `0542e2d2f`
+(subsequent receipt-only commits may follow). All twelve active
+batch/memory/IPC/sigsuspend worktrees inventoried below were clean at the
+initial refresh inspection; only batch 3 has been advanced in this goal.
 
 Evidence labels:
 - **Source-confirmed:** code or Git ancestry inspected on the named revision;
@@ -87,7 +88,7 @@ do not overwrite it with that branch's pre-refresh controller.
 
 | Worktree / branch | Head | Disposition |
 |---|---|---|
-| `wt-batch3` / `integ/batch3` | `11e8c6a29` | Current blocker owner; review original slot-liveness/pgrp/ICMP changes and notification fix together |
+| `wt-batch3` / `integ/batch3` | `0542e2d2f` signed source | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
 | `wt-cp2-descr` / `work/cp2-el1-descriptor-owner` | `c555f5dd1` | Review candidate; 9 signed filters and first-touch slopes 0.004–0.009 are handoff claims |
 | `wt-cp2-cow` / `work/cp2-hvf-cow-adapters` | `d581dd099` | Ancestry-confirmed in descriptor branch; do not merge it a second time |
 | `wt-cp2-return` / `work/cp2-elastic-return` | `8f268dee4` | Review candidate; scoped grant/return accounting and signed green are handoff claims |
@@ -136,6 +137,14 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   zero scoped leftovers. These are receipt-confirmed, not rerun for this edit.
 - [ ] Attribute the historical `otmpfileforkexec` reaped-task wake to an exact
   producer/interleaving. The reduction is a real defect but not that attribution.
+- [x] Reduce deferred evacuation identity reuse, fix it with retained
+  RecordRefs (`3981c0366`), and preserve the red/green witness at 1/8/32
+  records. Kernel/semantics 2,459 passes, serial-host 109 passes, kernel
+  Clippy and `just lint-domains` passed. The authority census is the macOS
+  subset (595 unchanged rows); non-macOS profiles remain pending. All 14
+  signed `el1_sched` tests at `0542e2d2f` passed, with negative entitlement
+  control and zero scoped leftovers. This is regression evidence; signed
+  deterministic interleaving and WorkObservation bindings remain open.
 - [ ] Reduce Python's `SnapshotRestoreFailed`: record 1/incarnation 35925 was
   `Parked { seq: 17965 }` during host materialization; subsequent MM cleanup
   aborted. Compare against main before calling it a batch regression.
@@ -153,8 +162,9 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
 
 Receipt on branch `integ/batch3`:
 `docs/perf-results/2026-09-29-el1-batch3-resume/README.md` and its raw artifacts
-(commit `11e8c6a29`). Read it in `wt-batch3`; it is not on main yet. One quiet
-Python pass and 100 passing probe diagnostics do not erase the original reds.
+(initial receipt commit `11e8c6a29`, extended by the deferred-handback
+receipts). Read it in `wt-batch3`; it is not on main yet. Quiet Python passes
+and 100 passing probe diagnostics do not erase the original reds.
 
 ### B. Integrate reviewed memory foundations
 
