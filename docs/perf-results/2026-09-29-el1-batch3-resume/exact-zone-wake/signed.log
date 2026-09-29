@@ -1,0 +1,387 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-interceptor-probe: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/embed-fixtures/interceptor-probe-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-zone-readers: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/embed-fixtures/zone-readers-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-el1-sched: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/embed-fixtures/el1-sched-aarch64
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 20s
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/host_wait_policy-f53fc18f775ffe51.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/host_wait_policy-f53fc18f775ffe51
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/write_seek_contract-655aefdea1874a90.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/write_seek_contract-655aefdea1874a90
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/entitlement_negative-2ea3128a996608c8.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/entitlement_negative-2ea3128a996608c8
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_gic-16f015d9c1504abe.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_gic-16f015d9c1504abe
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/wedge_capture_ladder-901bc0106cd0e8dd.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/wedge_capture_ladder-901bc0106cd0e8dd
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/realtime_calibration-17c355e0310708c2.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/realtime_calibration-17c355e0310708c2
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/perf_regression-28b7174fbae1d3a3.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/perf_regression-28b7174fbae1d3a3
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-5c0e433fa1c09ea5.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-5c0e433fa1c09ea5
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/conformance_contracts-7718e7bd813cbef7.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/conformance_contracts-7718e7bd813cbef7
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/inotify_hotpath_contract-b6e66637595bd8ed.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/inotify_hotpath_contract-b6e66637595bd8ed
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify-bce76854a0c94a41.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify-bce76854a0c94a41
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/shared_buffer_futex-692fbc5fdd19b57b.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/shared_buffer_futex-692fbc5fdd19b57b
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_files-1e6a92366579cf6c.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_files-1e6a92366579cf6c
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/two_process_parallelism-4f3c6fc63376028d.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/two_process_parallelism-4f3c6fc63376028d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_vcpu_lifetime-2567fb3a3dc40a15.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_vcpu_lifetime-2567fb3a3dc40a15
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/fault_budget_guest-d7108058cd078309.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/fault_budget_guest-d7108058cd078309
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/crash_parked_thread-ac4b8d7e5234f849.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/crash_parked_thread-ac4b8d7e5234f849
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify09_probe-e2247aca698e3431.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify09_probe-e2247aca698e3431
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/kernel_abort-d1ac0df7510c64fb.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/kernel_abort-d1ac0df7510c64fb
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_kick_served_loop-515d037f012f44fb.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_kick_served_loop-515d037f012f44fb
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_transparent-9f1543913016aba2.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_transparent-9f1543913016aba2
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/carrick_embed-46b7704b908cc13f.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/carrick_embed-46b7704b908cc13f
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/scheduler_race-6158a0c72347df12.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/scheduler_race-6158a0c72347df12
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/scheduler_preemption-a848ab6a40a27c3a.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/scheduler_preemption-a848ab6a40a27c3a
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/discard_fork_threads-ede4836bafd3d408.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/discard_fork_threads-ede4836bafd3d408
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/pt_pause_drain_pressure-8c901bf0cbbb2367.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/pt_pause_drain_pressure-8c901bf0cbbb2367
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/guest_smoke-42224af0716988ce.tmp.69046: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/guest_smoke-42224af0716988ce
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_gic-16f015d9c1504abe el1_ --nocapture
+
+running 2 tests
+test el1_gic_el0_id_view_hides_the_gic ... el1-gic-id-view id_aa64pfr0_gic=0 CarrierGicSnapshot { gic: true, generation: 1, vcpus: 12, capacity: 256 }
+ok
+test el1_gic_vtimer_reaches_el1_without_host_exits ... el1-gic-vtimer VtimerProbeReport { armed: true, delivered: true, vcpu: 0, host_initiated_exits: 0, other_exits: 0 } vtimer_taken=1 kick_sgis_taken=0 lseek served=2001000 forwarded=0
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-5c0e433fa1c09ea5 el1_ --nocapture
+
+running 22 tests
+test el1_anonymous_mapping_retirement_returns_and_reuses_frames ... el1-sched mapping-retirement pages=256 rounds=4 exits=49 served_munmap=5 forwarded_munmap=1 grants=6 returns=6 reused=3 bytes_granted=4308992 bytes_returned=4308992 mapping-retirement pages=256 rounds=4 base=0x6000005000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement pages=1024 rounds=4 exits=69 served_munmap=5 forwarded_munmap=1 grants=14 returns=14 reused=9 bytes_granted=16891904 bytes_returned=16891904 mapping-retirement pages=1024 rounds=4 base=0x6000005000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement pages=4096 rounds=4 exits=117 served_munmap=5 forwarded_munmap=1 grants=38 returns=38 reused=27 bytes_granted=67223552 bytes_returned=67223552 mapping-retirement pages=4096 rounds=4 base=0x6000005000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement slope 256->1024 pages rounds=4: exits_diff=20 slope=0.0065 exits/page/round
+el1-sched mapping-retirement slope 1024->4096 pages rounds=4: exits_diff=48 slope=0.0039 exits/page/round
+ok
+test el1_anonymous_permission_transitions_stay_in_guest ... el1-sched permission-transitions pages=256 rounds=4 exits=59 served_mprotect=16 forwarded_mprotect=1 faults=267 grants=3 returns=3 bytes_granted=1114112 bytes_returned=1114112 permission-transitions pages=256 rounds=4 write_faults=4 read_faults=4 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions pages=1024 rounds=4 exits=62 served_mprotect=16 forwarded_mprotect=1 faults=1037 grants=5 returns=5 bytes_granted=4276224 bytes_returned=4276224 permission-transitions pages=1024 rounds=4 write_faults=4 read_faults=4 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions pages=4096 rounds=4 exits=74 served_mprotect=16 forwarded_mprotect=1 faults=4115 grants=11 returns=11 bytes_granted=16875520 bytes_returned=16875520 permission-transitions pages=4096 rounds=4 write_faults=4 read_faults=4 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions pages=256 rounds=2 exits=48 served_mprotect=8 forwarded_mprotect=1 faults=263 grants=3 returns=3 bytes_granted=1114112 bytes_returned=1114112 permission-transitions pages=256 rounds=2 write_faults=2 read_faults=2 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions pages=256 rounds=18 exits=112 served_mprotect=72 forwarded_mprotect=1 faults=295 grants=3 returns=3 bytes_granted=1114112 bytes_returned=1114112 permission-transitions pages=256 rounds=18 write_faults=18 read_faults=18 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions page-slope 256->1024 rounds=4: exits_diff=3 slope=0.0010 exits/page/round
+el1-sched permission-transitions page-slope 1024->4096 rounds=4: exits_diff=12 slope=0.0010 exits/page/round
+el1-sched permission-transitions round-slope pages=256 2->18: exits_diff=64 slope=4.0000 exits/round
+ok
+test el1_fork_cow_resolves_in_guest ... ok
+test el1_memory_fault_entry_preserves_context ... ok
+test el1_memory_first_touch_stays_in_guest ... el1-sched first-touch pages=256 exits=109 carrier_cpu_ns=9983000 wall_ms=8 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 10, wfi_entries: 8, idle_exits: 4, misplaced: 0, steals: 1, service_exits: 2, service_placements: 5, ready_placements: 0, service_adoptions: 5, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=256 ok=true
+first-touch parent pages=256 child_ok=true ok=true
+el1-sched first-touch pages=1024 exits=114 carrier_cpu_ns=14291000 wall_ms=12 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4, wfi_entries: 3, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=1024 ok=true
+first-touch parent pages=1024 child_ok=true ok=true
+el1-sched first-touch pages=4096 exits=147 carrier_cpu_ns=34748000 wall_ms=22 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 8, wfi_entries: 5, idle_exits: 5, misplaced: 0, steals: 2, service_exits: 3, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=4096 ok=true
+first-touch parent pages=4096 child_ok=true ok=true
+el1-sched first-touch slope 256->1024 pages (added=1536): exits_diff=5 slope=0.0033 exits/page
+el1-sched first-touch slope 1024->4096 pages (added=6144): exits_diff=33 slope=0.0054 exits/page
+ok
+test el1_metadata_allocator_concurrent_growth ... ok
+test el1_metadata_allocator_grows_and_returns_extents ... metadata_grant_stats after growth: MetadataGrantStats { grants_requested: 1, grants_succeeded: 1, grants_denied: 0, returns_completed: 1, bytes_granted: 11010048, bytes_returned: 11010048, inline_hvc_traps: 0 }
+metadata_grant_stats final: MetadataGrantStats { grants_requested: 3, grants_succeeded: 2, grants_denied: 1, returns_completed: 2, bytes_granted: 13631488, bytes_returned: 13631488, inline_hvc_traps: 0 }
+ok
+test el1_metadata_allocator_host_wait_requires_unmasked_irq ... ok
+test el1_sched_cross_vcpu_handoff_has_no_host_exits ... el1-sched pinned-pingpong iters=2000 work_us=5 exits=70 carrier_cpu_ns=67543000 wall_ms=40 zone=ZoneCounts { el1_parks: 4401, el1_switches: 4400, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 4399, sgis: 8, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4405, wfi_entries: 13, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 2, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=2000 work_us=5 rt_p50_ns=6458 handoff_p50_ns=729 handoff_p99_ns=4250 rt_max_ns=97208
+el1-sched pinned-pingpong iters=22000 work_us=5 exits=70 carrier_cpu_ns=506199000 wall_ms=260 zone=ZoneCounts { el1_parks: 44395, el1_switches: 44394, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 44393, sgis: 89, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 44395, wfi_entries: 90, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=22000 work_us=5 rt_p50_ns=6000 handoff_p50_ns=500 handoff_p99_ns=2521 rt_max_ns=97542
+el1-sched pinned-pingpong iters=2000 work_us=5 exits=70 carrier_cpu_ns=56814000 wall_ms=32 zone=ZoneCounts { el1_parks: 4403, el1_switches: 4402, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 4401, sgis: 8, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4403, wfi_entries: 10, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=2000 work_us=5 rt_p50_ns=6000 handoff_p50_ns=500 handoff_p99_ns=2188 rt_max_ns=60458
+el1-sched pinned-pingpong iters=22000 work_us=5 exits=70 carrier_cpu_ns=497964000 wall_ms=254 zone=ZoneCounts { el1_parks: 44402, el1_switches: 44401, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 44400, sgis: 18, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 44402, wfi_entries: 20, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=22000 work_us=5 rt_p50_ns=5958 handoff_p50_ns=479 handoff_p99_ns=688 rt_max_ns=54625
+el1-sched cross-vcpu-handoff work_us=5 exits_per_round_trip=0.0000 carrier_cpu_ns_per_round_trip=21933 handoff_p50_ns=500
+el1-sched cross-vcpu-handoff work_us=5 exits_per_round_trip=0.0000 carrier_cpu_ns_per_round_trip=22058 handoff_p50_ns=479
+el1-sched pinned-pingpong iters=300 work_us=200 exits=70 carrier_cpu_ns=235136000 wall_ms=217 zone=ZoneCounts { el1_parks: 1003, el1_switches: 1002, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1001, sgis: 1000, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 1003, wfi_entries: 1004, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=300 work_us=200 rt_p50_ns=218125 handoff_p50_ns=9062 handoff_p99_ns=19042 rt_max_ns=287167
+el1-sched pinned-pingpong iters=3300 work_us=200 exits=72 carrier_cpu_ns=1609486000 wall_ms=1477 zone=ZoneCounts { el1_parks: 7003, el1_switches: 7002, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 7001, sgis: 7000, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 7003, wfi_entries: 7002, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 1, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=3300 work_us=200 rt_p50_ns=217917 handoff_p50_ns=8958 handoff_p99_ns=17750 rt_max_ns=257542
+el1-sched pinned-pingpong iters=300 work_us=200 exits=70 carrier_cpu_ns=234820000 wall_ms=216 zone=ZoneCounts { el1_parks: 1003, el1_switches: 1002, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1001, sgis: 1000, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 1003, wfi_entries: 1004, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=300 work_us=200 rt_p50_ns=216250 handoff_p50_ns=8125 handoff_p99_ns=15479 rt_max_ns=231958
+el1-sched pinned-pingpong iters=3300 work_us=200 exits=70 carrier_cpu_ns=1605220000 wall_ms=1473 zone=ZoneCounts { el1_parks: 7003, el1_switches: 7002, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 7001, sgis: 7000, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 7003, wfi_entries: 7004, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=3300 work_us=200 rt_p50_ns=216417 handoff_p50_ns=8208 handoff_p99_ns=18146 rt_max_ns=278333
+el1-sched cross-vcpu-handoff work_us=200 exits_per_round_trip=0.0007 carrier_cpu_ns_per_round_trip=458117 handoff_p50_ns=8958
+el1-sched cross-vcpu-handoff work_us=200 exits_per_round_trip=0.0000 carrier_cpu_ns_per_round_trip=456800 handoff_p50_ns=8208
+ok
+test el1_sched_exec_from_a_sibling_with_parked_threads ... el1-sched exec exec-child ok wall_ms=133 zone=ZoneCounts { el1_parks: 241483, el1_switches: 241477, host_parks: 0, signal_claims: 0, control_claims: 4, cross_wakes: 236907, sgis: 23, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 236943, wfi_entries: 24, idle_exits: 12, misplaced: 0, steals: 381, service_exits: 19, service_placements: 15, ready_placements: 2, service_adoptions: 15, exit_adoptions: 5, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exec exec-child ok wall_ms=136 zone=ZoneCounts { el1_parks: 216207, el1_switches: 216198, host_parks: 0, signal_claims: 0, control_claims: 4, cross_wakes: 212880, sgis: 13, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 212910, wfi_entries: 23, idle_exits: 15, misplaced: 0, steals: 57, service_exits: 18, service_placements: 17, ready_placements: 0, service_adoptions: 17, exit_adoptions: 4, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exec exec-child ok wall_ms=135 zone=ZoneCounts { el1_parks: 212632, el1_switches: 212623, host_parks: 0, signal_claims: 0, control_claims: 4, cross_wakes: 209250, sgis: 4, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 209284, wfi_entries: 19, idle_exits: 17, misplaced: 0, steals: 33, service_exits: 16, service_placements: 16, ready_placements: 1, service_adoptions: 16, exit_adoptions: 4, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exec exec-child ok wall_ms=136 zone=ZoneCounts { el1_parks: 230024, el1_switches: 230016, host_parks: 0, signal_claims: 0, control_claims: 3, cross_wakes: 229355, sgis: 7, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 229383, wfi_entries: 20, idle_exits: 15, misplaced: 0, steals: 14, service_exits: 14, service_placements: 16, ready_placements: 0, service_adoptions: 16, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exec exec-child ok wall_ms=135 zone=ZoneCounts { el1_parks: 219005, el1_switches: 218999, host_parks: 1, signal_claims: 0, control_claims: 4, cross_wakes: 214359, sgis: 1, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 214391, wfi_entries: 18, idle_exits: 16, misplaced: 0, steals: 116, service_exits: 14, service_placements: 15, ready_placements: 1, service_adoptions: 15, exit_adoptions: 3, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+ok
+test el1_sched_exit_group_with_parked_threads ... el1-sched exit-group exit=42 wall_ms=131 zone=ZoneCounts { el1_parks: 236662, el1_switches: 236656, host_parks: 1, signal_claims: 0, control_claims: 3, cross_wakes: 236223, sgis: 6, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 236242, wfi_entries: 15, idle_exits: 12, misplaced: 0, steals: 136, service_exits: 9, service_placements: 12, ready_placements: 0, service_adoptions: 12, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exit-group exit=42 wall_ms=129 zone=ZoneCounts { el1_parks: 243804, el1_switches: 243800, host_parks: 0, signal_claims: 0, control_claims: 3, cross_wakes: 243096, sgis: 5, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 243112, wfi_entries: 12, idle_exits: 13, misplaced: 0, steals: 84, service_exits: 6, service_placements: 11, ready_placements: 0, service_adoptions: 11, exit_adoptions: 3, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exit-group exit=42 wall_ms=131 zone=ZoneCounts { el1_parks: 227202, el1_switches: 227196, host_parks: 0, signal_claims: 0, control_claims: 2, cross_wakes: 226707, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 226729, wfi_entries: 7, idle_exits: 9, misplaced: 0, steals: 282, service_exits: 16, service_placements: 12, ready_placements: 2, service_adoptions: 12, exit_adoptions: 4, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exit-group exit=42 wall_ms=131 zone=ZoneCounts { el1_parks: 217889, el1_switches: 217886, host_parks: 0, signal_claims: 0, control_claims: 3, cross_wakes: 217233, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 217253, wfi_entries: 9, idle_exits: 13, misplaced: 0, steals: 111, service_exits: 6, service_placements: 12, ready_placements: 0, service_adoptions: 12, exit_adoptions: 2, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exit-group exit=42 wall_ms=131 zone=ZoneCounts { el1_parks: 205281, el1_switches: 205271, host_parks: 0, signal_claims: 0, control_claims: 2, cross_wakes: 205242, sgis: 13, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 205263, wfi_entries: 9, idle_exits: 9, misplaced: 0, steals: 20, service_exits: 20, service_placements: 12, ready_placements: 0, service_adoptions: 12, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 }
+ok
+test el1_sched_futex_handoff_has_no_host_exits ... el1-sched pingpong iters=5000 exits=68 host_classes=canceled:1 idle:6 kick:0 syscall:50 metadata:0 maintenance:11 fault:0 other:0 hvc_not_svc=4 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 4)],fsc:[(5, 1), (7, 3)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:5 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (93, 1), (94, 1), (96, 1), (122, 2), (132, 6), (134, 5), (135, 8), (178, 1), (215, 3), (220, 1), (226, 3)] carrier_cpu_ns=16415000 wall_ms=15 zone=ZoneCounts { el1_parks: 14001, el1_switches: 14000, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 9, wfi_entries: 4, idle_exits: 1, misplaced: 0, steals: 3, service_exits: 5, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pingpong iters=5000 p50_ns=750 mean_ns=752 max_ns=4708
+el1-sched pingpong iters=55000 exits=65 host_classes=canceled:1 idle:3 kick:0 syscall:50 metadata:0 maintenance:11 fault:0 other:0 hvc_not_svc=4 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 4)],fsc:[(5, 1), (7, 3)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:2 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (93, 1), (94, 1), (96, 1), (122, 2), (132, 6), (134, 5), (135, 8), (178, 1), (215, 3), (220, 1), (226, 3)] carrier_cpu_ns=56514000 wall_ms=56 zone=ZoneCounts { el1_parks: 114001, el1_switches: 114000, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2, wfi_entries: 1, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 2, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pingpong iters=55000 p50_ns=667 mean_ns=705 max_ns=16000
+el1-sched pingpong iters=5000 exits=65 host_classes=canceled:1 idle:3 kick:0 syscall:50 metadata:0 maintenance:11 fault:0 other:0 hvc_not_svc=4 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 4)],fsc:[(5, 1), (7, 3)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:2 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (93, 1), (94, 1), (96, 1), (122, 2), (132, 6), (134, 5), (135, 8), (178, 1), (215, 3), (220, 1), (226, 3)] carrier_cpu_ns=12545000 wall_ms=12 zone=ZoneCounts { el1_parks: 14001, el1_switches: 14000, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2, wfi_entries: 3, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 2, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pingpong iters=5000 p50_ns=667 mean_ns=656 max_ns=6375
+el1-sched pingpong iters=55000 exits=65 host_classes=canceled:1 idle:3 kick:0 syscall:50 metadata:0 maintenance:11 fault:0 other:0 hvc_not_svc=4 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 4)],fsc:[(5, 1), (7, 3)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:2 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (93, 1), (94, 1), (96, 1), (122, 2), (132, 6), (134, 5), (135, 8), (178, 1), (215, 3), (220, 1), (226, 3)] carrier_cpu_ns=54028000 wall_ms=54 zone=ZoneCounts { el1_parks: 114001, el1_switches: 114000, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2, wfi_entries: 3, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 2, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pingpong iters=55000 p50_ns=667 mean_ns=688 max_ns=12417
+el1-sched futex-handoff exits_per_round_trip=-0.0001 carrier_cpu_ns_per_round_trip=802 p50_ns=667
+el1-sched futex-handoff exits_per_round_trip=0.0000 carrier_cpu_ns_per_round_trip=830 p50_ns=667
+ok
+test el1_sched_host_blocked_read_resumes_by_guest_scheduling ... el1-sched pipe-pingpong iters=1000 exits=12618 carrier_cpu_ns=251417000 wall_ms=91 zone=ZoneCounts { el1_parks: 1, el1_switches: 1, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 3872, wfi_entries: 1468, idle_exits: 1465, misplaced: 0, steals: 1465, service_exits: 2402, service_placements: 2402, ready_placements: 0, service_adoptions: 2402, exit_adoptions: 0, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pipe-pingpong iters=1000 rt_p50_ns=62000 rt_p99_ns=88500
+el1-sched pipe-pingpong iters=6000 exits=65504 carrier_cpu_ns=1143462000 wall_ms=376 zone=ZoneCounts { el1_parks: 1, el1_switches: 1, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 20885, wfi_entries: 7230, idle_exits: 7231, misplaced: 0, steals: 8484, service_exits: 13653, service_placements: 12399, ready_placements: 0, service_adoptions: 12399, exit_adoptions: 0, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pipe-pingpong iters=6000 rt_p50_ns=58750 rt_p99_ns=85917
+el1-sched pipe-pingpong iters=1000 exits=12706 carrier_cpu_ns=226762000 wall_ms=78 zone=ZoneCounts { el1_parks: 1, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4001, wfi_entries: 1409, idle_exits: 1411, misplaced: 0, steals: 1598, service_exits: 2590, service_placements: 2400, ready_placements: 0, service_adoptions: 2400, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-pingpong iters=1000 rt_p50_ns=58833 rt_p99_ns=85250
+el1-sched pipe-pingpong iters=6000 exits=65811 carrier_cpu_ns=1149535000 wall_ms=377 zone=ZoneCounts { el1_parks: 1, el1_switches: 1, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 21131, wfi_entries: 7261, idle_exits: 7261, misplaced: 0, steals: 8731, service_exits: 13869, service_placements: 12399, ready_placements: 0, service_adoptions: 12399, exit_adoptions: 0, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pipe-pingpong iters=6000 rt_p50_ns=58958 rt_p99_ns=88833
+el1-sched host-blocked-read host_queue_claims_per_rt=0.0000 host_executor_parks_per_rt=0.0000 service_adoptions_per_rt=1.999 carrier_cpu_ns_per_rt=178409 rt_p50_ns=58750
+el1-sched host-blocked-read host_queue_claims_per_rt=0.0000 host_executor_parks_per_rt=0.0000 service_adoptions_per_rt=2.000 carrier_cpu_ns_per_rt=184555 rt_p50_ns=58958
+ok
+test el1_sched_host_woken_thread_preempts_a_compute_loop ... el1-sched pipe-compute exits=74 zone=ZoneCounts { el1_parks: 1, el1_switches: 150, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 150, migrations: 0, timeouts: 0, idle_entries: 11, wfi_entries: 8, idle_exits: 2, misplaced: 0, steals: 3, service_exits: 6, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-compute ms=300 a_count=15236626 b_count=84932741 b_first_ms=4.042
+el1-sched pipe-compute exits=71 zone=ZoneCounts { el1_parks: 1, el1_switches: 150, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 150, migrations: 0, timeouts: 0, idle_entries: 4, wfi_entries: 5, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 2, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-compute ms=300 a_count=15042813 b_count=83573014 b_first_ms=4.041
+el1-sched pipe-compute exits=71 zone=ZoneCounts { el1_parks: 1, el1_switches: 150, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 150, migrations: 0, timeouts: 0, idle_entries: 4, wfi_entries: 3, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 2, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-compute ms=300 a_count=15339929 b_count=83581748 b_first_ms=4.043
+ok
+test el1_sched_idle_carrier_costs_no_host_cpu ... el1-sched idle-carrier ms=500 exits=158 carrier_cpu_ns=20236000 wall_ms=547 zone=ZoneCounts { el1_parks: 7, el1_switches: 4, host_parks: 2, signal_claims: 0, control_claims: 0, cross_wakes: 4, sgis: 4, preemptions: 0, migrations: 0, timeouts: 1, idle_entries: 20, wfi_entries: 17, idle_exits: 8, misplaced: 0, steals: 6, service_exits: 5, service_placements: 8, ready_placements: 1, service_adoptions: 8, exit_adoptions: 3, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } idle-carrier ms=500 result=-110 elapsed_ms=510.079
+el1-sched idle-carrier ms=2500 exits=137 carrier_cpu_ns=24987000 wall_ms=2550 zone=ZoneCounts { el1_parks: 5, el1_switches: 4, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 4, sgis: 4, preemptions: 0, migrations: 0, timeouts: 1, idle_entries: 12, wfi_entries: 12, idle_exits: 6, misplaced: 0, steals: 2, service_exits: 2, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 2, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } idle-carrier ms=2500 result=-110 elapsed_ms=2510.100
+el1-sched idle-carrier ms=500 exits=139 carrier_cpu_ns=23949000 wall_ms=549 zone=ZoneCounts { el1_parks: 7, el1_switches: 5, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 5, sgis: 4, preemptions: 0, migrations: 0, timeouts: 1, idle_entries: 14, wfi_entries: 11, idle_exits: 5, misplaced: 0, steals: 3, service_exits: 4, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 2, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } idle-carrier ms=500 result=-110 elapsed_ms=507.256
+el1-sched idle-carrier ms=2500 exits=169 carrier_cpu_ns=26987000 wall_ms=2553 zone=ZoneCounts { el1_parks: 7, el1_switches: 3, host_parks: 5, signal_claims: 0, control_claims: 0, cross_wakes: 4, sgis: 4, preemptions: 0, migrations: 0, timeouts: 1, idle_entries: 24, wfi_entries: 14, idle_exits: 10, misplaced: 0, steals: 10, service_exits: 11, service_placements: 11, ready_placements: 1, service_adoptions: 11, exit_adoptions: 2, host_handbacks: 5, host_queue_claims: 0, host_executor_parks: 0 } idle-carrier ms=2500 result=-110 elapsed_ms=2510.070
+el1-sched idle-carrier cpu_fraction_of_one_core=0.00238 exits_per_idle_second=-10.5
+el1-sched idle-carrier cpu_fraction_of_one_core=0.00152 exits_per_idle_second=15.0
+ok
+test el1_sched_mm_occupancy_two_processes ... el1-sched mm-occupancy exits=128569 carrier_cpu_ns=2164130000 wall_ms=847 zone=ZoneCounts { el1_parks: 11182, el1_switches: 8548, host_parks: 1258, signal_claims: 0, control_claims: 0, cross_wakes: 4510, sgis: 28, preemptions: 106, migrations: 0, timeouts: 0, idle_entries: 7162, wfi_entries: 342, idle_exits: 352, misplaced: 0, steals: 4408, service_exits: 4755, service_placements: 7671, ready_placements: 180, service_adoptions: 7671, exit_adoptions: 4064, host_handbacks: 612, host_queue_claims: 0, host_executor_parks: 0 } mm-occupancy parent writers=8 forks=150 edits=768 edit_failures=0 edit_errors=none torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=988 edit_failures=0 edit_errors=none torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+ok
+test el1_sched_preemption_reaches_compute_loops ... el1-sched compute-pair exits=69 wall_ms=341 zone=ZoneCounts { el1_parks: 2, el1_switches: 152, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 1, preemptions: 150, migrations: 0, timeouts: 0, idle_entries: 9, wfi_entries: 7, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } compute-pair ms=300 a_count=15329750 b_count=82655540 b_first_ms=4.003
+el1-sched compute-pair exits=69 wall_ms=340 zone=ZoneCounts { el1_parks: 2, el1_switches: 152, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 1, preemptions: 150, migrations: 0, timeouts: 0, idle_entries: 5, wfi_entries: 4, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } compute-pair ms=300 a_count=15424981 b_count=83475598 b_first_ms=4.004
+el1-sched compute-pair exits=69 wall_ms=341 zone=ZoneCounts { el1_parks: 2, el1_switches: 152, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 1, preemptions: 150, migrations: 0, timeouts: 0, idle_entries: 5, wfi_entries: 6, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } compute-pair ms=300 a_count=15737042 b_count=84826931 b_first_ms=4.002
+ok
+test el1_sched_pstate_seen_by_the_guest_is_unchanged ... el1-sched pstate pstate tgkill=0/0 sync_daif=0x3c0 async_daif=0x3c0 sync_el=0 async_el=0
+ok
+test el1_sched_signal_reaches_a_parked_thread ... el1-sched signal zone=ZoneCounts { el1_parks: 4, el1_switches: 2, host_parks: 0, signal_claims: 2, control_claims: 0, cross_wakes: 1, sgis: 1, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 17, wfi_entries: 15, idle_exits: 8, misplaced: 0, steals: 3, service_exits: 4, service_placements: 8, ready_placements: 0, service_adoptions: 8, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } signal eintr_result=-4 usr1_handled=1 restart_result=-4 usr2_handled=1
+ok
+test el1_sched_signal_reaches_a_wfi_parked_vcpu ... el1-sched wfi-signal exits=3352 wall_ms=627 zone=ZoneCounts { el1_parks: 401, el1_switches: 202, host_parks: 1, signal_claims: 200, control_claims: 0, cross_wakes: 66, sgis: 66, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 879, wfi_entries: 656, idle_exits: 538, misplaced: 0, steals: 199, service_exits: 271, service_placements: 537, ready_placements: 0, service_adoptions: 537, exit_adoptions: 136, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } wfi-signal rounds=200 eintr=200 handled=200 wake_p50_us=230.2 wake_max_us=337.8
+ok
+test el1_sched_timed_wait_times_out_in_guest ... el1-sched timed-wait iters=200 exits=42 host_classes=canceled:1 idle:6 kick:0 syscall:28 metadata:0 maintenance:7 fault:0 other:0 hvc_not_svc=4 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 4)],fsc:[(5, 1), (7, 3)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:0 idle_entry_host_work:0 service:6 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (94, 1), (96, 1), (132, 3), (134, 5), (135, 1), (215, 2), (226, 1)] carrier_cpu_ns=30838000 wall_ms=320 zone=ZoneCounts { el1_parks: 200, el1_switches: 200, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 200, idle_entries: 210, wfi_entries: 403, idle_exits: 0, misplaced: 0, steals: 5, service_exits: 6, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } timed-wait iters=200 wrong=0 early=0 late_p50_ns=508542 late_p99_ns=532750 late_max_ns=539208
+el1-sched timed-wait iters=1200 exits=37 host_classes=canceled:1 idle:1 kick:0 syscall:28 metadata:0 maintenance:7 fault:0 other:0 hvc_not_svc=4 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 4)],fsc:[(5, 1), (7, 3)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:0 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (94, 1), (96, 1), (132, 3), (134, 5), (135, 1), (215, 2), (226, 1)] carrier_cpu_ns=74694000 wall_ms=1816 zone=ZoneCounts { el1_parks: 1200, el1_switches: 1200, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 1200, idle_entries: 1201, wfi_entries: 2393, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 0, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } timed-wait iters=1200 wrong=0 early=0 late_p50_ns=507500 late_p99_ns=536542 late_max_ns=613375
+el1-sched timed-wait iters=200 exits=37 host_classes=canceled:1 idle:1 kick:0 syscall:28 metadata:0 maintenance:7 fault:0 other:0 hvc_not_svc=4 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 4)],fsc:[(5, 1), (7, 3)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:0 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (94, 1), (96, 1), (132, 3), (134, 5), (135, 1), (215, 2), (226, 1)] carrier_cpu_ns=25676000 wall_ms=316 zone=ZoneCounts { el1_parks: 200, el1_switches: 200, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 200, idle_entries: 201, wfi_entries: 400, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 0, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } timed-wait iters=200 wrong=0 early=0 late_p50_ns=509042 late_p99_ns=539333 late_max_ns=546833
+el1-sched timed-wait iters=1200 exits=37 host_classes=canceled:1 idle:1 kick:0 syscall:28 metadata:0 maintenance:7 fault:0 other:0 hvc_not_svc=4 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 4)],fsc:[(5, 1), (7, 3)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:0 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (94, 1), (96, 1), (132, 3), (134, 5), (135, 1), (215, 2), (226, 1)] carrier_cpu_ns=73183000 wall_ms=1821 zone=ZoneCounts { el1_parks: 1200, el1_switches: 1200, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 1200, idle_entries: 1201, wfi_entries: 2395, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 0, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } timed-wait iters=1200 wrong=0 early=0 late_p50_ns=508167 late_p99_ns=536875 late_max_ns=694167
+el1-sched timed-wait exits_per_wait=-0.0050 late_p50_ns=507500
+el1-sched timed-wait exits_per_wait=0.0000 late_p50_ns=508167
+ok
+test el1_sched_two_processes_share_vcpus ... el1-sched two-process iters=500 exits=378 carrier_cpu_ns=36798000 wall_ms=25 zone=ZoneCounts { el1_parks: 1365, el1_switches: 1359, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1268, sgis: 178, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 1188, wfi_entries: 89, idle_exits: 4, misplaced: 3, steals: 11, service_exits: 16, service_placements: 13, ready_placements: 88, service_adoptions: 13, exit_adoptions: 38, host_handbacks: 6, host_queue_claims: 0, host_executor_parks: 0 } two-process child round_trips=500 ms=5.7
+two-process parent round_trips=500 ms=5.5 child_ok=true
+el1-sched two-process iters=3000 exits=475 carrier_cpu_ns=41613000 wall_ms=27 zone=ZoneCounts { el1_parks: 4546, el1_switches: 4543, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 4389, sgis: 259, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4243, wfi_entries: 111, idle_exits: 7, misplaced: 4, steals: 9, service_exits: 6, service_placements: 9, ready_placements: 151, service_adoptions: 9, exit_adoptions: 51, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } two-process child round_trips=3000 ms=9.8
+two-process parent round_trips=3000 ms=6.5 child_ok=true
+el1-sched two-process iters=500 exits=241 carrier_cpu_ns=23554000 wall_ms=18 zone=ZoneCounts { el1_parks: 1121, el1_switches: 1116, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1089, sgis: 62, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 1070, wfi_entries: 41, idle_exits: 10, misplaced: 2, steals: 6, service_exits: 7, service_placements: 9, ready_placements: 27, service_adoptions: 9, exit_adoptions: 13, host_handbacks: 3, host_queue_claims: 0, host_executor_parks: 0 } two-process child round_trips=500 ms=2.0
+two-process parent round_trips=500 ms=3.2 child_ok=true
+el1-sched two-process iters=3000 exits=353 carrier_cpu_ns=35991000 wall_ms=24 zone=ZoneCounts { el1_parks: 4098, el1_switches: 4095, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 4007, sgis: 161, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 3917, wfi_entries: 71, idle_exits: 9, misplaced: 4, steals: 6, service_exits: 5, service_placements: 8, ready_placements: 85, service_adoptions: 8, exit_adoptions: 31, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } two-process child round_trips=3000 ms=4.8
+two-process parent round_trips=3000 ms=8.4 child_ok=true
+el1-sched two-process exits_per_rt=0.019 cross_wakes_per_rt=0.624 service_exits_per_rt=-0.002 host_queue_claims_per_rt=0.0000 carrier_cpu_ns_per_rt=963
+el1-sched two-process exits_per_rt=0.022 cross_wakes_per_rt=0.584 service_exits_per_rt=-0.000 host_queue_claims_per_rt=0.0000 carrier_cpu_ns_per_rt=2487
+ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 26.84s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify-bce76854a0c94a41 el1_ --nocapture
+
+running 4 tests
+test el1_inotify09_contract ... ok
+test el1_inotify_contract ... el1_inotify_contract population: DelegationCounts { delegations: 28, recalls: 28, host_served: 0, tableless_publishes: 0, revalidated_records: 0, refusals: [(FileTooLarge, 3), (Unregistered, 4)], recall_triggers: [("crates/carrick-kernel/src/kernel/objects.rs:1464", 16), ("crates/carrick-kernel/src/el1_delegation.rs:1798", 12)] }
+el1_inotify_contract: add_watch served=1000, fwd=1; rm_watch served=1001, fwd=0; write served=1000; seek served=1026
+ok
+test el1_inotify_queue_shape ... ok
+test el1_inotify_recall_on_dir_watch ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.70s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_files-1e6a92366579cf6c el1_ --nocapture
+
+running 13 tests
+test el1_files_blocking_survives_task_reschedule ... ok
+test el1_files_contract ... ok
+test el1_files_cross_process_readers_contract ... ok
+test el1_files_exit_group_stress ... ok
+test el1_files_inode_exclusivity_two_processes ... ok
+test el1_files_kick_delivery_spin_loop ... ok
+test el1_files_kick_delivery_spin_loop_signal ... ok
+test el1_files_memfd_never_delegated_and_seals_hold ... ok
+test el1_files_path_mutation_contract ... ok
+test el1_files_recall_on_teardown ... ok
+test el1_files_shared_inode_contract ... ok
+test el1_files_signal_stress ... ok
+test el1_zone_entry_at_open_contract ... el1_zone_entry_at_open_contract: served pwrite64=500 lseek=2 write=0 read=1 pread64=500; forwarded lseek=2004 write=1001 read=1004; population DelegationCounts { delegations: 16, recalls: 16, host_served: 0, tableless_publishes: 0, revalidated_records: 0, refusals: [(FileTooLarge, 3), (Unregistered, 4)], recall_triggers: [("crates/carrick-kernel/src/kernel/objects.rs:1464", 15), ("crates/carrick-kernel/src/el1_delegation.rs:1798", 1)] }
+ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.46s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_vcpu_lifetime-2567fb3a3dc40a15 el1_ --nocapture
+
+running 1 test
+test el1_vcpus_live_for_the_vm_lifetime_across_a_second_root ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/crash_parked_thread-ac4b8d7e5234f849 el1_ --nocapture
+
+running 1 test
+test crash_core_attributes_the_el1_parked_sibling_registers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify09_probe-e2247aca698e3431 el1_ --nocapture
+
+running 2 tests
+test el1_inotify09_probe ... LTP| ../../../../include/tst_fuzzy_sync.h:484: TINFO: Minimum sampling period ended
+LTP| ../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1024, delay_bias = 0
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -44ns, avg_dev =     6ns, dev_ratio = 0.14 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =    86ns, avg_dev =     6ns, dev_ratio = 0.07 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =   170ns, avg_dev =     8ns, dev_ratio = 0.04 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =  -128ns, avg_dev =     7ns, dev_ratio = 0.06 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   227  , avg_dev =     5  , dev_ratio = 0.02 }
+LTP| ../../../../include/tst_fuzzy_sync.h:494: TINFO: Reached deviation ratios < 0.10, introducing randomness
+LTP| ../../../../include/tst_fuzzy_sync.h:497: TINFO: Delay range is [-290, 143]
+LTP| ../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1041, delay_bias = 0
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -42ns, avg_dev =     1ns, dev_ratio = 0.02 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =    86ns, avg_dev =     8ns, dev_ratio = 0.09 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =   174ns, avg_dev =    13ns, dev_ratio = 0.07 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =  -129ns, avg_dev =    10ns, dev_ratio = 0.07 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   216  , avg_dev =     5  , dev_ratio = 0.02 }
+LTP| ../../../../include/tst_fuzzy_sync.h:654: TINFO: Exceeded execution loops, requesting exit
+LTP| inotify09.c:90: TPASS: kernel survived inotify beating
+WALL| 2.701856875s exit=0
+NR|  17 served=         0 forwarded=         3
+NR|  24 served=         0 forwarded=         1
+NR|  25 served=         0 forwarded=         5
+NR|  26 served=         0 forwarded=         1
+NR|  27 served=   2999999 forwarded=         1
+NR|  28 served=   2999995 forwarded=         5
+NR|  29 served=         0 forwarded=         1
+NR|  34 served=         0 forwarded=         1
+NR|  35 served=         0 forwarded=         3
+NR|  43 served=         0 forwarded=         1
+NR|  46 served=         0 forwarded=         1
+NR|  48 served=         0 forwarded=        12
+NR|  49 served=         0 forwarded=         1
+NR|  53 served=         0 forwarded=         2
+NR|  54 served=         0 forwarded=         1
+NR|  56 served=         0 forwarded=        26
+NR|  57 served=         0 forwarded=        28
+NR|  59 served=         0 forwarded=         1
+NR|  61 served=         0 forwarded=         2
+NR|  62 served=   2999999 forwarded=         1
+NR|  63 served=         0 forwarded=        16
+NR|  64 served=   2999998 forwarded=        33
+NR|  79 served=         0 forwarded=        11
+NR|  80 served=         0 forwarded=        20
+NR|  93 served=         0 forwarded=         1
+NR|  94 served=         0 forwarded=         5
+NR|  96 served=         0 forwarded=         5
+NR|  98 served=         0 forwarded=         1
+NR|  99 served=         0 forwarded=         7
+NR| 103 served=         0 forwarded=         5
+NR| 113 served=         0 forwarded=         1
+NR| 123 served=         0 forwarded=         1
+NR| 129 served=         0 forwarded=         3
+NR| 134 served=         0 forwarded=       108
+NR| 135 served=         0 forwarded=        15
+NR| 139 served=         0 forwarded=         5
+NR| 154 served=         0 forwarded=         1
+NR| 160 served=         0 forwarded=         1
+NR| 173 served=         0 forwarded=         9
+NR| 174 served=         0 forwarded=         3
+NR| 175 served=         0 forwarded=         6
+NR| 176 served=         0 forwarded=         4
+NR| 177 served=         0 forwarded=         3
+NR| 215 served=         1 forwarded=        16
+NR| 220 served=         0 forwarded=         5
+NR| 221 served=         0 forwarded=         8
+NR| 226 served=         0 forwarded=        21
+NR| 227 served=         0 forwarded=         1
+NR| 233 served=         0 forwarded=         1
+NR| 260 served=         0 forwarded=        10
+NR| 261 served=         0 forwarded=         7
+NR| 278 served=         0 forwarded=         5
+NR| 293 served=         0 forwarded=         5
+NR| 435 served=         0 forwarded=         2
+POP| DelegationCounts { delegations: 7, recalls: 7, host_served: 4, tableless_publishes: 0, revalidated_records: 0, refusals: [(NotRootfs, 1), (FileTooLarge, 1), (Shared, 4), (Unregistered, 12)], recall_triggers: [("crates/carrick-kernel/src/kernel/objects.rs:1464", 5), ("crates/carrick-kernel/src/dispatch/mqueue.rs:680", 1), ("crates/carrick-kernel/src/el1_delegation.rs:1798", 1)] }
+ok
+test el1_inotify_loop_bench ... BENCH| loop_ns_per_iter=555 getpid_ns=39
+BENCHERR| 
+BENCH| nr 27 served=201000 forwarded=1
+BENCH| nr 28 served=201001 forwarded=0
+BENCH| nr 62 served=201007 forwarded=4
+BENCH| nr 64 served=201000 forwarded=1
+BENCH| nr 172 served=0 forwarded=0
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.86s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_kick_served_loop-515d037f012f44fb el1_ --nocapture
+
+running 2 tests
+test el1_served_burst_surfaces_kicks_under_oversubscription ... el1-served-loop-kick mode=burst served loop kick max_ns=20188792 cycles=20000 lseeks=2741446 el1 lseek served=2741444 forwarded=2
+el1-served-loop-kick mode=burst served loop kick max_ns=27097083 cycles=20000 lseeks=2656276 el1 lseek served=2656276 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=25536584 cycles=20000 lseeks=4513462 el1 lseek served=4513461 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=20273250 cycles=20000 lseeks=3601763 el1 lseek served=3601763 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=20323334 cycles=20000 lseeks=3530854 el1 lseek served=3530852 forwarded=2
+el1-served-loop-kick mode=burst served loop kick max_ns=21767583 cycles=20000 lseeks=3576216 el1 lseek served=3576215 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=40809709 cycles=20000 lseeks=3128058 el1 lseek served=3128058 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=18503125 cycles=20000 lseeks=3168712 el1 lseek served=3168712 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=20399792 cycles=20000 lseeks=3457896 el1 lseek served=3457896 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=31650167 cycles=20000 lseeks=4688301 el1 lseek served=4688300 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=57888250 cycles=20000 lseeks=3543117 el1 lseek served=3543111 forwarded=6
+el1-served-loop-kick mode=burst served loop kick max_ns=32125583 cycles=20000 lseeks=2469184 el1 lseek served=2469183 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=32801750 cycles=20000 lseeks=3082875 el1 lseek served=3082875 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=22841417 cycles=20000 lseeks=3155847 el1 lseek served=3155846 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=41123000 cycles=20000 lseeks=2651126 el1 lseek served=2651126 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=19568958 cycles=20000 lseeks=3321924 el1 lseek served=3321922 forwarded=2
+el1-served-loop-kick mode=burst served loop kick max_ns=22945667 cycles=20000 lseeks=3123392 el1 lseek served=3123391 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=25320667 cycles=20000 lseeks=2418256 el1 lseek served=2418256 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=21036958 cycles=20000 lseeks=2278433 el1 lseek served=2278432 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=30540125 cycles=20000 lseeks=4504595 el1 lseek served=4504594 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=36444708 cycles=20000 lseeks=3591317 el1 lseek served=3591317 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=26949500 cycles=20000 lseeks=2954294 el1 lseek served=2954292 forwarded=2
+el1-served-loop-kick mode=burst served loop kick max_ns=47209791 cycles=20000 lseeks=3794955 el1 lseek served=3794953 forwarded=2
+el1-served-loop-kick mode=burst served loop kick max_ns=19986292 cycles=20000 lseeks=3759243 el1 lseek served=3759242 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=21449417 cycles=20000 lseeks=3070071 el1 lseek served=3070069 forwarded=2
+el1-served-loop-kick mode=burst served loop kick max_ns=23603125 cycles=20000 lseeks=2272573 el1 lseek served=2272570 forwarded=3
+el1-served-loop-kick mode=burst served loop kick max_ns=30593750 cycles=20000 lseeks=3472239 el1 lseek served=3472237 forwarded=2
+el1-served-loop-kick mode=burst served loop kick max_ns=25112875 cycles=20000 lseeks=3622122 el1 lseek served=3622122 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=27317125 cycles=20000 lseeks=2937093 el1 lseek served=2937093 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=24424209 cycles=20000 lseeks=3853241 el1 lseek served=3853239 forwarded=2
+ok
+test el1_served_loop_surfaces_kicks ... el1-served-loop-kick mode=loop served loop kick max_ns=141667 cycles=2000 lseeks=14450 el1 lseek served=12737 forwarded=1713
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 114.47s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_transparent-9f1543913016aba2 el1_ --nocapture
+
+running 2 tests
+test el1_transparent_fork_exec_shared_backing ... ok
+test el1_transparent_smoke ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/entitlement_negative-2ea3128a996608c8.noent.69046: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/entitlement_negative-2ea3128a996608c8.noent.69046
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+remaining carrick procs (run-id el1-b3-exactwake-20260929) = 0
+remaining carrick procs (run-id el1-b3-exactwake-20260929-cli) = 0
+test-signed: receipt target/test-results/carrick-embed-signed-artifacts.jsonl
+test-signed: OK (carrick-embed: 9 invoked signed executable(s) passed, 27 signed, negative control passed)

@@ -61,3 +61,24 @@ Two red-first fixture cases prove both correct descriptor acceptance and
 rejection of unrelated suffix-lookalike files; all 11 checker tests pass.
 The first new fixture inherited another undeclared surface contract; its
 failure is retained and the final fixtures isolate the contract they test.
+
+## Final source and signed regression
+
+Implementation `a2c0fcee3` includes the ordering follow-up. Clean compiler
+reconciliation retained all 595 authority rows unchanged; provenance is
+`257de53e0`. Final lint-domains and exact contract-change coverage from
+`55cb799a3` both passed. The authority census covers macOS only; other host
+profiles remain pending. See lint-final.log and coverage-final.log.
+
+On source `257de53e055aeba43a70e389c209fcfb1ccf1b47`, run
+`el1-b3-exactwake-20260929` completed `scripts/test-signed.sh carrick-embed
+el1_ --nocapture`: 49 unique positive executions across nine artifacts,
+unentitled negative control and scoped cleanup passed. All nine current
+executable SHA-256 hashes were independently recomputed and matched the
+retained signed-artifacts.jsonl, which also records CDHash, UUID, entitlement
+and DOF identity. Full output is signed.log.
+
+This supersedes the earlier signed regression for this changed scheduler.
+It does not bind a deterministic signed retirement/reuse interleaving, prove
+all service/restore lifetime transitions, attribute either historical crash,
+or close structural observations, full batch acceptance or integration.
