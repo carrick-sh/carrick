@@ -181,20 +181,17 @@ pub fn transfer<U: UserCopy>(
             }
         }
         IpcOpKind::EventFdWrite => {
-            let mut bytes = [0u8; 8];
-            if copy.copy_in(&mut bytes, buf) != bytes.len() {
-                StepStatus::Fault
-            } else {
-                let e = guard.eventfd()?;
-                let step = e.try_write(u64::from_ne_bytes(bytes));
-                owe(step.wake);
-                match step.result {
-                    Ok(()) => {
-                        op.progress.written = op.progress.len;
-                        StepStatus::Complete
-                    }
-                    Err(e) => blocked_or(e)?,
+            // The value was copied from user memory at admission, before the
+            // operation could block; a resumed write never re-reads it.
+            let e = guard.eventfd()?;
+            let step = e.try_write(op.value.0);
+            owe(step.wake);
+            match step.result {
+                Ok(()) => {
+                    op.progress.written = op.progress.len;
+                    StepStatus::Complete
                 }
+                Err(e) => blocked_or(e)?,
             }
         }
         IpcOpKind::None => return Err(IpcError::Corrupt),
