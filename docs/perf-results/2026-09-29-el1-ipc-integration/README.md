@@ -280,3 +280,22 @@ Next: real blocking/park/wake, close/reuse, mixed-venue and signal/partial-write
 witnesses at the required scales and two-process shapes. The rejected fixture
 reports remain rejected. Full CI/inventory reconciliation, native-Linux cost
 and complete promotion remain open; main is unchanged. No checkpoint closed.
+
+
+## Blocking IPC execution
+
+The first signed two-thread pipe-pingpong check passed, including an assertion
+of at least 256 real EL1 parks and EL1-served reads/writes across 256 measured
+rounds plus the existing warmup. Entitlement negative control and scoped
+cleanup passed. This initial development run used an uncommitted test on
+ab5ec3e1d; the manifest does not capture that test delta, so retain it as a
+diagnostic result, not promotion evidence. Tested bytes were preserved in
+target/el1-ipc-blocking-initial before any signed rebuild.
+
+The next committed witness reuses the static scheduler fixture and adds real
+request/response IPC pairs at 1/8/64 for both pipes and eventfds. Every payload
+carries pair/round identity and each response is checked. Guest output counts
+completed checked operations only. The embed runner reads real whole-run
+EL1 park and served/forwarded counters; no feature flag or loop count creates
+an execution observation. Scoped zero-exit, two-process, descriptor reuse,
+signal/partial-progress and full vertical acceptance remain open.

@@ -799,6 +799,111 @@ fn el1_sched_pstate_seen_by_the_guest_is_unchanged() {
     );
 }
 
+/// Concurrent production pipe/eventfd pairs. Whole-run counters establish
+/// repeated guest blocking; exact scoped work/exit acceptance remains separate.
+#[test]
+fn el1_ipc_pairs_blocking() {
+    const ROUNDS: u64 = 128;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    for kind in ["pipe", "eventfd"] {
+        for pairs in [1u64, 8, 64] {
+            let before = read_el1_counters()
+                .map(|c| [63, 64].map(|nr| c.served[nr].load(std::sync::atomic::Ordering::Relaxed)))
+                .unwrap_or([0; 2]);
+            let measured = run_fixture(
+                &carrier,
+                &["ipc-pairs", kind, &pairs.to_string(), &ROUNDS.to_string()],
+                Duration::from_secs(60),
+            );
+            println!(
+                "IPC pairs {kind} n={pairs}: zone={:?} forwarded={:?} {}",
+                measured.zone,
+                measured.forwarded_syscalls,
+                describe(&measured)
+            );
+            assert!(measured.result.success(), "{}", describe(&measured));
+            assert!(
+                measured
+                    .result
+                    .stdout_utf8()
+                    .contains(&format!("completed={}", pairs * ROUNDS))
+            );
+            let counters = read_el1_counters().expect("real EL1 counters");
+            let served =
+                [63, 64].map(|nr| counters.served[nr].load(std::sync::atomic::Ordering::Relaxed));
+            assert!(
+                served[0] - before[0] >= 2 * pairs * ROUNDS
+                    && served[1] - before[1] >= 2 * pairs * ROUNDS,
+                "IPC fell back: served before={before:?} after={served:?}"
+            );
+            assert!(
+                measured.zone.el1_parks >= pairs * ROUNDS,
+                "startup/barrier parks cannot stand in for repeated IPC parking: {:?}",
+                measured.zone
+            );
+            let reads = measured
+                .forwarded_syscalls
+                .iter()
+                .find(|(nr, _)| *nr == 63)
+                .map_or(0, |(_, n)| *n);
+            assert!(
+                reads < pairs * ROUNDS,
+                "read continuations fell back: {reads}"
+            );
+        }
+    }
+}
+
+/// Production IPC continuation witness using the existing two-pipe fixture.
+/// Its only repeated blocking operations are pipe reads; thread startup and
+/// join cannot account for a park population proportional to the loop.
+#[test]
+fn el1_ipc_pipe_blocking_roundtrips() {
+    const ROUNDS: usize = 256;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["pipe-pingpong", &ROUNDS.to_string()],
+        Duration::from_secs(60),
+    );
+    println!(
+        "IPC blocking whole-run observation: {}",
+        describe(&measured)
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        measured
+            .result
+            .stdout_utf8()
+            .contains("pipe-pingpong iters=256")
+    );
+    let counters = read_el1_counters().expect("real EL1 counters");
+    let reads = counters.served[63].load(std::sync::atomic::Ordering::Relaxed);
+    let writes = counters.served[64].load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        reads >= 2 * ROUNDS as u64 && writes >= 2 * ROUNDS as u64,
+        "IPC must execute in EL1: served reads={reads} writes={writes}"
+    );
+    assert!(
+        measured.zone.el1_parks >= ROUNDS as u64,
+        "pipe reads must park in EL1: {:?}",
+        measured.zone
+    );
+    let forwarded_reads = measured
+        .forwarded_syscalls
+        .iter()
+        .find(|(nr, _)| *nr == 63)
+        .map_or(0, |(_, n)| *n);
+    assert!(
+        forwarded_reads < ROUNDS as u64,
+        "read continuation fell back on every round: {forwarded_reads}"
+    );
+}
+
 /// Contract `kernel.el1.guest-run-queue` (EL1 plan 1d), part (a): a thread
 /// blocked in a host-served syscall (a pipe `read`) is resumed by the guest's
 /// scheduler. Two threads hand a byte back and forth over two pipes, so every
