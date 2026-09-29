@@ -155,6 +155,70 @@ fn guest_fork_arm_txns(
     Ok(txns)
 }
 
+/// The maintenance trampoline's closing `hvc #1`, used as the return address
+/// of a host-driven EL1 call so its `ret` completes as `MaintenanceDone`.
+const EL1_SERVICE_CALL_RETURN: u64 = carrick_mem::memory::LINUX_EL1_MAINT_BASE + 16;
+
+/// See [`carrick_hal::threaded::ThreadedEngine::run_el1_service_call`].
+fn run_el1_service_call_on<V: Aarch64Vmm>(
+    vcpu: &mut V::Vcpu,
+    entry_pc: u64,
+    frame_va: u64,
+) -> Result<(), TrapError> {
+    const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+    let mut saved = Vec::with_capacity(36);
+    let mut regs: Vec<Reg> = (0..31).map(Reg::X).collect();
+    regs.extend([Reg::Pc, Reg::Pstate, Reg::ElrEl1, Reg::SpsrEl1, Reg::SpEl1]);
+    for &reg in &regs {
+        saved.push(vcpu.get_reg(reg).map_err(|error| {
+            TrapError::Hypervisor(format!("save {reg:?} for host-driven EL1 call: {error}"))
+        })?);
+    }
+    let setup = [
+        (Reg::Pc, entry_pc),
+        (Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED),
+        (Reg::X(0), frame_va),
+        (Reg::X(30), EL1_SERVICE_CALL_RETURN),
+        (Reg::SpEl1, frame_va & !0xF),
+    ];
+    let mut result = Ok(());
+    for (reg, value) in setup {
+        if let Err(error) = vcpu.set_reg(reg, value) {
+            result = Err(TrapError::Hypervisor(format!(
+                "set {reg:?} for host-driven EL1 call: {error}"
+            )));
+            break;
+        }
+    }
+    if result.is_ok() {
+        // A cross-thread kick only interrupts the run; the call continues
+        // from where it stopped.
+        result = loop {
+            match vcpu.run() {
+                Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
+                Ok(Aarch64Exit::Kicked) => continue,
+                Ok(other) => {
+                    break Err(TrapError::UnexpectedExit {
+                        reason: format!(
+                            "{} during host-driven EL1 call",
+                            maintenance_exit_detail(&other)
+                        ),
+                    });
+                }
+                Err(error) => break Err(error),
+            }
+        };
+    }
+    for (&reg, &value) in regs.iter().zip(&saved) {
+        vcpu.set_reg(reg, value).map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "restore {reg:?} after host-driven EL1 call: {error}"
+            ))
+        })?;
+    }
+    result
+}
+
 /// A host live-table edit attempted on the lane where guest EL1 owns the live
 /// descriptors. The caller must submit a guest descriptor transaction.
 fn guest_owned_live_edit_error() -> MemoryError {
@@ -3598,6 +3662,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         })
         .map_err(|error| memory_error_to_trap_error(error, "publish EL1 frame grant on host"))?;
         Ok(El1FrameGrantPublished::OnHost)
+    }
+
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+        self.vcpu
+            .get_sys_reg(SysReg::Ttbr0)
+            .map_err(|error| TrapError::Hypervisor(format!("read TTBR0_EL1: {error}")))
+    }
+
+    fn run_el1_service_call(&mut self, entry_pc: u64, frame_va: u64) -> Result<(), TrapError> {
+        run_el1_service_call_on::<V>(&mut self.vcpu, entry_pc, frame_va)
     }
 
     fn live_descriptor_owner(&self) -> LiveDescriptorOwner {

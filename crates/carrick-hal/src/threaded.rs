@@ -2921,6 +2921,24 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         false
     }
 
+    /// This vCPU's full TTBR0 (root and ASID).
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend exposes no live TTBR0".to_owned(),
+        ))
+    }
+
+    /// Run one EL1 image function on this vCPU as a host-driven call: PC =
+    /// `entry_pc` at EL1h with interrupts masked, `x0` = `frame_va`, the
+    /// stack just below the frame, and the maintenance `hvc #1` as the return
+    /// address. Every register the call may clobber is restored afterwards,
+    /// so a parked syscall resumes unperturbed.
+    fn run_el1_service_call(&mut self, _entry_pc: u64, _frame_va: u64) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend has no host-driven EL1 call".to_owned(),
+        ))
+    }
+
     /// Authenticate EL1's receipt for a transaction this engine returned and
     /// return its unused table grants. Required before residency commit,
     /// inventory repoint or old-owner retirement.
