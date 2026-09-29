@@ -982,8 +982,8 @@ impl InZoneRegistry {
     /// back via `getsockname`, which the kernel guarantees is exclusively
     /// this process's for as long as the socket stays open) and seed the
     /// allocator to try exactly that port first.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_next_ephemeral_candidate_for_test(&self, scope: &InZoneScope, port: u16) {
+    #[cfg(test)]
+    pub(crate) fn set_next_ephemeral_candidate_for_test(&self, scope: &InZoneScope, port: u16) {
         self.ephemeral
             .lock()
             .unwrap_or_else(|p| p.into_inner())
