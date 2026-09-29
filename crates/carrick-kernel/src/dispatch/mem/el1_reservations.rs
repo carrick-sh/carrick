@@ -4,28 +4,37 @@
 //! `admit_el1_reservations` under its mutation permit. Thereafter grant service
 //! uses `el1_reservation_fault_plan`, NOT `resident_frame_grant_plan`: backing
 //! eligibility comes from the shared root, not FirstTouchArming. The plan owns
-//! exact-MM alias exclusion across backing service. Reauthenticate immediately
+//! exact-MM alias exclusion and a borrowed owned-pin storage view across backing service.
+//! Refresh `ResolvedReservationNodes` through the carrier metadata resolver before
+//! acquiring the MM permit; pass that view to `el1_reservation_fault_plan`. Reauthenticate immediately
 //! before publishing the grant receipt. A generation mismatch is refusal, never
 //! permission to replay the Linux syscall or revive an old mapping.
 //!
-//! Admission is deliberately explicit while dispatch still forwards: sealing a
-//! root and then allowing the old host mmap-family handlers to mutate MemState
-//! would create two authorities. The activation change must route host memory
-//! mutations through the same decision/completion API too.
+//! Production admission currently fails closed with `ForeignMapping`: the
+//! legacy MemState authority still serves mmap/munmap/mprotect/brk/mremap,
+//! madvise, fault planning, mincore, proc maps, fork and exec/exit. None of those
+//! MMs may seal a shared root until those paths relinquish their anonymous
+//! facts. The snapshot importer below is a host-only conformance fixture, not
+//! a second production authority or an activation mechanism.
 
 use super::*;
+#[cfg(test)]
+use carrick_el1::memory::reservations::Layout;
 use carrick_el1::memory::reservations::{
-    Layout, Refusal, ReservationFaultPlan, Reservations, shared_host,
+    Refusal, ReservationFaultPlan, Reservations, ResolvedReservationNodes, shared_host,
 };
-use carrick_el1_abi::{ReservationMm, ReservationProtection, ReservationRange};
+#[cfg(test)]
+use carrick_el1_abi::ReservationRange;
+use carrick_el1_abi::{PinnedMetadataExtent, ReservationMm, ReservationProtection};
 
-pub struct El1ReservationFaultPlan<'permit> {
+pub struct El1ReservationFaultPlan<'permit, P: PinnedMetadataExtent> {
+    nodes: &'permit ResolvedReservationNodes<P>,
     plan: ReservationFaultPlan,
     index: usize,
     exclusion: HostAliasDispatchGuard<'permit>,
 }
 
-impl El1ReservationFaultPlan<'_> {
+impl<P: PinnedMetadataExtent> El1ReservationFaultPlan<'_, P> {
     pub fn reservation(&self) -> ReservationFaultPlan {
         self.plan
     }
@@ -39,6 +48,17 @@ fn index_for(mm: ReservationMm) -> Result<usize, Refusal> {
         .ok_or(Refusal::Stale)
 }
 
+fn admit_host_snapshot(
+    _model: &mut Reservations<'_>,
+    _mem: &MemState,
+    _limits: (u64, u64),
+) -> Result<(), Refusal> {
+    // The presence of an accessible MemState means these facts still have a
+    // host writer. Sealing a snapshot here would create two Linux answers.
+    Err(Refusal::ForeignMapping)
+}
+
+#[cfg(test)]
 fn import_snapshot(
     model: &mut Reservations<'_>,
     mem: &MemState,
@@ -93,6 +113,7 @@ fn import_snapshot(
     model.finish_import()
 }
 
+#[cfg(test)]
 fn eligible(vma: &SemanticVma, mem: &MemState) -> bool {
     vma.provenance.is_private_anonymous()
         && vma.fork_policy == carrick_abi::VmaForkPolicy::DEFAULT
@@ -121,20 +142,21 @@ impl MemView<'_> {
             .unwrap_or((u64::MAX, u64::MAX));
         let authority = self.mem();
         let mem = authority.lock();
-        let result = import_snapshot(&mut model, &mem, limits);
+        let result = admit_host_snapshot(&mut model, &mem, limits);
         if result.is_err() && !model.is_admitted() {
             model.abort_import()?;
         }
         result
     }
 
-    fn el1_reservation_fault_plan<'permit>(
+    fn el1_reservation_fault_plan<'permit, P: PinnedMetadataExtent>(
         &self,
         permit: &'permit super::super::mm_mutation::HostAliasPermit<'_>,
+        nodes: &'permit ResolvedReservationNodes<P>,
         address: u64,
         max_len: u64,
         access: ReservationProtection,
-    ) -> Result<El1ReservationFaultPlan<'permit>, Refusal> {
+    ) -> Result<El1ReservationFaultPlan<'permit, P>, Refusal> {
         if permit.mm() != self.mm_authority().mm_id {
             return Err(Refusal::Stale);
         }
@@ -143,19 +165,27 @@ impl MemView<'_> {
         let index = index_for(mm)?;
         let plan = shared_host()
             .ok_or(Refusal::Stale)?
-            .lock(index, mm)?
+            .lock_resolved(index, mm, nodes)?
             .fault_plan(address, max_len, access)?;
         Ok(El1ReservationFaultPlan {
+            nodes,
             plan,
             index,
             exclusion,
         })
     }
 
-    fn authenticate_el1_reservation_fault(&self, plan: &El1ReservationFaultPlan<'_>) -> bool {
+    fn authenticate_el1_reservation_fault<P: PinnedMetadataExtent>(
+        &self,
+        plan: &El1ReservationFaultPlan<'_, P>,
+    ) -> bool {
         self.owns_host_alias_dispatch(&plan.exclusion)
             && shared_host()
-                .and_then(|table| table.lock(plan.index, plan.plan.mm).ok())
+                .and_then(|table| {
+                    table
+                        .lock_resolved(plan.index, plan.plan.mm, plan.nodes)
+                        .ok()
+                })
                 .is_some_and(|mut model| model.authenticate_fault(plan.plan))
     }
 }
@@ -167,17 +197,21 @@ impl SyscallDispatcher {
     ) -> Result<(), Refusal> {
         self.mem_view().admit_el1_reservations(permit)
     }
-    pub fn el1_reservation_fault_plan<'permit>(
+    pub fn el1_reservation_fault_plan<'permit, P: PinnedMetadataExtent>(
         &self,
         permit: &'permit super::super::mm_mutation::HostAliasPermit<'_>,
+        nodes: &'permit ResolvedReservationNodes<P>,
         address: u64,
         max_len: u64,
         access: ReservationProtection,
-    ) -> Result<El1ReservationFaultPlan<'permit>, Refusal> {
+    ) -> Result<El1ReservationFaultPlan<'permit, P>, Refusal> {
         self.mem_view()
-            .el1_reservation_fault_plan(permit, address, max_len, access)
+            .el1_reservation_fault_plan(permit, nodes, address, max_len, access)
     }
-    pub fn authenticate_el1_reservation_fault(&self, plan: &El1ReservationFaultPlan<'_>) -> bool {
+    pub fn authenticate_el1_reservation_fault<P: PinnedMetadataExtent>(
+        &self,
+        plan: &El1ReservationFaultPlan<'_, P>,
+    ) -> bool {
         self.mem_view().authenticate_el1_reservation_fault(plan)
     }
 }
@@ -240,6 +274,24 @@ mod tests {
             )
             .unwrap();
         mm
+    }
+
+    #[test]
+    fn reservation_legacy_host_authority_refuses_both_mm_admissions() {
+        let table = shared();
+        let mem = snapshot();
+        for index in 0..2 {
+            let mm = publish(&table, &mem, index);
+            let mut model = table.lock(index, mm).unwrap();
+            assert_eq!(
+                admit_host_snapshot(&mut model, &mem, (u64::MAX, u64::MAX)),
+                Err(Refusal::ForeignMapping)
+            );
+            assert!(!model.is_admitted());
+            assert!(model.pending().is_none());
+            assert!(model.mapping(mem.layout.mmap_base).is_none());
+        }
+        assert_eq!(mem.semantic_vmas.len(), 1);
     }
 
     #[test]
