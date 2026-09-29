@@ -152,9 +152,14 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   EL1 executions across nine executables passed, with negative control and
   zero scoped leftovers. Clippy and lint passed. These are regression receipts,
   not historical attribution or deterministic signed-interleaving closure.
-- [ ] Complete the producer lifetime audit: RecordRef preserves identity but
-  does not grant exclusive record-field access; inspect post-Host publication
-  writes, cancellation and scheduler handback wakes.
+- [ ] Repair the newly reproduced producer lifetime defect: Host becomes
+  visible before `claim_for_host` finishes unlinking. Cancellation can free
+  and reuse that slot; the old producer then removes the replacement waiter's
+  queue entry while it remains Parked (deterministic count 0 instead of 1).
+  Two VM-free reds are retained in the branch receipt's `host-publication/`.
+  RecordRef preserves identity but does not grant exclusive field access.
+  Close all producer publication/cancellation boundaries and then audit
+  scheduler handback wakes; historical crash attribution remains separate.
 - [ ] Reduce Python's `SnapshotRestoreFailed`: record 1/incarnation 35925 was
   `Parked { seq: 17965 }` during host materialization; subsequent MM cleanup
   aborted. Compare against main before calling it a batch regression.
