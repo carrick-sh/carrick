@@ -1628,3 +1628,47 @@ fn read_parked_context_reports_not_parked_for_an_unmatched_identity() {
     };
     assert!(matches!(no_longer_parked, ParkedContextRead::NotParked));
 }
+
+/// A target slot can run a placed waiter as soon as its queue lock is
+/// released; publication must therefore finish removing its futex entry.
+#[test]
+fn guest_wake_publication_has_no_remaining_futex_entry() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    for population in [1, 8, 32] {
+        let records: Vec<_> = (0..population)
+            .map(|i| park(&zone, 100 + i, 0x1000))
+            .collect();
+        let guard = zone
+            .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
+            .unwrap();
+        let mut remaining_entries = Vec::new();
+        let mut unexpected_handbacks = Vec::new();
+        let count = zone.wake_host(
+            &guard,
+            MM,
+            0x1000,
+            u32::MAX,
+            population as u32,
+            true,
+            &mut |record| unexpected_handbacks.push(record),
+            &mut |placement| {
+                // This is the real consumer boundary, after the target's
+                // lock was released. Take the waiter like a target vCPU.
+                let record = zone.switch_in(placement.slot).unwrap();
+                remaining_entries.push(zone.record(record).entry_count());
+            },
+        );
+        drop(guard);
+        assert_eq!(count, population as u32);
+        assert!(unexpected_handbacks.is_empty());
+        assert_eq!(
+            remaining_entries,
+            std::vec![0; population as usize],
+            "runnable publication left futex queue entries attached"
+        );
+        for record in records {
+            zone.free_record(record);
+        }
+    }
+}

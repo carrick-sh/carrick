@@ -1593,7 +1593,12 @@ impl ZoneTables {
                 let index = u64::from(entry.index.load(Ordering::Relaxed));
                 let identity = self.record_ref(record);
                 let claimed = match waker {
-                    Waker::El1 { slot } => self.claim_for_el1(record, seq, index, slot, effects),
+                    Waker::El1 { slot } => {
+                        self.claim_for_el1(record, seq, index, slot, effects, || {
+                            self.unlink(guard, cursor);
+                            self.drop_entry(self.record(record), cursor);
+                        })
+                    }
                     Waker::Host => {
                         let rec = self.record(record);
                         let won = rec.cas(Claim::Parked { seq }, Claim::Host { seq });
@@ -1607,8 +1612,10 @@ impl ZoneTables {
                     }
                 };
                 if claimed {
-                    self.unlink(guard, cursor);
-                    self.drop_entry(self.record(record), cursor);
+                    if matches!(waker, Waker::Host) {
+                        self.unlink(guard, cursor);
+                        self.drop_entry(self.record(record), cursor);
+                    }
                     if let Some(slot) = woken.get_mut(done) {
                         *slot = identity;
                     }
@@ -1705,7 +1712,9 @@ impl ZoneTables {
 
     /// EL1 claims the parked `record` (park `seq`, waitv `index`) for the
     /// slot [`Self::placement`] chooses, falling back to the waker's own run
-    /// queue. The caller holds the record's bucket lock.
+    /// queue. The caller holds the record's bucket lock. `unlink_wait`
+    /// removes the old wait entry after winning ownership and before the
+    /// target's queue lock is released; no consumer may run it earlier.
     fn claim_for_el1(
         &self,
         record: RecordId,
@@ -1713,6 +1722,7 @@ impl ZoneTables {
         index: u64,
         waker: SlotId,
         effects: &mut WakeEffects,
+        unlink_wait: impl FnOnce(),
     ) -> bool {
         let rec = self.record(record);
         let home = rec.home();
@@ -1731,6 +1741,7 @@ impl ZoneTables {
                     return false;
                 }
                 self.mark_woken(rec, index);
+                unlink_wait();
                 let state = self.slot(target).state();
                 self.push_locked(&slot_guard, record, None);
                 drop(slot_guard);
@@ -1753,13 +1764,14 @@ impl ZoneTables {
             return false;
         }
         self.mark_woken(rec, index);
+        unlink_wait();
+        let misplaced = (home.is_some() && home != Some(waker))
+            || !self.runs_mm_of(waker, rec)
+            || !rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed));
         self.push_locked(&slot_guard, record, None);
         drop(slot_guard);
         effects.queued_own = true;
-        if (home.is_some() && home != Some(waker))
-            || !self.runs_mm_of(waker, rec)
-            || !rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed))
-        {
+        if misplaced {
             effects.misplaced = true;
             self.counters.el1_misplaced.fetch_add(1, Ordering::Relaxed);
         }
@@ -2897,14 +2909,22 @@ impl ZoneTables {
                 let rec = self.record(record);
                 let from = Claim::Parked { seq };
                 let outcome = if place && rec.entry_count() == 1 {
-                    self.place_in_guest(record, from, None, |rec| self.mark_woken(rec, index))
+                    self.place_in_guest(record, from, None, |rec| {
+                        self.mark_woken(rec, index);
+                        self.unlink(guard, cursor);
+                        self.drop_entry(rec, cursor);
+                    })
                 } else {
                     Placement::NoSlot
                 };
                 let claimed = match outcome {
                     Placement::Placed(placement) => {
+                        // The queue entry was removed under the target's
+                        // slot lock, before any consumer could take it.
                         placed(placement);
-                        true
+                        done += 1;
+                        cursor = next;
+                        continue;
                     }
                     Placement::Lost => false,
                     Placement::NoSlot => {
