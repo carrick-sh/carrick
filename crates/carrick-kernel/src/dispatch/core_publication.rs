@@ -1672,8 +1672,11 @@ mod tests {
         let generation = authority.issue().expect("generation");
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("context");
-        let quorum =
-            crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
+        let quorum = crate::kernel::CrashQuorum::open(
+            std::sync::Arc::clone(context.task()),
+            generation,
+            context.shared().mm().id().raw(),
+        );
 
         // A live participant that has not answered is genuinely owed.
         let participation = context
@@ -1702,8 +1705,11 @@ mod tests {
         let generation = authority.issue().expect("generation");
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("context");
-        let quorum =
-            crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
+        let quorum = crate::kernel::CrashQuorum::open(
+            std::sync::Arc::clone(context.task()),
+            generation,
+            context.shared().mm().id().raw(),
+        );
         let _participation = context
             .thread()
             .enter_crash_safe_point_participation()

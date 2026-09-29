@@ -2404,7 +2404,9 @@
       "support": "bring_up",
       "handler": "process",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.dispatch.resource-scope"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2417,7 +2419,9 @@
       "support": "bring_up",
       "handler": "credentials",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.dispatch.resource-scope"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"

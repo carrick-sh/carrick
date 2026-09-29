@@ -401,6 +401,25 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = false)]
         interrupted: bool,
     },
+    #[command(name = "__hvpatch-carrier-cpu-attribution-validate", hide = true)]
+    HvpatchCarrierCpuAttributionValidate {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        principal_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        aggregation_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        dynamic_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        dynamic_rinse_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        dynamic_dirty_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        other_drops: u64,
+        #[arg(long, default_value_t = false)]
+        interrupted: bool,
+    },
 
     InspectElf {
         path: PathBuf,
