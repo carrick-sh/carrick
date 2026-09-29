@@ -133,3 +133,13 @@ The original Python confirmation's two raw streams are preserved here as
 `historical-python.err` and `historical-python.out` from
 `target/conformance/raw/conf-89705-s03.{err,out}`. No original failure is
 converted into acceptance by the successful diagnostics or focused suites.
+
+## Core handback identity transport
+
+The follow-up producer/consumer audit found an earlier identity-loss boundary:
+the core returned raw indices after publishing host ownership. Correction
+`99c8cd5ac` carries the original RecordRef across that boundary. Three red-first
+witnesses and the 49-execution signed EL1 regression gate at `40a707ba0` are
+recorded in [core-handback/README.md](core-handback/README.md). The separate
+capacity-test publication race is documented there. Historical crash
+attribution, producer lifetime and full batch acceptance remain open.

@@ -21,7 +21,7 @@ unchanged. A stale service key no longer causes an unconditional free of its
 raw table index. Shared-zone record layout and claim encodings are unchanged;
 there is no second implementation or compatibility adapter.
 
-Validation before signed promotion:
+Validation:
 
 - Scheduler core: 53 passed; three new identity witnesses.
 - EL1 host-test library: 74 passed.
@@ -41,3 +41,18 @@ record captures its reference before handback in runtime zone.rs. Historical
 Python/otmp attribution, deterministic signed interleavings, WorkObservation
 bindings and complete batch acceptance remain open. These reductions do not
 retroactively attribute a historical crash or accept checkpoint 0.
+
+Signed regression gate at clean source `40a707ba0`:
+`CARRICK_RUN_ID=el1-b3-core-handback-20260929 RUSTC_WRAPPER= scripts/test-signed.sh carrick-embed el1_ --nocapture`
+exited 0. The machine-counted receipt records 49 passing positive executions
+across nine executables: scheduler/memory, interrupt kicks, GIC, parked-thread
+crash capture, VM lifetime, files, inotify and transparent execution. The
+unentitled negative control passed; scoped cleanup recorded zero remaining
+processes. `signed-artifacts.jsonl` preserves SHA-256, CDHash, LC_UUID,
+entitlement and DOF presence for each invoked artifact. This broad regression
+gate does not supply the missing deterministic signed interleaving bindings.
+
+Clean compiler-backed reconciliation at `40a707ba0` retained all 595 authority
+identities with one source-position adjustment. `just lint-domains` passed;
+the compiler census covers the macOS subset, with other host profiles pending.
+See `reconcile.log`, `lint.log` and `signed.log`.
