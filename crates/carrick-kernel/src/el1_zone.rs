@@ -120,9 +120,6 @@ pub fn cancel(record: RecordRef) {
             }
         }
         HostClaim::El1Held { slot } => {
-            if let Some(rec) = zone.live(record) {
-                rec.request_cancel();
-            }
             kick_slot(slot);
         }
         HostClaim::Deferred | HostClaim::Stale => {}

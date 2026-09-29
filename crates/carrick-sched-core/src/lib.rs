@@ -450,6 +450,29 @@ pub struct ThreadIdentity {
     pub affinity: u64,
 }
 
+/// A deferred request belongs to one non-wrapping record incarnation.
+/// Old publishers may finish after reuse, but cannot set or erase a newer
+/// incarnation's request. Only the record owner clears a request.
+#[repr(transparent)]
+struct IncarnationRequest(AtomicU64);
+
+impl IncarnationRequest {
+    fn publish(&self, incarnation: u64) {
+        self.0.fetch_max(incarnation, Ordering::SeqCst);
+    }
+
+    fn is_for(&self, incarnation: u64) -> bool {
+        incarnation != 0 && self.0.load(Ordering::SeqCst) == incarnation
+    }
+
+    fn clear(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Incarnation-tagged host request encoding; included in the shared ABI hash.
+pub const HOST_REQUEST_PROTOCOL: u64 = 1;
+
 /// One parked thread. See the crate docs for the ownership protocol.
 #[repr(C, align(64))]
 pub struct ZoneRecord {
@@ -471,7 +494,7 @@ pub struct ZoneRecord {
     last_seq: AtomicU32,
     /// The host retired the thread while EL1 held its record: whoever next
     /// owns the record discards it instead of running or handing it back.
-    cancelled: AtomicU32,
+    cancelled: IncarnationRequest,
     /// `slot + 1` while this is that slot's home record (the host-loaded
     /// thread's own record): it may run on that slot only. 0: not homed.
     home: AtomicU32,
@@ -484,7 +507,7 @@ pub struct ZoneRecord {
     /// while EL1 held its record: the slot's executor hands it back at its
     /// next exit ([`ZoneTables::take_host_wanted`]) instead of leaving it
     /// queued.
-    host_wanted: AtomicU32,
+    host_wanted: IncarnationRequest,
     /// CNTVCT deadline of the current park (0: untimed).
     deadline: AtomicU64,
     affinity: AtomicU64,
@@ -550,7 +573,7 @@ impl ZoneRecord {
 
     /// The host asked for the thread back while EL1 held its record.
     pub fn host_wanted(&self) -> bool {
-        self.host_wanted.load(Ordering::SeqCst) != 0
+        self.host_wanted.is_for(self.incarnation())
     }
 
     pub fn entry_count(&self) -> u32 {
@@ -559,13 +582,21 @@ impl ZoneRecord {
 
     /// Whether the host retired the thread while EL1 held this record.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) != 0
+        self.cancelled.is_for(self.incarnation())
     }
 
     /// The host retires the thread while EL1 holds the record (a claim
     /// returned [`HostClaim::El1Held`]); the slot's executor discards it.
-    pub fn request_cancel(&self) {
-        self.cancelled.store(1, Ordering::Release);
+    fn request_cancel(&self, incarnation: u64) {
+        self.cancelled.publish(incarnation);
+    }
+
+    fn advance_incarnation(&self) -> bool {
+        self.incarnation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .is_ok()
     }
 
     /// The context.
@@ -1044,7 +1075,7 @@ impl HostTransfer<'_> {
 
     fn publish(self) -> Option<RecordRef> {
         let rec = self.zone.record(self.record.id);
-        rec.host_wanted.store(0, Ordering::SeqCst);
+        rec.host_wanted.clear();
         // Requests can only advance to host-requested and then cancelled;
         // each failed CAS therefore consumes one of those finite transitions.
         loop {
@@ -1270,17 +1301,21 @@ impl ZoneTables {
             return Err(Exhausted);
         };
         let record = self.record(id);
-        record.incarnation.fetch_add(1, Ordering::AcqRel);
+        if !record.advance_incarnation() {
+            // Never release an exhausted index for another incarnation.
+            self.counters.exhausted.fetch_add(1, Ordering::Relaxed);
+            return Err(Exhausted);
+        }
         record.set_identity(identity);
         record.result.store(0, Ordering::Relaxed);
         record.handback.store(0, Ordering::Relaxed);
         record.first_entry.store(NIL, Ordering::Relaxed);
         record.entry_count.store(0, Ordering::Relaxed);
-        record.cancelled.store(0, Ordering::Relaxed);
+        record.cancelled.clear();
         record.home.store(0, Ordering::Relaxed);
         record.last_slot.store(0, Ordering::Relaxed);
         record.next.store(NIL, Ordering::Relaxed);
-        record.host_wanted.store(0, Ordering::Relaxed);
+        record.host_wanted.clear();
         record.deadline.store(0, Ordering::Relaxed);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         Ok(id)
@@ -1471,7 +1506,7 @@ impl ZoneTables {
             let record = RecordId(cursor);
             let rec = self.record(record);
             cursor = rec.next.load(Ordering::Relaxed);
-            if rec.host_wanted.load(Ordering::Acquire) == 0 || rec.is_cancelled() {
+            if !rec.host_wanted() || rec.is_cancelled() {
                 continue;
             }
             let Claim::Queued { slot: owner, seq } = rec.claim() else {
@@ -1483,7 +1518,7 @@ impl ZoneTables {
                     self.begin_host_transfer(identity, Claim::Queued { slot, seq })
             {
                 self.remove_locked(&guard, record);
-                rec.host_wanted.store(0, Ordering::Release);
+                rec.host_wanted.clear();
                 if !matches!(rec.handback(), Some(Handback::Resumed | Handback::Service)) {
                     rec.handback
                         .store(Handback::Woken as u32, Ordering::Release);
@@ -1534,8 +1569,9 @@ impl ZoneTables {
     pub fn free_record(&self, id: RecordId) {
         let record = self.record(id);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
-        record.incarnation.fetch_add(1, Ordering::AcqRel);
-        Self::free_bit(&self.record_map, id.raw());
+        if record.advance_incarnation() {
+            Self::free_bit(&self.record_map, id.raw());
+        }
     }
 
     fn entry(&self, id: u32) -> &ZoneEntry {
@@ -1630,7 +1666,7 @@ impl ZoneTables {
     pub fn publish_park(&self, record: RecordId, seq: u32) {
         let rec = self.record(record);
         // A host claim refused while EL1 held it is retried on this park.
-        rec.host_wanted.store(0, Ordering::Relaxed);
+        rec.host_wanted.clear();
         rec.last_seq.store(seq, Ordering::Relaxed);
         rec.handback.store(0, Ordering::Relaxed);
         rec.claim
@@ -3216,6 +3252,12 @@ impl ZoneTables {
         wait: &impl LockWait,
     ) -> HostClaim {
         let rec = self.record(r.id);
+        if kind == Handback::Cancelled {
+            // Publish intent before observing ownership: a handback that
+            // wins immediately after El1Held must already see cancellation.
+            // This tagged write is harmless even if r was retired/reused.
+            rec.request_cancel(r.incarnation);
+        }
         self.claim_for_host_inner(r, rec, seq, kind, wait)
     }
 
@@ -3297,7 +3339,7 @@ impl ZoneTables {
                     };
                 }
                 Claim::OnCpu { slot, .. } => {
-                    rec.host_wanted.store(1, Ordering::SeqCst);
+                    rec.host_wanted.publish(r.incarnation);
                     if rec.claim() != claim {
                         continue;
                     }
