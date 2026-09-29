@@ -80,10 +80,16 @@ impl<P: PinnedMetadataExtent> ResolvedReservationNodes<P> {
         resolver: &R,
         region: core::ptr::NonNull<u8>,
     ) -> Result<(), Refusal> {
+        if table.layout_hash.load(Ordering::Acquire) != LAYOUT_HASH {
+            return Err(Refusal::Stale);
+        }
         if !self.table.is_null() && !core::ptr::eq(self.table, table) {
             return Err(Refusal::Stale);
         }
         let count = table.storage.count.load(Ordering::Acquire);
+        if count as usize > BANKS || self.count > count {
+            return Err(Refusal::Stale);
+        }
         while self.count < count {
             let bank = table.storage.bank(self.count as usize);
             let bytes = core::mem::size_of::<Node>() * BANK_NODES;
@@ -374,6 +380,18 @@ mod tests {
         .unwrap();
         model.complete(completion).unwrap();
         request
+    }
+
+    #[test]
+    fn reservation_host_resolution_refuses_an_unpublished_layout_before_pinning() {
+        let table = table();
+        let resolver = bank(&table);
+        let mut host = ResolvedReservationNodes::default();
+        assert_eq!(
+            unsafe { host.refresh(&table, &resolver, NonNull::dangling()) },
+            Err(Refusal::Stale)
+        );
+        assert_eq!(resolver.calls.get(), 0);
     }
 
     #[test]

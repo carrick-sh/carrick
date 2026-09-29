@@ -1,5 +1,6 @@
 //! Resident private-anonymous memory operations served inside guest EL1.
 
+#[path = "personality/reservations.rs"]
 pub mod reservations;
 
 use carrick_el1_abi::{CurrentTask, TrapFrame};
