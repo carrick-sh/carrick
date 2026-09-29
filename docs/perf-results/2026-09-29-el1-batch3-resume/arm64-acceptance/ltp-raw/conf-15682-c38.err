@@ -1,0 +1,16 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_fankzsBp6 as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+fanotify11.c:63: TINFO: Test #0: without FAN_REPORT_TID: tgid=5, tid=0, event.pid=0
+fanotify11.c:84: TPASS: event.pid == tgid
+fanotify11.c:63: TINFO: Test #1: with FAN_REPORT_TID: tgid=5, tid=6, event.pid=255
+fanotify11.c:82: TPASS: event.pid == tid
+
+Summary:
+passed   2
+failed   0
+broken   0
+skipped  0
+warnings 0

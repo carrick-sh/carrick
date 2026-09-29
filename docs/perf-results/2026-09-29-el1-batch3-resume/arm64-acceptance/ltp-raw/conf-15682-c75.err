@@ -1,0 +1,17 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_inoXrUz3b as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+inotify04.c:138: TPASS: got event: wd=1 mask=0400 cookie=0 len=0 name=""
+inotify04.c:138: TPASS: got event: wd=1 mask=8000 cookie=0 len=0 name=""
+inotify04.c:138: TPASS: got event: wd=2 mask=0004 cookie=0 len=0 name=""
+inotify04.c:138: TPASS: got event: wd=2 mask=0400 cookie=0 len=0 name=""
+inotify04.c:138: TPASS: got event: wd=2 mask=8000 cookie=0 len=0 name=""
+
+Summary:
+passed   5
+failed   0
+broken   0
+skipped  0
+warnings 0

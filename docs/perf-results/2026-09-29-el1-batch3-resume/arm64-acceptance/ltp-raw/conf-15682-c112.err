@@ -1,0 +1,29 @@
+tst_buffers.c:57: TINFO: Test is using guarded buffers
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_opeoNFC3F as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+openat201.c:86: TPASS: openat2() passed (0)
+openat201.c:86: TPASS: openat2() passed (1)
+openat201.c:86: TPASS: openat2() passed (2)
+openat201.c:86: TPASS: openat2() passed (3)
+openat201.c:86: TPASS: openat2() passed (4)
+openat201.c:86: TPASS: openat2() passed (5)
+openat201.c:86: TPASS: openat2() passed (6)
+openat201.c:86: TPASS: openat2() passed (7)
+openat201.c:86: TPASS: openat2() passed (8)
+openat201.c:86: TPASS: openat2() passed (9)
+openat201.c:86: TPASS: openat2() passed (10)
+openat201.c:86: TPASS: openat2() passed (11)
+openat201.c:86: TPASS: openat2() passed (12)
+openat201.c:86: TPASS: openat2() passed (13)
+openat201.c:86: TPASS: openat2() passed (14)
+openat201.c:86: TPASS: openat2() passed (15)
+
+Summary:
+passed   16
+failed   0
+broken   0
+skipped  0
+warnings 0

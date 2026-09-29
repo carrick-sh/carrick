@@ -1,0 +1,25 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_opeXlIipd as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+../../../../include/lapi/name_to_handle_at.h:47: TFAIL: name_to_handle_at() should fail with EOVERFLOW: EOPNOTSUPP (95)
+../../../../include/lapi/name_to_handle_at.h:47: TFAIL: name_to_handle_at() should fail with EOVERFLOW: EOPNOTSUPP (95)
+../../../../include/lapi/name_to_handle_at.h:47: TFAIL: name_to_handle_at() should fail with EOVERFLOW: EOPNOTSUPP (95)
+open_by_handle_at01.c:64: TFAIL: name_to_handle_at() failed: EOPNOTSUPP (95)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (0): ENOSYS (38)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (1): ENOSYS (38)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (2): ENOSYS (38)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (3): ENOSYS (38)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (4): ENOSYS (38)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (5): ENOSYS (38)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (6): ENOSYS (38)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (7): ENOSYS (38)
+open_by_handle_at01.c:91: TFAIL: open_by_handle_at() failed (8): ENOSYS (38)
+
+Summary:
+passed   0
+failed   13
+broken   0
+skipped  0
+warnings 0

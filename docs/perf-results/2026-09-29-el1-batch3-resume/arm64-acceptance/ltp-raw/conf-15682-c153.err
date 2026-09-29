@@ -1,0 +1,34 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_reaAcJHmM as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+readahead01.c:34: TPASS: readahead() with fd = -1 : EBADF (9)
+readahead01.c:41: TPASS: readahead() with invalid fd : EBADF (9)
+readahead01.c:62: TPASS: readahead() on O_PATH file : EBADF (9)
+readahead01.c:62: TPASS: readahead() on directory : EINVAL (22)
+readahead01.c:62: TPASS: readahead() on /dev/zero : EINVAL (22)
+readahead01.c:62: TPASS: readahead() on pipe read end : EINVAL (22)
+readahead01.c:62: TPASS: readahead() on pipe write end : EBADF (9)
+readahead01.c:62: TPASS: readahead() on unix socket : EINVAL (22)
+readahead01.c:62: TPASS: readahead() on inet socket : EINVAL (22)
+readahead01.c:62: TPASS: readahead() on epoll : EINVAL (22)
+readahead01.c:62: TPASS: readahead() on eventfd : EINVAL (22)
+readahead01.c:62: TPASS: readahead() on signalfd : EINVAL (22)
+readahead01.c:62: TPASS: readahead() on timerfd : EINVAL (22)
+tst_fd.c:151: TCONF: Skipping fanotify: EPERM (1)
+readahead01.c:62: TPASS: readahead() on inotify : EINVAL (22)
+tst_fd.c:170: TCONF: Skipping userfaultfd: EPERM (1)
+tst_fd.c:188: TCONF: Skipping perf event: EPERM (1)
+tst_fd.c:199: TCONF: Skipping io uring: EPERM (1)
+tst_fd.c:215: TCONF: Skipping bpf map: EPERM (1)
+tst_fd.c:224: TCONF: Skipping fsopen: EPERM (1)
+tst_fd.c:233: TCONF: Skipping fspick: EPERM (1)
+tst_fd.c:242: TCONF: Skipping open_tree: EPERM (1)
+
+Summary:
+passed   14
+failed   0
+broken   0
+skipped  8
+warnings 0

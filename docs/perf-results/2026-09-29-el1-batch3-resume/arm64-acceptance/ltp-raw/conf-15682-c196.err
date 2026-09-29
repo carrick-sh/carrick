@@ -1,0 +1,12 @@
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_kconfig.c:608: TINFO: Constraint 'CONFIG_FS_VERITY' not satisfied!
+tst_kconfig.c:554: TINFO: Variables:
+tst_kconfig.c:563: TINFO:  CONFIG_FS_VERITY Undefined
+tst_test.c:1453: TCONF: Aborting due to unsuitable kernel config, see above!
+
+Summary:
+passed   0
+failed   0
+broken   0
+skipped  1
+warnings 0

@@ -1,0 +1,11 @@
+tst_cmd.c:288: TINFO: Parsing mkfs.ext4 version
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_staUx0ikZ as tmpdir (overlayfs filesystem)
+tst_device.c:149: TINFO: No free devices found
+tst_device.c:440: TBROK: Failed to acquire device
+
+Summary:
+passed   0
+failed   0
+broken   1
+skipped  0
+warnings 0

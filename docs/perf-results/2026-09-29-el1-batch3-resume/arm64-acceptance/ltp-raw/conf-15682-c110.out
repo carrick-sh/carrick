@@ -1,0 +1,18 @@
+openat03    0  TINFO  :  Using /tmp/LTP_opezNwpZK as tmpdir (overlayfs filesystem)
+openat03    0  TINFO  :  creating a file with O_TMPFILE flag
+openat03    0  TINFO  :  writing data to the file
+openat03    0  TINFO  :  file size is '4096'
+openat03    0  TINFO  :  looking for the file in '.'
+openat03    0  TINFO  :  file not found, OK
+openat03    0  TINFO  :  renaming '/__carrick_o_tmpfile' -> 'tmpfile'
+openat03    0  TINFO  :  found a file: tmpfile
+openat03    1  TPASS  :  single file tests passed
+openat03    0  TINFO  :  create files in multiple directories
+openat03    0  TINFO  :  removing test directories
+openat03    0  TINFO  :  writing/reading temporary files
+openat03    0  TINFO  :  closing temporary files
+openat03    2  TPASS  :  multiple files tests passed
+openat03    0  TINFO  :  create multiple directories, link files into them
+openat03    0  TINFO  :  and check file permissions
+openat03    0  TINFO  :  remove files, directories
+openat03    3  TPASS  :  file permission tests passed

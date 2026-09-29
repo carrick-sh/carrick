@@ -1,0 +1,18 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_opeLCHbnc as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+open08.c:50: TPASS: O_CREAT | O_EXCL : EEXIST (17)
+open08.c:50: TPASS: O_RDWR : EISDIR (21)
+open08.c:50: TPASS: O_DIRECTORY : ENOTDIR (20)
+open08.c:50: TPASS: O_RDWR : ENAMETOOLONG (36)
+open08.c:50: TPASS: O_WRONLY : EACCES (13)
+open08.c:50: TPASS: O_CREAT : EFAULT (14)
+
+Summary:
+passed   6
+failed   0
+broken   0
+skipped  0
+warnings 0

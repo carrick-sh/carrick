@@ -1,0 +1,40 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_ope3ixbCp as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+open11.c:271: TPASS: open regular file O_RDONLY returned fd 3
+open11.c:271: TPASS: open regular file O_WRONLY returned fd 3
+open11.c:271: TPASS: open regular file O_RDWR returned fd 3
+open11.c:271: TPASS: open regular file O_RDWR | O_SYNC returned fd 3
+open11.c:271: TPASS: open regular file O_RDWR | O_TRUNC returned fd 3
+open11.c:271: TPASS: open directory O_RDONLY returned fd 3
+open11.c:268: TPASS: open directory O_RDWR : EISDIR (21)
+open11.c:268: TPASS: open regular file O_DIRECTORY : ENOTDIR (20)
+open11.c:271: TPASS: open hard link file O_RDONLY returned fd 3
+open11.c:271: TPASS: open hard link file O_WRONLY returned fd 3
+open11.c:271: TPASS: open hard link file O_RDWR returned fd 3
+open11.c:271: TPASS: open symlink file O_RDONLY returned fd 3
+open11.c:271: TPASS: open symlink file O_WRONLY returned fd 3
+open11.c:271: TPASS: open symlink file O_RDWR returned fd 3
+open11.c:271: TPASS: open symlink directory O_RDONLY returned fd 3
+open11.c:268: TPASS: open symlink directory O_WRONLY : EISDIR (21)
+open11.c:268: TPASS: open symlink directory O_RDWR : EISDIR (21)
+open11.c:271: TPASS: open device special file O_RDONLY returned fd 3
+open11.c:271: TPASS: open device special file O_WRONLY returned fd 3
+open11.c:271: TPASS: open device special file O_RDWR returned fd 3
+open11.c:271: TPASS: open non-existing regular file in existing dir returned fd 3
+open11.c:271: TPASS: open link file O_RDONLY | O_CREAT returned fd 3
+open11.c:271: TPASS: open symlink file O_RDONLY | O_CREAT returned fd 3
+open11.c:271: TPASS: open regular file O_RDONLY | O_CREAT returned fd 3
+open11.c:268: TPASS: open symlink directory O_RDONLY | O_CREAT : EISDIR (21)
+open11.c:268: TPASS: open directory O_RDONLY | O_CREAT : EISDIR (21)
+open11.c:275: TPASS: open regular file O_RDONLY | O_TRUNC, behaviour is undefined but should not oops or hang
+open11.c:275: TPASS: open regular file(non-empty) O_RDONLY | O_TRUNC, behaviour is undefined but should not oops or hang
+
+Summary:
+passed   28
+failed   0
+broken   0
+skipped  0
+warnings 0
