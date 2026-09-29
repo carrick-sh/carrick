@@ -87,8 +87,8 @@ pub const IPC_OBJECTS: usize = 1024;
 pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
-/// Region magic: "CRKIPC" + ABI version 1.
-pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x01");
+/// Region magic: "CRKIPC" + ABI version 2 (v2: `IpcOperation::value`).
+pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x02");
 const IPC_READY: u64 = 1;
 
 /// The descriptor authority shared by host and EL1.
@@ -347,6 +347,7 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::offset_of!(IpcOperation, pin) as u64,
     core::mem::offset_of!(IpcOperation, progress) as u64,
     core::mem::offset_of!(IpcOperation, park_seq) as u64,
+    core::mem::offset_of!(IpcOperation, value) as u64,
     core::mem::size_of::<RawOfdPin>() as u64,
     core::mem::size_of::<RawTableId>() as u64,
     core::mem::size_of::<DescriptorSlot>() as u64,
@@ -430,7 +431,16 @@ pub struct IpcOperation {
     pub buf: IpcUserVa,
     pub progress: WriteProgress,
     pub park_seq: u64,
+    /// An eventfd write's counter value, copied from `buf` before the
+    /// operation could block: a resumed write adds this value, never a
+    /// re-read of user memory (eventfd(2)). Unused by other kinds.
+    pub value: IpcEventValue,
 }
+
+/// The 8-byte value of one eventfd write.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IpcEventValue(pub u64);
 impl IpcOperation {
     pub const EMPTY: Self = Self {
         kind: IpcOpKind::None,
@@ -449,6 +459,7 @@ impl IpcOperation {
         buf: IpcUserVa(0),
         progress: WriteProgress { len: 0, written: 0 },
         park_seq: 0,
+        value: IpcEventValue(0),
     };
 }
 

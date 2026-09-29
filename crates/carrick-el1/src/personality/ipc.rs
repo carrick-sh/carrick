@@ -39,8 +39,8 @@ use crate::substrate::sched::object_wait::OperationResumePc;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
-    BackingToken, IpcBacking, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
-    IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawTableId, WriteProgress,
+    BackingToken, IpcBacking, IpcEventValue, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken,
+    IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawTableId, WriteProgress,
 };
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, TrapFrame};
 use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
@@ -146,7 +146,7 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             (token, op, true)
         }
-        Ok(None) => match admit(sched, frame, venue, &mut owed) {
+        Ok(None) => match admit(sched, frame, venue, user, &mut owed) {
             Admission::Admitted(token, op) => (token, op, false),
             Admission::Immediate(result) => return complete(frame, result, false, &owed),
             Admission::Forward => return owed.forward(frame),
@@ -189,10 +189,11 @@ enum Admission {
 }
 
 /// Decode a fresh call and take ownership of it, before any effect.
-fn admit<C: ThreadCpu, U: UserWord>(
+fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     sched: &mut Sched<'_, C, U>,
     frame: &TrapFrame,
     venue: &IpcVenue<'_>,
+    user: &mut M,
     owed: &mut Owed,
 ) -> Admission {
     let task = sched.task;
@@ -244,6 +245,15 @@ fn admit<C: ThreadCpu, U: UserWord>(
         IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite => linux::EVENTFD_WORD,
         _ => count,
     };
+    // eventfd(2): a write copies its value once, before it can block.
+    let mut value = [0u8; linux::EVENTFD_WORD as usize];
+    if kind == IpcOpKind::EventFdWrite
+        && PrefixCopy::new(user).copy_in(&mut value, frame.x[1]) != value.len()
+    {
+        // No effect yet: the host resolves the fault (first touch or EFAULT).
+        release_pin(sched, pin, region, owed);
+        return Admission::Forward;
+    }
     let op = IpcOperation {
         kind,
         nonblock: 0,
@@ -254,6 +264,7 @@ fn admit<C: ThreadCpu, U: UserWord>(
         buf: IpcUserVa(frame.x[1]),
         progress: WriteProgress::new(len),
         park_seq: 0,
+        value: IpcEventValue(u64::from_ne_bytes(value)),
     };
     match region.begin_operation(op) {
         Ok(token) => Admission::Admitted(token, op),
@@ -1331,6 +1342,54 @@ mod tests {
         // Without progress, EPIPE is the host's to raise: forward unchanged.
         let mut f = syscall(SYS_WRITE, wfd, 0x100000, 10, A_SVC);
         assert_eq!(w.call(&mut f), IpcServed::Forward);
+    }
+
+    /// A blocked eventfd write uses the value it copied before blocking,
+    /// even if the user buffer changes while it waits (eventfd(2)).
+    #[test]
+    fn el1_ipc_io_blocked_eventfd_write_keeps_its_value() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 0, EventMode::Counter, BLOCK);
+        let (r2, _, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let object = {
+            let d = w.host().get(a, Fd(e)).unwrap();
+            match IpcBacking::decode(d.backing) {
+                Some(IpcBacking::EventFd { object }) => object,
+                other => panic!("{other:?}"),
+            }
+        };
+        w.region
+            .lock(object, &HostWait)
+            .unwrap()
+            .eventfd()
+            .unwrap()
+            .try_write(u64::MAX - 1)
+            .result
+            .unwrap();
+        w.mem.write(MM, 0x10000, &5u64.to_ne_bytes());
+        w.mem.map(OTHER_MM, 0x10000, PAGE);
+        let b_read = syscall(SYS_READ, e, 0x10000, 8, B_SVC);
+        w.queue(202, OTHER_MM, &b_read, B_SVC);
+        let mut f = syscall(SYS_WRITE, e, 0x10000, 8, A_SVC);
+        assert_eq!(w.call(&mut f), SWITCHED, "A's write would overflow: parks");
+        // The writer's buffer changes while it is blocked.
+        w.mem.write(MM, 0x10000, &9u64.to_ne_bytes());
+        f = b_read;
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8), "B drains");
+        let mut g = syscall(SYS_READ, r2, 0x10000, 1, B_SVC);
+        assert_eq!(w.call(&mut g), SWITCHED);
+        reenter(&mut g, A_SVC);
+        assert_eq!((w.call(&mut g), g.x[0]), (RETURNED, 8));
+        let value = w
+            .region
+            .lock(object, &HostWait)
+            .unwrap()
+            .eventfd()
+            .unwrap()
+            .value();
+        assert_eq!(value, 5, "the value copied before blocking");
     }
 
     /// Dispatch maps the adapter onto actions and counters: a served write
