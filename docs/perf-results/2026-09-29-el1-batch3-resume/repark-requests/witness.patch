@@ -1,0 +1,100 @@
+diff --git a/crates/carrick-el1/src/sched/tests.rs b/crates/carrick-el1/src/sched/tests.rs
+index 44b444264..a958508ae 100644
+--- a/crates/carrick-el1/src/sched/tests.rs
++++ b/crates/carrick-el1/src/sched/tests.rs
+@@ -227,6 +227,95 @@ fn ping_pong(skip_fpsimd: bool) -> (TrapFrame, FakeCpu, TrapFrame, FakeCpu) {
+     (a_before_wait.0, a_before_wait.1, frame, cpu)
+ }
+ 
++/// A host request arrives after futex dispatch admission, while the current
++/// guest thread still owns its OnCpu record. The CPU then finishes its park
++/// and handles the host kick. No further futex wake is owed by the workload.
++fn host_request_during_repark(kind: Handback) {
++    struct RequestOnRead<'a> {
++        zone: &'a ZoneTables,
++        record: carrick_el1_abi::RecordRef,
++        kind: Handback,
++    }
++    impl UserWord for RequestOnRead<'_> {
++        fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
++            assert_eq!(
++                self.zone
++                    .claim_for_host(self.record, None, self.kind, &HostWait),
++                carrick_el1_abi::HostClaim::El1Held { slot: SLOT }
++            );
++            // Model delivery of the claimant's kick after dispatch admission.
++            task.mark_pending_host_work();
++            HardwareUserWord.read_u32(task, uaddr)
++        }
++        fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
++            HardwareUserWord.read_u64(task, uaddr)
++        }
++    }
++
++    let zone = zone();
++    let word = AtomicU32::new(0);
++    let uaddr = word.as_ptr() as u64;
++    let task = task_for(101);
++    let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
++    let original = zone.record_ref(b);
++    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
++    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
++    set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
++    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
++    assert_eq!(zone.slot(SLOT).current(), Some(b));
++
++    let user = RequestOnRead {
++        zone: &zone,
++        record: original,
++        kind,
++    };
++    set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
++    let result = Sched {
++        zone: &zone,
++        slot: SLOT,
++        task: &task,
++        cpu: &mut cpu,
++        user: &user,
++        counters: counters(),
++    }
++    .serve_futex(&mut frame);
++    assert!(matches!(result, None | Some(Served::Idle)));
++
++    // The stopped executor's normal reconciliation: queue cancellation,
++    // requested handbacks, then the current record, if one remains.
++    zone.sweep_cancelled(SLOT);
++    let mut handed = std::vec::Vec::new();
++    zone.take_host_wanted(SLOT, &mut |record| handed.push(record));
++    if zone.slot(SLOT).current() == Some(b) {
++        let _ = zone.handback_current(SLOT, b);
++    }
++    if kind == Handback::Cancelled {
++        assert!(
++            zone.live(original).is_none(),
++            "cancelled re-park must retire"
++        );
++    } else {
++        let rec = zone.live(original).expect("signal preserves the thread");
++        assert!(
++            matches!(rec.claim(), Claim::Host { .. }),
++            "host request must survive re-park, got {:?}",
++            rec.claim()
++        );
++        assert_eq!(rec.entry_count(), 0, "no attached wait after handback");
++    }
++    assert_eq!(cpu.wfis, 0, "the pending host request must prevent WFI");
++}
++
++#[test]
++fn cancelled_on_cpu_thread_is_not_stranded_by_repark() {
++    host_request_during_repark(Handback::Cancelled);
++}
++
++#[test]
++fn signal_requested_on_cpu_is_not_lost_by_repark() {
++    host_request_during_repark(Handback::Signal);
++}
++
+ #[test]
+ fn a_futex_handoff_switches_threads_in_guest_and_preserves_state() {
+     let (mut before, before_cpu, after, after_cpu) = ping_pong(false);

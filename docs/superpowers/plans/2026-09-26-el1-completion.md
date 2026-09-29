@@ -39,6 +39,9 @@ remote-tracking `origin/main` is `a70b40466`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
 Batch 3 is on `integ/batch3`, unlanded. Its current implementation correction
 is `276e05673`; its request-lifetime checkpoint has VM-free proof only.
+Two further red-first EL1 re-park witnesses at `fb265ba9b` show that a
+pending cancellation or signal can be stranded by a new park; the retained
+`repark-requests/` receipt is the next repair boundary.
 The prior broader signed EL1 regression source is `40a707ba0`
 (subsequent receipt-only commits may follow). All twelve active
 batch/memory/IPC/sigsuspend worktrees inventoried below were clean at the
