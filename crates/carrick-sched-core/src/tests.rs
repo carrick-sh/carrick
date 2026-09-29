@@ -46,6 +46,23 @@ fn zone() -> Box<ZoneTables> {
 const MM: u64 = 7;
 const SLOT: SlotId = SlotId::new(3);
 
+/// Red-first for kernel.el1.ipc-wait-ownership: the existing futex-shaped
+/// wake completes x0 with zero, which cannot resume a blocked byte stream.
+#[test]
+fn el1_ipc_wait_recheck_preserves_pending_result() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let record = park(&zone, 17, 0x1000);
+    wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    let switched = zone.switch_in_full(SLOT).unwrap();
+    assert_eq!(switched.record, record);
+    assert_eq!(
+        switched.result, None,
+        "readiness is not a completed zero-byte read"
+    );
+}
+
 fn identity(tid: u64) -> ThreadIdentity {
     ThreadIdentity {
         tid,
