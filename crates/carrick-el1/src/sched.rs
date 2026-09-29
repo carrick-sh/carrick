@@ -1,7 +1,7 @@
 //! Context switching, wait enrollment, timer expiration and CPU hardware.
 use carrick_el1_abi::{
-    Counters, CurrentTask, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_SPURIOUS_INTID, GIC_VTIMER_INTID,
-    SlotId, ThreadCtx, ThreadIdentity, TrapFrame, Waker, ZoneTables,
+    Counters, CurrentTask, El1ExitReason, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_SPURIOUS_INTID,
+    GIC_VTIMER_INTID, SlotId, ThreadCtx, ThreadIdentity, TrapFrame, Waker, ZoneTables,
 };
 use carrick_sched_core::{BoundedSpin, IDLE_SPIN_NS, PREEMPT_SLICE_NS, SwitchedIn, WakeEffects};
 use core::sync::atomic::Ordering;
@@ -251,6 +251,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// The next thread on this vCPU needs its executor: leave for the host
     /// with no thread on the vCPU; the executor takes it from the run queue.
     fn service_exit(&mut self) -> Served {
+        self.counters.exit_reasons[El1ExitReason::Service as usize].fetch_add(1, Ordering::Relaxed);
         self.zone
             .counters
             .el1_service_exits
@@ -356,6 +357,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         loop {
             self.take_irqs();
             if self.task.has_pending_host_work() {
+                self.counters.exit_reasons[El1ExitReason::IdleHostWork as usize]
+                    .fetch_add(1, Ordering::Relaxed);
                 zone.leave_idle(slot);
                 zone.counters.el1_idle_exits.fetch_add(1, Ordering::Relaxed);
                 return Served::Idle;
@@ -431,6 +434,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
         if self.task.has_pending_host_work() {
+            self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
+                .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Forward;
         }
         if self.task.zone_mm.load(Ordering::Acquire) == 0 {
@@ -486,6 +491,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
         if self.task.has_pending_host_work() {
+            self.counters.exit_reasons[El1ExitReason::IdleEntryHostWork as usize]
+                .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Idle;
         }
         match self.idle(frame, timeout_result) {

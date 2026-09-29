@@ -13,15 +13,31 @@
 
 mod common;
 
+#[path = "../../../fixtures/embed-el1-sched/src/sample_buffer.rs"]
+mod sample_buffer;
+
 use std::time::Duration;
 
 use carrick_abi::{NsGid, NsUid};
 use carrick_embed::{
     Carrier, ContainerResult, EmbedError, InMemoryFileVfs, PullPolicy, read_el1_counters,
-    reset_el1_counters, vcpu_run_exits_total,
+    reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total, vcpu_run_exit_classes,
+    vcpu_run_exits_total,
 };
 
 const FIXTURE: &str = "/opt/carrick/el1-sched";
+
+#[test]
+fn measured_sample_backing_is_fixed_across_short_and_long_runs() {
+    for (short, long) in [(5_000, 55_000), (200, 1_200)] {
+        let short_samples = sample_buffer::measured_samples(short, long);
+        let long_samples = sample_buffer::measured_samples(long, long);
+        assert_eq!(short_samples.capacity(), long_samples.capacity());
+        assert!(short_samples.capacity() >= long);
+        assert!(short_samples.is_empty());
+        assert!(long_samples.is_empty());
+    }
+}
 
 fn carrier_or_fail() -> Carrier {
     for _ in 0..50 {
@@ -167,6 +183,12 @@ impl ZoneCounts {
 struct Measured {
     result: ContainerResult,
     exits: u64,
+    hvc_not_svc: u64,
+    hvc_not_svc_reasons: carrick_el1_abi::HvcNotSvcCounts,
+    exit_classes: [u64; carrick_el1_abi::HostExitClass::COUNT],
+    el1_exit_reasons: [u64; carrick_el1_abi::El1ExitReason::COUNT],
+    forwarded_syscalls: Vec<(usize, u64)>,
+    host_work_publications: [u64; carrick_el1_abi::HostWorkPublishReason::COUNT],
     cpu_ns: u64,
     wall: Duration,
     zone: ZoneCounts,
@@ -177,6 +199,17 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     command.extend(args.iter().map(|arg| (*arg).to_owned()));
     let watchdog = common::Watchdog::start(timeout);
     let exits_before = vcpu_run_exits_total();
+    let not_svc_before = vcpu_hvc_not_svc_total();
+    let not_svc_reasons_before = vcpu_hvc_not_svc_reasons();
+    let classes_before = vcpu_run_exit_classes();
+    let reasons_before = read_el1_counters()
+        .map_or([0; carrick_el1_abi::El1ExitReason::COUNT], |c| {
+            std::array::from_fn(|i| c.exit_reasons[i].load(std::sync::atomic::Ordering::Relaxed))
+        });
+    let forwarded_before = read_el1_counters().map_or([0; 512], |c| {
+        std::array::from_fn(|i| c.forwarded[i].load(std::sync::atomic::Ordering::Relaxed))
+    });
+    let host_work_before = carrick_el1_abi::host_work_publication_counts();
     let zone_before = ZoneCounts::read();
     let cpu_before = carrier_cpu_ns();
     let start = std::time::Instant::now();
@@ -191,11 +224,59 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     let wall = start.elapsed();
     let cpu_ns = carrier_cpu_ns() - cpu_before;
     let exits = vcpu_run_exits_total() - exits_before;
+    let hvc_not_svc = vcpu_hvc_not_svc_total() - not_svc_before;
+    let mut hvc_not_svc_reasons = vcpu_hvc_not_svc_reasons();
+    for i in 0..carrick_el1_abi::HvcNotSvcReason::COUNT {
+        hvc_not_svc_reasons.by_ec[i] -= not_svc_reasons_before.by_ec[i];
+        hvc_not_svc_reasons.fault_status[i] -= not_svc_reasons_before.fault_status[i];
+    }
+    for i in 0..carrick_el1_abi::HvcSysregKind::COUNT {
+        hvc_not_svc_reasons.sysreg[i] -= not_svc_reasons_before.sysreg[i];
+    }
+    hvc_not_svc_reasons.emulated_sys64 -= not_svc_reasons_before.emulated_sys64;
+    assert_eq!(
+        hvc_not_svc_reasons.by_ec.iter().sum::<u64>(),
+        hvc_not_svc,
+        "unattributed HVC #2 non-SVC return"
+    );
+    let exit_classes = vcpu_run_exit_classes();
+    let exit_classes = std::array::from_fn(|i| exit_classes[i] - classes_before[i]);
+    assert_eq!(
+        exit_classes.iter().sum::<u64>(),
+        exits,
+        "unattributed HVF return"
+    );
+    let el1_exit_reasons =
+        read_el1_counters().map_or([0; carrick_el1_abi::El1ExitReason::COUNT], |c| {
+            std::array::from_fn(|i| {
+                c.exit_reasons[i]
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(reasons_before[i])
+            })
+        });
+    let forwarded_syscalls = read_el1_counters().map_or_else(Vec::new, |c| {
+        (0..512)
+            .filter_map(|nr| {
+                let count = c.forwarded[nr]
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(forwarded_before[nr]);
+                (count != 0).then_some((nr, count))
+            })
+            .collect()
+    });
+    let host_work_after = carrick_el1_abi::host_work_publication_counts();
+    let host_work_publications = std::array::from_fn(|i| host_work_after[i] - host_work_before[i]);
     let zone = ZoneCounts::read().since(zone_before);
     watchdog.disarm();
     Measured {
         result,
         exits,
+        hvc_not_svc,
+        hvc_not_svc_reasons,
+        exit_classes,
+        el1_exit_reasons,
+        forwarded_syscalls,
+        host_work_publications,
         cpu_ns,
         wall,
         zone,
@@ -209,6 +290,70 @@ fn describe(measured: &Measured) -> String {
         measured.result.signal,
         measured.result.stdout_utf8(),
         measured.result.stderr_utf8()
+    )
+}
+
+fn exit_breakdown(measured: &Measured) -> String {
+    use carrick_el1_abi::HostExitClass as C;
+    let c = &measured.exit_classes;
+    format!(
+        "canceled:{} idle:{} kick:{} syscall:{} metadata:{} maintenance:{} fault:{} other:{}",
+        c[C::Canceled as usize],
+        c[C::Idle as usize],
+        c[C::Kick as usize],
+        c[C::Syscall as usize],
+        c[C::Metadata as usize],
+        c[C::Maintenance as usize],
+        c[C::Fault as usize],
+        c[C::Other as usize],
+    )
+}
+
+fn hvc_not_svc_breakdown(measured: &Measured) -> String {
+    use carrick_el1_abi::HvcSysregKind as S;
+    let counts = &measured.hvc_not_svc_reasons;
+    let nonzero = |values: &[u64]| {
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(code, count)| (*count != 0).then_some((code, *count)))
+            .collect::<Vec<_>>()
+    };
+    format!(
+        "hvc_fn:2,ec:{:?},fsc:{:?},sysreg:cntfrq:{}|cntvct:{}|ctr:{}|dczid:{}|feature_id:{}|other:{},emulated_sys64:{}",
+        nonzero(&counts.by_ec),
+        nonzero(&counts.fault_status),
+        counts.sysreg[S::Cntfrq as usize],
+        counts.sysreg[S::Cntvct as usize],
+        counts.sysreg[S::Ctr as usize],
+        counts.sysreg[S::Dczid as usize],
+        counts.sysreg[S::FeatureId as usize],
+        counts.sysreg[S::Other as usize],
+        counts.emulated_sys64
+    )
+}
+
+fn host_work_breakdown(measured: &Measured) -> String {
+    use carrick_el1_abi::HostWorkPublishReason as R;
+    let counts = &measured.host_work_publications;
+    format!(
+        "slot:{} all:{} task:{} file_table:{}",
+        counts[R::DirectSlot as usize],
+        counts[R::AllSlots as usize],
+        counts[R::ExactTask as usize],
+        counts[R::FileTable as usize],
+    )
+}
+
+fn el1_reason_breakdown(measured: &Measured) -> String {
+    use carrick_el1_abi::El1ExitReason as R;
+    let r = &measured.el1_exit_reasons;
+    format!(
+        "idle_host_work:{} idle_entry_host_work:{} service:{} interrupt_host_work:{}",
+        r[R::IdleHostWork as usize],
+        r[R::IdleEntryHostWork as usize],
+        r[R::Service as usize],
+        r[R::InterruptHostWork as usize],
     )
 }
 
@@ -244,8 +389,14 @@ fn el1_sched_futex_handoff_has_no_host_exits() {
         assert!(measured.result.success(), "{}", describe(&measured));
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched pingpong iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            "el1-sched pingpong iters={iters} exits={} host_classes={} hvc_not_svc={} hvc_not_svc_reasons={} el1_reasons={} host_work={} forwarded_by_nr={:?} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
             measured.exits,
+            exit_breakdown(&measured),
+            measured.hvc_not_svc,
+            hvc_not_svc_breakdown(&measured),
+            el1_reason_breakdown(&measured),
+            host_work_breakdown(&measured),
+            measured.forwarded_syscalls,
             measured.cpu_ns,
             measured.wall.as_millis(),
             measured.zone,
@@ -277,11 +428,8 @@ fn el1_sched_futex_handoff_has_no_host_exits() {
         );
         worst_exits_per_rt = worst_exits_per_rt.max(exits_per_rt);
     }
-    // WEAKENED 2026-09-27 (owner-approved): was < 0.01; measured 0.0121 at load
-    // average 16 during the EL1 correctness landing (0.0039 in the paired run).
-    // Restore once measured on a quiet host.
     assert!(
-        worst_exits_per_rt < 0.05,
+        worst_exits_per_rt < 0.01,
         "a futex handoff between two guest threads cost {worst_exits_per_rt:.3} host exits \
          per round trip; the in-guest (EL1) handoff must cost none in steady state"
     );
@@ -472,8 +620,14 @@ fn el1_sched_timed_wait_times_out_in_guest() {
         );
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched timed-wait iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            "el1-sched timed-wait iters={iters} exits={} host_classes={} hvc_not_svc={} hvc_not_svc_reasons={} el1_reasons={} host_work={} forwarded_by_nr={:?} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
             measured.exits,
+            exit_breakdown(&measured),
+            measured.hvc_not_svc,
+            hvc_not_svc_breakdown(&measured),
+            el1_reason_breakdown(&measured),
+            host_work_breakdown(&measured),
+            measured.forwarded_syscalls,
             measured.cpu_ns,
             measured.wall.as_millis(),
             measured.zone,
@@ -498,10 +652,8 @@ fn el1_sched_timed_wait_times_out_in_guest() {
         );
         worst = worst.max(exits_per_wait);
     }
-    // WEAKENED 2026-09-27 (owner-approved): was < 0.01; measured 0.010 on a loaded
-    // host during the EL1 correctness landing. Restore once rerun on a quiet host.
     assert!(
-        worst < 0.05,
+        worst < 0.01,
         "a timed futex wait cost {worst:.3} host exits; EL1 must end it on the virtual timer"
     );
 }
