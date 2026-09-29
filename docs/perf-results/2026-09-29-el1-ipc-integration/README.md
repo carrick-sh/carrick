@@ -337,3 +337,20 @@ claim or full checkpoint acceptance is made.
 Next: real blocked close/reuse and two-process functional witnesses, then
 mixed host/guest operation and signals with partial progress. Keep exit
 attribution bounded and separate from independent capability development.
+
+## Two-process inherited IPC: first signed execution is red
+
+Source `15021dfb8`, run `el1-ipc-processes-20260929-a`: pipe one-pair
+completed 128 checked round trips with 257 guest parks. Pipe eight-pair
+hit the unchanged 60-second watchdog. The census shows four idle-WFI slots
+and parked tasks spanning both address spaces. It also reports one lost
+adoption and one address-space refusal; these are observations, not a
+root-cause attribution. Later scales/eventfd did not run. Entitlement
+negative control passed; scoped cleanup found zero processes.
+
+Raw census/output and post-run executable fingerprint are retained in
+`processes-first-red*`. The exact failing bytes are preserved before any
+rebuild. No product fix, retry or acceptance is claimed. This concrete
+cross-process blocker takes priority over generic counter attribution.
+Next: inspect existing wake/handback ownership and reduce the parked state
+using existing scheduler/IPC contracts; no new diagnostic framework.
