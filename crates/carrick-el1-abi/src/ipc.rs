@@ -19,7 +19,12 @@
 //!   (`carrick_pipe_core::PipeRecord` or `EventFd`). A pipe's ring bytes and
 //!   page metadata live in a pool [`IpcPipeStorage`] extent.
 //! - **Continuations** — [`IpcOperation`]: the plain-data record an owned
-//!   suspended operation keeps outside any stack.
+//!   suspended operation keeps outside any stack, in an [`IpcOperationSlot`]
+//!   named by the owned [`IpcOpToken`] `(index, generation)` that the
+//!   scheduler stores with the parked thread.
+//! - **Wait identity** — an object's wait queue is named by its
+//!   [`IpcObjectHandle`] `(index, generation)` plus the lane
+//!   (`pipe::WaitFor::{Readable, Writable}`); distinct from any futex key.
 //!
 //! Handles ([`IpcObjectHandle`], `TableId`, `OfdPin`) carry generations;
 //! freeing an object, OFD or table advances its generation, so a stale handle
@@ -72,7 +77,10 @@ pub use carrick_pipe_core::{
 /// Descriptor tables (distinct `CLONE_FILES` groups) in the shared authority.
 pub const IPC_FD_TABLES: usize = 256;
 /// Open file descriptions in the shared authority.
-pub const IPC_OFDS: usize = 4096;
+pub const IPC_OFDS: usize = 2048;
+/// Suspended-operation records ([`IpcOperation`] behind an [`IpcOpToken`]).
+/// Exhaustion refuses before effects (`NoOperations`: EL1 forwards).
+pub const IPC_OPERATIONS: usize = 1024;
 /// Pipe and eventfd objects.
 pub const IPC_OBJECTS: usize = 1024;
 /// Guest page size used for pipe capacity and ring pages.
@@ -304,6 +312,9 @@ pub struct IpcDirectory {
     _reserved: [u64; 7],
     fd: IpcFdCore,
     objects: [IpcObjectRecord; IPC_OBJECTS],
+    free_operations: AtomicU64,
+    _reserved_ops: [u64; 7],
+    operations: [IpcOperationSlot; IPC_OPERATIONS],
 }
 
 /// Layout facts of this ABI; see [`IPC_LAYOUT_HASH`].
@@ -342,6 +353,10 @@ const LAYOUT_FACTS: &[u64] = &[
     TAG_SHIFT as u64,
     END_WRITER,
     INDEX_BITS,
+    IPC_OPERATIONS as u64,
+    core::mem::size_of::<IpcOperationSlot>() as u64,
+    core::mem::offset_of!(IpcDirectory, operations) as u64,
+    core::mem::offset_of!(IpcOperationSlot, op) as u64,
 ];
 
 /// FNV-1a over [`LAYOUT_FACTS`] and the fd core's layout facts. Written into
@@ -403,7 +418,7 @@ pub struct IpcUserVa(pub u64);
 /// signal after progress returns it (never replays bytes). `park_seq` is the
 /// object's read/write sequence sampled before parking. The copier reloads
 /// `mm` before touching `buf`.
-#[repr(C, align(64))]
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IpcOperation {
     pub kind: IpcOpKind,
@@ -437,6 +452,59 @@ impl IpcOperation {
     };
 }
 
+/// Owned handle of one suspended operation's record: the opaque
+/// `(index, generation)` the scheduler keeps in the parked thread's record
+/// across park, wake and control claims. Exactly one owner: not
+/// `Clone`/`Copy`; [`IpcOpToken::into_raw`]/[`IpcOpToken::from_raw`] move
+/// that ownership into and out of a shared record (a copied raw value is
+/// not a second owner). The owner alone reads and updates the record, so
+/// the pinned description, buffer authority and byte progress behind the
+/// token have one completion owner; [`IpcRegion::finish_operation`]
+/// returns them and retires the token.
+#[must_use = "an operation record stays allocated until finish_operation"]
+#[derive(Debug, Eq, PartialEq)]
+pub struct IpcOpToken {
+    index: u32,
+    generation: u32,
+}
+/// Plain-data [`IpcOpToken`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawIpcOpToken {
+    pub index: u32,
+    pub generation: u32,
+}
+impl IpcOpToken {
+    pub fn into_raw(self) -> RawIpcOpToken {
+        RawIpcOpToken {
+            index: self.index,
+            generation: self.generation,
+        }
+    }
+    /// Reclaim the ownership moved out by [`IpcOpToken::into_raw`].
+    pub fn from_raw(raw: RawIpcOpToken) -> Self {
+        Self {
+            index: raw.index,
+            generation: raw.generation,
+        }
+    }
+}
+
+/// One operation record slot. `op` is touched only by the token's owner;
+/// `live`/`generation` authenticate tokens (a finished record advances its
+/// generation, retiring the slot when exhausted).
+#[repr(C)]
+pub struct IpcOperationSlot {
+    generation: AtomicU32,
+    live: AtomicU32,
+    next_free: AtomicU64,
+    op: UnsafeCell<IpcOperation>,
+}
+// SAFETY: `op` is accessed only by the single owner of the slot's live
+// token; ownership moves between vCPUs/host through the scheduler's claim
+// CAS (Acquire/Release), which orders the accesses.
+unsafe impl Sync for IpcOperationSlot {}
+
 // ---------------------------------------------------------------- errors
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -449,6 +517,8 @@ pub enum IpcError {
     WrongKind,
     /// Every object record is in use.
     NoObjects,
+    /// Every operation record is in use (refused before effects).
+    NoOperations,
     /// The host must provision pipe storage of at least this size (outside
     /// any lock) and retry; never a guest errno by itself.
     NeedsStorage { ring_bytes: u64, pages: u64 },
@@ -514,6 +584,9 @@ impl<'a> IpcRegion<'a> {
         d.fd.initialize(identity).map_err(IpcError::Fd)?;
         for i in (0..IPC_OBJECTS).rev() {
             push(&d.free_objects, i, &d.objects[i].next_free);
+        }
+        for i in (0..IPC_OPERATIONS).rev() {
+            push(&d.free_operations, i, &d.operations[i].next_free);
         }
         d.header.magic.store(IPC_MAGIC, Ordering::Relaxed);
         d.header
@@ -796,6 +869,75 @@ impl<'a> IpcRegion<'a> {
             r.generation.load(Ordering::Acquire) == object.generation as u64
                 && r.host_wake_owed.swap(0, Ordering::AcqRel) != 0
         })
+    }
+}
+
+impl<'a> IpcRegion<'a> {
+    fn op_slot(&self, token: &IpcOpToken) -> Result<&'a IpcOperationSlot, IpcError> {
+        let slot = self
+            .dir
+            .operations
+            .get(token.index as usize)
+            .ok_or(IpcError::Stale)?;
+        if slot.live.load(Ordering::Acquire) == 0
+            || slot.generation.load(Ordering::Acquire) != token.generation
+        {
+            return Err(IpcError::Stale);
+        }
+        Ok(slot)
+    }
+
+    /// Record a suspended operation (moving its pin into `op`) and return
+    /// the owned token the scheduler keeps with the parked thread. Lock-free.
+    pub fn begin_operation(&self, op: IpcOperation) -> Result<IpcOpToken, IpcError> {
+        let ops = &self.dir.operations;
+        let index = pop(&self.dir.free_operations, |i| {
+            ops.get(i).map(|o| o.next_free.load(Ordering::Relaxed))
+        })
+        .ok_or(IpcError::NoOperations)?;
+        let slot = &ops[index];
+        // SAFETY: the slot was just popped from the free list: no token
+        // names it, so this caller is its only accessor.
+        unsafe { *slot.op.get() = op };
+        slot.live.store(1, Ordering::Release);
+        Ok(IpcOpToken {
+            index: index as u32,
+            generation: slot.generation.load(Ordering::Relaxed),
+        })
+    }
+
+    /// The owner's view of its operation record.
+    pub fn operation(&self, token: &IpcOpToken) -> Result<IpcOperation, IpcError> {
+        let slot = self.op_slot(token)?;
+        // SAFETY: the token's owner is the slot's only accessor.
+        Ok(unsafe { *slot.op.get() })
+    }
+
+    /// Store the owner's progress (e.g. bytes transferred before re-parking).
+    pub fn update_operation(&self, token: &IpcOpToken, op: IpcOperation) -> Result<(), IpcError> {
+        let slot = self.op_slot(token)?;
+        // SAFETY: the token's owner is the slot's only accessor.
+        unsafe { *slot.op.get() = op };
+        Ok(())
+    }
+
+    /// Complete the operation: return its record (the caller then unpins
+    /// `op.pin` exactly once) and retire the token.
+    pub fn finish_operation(&self, token: IpcOpToken) -> Result<IpcOperation, IpcError> {
+        let slot = self.op_slot(&token)?;
+        // SAFETY: the token's owner is the slot's only accessor.
+        let op = unsafe { *slot.op.get() };
+        slot.live.store(0, Ordering::Relaxed);
+        let next = token.generation.wrapping_add(1);
+        slot.generation.store(next, Ordering::Release);
+        if next != u32::MAX {
+            push(
+                &self.dir.free_operations,
+                token.index as usize,
+                &slot.next_free,
+            );
+        }
+        Ok(op)
     }
 }
 
