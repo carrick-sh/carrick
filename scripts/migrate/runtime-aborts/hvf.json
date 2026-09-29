@@ -986,7 +986,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::prepare_el1_frame_grant",
       "ordinal_in_function": 2,
-      "fingerprint": "2a0d4b312777bb9986093e96b06b5a02630d566ef918b5dd4e31cb6fde2dc09e",
+      "fingerprint": "5bcab621e68692ffb58e95060d95fa86be22d654dd9338b6820bcb71ee4aa37d",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::el1_frame_grant",
       "rationale": "Published EL1 frame grant failed to bind allocator diagnostics into the custody registry.",
