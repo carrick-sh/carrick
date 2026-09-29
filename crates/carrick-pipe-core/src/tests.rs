@@ -529,3 +529,77 @@ fn el1_ipc_copy_work_is_linear_in_delivered_bytes() {
         }
     }
 }
+
+#[test]
+fn el1_ipc_reback_preserves_wrapped_partial_pages_and_endpoints() {
+    let mut bytes = [0; 8192];
+    let mut slots = [Page::default(); 2];
+    let mut record = PipeRecord::default();
+    let mut p = Pipe::init(&mut record, &mut bytes, &mut slots, 4096, 8192).unwrap();
+    assert_eq!(p.try_write(&[1; 8192]).result, Ok(8192));
+    assert_eq!(p.try_read(&mut [0; 4096]).result, Ok(4096));
+    assert_eq!(p.try_write(&[2; 4096]).result, Ok(4096));
+    assert_eq!(p.try_read(&mut [0; 17]).result, Ok(17));
+    p.retain(End::Reader).unwrap();
+    let mut larger = [0; 16384];
+    let mut larger_slots = [Page::default(); 4];
+    let mut p = p.replace_storage(&mut larger, &mut larger_slots).unwrap();
+    assert_eq!(p.capacity(), 8192);
+    assert_eq!(p.references(End::Reader), 2);
+    assert_eq!(p.references(End::Writer), 1);
+    assert_eq!(p.set_capacity(16384, 16384).result, Ok(16384));
+    assert_eq!(p.try_write(&[3; 4096]).result, Ok(4096));
+    let mut out = [0; 16384];
+    assert_eq!(p.try_read(&mut out).result, Ok(12288 - 17));
+    assert!(out[..4079].iter().all(|b| *b == 1));
+    assert!(out[4079..8175].iter().all(|b| *b == 2));
+    assert!(out[8175..12271].iter().all(|b| *b == 3));
+}
+
+#[test]
+fn el1_ipc_reback_refusal_preserves_live_record_and_bytes() {
+    let mut bytes = [0; 8192];
+    let mut slots = [Page::default(); 2];
+    let mut record = PipeRecord::default();
+    let mut p = Pipe::init(&mut record, &mut bytes, &mut slots, 4096, 8192).unwrap();
+    assert_eq!(p.try_write(b"unchanged").result, Ok(9));
+    let before = *p.state;
+    let mut small = [0; 4096];
+    let mut small_slots = [Page::default(); 1];
+    assert!(matches!(
+        p.replace_storage(&mut small, &mut small_slots),
+        Err(Error::Storage)
+    ));
+    assert_eq!(record, before);
+    let mut p = Pipe::attach(&mut record, &mut bytes, &mut slots).unwrap();
+    let mut out = [0; 9];
+    assert_eq!(p.try_read(&mut out).result, Ok(9));
+    assert_eq!(&out, b"unchanged");
+}
+
+#[test]
+fn el1_ipc_peek_then_commit_preserves_undelivered_suffix() {
+    let mut bytes = [0; 8192];
+    let mut slots = [Page::default(); 2];
+    let mut p = Pipe::with_capacity(&mut bytes, &mut slots, 4096, 8192).unwrap();
+    assert_eq!(p.try_write(&[7; 5000]).result, Ok(5000));
+    let before = *p.st();
+    let mut copied = 0;
+    assert_eq!(
+        p.peek_with(5000, |chunk| {
+            let n = chunk.len().min(4000 - copied);
+            copied += n;
+            n
+        }),
+        Ok(4000)
+    );
+    assert_eq!(*p.st(), before);
+    assert_eq!(p.peek_with(5000, |_| 0), Err(Error::Fault));
+    assert_eq!(*p.st(), before);
+    assert_eq!(p.consume(5001).result, Err(Error::Invalid));
+    assert_eq!(*p.st(), before);
+    assert_eq!(p.consume(4000).result, Ok(4000));
+    let mut out = [0; 2000];
+    assert_eq!(p.try_read(&mut out).result, Ok(1000));
+    assert!(out[..1000].iter().all(|b| *b == 7));
+}

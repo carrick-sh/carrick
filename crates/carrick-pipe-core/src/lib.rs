@@ -128,6 +128,13 @@ pub struct Pipe<'a, R: BorrowMut<PipeRecord> = PipeRecord> {
     work: Work,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadAction {
+    CopyAndConsume,
+    Peek,
+    Consume,
+}
+
 #[cfg(test)]
 #[derive(Default, Clone, Copy)]
 struct Work {
@@ -288,6 +295,56 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         }
     }
 
+    /// Move live storage to a separately provisioned extent. The caller holds
+    /// the object lock and publishes the replacement only after success. The
+    /// logical capacity, page offsets, byte order and endpoint counts survive;
+    /// `set_capacity` separately applies the venue's authorized growth limit.
+    /// Failure leaves the old storage and shared record unchanged. The new
+    /// extent can be discarded; it is never installed on refusal.
+    pub fn replace_storage<'b>(
+        mut self,
+        bytes: &'b mut [u8],
+        slots: &'b mut [Page],
+    ) -> Result<Pipe<'b, R>, Error> {
+        let state = *self.st();
+        let page_size = self.page_size();
+        let pages = state.capacity_pages as usize;
+        if bytes.len() < self.capacity() || slots.len() < pages {
+            return Err(Error::Storage);
+        }
+        // Authenticate every live page before changing even destination bytes.
+        for ordinal in 0..state.used as usize {
+            let page = self.slots[(state.head as usize + ordinal) % pages];
+            if page.len == 0 || u64::from(page.offset) + u64::from(page.len) > state.page_size {
+                return Err(Error::Corrupt);
+            }
+        }
+        slots.fill(Page::default());
+        for (ordinal, slot) in slots.iter_mut().enumerate().take(state.used as usize) {
+            let old = (state.head as usize + ordinal) % pages;
+            let page = self.slots[old];
+            let offset = page.offset as usize;
+            let len = page.len as usize;
+            let source = old * page_size + offset;
+            let dest = ordinal * page_size + offset;
+            bytes[dest..dest + len].copy_from_slice(&self.bytes[source..source + len]);
+            *slot = page;
+            #[cfg(test)]
+            {
+                self.work.copied += len;
+                self.work.visits += 1;
+            }
+        }
+        self.state.borrow_mut().head = 0;
+        Ok(Pipe {
+            state: self.state,
+            bytes,
+            slots,
+            #[cfg(test)]
+            work: self.work,
+        })
+    }
+
     /// Retain an existing live endpoint (including a suspended syscall lease).
     /// A closed endpoint cannot be resurrected. Dup/fork of a description may
     /// instead share a venue lease and release this count only on final close.
@@ -387,7 +444,36 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
     /// The delivered prefix is the result; if nothing was delivered the
     /// result is [`Error::Fault`] and the pipe is unchanged. EOF and
     /// `WouldBlock` are decided before `copy` runs.
-    pub fn read_with(&mut self, max: usize, mut copy: impl FnMut(&[u8]) -> usize) -> Step<usize> {
+    pub fn read_with(&mut self, max: usize, copy: impl FnMut(&[u8]) -> usize) -> Step<usize> {
+        self.read_action(max, copy, ReadAction::CopyAndConsume)
+    }
+
+    /// Copy without consuming. The caller retains the object lock through a
+    /// following `consume`, committing only the prefix accepted by a splice
+    /// destination. A tee omits that commit entirely.
+    pub fn peek_with(
+        &mut self,
+        max: usize,
+        copy: impl FnMut(&[u8]) -> usize,
+    ) -> Result<usize, Error> {
+        self.read_action(max, copy, ReadAction::Peek).result
+    }
+
+    /// Commit an already delivered prefix under the same exclusive ownership
+    /// as `peek_with`. No bytes are copied or allocated by this operation.
+    pub fn consume(&mut self, count: usize) -> Step<usize> {
+        if count > self.unread_bytes() {
+            return Step::quiet(Err(Error::Invalid));
+        }
+        self.read_action(count, |chunk| chunk.len(), ReadAction::Consume)
+    }
+
+    fn read_action(
+        &mut self,
+        max: usize,
+        mut copy: impl FnMut(&[u8]) -> usize,
+        action: ReadAction,
+    ) -> Step<usize> {
         if max == 0 {
             return Step::quiet(Ok(0));
         }
@@ -416,13 +502,18 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
             let delivered = copy(&self.bytes[start..start + n]).min(n);
             #[cfg(test)]
             {
-                self.work.copied += delivered;
+                if action != ReadAction::Consume {
+                    self.work.copied += delivered;
+                }
                 self.work.visits += 1;
             }
             done += delivered;
-            let slot = &mut self.slots[head];
+            let mut slot = self.slots[head];
             slot.offset += delivered as u32;
             slot.len -= delivered as u32;
+            if action != ReadAction::Peek {
+                self.slots[head] = slot;
+            }
             if slot.len == 0 {
                 head = (head + 1) % pages;
                 used -= 1;
@@ -431,14 +522,16 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
                 break;
             }
         }
-        let s = self.state.borrow_mut();
-        s.head = head as u64;
-        s.used = used;
-        s.unread -= done as u64;
+        if action != ReadAction::Peek {
+            let s = self.state.borrow_mut();
+            s.head = head as u64;
+            s.used = used;
+            s.unread -= done as u64;
+        }
         if done == 0 {
             Step::quiet(Err(Error::Fault))
         } else {
-            Step::changed(done, false, true)
+            Step::changed(done, false, action != ReadAction::Peek)
         }
     }
 
