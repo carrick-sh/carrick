@@ -1,30 +1,71 @@
-# Descriptor substrate (checkpoint 3.1)
+# Descriptor substrate (checkpoint 3.1, shared records for checkpoint 3)
 
-`Core<T, O>` owns T table identities and O shared open file descriptions.
-Each table borrows venue-provided descriptor slots and a hierarchical free-slot
-bitmap through `TableStorage`. No `std`, `alloc`, dependency, host lock, host fd,
-syscall, or venue binding is present. The workspace's `crates/*` membership
-includes this crate automatically.
+`Core<T, O>` owns T table identities and O shared open file descriptions as
+one `repr(C)` object of atomics with no pointers, so a single instance can live
+in memory shared by the host and EL1. Both venues operate on it through
+`core.bind(&backing, wait)`, an `Authority` view supplying descriptor-slot
+resolution (`SlotBacking`) and a lock-wait policy (`LockWait`, shared with
+sched-core: EL1 uses a bounded spin and forwards on `Contended`, the host
+waits). No `std`, `alloc`, host lock, host fd, syscall or venue binding is
+present; the only dependency is the neutral `carrick-sched-core` lock-wait
+trait. The workspace's `crates/*` membership includes this crate automatically.
 
-Descriptor backing capacity is independent of the configured soft limit. The
-venue validates that limit against RLIMIT_NOFILE's hard limit and `nr_open`;
-the core imposes only the signed descriptor number's representation limit.
-When the lowest free descriptor needs additional storage, `NeedsBacking`
-reports the required descriptor count without changing entries or refcounts.
-The venue supplies larger slots plus `bitmap_words(capacity)` u64 words, calls
-`grow_table`, and retries. Geometric growth amortizes storage replacement;
-`NeedsBacking` reports the minimum, not an allocation policy. The venue must
-never translate `NeedsBacking` to EMFILE.
-`TooManyFiles` means no free descriptor exists below the configured soft limit.
-A table may start with no backing, including with a 1,048,576 soft limit.
+Each table's slots and hierarchical free-slot bitmap live in a venue-provided
+`Extent` (opaque token + capacity) stored in its `TableRecord` and resolved per
+operation under the table's lock; tokens are never pointers. Descriptor backing
+capacity is independent of the configured soft limit. The venue validates that
+limit against RLIMIT_NOFILE's hard limit and `nr_open`; the core imposes only
+the signed descriptor number's representation limit. When the lowest free
+descriptor needs additional storage, `NeedsBacking` reports the required
+descriptor count without changing entries or refcounts. The venue provisions a
+larger extent **outside any lock** (`bitmap_words(capacity)` u64 words beside
+the slots), calls `grow_table`, and retries. Geometric growth amortizes storage
+replacement; `NeedsBacking` reports the minimum, not an allocation policy. The
+venue must never translate `NeedsBacking` to EMFILE. EL1 never provisions: it
+forwards before effects. `TooManyFiles` means no free descriptor exists below
+the configured soft limit. A table may start with no backing (`Extent::EMPTY`),
+including with a 1,048,576 soft limit.
 
-`create_table` and `fork` consume a `TableStorage` only on success. `grow_table`
+`create_table` and `fork` consume an `Extent` only on success. `grow_table`
 swaps larger backing into an existing table, preserving its identity, flags,
-offsets, free holes and shared OFD reference counts. The argument receives the
-retired backing, which can be reused for another table or recovered with
-`into_parts`. `destroy_table` likewise returns its backing after finalization.
-No pointer into replaced storage is retained. Supply storage with a lifetime
-covering the authority; recycling slices does not require dropping the core.
+offsets, free holes and shared OFD reference counts; the argument receives the
+retired extent. `destroy_table` likewise returns its extent after
+finalization. No reference into replaced storage outlives the operation.
+
+## Contract: kernel.el1.ipc-fd-authority
+
+Shared-record rules (VM-free bindings: this crate's `el1_ipc_*` tests):
+
+- **Publication.** Zeroed memory is a valid *unpublished* core; every operation
+  fails closed (`StaleTable`) until the one initialization venue calls
+  `Core::initialize(identity)`, which links the free lists and then publishes
+  the nonzero identity with Release. A table becomes visible when its record's
+  generation and then `state` (Release) are stored, under its lock.
+- **Synchronization.** One lock word per table covers that table's slots,
+  limit and extent; there is no whole-core lock, and no operation holds a lock
+  across I/O. OFD reference/pin counts, status flags and offsets are atomic
+  words shared by every table naming the description (fork, CLONE_FILES); the
+  OFD and table free lists are tagged lock-free stacks. Lock order: at most one
+  published table lock, plus the lock of an unpublished fork/create target.
+- **Pins.** `pin(table, fd)` resolves a descriptor (one slot read, one OFD
+  word) and returns an owned, non-Copy `OfdPin` retaining that exact
+  description incarnation. Closing or reusing the fd, closing every alias, or
+  destroying the table never finalizes a pinned description: `holds` packs
+  descriptor references (high 32 bits) and pins (low 32 bits), and whoever
+  moves it to zero receives the description exactly once (from `close`,
+  `dup2/3`, range/exec/destroy callbacks, or `unpin`). `pinned` reads current
+  flags (F_SETFL from a sibling is visible to a suspended operation).
+  `into_raw`/`from_raw` move the one ownership into and out of a shared
+  continuation record; a stale, copied or foreign raw pin fails `StalePin`
+  and changes nothing.
+- **Generations.** Table IDs carry authority, index and a non-wrapping
+  generation; OFD records advance their generation when freed, so reused
+  indices never match stale keys. Exhausted generations retire the slot.
+- **Budgets.** Lookup/pin reads exactly one descriptor slot at 65, 4096 and
+  65,536 populated descriptors; allocation keeps the logarithmic bitmap budget
+  below; zero allocation (no `alloc`). A contended lock with a bounded policy
+  refuses with `Contended` before any effect. Concurrent pin/unpin/close from
+  two forked tables finalizes exactly once (200 threaded rounds).
 
 ## Contract: fd-core-lifecycle-v1
 
@@ -45,7 +86,8 @@ summarizes 64 words below it: O(log64 capacity) independently of occupancy.
 Marking an allocated/freed slot updates one word per level. Lookup indexes one
 table slot and one OFD slot. OFD allocation remains a free-list pop.
 All core operations allocate zero heap objects; production code imports neither
-`alloc` nor `std`. Table creation/fork cost O(T + backed capacity) and growth
+`alloc` nor `std`. Table creation/fork cost O(backed capacity) (identities come
+from a lock-free free list) and growth
 costs O(backed capacity). Range close/exec/teardown scan backed capacity and
 update the bitmap in O(log64 capacity) per closed descriptor, never scanning
 O(last) for an unbounded close_range endpoint. Table identity uses a non-wrapping generation plus
@@ -56,13 +98,9 @@ The director owns those later gates. No existing runtime behavior changes.
 
 ## Venue responsibilities
 
-- Serialize each complete core operation with exclusive access to the Core.
-  This lock covers tables **and shared OFDs**; a table-only lock is insufficient
-  for forked tables that share offsets. No blocking I/O belongs inside it.
-  Host and EL1 must share one authority and its synchronization, not copy it.
-  Constructor identity allocation belongs to one initialization venue; do not
-  independently construct authorities in separately linked address spaces and
-  exchange their IDs. IDs are not persistent serialization identifiers.
+- Host and EL1 bind the SAME core in shared memory; never construct a second
+  authority for the same descriptor namespace, and never copy records.
+  Constructor identity allocation belongs to one initialization venue.
 - CLONE_FILES owners use the same TableId, without adding OFD references.
   The venue tracks table owners and calls destroy_table at last-owner exit.
   Fork creates a new TableId and retains once per copied descriptor.
@@ -76,9 +114,9 @@ The director owns those later gates. No existing runtime behavior changes.
   Dropping Core does not release external resources: drain tables first.
   The venue must also perform per-descriptor epoll/record-lock cleanup, including
   non-final closes; final-OFD notifications do not replace descriptor cleanup.
-- A get snapshot does not retain an OFD. Finish offset/flag transactions under
-  the lock; asynchronous I/O and SCM_RIGHTS need a future owned pin mechanism.
-  This core counts descriptor references only and is not wired into I/O yet.
+- A get snapshot does not retain an OFD; a suspended or in-flight operation
+  (and future SCM_RIGHTS in flight) holds an `OfdPin` instead of a numeric fd.
+  A final release from `unpin` obliges the venue exactly like a final close.
 - Translate raw ABI constants to typed modes/flags. getfd/setfd model FD_CLOEXEC
   (ignore other F_SETFD bits); dupfd's bool selects F_DUPFD_CLOEXEC; dup3's bool
   represents validated O_CLOEXEC. Reject any other dup3/close_range raw flags
@@ -90,7 +128,8 @@ The director owns those later gates. No existing runtime behavior changes.
   DIRECT support and async notification in the backing personality. O_PATH
   allows duplication and descriptor flags but rejects setfl with BadFd.
 - Map BadFd to EBADF, InvalidArgument to EINVAL, TooManyFiles to EMFILE and
-  NoMemory to ENOMEM. StaleTable is a venue ownership bug, not a guest errno.
+  NoMemory to ENOMEM. StaleTable, StalePin and BadBacking are venue ownership
+  bugs, not guest errnos; Contended means "forward before effects".
   Resource exhaustion differs from the per-table soft fd ceiling. Existing
   descriptors remain usable after lowering the soft limit, including dup2 onto
   self, fork and close-on-exec above the new limit. A storage request is not
