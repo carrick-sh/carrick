@@ -1,0 +1,131 @@
+    Finished `release` profile [optimized] target(s) in 0.08s
+build-embed-interceptor-probe: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/interceptor-probe-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-zone-readers: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/zone-readers-aarch64
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-sched-core)
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fd-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+   Compiling carrick-embed-el1-sched v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/fixtures/embed-el1-sched)
+    Finished `release` profile [optimized] target(s) in 1.16s
+build-embed-el1-sched: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/el1-sched-aarch64
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-sched-core)
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fd-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 33s
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/host_wait_policy-728fed50fb490be5.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/host_wait_policy-728fed50fb490be5
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/write_seek_contract-ae3942d64d36dd47.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/write_seek_contract-ae3942d64d36dd47
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/inotify_hotpath_contract-447c6fd266adf039.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/inotify_hotpath_contract-447c6fd266adf039
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify-8d58401ad14f61d2.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify-8d58401ad14f61d2
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/wedge_capture_ladder-c184a6d912502b10.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/wedge_capture_ladder-c184a6d912502b10
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/kernel_abort-201c922b6ee92d74.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/kernel_abort-201c922b6ee92d74
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/realtime_calibration-ab4ec1be5f00ad51.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/realtime_calibration-ab4ec1be5f00ad51
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/perf_regression-c77a40a76f722eca.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/perf_regression-c77a40a76f722eca
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/fault_budget_guest-b05d4abe5fb16d7c.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/fault_budget_guest-b05d4abe5fb16d7c
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_preemption-fec5a6ce0c55a5db.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_preemption-fec5a6ce0c55a5db
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/pt_pause_drain_pressure-e1f729ebc91cdf7d.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/pt_pause_drain_pressure-e1f729ebc91cdf7d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/shared_buffer_futex-f5fc4aac3288eaab.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/shared_buffer_futex-f5fc4aac3288eaab
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_files-f14f7a86ea8287c9.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_files-f14f7a86ea8287c9
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_kick_served_loop-9721202fdb30b811.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_kick_served_loop-9721202fdb30b811
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_gic-08087e1d0b8bdf2e.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_gic-08087e1d0b8bdf2e
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/discard_fork_threads-40d01799be59a0ad.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/discard_fork_threads-40d01799be59a0ad
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_race-3690085b56dad18b.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_race-3690085b56dad18b
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/conformance_contracts-e010d7eaa8826e2d.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/conformance_contracts-e010d7eaa8826e2d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify09_probe-8ab374e06b8cf677.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify09_probe-8ab374e06b8cf677
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_transparent-2ea7e87d7d389879.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_transparent-2ea7e87d7d389879
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/crash_parked_thread-daaf29baf92b16c3.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/crash_parked_thread-daaf29baf92b16c3
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_embed-ac5091a89d42fbfc.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_embed-ac5091a89d42fbfc
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/guest_smoke-820ee32ef5a9e9d3.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/guest_smoke-820ee32ef5a9e9d3
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_vcpu_lifetime-16462fe60de7b299.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_vcpu_lifetime-16462fe60de7b299
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/two_process_parallelism-266adc1a3cc33999.tmp.4679: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/two_process_parallelism-266adc1a3cc33999
+test-signed: resolved exact filter el1_ipc_two_processes_blocking -> el1_ipc_two_processes_blocking
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e el1_ipc_two_processes_blocking --exact --nocapture
+
+running 1 test
+test el1_ipc_two_processes_blocking ... IPC pairs pipe n=1: zone=ZoneCounts { el1_parks: 257, el1_switches: 255, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 128, sgis: 128, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 146, wfi_entries: 138, idle_exits: 5, misplaced: 0, steals: 133, service_exits: 9, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 9), (59, 2), (64, 1), (73, 1), (93, 2), (94, 2), (96, 2), (132, 9), (134, 5), (135, 21), (178, 2), (215, 5), (220, 3), (226, 5), (260, 1)] exit 0 signal None stdout "ipc-processes kind=pipe pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs pipe n=1 served before=[0, 0] after=[511, 256]
+IPC pairs pipe n=8: zone=ZoneCounts { el1_parks: 2044, el1_switches: 2019, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 2, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 34, wfi_entries: 13, idle_exits: 8, misplaced: 15, steals: 28, service_exits: 46, service_placements: 24, ready_placements: 0, service_adoptions: 24, exit_adoptions: 33, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 71), (59, 16), (63, 4), (64, 3), (73, 1), (93, 16), (94, 2), (96, 2), (98, 2), (132, 52), (134, 5), (135, 77), (178, 16), (215, 34), (220, 17), (222, 6), (226, 33), (260, 1)] exit 0 signal None stdout "ipc-processes kind=pipe pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs pipe n=8 served before=[511, 256] after=[4562, 2303]
+IPC pairs pipe n=64: zone=ZoneCounts { el1_parks: 16315, el1_switches: 16096, host_parks: 7, signal_claims: 0, control_claims: 0, cross_wakes: 11, sgis: 0, preemptions: 18, migrations: 0, timeouts: 0, idle_entries: 192, wfi_entries: 8, idle_exits: 7, misplaced: 213, steals: 282, service_exits: 403, service_placements: 152, ready_placements: 1, service_adoptions: 152, exit_adoptions: 392, host_handbacks: 4, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 611), (59, 128), (63, 31), (64, 15), (73, 1), (93, 128), (94, 2), (96, 2), (98, 12), (132, 387), (134, 5), (135, 535), (178, 128), (215, 264), (220, 129), (222, 22), (226, 262), (260, 1)] exit 0 signal None stdout "ipc-processes kind=pipe pairs=64 rounds=128 completed=8192\n" stderr ""
+IPC pairs pipe n=64 served before=[4562, 2303] after=[36946, 18679]
+IPC pairs eventfd n=1: zone=ZoneCounts { el1_parks: 257, el1_switches: 256, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 257, sgis: 3, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 265, wfi_entries: 8, idle_exits: 6, misplaced: 0, steals: 3, service_exits: 3, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 2), (57, 4), (64, 1), (73, 1), (93, 2), (94, 2), (96, 2), (98, 2), (132, 9), (134, 5), (135, 21), (178, 2), (215, 5), (220, 3), (226, 5), (260, 1)] exit 0 signal None stdout "ipc-processes kind=eventfd pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs eventfd n=1 served before=[36946, 18679] after=[37457, 18935]
+IPC pairs eventfd n=8: zone=ZoneCounts { el1_parks: 2046, el1_switches: 2013, host_parks: 2, signal_claims: 0, control_claims: 0, cross_wakes: 17, sgis: 2, preemptions: 1, migrations: 0, timeouts: 0, idle_entries: 45, wfi_entries: 13, idle_exits: 5, misplaced: 27, steals: 26, service_exits: 55, service_placements: 21, ready_placements: 0, service_adoptions: 21, exit_adoptions: 34, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 16), (57, 36), (64, 3), (73, 1), (93, 16), (94, 2), (96, 2), (98, 7), (132, 51), (134, 5), (135, 78), (178, 16), (215, 35), (220, 17), (222, 2), (226, 33), (260, 1)] exit 0 signal None stdout "ipc-processes kind=eventfd pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs eventfd n=8 served before=[37457, 18935] after=[41505, 20982]
+WATCHDOG: timeout (60s) exceeded for CARRICK_RUN_ID=el1-ipc-processes-20260929-b; reaping with scripts/sudo/kill.sh
+WATCHDOG zone census:
+zone slot 0: state=IdleWfi mm=17 installed=0 cpu+1=1 current=0 host_record=1 len=0 queue=[] resched=0 timer_cval=0
+zone slot 1: state=IdleWfi mm=18 installed=0 cpu+1=2 current=0 host_record=2 len=0 queue=[] resched=0 timer_cval=0
+zone slot 2: state=IdleWfi mm=0 installed=0 cpu+1=3 current=0 host_record=0 len=0 queue=[] resched=0 timer_cval=0
+zone slot 3: state=IdleWfi mm=0 installed=0 cpu+1=4 current=0 host_record=0 len=0 queue=[] resched=0 timer_cval=0
+zone counters: el1_wakes=37215 host_wakes=17 el1_parks=37218 host_parks=21 switches=36696 steals=771 service_exits=927 host_service_placements=363 host_ready_placements=3 resched_kicks=168 service_adoptions=363 exit_adoptions=847 host_handbacks=17 lost_adoptions=2 stale_services=0 held_refusals=0 host_queue_claims=0 host_executor_parks=0 host_queue_takes=0 foreign_adoptions=570
+zone spaces: idle_ttbr=0x2d001f8000 el1_space_switches=19542 el1_space_refusals=10 el1_cow_invalidations=0
+zone space 17: mm=17 gate=0x0
+zone space 18: mm=18 gate=0x0
+zone record 1: claim=Parked { seq: 888 } handback=None tid=175 serial=1838 mm=17 gen=34 home=Some(SlotId(0)) last_slot=None wanted=false cancelled=false entries=1 deadline=None
+zone record 2: claim=Parked { seq: 772 } handback=None tid=176 serial=1880 mm=18 gen=39 home=Some(SlotId(1)) last_slot=None wanted=false cancelled=false entries=1 deadline=None
+zone record 8: claim=Parked { seq: 622 } handback=None tid=301 serial=2743 mm=18 gen=9 home=None last_slot=Some(SlotId(1)) wanted=false cancelled=false entries=0 deadline=None
+zone record 15: claim=Parked { seq: 367 } handback=None tid=274 serial=2568 mm=17 gen=9 home=None last_slot=Some(SlotId(1)) wanted=false cancelled=false entries=0 deadline=None
+
+
+thread 'el1_ipc_two_processes_blocking' (34466545) panicked at crates/carrick-embed/tests/common/mod.rs:112:21:
+container run failed: kernel aborted: kernel abort requested for run el1-ipc-processes-20260929-b
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+pass 1: killing 1 procs (run-id el1-ipc-processes-20260929-b)
+scripts/test-signed.sh: line 371:  6691 Killed: 9               env RUST_TEST_THREADS=1 "$exe" "$@"
+test-signed: FAIL /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.noent.4679: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.noent.4679
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id el1-ipc-processes-20260929-b) = 0
+remaining carrick procs (run-id el1-ipc-processes-20260929-b) = 0
+remaining carrick procs (run-id el1-ipc-processes-20260929-b-cli) = 0

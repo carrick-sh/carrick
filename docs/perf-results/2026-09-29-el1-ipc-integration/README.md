@@ -354,3 +354,25 @@ rebuild. No product fix, retry or acceptance is claimed. This concrete
 cross-process blocker takes priority over generic counter attribution.
 Next: inspect existing wake/handback ownership and reduce the parked state
 using existing scheduler/IPC contracts; no new diagnostic framework.
+
+## Unplaceable guest wake correction, remaining eventfd failure
+
+`8c9617950` removes a proved ownership gap: object readiness could leave
+an unplaceable waiter parked with only a pending-host flag and no specific
+delivery owner. The existing scheduler fallback instead queues its owned
+operation and requests misplaced handback. The deterministic regression
+fails before (queued=0), passes after; all 62 scheduler-core and 14 focused
+EL1 IPC tests pass. An initial exact-name invocation selected zero tests
+and was not counted; the subsequent selected test supplied the red.
+
+Unchanged signed run `el1-ipc-processes-20260929-b` completes pipe at
+1/8/64 pairs and eventfd at 1/8 pairs, with every payload checked. Eventfd64
+hits the existing watchdog: two home records with wait entries and two
+remaining worker records are parked. Full test remains RED. Some completed
+populations also miss the unchanged served-write bound; no zero-exit claim
+is made. Negative entitlement passes; scoped cleanup zero. Exact failed
+bytes and complete census are preserved in `processes-wake-fix*`.
+
+Next decisive experiment: use existing kernel post-mortem/event-ring capture
+on the remaining eventfd case to identify the two workers' wait ownership.
+Do not rerun until green or assume the first correction explains this state.
