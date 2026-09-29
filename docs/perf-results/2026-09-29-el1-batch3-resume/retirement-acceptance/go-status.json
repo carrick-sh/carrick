@@ -1,0 +1,402 @@
+[
+  {
+    "round": 1,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round1.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 2,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round2.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 3,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round3.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 4,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round4.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 5,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round5.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 6,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round6.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 7,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round7.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 8,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round8.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 9,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round9.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 10,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round10.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 11,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round11.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 12,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round12.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 13,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round13.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 14,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round14.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 15,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round15.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 16,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round16.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 17,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round17.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 18,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round18.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 19,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round19.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  },
+  {
+    "round": 20,
+    "exit": 0,
+    "args": [
+      "target/debug/carrick-conformance",
+      "--suite",
+      "go-build",
+      "--oracle-cache",
+      "target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl",
+      "--require-cached-oracle",
+      "--force",
+      "--carrick-serial-confirm-budget-s",
+      "0",
+      "--flake-retries",
+      "0",
+      "--jsonl",
+      "target/el1-resume-b3/retirement-acceptance/go-round20.jsonl"
+    ],
+    "cli_sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f"
+  }
+]
