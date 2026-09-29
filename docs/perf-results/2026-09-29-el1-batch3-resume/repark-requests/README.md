@@ -101,3 +101,26 @@ shared-ABI evidence registrations. Binding-only commits `ed32f941d` and
 gate and final 68-contract registry passed. Both diagnostics and final
 coverage log are retained. ABI bindings claim image identity checks only,
 not fresh signed acceptance for GIC/fault/metadata/stage-1 behavior.
+
+## Fresh signed regression
+
+Clean source `8916e1fe20a6eee7e174570dc8320973384a03ef` ran:
+
+```
+CARRICK_RUN_ID=el1-b3-repark-20260929 RUSTC_WRAPPER= scripts/test-signed.sh carrick-embed el1_ --nocapture
+```
+
+Exit 0. Receipt machine validation counted 49 unique passing executions
+across nine invoked executables: scheduler/memory 22, files 13, inotify 4,
+inotify probe 2, transparent execution 2, GIC 2, host kicks 2, parked-thread
+crash capture 1, VM lifetime 1. The unentitled negative control passed.
+Both run-scoped cleanup checks found zero remaining processes. All nine
+current executable SHA-256 values were independently recomputed and matched
+the receipt after execution; CDHash, LC_UUID, hypervisor entitlement and
+DOF presence are retained per executable in signed-artifacts.jsonl.
+
+These fresh signed regressions cover the combined transfer, tagged-request
+and atomic re-park repairs. They do not force the deterministic re-park
+interleaving in a guest and do not supply missing WorkObservation bindings.
+No broad conformance/workload promotion, historical failure attribution or
+<=2x native-Linux acceptance is claimed. Task A and subsequent B-E remain open.
