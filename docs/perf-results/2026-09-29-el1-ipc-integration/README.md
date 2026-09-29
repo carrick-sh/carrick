@@ -258,3 +258,25 @@ Registration now occurs at the authoritative executor launch before window
 installation, and that root's FileTable is published after mapping, before
 its start gate opens. The earlier bootstrap registration/publication is
 removed. The same signed witness must now prove this correction.
+
+
+### First live routing milestone (not vertical acceptance)
+
+On clean source e6e2ab3bf, the unchanged signed witness passes: 1,024 pipe
+round trips plus 1,024 eventfd round trips return exact bytes/values. Actual
+whole-run EL1 counters report served read=2054/write=2048, forwarded
+read=4/write=1. The prior artifact reported forwarded read=2052/write=2049
+and served read=6/write=0. These counts demonstrate production routing;
+they are not steady-state exit attribution or a native-Linux timing ratio.
+
+Run el1-ipc-routing-20260929-b has one positive signed execution, a passing
+unentitled negative control and zero scoped leftovers. The source is clean,
+and the tested executable SHA-256 independently matches the official manifest:
+e1c036c86ac45cdc93b2ceec8a5c05fb7298d6afa1110d77368608b2390a010e.
+Its tested bytes are preserved at the absolute path in
+live-routing-preserved.json. Full output and the official receipt are retained.
+
+Next: real blocking/park/wake, close/reuse, mixed-venue and signal/partial-write
+witnesses at the required scales and two-process shapes. The rejected fixture
+reports remain rejected. Full CI/inventory reconciliation, native-Linux cost
+and complete promotion remain open; main is unchanged. No checkpoint closed.
