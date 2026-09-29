@@ -445,7 +445,9 @@ dependencies = [
 name = "carrick-el1-abi"
 version = "0.1.0"
 dependencies = [
+ "carrick-fd-core",
  "carrick-inotify-core",
+ "carrick-pipe-core",
  "carrick-sched-core",
 ]
 

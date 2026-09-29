@@ -530,47 +530,60 @@ pub const LAYOUT_FACTS: [u64; 10] = [
     MODE_MUTABLE,
 ];
 
-fn pop(head: &AtomicU64, next: impl Fn(usize) -> Option<u64>) -> Option<usize> {
-    loop {
-        let current = head.load(Ordering::Acquire);
-        let top = current & FREE_INDEX;
-        if top == 0 {
-            return None;
+/// A tagged lock-free stack of free record indices, for venue record arrays
+/// in shared memory: `head` holds the ABA tag (high 32 bits) and the top
+/// index + 1 (low 32 bits, 0 = empty); each record's `link` holds the next
+/// index + 1. Push and pop never block, so a final release can always free
+/// its record, even from EL1.
+pub mod free_list {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    const INDEX: u64 = u32::MAX as u64;
+
+    /// Pop the top index; `link(i)` reads record `i`'s link (None: out of range).
+    pub fn pop(head: &AtomicU64, link: impl Fn(usize) -> Option<u64>) -> Option<usize> {
+        loop {
+            let current = head.load(Ordering::Acquire);
+            let top = current & INDEX;
+            if top == 0 {
+                return None;
+            }
+            let index = (top - 1) as usize;
+            let successor = link(index)? & INDEX;
+            let tag = (current >> 32).wrapping_add(1) << 32;
+            if head
+                .compare_exchange(
+                    current,
+                    tag | successor,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(index);
+            }
         }
-        let index = (top - 1) as usize;
-        let successor = next(index)? & FREE_INDEX;
-        let tag = (current >> 32).wrapping_add(1) << 32;
-        if head
-            .compare_exchange(
-                current,
-                tag | successor,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            return Some(index);
+    }
+    /// Push `index`, whose record link is `link`.
+    pub fn push(head: &AtomicU64, index: usize, link: &AtomicU64) {
+        loop {
+            let current = head.load(Ordering::Acquire);
+            link.store(current & INDEX, Ordering::Relaxed);
+            let tag = (current >> 32).wrapping_add(1) << 32;
+            if head
+                .compare_exchange(
+                    current,
+                    tag | (index as u64 + 1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
         }
     }
 }
-fn push(head: &AtomicU64, index: usize, link: &AtomicU64) {
-    loop {
-        let current = head.load(Ordering::Acquire);
-        link.store(current & FREE_INDEX, Ordering::Relaxed);
-        let tag = (current >> 32).wrapping_add(1) << 32;
-        if head
-            .compare_exchange(
-                current,
-                tag | (index as u64 + 1),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            return;
-        }
-    }
-}
+use free_list::{pop, push};
 
 impl<const T: usize, const O: usize> Core<T, O> {
     /// A published core for a single address space (host-only venues and
