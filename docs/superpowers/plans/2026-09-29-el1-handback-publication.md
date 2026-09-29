@@ -84,3 +84,37 @@ Step 1 alone is a preparatory correction, not repair of the host red.
 Green scheduler-core/EL1 host tests do not replace signed proof. Existing
 signed receipts at `40a707ba0` belong to that source and cannot certify this
 changed implementation. Full controller A and later B-E obligations remain.
+
+## Implementation checkpoint after guest publication preparation
+
+The next branch change introduces producer-owned Transferring claims, with
+atomic host-request and cancellation states. A non-copyable HostTransfer
+carries cleanup authority through wake callbacks/batches; finish consumes it
+only after bucket locks are released. WakeRecord distinguishes complete guest
+notifications from pending host cleanup. Readiness/control consumers defer
+while a producer owns the transfer. Detached relocation batches retain the
+same token and honor a host request before guest placement. Current-record
+retirement now happens in the producer, so the runtime does not free it again.
+The shared ABI hash includes the new claim encodings.
+
+The original two host reds are now ordinary tests. The cancellation witness
+expects the completing producer to report Stale when cancellation won, and
+also verifies the record is retired and the slot reusable; this is a changed
+ownership result, not removal of the replacement-corruption assertion. The
+old branch of the witness still detects removal of a replacement queue entry.
+Additional tests cover waitv cleanup with cancellation and a pending host
+request, plus transfer-to-guest refusal when a control request wins.
+
+This is not final lifecycle acceptance. Continue step 4 before promotion:
+- Audit/rework public raw-index free and context/identity reads after a live
+  check, including take_unplaced_service, cancellation after public Host,
+  runtime adoption/restore, and discard callbacks that still transfer a
+  ready reference plus a separate free decision.
+- OnCpu host-request and cancellation flags remain out-of-band; authenticate
+  their lifetime through concurrent handback and reuse.
+- Park sequence wrap behavior is unchanged; do not assume it provides an
+  unbounded incarnation guarantee for a later ownership CAS.
+- Complete exact scheduler handback wake targeting, deterministic signed
+  bindings, structural observations, historical attribution and all A gates.
+The restored VM-free witnesses establish the named producer-cleanup boundary;
+they do not prove those remaining lifetime boundaries.

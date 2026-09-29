@@ -1,0 +1,26 @@
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-sched-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 2 tests
+
+thread 'tests::host_claim_cleanup_does_not_unlink_a_replacement_waiter' (33228819) panicked at crates/carrick-sched-core/src/tests.rs:1774:9:
+assertion `left == right` failed: old producer removed the replacement waiter's queue entry
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'tests::host_claim_is_not_published_before_queue_cleanup' (33228820) panicked at crates/carrick-sched-core/src/tests.rs:1714:5:
+Host exposed while producer still owns queue cleanup: Host { seq: 1 }
+test tests::host_claim_cleanup_does_not_unlink_a_replacement_waiter ... FAILED
+test tests::host_claim_is_not_published_before_queue_cleanup ... FAILED
+
+failures:
+
+failures:
+    tests::host_claim_cleanup_does_not_unlink_a_replacement_waiter
+    tests::host_claim_is_not_published_before_queue_cleanup
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 54 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-sched-core --lib`

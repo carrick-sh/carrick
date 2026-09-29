@@ -246,7 +246,7 @@ where
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         owe_adoption(current_ref);
                     }
-                    CurrentHandback::Discard => zone.free_record(current),
+                    CurrentHandback::Retired => {}
                     CurrentHandback::Lost => {
                         return Err(RuntimeError::Configuration(format!(
                             "EL1 zone slot {slot:?} switched-in record {current:?} was not on the slot"

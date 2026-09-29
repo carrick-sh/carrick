@@ -91,9 +91,13 @@ fn wake(
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
         .unwrap();
-    let mut woken = [RecordRef::PLACEHOLDER; 64];
+    let mut woken = [const { WakeRecord::Empty }; 64];
     let n = zone.wake(&guard, MM, uaddr, u32::MAX, count, waker, &mut woken)?;
-    Ok(woken[..n as usize].iter().map(|r| r.id).collect())
+    drop(guard);
+    Ok(woken[..n as usize]
+        .iter_mut()
+        .filter_map(|r| r.take_ready(&HostWait).map(|r| r.id))
+        .collect())
 }
 
 /// Drain `slot` as its executor does at an exit: (handed back, discarded).
@@ -124,6 +128,21 @@ fn claim_word_round_trips() {
             seq: 2,
         },
         Claim::Host { seq: 77 },
+        Claim::Transferring {
+            seq: u32::MAX,
+            cancelled: false,
+            host_requested: false,
+        },
+        Claim::Transferring {
+            seq: u32::MAX,
+            cancelled: false,
+            host_requested: true,
+        },
+        Claim::Transferring {
+            seq: u32::MAX,
+            cancelled: true,
+            host_requested: false,
+        },
     ] {
         assert_eq!(Claim::decode(claim.encode()), claim);
     }
@@ -155,7 +174,7 @@ fn bitsets_select_waiters() {
     zone.enqueue(&guard, record, seq, MM, 0x40, 0b10, 0)
         .unwrap();
     zone.publish_park(record, seq);
-    let mut woken = [RecordRef::PLACEHOLDER; 4];
+    let mut woken = [const { WakeRecord::Empty }; 4];
     assert_eq!(
         zone.wake(&guard, MM, 0x40, 0b01, 1, Waker::Host, &mut woken),
         Ok(0)
@@ -164,6 +183,8 @@ fn bitsets_select_waiters() {
         zone.wake(&guard, MM, 0x40, 0b10, 1, Waker::Host, &mut woken),
         Ok(1)
     );
+    drop(guard);
+    assert_eq!(woken[0].take_ready(&HostWait).map(|r| r.id), Some(record));
 }
 
 #[test]
@@ -243,11 +264,13 @@ fn el1_wakes_any_count_and_exactly_that_many() {
         assert_eq!(zone.switch_in(SLOT), Some(*record), "position {index}");
     }
     // The host takes batches of its buffer and its caller loops.
-    let mut small = [RecordRef::PLACEHOLDER; 1];
+    let mut small = [const { WakeRecord::Empty }; 1];
     assert_eq!(
         zone.wake(&guard, MM, 0x5000, u32::MAX, 5, Waker::Host, &mut small),
         Ok(1)
     );
+    drop(guard);
+    assert!(small[0].take_ready(&HostWait).is_some());
 }
 
 #[test]
@@ -397,7 +420,7 @@ fn host_wake_batch_keeps_identity_after_return_and_reuse() {
     let zone = zone();
     let record = park(&zone, 1, 0x1000);
     let expected = zone.record_ref(record);
-    let mut batch = [RecordRef::PLACEHOLDER; 1];
+    let mut batch = [const { WakeRecord::Empty }; 1];
     {
         let guard = zone
             .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
@@ -407,12 +430,13 @@ fn host_wake_batch_keeps_identity_after_return_and_reuse() {
             Ok(1)
         );
     }
+    let ready = batch[0].take_ready(&HostWait).unwrap();
     zone.free_record(record);
     assert_eq!(zone.alloc_record(identity(2)).unwrap(), record);
     let seq = zone.next_seq(record);
     zone.publish_park(record, seq);
     assert_eq!(
-        batch[0], expected,
+        ready, expected,
         "returned batch acquired a replacement identity"
     );
 }
@@ -562,7 +586,7 @@ fn wake_effects(
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
         .unwrap();
-    let mut woken = [RecordRef::PLACEHOLDER; 16];
+    let mut woken = [const { WakeRecord::Empty }; 16];
     let mut effects = WakeEffects::default();
     let result = zone
         .wake_placed(
@@ -575,7 +599,13 @@ fn wake_effects(
             &mut woken,
             &mut effects,
         )
-        .map(|n| woken[..n as usize].iter().map(|r| r.id).collect());
+        .map(|n| {
+            drop(guard);
+            woken[..n as usize]
+                .iter_mut()
+                .filter_map(|r| r.take_ready(&HostWait).map(|r| r.id))
+                .collect()
+        });
     (result, effects)
 }
 
@@ -778,12 +808,13 @@ fn the_slot_timer_ends_a_timed_park_once() {
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
         .unwrap();
-    let mut woken = [RecordRef::PLACEHOLDER; 4];
+    let mut woken = [const { WakeRecord::Empty }; 4];
     assert_eq!(
         zone.wake(&guard, MM, 0x1000, u32::MAX, 1, Waker::Host, &mut woken),
         Ok(1)
     );
     drop(guard);
+    assert_eq!(woken[0].take_ready(&HostWait).map(|r| r.id), Some(b));
     assert!(matches!(zone.record(b).claim(), Claim::Host { .. }));
     assert_eq!(zone.expire_timer(SLOT, 900, 0xdead_beef), Ok(false));
     assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 1);
@@ -1184,9 +1215,14 @@ fn host_wake(
         u32::MAX,
         count,
         place,
-        &mut |record| handed.push(record.id),
+        &mut |record| handed.push(record),
         &mut |placement| placed.push(placement),
     );
+    drop(guard);
+    let handed = handed
+        .into_iter()
+        .filter_map(|transfer| transfer.finish(&HostWait).map(|r| r.id))
+        .collect();
     (n, handed, placed)
 }
 
@@ -1671,4 +1707,242 @@ fn guest_wake_publication_has_no_remaining_futex_entry() {
             zone.free_record(record);
         }
     }
+}
+
+#[test]
+fn host_claim_is_not_published_before_queue_cleanup() {
+    struct ObserveWait(std::sync::mpsc::Sender<()>);
+    impl LockWait for ObserveWait {
+        fn wait(&self, attempt: u32) -> bool {
+            if attempt == 1 {
+                let _ = self.0.send(());
+            }
+            std::thread::yield_now();
+            true
+        }
+    }
+    let zone = zone();
+    let id = park(&zone, 1, 0x1000);
+    let original = zone.record_ref(id);
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let observed = std::thread::scope(|scope| {
+        let zone = &zone;
+        let producer = scope
+            .spawn(move || zone.claim_for_host(original, None, Handback::Signal, &ObserveWait(tx)));
+        // Observe the real unlink lock boundary, without sleeps or a guest
+        // scheduler hook. Release the bucket before assertions or joining.
+        let reached = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let claim = zone.record(id).claim();
+        let entries = zone.record(id).entry_count();
+        drop(guard);
+        let result = producer.join().unwrap();
+        reached.unwrap();
+        assert_eq!(result, HostClaim::Claimed);
+        (claim, entries)
+    });
+    assert_eq!(zone.record(id).entry_count(), 0);
+    assert_eq!(zone.record(id).handback(), Some(Handback::Signal));
+    assert_eq!(observed.1, 1, "producer paused before queue cleanup");
+    assert!(
+        !matches!(observed.0, Claim::Host { .. }),
+        "Host exposed while producer still owns queue cleanup: {:?}",
+        observed.0
+    );
+}
+
+#[test]
+fn host_claim_cleanup_does_not_unlink_a_replacement_waiter() {
+    struct ObserveWait(std::sync::mpsc::Sender<()>);
+    impl LockWait for ObserveWait {
+        fn wait(&self, attempt: u32) -> bool {
+            if attempt == 1 {
+                let _ = self.0.send(());
+            }
+            std::thread::yield_now();
+            true
+        }
+    }
+    let zone = zone();
+    let address = 0x1000;
+    let id = park(&zone, 1, address);
+    let original = zone.record_ref(id);
+    let bucket = ZoneTables::bucket_of(MM, address);
+    let replacement_address = (0x2000..0x3000)
+        .step_by(4)
+        .find(|addr| ZoneTables::bucket_of(MM, *addr) != bucket)
+        .unwrap();
+    let guard = zone.lock(bucket, &HostWait).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let replacement = std::thread::scope(|scope| {
+        let zone = &zone;
+        let producer = scope
+            .spawn(move || zone.claim_for_host(original, None, Handback::Signal, &ObserveWait(tx)));
+        let reached = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if reached.is_err() {
+            drop(guard);
+            let _ = producer.join();
+            panic!("claim did not reach queue cleanup");
+        }
+        // Same cancellation decision as el1_zone::cancel: AlreadyHost
+        // permits free, although this producer is still in unlink_all.
+        let cancellation = zone.claim_for_host(original, None, Handback::Cancelled, &HostWait);
+        let replacement = if matches!(cancellation, HostClaim::Claimed | HostClaim::AlreadyHost) {
+            zone.free_record(id);
+            Some(park(zone, 2, replacement_address))
+        } else {
+            None
+        };
+        drop(guard);
+        let completion = producer.join().unwrap();
+        assert_eq!(
+            completion,
+            if replacement.is_some() {
+                HostClaim::Claimed
+            } else {
+                HostClaim::Stale
+            }
+        );
+        replacement
+    });
+    if let Some(replacement) = replacement {
+        assert_eq!(replacement, id, "fixture must reuse the retired slot");
+        assert_ne!(zone.record_ref(replacement), original);
+        assert!(matches!(
+            zone.record(replacement).claim(),
+            Claim::Parked { .. }
+        ));
+        assert_eq!(
+            zone.record(replacement).entry_count(),
+            1,
+            "old producer removed the replacement waiter's queue entry"
+        );
+        assert_eq!(
+            wake(&zone, replacement_address, 1, Waker::Host).unwrap(),
+            [replacement]
+        );
+    } else {
+        assert_eq!(zone.record(id).entry_count(), 0);
+        assert!(
+            zone.live(original).is_none(),
+            "producer must retire a cancelled transfer"
+        );
+        assert_eq!(
+            zone.alloc_record(identity(3)).unwrap(),
+            id,
+            "retirement must release the slot"
+        );
+    }
+}
+
+#[test]
+fn host_wake_transfer_owns_waitv_cleanup_until_completion() {
+    for cancel in [false, true] {
+        let zone = zone();
+        let addresses = [
+            0x1000,
+            (0x2000..0x3000)
+                .step_by(4)
+                .find(|addr| ZoneTables::bucket_of(MM, *addr) != ZoneTables::bucket_of(MM, 0x1000))
+                .unwrap(),
+        ];
+        let record = zone.alloc_record(identity(1)).unwrap();
+        let seq = zone.next_seq(record);
+        // The fixture has no competing parker; both entries precede publish.
+        for (index, address) in addresses.iter().enumerate() {
+            let guard = zone
+                .lock(ZoneTables::bucket_of(MM, *address), &HostWait)
+                .unwrap();
+            zone.enqueue(&guard, record, seq, MM, *address, u32::MAX, index as u32)
+                .unwrap();
+        }
+        zone.publish_park(record, seq);
+        let original = zone.record_ref(record);
+        let mut pending = Vec::new();
+        let guard = zone
+            .lock(ZoneTables::bucket_of(MM, addresses[1]), &HostWait)
+            .unwrap();
+        assert_eq!(
+            zone.wake_host(
+                &guard,
+                MM,
+                addresses[1],
+                u32::MAX,
+                1,
+                false,
+                &mut |transfer| pending.push(transfer),
+                &mut |_| panic!("host-only wake placed in guest")
+            ),
+            1
+        );
+        drop(guard);
+        assert_eq!(zone.record(record).entry_count(), 1);
+        assert!(matches!(
+            zone.record(record).claim(),
+            Claim::Transferring { .. }
+        ));
+        assert_eq!(
+            zone.claim_for_host(
+                original,
+                None,
+                if cancel {
+                    Handback::Cancelled
+                } else {
+                    Handback::Signal
+                },
+                &HostWait
+            ),
+            HostClaim::Deferred
+        );
+        assert!(zone.live(original).is_some());
+        let ready = pending.pop().unwrap().finish(&HostWait);
+        assert_eq!(zone.record(record).entry_count(), 0);
+        for address in addresses {
+            let guard = zone
+                .lock(ZoneTables::bucket_of(MM, address), &HostWait)
+                .unwrap();
+            assert_eq!(zone.buckets[guard.bucket()].len.load(Ordering::Relaxed), 0);
+        }
+        if cancel {
+            assert!(ready.is_none());
+            assert!(zone.live(original).is_none());
+            assert_eq!(zone.alloc_record(identity(2)).unwrap(), record);
+        } else {
+            assert_eq!(ready, Some(original));
+            assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
+            assert_eq!(zone.record(record).result(), 1);
+            assert_eq!(zone.record(record).handback(), Some(Handback::Woken));
+        }
+    }
+}
+
+#[test]
+fn a_host_request_during_transfer_prevents_guest_relocation() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let record = park(&zone, 1, 0x1000);
+    let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    let original = zone.record_ref(record);
+    let Claim::Queued { slot, .. } = zone.record(record).claim() else {
+        panic!("not queued")
+    };
+    let guard = zone.slot_lock(slot, &HostWait).unwrap();
+    let transfer = zone
+        .begin_host_transfer(original, zone.record(record).claim())
+        .unwrap();
+    assert!(zone.remove_locked(&guard, record));
+    drop(guard);
+    assert_eq!(
+        zone.claim_for_host(original, None, Handback::Control, &HostWait),
+        HostClaim::Deferred
+    );
+    let transfer = match transfer.place_in_guest(slot) {
+        Err(transfer) => transfer,
+        Ok(_) => panic!("pending host request lost to guest placement"),
+    };
+    assert_eq!(transfer.finish(&HostWait), Some(original));
+    assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
 }

@@ -125,7 +125,7 @@ pub fn cancel(record: RecordRef) {
             }
             kick_slot(slot);
         }
-        HostClaim::Stale => {}
+        HostClaim::Deferred | HostClaim::Stale => {}
     }
 }
 
@@ -144,6 +144,7 @@ pub struct ZoneWake {
 pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> ZoneWake {
     let mut wake = ZoneWake::default();
     let mut placements = Vec::new();
+    let mut transfers = Vec::new();
     {
         let Some(guard) = zone.lock(ZoneTables::bucket_of(mm, uaddr), &HostLockWait) else {
             return wake;
@@ -155,7 +156,7 @@ pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> 
             bitset,
             count,
             schedules_in_guest(),
-            &mut |record| wake.handed.push(record),
+            &mut |transfer| transfers.push(transfer),
             &mut |placement| placements.push(placement),
         );
     }
@@ -163,9 +164,10 @@ pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> 
         deliver_placement(Some(placement));
     }
     // A futex_waitv park is queued on other buckets too.
-    for record in &wake.handed {
-        zone.unlink_all(record.id, &HostLockWait);
-    }
+    wake.handed = transfers
+        .into_iter()
+        .filter_map(|transfer| transfer.finish(&HostLockWait))
+        .collect();
     wake
 }
 
@@ -191,6 +193,7 @@ pub fn requeue<E>(
         (to_bucket, from_bucket)
     };
     let mut woken = Vec::new();
+    let mut transfers = Vec::new();
     let moved;
     {
         let Some(first_guard) = zone.lock(first, &HostLockWait) else {
@@ -208,7 +211,7 @@ pub fn requeue<E>(
         };
         check()?;
         let mut remaining = wake_count;
-        let mut batch = [RecordRef::PLACEHOLDER; 64];
+        let mut batch = [const { carrick_el1_abi::WakeRecord::Empty }; 64];
         while remaining > 0 {
             let Ok(n) = zone.wake(
                 from_guard,
@@ -221,7 +224,12 @@ pub fn requeue<E>(
             ) else {
                 break;
             };
-            woken.extend_from_slice(&batch[..n as usize]);
+            transfers.extend(
+                batch
+                    .iter_mut()
+                    .take(n as usize)
+                    .map(|entry| core::mem::replace(entry, carrick_el1_abi::WakeRecord::Empty)),
+            );
             if (n as usize) < batch.len() {
                 break;
             }
@@ -229,9 +237,11 @@ pub fn requeue<E>(
         }
         moved = zone.requeue(from_guard, to_guard, mm, from, to, requeue_count);
     }
-    for record in &woken {
-        zone.unlink_all(record.id, &HostLockWait);
-    }
+    woken.extend(
+        transfers
+            .iter_mut()
+            .filter_map(|entry| entry.take_ready(&HostLockWait)),
+    );
     Ok((woken, moved))
 }
 
@@ -241,7 +251,9 @@ pub fn requeue<E>(
 pub fn record_runs(record: RecordRef) -> Option<bool> {
     let rec = zone_tables()?.live(record)?;
     match rec.claim() {
-        carrick_el1_abi::Claim::Parked { .. } => Some(false),
+        carrick_el1_abi::Claim::Parked { .. } | carrick_el1_abi::Claim::Transferring { .. } => {
+            Some(false)
+        }
         carrick_el1_abi::Claim::Queued { .. }
         | carrick_el1_abi::Claim::OnCpu { .. }
         | carrick_el1_abi::Claim::Host { .. } => Some(true),

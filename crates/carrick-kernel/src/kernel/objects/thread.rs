@@ -1395,7 +1395,8 @@ impl Thread {
                 .and_then(|continuation| continuation.zone_wait())
         {
             match crate::el1_zone::claim(wait.record, None, carrick_el1_abi::Handback::Control) {
-                carrick_el1_abi::HostClaim::El1Held { .. } => {
+                carrick_el1_abi::HostClaim::Deferred
+                | carrick_el1_abi::HostClaim::El1Held { .. } => {
                     return Ok(ThreadSchedulerAction::None);
                 }
                 carrick_el1_abi::HostClaim::Claimed
@@ -2184,7 +2185,8 @@ impl Thread {
                                 None,
                                 carrick_el1_abi::Handback::Control,
                             ) {
-                                carrick_el1_abi::HostClaim::El1Held { .. } => false,
+                                carrick_el1_abi::HostClaim::Deferred
+                                | carrick_el1_abi::HostClaim::El1Held { .. } => false,
                                 carrick_el1_abi::HostClaim::Claimed
                                 | carrick_el1_abi::HostClaim::AlreadyHost
                                 | carrick_el1_abi::HostClaim::Stale => {

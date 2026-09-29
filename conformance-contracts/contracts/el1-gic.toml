@@ -1,3 +1,8 @@
+# Transfer-protocol review: the shared ABI hash now includes transfer claim
+# encodings, so older images cannot decode an in-flight transfer as Free.
+# No GIC, fault, metadata or page-table layout/algorithm changed here; retain
+# those existing regression bindings. New transfer unit tests do not prove
+# these contracts, and fresh signed promotion remains required.
 schema_version = 1
 id = "kernel.el1.gic"
 title = "Every HVF carrier VM carries the in-kernel GICv3, invisible to guest EL0, and EL1 takes the virtual timer with no host exit"
