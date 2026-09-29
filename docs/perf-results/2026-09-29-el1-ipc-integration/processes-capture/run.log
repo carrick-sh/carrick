@@ -1,0 +1,31 @@
+
+running 1 test
+test el1_ipc_two_processes_blocking ... IPC pairs pipe n=1: zone=ZoneCounts { el1_parks: 257, el1_switches: 255, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 255, sgis: 1, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 269, wfi_entries: 10, idle_exits: 5, misplaced: 0, steals: 2, service_exits: 5, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 8), (59, 2), (64, 1), (73, 1), (93, 2), (94, 2), (96, 2), (132, 9), (134, 5), (135, 21), (178, 2), (215, 5), (220, 3), (226, 5), (260, 1)] exit 0 signal None stdout "ipc-processes kind=pipe pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs pipe n=1 served before=[0, 0] after=[511, 256]
+IPC pairs pipe n=8: zone=ZoneCounts { el1_parks: 2039, el1_switches: 2004, host_parks: 5, signal_claims: 0, control_claims: 0, cross_wakes: 106, sgis: 106, preemptions: 1, migrations: 0, timeouts: 0, idle_entries: 35, wfi_entries: 12, idle_exits: 6, misplaced: 27, steals: 39, service_exits: 60, service_placements: 24, ready_placements: 0, service_adoptions: 24, exit_adoptions: 38, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 71), (59, 16), (63, 4), (64, 2), (73, 1), (93, 16), (94, 2), (96, 2), (98, 7), (132, 51), (134, 5), (135, 78), (178, 16), (215, 35), (220, 17), (222, 5), (226, 33), (260, 1)] exit 0 signal None stdout "ipc-processes kind=pipe pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs pipe n=8 served before=[511, 256] after=[4551, 2304]
+IPC pairs pipe n=64: zone=ZoneCounts { el1_parks: 16338, el1_switches: 16097, host_parks: 15, signal_claims: 0, control_claims: 0, cross_wakes: 31, sgis: 30, preemptions: 19, migrations: 0, timeouts: 0, idle_entries: 185, wfi_entries: 14, idle_exits: 9, misplaced: 306, steals: 277, service_exits: 421, service_placements: 156, ready_placements: 2, service_adoptions: 156, exit_adoptions: 536, host_handbacks: 11, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 607), (59, 128), (63, 27), (64, 15), (73, 1), (93, 128), (94, 2), (96, 2), (98, 33), (132, 394), (134, 5), (135, 540), (178, 128), (215, 266), (220, 129), (222, 14), (226, 257), (260, 1)] exit 0 signal None stdout "ipc-processes kind=pipe pairs=64 rounds=128 completed=8192\n" stderr ""
+IPC pairs pipe n=64 served before=[4551, 2304] after=[36899, 18679]
+IPC pairs eventfd n=1: zone=ZoneCounts { el1_parks: 257, el1_switches: 256, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 257, sgis: 3, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 265, wfi_entries: 8, idle_exits: 6, misplaced: 0, steals: 3, service_exits: 3, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 2), (57, 4), (64, 1), (73, 1), (93, 2), (94, 2), (96, 2), (98, 1), (132, 9), (134, 5), (135, 21), (178, 2), (215, 5), (220, 3), (226, 5), (260, 1)] exit 0 signal None stdout "ipc-processes kind=eventfd pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs eventfd n=1 served before=[36899, 18679] after=[37410, 18935]
+WATCHDOG: timeout (60s) exceeded for CARRICK_RUN_ID=el1-ipc-processes-capture-20260929; reaping with scripts/sudo/kill.sh
+WATCHDOG zone census:
+zone slot 0: state=IdleWfi mm=0 installed=0 cpu+1=1 current=0 host_record=0 len=0 queue=[] resched=0 timer_cval=0
+zone slot 1: state=IdleWfi mm=14 installed=0 cpu+1=2 current=0 host_record=2 len=0 queue=[] resched=0 timer_cval=0
+zone slot 2: state=IdleWfi mm=0 installed=0 cpu+1=3 current=0 host_record=0 len=0 queue=[] resched=0 timer_cval=0
+zone slot 3: state=IdleWfi mm=0 installed=0 cpu+1=4 current=0 host_record=0 len=0 queue=[] resched=0 timer_cval=0
+zone counters: el1_wakes=20841 host_wakes=14 el1_parks=20841 host_parks=20 switches=20523 steals=364 service_exits=552 host_service_placements=216 host_ready_placements=2 resched_kicks=112 service_adoptions=216 exit_adoptions=600 host_handbacks=14 lost_adoptions=1 stale_services=0 held_refusals=0 host_queue_claims=0 host_executor_parks=0 host_queue_takes=0 foreign_adoptions=344
+zone spaces: idle_ttbr=0x2d001f8000 el1_space_switches=10035 el1_space_refusals=4 el1_cow_invalidations=0
+zone space 14: mm=14 gate=0x0
+zone space 15: mm=15 gate=0x0
+zone record 1: claim=Parked { seq: 762 } handback=None tid=158 serial=1637 mm=15 gen=6 home=None last_slot=None wanted=false cancelled=false entries=1 deadline=None
+zone record 2: claim=Parked { seq: 385 } handback=None tid=157 serial=1598 mm=14 gen=7 home=Some(SlotId(1)) last_slot=None wanted=false cancelled=false entries=1 deadline=None
+zone record 3: claim=Parked { seq: 571 } handback=None tid=164 serial=1742 mm=14 gen=9 home=None last_slot=Some(SlotId(3)) wanted=false cancelled=false entries=0 deadline=None
+zone record 5: claim=Parked { seq: 387 } handback=None tid=168 serial=1766 mm=15 gen=9 home=None last_slot=Some(SlotId(3)) wanted=false cancelled=false entries=0 deadline=None
+
+
+thread 'el1_ipc_two_processes_blocking' (34471924) panicked at crates/carrick-embed/tests/common/mod.rs:112:21:
+container run failed: kernel aborted: kernel abort requested for run el1-ipc-processes-capture-20260929
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+pass 1: killing 1 procs (run-id el1-ipc-processes-capture-20260929)
+remaining carrick procs (run-id el1-ipc-processes-capture-20260929) = 0
