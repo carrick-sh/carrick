@@ -1,0 +1,6 @@
+(lldb) script exec(open("/private/tmp/el1-ipc-core-scan.py").read())
+IPC magic 0x102b1c000 file 0x25a000 header 43524b49504300031e45f68d3c6876db01000000000000000000000800000000
+object 2 kind 1 lock 0 gen/readseq/writeseq (0, 113, 113) sub/owed (0, 0) state (4096, 16, 1, 0, 0, 1, 1, 0, 0)
+object 3 kind 1 lock 0 gen/readseq/writeseq (0, 112, 112) sub/owed (0, 0) state (4096, 16, 0, 0, 0, 1, 1, 0, 0)
+operation 4 generation 277 live 1 kind 1 object (3, 0) task/mm/buf/len/written/park/value/fd (9, 5, 412321098048, 8, 0, 0, 0, 9) nr 63
+operation 9 generation 242 live 1 kind 1 object (2, 0) task/mm/buf/len/written/park/value/fd (11, 6, 412321098048, 8, 0, 0, 0, 7) nr 63
