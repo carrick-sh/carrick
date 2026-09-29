@@ -8,5 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+carrick-fd-core = { path = "../carrick-fd-core" }
+carrick-pipe-core = { path = "../carrick-pipe-core" }
 carrick-inotify-core = { path = "../carrick-inotify-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
