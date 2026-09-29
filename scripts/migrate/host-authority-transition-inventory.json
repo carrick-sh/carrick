@@ -3845,18 +3845,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:640 in `new`, `std::fs::create_dir_all` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:641 in `new`, `std::fs::create_dir_all` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000171",
     "source": {
-      "byte_end": 24872,
-      "byte_start": 24849,
+      "byte_end": 24947,
+      "byte_start": 24924,
       "column": 25,
       "column_end": 48,
       "column_start": 25,
       "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-      "line": 640,
-      "line_end": 640,
-      "line_start": 640
+      "line": 641,
+      "line_end": 641,
+      "line_start": 641
     }
   },
   {
@@ -8610,18 +8610,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:648 in `new`, `std::fs::set_permissions` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:649 in `new`, `std::fs::set_permissions` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000369",
     "source": {
-      "byte_end": 25402,
-      "byte_start": 25378,
+      "byte_end": 25477,
+      "byte_start": 25453,
       "column": 21,
       "column_end": 45,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-      "line": 648,
-      "line_end": 648,
-      "line_start": 648
+      "line": 649,
+      "line_end": 649,
+      "line_start": 649
     }
   },
   {
@@ -11112,18 +11112,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:639 in `new`, `std::process::id` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:640 in `new`, `std::process::id` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000494",
     "source": {
-      "byte_end": 24819,
-      "byte_start": 24803,
+      "byte_end": 24894,
+      "byte_start": 24878,
       "column": 73,
       "column_end": 89,
       "column_start": 73,
       "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-      "line": 639,
-      "line_end": 639,
-      "line_start": 639
+      "line": 640,
+      "line_end": 640,
+      "line_start": 640
     }
   },
   {
@@ -11193,18 +11193,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2253 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2257 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 90832,
-      "byte_start": 90816,
+      "byte_end": 90920,
+      "byte_start": 90904,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2253,
-      "line_end": 2253,
-      "line_start": 2253
+      "line": 2257,
+      "line_end": 2257,
+      "line_start": 2257
     }
   },
   {
@@ -11220,18 +11220,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2468 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2472 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 99443,
-      "byte_start": 99427,
+      "byte_end": 99531,
+      "byte_start": 99515,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2468,
-      "line_end": 2468,
-      "line_start": 2468
+      "line": 2472,
+      "line_end": 2472,
+      "line_start": 2472
     }
   },
   {
