@@ -273,73 +273,77 @@ impl<'a> FsView<'a> {
         fn close(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
+            if !(0..this.nofile_limit()).contains(&fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
             // Closing a stdio number (0/1/2) frees it for reuse by the
             // lowest-free-descriptor allocator (a later open()/dup can land there).
             if fd.0 >= 0 && fd.0 < 3 {
                 this.captured_file_table().lock_closed_stdio()[fd.0 as usize] = true;
             }
-            this.discard_splice_pushback_if_final(fd.0);
+            let files = this.captured_file_table();
+            let (open_file, epoll_reservation) = {
+                let mut table = files.write_open_files();
+                let Some(open_file) = table.remove(&fd.0) else {
+                    return Ok(if is_stdio_fd(fd.0) {
+                        // Guest closing its own stdio at exit: there's nothing for
+                        // us to do (host fd stays open under StdioSink::Inherit so
+                        // sibling processes keep working), but reporting EBADF
+                        // here makes glibc print "write error: Bad file descriptor"
+                        // after the program's real output. Return success.
+                        this.discard_splice_pushback_if_final(fd.0);
+                        this.dnotify_close_fd(fd.0);
+                        this.inotify_close_for_fd(fd.0);
+                        this.fanotify_close_for_fd(cx.kernel, fd.0);
+                        this.detach_fd_from_epolls(fd.0);
+                        this.note_fd_closed(fd.0);
+                        DispatchOutcome::Returned { value: 0 }
+                    } else {
+                        DispatchOutcome::errno(LINUX_EBADF)
+                    });
+                };
+                let reservation = if open_file.description.has_epoll_registrations() {
+                    Some(files.reserve_slot_for_epoll_detach(fd.0))
+                } else {
+                    None
+                };
+                (open_file, reservation)
+            };
+            Self::discard_splice_pushback_for_description(&open_file.description);
             this.dnotify_close_fd(fd.0);
             // inotify IN_CLOSE_WRITE/IN_CLOSE_NOWRITE for a watched regular file
-            // or directory — emitted while the fd is still in the table so its
-            // description (writability) and recorded path are still readable.
-            this.inotify_close_for_fd(fd.0);
-            // fanotify FAN_CLOSE_WRITE/FAN_CLOSE_NOWRITE, emitted here for the
-            // same reason: the description's writability and recorded path are
-            // only readable while the fd is still in the table.
-            this.fanotify_close_for_fd(cx.kernel, fd.0);
-            // Auto-remove this fd from every epoll interest set BEFORE freeing
-            // the fd number from open_files. ORDER IS LOAD-BEARING: the instant
-            // the fd leaves open_files another thread's open/pipe/dup can recycle
-            // that number and `epoll_ctl(ADD)` it; if the detach ran AFTER the
-            // free it would rip out the NEW owner's freshly-added interest, whose
-            // EPOLLET edge then never re-fires (the Go-netpoller hang reproduced
-            // by epoll_et_pipe_eof_not_lost — a worker's close raced a sibling's
-            // reuse+ADD of the same fd number). While the fd is still in the table
-            // the allocator cannot hand it out, so detaching first scopes the
-            // removal to THIS registration. detach takes only a read lock, so it
-            // does not deadlock with the separate write below.
-            this.detach_fd_from_epolls(fd.0);
-            let files = this.captured_file_table();
-            let removed = files.write_open_files().remove(&fd.0);
-            Ok(
-                if let Some(open_file) = removed {
-                    this.mqueue_owner_alias_closed(&files, &open_file);
-                    this.record_fd_close_owner(fd.0, cx.tid().raw(), &open_file);
-                    this.release_hvpatch_classic_record_locks(
-                        cx.kernel.task().key(),
-                        &open_file,
-                    );
-                    crate::event_ring::rec(
-                        crate::event_ring::FDCLOSE,
-                        fd.0,
-                        fd_helpers::event_ring_host_fd(&open_file),
-                        0,
-                    );
-                    // Centralised close: frees the host fd and, for pty masters,
-                    // removes the /dev/pts/N entry from the PtyTable so it becomes
-                    // ENOENT — mirroring Linux devpts semantics. The same helper is
-                    // used by close_range and close_cloexec_fds so every close path
-                    // stays in sync.
-                    this.close_open_file_and_free_pty(&open_file);
-                    this.note_fd_closed(fd.0);
-                    if let Some(err) = open_file.description.common().take_writeback_error() {
-                        DispatchOutcome::errno(err)
-                    } else {
-                        DispatchOutcome::Returned { value: 0 }
-                    }
-                } else if is_stdio_fd(fd.0) {
-                    // Guest closing its own stdio at exit: there's nothing for
-                    // us to do (host fd stays open under StdioSink::Inherit so
-                    // sibling processes keep working), but reporting EBADF
-                    // here makes glibc print "write error: Bad file descriptor"
-                    // after the program's real output. Return success.
-                    this.note_fd_closed(fd.0);
-                    DispatchOutcome::Returned { value: 0 }
-                } else {
-                    DispatchOutcome::errno(LINUX_EBADF)
-                },
-            )
+            // or directory.
+            this.inotify_close_for_open_file(fd.0, &open_file);
+            // fanotify FAN_CLOSE_WRITE/FAN_CLOSE_NOWRITE.
+            this.fanotify_close_for_open_file(cx.kernel, fd.0, &open_file);
+            if let Some(reservation) = epoll_reservation {
+                this.detach_open_file_from_epolls(fd.0, &open_file);
+                reservation.release();
+            }
+            this.mqueue_owner_alias_closed(&files, &open_file);
+            this.record_fd_close_owner(fd.0, cx.tid().raw(), &open_file);
+            this.release_hvpatch_classic_record_locks(
+                cx.kernel.task().key(),
+                &open_file,
+            );
+            crate::event_ring::rec(
+                crate::event_ring::FDCLOSE,
+                fd.0,
+                fd_helpers::event_ring_host_fd(&open_file),
+                0,
+            );
+            // Centralised close: frees the host fd and, for pty masters,
+            // removes the /dev/pts/N entry from the PtyTable so it becomes
+            // ENOENT — mirroring Linux devpts semantics. The same helper is
+            // used by close_range and close_cloexec_fds so every close path
+            // stays in sync.
+            this.close_open_file_and_free_pty(&open_file);
+            this.note_fd_closed(fd.0);
+            Ok(if let Some(err) = open_file.description.common().take_writeback_error() {
+                DispatchOutcome::errno(err)
+            } else {
+                DispatchOutcome::Returned { value: 0 }
+            })
 
         }
 

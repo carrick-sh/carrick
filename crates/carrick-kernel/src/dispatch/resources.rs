@@ -68,9 +68,73 @@ impl CapturedResources {
     }
 }
 
+struct CapturedResourcesStack {
+    inline: [Option<CapturedResources>; 4],
+    len: usize,
+    heap: Vec<CapturedResources>,
+}
+
+impl CapturedResourcesStack {
+    const fn new() -> Self {
+        Self {
+            inline: [None, None, None, None],
+            len: 0,
+            heap: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0 && self.heap.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.len + self.heap.len()
+    }
+
+    fn push(&mut self, item: CapturedResources) {
+        if self.heap.is_empty() && self.len < 4 {
+            self.inline[self.len] = Some(item);
+            self.len += 1;
+        } else {
+            self.heap.push(item);
+        }
+    }
+
+    fn pop(&mut self) -> Option<CapturedResources> {
+        if let Some(item) = self.heap.pop() {
+            Some(item)
+        } else if self.len > 0 {
+            self.len -= 1;
+            self.inline[self.len].take()
+        } else {
+            None
+        }
+    }
+
+    fn last(&self) -> Option<&CapturedResources> {
+        if let Some(item) = self.heap.last() {
+            Some(item)
+        } else if self.len > 0 {
+            self.inline[self.len - 1].as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn last_mut(&mut self) -> Option<&mut CapturedResources> {
+        if self.heap.last().is_some() {
+            self.heap.last_mut()
+        } else if self.len > 0 {
+            self.inline[self.len - 1].as_mut()
+        } else {
+            None
+        }
+    }
+}
+
 thread_local! {
-    static CAPTURED_RESOURCES: RefCell<Vec<CapturedResources>> =
-        const { RefCell::new(Vec::new()) };
+    static CAPTURED_RESOURCES: RefCell<CapturedResourcesStack> =
+        const { RefCell::new(CapturedResourcesStack::new()) };
     static ACTIVE_CONTEXT: Cell<*const crate::kernel::KernelContext> =
         const { Cell::new(std::ptr::null()) };
     static RETIRING_FILE_TABLES: RefCell<Vec<Arc<crate::kernel::FileTable>>> =

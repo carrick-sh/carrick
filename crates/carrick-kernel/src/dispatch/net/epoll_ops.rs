@@ -898,8 +898,25 @@ impl<'a> NetView<'a> {
         }
     }
 
+    pub(in crate::dispatch) fn detach_open_file_from_epolls(&self, fd: i32, open_file: &OpenFile) {
+        let target = &open_file.description;
+        if !target.has_epoll_registrations() {
+            return;
+        }
+        let detached_host_fd = Self::description_initialized_host_fd_for_poll(target);
+        let logical_refs = target.fd_ref_count();
+        if logical_refs == 1 {
+            self.detach_description_from_all_epolls(target, detached_host_fd);
+            return;
+        }
+        let owners = target.epoll_owners();
+        if owners.is_empty() {
+            return;
+        }
+        self.detach_epoll_owners(fd, Some(target), owners, false, detached_host_fd);
+    }
+
     pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
-        let detached_host_fd = self.initialized_host_fd_for_poll(fd);
         let (detached_description, owners, should_auto_detach) = {
             let files = self.captured_file_table();
             let table = files.read_open_files();
@@ -930,10 +947,31 @@ impl<'a> NetView<'a> {
             let should_auto_detach = logical_refs == 1;
             (detached_description, owners, should_auto_detach)
         };
+        let detached_host_fd = detached_description
+            .as_ref()
+            .and_then(Self::description_initialized_host_fd_for_poll)
+            .or_else(|| self.initialized_host_fd_for_poll(fd));
         if should_auto_detach && let Some(target) = &detached_description {
             self.detach_description_from_all_epolls(target, detached_host_fd);
             return;
         }
+        self.detach_epoll_owners(
+            fd,
+            detached_description.as_ref(),
+            owners,
+            should_auto_detach,
+            detached_host_fd,
+        );
+    }
+
+    fn detach_epoll_owners(
+        &self,
+        fd: i32,
+        detached_description: Option<&Arc<crate::kernel::FileDescription>>,
+        owners: Vec<Arc<crate::kernel::FileDescription>>,
+        should_auto_detach: bool,
+        detached_host_fd: Option<HostFd>,
+    ) {
         for description in owners {
             let Some(mut guard) = description.write_for_io() else {
                 continue;

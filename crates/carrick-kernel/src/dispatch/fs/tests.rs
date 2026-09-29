@@ -11010,17 +11010,14 @@ mod readonly_destination_offsets {
                 carrick_vfs::fs_backend::reset_test_host_stat_count();
                 carrick_vfs::fs_backend::reset_test_layer_merge_count();
 
-                let (n2, alloc_stats2) =
-                    crate::dispatch::mem::metadata_budget_tests::allocation_meter::measure_stats(
-                        || {
-                            lane_syscall(
-                                &mut dispatcher,
-                                &mut memory,
-                                61,
-                                [dir_fd as u64, buf_addr, chunk_size, 0, 0, 0],
-                            )
-                        },
-                    );
+                let (n2, alloc_stats2) = crate::dispatch::allocation_meter::measure_stats(|| {
+                    lane_syscall(
+                        &mut dispatcher,
+                        &mut memory,
+                        61,
+                        [dir_fd as u64, buf_addr, chunk_size, 0, 0, 0],
+                    )
+                });
                 assert!(n2 > 0, "Call 2 getdents64 must return bytes, got {n2}");
 
                 let readdir2 = carrick_vfs::fs_backend::test_host_readdir_count();

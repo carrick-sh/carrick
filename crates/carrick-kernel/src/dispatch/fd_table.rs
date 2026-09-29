@@ -1579,6 +1579,13 @@ struct HostFdOwner {
     inode_identity: std::sync::OnceLock<carrick_vfs::vfs::InodeIdentity>,
 }
 
+impl Drop for HostFdOwner {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_host_close();
+    }
+}
+
 /// The OWNED, Arc-refcounted handle to a host kernel fd. The single owner of a
 /// host-backed [`OpenDescription`]'s fd lives IN the description (`host_fd`
 /// field); `Clone` bumps the refcount (never `dup(2)`s), and the last clone's

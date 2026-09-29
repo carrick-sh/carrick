@@ -1302,6 +1302,10 @@ impl FileDescription {
     /// this description, without disturbing the registry. A close that is
     /// not the description's final reference consults exactly these owners;
     /// no other epoll instance can hold a registration naming it.
+    pub(crate) fn has_epoll_registrations(&self) -> bool {
+        !self.epoll_registrations.lock().is_empty()
+    }
+
     pub(crate) fn epoll_owners(&self) -> Vec<Arc<Self>> {
         let mut owners: Vec<Arc<Self>> = Vec::new();
         for owner in self.epoll_registrations.lock().values() {
@@ -1732,6 +1736,31 @@ impl Drop for ExactSlotReservation {
     fn drop(&mut self) {
         if !self.committed {
             self.table.cancel_reservation(self.fd, self.reservation_id);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EpollDetachReservation<'a> {
+    table: &'a FileTable,
+    fd: i32,
+    active: bool,
+}
+
+impl EpollDetachReservation<'_> {
+    pub fn release(mut self) {
+        if self.active {
+            self.table.lock_reserved_slots().remove(&self.fd);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for EpollDetachReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.table.lock_reserved_slots().remove(&self.fd);
+            self.active = false;
         }
     }
 }
@@ -2479,6 +2508,17 @@ impl FileTable {
         }
     }
 
+    pub(crate) fn reserve_slot_for_epoll_detach(&self, fd: i32) -> EpollDetachReservation<'_> {
+        let mut reserved = self.lock_reserved_slots();
+        let res_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        reserved.insert(fd, res_id);
+        EpollDetachReservation {
+            table: self,
+            fd,
+            active: true,
+        }
+    }
+
     pub(crate) fn commit_reserved_slot(
         &self,
         fd: i32,
@@ -2600,6 +2640,12 @@ impl FileTable {
     }
 
     pub fn capture_slot_authority(&self, number: FileSlotNumber) -> Option<FileSlotAuthority> {
+        #[cfg(test)]
+        {
+            crate::dispatch::budget_meter::record_table_read_lock();
+            crate::dispatch::budget_meter::record_table_lookup();
+            crate::dispatch::budget_meter::record_authority_check();
+        }
         let slot = self.open_files.read().get(&number.raw()).cloned()?;
         Some(FileSlotAuthority {
             table: self.id,
@@ -2616,6 +2662,12 @@ impl FileTable {
         &self,
         number: FileSlotNumber,
     ) -> Option<(FileSlot, FileSlotAuthority)> {
+        #[cfg(test)]
+        {
+            crate::dispatch::budget_meter::record_table_read_lock();
+            crate::dispatch::budget_meter::record_table_lookup();
+            crate::dispatch::budget_meter::record_authority_check();
+        }
         let slots = self.open_files.read();
         let slot = slots.get(&number.raw())?;
         Some((
@@ -2654,6 +2706,12 @@ impl FileTable {
     }
 
     pub fn validate_slot_authority(&self, authority: FileSlotAuthority) -> bool {
+        #[cfg(test)]
+        {
+            crate::dispatch::budget_meter::record_table_read_lock();
+            crate::dispatch::budget_meter::record_table_lookup();
+            crate::dispatch::budget_meter::record_authority_check();
+        }
         if authority.table != self.id {
             return false;
         }
@@ -2773,6 +2831,8 @@ impl FileTable {
     }
 
     pub fn slot(&self, number: FileSlotNumber) -> Option<FileSlot> {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_lookup();
         self.open_files.read().get(&number.raw()).cloned()
     }
 
@@ -2781,10 +2841,14 @@ impl FileTable {
     }
 
     pub(crate) fn read_open_files(&self) -> RwLockReadGuard<'_, FileSlotMap> {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_read_lock();
         self.open_files.read()
     }
 
     pub(crate) fn write_open_files(&self) -> FileTableWriteGuard<'_> {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_write_lock();
         let mutation = self.mutation_lease();
         let guard = self.open_files.write();
         FileTableWriteGuard {
@@ -2794,7 +2858,7 @@ impl FileTable {
             revision: &self.revision,
             table: self.id,
             subscriptions: &self.slot_subscriptions,
-            touched: Vec::new(),
+            touched: TouchedSlots::new(),
         }
     }
 
@@ -2993,6 +3057,60 @@ impl Drop for FileTable {
 /// size of the table. (The previous design snapshotted every slot on acquire
 /// and re-walked every slot on release to discover changes, which made an
 /// fd-fill loop quadratic — `dup` at 20k open fds cost ~1 ms, 6000x Linux.)
+#[derive(Default)]
+struct TouchedSlots {
+    inline: [(i32, Option<FileDescriptionId>); 4],
+    len: usize,
+    heap: Vec<(i32, Option<FileDescriptionId>)>,
+}
+
+impl TouchedSlots {
+    const fn new() -> Self {
+        Self {
+            inline: [(0, None); 4],
+            len: 0,
+            heap: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, item: (i32, Option<FileDescriptionId>)) {
+        if self.heap.is_empty() && self.len < 4 {
+            self.inline[self.len] = item;
+            self.len += 1;
+        } else {
+            self.heap.push(item);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(i32, Option<FileDescriptionId>)> {
+        self.inline[..self.len].iter().chain(self.heap.iter())
+    }
+
+    fn mark_replaced(&mut self, number: i32) {
+        for (touched, before) in self.inline[..self.len].iter_mut() {
+            if *touched == number {
+                *before = None;
+                return;
+            }
+        }
+        for (touched, before) in self.heap.iter_mut() {
+            if *touched == number {
+                *before = None;
+                return;
+            }
+        }
+        self.push((number, None));
+    }
+
+    fn take(&mut self) -> impl Iterator<Item = (i32, Option<FileDescriptionId>)> {
+        let inline_items = self.inline;
+        let inline_len = self.len;
+        self.len = 0;
+        let heap_items = std::mem::take(&mut self.heap);
+        inline_items.into_iter().take(inline_len).chain(heap_items)
+    }
+}
+
 pub struct FileTableWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, FileSlotMap>,
     _mutation: FileTableMutationLease,
@@ -3005,7 +3123,7 @@ pub struct FileTableWriteGuard<'a> {
     /// description a slot carried when it was first borrowed mutably, so an
     /// in-place description swap is detected on release while an fd-flag
     /// update keeps the slot's identity.
-    touched: Vec<(i32, Option<FileDescriptionId>)>,
+    touched: TouchedSlots,
 }
 
 impl Deref for FileTableWriteGuard<'_> {
@@ -3018,20 +3136,15 @@ impl Deref for FileTableWriteGuard<'_> {
 
 impl FileTableWriteGuard<'_> {
     fn mark_replaced(&mut self, number: i32) {
-        match self
-            .touched
-            .iter_mut()
-            .find(|(touched, _)| *touched == number)
-        {
-            Some((_, before)) => *before = None,
-            None => self.touched.push((number, None)),
-        }
+        self.touched.mark_replaced(number);
     }
 
     /// Install `slot` at `number`, returning the slot it displaced. The
     /// installed slot always receives a fresh generation: a number that is
     /// (re)populated is a new slot identity, whatever the caller built it from.
     pub(crate) fn insert(&mut self, number: i32, mut slot: FileSlot) -> Option<FileSlot> {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_lookup();
         slot.generation = next_file_slot_generation();
         self.mark_replaced(number);
         self.fd_ceiling.publish(number);
@@ -3039,6 +3152,8 @@ impl FileTableWriteGuard<'_> {
     }
 
     pub(crate) fn remove(&mut self, number: &i32) -> Option<FileSlot> {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_lookup();
         let removed = self.guard.remove(number);
         if removed.is_some() {
             self.mark_replaced(*number);
@@ -3047,6 +3162,8 @@ impl FileTableWriteGuard<'_> {
     }
 
     pub(crate) fn get_mut(&mut self, number: &i32) -> Option<&mut FileSlot> {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_lookup();
         let slot = self.guard.get_mut(number)?;
         if !self.touched.iter().any(|(touched, _)| touched == number) {
             self.touched.push((*number, Some(slot.description.id())));
@@ -3057,33 +3174,64 @@ impl FileTableWriteGuard<'_> {
 
 impl Drop for FileTableWriteGuard<'_> {
     fn drop(&mut self) {
-        let mut changed = Vec::with_capacity(self.touched.len());
-        for (number, before) in self.touched.drain(..) {
+        let mut changed_inline = [0i32; 4];
+        let mut changed_len = 0usize;
+        let mut changed_heap: Option<Vec<i32>> = None;
+
+        let mut push_changed = |num: i32| {
+            if changed_heap.is_none() && changed_len < 4 {
+                changed_inline[changed_len] = num;
+                changed_len += 1;
+            } else {
+                changed_heap.get_or_insert_with(Vec::new).push(num);
+            }
+        };
+
+        for (number, before) in self.touched.take() {
             match before {
-                None => changed.push(number),
+                None => push_changed(number),
                 Some(before) => {
                     let Some(slot) = self.guard.get_mut(&number) else {
-                        changed.push(number);
+                        push_changed(number);
                         continue;
                     };
                     if slot.description.id() != before {
                         slot.generation = next_file_slot_generation();
-                        changed.push(number);
+                        push_changed(number);
                     }
                 }
             }
         }
         self.revision.publish();
-        if !changed.is_empty() {
+        let total_changed = if let Some(ref h) = changed_heap {
+            changed_len + h.len()
+        } else {
+            changed_len
+        };
+        if total_changed > 0 {
             // EL1 must stop serving an fd number the moment it stops referring
             // to the object it was published for.
-            let now: Vec<(i32, Option<FileDescriptionId>)> = changed
-                .iter()
-                .map(|fd| (*fd, self.guard.get(fd).map(|slot| slot.description.id())))
-                .collect();
-            crate::el1_delegation::fd_map_forget(self.table, &now);
-            self.subscriptions
-                .publish_changes(self.table, &self.guard, &changed);
+            if let Some(mut h) = changed_heap {
+                let mut all_changed = Vec::with_capacity(changed_len + h.len());
+                all_changed.extend_from_slice(&changed_inline[..changed_len]);
+                all_changed.append(&mut h);
+                let now: Vec<(i32, Option<FileDescriptionId>)> = all_changed
+                    .iter()
+                    .map(|fd| (*fd, self.guard.get(fd).map(|slot| slot.description.id())))
+                    .collect();
+                crate::el1_delegation::fd_map_forget(self.table, &now);
+                self.subscriptions
+                    .publish_changes(self.table, &self.guard, &all_changed);
+            } else {
+                let changed_slice = &changed_inline[..changed_len];
+                let mut now_inline = [(0i32, None); 4];
+                for (i, fd) in changed_slice.iter().enumerate() {
+                    now_inline[i] = (*fd, self.guard.get(fd).map(|slot| slot.description.id()));
+                }
+                crate::el1_delegation::fd_map_forget(self.table, &now_inline[..changed_len]);
+                self.subscriptions
+                    .publish_changes(self.table, &self.guard, changed_slice);
+            }
         }
     }
 }
