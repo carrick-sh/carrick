@@ -56,9 +56,18 @@ concurrency reduction or auditor weakening is introduced.
 - Contract: `kernel.wait.child-exit-notification-lifecycle`. Its signed
   deterministic interleaving and WorkObservation bindings remain explicitly
   unresolved. Registry and inventory validation passed with 67 contracts.
+- The rebuilt signed shard at `df9741d88` passed both libc lanes, including
+  `otmpfileforkexec`; see `candidate-shard0.log` and
+  `candidate-shard0-artifacts.jsonl` for exact source, SHA-256, CDHash, UUID,
+  entitlement and DOF identity. Negative entitlement control passed and both
+  scoped process censuses were zero. This is regression evidence, not a
+  deterministic signed witness for the notification race.
+- Compiler-backed authority reconciliation retained all 595 rows unchanged;
+  only its source-head stamp changed. Runtime-global-state, runtime-abort,
+  dispatch-lock and exact contract-change checks passed.
 
-Still required: signed candidate regression runs; attribution of the original
-probe failure; reduction/fix of the Python parked-record failure; full batch
+Still required: attribution of the original probe failure; reduction/fix of
+the Python parked-record failure; full batch
 gate, exact-artifact promotion, and landing. Checkpoint 2/3 integration and
 the remaining EL1 controller obligations are untouched.
 
