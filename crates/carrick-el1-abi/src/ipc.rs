@@ -348,6 +348,10 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::offset_of!(IpcOperation, progress) as u64,
     core::mem::offset_of!(IpcOperation, park_seq) as u64,
     core::mem::offset_of!(IpcOperation, value) as u64,
+    core::mem::offset_of!(IpcOperation, orig_x0) as u64,
+    core::mem::offset_of!(IpcOperation, handback) as u64,
+    core::mem::offset_of!(IpcOperation, result) as u64,
+    IPC_HANDBACK_NR,
     core::mem::size_of::<RawOfdPin>() as u64,
     core::mem::size_of::<RawTableId>() as u64,
     core::mem::size_of::<DescriptorSlot>() as u64,
@@ -435,6 +439,49 @@ pub struct IpcOperation {
     /// operation could block: a resumed write adds this value, never a
     /// re-read of user memory (eventfd(2)). Unused by other kinds.
     pub value: IpcEventValue,
+    /// The call's original `x0` and syscall number: a handback frame
+    /// carries the token in `x0` and [`IPC_HANDBACK_NR`] in `x8`, and the
+    /// host restores both (every other register is untouched).
+    pub orig_x0: u64,
+    pub nr: u32,
+    /// What the host must do with a handed-back operation.
+    pub handback: IpcHandback,
+    /// The completed result for [`IpcHandback::Sigpipe`].
+    pub result: i64,
+}
+
+/// Private call number of an EL1 handback frame (`x0` = the packed raw
+/// [`IpcOpToken`]); next to `SYS_CARRICK_EL1_CONTROL`.
+pub const IPC_HANDBACK_NR: u64 = 0xCA88_0002;
+
+/// What the host does with an operation EL1 handed back.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpcHandback {
+    /// Not handed back.
+    None = 0,
+    /// Continue the owned operation from its recorded progress (never
+    /// replaying it from the numeric fd).
+    Continue = 1,
+    /// The operation completed with `result` after progress but its peer
+    /// closed: finish it and deliver SIGPIPE with the result.
+    Sigpipe = 2,
+    /// The operation never took effect: finish (unpin) it and run the
+    /// original call again on the host path.
+    Restart = 3,
+}
+
+impl RawIpcOpToken {
+    /// The one-register form a handback frame carries.
+    pub const fn pack(self) -> u64 {
+        self.index as u64 | ((self.generation as u64) << 32)
+    }
+    pub const fn unpack(word: u64) -> Self {
+        Self {
+            index: word as u32,
+            generation: (word >> 32) as u32,
+        }
+    }
 }
 
 /// The 8-byte value of one eventfd write.
@@ -460,6 +507,10 @@ impl IpcOperation {
         progress: WriteProgress { len: 0, written: 0 },
         park_seq: 0,
         value: IpcEventValue(0),
+        orig_x0: 0,
+        nr: 0,
+        handback: IpcHandback::None,
+        result: 0,
     };
 }
 
