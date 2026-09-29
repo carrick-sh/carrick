@@ -6003,7 +6003,26 @@ mod tests {
         let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
         context.task().set_waker(compatibility_wake.clone());
 
+        #[cfg(feature = "conformance-metrics")]
+        let scope = {
+            let scope = carrick_observability::work_meter::WorkMeter::default().new_scope();
+            context.kernel().set_work_scope(scope.clone());
+            scope
+        };
         directory.notify_child_exit(context.task().key(), context.kernel());
+        #[cfg(feature = "conformance-metrics")]
+        {
+            use carrick_observability::work_meter::WorkMetric;
+            let work = scope.snapshot().expect("live notification work");
+            assert_eq!(
+                work.get(WorkMetric::ChildExitNotificationThreadVisits),
+                Some(1)
+            );
+            assert_eq!(
+                work.get(WorkMetric::ChildExitNotificationWakeAttempts),
+                Some(1)
+            );
+        }
         assert_eq!(scheduler.queued_len(), 1);
         assert_eq!(
             compatibility_wake
