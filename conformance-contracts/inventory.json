@@ -3405,6 +3405,7 @@
         "kernel.el1.guest-run-queue",
         "kernel.fork.stage1-image",
         "kernel.signal.lease-gap",
+        "kernel.wait.child-exit-notification-lifecycle",
         "kernel.wait.process-group"
       ],
       "claims": [
