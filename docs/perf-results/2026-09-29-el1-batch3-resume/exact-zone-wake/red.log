@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 1 test
+test kernel::scheduler::tests::a_deferred_zone_handback_does_not_audit_a_reaped_target ... FAILED
+
+failures:
+
+---- kernel::scheduler::tests::a_deferred_zone_handback_does_not_audit_a_reaped_target stdout ----
+
+thread 'kernel::scheduler::tests::a_deferred_zone_handback_does_not_audit_a_reaped_target' (33508815) panicked at crates/carrick-kernel/src/kernel/scheduler.rs:5839:9:
+late zone handback must not issue an untyped wake: [(TaskKey { id: TaskId(12466), serial: TaskSerial(12) }, Reaped)]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    kernel::scheduler::tests::a_deferred_zone_handback_does_not_audit_a_reaped_target
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2309 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

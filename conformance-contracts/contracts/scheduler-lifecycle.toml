@@ -11,7 +11,7 @@ scale_points = [1, 2, 4, 8]
 rationale = "A stale request never affects a successor; control reasons survive fairness cancellation; handoff preserves slot ownership."
 
 [bindings]
-vm_free = "carrick-kernel-example::scheduler_lifecycle_contract"
+vm_free = "carrick-kernel-example::scheduler_lifecycle_contract; carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation,zone_handback_before_registration_kicks_the_running_owner_once} (zone delivery target authentication, retired no-op, and one kick/zero queue rows before enrollment; no new preemption-policy or runtime-cost acceptance)"
 embed = "carrick-embed::scheduler_lifecycle_contract"
 docker = "fixture:scheduler_preemption"
 ecosystem = ["go:runtime", "cpython:threading"]
