@@ -81,8 +81,6 @@ use crate::args::DebugCommand;
 #[cfg(feature = "platform-macos")]
 use crate::debug::run_debug;
 #[cfg(target_os = "macos")]
-use crate::hvpatch_carrier_cpu_attribution_profile::HvpatchCarrierCpuAttributionSummary;
-#[cfg(target_os = "macos")]
 use crate::hvpatch_carrier_cpu_low_rate_profile::HvpatchCarrierCpuLowRateSummary;
 #[cfg(target_os = "macos")]
 use crate::hvpatch_core_profile::HvpatchCoreSummary;
@@ -203,31 +201,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 capture_status,
             )?;
             println!("HVPCARRIERLOW_VALID samples={}", summary.sample_population);
-        }
-        Commands::HvpatchCarrierCpuAttributionValidate {
-            input,
-            principal_drops,
-            aggregation_drops,
-            dynamic_drops,
-            dynamic_rinse_drops,
-            dynamic_dirty_drops,
-            other_drops,
-            interrupted,
-        } => {
-            let capture_status = crate::trace_profile::ProfileCaptureStatus {
-                principal_drops,
-                aggregation_drops,
-                dynamic_drops,
-                dynamic_rinse_drops,
-                dynamic_dirty_drops,
-                other_drops,
-                interrupted,
-            };
-            let summary = crate::hvpatch_carrier_cpu_attribution_profile::HvpatchCarrierCpuAttributionSummary::from_path(
-                &input,
-                capture_status,
-            )?;
-            println!("HVPCARRIERATTR_VALID samples={}", summary.sample_population);
         }
         Commands::InspectElf { path } => {
             let metadata = inspect_elf(&path)
@@ -974,13 +947,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     {
                         bail!("hvpatch-identity-host-safety requires a Darwin/HVF host");
                     }
-                    if profile
-                        == Some(
-                            crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuAttribution,
-                        )
-                    {
-                        bail!("hvpatch-carrier-cpu-attribution requires a Darwin/HVF host");
-                    }
                 }
                 if command.is_empty() {
                     bail!(
@@ -997,14 +963,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 {
                     bail!(
                         "hvpatch-carrier-cpu-low-rate requires --trace-out so its complete raw stack population is retained"
-                    );
-                }
-                if profile
-                    == Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuAttribution)
-                    && trace_out.is_none()
-                {
-                    bail!(
-                        "hvpatch-carrier-cpu-attribution requires --trace-out so its complete raw stack population is retained"
                     );
                 }
                 if profile
@@ -1111,18 +1069,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         })?;
                         Some(
                             crate::hvpatch_carrier_cpu_low_rate_profile::render_profile_script(
-                                template,
-                            )?,
-                        )
-                    }
-                    Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuAttribution) => {
-                        let template = script_template.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "HVPatch carrier CPU attribution profile has no bundled D program"
-                            )
-                        })?;
-                        Some(
-                            crate::hvpatch_carrier_cpu_attribution_profile::render_profile_script(
                                 template,
                             )?,
                         )
@@ -1272,20 +1218,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 raw_path,
                                 capture_status,
                             )?;
-                            eprintln!("{}", summary.render_human());
-                        } else if requested_profile
-                            == crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuAttribution
-                        {
-                            let summary = HvpatchCarrierCpuAttributionSummary::from_path(
-                                raw_path,
-                                capture_status,
-                            )?;
-                            if let Some(jsonl_path) = summary_jsonl {
-                                let json = serde_json::to_string(&summary)?;
-                                std::fs::write(&jsonl_path, format!("{json}\n")).with_context(
-                                    || format!("write summary JSON to {}", jsonl_path.display()),
-                                )?;
-                            }
                             eprintln!("{}", summary.render_human());
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchInotify09Population
