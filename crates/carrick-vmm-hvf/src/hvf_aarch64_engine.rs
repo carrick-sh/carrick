@@ -32,6 +32,130 @@
 
 use std::sync::Arc;
 
+/// Exact backing observations retained under MM mutation and inventory
+/// exclusion. The old and replacement owners are separate identities; neither
+/// a matching VA nor an unchanged frame number authenticates a reused owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestCowBackingState {
+    pub mm_key: std::num::NonZeroU64,
+    pub root: carrick_mmu_core::aarch64::SubstrateGpa,
+    pub va: carrick_guest_mem::GuestVa,
+    pub old_ipa: carrick_mmu_core::aarch64::SubstrateGpa,
+    pub new_ipa: carrick_mmu_core::aarch64::SubstrateGpa,
+    pub old_backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity,
+    pub new_backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestCowBackingError {
+    WrongOperation,
+    StaleBacking,
+    WrongReceipt,
+    AlreadyCommitted,
+}
+
+/// One backing completion, retained across the guest copy/repoint boundary.
+/// This is a receipt gate, not a guest-copy transport. Construct it only after
+/// the replacement inventory and guest copy are complete, when submitting the
+/// T2 `CowRepoint`. Keep both backing pins through receipt settlement.
+///
+/// The caller must retain exact-MM and inventory exclusion while reading
+/// `current` and running `commit`; this gate deliberately takes no host
+/// page-table writer or byte-copy capability. It does not settle table grants:
+/// obtain `verified` from `Stage1Authority::settle_guest_descriptor_receipt`.
+pub struct GuestCowBackingTransaction {
+    txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    expected: GuestCowBackingState,
+    committed: bool,
+}
+
+impl GuestCowBackingTransaction {
+    pub fn new(
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        expected: GuestCowBackingState,
+    ) -> Result<Self, GuestCowBackingError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp;
+        if txn.id.mm_key != expected.mm_key
+            || txn.root != expected.root
+            || txn.op
+                != (DescriptorOp::CowRepoint {
+                    va: expected.va.raw(),
+                    old_ipa: expected.old_ipa,
+                    new_ipa: expected.new_ipa,
+                    backing: expected.new_backing,
+                })
+        {
+            return Err(GuestCowBackingError::WrongOperation);
+        }
+        Ok(Self {
+            txn,
+            expected,
+            committed: false,
+        })
+    }
+
+    /// Repoint inventory / retire the old owner only after validating the
+    /// exact submission and BOTH current owner generations. Rejection leaves
+    /// the pending operation usable by its authentic receipt, with no effects.
+    /// The callback is the already-preflighted, infallible backing commit.
+    pub fn commit<R>(
+        &mut self,
+        verified: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        current: GuestCowBackingState,
+        commit: impl FnOnce() -> R,
+    ) -> Result<R, GuestCowBackingError> {
+        if self.committed {
+            return Err(GuestCowBackingError::AlreadyCommitted);
+        }
+        if *verified.txn() != self.txn || verified.cow_repoint().is_none() {
+            return Err(GuestCowBackingError::WrongReceipt);
+        }
+        if current != self.expected {
+            return Err(GuestCowBackingError::StaleBacking);
+        }
+        self.committed = true;
+        Ok(commit())
+    }
+}
+
+/// Retain this handle at MM admission to measure completed host COW work even
+/// after that MM exits. Siblings share it; a fork child gets a separate handle.
+/// Runtime/embed must retain all admitted handles to aggregate a workload.
+#[derive(Clone, Debug, Default)]
+pub struct HostCowStats {
+    host_cow_resolutions: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl HostCowStats {
+    /// Completed host COW transactions, excluding stale-fault retries,
+    /// rejected attempts, sparse first-touch grants and guest completions.
+    pub fn host_cow_resolutions(&self) -> u64 {
+        self.host_cow_resolutions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_host_cow_resolution(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .host_cow_resolutions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .is_err()
+        {
+            carrick_fatal!(
+                "hvpatch::cow_accounting",
+                "host COW resolution counter overflow"
+            );
+        }
+    }
+}
+
+impl HvfAarch64Vmm {
+    /// Exact-MM COW accounting; retain the handle before detaching the MM.
+    pub fn host_cow_stats(&self) -> HostCowStats {
+        self.state.task.mm_access_authority().host_cow_stats.clone()
+    }
+}
+
 use carrick_fatal::carrick_fatal;
 
 use carrick_aarch64::engine::{Aarch64ProcessSpec, Aarch64SiblingSpec};
