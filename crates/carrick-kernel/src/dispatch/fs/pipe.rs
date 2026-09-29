@@ -31,21 +31,38 @@ pub(crate) struct PipeSnapshot {
 }
 
 /// Host binding of one shared PipeRecord. Bytes, endpoint counts and capacity
-/// live exclusively in the IPC region. Unpublished endpoint holds are consumed
-/// by the first descriptions; failure before publication releases them in Drop.
+/// live exclusively in the IPC region. Each anonymous endpoint has one shared
+/// OFD. Host functional references retain its host pin; guest slots/operations
+/// retain the same OFD, so host close cannot retire their endpoint.
 pub struct PipeInner {
     owner: Arc<crate::el1_ipc::HostIpc>,
     object: IpcObjectHandle,
     pipe_id: u64,
-    initial: Mutex<[Option<core_pipe::End>; 2]>,
+    endpoints: [Mutex<HostEndpointOwnership>; 2],
     #[cfg(test)]
     fixture: [Option<core_pipe::End>; 2],
     resize: Mutex<()>,
     readiness: Arc<Mutex<(bool, bool)>>,
     read_pipe_ready: Arc<OnceLock<Option<(HostFdRef, HostFdRef)>>>,
     write_pipe_ready: Arc<OnceLock<Option<(HostFdRef, HostFdRef)>>>,
-    readiness_publisher: Arc<dyn Fn() + Send + Sync>,
+    _readiness_publisher: Arc<dyn Fn() + Send + Sync>,
     pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
+}
+
+struct HostEndpointOwnership {
+    description: Option<crate::el1_ipc::HostDescription>,
+    refs: usize,
+    initial: bool,
+}
+
+impl HostEndpointOwnership {
+    fn new(description: crate::el1_ipc::HostDescription) -> Mutex<Self> {
+        Mutex::new(Self {
+            description: Some(description),
+            refs: 1,
+            initial: true,
+        })
+    }
 }
 
 impl std::fmt::Debug for PipeInner {
@@ -205,6 +222,56 @@ impl PipeInner {
         capacity: usize,
     ) -> Result<Self, crate::el1_ipc::AdmissionError> {
         let object = owner.create_pipe(capacity)?;
+        let description = |end, access| {
+            carrick_el1_abi::ipc::fd::Description::new(
+                IpcBacking::Pipe { object, end }.encode(),
+                access,
+                carrick_el1_abi::ipc::fd::StatusFlags::default(),
+            )
+        };
+        let reader = match owner.admit_description(description(
+            core_pipe::End::Reader,
+            carrick_el1_abi::ipc::fd::AccessMode::ReadOnly,
+        )) {
+            Ok(reader) => reader,
+            Err(error) => {
+                for end in [core_pipe::End::Reader, core_pipe::End::Writer] {
+                    owner
+                        .release(IpcBacking::Pipe { object, end }.encode())
+                        .unwrap_or_else(|_| {
+                            carrick_fatal::carrick_fatal!(
+                                "ipc::pipe",
+                                "reader admission rollback failed"
+                            )
+                        });
+                }
+                return Err(error.into());
+            }
+        };
+        let writer = match owner.admit_description(description(
+            core_pipe::End::Writer,
+            carrick_el1_abi::ipc::fd::AccessMode::WriteOnly,
+        )) {
+            Ok(writer) => writer,
+            Err(error) => {
+                owner
+                    .release(
+                        IpcBacking::Pipe {
+                            object,
+                            end: core_pipe::End::Writer,
+                        }
+                        .encode(),
+                    )
+                    .unwrap_or_else(|_| {
+                        carrick_fatal::carrick_fatal!(
+                            "ipc::pipe",
+                            "writer admission rollback failed"
+                        )
+                    });
+                drop(reader);
+                return Err(error.into());
+            }
+        };
         let wait_queue = owner.wait_queue(object);
         let readiness = Arc::new(Mutex::new((false, false)));
         let read_pipe_ready = Arc::new(OnceLock::new());
@@ -231,14 +298,17 @@ impl PipeInner {
             owner,
             object,
             pipe_id,
-            initial: Mutex::new([Some(core_pipe::End::Reader), Some(core_pipe::End::Writer)]),
+            endpoints: [
+                HostEndpointOwnership::new(reader),
+                HostEndpointOwnership::new(writer),
+            ],
             #[cfg(test)]
             fixture: [None, None],
             resize: Mutex::new(()),
             readiness,
             read_pipe_ready,
             write_pipe_ready,
-            readiness_publisher,
+            _readiness_publisher: readiness_publisher,
             wait_queue,
         })
     }
@@ -254,7 +324,10 @@ impl PipeInner {
     #[cfg(test)]
     pub(crate) fn new_connected(pipe_id: u64, capacity: usize) -> Self {
         let mut pipe = Self::new(pipe_id, capacity);
-        pipe.fixture = std::mem::take(pipe.initial.get_mut());
+        pipe.fixture = [Some(core_pipe::End::Reader), Some(core_pipe::End::Writer)];
+        for endpoint in &mut pipe.endpoints {
+            endpoint.get_mut().initial = false;
+        }
         pipe
     }
     #[cfg(test)]
@@ -357,39 +430,53 @@ impl PipeInner {
             .read_with(count, copy);
         self.finish(guard, step)
     }
-    pub(crate) fn retain_endpoint(&self, end: core_pipe::End) {
-        let index = usize::from(end == core_pipe::End::Writer);
-        if self.initial.lock()[index].take().is_some() {
-            return;
-        }
-        self.lock()
-            .pipe()
-            .and_then(|mut pipe| {
-                pipe.retain(end)
-                    .map_err(carrick_el1_abi::ipc::IpcError::Object)
-            })
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::pipe", "retaining a closed endpoint")
-            });
+    #[cfg(test)]
+    fn install_endpoint_for_test(
+        &self,
+        end: core_pipe::End,
+        table: carrick_el1_abi::ipc::fd::TableId,
+        fd: carrick_el1_abi::ipc::fd::Fd,
+    ) -> Result<(), carrick_el1_abi::ipc::fd::Error> {
+        self.endpoints[usize::from(end == core_pipe::End::Writer)]
+            .lock()
+            .description
+            .as_ref()
+            .ok_or(carrick_el1_abi::ipc::fd::Error::StalePin)?
+            .install(table, fd, false)
     }
-    pub(crate) fn release_endpoint(&self, end: core_pipe::End) {
-        let released = self
-            .owner
-            .release(
-                IpcBacking::Pipe {
-                    object: self.object,
-                    end,
-                }
-                .encode(),
-            )
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::pipe", "releasing a closed endpoint")
-            });
-        if let carrick_el1_abi::ipc::IpcReleased::Object { wake, .. } = released {
-            if wake.host_owed {
-                (self.readiness_publisher)();
-            }
+
+    pub(crate) fn retain_endpoint(&self, end: core_pipe::End) {
+        let mut endpoint = self.endpoints[usize::from(end == core_pipe::End::Writer)].lock();
+        if endpoint.description.is_none() {
+            carrick_fatal::carrick_fatal!("ipc::pipe", "retaining a closed host endpoint");
         }
+        if endpoint.initial {
+            endpoint.initial = false;
+        } else {
+            endpoint.refs = endpoint.refs.checked_add(1).unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!("ipc::pipe", "endpoint reference overflow")
+            });
+        }
+    }
+
+    pub(crate) fn release_endpoint(&self, end: core_pipe::End) {
+        let description = {
+            let mut endpoint = self.endpoints[usize::from(end == core_pipe::End::Writer)].lock();
+            if endpoint.initial {
+                carrick_fatal::carrick_fatal!("ipc::pipe", "releasing an unadmitted endpoint");
+            }
+            endpoint.refs = endpoint.refs.checked_sub(1).unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!("ipc::pipe", "endpoint reference underflow")
+            });
+            if endpoint.refs == 0 {
+                endpoint.description.take()
+            } else {
+                None
+            }
+        };
+        // Final pin release can notify host callbacks. No endpoint lock may
+        // be held while the shared core publishes EOF/EPIPE readiness.
+        drop(description);
     }
     pub(crate) fn set_capacity(&self, capacity: usize) -> Result<usize, LinuxErrno> {
         let _resize = self.resize.lock();
@@ -488,30 +575,6 @@ impl PipeInner {
             .and_then(|_| self.write_poll_fd())
     }
 }
-impl Drop for PipeInner {
-    fn drop(&mut self) {
-        #[cfg(test)]
-        for end in self.fixture.iter_mut().filter_map(Option::take) {
-            let _ = self.owner.release(
-                IpcBacking::Pipe {
-                    object: self.object,
-                    end,
-                }
-                .encode(),
-            );
-        }
-        for end in self.initial.get_mut().iter_mut().filter_map(Option::take) {
-            let _ = self.owner.release(
-                IpcBacking::Pipe {
-                    object: self.object,
-                    end,
-                }
-                .encode(),
-            );
-        }
-    }
-}
-
 pub(crate) fn read_pipe<M: CurrentMmMemory>(
     memory: &mut M,
     address: u64,
@@ -875,6 +938,87 @@ impl<'a> FsView<'a> {
 mod tests {
     use super::*;
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
+
+    #[test]
+    fn serial_host_el1_ipc_pipe_second_description_refusal_rolls_back() {
+        use carrick_el1_abi::ipc::{IPC_OBJECTS, IPC_OFDS, fd, pipe::EventMode};
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let descriptions: Vec<_> = (0..IPC_OFDS - 1)
+            .map(|_| {
+                let token = owner.retain_host_resource(Box::new(())).unwrap();
+                owner
+                    .admit_description(fd::Description::new(
+                        IpcBacking::Host(token).encode(),
+                        fd::AccessMode::ReadWrite,
+                        fd::StatusFlags::default(),
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        for _ in 0..4 {
+            assert!(PipeInner::create(Arc::clone(&owner), 1, 65536).is_err());
+        }
+        // Both raw endpoints and the first OFD must be returned on refusal.
+        let objects: Vec<_> = (0..IPC_OBJECTS)
+            .map(|_| owner.create_eventfd(0, EventMode::Counter).unwrap())
+            .collect();
+        for object in objects {
+            owner
+                .release(IpcBacking::EventFd { object }.encode())
+                .unwrap();
+        }
+        drop(descriptions);
+        // Repeated failures also must not strand the pipe's backing extent.
+        for _ in 0..32 {
+            drop(PipeInner::create(Arc::clone(&owner), 1, 65536).unwrap());
+        }
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_guest_writer_pin_delays_eof_after_host_close() {
+        use carrick_el1_abi::ipc::fd;
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let pipe = PipeInner::create(Arc::clone(&owner), 1, 65536).unwrap();
+        pipe.retain_endpoint(core_pipe::End::Reader);
+        pipe.retain_endpoint(core_pipe::End::Writer);
+        let table = owner.create_table(64, 4).unwrap();
+        pipe.install_endpoint_for_test(core_pipe::End::Writer, table, fd::Fd(0))
+            .expect("pipe writer must install its shared description");
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        let (pin, _) = authority.pin(table, fd::Fd(0)).unwrap();
+        assert!(authority.close(table, fd::Fd(0)).unwrap().is_none());
+        pipe.release_endpoint(core_pipe::End::Writer);
+        assert_eq!(authority.holds(&pin).unwrap(), (0, 1));
+        assert_eq!(
+            pipe.snapshot().writers,
+            1,
+            "guest operation must prevent premature EOF"
+        );
+        {
+            let mut guard = region.lock(pipe.object, &HostLockWait).unwrap();
+            assert_eq!(guard.pipe().unwrap().try_write(b"guest").result, Ok(5));
+        }
+        let mut bytes = [0; 5];
+        assert_eq!(
+            pipe.read_with(5, |source| {
+                bytes.copy_from_slice(source);
+                5
+            }),
+            Ok(5)
+        );
+        assert_eq!(&bytes, b"guest");
+        let description = authority.unpin(pin).unwrap().expect("final guest pin");
+        owner.release(description.backing).unwrap();
+        assert_eq!(pipe.snapshot().writers, 0);
+        assert_eq!(pipe.read_with(5, |_| panic!("EOF copies no bytes")), Ok(0));
+        pipe.release_endpoint(core_pipe::End::Reader);
+        assert!(pipe.is_retired());
+        let extent = authority
+            .destroy_table(table, |_| panic!("empty table"))
+            .unwrap();
+        owner.reclaim_descriptors(extent);
+    }
 
     #[test]
     fn serial_host_el1_ipc_pipe_proxy_subscription_ends_with_lease() {

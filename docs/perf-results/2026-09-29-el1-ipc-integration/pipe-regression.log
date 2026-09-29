@@ -1,0 +1,108 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+warning: field `readiness_publisher` is never read
+  --> crates/carrick-kernel/src/dispatch/fs/pipe.rs:48:5
+   |
+37 | pub struct PipeInner {
+   |            --------- field in this struct
+...
+48 |     readiness_publisher: Arc<dyn Fn() + Send + Sync>,
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `carrick-kernel` (lib) generated 1 warning
+warning: `carrick-kernel` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.04s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 87 tests
+test dispatch::closing_unpolled_pipe_does_not_materialize_readiness_fds ... ok
+test dispatch::fifo_beacon::tests::serial_host::rdwr_registration_asserts_both_presence_pipes ... ok
+test dispatch::fs::pipe::tests::aggregate_blocking_write_excludes_unadmitted_later_vectors ... ok
+test dispatch::fs::pipe::tests::aggregate_fault_truncates_staged_current_suffix_at_copy_boundary ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_basic_read_write ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_blocking_write_to_full_parks_on_readiness ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_broken_pipe_and_eof ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_capacity_and_resize ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_interrupted_write_returns_eintr_when_unwritten ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_nonblocking_eagain ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_write_readiness_requires_pipe_buf_room ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_write_with_room_ignores_pending_interrupt ... ok
+test dispatch::fs::pipe::tests::in_memory_pipe_zero_length_write_returns_zero ... ok
+test dispatch::fs::pipe::tests::parked_large_write_keeps_writer_functional_after_numeric_close ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_guest_writer_pin_delays_eof_after_host_close ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_guest_write_host_read_and_reverse ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_proxy_subscription_ends_with_lease ... ok
+test dispatch::fs::rw::writev_pipe_copy_tests::later_fault_keeps_only_completed_aggregate_copy_blocks ... ok
+test dispatch::fs::rw::writev_pipe_copy_tests::later_fault_never_truncates_the_already_admitted_current_vector ... ok
+test dispatch::fs::stat::tests::host_stream_stats_distinguish_devices_and_preserve_pipe_identity ... ok
+test dispatch::fs::state::stdio_sink_tests::forked_child_output_streamed_to_piped_sink ... ok
+test dispatch::fs::state::stdio_sink_tests::forked_runtime_io_shares_the_piped_writer ... ok
+test dispatch::fs::state::stdio_sink_tests::interleaved_parent_and_child_writes_preserve_pipeline_order ... ok
+test dispatch::fs::state::stdio_sink_tests::piped_dup_and_stream_separation ... ok
+test dispatch::fs::state::stdio_sink_tests::piped_writer_errors_surface_as_the_guest_write_errno ... ok
+test dispatch::fs::state::stdio_sink_tests::write_to_fd1_and_fd2_lands_in_the_piped_sink_not_the_capture_buffer ... ok
+test dispatch::fs::tests::dispatch_threaded_pipe_reader_write_shared_ebadf_not_enosys ... ok
+test dispatch::fs::tests::fcntl_pipe_host_pipe_accounting_and_set_capacity ... ok
+test dispatch::fs::tests::fcntl_pipe_set_capacity_preserves_authority_fatal_without_direct_fallback ... ok
+test dispatch::fs::tests::fcntl_pipe_set_capacity_routes_through_canonical_authority ... ok
+test dispatch::fs::tests::fcntl_pipe_set_capacity_semantic_errors ... ok
+test dispatch::fs::tests::final_pipe_description_close_disarms_fasync_registration ... ok
+test dispatch::fs::tests::legacy_aio_nowait_empty_pipe_publishes_eagain_completion ... ok
+test dispatch::fs::tests::non_pipe_access_mode_readv_writev_and_splice_precedence ... ok
+test dispatch::fs::tests::pipe_end_direction_matrix_and_fd_lifecycle_closure ... ok
+test dispatch::fs::tests::pselect6_counts_in_memory_pipe_write_end_writable ... ok
+test dispatch::fs::tests::pselect6_parks_full_pipe_write_end_on_readiness_pipe_pollin ... ok
+test dispatch::fs::tests::serial_host_el1_ipc_pipe_capacity_admission_matches_shared_rounding ... ok
+test dispatch::fs::tests::splice_host_file_to_pipe_returns_short_and_advances_offset ... ok
+test dispatch::fs::tests::splice_pipe_to_writable_null_and_zero_devices_consumes_bytes ... ok
+test dispatch::fs::tests::splice_synthetic_devices_pipe_capacity_and_nonblocking ... ok
+test dispatch::fs::tests::splice_synthetic_devices_to_pipe_transfers_bytes_or_eof ... ok
+test dispatch::fs::tests::staged_splice_pipe_bytes_are_visible_to_read ... ok
+test dispatch::fs::tests::staged_splice_pipe_bytes_preserve_fifo_order ... ok
+test dispatch::fs::tests::sync_file_range_rejects_synthetic_character_device_with_espipe ... ok
+test dispatch::fs::tests::tee_in_memory_destination_reader_closed_epipe_and_sigpipe ... ok
+test dispatch::fs::tests::tee_in_memory_validation_and_same_pipe_precedence ... ok
+test dispatch::fs::tests::vmsplice_in_memory_pipe_writer_full_blocking_parks_on_write_readiness_pollin ... ok
+test dispatch::fs::tests::vmsplice_in_memory_pipe_writer_full_nonblocking_returns_eagain ... ok
+test dispatch::fs::tests::vmsplice_in_memory_pipe_writer_is_bounded_by_available_capacity ... ok
+test dispatch::hvpatch_in_process_fork_tests::fcntl_pipe_set_capacity_works_on_successor_table_after_close_range_unshare ... ok
+test dispatch::hvpatch_in_process_fork_tests::hvpatch_exit_notification_observes_retired_inherited_pipe_writer ... ok
+test dispatch::inzone_tcp::tcp_splice_socket_to_pipe_and_pipe_to_socket ... ok
+test dispatch::io_pipe::host_wait_policy_tests::regular_file_writes_stay_inline_while_waitable_streams_release_the_executor ... ok
+test dispatch::net::epoll_ops::epoll_interest_tests::in_memory_pipe_host_filters_follow_the_linux_endpoint_direction ... ok
+test dispatch::net::netlink_readiness_tests::host_pipe_readiness_suppresses_out_below_pipe_buf_threshold ... ok
+test dispatch::net::send_recv::inet_in_memory_socket_tests::inet_in_memory_socket_closed_peer_send_epipe_and_sigpipe ... ok
+test dispatch::net::send_recv::inet_in_memory_socket_tests::unconnected_inet_stream_sendto_returns_epipe_and_sigpipe ... ok
+test dispatch::net::support::staged_splice_readiness_tests::staged_splice_pipe_bytes_are_pollin_ready ... ok
+test dispatch::net::unix_pure::tests::inet_stream_reset_is_reported_once_by_recv_then_eof_and_epipe ... ok
+test dispatch::net::unix_pure::tests::unix_stream_final_close_keeps_existing_epipe_semantics ... ok
+test dispatch::net::wait_source_tests::readiness_pipe_classifies_as_dual_latched ... ok
+test dispatch::overlay_dispatch_tests::epoll_et_pipe_eof_not_lost_under_concurrent_churn ... ok
+test dispatch::overlay_dispatch_tests::known_pipe2_flag_is_silent ... ok
+test dispatch::overlay_dispatch_tests::large_blocking_host_pipe_write_hands_off_after_partial_progress ... ok
+test dispatch::overlay_dispatch_tests::large_nonblocking_host_pipe_write_uses_small_ready_window ... ok
+test dispatch::overlay_dispatch_tests::retained_exec_generation_does_not_keep_cloexec_pipe_writer_alive ... ok
+test dispatch::overlay_dispatch_tests::unknown_pipe2_flag_is_recorded_in_compat_report ... ok
+test dispatch::pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close ... ok
+test dispatch::scm_rights_tests::carrick_owned_pipe_ends_cross_scm_rights_as_shared_descriptions ... ok
+test file_authority::tests::canonical_pipe_capacity_accounting_mismatch_is_fatal_invariant_violation ... ok
+test file_authority::tests::canonical_pipe_capacity_host_pipe_ebusy_leaves_state_and_revisions_unchanged ... ok
+test file_authority::tests::canonical_pipe_capacity_host_pipe_updates_exact_description_and_shared_capacity ... ok
+test file_authority::tests::canonical_pipe_capacity_in_memory_ebusy_leaves_state_and_revisions_unchanged ... ok
+test file_authority::tests::canonical_pipe_capacity_in_memory_updates_both_ends_and_publishes_one_revision ... ok
+test file_authority::tests::canonical_pipe_capacity_outcome_carries_exact_description_id_and_published_revision ... ok
+test file_authority::tests::canonical_pipe_capacity_rejects_closed_slot_as_not_pipe ... ok
+test file_authority::tests::canonical_pipe_capacity_rejects_non_pipe_as_not_pipe ... ok
+test file_authority::tests::canonical_pipe_capacity_stale_slot_token_does_not_mutate_replacement ... ok
+test file_authority::tests::direct_pipe_streams_preserve_shared_state_and_endpoint_lifetime ... ok
+test file_authority::tests::pipe_authority_direction_and_stream_sharing_survives_fork_copy ... ok
+test file_authority::tests::pipe_authority_direction_and_stream_sharing_survives_share_table_and_exec ... ok
+test host_tty::tests::isatty_for_pipe_is_false ... ok
+test kernel::continuation::ipc::tests::el1_ipc_sigpipe_after_partial_write_completes_exactly_once ... ok
+test kernel::wait_set::tests::wake_pipe_host_poll_integration ... ok
+test observe::tests::test_user_observer_deny_and_pipeline_order ... ok
+test pty_relay::tests::retired_sigwinch_pipe_cannot_be_reused_by_an_inflight_handler ... ok
+
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 2239 filtered out; finished in 0.13s
+

@@ -106,3 +106,25 @@ with actual semantic cases and scoped observations before signed acceptance.
 Do not add a control response that simply turns the derived counters green.
 This review changes qualification planning, not the implementation priority:
 continue shared table/description ownership; repair fixtures at that boundary.
+
+## Shared pipe endpoint lifetime
+
+Anonymous pipe creation now admits two shared OFDs before publishing endpoints.
+Host functional references retain the corresponding host pin. Guest descriptor
+slots and operation pins retain the same OFD; the last host close therefore
+cannot manufacture EOF while a guest writer is still alive. Final shared release
+retires the endpoint and delivers both guest and host readiness outside locks.
+Creation rolls back both raw endpoints and any admitted OFD on refusal.
+
+The writer witness failed at the missing shared-install bridge, then passed:
+close shared slot, close host writer, retain one guest pin, transfer the expected
+bytes, release the guest pin, observe EOF, and retire the reader. A second-OFD
+exhaustion test proves all object slots remain available and pipe storage is
+reusable after repeated refused admissions. Initial pipe regressions: 87/87.
+Final IPC filter: 62 passed, one pre-existing ignored. Kernel/runtime Clippy and
+workspace formatting passed. Receipts: pipe-description-red.log,
+pipe-regression.log, pipe-description-final.log, pipe-description-clippy.log.
+
+Tables remain unpublished. Shared flags and FileTable admission/mutation,
+fork/unshare, CLOEXEC and destruction are the next implementation boundary.
+No signed guest execution or checkpoint acceptance is claimed here.
