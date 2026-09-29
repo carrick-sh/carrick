@@ -54,6 +54,8 @@ fn identity(tid: u64) -> ThreadIdentity {
 /// slot's scheduling facts and its occupancy word (the executor installs the
 /// loaded task's address space before it runs the vCPU).
 fn host_publish(zone: &ZoneTables, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
+    // The executor that loads it drives the slot (one executor per slot).
+    zone.drive(slot, u64::from(slot.raw()) + 1);
     zone.publish_slot(slot, mm, cpu, affinity);
     let here = carrick_sched_core::ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);

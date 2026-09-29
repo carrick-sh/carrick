@@ -467,70 +467,66 @@ pub fn drain_to_host(slot: SlotId) {
     }
 }
 
-/// The executor of `slot` entered a blocking inline host wait and lent its
-/// guest CPU: its stopped vCPU may hold no thread another vCPU could run, so
-/// what is queued there goes elsewhere (as for a spare, [`retire_slot`]),
-/// and no placement chooses the slot until [`revive_slot`]. A service thread
-/// no live slot will take stays, for this executor when it returns.
-pub fn park_slot_for_host_wait(slot: SlotId) {
-    retire_slot_inner(slot, true);
-}
-
-/// The executor of `slot` is back from its blocking host wait.
-pub fn revive_slot(slot: SlotId) {
-    if let Some(zone) = zone() {
-        zone.revive_slot(slot);
-    }
-}
-
-/// The executor of `slot` is about to wait on the host with its vCPU stopped
-/// (a spare): nothing may be queued on it, and what is goes elsewhere.
-pub fn retire_slot(slot: SlotId) {
-    retire_slot_inner(slot, false);
-}
-
-/// Executor `driver` stopped driving `slot`: the mailbox lease the slot
-/// follows went with the task it unloaded, and it drives `now` instead. If
-/// nobody took `slot` over, what is queued there leaves ([`retire_slot`]); a
-/// service thread no live slot will take waits on `now`.
-pub fn leave_slot(slot: SlotId, driver: u64, now: SlotId) {
+/// Executor `driver` of `slot` entered a blocking inline host wait and lent
+/// its guest CPU: its stopped vCPU may hold no thread another vCPU could run,
+/// so what is queued there goes elsewhere, and no placement chooses the slot
+/// until [`come_back_to_slot`] (`ZoneTables::step_away`). A service thread no
+/// live slot will take stays, for this executor when it returns.
+pub fn step_away_from_slot(slot: SlotId, driver: u64) {
     let Some(zone) = zone() else {
         return;
     };
     let mut records = Vec::new();
     let mut placements = Vec::new();
-    if !zone.leave_slot(
+    if zone.step_away(
         slot,
         driver,
         &mut |record| records.push(record),
         &mut |placement| placements.push(placement),
     ) {
-        return;
+        settle_vacated(zone, Some(slot), records, placements);
     }
-    settle_vacated(zone, now, records, placements, true);
 }
 
-fn retire_slot_inner(slot: SlotId, keep_unplaced: bool) {
-    let Some(zone) = zone() else {
-        return;
-    };
+/// Executor `driver` of `slot` is back from its blocking host wait.
+pub fn come_back_to_slot(slot: SlotId, driver: u64) {
+    if let Some(zone) = zone() {
+        zone.step_back(slot, driver);
+    }
+}
+
+/// Executor `driver` stopped driving `slot`: the mailbox lease the slot
+/// follows moved on and it drives `now` instead, or (`now` `None`) it parks
+/// with no guest CPU and drives nothing. If nobody took `slot` over, what is
+/// queued there leaves; a service thread no live slot will take waits on
+/// `now`, or goes back to its host continuation.
+pub fn leave_slot(slot: SlotId, driver: u64, now: Option<SlotId>) {
+    if let Some(zone) = zone() {
+        leave_slot_in(zone, slot, driver, now);
+    }
+}
+
+/// [`leave_slot`] on the tables `zone`.
+pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<SlotId>) {
     let mut records = Vec::new();
     let mut placements = Vec::new();
-    zone.retire_slot(slot, &mut |record| records.push(record), &mut |placement| {
-        placements.push(placement)
-    });
-    settle_vacated(zone, slot, records, placements, keep_unplaced);
+    if zone.leave_slot(
+        slot,
+        driver,
+        &mut |record| records.push(record),
+        &mut |placement| placements.push(placement),
+    ) {
+        settle_vacated(zone, now, records, placements);
+    }
 }
 
 /// Deliver what vacating a slot placed, and place or hand back what it took:
-/// a service thread no live slot takes goes to `fallback` when
-/// `keep_unplaced`.
+/// a service thread no live slot takes waits on `fallback`, if any.
 fn settle_vacated(
     zone: &ZoneTables,
-    fallback: SlotId,
+    fallback: Option<SlotId>,
     records: Vec<RecordId>,
     placements: Vec<carrick_el1_abi::HostPlacement>,
-    keep_unplaced: bool,
 ) {
     for placement in placements {
         deliver_placement(Some(placement));
@@ -543,7 +539,7 @@ fn settle_vacated(
             if deliver_placement(zone.place_from_host(record)) {
                 continue;
             }
-            if keep_unplaced && zone.requeue_on(fallback, record) {
+            if fallback.is_some_and(|fallback| zone.requeue_on(fallback, record)) {
                 continue;
             }
             // No slot runs an executor that could take it (every one is
