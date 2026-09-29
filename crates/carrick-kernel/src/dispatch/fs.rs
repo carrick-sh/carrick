@@ -1187,20 +1187,12 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn record_fd_open_path(&self, fd: i32, path: String) {
-        let files = self.captured_file_table();
-        let description_path = files.read_open_files().get(&fd).and_then(|open| {
-            let description = open.description.read_for_io()?;
-            match &*description {
-                OpenDescription::File { path, .. } | OpenDescription::Directory { path, .. } => {
-                    Some(path.clone())
-                }
-                OpenDescription::HostFile { metadata, .. } => {
-                    metadata.path.to_str().map(str::to_owned)
-                }
-                _ => None,
-            }
-        });
-        files
+        // The description's own path goes through the inspect authority
+        // (`open_path_snapshot`); no raw table or description guard here.
+        let description_path = self
+            .open_file(fd)
+            .and_then(|open_file| open_file.description().open_path_snapshot());
+        self.captured_file_table()
             .write_fd_open_paths()
             .insert_with_description_path(fd, path, description_path);
     }
