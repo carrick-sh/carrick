@@ -573,11 +573,6 @@ impl<'a> FsView<'a> {
         self.notify_inmem_epoll();
     }
 
-    /// Push an undelivered `splice(2)` tail back onto the FRONT of an
-    /// in-memory pipe, the [`Self::restore_splice_pipe_bytes`] twin for the
-    /// legacy `PipeReader` source. A short destination write must leave the
-    /// source byte stream exactly as it found it minus what was delivered.
-
     /// The destination's readiness park for a blocking `splice`/`vmsplice`
     /// whose output could not take a single byte. Nothing has been consumed
     /// when this is reached, so the runtime re-dispatches the whole call after
