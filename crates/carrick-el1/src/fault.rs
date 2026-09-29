@@ -323,6 +323,56 @@ where
     )
 }
 
+/// Where EL1 reads the still-shared frame and writes its private
+/// replacement for one COW grant (each exactly one page).
+pub trait CowCopyWindow {
+    fn frames(
+        &mut self,
+        grant: &carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant,
+    ) -> Option<(&[u8], &mut [u8])>;
+}
+
+/// Guest COW copy: claim the grant MM's exact editor, check that the live
+/// leaf still maps the shared frame COW-armed, copy it into the granted
+/// replacement, and return the proof that authorizes exactly one repoint.
+/// A closed gate or another editor refuses (`Contended`); nothing is copied.
+pub fn copy_granted_cow_page<W, C>(
+    words: &W,
+    grant: carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant,
+    spaces: &AddressSpaces,
+    owner: NonZeroU64,
+    window: &mut C,
+) -> Result<
+    carrick_mmu_core::aarch64::descriptor_txn::CowCopyComplete,
+    carrick_mmu_core::aarch64::descriptor_txn::CowCopyError,
+>
+where
+    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    C: CowCopyWindow,
+{
+    use carrick_mmu_core::aarch64::descriptor_txn::{CowCopyError, DescriptorRefusal};
+    let mm_key = grant.mm_key.get();
+    let index = spaces
+        .find(mm_key)
+        .ok_or(CowCopyError::Refused(DescriptorRefusal::WrongMm))?;
+    let space = spaces
+        .grant(index, mm_key)
+        .ok_or(CowCopyError::Refused(DescriptorRefusal::Contended))?;
+    if space.ttbr0 & 0x0000_FFFF_FFFF_F000 != grant.root.raw() {
+        return Err(CowCopyError::Refused(DescriptorRefusal::StaleRoot));
+    }
+    let _editor = spaces
+        .try_begin_edit(index, mm_key, owner)
+        .ok_or(CowCopyError::Refused(DescriptorRefusal::Contended))?;
+    let (source, destination) = window.frames(&grant).ok_or(CowCopyError::BadWindow)?;
+    carrick_mmu_core::aarch64::descriptor_txn::copy_granted_cow_page(
+        words,
+        grant,
+        source,
+        destination,
+    )
+}
+
 /// Result of draining one MM's host descriptor submissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrainOutcome {
@@ -1699,6 +1749,76 @@ mod tests {
             assert!(!writable(&arena));
             let receipt = slots.take_receipt(5, txn.id).unwrap();
             assert!(txn.verify_receipt(&receipt).is_ok());
+        }
+
+        struct Frames {
+            source: Vec<u8>,
+            destination: Vec<u8>,
+        }
+
+        impl CowCopyWindow for Frames {
+            fn frames(
+                &mut self,
+                _grant: &carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant,
+            ) -> Option<(&[u8], &mut [u8])> {
+                Some((&self.source, &mut self.destination))
+            }
+        }
+
+        #[test]
+        fn the_guest_cow_copy_runs_only_under_the_grant_mms_open_editor() {
+            use carrick_mmu_core::aarch64::descriptor_txn::{CowCopyError, CowCopyGrant};
+            let (arena, _) = armable();
+            let byte_len = arena.words.len() * 8;
+            unsafe {
+                carrick_mmu_core::aarch64::arm_existing_el1_fork_pages(
+                    arena.words.as_ptr().cast_mut(),
+                    ROOT,
+                    byte_len,
+                    VA,
+                    4096,
+                )
+            }
+            .unwrap();
+            let words = unsafe {
+                PrimaryTableWords::new(arena.words.as_ptr().cast_mut(), ROOT, byte_len, &NoBarrier)
+            }
+            .unwrap();
+            let grant = CowCopyGrant {
+                mm_key: nz(77),
+                root: SubstrateGpa(ROOT),
+                va: VA,
+                old_ipa: SubstrateGpa(IPA),
+                new_ipa: SubstrateGpa(0x009d_0000_0000),
+                old_backing: BackingIdentity {
+                    frame_id: nz(1),
+                    mapping_id: nz(2),
+                    owner_generation: nz(3),
+                    inventory_revision: nz(4),
+                },
+                new_backing: BackingIdentity {
+                    frame_id: nz(5),
+                    mapping_id: nz(6),
+                    owner_generation: nz(7),
+                    inventory_revision: nz(8),
+                },
+            };
+            let mut frames = Frames {
+                source: (0..4096).map(|i| (i % 253) as u8).collect(),
+                destination: vec![0; 4096],
+            };
+            // Behind a closed gate (host pause) nothing is copied.
+            let closed = AddressSpaces::new();
+            closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
+            assert!(matches!(
+                copy_granted_cow_page(&words, grant, &closed, nz(1), &mut frames),
+                Err(CowCopyError::Refused(DescriptorRefusal::Contended))
+            ));
+            assert!(frames.destination.iter().all(|&b| b == 0));
+            let spaces = published_space(77, ROOT | ASID);
+            let copy = copy_granted_cow_page(&words, grant, &spaces, nz(1), &mut frames).unwrap();
+            assert_eq!(frames.destination, frames.source);
+            assert_eq!(copy.grant(), grant);
         }
     }
 }
