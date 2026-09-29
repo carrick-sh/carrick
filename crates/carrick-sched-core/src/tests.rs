@@ -1641,6 +1641,26 @@ mod ipc_wait {
         assert_eq!(zone.record(object).handback(), Some(Handback::Resumed));
     }
     #[test]
+    fn el1_ipc_wait_interruption_requires_adapter_settlement() {
+        for kind in [Handback::Signal, Handback::Control] {
+            let zone = zone();
+            host_publish(&zone, SLOT, MM, None, 0);
+            zone.enter_guest(SLOT);
+            let key = key(1, 1);
+            zone.bind_object_wait(key, &HostWait).unwrap();
+            let record = object_park(&zone, key, 1);
+            assert_eq!(
+                zone.claim_for_host(zone.record_ref(record), None, kind, &HostWait),
+                HostClaim::Claimed
+            );
+            assert!(
+                zone.record(record).needs_host(),
+                "pending interruption must not become a zero-byte completion"
+            );
+        }
+    }
+
+    #[test]
     fn el1_ipc_wait_cancelled_pin_reaches_adapter_before_recycling() {
         let zone = zone();
         host_publish(&zone, SLOT, MM, None, 0);
