@@ -15942,5 +15942,83 @@
       "line_end": 1427,
       "line_start": 1427
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "carrick executable located for in-process symbol resolution of the attribution profile's own captured stacks"
+    },
+    "expansion": null,
+    "operation": "std::fs::read",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/hvpatch_carrier_cpu_attribution_profile.rs:169 in `SymbolTable::from_binary`, `std::fs::read` accesses only the carrick executable located for in-process symbol resolution of the attribution profile's own captured stacks; no guest identity selects the path.",
+    "review_id": "HA-000688",
+    "source": {
+      "byte_end": 5403,
+      "byte_start": 5395,
+      "column": 13,
+      "column_end": 21,
+      "column_start": 13,
+      "file": "crates/carrick-cli/src/hvpatch_carrier_cpu_attribution_profile.rs",
+      "line": 169,
+      "line_end": 169,
+      "line_start": 169
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "user-selected HVPatch carrier CPU attribution profile receipt"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/hvpatch_carrier_cpu_attribution_profile.rs:629 in `HvpatchCarrierCpuAttributionSummary::from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch carrier CPU attribution profile receipt.",
+    "review_id": "HA-000689",
+    "source": {
+      "byte_end": 22099,
+      "byte_start": 22081,
+      "column": 19,
+      "column_end": 37,
+      "column_start": 19,
+      "file": "crates/carrick-cli/src/hvpatch_carrier_cpu_attribution_profile.rs",
+      "line": 629,
+      "line_end": 629,
+      "line_start": 629
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "operator-selected `--summary-jsonl` path for the HVPatch carrier CPU attribution profile summary"
+    },
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/commands.rs:1285 in `run_cli`, `std::fs::write` accesses only the operator-selected `--summary-jsonl` path, publishing the HVPatch carrier CPU attribution profile's parsed summary as JSON.",
+    "review_id": "HA-000690",
+    "source": {
+      "byte_end": 60930,
+      "byte_start": 60916,
+      "column": 33,
+      "column_end": 47,
+      "column_start": 33,
+      "file": "crates/carrick-cli/src/commands.rs",
+      "line": 1285,
+      "line_end": 1285,
+      "line_start": 1285
+    }
   }
 ]
