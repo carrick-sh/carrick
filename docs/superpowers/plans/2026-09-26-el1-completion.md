@@ -37,20 +37,24 @@ status/order statements where explicitly corrected below.
 At refresh, the implementation baseline on local `main` and local
 remote-tracking `origin/main` is `a70b40466`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
-Batch 3 is on `integ/batch3`, unlanded. Its current implementation correction
-is `0e1d7c12c`; deterministic request-lifetime interleavings have VM-free
-proof, with fresh signed regression coverage described below.
-Two red-first EL1 re-park witnesses at `fb265ba9b` showed that cancellation
-or signal could be stranded by a new park. Atomic OnCpuRequested admission
-now prevents that overwrite and rolls back the unpublished wait on refusal.
-Core 65, EL1 host 76, ABI 32, kernel/semantics 2,459, serial kernel 109 and
-runtime 630 passed; affected Clippy, registry, lint and contract coverage
-passed. See `repark-requests/` for exact logs and acceptance limits.
-The fresh broader signed EL1 regression source is `8916e1fe2`: 49 positive
-executions across nine artifacts, unentitled negative control and scoped
-cleanup passed. Exact identities are in `repark-requests/signed-artifacts.jsonl`.
-This supersedes `40a707ba0` for the combined ownership repairs, but does not
-supply deterministic signed race bindings or full task-A acceptance. All twelve active
+Batch 3 is on `integ/batch3`, unlanded. Its current implementation is
+`a2c0fcee3`, following the atomic re-park correction `0e1d7c12c` and exact
+zone handback targeting `da84671b7`. The latter has a deterministic red-first
+reaped-child witness, continuation authentication and pre-enrollment kick
+controls. Direct adoption reserves ownership before publishing readiness.
+Final kernel/semantics 2,462 (one existing ignore), three focused controls
+and affected Clippy passed. Serial kernel 109 and runtime 630 passed before
+the ordering-only follow-up. Registry, clean-source lint and exact contract
+coverage passed; the 595-row authority census remains macOS-only.
+
+Fresh signed source `257de53e0` passed 49 unique positive EL1 executions
+across nine artifacts, the unentitled negative control and scoped cleanup.
+The nine executable SHA-256 hashes were independently matched to the
+retained `exact-zone-wake/signed-artifacts.jsonl`; full output and final
+source-gate logs are in that receipt directory. This replaces `8916e1fe2`
+as current scheduler regression evidence, but does not supply deterministic
+signed race bindings, historical crash attribution or full task-A acceptance.
+All twelve active
 batch/memory/IPC/sigsuspend worktrees inventoried below were clean at the
 initial refresh inspection; only batch 3 has been advanced in this goal.
 
@@ -99,7 +103,7 @@ do not overwrite it with that branch's pre-refresh controller.
 
 | Worktree / branch | Head | Disposition |
 |---|---|---|
-| `wt-batch3` / `integ/batch3` | `276e05673` implementation; prior signed `40a707ba0` | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
+| `wt-batch3` / `integ/batch3` | `a2c0fcee3` implementation; signed `257de53e0` | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
 | `wt-cp2-descr` / `work/cp2-el1-descriptor-owner` | `c555f5dd1` | Review candidate; 9 signed filters and first-touch slopes 0.004–0.009 are handoff claims |
 | `wt-cp2-cow` / `work/cp2-hvf-cow-adapters` | `d581dd099` | Ancestry-confirmed in descriptor branch; do not merge it a second time |
 | `wt-cp2-return` / `work/cp2-elastic-return` | `8f268dee4` | Review candidate; scoped grant/return accounting and signed green are handoff claims |
@@ -175,15 +179,19 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   The producer-transfer implementation now passes the two restored red-first
   witnesses, waitv/cancellation and host-request controls (core 58, EL1 host
   74, ABI 32, kernel/semantics 2,459, serial-host 109, runtime 630; existing
-  ignores unchanged). Fresh signed proof and the remaining retirement/restore
-  lifetime audit are still required; see the `owned-transfer/` receipt.
+  ignores unchanged). The combined fixes now have signed EL1 regression
+  coverage at `257de53e0`; deterministic signed interleavings and the remaining
+  retirement/restore lifetime audit are still required. See `owned-transfer/`
+  and `exact-zone-wake/` for their distinct proof scopes.
   Cancellation-before-El1Held and delayed flag writes now have red-first
   repairs using incarnation-bound requests; incarnation exhaustion is also
   fail-closed. Core62/EL1host74/ABI32 and the broader VM-free regressions
   passed; see `tagged-requests/`. RecordRef still does not grant exclusive
   field access; post-publication retirement/restore audit remains open.
-  Close all producer publication/cancellation boundaries and then audit
-  scheduler handback wakes; historical crash attribution remains separate.
+  Scheduler handback wakes now use exact targets: the captured-key/reaped-child
+  witness is red-first, and matching continuation plus pre-enrollment delivery
+  controls pass. Remaining producer/service/restore lifetime boundaries and
+  deterministic signed bindings stay open; historical attribution is separate.
 - [ ] Reduce Python's `SnapshotRestoreFailed`: record 1/incarnation 35925 was
   `Parked { seq: 17965 }` during host materialization; subsequent MM cleanup
   aborted. Compare against main before calling it a batch regression.
