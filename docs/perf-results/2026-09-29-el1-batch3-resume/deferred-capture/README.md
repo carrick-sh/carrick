@@ -45,3 +45,12 @@ Affinity alone and a fortunate timer schedule are insufficient proof. Do not
 force raw record allocation or mutate a slot from a non-owning test thread.
 Further inventory/whole-suite runs wait until this hook/fixture slice is
 stable; the prior source gates do not qualify the new hook.
+
+## Investigation stopped at user priority reset
+
+The user explicitly identified this investigation as a rabbit hole and asked
+for an impact-focused plan. No second signed run was launched. The proposed
+piped-stdio change passed its compile check but remains unrun; its exact patch
+is preserved in `unrun-host-wait-routing.patch` and removed from the working
+source. The initial failing fixture and hook are retained as unaccepted work.
+Resume only for a concrete active-vertical failure or an acceptance dependency.
