@@ -41,8 +41,17 @@ matched after execution. This is one selected execution, not the full EL1 suite.
 
 Compile check, the existing VM-free notification regression, affected
 all-target Clippy, registry and contract coverage passed during fixture
-development. check2.log covers the final rejection-count addition. Broad
-regressions and clean compiler inventory/domain gates after the added lifecycle
-auditor event remain pending. Other deferred-record signed interleavings,
+development. check2.log covers the final rejection-count addition. Broader regression results below cover the final auditor event; clean
+compiler inventory/domain gates remain pending. Other deferred-record signed interleavings,
 structural notification observations, historical attribution and full batch
 acceptance remain open.
+
+## Final broader regression
+
+On `b1f5290b5` (the signed source plus receipt/controller changes), kernel and
+semantics passed 2,462 tests in 21 binaries with one existing ignore. The
+separate serialized kernel lane passed 110 tests; runtime passed 630 tests
+with eight existing ignores. Affected kernel/runtime/embed all-target Clippy
+passed. Logs are final-kernel, final-serial, final-runtime and final-clippy.
+The contract registry also passed (final-registry). These are source regressions;
+they do not enlarge the signed fixture's one-test execution population.
