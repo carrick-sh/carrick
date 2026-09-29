@@ -36,7 +36,9 @@ use carrick_hal::{
     SyscallTrap, ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
-use carrick_mmu_core::aarch64::{PageTableApplyOutcome, PageTableError, PageTableManager};
+use carrick_mmu_core::aarch64::{
+    LiveDescriptorOwner, PageTableApplyOutcome, PageTableError, PageTableManager,
+};
 
 pub use crate::stage1_authority::{ShareState, Stage1Authority, Stage1Editor};
 
@@ -65,6 +67,50 @@ pub fn reserve_hvpatch_process_apertures(
         (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
             + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE) as usize,
         None,
+    )
+}
+
+/// Build the guest-owned lane's frame-grant publication: a Prepare
+/// transaction naming the backend-authenticated backing, with exactly the
+/// faulting page resident. Nothing is stored in the live tables.
+fn guest_frame_grant_submission(
+    page_tables: &Stage1Authority,
+    grant: carrick_hal::threaded::El1FrameGrantPublication,
+    publication: carrick_mmu_core::aarch64::GuestLeafPublication,
+) -> Result<carrick_hal::threaded::El1FrameGrantPublished, TrapError> {
+    use carrick_hal::threaded::El1FrameGrantPublished;
+    use carrick_mmu_core::aarch64::GuestTxnPrepareError;
+    use carrick_mmu_core::aarch64::descriptor_txn::{BackingIdentity, DescriptorOp, PageSpan};
+    use std::num::NonZeroU64;
+
+    let unauthenticated =
+        || TrapError::Hypervisor("EL1 frame grant lacks an authenticated identity".to_owned());
+    let nonzero = |value| NonZeroU64::new(value).ok_or_else(unauthenticated);
+    let backing = BackingIdentity {
+        frame_id: nonzero(grant.ready.frame_id)?,
+        mapping_id: nonzero(grant.ready.mapping_id)?,
+        owner_generation: nonzero(grant.ready.owner_generation)?,
+        inventory_revision: nonzero(grant.ready.inventory_revision)?,
+    };
+    let op = DescriptorOp::Prepare {
+        publication,
+        resident: PageSpan::new(grant.fault_va & !0xfff, 0x1000),
+        backing,
+    };
+    match page_tables.prepare_guest_descriptor_txn(nonzero(grant.mm_key)?, op) {
+        Ok(txn) => Ok(El1FrameGrantPublished::Submit(txn)),
+        Err(GuestTxnPrepareError::Refused(refusal)) => Ok(El1FrameGrantPublished::Refused(refusal)),
+        Err(error) => Err(TrapError::Hypervisor(format!(
+            "prepare EL1 frame-grant descriptor transaction: {error:?}"
+        ))),
+    }
+}
+
+/// A host live-table edit attempted on the lane where guest EL1 owns the live
+/// descriptors. The caller must submit a guest descriptor transaction.
+fn guest_owned_live_edit_error() -> MemoryError {
+    MemoryError::HostMap(
+        "guest EL1 owns the live stage-1 descriptors; submit a descriptor transaction".to_owned(),
     )
 }
 
@@ -1076,6 +1122,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .get_sys_reg(SysReg::Ttbr0)
             .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
             & TTBR_ROOT_MASK;
+        // The single live edit funnel. On the guest-owned lane EL1 is the only
+        // live descriptor writer: refuse before staging anything, so no dirty
+        // host state can outlive the refusal.
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            return Err(guest_owned_live_edit_error());
+        }
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = self
             .vm
@@ -1182,6 +1234,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     }
                     Err(PageTableError::MetadataAllocation) => {
                         Err(MemoryError::MetadataAllocation)
+                    }
+                    Err(PageTableError::GuestOwnsLiveDescriptors) => {
+                        Err(guest_owned_live_edit_error())
                     }
                 }
             },
@@ -3458,30 +3513,27 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.prepare_el1_frame_grant(request)
     }
 
-    fn publish_el1_frame_grant_on_host(
+    fn publish_el1_frame_grant(
         &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        fault_va: u64,
-        permissions: u64,
-    ) -> Result<bool, TrapError> {
-        let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
-        self.pt_edit_and_flush_after_adopting(va, size, |editor| {
+        grant: carrick_hal::threaded::El1FrameGrantPublication,
+    ) -> Result<carrick_hal::threaded::El1FrameGrantPublished, TrapError> {
+        use carrick_hal::threaded::El1FrameGrantPublished;
+        let publication = carrick_mmu_core::aarch64::GuestLeafPublication {
+            va: grant.semantic_base,
+            ipa: grant.ready.physical_ipa,
+            len: grant.len,
+            writable: grant.permissions & 2 != 0,
+            executable: grant.permissions & 4 != 0,
+        };
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            return guest_frame_grant_submission(&self.page_tables, grant, publication);
+        }
+        let size = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
+        self.pt_edit_and_flush_after_adopting(grant.semantic_base, size, |editor| {
             let source = editor.arena_source.as_deref_mut();
             editor
                 .manager
-                .publish_private_pages(
-                    carrick_mmu_core::aarch64::GuestLeafPublication {
-                        va,
-                        ipa,
-                        len,
-                        writable: permissions & 2 != 0,
-                        executable: permissions & 4 != 0,
-                    },
-                    fault_va,
-                    source,
-                )
+                .publish_private_pages(publication, grant.fault_va, source)
                 .map_err(|error| match error {
                     carrick_mmu_core::aarch64::GuestLeafPublicationError::Manager(error) => error,
                     _ => PageTableError::BadAddress,
@@ -3492,7 +3544,31 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })
         })
         .map_err(|error| memory_error_to_trap_error(error, "publish EL1 frame grant on host"))?;
-        Ok(true)
+        Ok(El1FrameGrantPublished::OnHost)
+    }
+
+    fn settle_el1_descriptor_receipt(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        self.page_tables
+            .settle_guest_descriptor_receipt(txn, receipt)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("settle EL1 descriptor receipt: {error:?}"))
+            })
+    }
+
+    fn abandon_el1_descriptor_txn(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<(), TrapError> {
+        self.page_tables
+            .abandon_guest_descriptor_txn(txn)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("abandon EL1 descriptor transaction: {error:?}"))
+            })
     }
 
     fn live_el1_grant_page(&self, va: u64, expected_ipa: u64) -> bool {
@@ -4689,6 +4765,54 @@ mod tests {
             );
             assert!(!body.contains("run_el1_maintenance"));
         }
+    }
+
+    /// The guest-owned lane has no host live-descriptor writer in the engine:
+    /// the single live edit funnel refuses before staging anything, and EL1
+    /// frame-grant publication builds a guest transaction instead of editing.
+    #[test]
+    fn guest_owned_lane_has_no_engine_live_descriptor_store() {
+        let source = include_str!("engine.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production AArch64 engine source");
+        let funnel = production
+            .split("fn pt_edit_locked_after_adopting")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("live edit funnel");
+        let refusal = funnel
+            .find("LiveDescriptorOwner::Guest")
+            .expect("funnel refuses the guest-owned lane");
+        let first_edit = funnel.find("page_tables.edit(").expect("funnel edit");
+        assert!(refusal < first_edit, "refusal must precede any staged edit");
+        assert_eq!(
+            production.matches("page_tables.edit(").count(),
+            1,
+            "the engine's only live editor is the refusing funnel"
+        );
+
+        let grant = production
+            .split("fn publish_el1_frame_grant(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("frame-grant publication");
+        let submission = grant
+            .find("guest_frame_grant_submission")
+            .expect("guest lane builds a transaction");
+        let host_edit = grant
+            .find("pt_edit_and_flush_after_adopting")
+            .expect("host lane edits");
+        assert!(submission < host_edit);
+        let submit_body = production
+            .split("fn guest_frame_grant_submission")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("guest submission");
+        assert!(submit_body.contains("prepare_guest_descriptor_txn"));
+        assert!(!submit_body.contains("pt_edit"));
+        assert!(!submit_body.contains("sync_to_host"));
     }
 
     #[test]

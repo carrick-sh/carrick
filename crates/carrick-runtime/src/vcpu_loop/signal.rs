@@ -581,13 +581,32 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         inventory_revision: ready.inventory_revision,
                     },
                     |grant| {
-                        engine.publish_el1_frame_grant_on_host(
-                            grant.semantic_base,
-                            grant.physical_ipa,
-                            grant.len,
-                            fault_page,
-                            grant.permissions,
-                        )
+                        use carrick_hal::threaded::{
+                            El1FrameGrantPublication, El1FrameGrantPublished,
+                        };
+                        match engine.publish_el1_frame_grant(El1FrameGrantPublication {
+                            mm_key: grant.mm_key,
+                            semantic_base: grant.semantic_base,
+                            len: grant.len,
+                            fault_va: fault_page,
+                            permissions: grant.permissions,
+                            ready,
+                        })? {
+                            El1FrameGrantPublished::OnHost => Ok::<bool, TrapError>(true),
+                            El1FrameGrantPublished::Unsupported
+                            | El1FrameGrantPublished::Refused(_) => Ok(false),
+                            // The guest-owned lane needs the descriptor
+                            // transaction slot in the shared EL1 region
+                            // (`carrick-el1-abi`) and receipt settlement
+                            // before residency commit. Until that transport
+                            // exists no MM selects the lane; if one did, the
+                            // grant is withdrawn and refused, never
+                            // published by the host.
+                            El1FrameGrantPublished::Submit(txn) => {
+                                engine.abandon_el1_descriptor_txn(&txn)?;
+                                Ok(false)
+                            }
+                        }
                     },
                     || {
                         dispatcher.commit_resident_frame_grant(plan);
