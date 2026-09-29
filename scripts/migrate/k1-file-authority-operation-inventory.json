@@ -788,7 +788,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3884,
+      "line": 3899,
       "categories": [
         "mapping"
       ],
@@ -797,7 +797,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3885,
+      "line": 3900,
       "categories": [
         "mapping"
       ],
@@ -806,7 +806,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3893,
+      "line": 3908,
       "categories": [
         "mapping"
       ],
@@ -815,7 +815,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3912,
+      "line": 3927,
       "categories": [
         "mapping"
       ],
@@ -824,7 +824,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3913,
+      "line": 3928,
       "categories": [
         "mapping"
       ],
