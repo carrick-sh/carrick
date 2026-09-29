@@ -17,7 +17,9 @@
 //! resumption entry; on wake the thread re-enters the SVC with its original
 //! registers and this adapter takes the token BEFORE any fd lookup, so a
 //! closed or reused descriptor number never redirects it and no byte is
-//! replayed.
+//! replayed. A final description release found on completion is performed
+//! here (the object lock is only ever held for short sections, so EL1 waits
+//! for it), waking the peer lane.
 //!
 //! # Leaving EL1
 //!
@@ -25,10 +27,10 @@
 //!   never parked (host-backed descriptions, unpublished tables, contended
 //!   locks, a first copy that faults, EPIPE with no progress).
 //! - After progress, or for any resumed operation, EL1 never forwards the
-//!   original call. It completes it, or hands the owned continuation to the
-//!   host with an [`IPC_HANDBACK_NR`] frame (`x0` result, `x1`
-//!   [`HandbackFlags`], `x2` raw operation token, `x3` a backing token whose
-//!   release is owed). The host venue (runtime integration) finishes it.
+//!   original call. It completes it, or hands the owned operation to the host
+//!   with an [`IPC_HANDBACK_NR`] frame: `x0` holds the packed raw token, every
+//!   other argument register is untouched, and the record says what to do
+//!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
 use crate::substrate::file::UserCopy;
@@ -36,16 +38,17 @@ use crate::substrate::ipc::{
     PrefixCopy, StepStatus, from_sched_token, to_sched_token, transfer, wait_key,
 };
 use crate::substrate::sched::object_wait::OperationResumePc;
+pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
-    BackingToken, IpcBacking, IpcEventValue, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken,
+    IpcBacking, IpcEventValue, IpcHandback, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken,
     IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawTableId, WriteProgress,
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, TrapFrame};
 use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
-use carrick_sched_core::{BoundedSpin, WakeEffects};
+use carrick_sched_core::{BoundedSpin, LockWait, WakeEffects};
 use core::sync::atomic::Ordering;
 
 /// Linux AArch64 values this adapter decodes and returns.
@@ -64,24 +67,6 @@ mod linux {
     pub const SVC_LEN: u64 = 4;
 }
 pub use linux::{SYS_READ, SYS_WRITE};
-
-/// Private host call carrying an owned IPC continuation or owed completion
-/// work out of EL1 (next to `SYS_CARRICK_EL1_CONTROL`).
-pub const IPC_HANDBACK_NR: u64 = 0xCA88_0002;
-
-/// What an [`IPC_HANDBACK_NR`] frame asks the host to do.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct HandbackFlags(pub u64);
-impl HandbackFlags {
-    /// `x2` is a raw [`IpcOpToken`]: finish that operation (its record holds
-    /// the pinned description, buffer, length and progress); `x0` is unused.
-    pub const CONTINUE: u64 = 1;
-    /// Deliver SIGPIPE to the calling thread along with the result in `x0`.
-    pub const SIGPIPE: u64 = 2;
-    /// Release the backing named by `x3` (a description's final hold went
-    /// away in EL1 and EL1 could not release it itself).
-    pub const RELEASE: u64 = 4;
-}
 
 /// Where the venue finds a task's descriptor table in the shared authority.
 /// Returns a table only when it is the task's complete descriptor namespace
@@ -158,6 +143,16 @@ impl IpcTables for GuestTables {
 
 const EL1_WAIT: BoundedSpin = BoundedSpin(EL1_GUEST_LOCK_SPINS);
 
+/// Wait for a lock held only by another party's short section (an object
+/// or queue lock: never held across I/O, a switch or a host wait).
+struct Finish;
+impl LockWait for Finish {
+    fn wait(&self, _attempt: u32) -> bool {
+        core::hint::spin_loop();
+        true
+    }
+}
+
 /// Serve read(2)/write(2) on a pipe or eventfd in EL1.
 pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
     sched: &mut Sched<'_, C, U>,
@@ -169,7 +164,6 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
     if nr != SYS_READ && nr != SYS_WRITE {
         return IpcServed::Forward;
     }
-    let mut owed = Owed::default();
     let (token, op, resumed) = match sched.take_object_operation() {
         // The slot's record is not this task's: the host settles it.
         Err(_) => return IpcServed::Forward,
@@ -181,36 +175,23 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 return IpcServed::Forward;
             };
             if op.task != task_key(sched.task) || op.mm != mm_key(sched.task) {
-                return handback_continue(frame, token, op, venue, &mut owed);
+                return handback(frame, token, op, IpcHandback::Continue, 0, venue);
             }
             (token, op, true)
         }
-        Ok(None) => match admit(sched, frame, venue, user, &mut owed) {
+        Ok(None) => match admit(sched, frame, venue, user) {
             Admission::Admitted(token, op) => (token, op, false),
-            Admission::Immediate(result) => return complete(frame, result, false, &owed),
-            Admission::Forward => return owed.forward(frame),
+            Admission::Immediate(result) => {
+                frame.x[0] = result as u64;
+                return IpcServed::Returned { switched: false };
+            }
+            Admission::Forward => return IpcServed::Forward,
+            Admission::Restart(token, op) => {
+                return handback(frame, token, op, IpcHandback::Restart, 0, venue);
+            }
         },
     };
-    run(sched, frame, venue, user, token, op, resumed, owed)
-}
-
-/// Work a call owes the host beyond its result.
-#[derive(Default)]
-struct Owed {
-    release: Option<BackingToken>,
-}
-
-impl Owed {
-    /// Forward unchanged, unless this call dropped its description's final
-    /// hold: every descriptor naming it was closed concurrently, so the call
-    /// completes as if it ran after the close (EBADF) and the release is
-    /// handed to the host with it, never lost.
-    fn forward(&self, frame: &mut TrapFrame) -> IpcServed {
-        match self.release {
-            None => IpcServed::Forward,
-            Some(_) => handback_result(frame, linux::EBADF, 0, self),
-        }
-    }
+    run(sched, frame, venue, user, token, op, resumed)
 }
 
 fn task_key(task: &CurrentTask) -> IpcTaskKey {
@@ -225,6 +206,22 @@ enum Admission {
     Admitted(IpcOpToken, IpcOperation),
     Immediate(i64),
     Forward,
+    /// The pinned description is not one EL1 serves (the fd changed between
+    /// the snapshot and the pin): the host drops the pin and runs the call.
+    Restart(IpcOpToken, IpcOperation),
+}
+
+fn op_kind(
+    backing: carrick_el1_abi::ipc::BackingToken,
+    reading: bool,
+) -> Option<(IpcOpKind, IpcObjectHandle)> {
+    match IpcBacking::decode(backing)? {
+        IpcBacking::Pipe { object, .. } if reading => Some((IpcOpKind::PipeRead, object)),
+        IpcBacking::Pipe { object, .. } => Some((IpcOpKind::PipeWrite, object)),
+        IpcBacking::EventFd { object } if reading => Some((IpcOpKind::EventFdRead, object)),
+        IpcBacking::EventFd { object } => Some((IpcOpKind::EventFdWrite, object)),
+        IpcBacking::Host(_) => None,
+    }
 }
 
 /// Decode a fresh call and take ownership of it, before any effect.
@@ -233,30 +230,49 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     frame: &TrapFrame,
     venue: &IpcVenue<'_>,
     user: &mut M,
-    owed: &mut Owed,
 ) -> Admission {
     let task = sched.task;
     let region = &venue.region;
     let Some(table) = venue.tables.table_of(task) else {
         return Admission::Forward;
     };
+    let table = TableId::from_raw(table);
+    let fd = Fd(frame.x[0] as i32);
+    let reading = frame.x[8] as usize == SYS_READ;
     let fda = region.fd(EL1_WAIT);
-    let (pin, desc) = match fda.pin(TableId::from_raw(table), Fd(frame.x[0] as i32)) {
+    // A snapshot first (no retention): host-backed descriptions are never
+    // pinned in EL1, so EL1 never holds a hold it could not release.
+    match fda.get(table, fd) {
+        Ok(snapshot) if op_kind(snapshot.backing, reading).is_some() => {}
+        Ok(_) => return Admission::Forward,
+        Err(FdError::BadFd) => return Admission::Immediate(linux::EBADF),
+        Err(_) => return Admission::Forward,
+    }
+    let (pin, desc) = match fda.pin(table, fd) {
         Ok(found) => found,
+        // Closed since the snapshot: the call ran after the close.
         Err(FdError::BadFd) => return Admission::Immediate(linux::EBADF),
         Err(_) => return Admission::Forward,
     };
-    let reading = frame.x[8] as usize == SYS_READ;
-    let (kind, object) = match IpcBacking::decode(desc.backing) {
-        Some(IpcBacking::Pipe { object, .. }) if reading => (IpcOpKind::PipeRead, object),
-        Some(IpcBacking::Pipe { object, .. }) => (IpcOpKind::PipeWrite, object),
-        Some(IpcBacking::EventFd { object }) if reading => (IpcOpKind::EventFdRead, object),
-        Some(IpcBacking::EventFd { object }) => (IpcOpKind::EventFdWrite, object),
-        // Host-backed (or unknown) descriptions stay host-served.
-        _ => {
-            release_pin(sched, pin, region, owed);
-            return Admission::Forward;
-        }
+    let mut op = IpcOperation {
+        pin: pin.into_raw(),
+        task: task_key(task),
+        mm: mm_key(task),
+        buf: IpcUserVa(frame.x[1]),
+        orig_x0: frame.x[0],
+        nr: frame.x[8] as u32,
+        ..IpcOperation::EMPTY
+    };
+    let Some((kind, object)) = op_kind(desc.backing, reading) else {
+        // Replaced by a host-backed description since the snapshot: the
+        // host owns its release.
+        return match region.begin_operation(op) {
+            Ok(token) => Admission::Restart(token, op),
+            Err(_) => {
+                release_pin(sched, OfdPin::from_raw(op.pin), region);
+                Admission::Forward
+            }
+        };
     };
     let permitted = match desc.access {
         AccessMode::ReadWrite => true,
@@ -265,83 +281,71 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         AccessMode::Path => false,
     };
     let count = frame.x[2].min(linux::MAX_RW_COUNT);
+    let eventfd = matches!(kind, IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite);
     let immediate = if !permitted {
         Some(linux::EBADF)
-    } else if matches!(kind, IpcOpKind::PipeRead | IpcOpKind::PipeWrite) && count == 0 {
+    } else if !eventfd && count == 0 {
         Some(0)
-    } else if matches!(kind, IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite)
-        && count < linux::EVENTFD_WORD
-    {
+    } else if eventfd && count < linux::EVENTFD_WORD {
         Some(linux::EINVAL)
     } else {
         None
     };
     if let Some(result) = immediate {
-        release_pin(sched, pin, region, owed);
+        release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Immediate(result);
     }
-    let len = match kind {
-        IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite => linux::EVENTFD_WORD,
-        _ => count,
-    };
     // eventfd(2): a write copies its value once, before it can block.
     let mut value = [0u8; linux::EVENTFD_WORD as usize];
     if kind == IpcOpKind::EventFdWrite
         && PrefixCopy::new(user).copy_in(&mut value, frame.x[1]) != value.len()
     {
         // No effect yet: the host resolves the fault (first touch or EFAULT).
-        release_pin(sched, pin, region, owed);
+        release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Forward;
     }
-    let op = IpcOperation {
-        kind,
-        nonblock: 0,
-        pin: pin.into_raw(),
-        object: object.to_raw(),
-        task: task_key(task),
-        mm: mm_key(task),
-        buf: IpcUserVa(frame.x[1]),
-        progress: WriteProgress::new(len),
-        park_seq: 0,
-        value: IpcEventValue(u64::from_ne_bytes(value)),
-    };
+    op.kind = kind;
+    op.object = object.to_raw();
+    op.progress = WriteProgress::new(if eventfd { linux::EVENTFD_WORD } else { count });
+    op.value = IpcEventValue(u64::from_ne_bytes(value));
     match region.begin_operation(op) {
         Ok(token) => Admission::Admitted(token, op),
         Err(_) => {
-            release_pin(sched, OfdPin::from_raw(op.pin), region, owed);
+            release_pin(sched, OfdPin::from_raw(op.pin), region);
             Admission::Forward
         }
     }
 }
 
-/// Drop a description pin. A final release is performed here (waking the
-/// peer lane: EOF for readers, EPIPE for writers) or owed to the host.
+/// Drop a description pin. A final release is performed here, waiting out
+/// another party's short object-lock section, and wakes the peer lane (EOF
+/// for readers, EPIPE for writers). Only IPC-backed descriptions are ever
+/// pinned in EL1.
 fn release_pin<C: ThreadCpu, U: UserWord>(
     sched: &mut Sched<'_, C, U>,
     pin: OfdPin,
     region: &IpcRegion<'_>,
-    owed: &mut Owed,
 ) {
     let Ok(Some(description)) = region.fd(EL1_WAIT).unpin(pin) else {
         return;
     };
-    match region.release_backing(description.backing, &EL1_WAIT) {
-        Ok(IpcReleased::Object { wake, freed }) => {
-            if wake.host_owed {
-                sched.task.mark_pending_host_work();
-            }
-            // A freed object has no waiters: each holds a pin on it.
-            if !freed {
-                let lanes = WakeSet {
-                    readers: wake.readers,
-                    writers: wake.writers,
-                };
-                for e in notify(sched, wake.object, lanes).into_iter().flatten() {
-                    sched.finish_object_wake(e);
-                }
-            }
+    let Ok(IpcReleased::Object { wake, freed }) =
+        region.release_backing(description.backing, &Finish)
+    else {
+        return;
+    };
+    if wake.host_owed {
+        sched.task.mark_pending_host_work();
+    }
+    // A freed object has no waiters: each holds a pin on it.
+    if !freed {
+        let lanes = WakeSet {
+            readers: wake.readers,
+            writers: wake.writers,
+        };
+        for e in notify(sched, wake.object, lanes).into_iter().flatten() {
+            sched.finish_object_wake(e);
         }
-        Ok(IpcReleased::Host(_)) | Err(_) => owed.release = Some(description.backing),
     }
 }
 
@@ -354,7 +358,6 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
     mut token: IpcOpToken,
     mut op: IpcOperation,
     resumed: bool,
-    mut owed: Owed,
 ) -> IpcServed {
     let region = &venue.region;
     let object = IpcObjectHandle::from_raw(op.object);
@@ -366,18 +369,18 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             op.pin = pin.into_raw();
             match flags {
                 Ok(nonblock) => nonblock,
-                Err(_) => return bail(sched, frame, token, op, resumed, venue, owed),
+                Err(_) => return bail(sched, frame, token, op, resumed, venue),
             }
         };
         let mut guard = match region.lock(object, &EL1_WAIT) {
             Ok(guard) => guard,
-            Err(_) => return bail(sched, frame, token, op, resumed, venue, owed),
+            Err(_) => return bail(sched, frame, token, op, resumed, venue),
         };
         let (status, wake) = match transfer(&mut guard, &mut op, &mut copy) {
             Ok(step) => step,
             Err(_) => {
                 drop(guard);
-                return bail(sched, frame, token, op, resumed, venue, owed);
+                return bail(sched, frame, token, op, resumed, venue);
             }
         };
         let published = guard.publish(wake);
@@ -407,7 +410,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             StepStatus::Blocked(lane) => {
                 let Some((_, Some(snap))) = parking else {
-                    return bail(sched, frame, token, op, resumed, venue, owed);
+                    return bail(sched, frame, token, op, resumed, venue);
                 };
                 match park(sched, frame, region, token, op, object, lane, snap) {
                     Parked::Done(served) => return served,
@@ -415,33 +418,33 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         token = t;
                         continue;
                     }
-                    Parked::Refused(t) => return bail(sched, frame, t, op, resumed, venue, owed),
+                    Parked::Refused(t) => return bail(sched, frame, t, op, resumed, venue),
                 }
             }
             StepStatus::Broken if written == 0 && !resumed => {
                 // No effect yet: the host re-runs the call (EPIPE + SIGPIPE).
-                finish(sched, token, region, &mut owed);
-                return owed.forward(frame);
+                finish(sched, token, region);
+                return IpcServed::Forward;
             }
             StepStatus::Broken => {
-                finish(sched, token, region, &mut owed);
                 let result = if written > 0 {
                     written as i64
                 } else {
                     linux::EPIPE
                 };
-                return handback_result(frame, result, HandbackFlags::SIGPIPE, &owed);
+                return handback(frame, token, op, IpcHandback::Sigpipe, result, venue);
             }
             StepStatus::Fault if written == 0 && !resumed => {
                 // The host resolves the fault (first touch or EFAULT).
-                finish(sched, token, region, &mut owed);
-                return owed.forward(frame);
+                finish(sched, token, region);
+                return IpcServed::Forward;
             }
             StepStatus::Fault if op.kind == IpcOpKind::PipeRead => written as i64,
-            StepStatus::Fault => return bail(sched, frame, token, op, resumed, venue, owed),
+            StepStatus::Fault => return bail(sched, frame, token, op, resumed, venue),
         };
-        finish(sched, token, region, &mut owed);
-        return complete(frame, result, false, &owed);
+        finish(sched, token, region);
+        frame.x[0] = result as u64;
+        return IpcServed::Returned { switched: false };
     }
 }
 
@@ -558,15 +561,14 @@ fn finish<C: ThreadCpu, U: UserWord>(
     sched: &mut Sched<'_, C, U>,
     token: IpcOpToken,
     region: &IpcRegion<'_>,
-    owed: &mut Owed,
 ) {
     if let Ok(op) = region.finish_operation(token) {
-        release_pin(sched, OfdPin::from_raw(op.pin), region, owed);
+        release_pin(sched, OfdPin::from_raw(op.pin), region);
     }
 }
 
 /// The call cannot continue in EL1: before any effect of a never-parked
-/// call, forward it unchanged; otherwise hand the owned continuation back.
+/// call, forward it unchanged; otherwise hand the owned operation back.
 fn bail<C: ThreadCpu, U: UserWord>(
     sched: &mut Sched<'_, C, U>,
     frame: &mut TrapFrame,
@@ -574,57 +576,35 @@ fn bail<C: ThreadCpu, U: UserWord>(
     op: IpcOperation,
     resumed: bool,
     venue: &IpcVenue<'_>,
-    mut owed: Owed,
 ) -> IpcServed {
     if op.progress.written == 0 && !resumed {
-        finish(sched, token, &venue.region, &mut owed);
-        return owed.forward(frame);
+        finish(sched, token, &venue.region);
+        return IpcServed::Forward;
     }
-    handback_continue(frame, token, op, venue, &mut owed)
+    handback(frame, token, op, IpcHandback::Continue, 0, venue)
 }
 
-fn handback_continue(
+/// Hand the owned operation to the host: the record says what to do; the
+/// frame carries only the token (`x0`) and [`IPC_HANDBACK_NR`] (`x8`).
+fn handback(
     frame: &mut TrapFrame,
     token: IpcOpToken,
-    op: IpcOperation,
+    mut op: IpcOperation,
+    what: IpcHandback,
+    result: i64,
     venue: &IpcVenue<'_>,
-    owed: &mut Owed,
 ) -> IpcServed {
-    let _ = venue.region.update_operation(&token, op);
-    let raw = token.into_raw();
-    frame.x[8] = IPC_HANDBACK_NR;
-    frame.x[0] = 0;
-    frame.x[1] = HandbackFlags::CONTINUE
-        | if owed.release.is_some() {
-            HandbackFlags::RELEASE
-        } else {
-            0
-        };
-    frame.x[2] = u64::from(raw.index) | (u64::from(raw.generation) << 32);
-    frame.x[3] = owed.release.map_or(0, |b| b.0);
-    IpcServed::Handback
-}
-
-fn handback_result(frame: &mut TrapFrame, result: i64, flags: u64, owed: &Owed) -> IpcServed {
-    frame.x[8] = IPC_HANDBACK_NR;
-    frame.x[0] = result as u64;
-    frame.x[1] = flags
-        | if owed.release.is_some() {
-            HandbackFlags::RELEASE
-        } else {
-            0
-        };
-    frame.x[2] = 0;
-    frame.x[3] = owed.release.map_or(0, |b| b.0);
-    IpcServed::Handback
-}
-
-fn complete(frame: &mut TrapFrame, result: i64, switched: bool, owed: &Owed) -> IpcServed {
-    if owed.release.is_some() {
-        return handback_result(frame, result, 0, owed);
+    op.handback = what;
+    op.result = result;
+    if op.nr == 0 {
+        // A resumed operation: the re-executed SVC carries its registers.
+        op.orig_x0 = frame.x[0];
+        op.nr = frame.x[8] as u32;
     }
-    frame.x[0] = result as u64;
-    IpcServed::Returned { switched }
+    let _ = venue.region.update_operation(&token, op);
+    frame.x[8] = IPC_HANDBACK_NR;
+    frame.x[0] = token.into_raw().pack();
+    IpcServed::Handback
 }
 
 #[cfg(test)]
@@ -1012,6 +992,12 @@ mod tests {
         }
     }
 
+    /// The operation a handback frame names (its token is in `x0`).
+    fn handed_back(w: &World, frame: &TrapFrame) -> IpcOperation {
+        let raw = carrick_el1_abi::ipc::RawIpcOpToken::unpack(frame.x[0]);
+        w.region.operation(&IpcOpToken::from_raw(raw)).unwrap()
+    }
+
     fn syscall(nr: usize, fd: i32, buf: u64, len: u64, svc: u64) -> TrapFrame {
         let mut frame = TrapFrame {
             elr: svc + 4,
@@ -1197,18 +1183,20 @@ mod tests {
         assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4096));
         w.mem.write(MM, 0x500000, &[9; 4096]);
         let mut f = syscall(SYS_WRITE, wfd, 0x500000, 8192, A_SVC);
+        let before = f;
         assert_eq!(w.call(&mut f), IpcServed::Handback);
         assert_eq!(f.x[8], IPC_HANDBACK_NR);
-        assert_eq!(f.x[1], HandbackFlags::CONTINUE);
-        let token = IpcOpToken::from_raw(carrick_el1_abi::ipc::RawIpcOpToken {
-            index: f.x[2] as u32,
-            generation: (f.x[2] >> 32) as u32,
-        });
-        let op = w.region.operation(&token).unwrap();
         assert_eq!(
-            (op.kind, op.progress.written, op.progress.len),
-            (IpcOpKind::PipeWrite, 4096, 8192)
+            f.x[1..8],
+            before.x[1..8],
+            "only x0 and x8 carry the handback"
         );
+        let op = handed_back(&w, &f);
+        assert_eq!(
+            (op.kind, op.progress.written, op.progress.len, op.handback),
+            (IpcOpKind::PipeWrite, 4096, 8192, IpcHandback::Continue)
+        );
+        assert_eq!((op.orig_x0, op.nr), (before.x[0], SYS_WRITE as u32));
         assert_eq!(unread(&w), 4096);
         assert_eq!(
             w.counters
@@ -1381,8 +1369,9 @@ mod tests {
         reenter(&mut f, A_SVC);
         assert_eq!(w.call(&mut f), IpcServed::Handback);
         assert_eq!(f.x[8], IPC_HANDBACK_NR);
-        assert_eq!(f.x[0], 65536);
-        assert_eq!(f.x[1], HandbackFlags::SIGPIPE);
+        let op = handed_back(&w, &f);
+        assert_eq!((op.handback, op.result), (IpcHandback::Sigpipe, 65536));
+        assert_eq!(op.nr, SYS_WRITE as u32);
         // Without progress, EPIPE is the host's to raise: forward unchanged.
         let mut f = syscall(SYS_WRITE, wfd, 0x100000, 10, A_SVC);
         assert_eq!(w.call(&mut f), IpcServed::Forward);

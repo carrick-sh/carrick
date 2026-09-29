@@ -221,7 +221,7 @@ fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
 fn el1_ipc_layout_is_frozen_and_fits_one_metadata_extent() {
     assert_ne!(IPC_LAYOUT_HASH, 0);
     assert_eq!(core::mem::size_of::<IpcObjectRecord>() % 64, 0);
-    assert_eq!(core::mem::size_of::<IpcOperation>(), 96);
+    assert_eq!(core::mem::size_of::<IpcOperation>(), 120);
     assert_eq!(core::mem::size_of::<IpcPipeStorage>(), 24);
     assert!(
         core::mem::size_of::<IpcDirectory>() <= crate::EL1_DYNAMIC_METADATA_EXTENT_SIZE,

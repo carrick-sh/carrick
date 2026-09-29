@@ -55,6 +55,7 @@ pub fn next_nonzero(source: &AtomicU64) -> u64 {
     value
 }
 
+pub mod ipc;
 pub mod readiness;
 pub mod wait_service;
 
