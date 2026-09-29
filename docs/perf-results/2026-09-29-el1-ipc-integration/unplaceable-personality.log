@@ -1,0 +1,24 @@
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fd-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.88s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-bd1deed3ff141365)
+
+running 14 tests
+test personality::ipc::tests::el1_ipc_io_access_and_size_errors_are_decoded_in_guest ... ok
+test personality::ipc::tests::el1_ipc_io_host_backed_descriptions_forward_unchanged ... ok
+test personality::ipc::tests::el1_ipc_io_blocked_eventfd_write_keeps_its_value ... ok
+test personality::ipc::tests::el1_ipc_io_dispatch_serves_ipc_without_the_host ... ok
+test personality::ipc::tests::el1_ipc_io_blocked_read_resumes_by_token_after_fd_reuse ... ok
+test substrate::sched::tests::el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock ... ok
+test substrate::sched::tests::el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation ... ok
+test personality::ipc::tests::el1_ipc_io_eventfd_counter_semaphore_and_saturation ... ok
+test personality::ipc::tests::el1_ipc_io_roundtrip_eof_and_nonblocking_eagain ... ok
+test personality::ipc::tests::el1_ipc_io_copy_faults_forward_before_effects_and_keep_prefixes ... ok
+test personality::ipc::tests::el1_ipc_io_epipe_after_progress_returns_count_and_requests_sigpipe ... ok
+test personality::ipc::tests::el1_ipc_io_nonblocking_saturation_and_atomic_small_writes ... ok
+test personality::ipc::tests::el1_ipc_io_large_write_suspends_without_replay ... ok
+test personality::ipc::tests::el1_ipc_io_steady_state_scales_without_host_calls_or_allocation ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out; finished in 0.14s
+

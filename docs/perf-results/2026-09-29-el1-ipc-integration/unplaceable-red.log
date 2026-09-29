@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 1 test
+
+thread 'object_wait::host_tests::el1_ipc_wait_unplaceable_wake_keeps_owned_operation_runnable' (34449022) panicked at crates/carrick-sched-core/src/object_wait.rs:510:9:
+assertion `left == right` failed: readiness must retain runnable ownership
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test object_wait::host_tests::el1_ipc_wait_unplaceable_wake_keeps_owned_operation_runnable ... FAILED
+
+failures:
+
+failures:
+    object_wait::host_tests::el1_ipc_wait_unplaceable_wake_keeps_owned_operation_runnable
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-sched-core --lib`

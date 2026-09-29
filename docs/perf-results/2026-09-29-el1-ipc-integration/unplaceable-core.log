@@ -1,0 +1,76 @@
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-sched-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 62 tests
+test occupancy::tests::one_vcpu_runs_one_address_space ... ok
+test occupancy::tests::a_switched_slot_is_counted_for_the_address_space_it_runs ... ok
+test occupancy::tests::host_slots_are_distinct_from_zone_slots_and_reusable ... ok
+test spaces::tests::a_closed_space_refuses_an_editor_without_leaking_the_claim ... ok
+test object_wait::host_tests::el1_ipc_wait_host_wake_without_slot_hands_back_exact_operation ... ok
+test spaces::tests::a_cow_publication_is_owed_until_an_install_covers_it ... ok
+test spaces::tests::a_published_space_is_granted_only_while_its_gate_is_open ... ok
+test spaces::tests::colliding_keys_probe_and_freed_entries_are_skipped_then_reused ... ok
+test tests::a_home_record_runs_only_on_its_home_slot ... ok
+test object_wait::host_tests::el1_ipc_wait_unplaceable_wake_keeps_owned_operation_runnable ... ok
+test spaces::tests::a_host_pause_closes_the_gate_before_waiting_for_the_guest_editor ... ok
+test spaces::tests::one_exact_guest_editor_owns_a_space_at_a_time ... ok
+test object_wait::host_tests::el1_ipc_wait_host_wake_scales_and_preserves_operation ... ok
+test tests::a_cancelled_record_is_discarded_not_run ... ok
+test tests::a_closed_space_is_never_installed_again ... ok
+test object_wait::host_tests::el1_ipc_wait_host_wake_closes_concurrent_enroll_gap ... ok
+test tests::a_host_load_starts_a_fresh_slice ... ok
+test tests::a_host_wake_queues_the_waiter_in_the_guest_directly ... ok
+test tests::a_preempted_thread_resumes_without_a_result ... ok
+test tests::a_tick_migrates_queued_threads_to_idle_slots ... ok
+test tests::a_service_record_is_never_switched_in ... ok
+test tests::a_timeout_claims_only_the_park_that_armed_it ... ok
+test tests::an_executor_sweeps_cancelled_records_and_takes_its_service_head ... ok
+test tests::an_idle_vcpu_rescues_service_work_from_a_stopped_slot ... ok
+test tests::arbitrary_non_linux_caller_result_propagates_on_timer_expiration ... ok
+test tests::bitsets_select_waiters ... ok
+test tests::claim_word_round_trips ... ok
+test tests::el1_honours_affinity_for_floating_threads ... ok
+test tests::drain_slot_hands_back_queued_and_reports_the_switched_in_record ... ok
+test tests::el1_refuses_multi_entry_waiters ... ok
+test tests::el1_wake_places_a_floating_thread_on_an_idle_slot ... ok
+test object_wait::host_tests::el1_ipc_wait_host_wake_races_signal_control_once ... ok
+test tests::el1_wake_queues_on_the_slot_and_switch_in_takes_it ... ok
+test tests::el1_wakes_any_count_and_exactly_that_many ... ok
+test tests::enter_idle_refuses_wfi_with_a_queued_thread ... ok
+test tests::host_claims_parked_but_is_refused_by_el1_held ... ok
+test tests::host_placement_respects_address_spaces_and_owes_resched_sgis ... ok
+test tests::ipc_wait::el1_ipc_wait_cancelled_pin_reaches_adapter_before_recycling ... ok
+test tests::ipc_wait::el1_ipc_wait_check_enroll_park_race ... ok
+test tests::ipc_wait::el1_ipc_wait_interruption_requires_adapter_settlement ... ok
+test tests::ipc_wait::el1_ipc_wait_never_aliases_a_private_futex ... ok
+test tests::ipc_wait::el1_ipc_wait_object_and_record_reuse_reject_stale_identity ... ok
+test tests::ipc_wait::el1_ipc_wait_recheck_preserves_pending_result ... ok
+test tests::ipc_wait::el1_ipc_wait_concurrent_notify_and_control_detach_once ... ok
+test tests::ipc_wait::el1_ipc_wait_wake_signal_control_have_one_owner ... ok
+test tests::ipc_wait::el1_ipc_wait_scales_with_affected_waiters_not_population ... ok
+test tests::read_parked_context_finds_and_attributes_the_exact_thread ... ok
+test tests::only_the_executor_still_driving_a_slot_vacates_it ... ok
+test tests::records_are_reused_with_a_new_incarnation ... ok
+test tests::relocation_moves_queued_threads_between_run_queues_without_host_ownership ... ok
+test tests::requeue_moves_waiters_to_the_new_address ... ok
+test tests::run_queue_is_unbounded_fifo_and_survives_removal_from_the_middle ... ok
+test tests::read_parked_context_reports_not_parked_for_an_unmatched_identity ... ok
+test tests::slot_ids_encode_as_plus_one_words ... ok
+test tests::stealing_takes_only_what_the_thief_may_run ... ok
+test tests::the_slot_timer_ends_a_timed_park_once ... ok
+test tests::wake_is_fifo_and_counts_only_waiters_on_the_address ... ok
+test tests::cross_slot_wakes_never_strand_a_thread_on_a_stopped_slot ... ok
+test tests::concurrent_el1_wakes_and_host_claims_give_each_record_one_owner ... ok
+test occupancy::tests::a_pause_never_misses_a_vcpu_about_to_run_its_address_space ... ok
+test tests::a_pause_never_misses_an_el1_address_space_install ... ok
+test tests::an_install_that_skips_the_gate_is_caught ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+   Doc-tests carrick_sched_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
