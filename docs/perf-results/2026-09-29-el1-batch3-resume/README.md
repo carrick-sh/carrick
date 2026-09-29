@@ -107,3 +107,12 @@ deterministic signed interleaving and WorkObservation bindings unresolved.
 The producer-side transition to host ownership and every other handback
 producer still need review; this correction only closes the demonstrated
 deferred-batch identity gap. Batch 3 and migration acceptance remain open.
+
+Source comparison with local main `f304f8415` finds the same bare-ID
+collection and reconstruction in its older `settle_vacated` implementation;
+`git log -S 'fn settle_vacated'` points to `2fbb84312`. This pattern predates
+batch 3. This is source comparison, not a main-runtime Python reproduction.
+Compiler-backed inventory reconciliation at `3981c0366` retained all 595
+authority rows and all other inventory positions unchanged; only the source
+revision stamp changed. Its first sandboxed run failed because clang could
+not create a temporary assembly file; the authorized unrestricted run passed.
