@@ -1,0 +1,147 @@
+{
+  "source": "8c9617950",
+  "artifact_sha256": "90f727e06005f80de57b63de11c55e824527915e8398bee8cb197bd0275082b0",
+  "purpose": "diagnostic rerun of preserved artifact with post-mortem enabled; not acceptance",
+  "truncated": [],
+  "findings": [],
+  "remaining_workers": [
+    {
+      "key": {
+        "tid": 164,
+        "serial": 1742
+      },
+      "execution": "Blocked { generation: ExecutionGeneration(10), reason: HostWait, continuation: Some(ContinuationId(960)) } task_state=true continuation=true control_quantum=None",
+      "continuation": {
+        "id": 960,
+        "family": "zone-futex-wait",
+        "detail": "zone record=3#89 armed_seq=0",
+        "deadline_ms_remaining": null,
+        "registration": {
+          "continuation": 960,
+          "thread_serial": 1742,
+          "execution_generation": 9,
+          "registration_generation": 960,
+          "service_alive": true,
+          "state": "enrolled",
+          "event": null,
+          "probe": "zone record=3#89",
+          "signal_readiness": "observed_wake=0 current_wake=0 observed_event=0 current_event=0",
+          "poll_fds": [],
+          "subscriptions": 1,
+          "has_task_waker": false
+        }
+      },
+      "task": {
+        "id": 157,
+        "serial": 1597
+      },
+      "registry_id": 164,
+      "class": "live",
+      "file_table": 1594,
+      "fs_context": 1595,
+      "credentials": 1741,
+      "exec_invalidation_pending": false
+    },
+    {
+      "key": {
+        "tid": 168,
+        "serial": 1766
+      },
+      "execution": "Blocked { generation: ExecutionGeneration(10), reason: HostWait, continuation: Some(ContinuationId(962)) } task_state=true continuation=true control_quantum=None",
+      "continuation": {
+        "id": 962,
+        "family": "zone-futex-wait",
+        "detail": "zone record=5#63 armed_seq=0",
+        "deadline_ms_remaining": null,
+        "registration": {
+          "continuation": 962,
+          "thread_serial": 1766,
+          "execution_generation": 9,
+          "registration_generation": 962,
+          "service_alive": true,
+          "state": "enrolled",
+          "event": null,
+          "probe": "zone record=5#63",
+          "signal_readiness": "observed_wake=0 current_wake=0 observed_event=0 current_event=0",
+          "poll_fds": [],
+          "subscriptions": 1,
+          "has_task_waker": false
+        }
+      },
+      "task": {
+        "id": 158,
+        "serial": 1636
+      },
+      "registry_id": 168,
+      "class": "live",
+      "file_table": 1633,
+      "fs_context": 1634,
+      "credentials": 1765,
+      "exec_invalidation_pending": false
+    }
+  ],
+  "remaining_file_slots": [
+    {
+      "table": 1594,
+      "number": 9,
+      "description": 301,
+      "close_on_exec": false,
+      "open_path": null
+    },
+    {
+      "table": 1594,
+      "number": 10,
+      "description": 302,
+      "close_on_exec": false,
+      "open_path": null
+    },
+    {
+      "table": 1633,
+      "number": 9,
+      "description": 301,
+      "close_on_exec": false,
+      "open_path": null
+    },
+    {
+      "table": 1633,
+      "number": 10,
+      "description": 302,
+      "close_on_exec": false,
+      "open_path": null
+    }
+  ],
+  "remaining_file_descriptions": [
+    {
+      "id": 301,
+      "class": "live",
+      "revision": 12,
+      "kind": "regular",
+      "backing_kind": "eventfd",
+      "status_flags": 2,
+      "offset": null,
+      "host_fd": null,
+      "path": null,
+      "pipe_id": null,
+      "logical_fd_refs": 2,
+      "epoll_interests": [],
+      "epoll_owners": []
+    },
+    {
+      "id": 302,
+      "class": "live",
+      "revision": 9,
+      "kind": "regular",
+      "backing_kind": "eventfd",
+      "status_flags": 2,
+      "offset": null,
+      "host_fd": null,
+      "path": null,
+      "pipe_id": null,
+      "logical_fd_refs": 2,
+      "epoll_interests": [],
+      "epoll_owners": []
+    }
+  ],
+  "cleanup_remaining": 0,
+  "limitation": "No counter values or saved IPC operation token payloads in this graph. Does not establish root cause."
+}

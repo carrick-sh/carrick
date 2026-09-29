@@ -376,3 +376,20 @@ bytes and complete census are preserved in `processes-wake-fix*`.
 Next decisive experiment: use existing kernel post-mortem/event-ring capture
 on the remaining eventfd case to identify the two workers' wait ownership.
 Do not rerun until green or assume the first correction explains this state.
+
+## Existing post-mortem capture narrows remaining eventfd stall
+
+One diagnostic execution of the preserved `8c9617950` binary, without
+rebuild/re-signing, enables `CARRICK_POSTMORTEM_DIR`. Run
+`el1-ipc-processes-capture-20260929` stalls at eventfd8 after pipe1/8/64
+and eventfd1 complete. This is timing-dependent, not limited to eventfd64.
+The capture has no truncation markers or findings. Worker serials1742/1766
+are enrolled on zone-record continuations960/962, records3#89 and5#63.
+Only eventfd descriptions301/302 remain, each with two functional fd refs;
+both process tables retain fd9/10. Raw captures and extracted facts are
+in `processes-capture/`. Scoped cleanup confirms zero remaining processes.
+
+The graph has no eventfd counter or saved IPC operation payloads. These
+observations do not distinguish missed wake, consumed operation or replay.
+Next is a bounded LLDB capture of those existing values on the authoritative
+carrier, not new counters, repeated acceptance attempts or another framework.
