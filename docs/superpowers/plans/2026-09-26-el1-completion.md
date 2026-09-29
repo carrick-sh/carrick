@@ -38,7 +38,7 @@ At refresh, the implementation baseline on local `main` and local
 remote-tracking `origin/main` is `a70b40466`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
 Batch 3 is on `integ/batch3`, unlanded. Its current implementation correction
-is `8c0ad1d34`; its owned-transfer checkpoint has VM-free proof only.
+is `276e05673`; its request-lifetime checkpoint has VM-free proof only.
 The prior broader signed EL1 regression source is `40a707ba0`
 (subsequent receipt-only commits may follow). All twelve active
 batch/memory/IPC/sigsuspend worktrees inventoried below were clean at the
@@ -89,7 +89,7 @@ do not overwrite it with that branch's pre-refresh controller.
 
 | Worktree / branch | Head | Disposition |
 |---|---|---|
-| `wt-batch3` / `integ/batch3` | `8c0ad1d34` implementation; prior signed `40a707ba0` | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
+| `wt-batch3` / `integ/batch3` | `276e05673` implementation; prior signed `40a707ba0` | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
 | `wt-cp2-descr` / `work/cp2-el1-descriptor-owner` | `c555f5dd1` | Review candidate; 9 signed filters and first-touch slopes 0.004–0.009 are handoff claims |
 | `wt-cp2-cow` / `work/cp2-hvf-cow-adapters` | `d581dd099` | Ancestry-confirmed in descriptor branch; do not merge it a second time |
 | `wt-cp2-return` / `work/cp2-elastic-return` | `8f268dee4` | Review candidate; scoped grant/return accounting and signed green are handoff claims |
