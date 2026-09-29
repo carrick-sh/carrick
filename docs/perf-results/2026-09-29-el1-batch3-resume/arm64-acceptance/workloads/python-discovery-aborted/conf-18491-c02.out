@@ -1,0 +1,77 @@
+== CPython 3.12.13 (main, Aug 5 2026, 03:49:12) [GCC 14.2.0]
+== Linux-6.12.0-carrick-aarch64-with-glibc2.41 little-endian
+== Python build: release shared LTO+PGO
+== cwd: /tmp/test_python_worker_1æ
+== CPU count: 4
+== encodings: locale=UTF-8 FS=utf-8
+== resources: all test resources are disabled, use -u option to unskip tests
+
+Using random seed: 0
+0:00:00 load avg: 0.00 Run 1 test sequentially in a single process
+0:00:00 load avg: 0.00 [1/1] test_mmap
+test_around_2GB (test.test_mmap.LargeMmapTests.test_around_2GB) ... ok
+test_around_4GB (test.test_mmap.LargeMmapTests.test_around_4GB) ... ok
+test_large_filesize (test.test_mmap.LargeMmapTests.test_large_filesize) ... ok
+test_large_offset (test.test_mmap.LargeMmapTests.test_large_offset) ... ok
+test_access_parameter (test.test_mmap.MmapTests.test_access_parameter) ... ok
+test_anonymous (test.test_mmap.MmapTests.test_anonymous) ... ok
+test_bad_file_desc (test.test_mmap.MmapTests.test_bad_file_desc) ... ok
+test_basic (test.test_mmap.MmapTests.test_basic) ... ok
+test_concat_repeat_exception (test.test_mmap.MmapTests.test_concat_repeat_exception) ... ok
+test_context_manager (test.test_mmap.MmapTests.test_context_manager) ... ok
+test_context_manager_exception (test.test_mmap.MmapTests.test_context_manager_exception) ... ok
+test_crasher_on_windows (test.test_mmap.MmapTests.test_crasher_on_windows) ... skipped 'requires Windows'
+test_double_close (test.test_mmap.MmapTests.test_double_close) ... ok
+test_empty_file (test.test_mmap.MmapTests.test_empty_file) ... ok
+test_entire_file (test.test_mmap.MmapTests.test_entire_file) ... ok
+test_error (test.test_mmap.MmapTests.test_error) ... ok
+test_extended_getslice (test.test_mmap.MmapTests.test_extended_getslice) ... ok
+test_extended_set_del_slice (test.test_mmap.MmapTests.test_extended_set_del_slice) ... ok
+test_find_does_not_access_beyond_buffer (test.test_mmap.MmapTests.test_find_does_not_access_beyond_buffer) ... ok
+test_find_end (test.test_mmap.MmapTests.test_find_end) ... ok
+test_flush_return_value (test.test_mmap.MmapTests.test_flush_return_value) ... ok
+test_invalid_descriptor (test.test_mmap.MmapTests.test_invalid_descriptor) ... skipped 'requires Windows'
+test_io_methods (test.test_mmap.MmapTests.test_io_methods) ... ok
+test_length_0_large_offset (test.test_mmap.MmapTests.test_length_0_large_offset) ... ok
+test_length_0_offset (test.test_mmap.MmapTests.test_length_0_offset) ... ok
+test_madvise (test.test_mmap.MmapTests.test_madvise) ... ok
+test_mmap_closed_by_int_scenarios (test.test_mmap.MmapTests.test_mmap_closed_by_int_scenarios)
+gh-103987: Test that mmap objects raise ValueError ... ok
+test_move (test.test_mmap.MmapTests.test_move) ... ok
+test_non_ascii_byte (test.test_mmap.MmapTests.test_non_ascii_byte) ... ok
+test_offset (test.test_mmap.MmapTests.test_offset) ... ok
+test_prot_readonly (test.test_mmap.MmapTests.test_prot_readonly) ... ok
+test_read_all (test.test_mmap.MmapTests.test_read_all) ... ok
+test_read_invalid_arg (test.test_mmap.MmapTests.test_read_invalid_arg) ... ok
+test_repr (test.test_mmap.MmapTests.test_repr) ... ok
+test_resize_down_when_mapped_to_pagefile (test.test_mmap.MmapTests.test_resize_down_when_mapped_to_pagefile)
+If the mmap is backed by the pagefile ensure a resize down up can happen ... skipped 'requires Windows'
+test_resize_fails_if_mapping_held_elsewhere (test.test_mmap.MmapTests.test_resize_fails_if_mapping_held_elsewhere)
+If more than one mapping is held against a named file on Windows, neither ... skipped 'requires Windows'
+test_resize_past_pos (test.test_mmap.MmapTests.test_resize_past_pos) ... ok
+test_resize_succeeds_with_error_for_second_named_mapping (test.test_mmap.MmapTests.test_resize_succeeds_with_error_for_second_named_mapping)
+If a more than one mapping exists of the same name, none of them can ... skipped 'requires Windows'
+test_resize_up_when_mapped_to_pagefile (test.test_mmap.MmapTests.test_resize_up_when_mapped_to_pagefile)
+If the mmap is backed by the pagefile ensure a resize up can happen ... skipped 'requires Windows'
+test_rfind (test.test_mmap.MmapTests.test_rfind) ... ok
+test_sizeof (test.test_mmap.MmapTests.test_sizeof) ... skipped 'requires Windows'
+test_subclass (test.test_mmap.MmapTests.test_subclass) ... ok
+test_tagname (test.test_mmap.MmapTests.test_tagname) ... skipped 'requires Windows'
+test_tougher_find (test.test_mmap.MmapTests.test_tougher_find) ... ok
+test_weakref (test.test_mmap.MmapTests.test_weakref) ... ok
+test_write_returning_the_number_of_bytes_written (test.test_mmap.MmapTests.test_write_returning_the_number_of_bytes_written) ... ok
+
+----------------------------------------------------------------------
+Ran 46 tests in 0.249s
+
+OK (skipped=8)
+0:00:00 load avg: 0.00 [1/1] test_mmap passed
+
+== Tests result: SUCCESS ==
+
+1 test OK.
+
+Total duration: 288 ms
+Total tests: run=46 skipped=8
+Total test files: run=1/1
+Result: SUCCESS

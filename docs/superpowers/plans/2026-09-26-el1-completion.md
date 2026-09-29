@@ -83,6 +83,12 @@ DIFF; this is regression evidence, not strict closure. Three generic shard
 files were re-signed by the later dedicated stage; their passing receipts
 remain, but final promotion must retain the tested bytes. Fixed Python/Go,
 controlled ratios and the remaining lifecycle obligations stay open.
+Fixed Python8x2 now passes all16 rows against fresh native Linux, with
+normal concurrency and serial confirmation disabled. Fixed Go20 is RED:
+round2 conf-20571-c00 aborted while publishing terminal inventory retirement
+(frame2697 still mapped; kernel_mm14). The other19 passes do not clear it.
+The immediate priority is a deterministic reduction of this live-frame
+retirement refusal; batch3 promotion is stopped. See `arm64-acceptance/workloads/`.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake
