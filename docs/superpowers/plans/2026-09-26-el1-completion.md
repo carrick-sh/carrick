@@ -203,6 +203,12 @@ must provide those witnesses where applicable.
 
 ### A. Close batch-3 lifecycle blockers
 
+Next bounded proof: [signed deferred handback ordering](2026-09-29-el1-signed-handback-proof.md).
+Capture must precede the stale-record filter; start with one real guest
+retirement/reuse ordering before expanding populations. The parked-restore
+admission fixture now confirms generic and exact wakes cannot queue a parked
+record; this is negative coverage, not historical crash attribution.
+
 Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`,
 `crates/carrick-kernel/src/{el1_zone.rs,kernel/scheduler.rs}`, and
 `crates/carrick-sched-core/src/`. Contract for the new notification reduction:
