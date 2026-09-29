@@ -1,0 +1,11 @@
+{
+  "source_head": "9055c465b",
+  "run_id": "el1-ipc-pairs-20260929-a",
+  "preserved_path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/el1-ipc-pairs-red-9055c465b/el1_sched-3c030f910e35df6e",
+  "sha256": "f06d3db83e78e0164f4deff1b8c8f2d138b0ec099985c105672242d5c829da4a",
+  "codesign": "Executable=/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e\nIdentifier=el1_sched-3c030f910e35df6e.tmp.97701\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=58045 flags=0x2(adhoc) hashes=1803+7 location=embedded\nHash type=sha256 size=32\nCandidateCDHash sha256=56bfdbf63c826454ebb2072603a3c6f7622a9843\nCandidateCDHashFull sha256=56bfdbf63c826454ebb2072603a3c6f7622a98431cb2ae4222ead840b19d9037\nHash choices=sha256\nCMSDigest=56bfdbf63c826454ebb2072603a3c6f7622a98431cb2ae4222ead840b19d9037\nCMSDigestType=2\nCDHash=56bfdbf63c826454ebb2072603a3c6f7622a9843\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n",
+  "lc_uuid": "85BD1619-0D79-314C-8F37-58593D20810E",
+  "dof_carrick_present": true,
+  "cleanup_remaining": 0,
+  "result": "pipe8 completed correct data and 2056 EL1 parks but 1 of 2048 writes forwarded; later scales not executed"
+}

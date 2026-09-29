@@ -807,6 +807,7 @@ fn el1_ipc_pairs_blocking() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
+    let mut failures = Vec::new();
     for kind in ["pipe", "eventfd"] {
         for pairs in [1u64, 8, 64] {
             let before = read_el1_counters()
@@ -833,27 +834,33 @@ fn el1_ipc_pairs_blocking() {
             let counters = read_el1_counters().expect("real EL1 counters");
             let served =
                 [63, 64].map(|nr| counters.served[nr].load(std::sync::atomic::Ordering::Relaxed));
-            assert!(
-                served[0] - before[0] >= 2 * pairs * ROUNDS
-                    && served[1] - before[1] >= 2 * pairs * ROUNDS,
-                "IPC fell back: served before={before:?} after={served:?}"
-            );
-            assert!(
-                measured.zone.el1_parks >= pairs * ROUNDS,
-                "startup/barrier parks cannot stand in for repeated IPC parking: {:?}",
-                measured.zone
-            );
+            println!("IPC pairs {kind} n={pairs} served before={before:?} after={served:?}");
+            if served[0] - before[0] < 2 * pairs * ROUNDS
+                || served[1] - before[1] < 2 * pairs * ROUNDS
+            {
+                failures.push(format!(
+                    "{kind} n={pairs}: IPC fell back; served before={before:?} after={served:?}"
+                ));
+            }
+            if measured.zone.el1_parks < pairs * ROUNDS {
+                failures.push(format!(
+                    "{kind} n={pairs}: insufficient IPC parks {:?}",
+                    measured.zone
+                ));
+            }
             let reads = measured
                 .forwarded_syscalls
                 .iter()
                 .find(|(nr, _)| *nr == 63)
                 .map_or(0, |(_, n)| *n);
-            assert!(
-                reads < pairs * ROUNDS,
-                "read continuations fell back: {reads}"
-            );
+            if reads >= pairs * ROUNDS {
+                failures.push(format!(
+                    "{kind} n={pairs}: read continuations fell back: {reads}"
+                ));
+            }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Production IPC continuation witness using the existing two-pipe fixture.
