@@ -1,7 +1,6 @@
 //! Linux syscall dispatch and completion mapping.
 use super::{file, inotify, sched};
 use crate::fault::dispatch_fault;
-#[cfg(target_os = "none")]
 use crate::memory;
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
@@ -16,6 +15,38 @@ use carrick_el1_abi::{
     FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
 use core::sync::atomic::Ordering;
+
+/// T2's SVC integration point. A Work result is an owned continuation, not a
+/// completed syscall and not permission to enter the host syscall dispatcher.
+pub enum AnonymousReservationRoute {
+    Action(Action),
+    Work(memory::PendingReservationSyscall),
+    Unavailable(memory::reservations::Refusal),
+}
+
+pub fn dispatch_anonymous_with_reservations(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    model: &mut memory::reservations::Reservations<'_>,
+) -> AnonymousReservationRoute {
+    match memory::decide_anonymous_syscall(frame, model) {
+        memory::ReservationDisposition::Forward => {
+            if let Some(counter) = counters.forwarded.get(frame.x[8] as usize) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            AnonymousReservationRoute::Action(Action::Forward)
+        }
+        memory::ReservationDisposition::Return(result) => {
+            frame.x[0] = result as u64;
+            counters.served[frame.x[8] as usize].fetch_add(1, Ordering::Relaxed);
+            AnonymousReservationRoute::Action(Action::Served)
+        }
+        memory::ReservationDisposition::Work(pending) => AnonymousReservationRoute::Work(pending),
+        memory::ReservationDisposition::Unavailable(reason) => {
+            AnonymousReservationRoute::Unavailable(reason)
+        }
+    }
+}
 
 /// The shared-record layout this image was built against; the image header
 /// points at it and the host refuses an image whose value differs

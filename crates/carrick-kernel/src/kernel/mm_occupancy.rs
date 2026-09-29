@@ -800,9 +800,50 @@ fn publish_in_with_layout(
     }
     let index =
         spaces.publish_closed_with_layout(mm.raw(), ttbr0, ttbr1, brk_current, mmap_next)?;
+    // Install the relocatable reservation root in this same slot while the MM
+    // gate is closed. The dispatcher imports exact VMAs/limits before T2 opts
+    // into reservation decisions; an unimported root refuses guest service.
+    if tables.zone {
+        use carrick_el1::memory::reservations::{Layout, shared_host};
+        use carrick_el1_abi::{ReservationMm, ReservationRange};
+        let installed = (|| {
+            let heap_base = carrick_mem::memory::LINUX_HEAP_BASE;
+            let arena_base = carrick_mem::memory::LINUX_MMAP_BASE;
+            shared_host()?
+                .publish(
+                    index.index(),
+                    ReservationMm::new(mm.raw())?,
+                    Layout {
+                        heap: ReservationRange::new(
+                            heap_base,
+                            heap_base + carrick_mem::memory::LINUX_HEAP_SIZE,
+                        )?,
+                        arena: ReservationRange::new(
+                            arena_base,
+                            arena_base + carrick_mem::memory::LINUX_MMAP_SIZE_MAX,
+                        )?,
+                        brk: if brk_current == 0 {
+                            heap_base
+                        } else {
+                            brk_current
+                        },
+                        address_limit: u64::MAX,
+                        data_limit: u64::MAX,
+                        external_address_bytes: 0,
+                        external_data_bytes: 0,
+                    },
+                )
+                .ok()
+        })();
+        if installed.is_none() {
+            spaces.free(index);
+            return None;
+        }
+    }
     // Bound while closed: a pause in force now raises the gate before it
     // opens, and every later pause raises it before its occupancy scan.
     if !fence.bind_mirror(Arc::new(SpaceGate { tables, index })) {
+        retire_reservation_root(tables, index, mm);
         spaces.free(index);
         return None;
     }
@@ -816,6 +857,16 @@ fn publish_in_with_layout(
 }
 
 impl AddressSpacePublication {
+    /// Final-MM settlement, after closing/draining the published address space.
+    /// Idempotent so publication rollback and the final Drop use the same path.
+    pub fn retire_reservations(&self) {
+        if !self.tables.live() {
+            return;
+        }
+        self.close();
+        drain_space(self.tables.occupancy, self.mm);
+        retire_reservation_root(self.tables, self.index, self.mm);
+    }
     /// No EL1 install of the space from now on (its ASID starts retiring).
     pub fn close(&self) {
         if self.tables.live() {
@@ -862,8 +913,32 @@ impl Drop for AddressSpacePublication {
             .spaces
             .close_and_wait_for_editor(self.index, core::hint::spin_loop);
         drain_space(self.tables.occupancy, self.mm);
+        retire_reservation_root(self.tables, self.index, self.mm);
         let _serial = SPACES_LOCK.lock();
         self.tables.spaces.free(self.index);
+    }
+}
+
+fn retire_reservation_root(tables: SpaceTables, index: carrick_sched_core::SpaceIndex, mm: MmId) {
+    if !tables.zone {
+        return;
+    }
+    use carrick_el1::memory::reservations::{Refusal, shared_host};
+    let Some(table) = shared_host() else {
+        return;
+    };
+    let Some(key) = carrick_el1_abi::ReservationMm::new(mm.raw()) else {
+        return;
+    };
+    match table
+        .lock(index.index(), key)
+        .and_then(|model| model.retire())
+    {
+        Ok(()) | Err(Refusal::Stale) => {}
+        Err(_) => carrick_fatal!(
+            "kernel::mm_occupancy",
+            "reservation authority remains busy at final MM settlement"
+        ),
     }
 }
 
