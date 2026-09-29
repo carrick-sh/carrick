@@ -21,7 +21,9 @@
  * LIVE QUALIFICATION
  * ------------------
  * Qualified against carrick's HVPatch runtime on Darwin/arm64.
- * The script fails closed on target timeout (90 s), DTrace error, target root
+ * The script fails closed on target timeout (90 s by default; the Rust
+ * launcher may override this with `carrick trace --profile-bound-seconds`
+ * for long workloads such as `go build`), DTrace error, target root
  * non-exit, or zero scoped samples. sample-population is the authoritative
  * event count and must equal the sum of all emitted user-stack counts.
  *
@@ -57,11 +59,24 @@ dtrace:::BEGIN
     bounded = 0;
     errors = 0;
     saw_sample = 0;
+    bound_elapsed_s = (uint64_t)0;
+    bound_limit_s = (uint64_t)90;
+
+    /*
+     * The declared capture bound. Left as the shipped default (90 s) when
+     * unrendered so the bundled template stays a legal D program on its own;
+     * `carrick trace --profile-bound-seconds` overrides it for long
+     * workloads (e.g. `go build`), and the summary always reports whichever
+     * bound was actually in force.
+     */
+    /* CARRICK_HVPCARRIERCPUATTR_BOUND */
 }
 
 /*
  * Exact Mach-O identity of the traced carrier so the raw stack population can
- * be symbolicated offline (atos -o target/release/carrick -l <text_base>).
+ * be symbolicated in-process by the Rust reader (goblin Mach-O/ELF symbol
+ * table parsing keyed on host_pid/text_base/slide) -- no child `atos`
+ * process, which the carrier-only process invariant forbids.
  * Only fires once per carrier process at startup.
  */
 carrick*:::host-image-base
@@ -95,8 +110,19 @@ proc:::exit
     exit(saw_sample && errors == 0 ? 0 : 1);
 }
 
-profile:::tick-1sec
-/timestamp - started > 90 * 1000000000/
+tick-10s
+{
+    bound_elapsed_s += (uint64_t)10;
+}
+
+/*
+ * Safety net only -- the census normally ends on the target's own exit. A
+ * truncated census still emits a clean summary record but with bounded=1,
+ * which the reader treats as an error (the marker, not the exit status, is
+ * what closes the capture).
+ */
+tick-10s
+/bound_elapsed_s >= bound_limit_s/
 {
     bounded = 1;
     exit(4);

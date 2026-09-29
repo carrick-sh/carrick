@@ -277,6 +277,18 @@ fn hvpatch_carrier_cpu_attribution_requires_a_retained_raw_capture() {
         1,
         "the Rust launcher must render exactly one immutable-template digest slot"
     );
+    // `go build` and other long workloads exceed the profile's shipped 90 s
+    // default; `carrick trace --profile-bound-seconds` must be able to raise
+    // it, which requires exactly one substitutable bound slot in the bundled
+    // template (asserted end-to-end against `render_profile_capture_bound` in
+    // `trace_profile::tests::hvpatch_carrier_cpu_attribution_declares_a_capture_bound`).
+    assert_eq!(
+        HVP_CARRIER_CPU_ATTR_PROGRAM
+            .matches("/* CARRICK_HVPCARRIERCPUATTR_BOUND */")
+            .count(),
+        1,
+        "the bundled template must declare exactly one capture-bound slot"
+    );
     cli()
         .args([
             "trace",

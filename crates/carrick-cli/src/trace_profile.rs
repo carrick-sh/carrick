@@ -271,8 +271,10 @@ impl TraceProfileKind {
     pub(crate) const fn capture_bound_placeholder(self) -> Option<&'static str> {
         match self {
             Self::NativeAmplification => Some(AMP1_BOUND_PLACEHOLDER),
+            Self::HvpatchCarrierCpuAttribution => {
+                Some(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
+            }
             Self::HvpatchCarrierCpuLowRate
-            | Self::HvpatchCarrierCpuAttribution
             | Self::HvpatchInotify09Population
             | Self::HvpatchFrameCow
             | Self::HvpatchExecRuntimeStages
@@ -437,6 +439,42 @@ mod tests {
             format!("{error:#}").contains("does not declare a capture bound"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// `hvpatch-carrier-cpu-attribution` must declare a capture bound so
+    /// `carrick trace -p hvpatch-carrier-cpu-attribution --profile-bound-seconds`
+    /// can raise its shipped 90 s default for long workloads (e.g. `go build`)
+    /// instead of failing with "does not declare a capture bound".
+    #[test]
+    fn hvpatch_carrier_cpu_attribution_declares_a_capture_bound() {
+        let template = carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_ATTRIBUTION_D;
+        assert_eq!(
+            TraceProfileKind::HvpatchCarrierCpuAttribution.capture_bound_placeholder(),
+            Some(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
+        );
+        assert_eq!(
+            template
+                .matches(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
+                .count(),
+            1,
+            "the bundled template must contain exactly one capture-bound placeholder"
+        );
+        assert!(
+            template.contains("bound_limit_s = (uint64_t)90;"),
+            "the unrendered template must stay a legal D program with its 90 s default"
+        );
+
+        let rendered = render_profile_capture_bound(
+            TraceProfileKind::HvpatchCarrierCpuAttribution,
+            template,
+            1800,
+        )
+        .expect("render a bound for a long workload like go build");
+        assert!(rendered.contains("bound_limit_s = (uint64_t)1800;"));
+        assert!(
+            !rendered.contains(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
+        );
+        assert!(rendered.contains("bound_limit_s = (uint64_t)90;"));
     }
 
     #[test]
