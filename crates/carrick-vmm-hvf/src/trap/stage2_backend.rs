@@ -1306,3 +1306,289 @@ fn stage2_map_refuses_the_gic_window() {
     };
     assert_eq!(rc, 0, "the page below the window is ordinary");
 }
+
+/// The host IPC authority's memory, shaped like the kernel authority's
+/// accessors (`directory_ptr/len`, `pool_ptr/len`). The carrier maps it into
+/// the kernel-only IPC window: the directory at
+/// [`carrick_el1_abi::EL1_IPC_BASE`], the pool at
+/// [`carrick_el1_abi::EL1_IPC_POOL_BASE`]. The mapping retains the owner
+/// (its `Arc`) for as long as the memory is mapped.
+pub trait IpcWindowBacking: Send + Sync {
+    fn directory_ptr(&self) -> *mut u8;
+    fn directory_len(&self) -> usize;
+    fn pool_ptr(&self) -> *mut u8;
+    fn pool_len(&self) -> usize;
+}
+
+/// Stage-2 granule of the host (16 KiB on Apple silicon).
+const IPC_WINDOW_GRANULE: usize = 0x4000;
+
+static IPC_WINDOW_BACKING: parking_lot::Mutex<Option<std::sync::Arc<dyn IpcWindowBacking>>> =
+    parking_lot::Mutex::new(None);
+
+/// Validate a backing against the window's fixed geometry: granule-aligned
+/// host memory, a directory that fits its span, and a pool exactly the ABI's
+/// length. Returns the (directory, pool) mapping lengths.
+fn ipc_window_geometry(backing: &dyn IpcWindowBacking) -> Result<(usize, usize), TrapError> {
+    let directory_len = backing.directory_len().next_multiple_of(IPC_WINDOW_GRANULE);
+    let aligned =
+        |ptr: *mut u8| !ptr.is_null() && (ptr as usize).is_multiple_of(IPC_WINDOW_GRANULE);
+    if !aligned(backing.directory_ptr())
+        || !aligned(backing.pool_ptr())
+        || backing.directory_len() < std::mem::size_of::<carrick_el1_abi::ipc::IpcDirectory>()
+        || directory_len as u64 > carrick_el1_abi::EL1_IPC_DIRECTORY_SPAN
+        || backing.pool_len() as u64 != carrick_el1_abi::EL1_IPC_POOL_SPAN
+    {
+        return Err(TrapError::Hypervisor(format!(
+            "IPC window backing does not fit the window: directory {:p}+{:#x}, pool {:p}+{:#x}",
+            backing.directory_ptr(),
+            backing.directory_len(),
+            backing.pool_ptr(),
+            backing.pool_len()
+        )));
+    }
+    Ok((directory_len, backing.pool_len()))
+}
+
+/// Register the host IPC authority's memory for this carrier (before its
+/// persistent executor is published). Refuses memory that does not fit the
+/// window or a second, different backing.
+pub fn register_ipc_window_backing(
+    backing: std::sync::Arc<dyn IpcWindowBacking>,
+) -> Result<(), TrapError> {
+    ipc_window_geometry(backing.as_ref())?;
+    let mut slot = IPC_WINDOW_BACKING.lock();
+    match slot.as_ref() {
+        Some(existing) if !std::sync::Arc::ptr_eq(existing, &backing) => {
+            Err(TrapError::Hypervisor(
+                "a different IPC window backing is already registered".to_owned(),
+            ))
+        }
+        _ => {
+            *slot = Some(backing);
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn registered_ipc_window_backing() -> Option<std::sync::Arc<dyn IpcWindowBacking>> {
+    IPC_WINDOW_BACKING.lock().clone()
+}
+
+/// The IPC window mapped into one carrier VM: its stage-2 records and the
+/// owner of the memory, retained until the VM that maps it is destroyed.
+pub(crate) struct IpcWindowInstallation {
+    /// Retained, never read: the memory's owner outlives the mapping.
+    _backing: std::sync::Arc<dyn IpcWindowBacking>,
+    pub(crate) records: [CarrierStage2RecordIdentity; 2],
+}
+
+impl std::fmt::Debug for IpcWindowInstallation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpcWindowInstallation")
+            .field("records", &self.records)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Map the directory and the pool (read/write, never executable) as two
+/// custody-owned stage-2 records of the live VM. A failure retires what was
+/// mapped and leaves nothing installed; EL1 then never sees a published
+/// directory and forwards every IPC call.
+pub(crate) fn install_ipc_window_using(
+    custody: &CarrierVmCustody,
+    backing: std::sync::Arc<dyn IpcWindowBacking>,
+    mut map: impl FnMut(*mut u8, u64, usize, u64) -> i32,
+    mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> Result<IpcWindowInstallation, TrapError> {
+    let (directory_len, pool_len) = ipc_window_geometry(backing.as_ref())?;
+    let generation = custody.live_generation().ok_or_else(|| {
+        TrapError::Hypervisor("IPC window installation without a live carrier VM".to_owned())
+    })?;
+    const READ_WRITE: u64 = 0b011;
+    let mut records = Vec::with_capacity(2);
+    for (host, ipa, len) in [
+        (
+            backing.directory_ptr(),
+            carrick_el1_abi::EL1_IPC_BASE,
+            directory_len,
+        ),
+        (
+            backing.pool_ptr(),
+            carrick_el1_abi::EL1_IPC_POOL_BASE,
+            pool_len,
+        ),
+    ] {
+        let owner = custody.allocate_logical_owner().map_err(|error| {
+            TrapError::Hypervisor(format!("IPC window owner identity: {error:?}"))
+        })?;
+        let spec = CarrierStage2RecordSpec {
+            vm_generation: generation,
+            ipa,
+            len,
+            host_addr: host as usize,
+            mapped: true,
+            backend_map_installed: true,
+            release_ipa: false,
+            perms: READ_WRITE,
+            logical_owner: Some(owner),
+        };
+        match custody.publish_stage2_record_using(spec, || map(host, ipa, len, READ_WRITE)) {
+            Ok(identity) => records.push(identity),
+            Err(error) => {
+                for identity in records {
+                    let _ = custody.retire_stage2_record_using(identity, &mut unmap);
+                    let _ = custody.remove_terminal_stage2_record(identity);
+                }
+                return Err(error);
+            }
+        }
+    }
+    let records: [CarrierStage2RecordIdentity; 2] = records
+        .try_into()
+        .map_err(|_| TrapError::Hypervisor("IPC window installation lost a record".to_owned()))?;
+    Ok(IpcWindowInstallation {
+        _backing: backing,
+        records,
+    })
+}
+
+/// The window mapped into the live carrier VM (one carrier per process);
+/// holding it retains the memory's owner. Replaced when a new carrier VM
+/// maps the window; the previous VM's records were terminalized with it.
+static INSTALLED_IPC_WINDOW: parking_lot::Mutex<Option<IpcWindowInstallation>> =
+    parking_lot::Mutex::new(None);
+
+/// Map the registered IPC window into the carrier VM, if the host authority
+/// registered one (otherwise EL1 never attaches and IPC calls forward).
+pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Result<(), TrapError> {
+    let Some(backing) = registered_ipc_window_backing() else {
+        return Ok(());
+    };
+    let installed = install_ipc_window_using(
+        custody,
+        backing,
+        // SAFETY: the backing is validated host memory retained by the
+        // installation for as long as the VM maps it.
+        |host, ipa, len, perms| unsafe { inventory_hv_vm_map(host.cast(), ipa, len, perms) },
+        |ipa, len| {
+            // SAFETY: unmapping exactly the extent this installation mapped.
+            let rc = unsafe { inventory_hv_vm_unmap(ipa, len) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(CarrierStage2BackendError::HvReturn(rc as u32))
+            }
+        },
+    )?;
+    *INSTALLED_IPC_WINDOW.lock() = Some(installed);
+    // Only now may EL1 touch the window (its header decides the rest).
+    if let Some(map) = carrick_el1_abi::ipc_table_map_host() {
+        map.publish_window();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ipc_window_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    struct Backing {
+        directory: *mut u8,
+        pool: *mut u8,
+        pool_len: usize,
+    }
+    // SAFETY: test memory, never freed while referenced.
+    unsafe impl Send for Backing {}
+    unsafe impl Sync for Backing {}
+    impl IpcWindowBacking for Backing {
+        fn directory_ptr(&self) -> *mut u8 {
+            self.directory
+        }
+        fn directory_len(&self) -> usize {
+            std::mem::size_of::<carrick_el1_abi::ipc::IpcDirectory>()
+        }
+        fn pool_ptr(&self) -> *mut u8 {
+            self.pool
+        }
+        fn pool_len(&self) -> usize {
+            self.pool_len
+        }
+    }
+    fn backing(pool_len: usize) -> std::sync::Arc<dyn IpcWindowBacking> {
+        let alloc = |len: usize| unsafe {
+            std::alloc::alloc_zeroed(
+                std::alloc::Layout::from_size_align(len, IPC_WINDOW_GRANULE).unwrap(),
+            )
+        };
+        std::sync::Arc::new(Backing {
+            directory: alloc(0x10_0000),
+            pool: alloc(IPC_WINDOW_GRANULE),
+            pool_len,
+        })
+    }
+
+    #[test]
+    fn el1_ipc_window_maps_directory_and_pool_as_custody_records() {
+        let custody = CarrierVmCustody::new_live_fixture();
+        let mut calls = Vec::new();
+        let installed = install_ipc_window_using(
+            &custody,
+            backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
+            |host, ipa, len, perms| {
+                calls.push((host as usize, ipa, len, perms));
+                0
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, carrick_el1_abi::EL1_IPC_BASE);
+        assert_eq!(calls[1].1, carrick_el1_abi::EL1_IPC_POOL_BASE);
+        assert_eq!(calls[1].2, carrick_el1_abi::EL1_IPC_POOL_SPAN as usize);
+        assert!(calls.iter().all(|c| c.3 == 0b011), "never executable");
+        assert!(calls[0].2 as u64 <= carrick_el1_abi::EL1_IPC_DIRECTORY_SPAN);
+        let live = custody.stage2_record_identities();
+        assert!(installed.records.iter().all(|r| live.contains(r)));
+    }
+
+    #[test]
+    fn el1_ipc_window_refuses_bad_geometry_and_rolls_back_a_failed_map() {
+        let custody = CarrierVmCustody::new_live_fixture();
+        let wrong_pool =
+            install_ipc_window_using(&custody, backing(0x10_0000), |_, _, _, _| 0, |_, _| Ok(()));
+        assert!(wrong_pool.is_err(), "a pool of another length fails closed");
+        let mut unmapped = Vec::new();
+        let mut maps = 0;
+        let failed = install_ipc_window_using(
+            &custody,
+            backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
+            |_, _, _, _| {
+                maps += 1;
+                if maps == 2 { 1 } else { 0 }
+            },
+            |ipa, len| {
+                unmapped.push((ipa, len));
+                Ok(())
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(unmapped.len(), 1, "the mapped directory is retired");
+        assert_eq!(unmapped[0].0, carrick_el1_abi::EL1_IPC_BASE);
+        assert!(
+            custody.stage2_record_identities().is_empty(),
+            "nothing installed"
+        );
+        let no_vm = CarrierVmCustody::new();
+        assert!(
+            install_ipc_window_using(
+                &no_vm,
+                backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
+                |_, _, _, _| 0,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+    }
+}

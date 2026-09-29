@@ -13,12 +13,17 @@
 //! - `0x0020_0000..0x0060_0000` (4 MiB): Per-vCPU kernel stacks ([`EL1_STACKS_OFFSET`]),
 //!   256 slots of [`EL1_STACK_SIZE`] (16 KiB) each.
 //! - `0x0100_0000..0x0400_0000` (48 MiB): Dynamic heap ([`EL1_HEAP_OFFSET`]).
+//!
+//! A separate kernel-only window at [`EL1_IPC_BASE`] (after the dynamic
+//! metadata aperture) maps the host IPC authority's [`ipc::IpcDirectory`] and
+//! byte pool; the [`ipc_tables::IpcTableMap`] lives in this region.
 
 #![no_std]
 
 use core::cell::UnsafeCell;
 
 pub mod ipc;
+pub mod ipc_tables;
 
 /// Guest VA/IPA base of the 64 MiB EL1 kernel region.
 /// Placed at 180 GiB + 64 MiB, cleanly within the 180..181 GiB L2 block table (L2_B)
@@ -178,6 +183,34 @@ pub const EL1_HEAP_BASE: u64 = EL1_REGION_BASE + EL1_HEAP_OFFSET;
 /// Size of the EL1 kernel heap (48 MiB).
 pub const EL1_HEAP_SIZE: u64 = EL1_REGION_SIZE - EL1_HEAP_OFFSET;
 
+/// Guest VA/IPA of the shared IPC window (kernel-only, identity mapped).
+/// The host's IPC authority owns the memory (directory and pool, two host
+/// allocations); the runtime maps the directory at [`EL1_IPC_BASE`] and the
+/// pool at [`EL1_IPC_POOL_BASE`]. EL1 attaches only once the directory is
+/// published, so an unmapped or unpublished window fails closed.
+pub const EL1_IPC_BASE: u64 = EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE;
+/// IPA span reserved for the directory (its length must fit).
+pub const EL1_IPC_DIRECTORY_SPAN: u64 = 0x20_0000;
+/// Guest VA/IPA of the IPC byte pool.
+pub const EL1_IPC_POOL_BASE: u64 = EL1_IPC_BASE + EL1_IPC_DIRECTORY_SPAN;
+/// Length of the IPC byte pool (the authority's pool is exactly this long).
+pub const EL1_IPC_POOL_SPAN: u64 = 0x800_0000;
+/// The whole kernel-only IPC window.
+pub const EL1_IPC_SIZE: u64 = EL1_IPC_DIRECTORY_SPAN + EL1_IPC_POOL_SPAN;
+/// Offset, within the EL1 region, of the [`ipc_tables::IpcTableMap`]
+/// (region memory the carrier owns, so it exists before any IPC authority).
+pub const EL1_IPC_TABLE_MAP_OFFSET: u64 = EL1_OPEN_FILE_TABLE_OFFSET + EL1_OPEN_FILE_TABLE_SIZE;
+
+const _: () = assert!(core::mem::size_of::<ipc::IpcDirectory>() as u64 <= EL1_IPC_DIRECTORY_SPAN);
+const _: () = assert!(
+    EL1_IPC_TABLE_MAP_OFFSET + core::mem::size_of::<ipc_tables::IpcTableMap>() as u64
+        <= EL1_CACHE_OFFSET
+);
+const _: () = assert!(EL1_IPC_TABLE_MAP_OFFSET.is_multiple_of(64));
+const _: () = assert!(EL1_IPC_BASE.is_multiple_of(0x20_0000));
+const _: () = assert!(EL1_IPC_POOL_BASE.is_multiple_of(0x20_0000));
+const _: () = assert!(EL1_IPC_BASE + EL1_IPC_SIZE <= 0x2D_4000_0000);
+
 /// Byte offset of the object table within the region (at start of heap).
 pub const EL1_OBJECT_TABLE_OFFSET: u64 = EL1_HEAP_OFFSET;
 
@@ -310,6 +343,13 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_CACHE_OFFSET,
         EL1_INOTIFY_TABLE_OFFSET,
         EL1_NAME_CACHE_OFFSET,
+        EL1_IPC_BASE,
+        EL1_IPC_DIRECTORY_SPAN,
+        EL1_IPC_POOL_BASE,
+        EL1_IPC_POOL_SPAN,
+        EL1_IPC_TABLE_MAP_OFFSET,
+        ipc::IPC_LAYOUT_HASH,
+        core::mem::size_of::<ipc_tables::IpcTableMap>() as u64,
         MAX_DELEGATED_FILES as u64,
         MAX_ZONE_OPEN_FILES as u64,
         MAX_DELEGATED_INOTIFY as u64,
@@ -2370,6 +2410,100 @@ pub fn get_el1_region_host_ptr() -> usize {
     EL1_REGION_HOST_PTR.load(Ordering::Acquire)
 }
 
+/// The shared IPC memory as one venue addresses it: the directory and the
+/// pool at this venue's addresses (the host authority's allocations, or the
+/// fixed EL1 VAs). Nothing here is persisted in shared memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpcWindow {
+    directory: usize,
+    directory_len: usize,
+    pool: usize,
+    pool_len: usize,
+}
+
+impl IpcWindow {
+    /// Describe a venue's mapping. Fails closed on a directory that does not
+    /// fit its span or a pool whose length is not the ABI's.
+    ///
+    /// # Safety
+    /// Both ranges are mapped, shared with the other venue, for `'static`.
+    pub unsafe fn new(
+        directory: usize,
+        directory_len: usize,
+        pool: usize,
+        pool_len: usize,
+    ) -> Option<Self> {
+        (directory != 0
+            && pool != 0
+            && directory_len >= core::mem::size_of::<ipc::IpcDirectory>()
+            && directory_len as u64 <= EL1_IPC_DIRECTORY_SPAN
+            && pool_len as u64 == EL1_IPC_POOL_SPAN)
+            .then_some(Self {
+                directory,
+                directory_len,
+                pool,
+                pool_len,
+            })
+    }
+    pub const fn directory_ptr(self) -> usize {
+        self.directory
+    }
+    pub const fn directory_len(self) -> usize {
+        self.directory_len
+    }
+    pub const fn pool_ptr(self) -> usize {
+        self.pool
+    }
+    pub const fn pool_len(self) -> usize {
+        self.pool_len
+    }
+    /// Attach to the published directory; fails closed (`BadRegion`) until
+    /// the host authority has published it.
+    pub fn attach(self) -> Result<ipc::IpcRegion<'static>, ipc::IpcError> {
+        // SAFETY: `new`'s contract; `attach` authenticates the header.
+        unsafe {
+            ipc::IpcRegion::attach(
+                self.directory as *mut ipc::IpcDirectory,
+                self.pool as *mut u8,
+                self.pool_len,
+            )
+        }
+    }
+}
+
+/// EL1's view of the IPC window (identity mapped kernel-only).
+#[cfg(target_os = "none")]
+pub fn ipc_window_guest() -> Option<IpcWindow> {
+    // SAFETY: the window is mapped in every EL1 translation regime; an
+    // unmapped window never has a published header, so attach fails.
+    unsafe {
+        IpcWindow::new(
+            EL1_IPC_BASE as usize,
+            EL1_IPC_DIRECTORY_SPAN as usize,
+            EL1_IPC_POOL_BASE as usize,
+            EL1_IPC_POOL_SPAN as usize,
+        )
+    }
+}
+
+/// The IPC table map in the EL1 region, as the host maps it.
+pub fn ipc_table_map_host() -> Option<&'static ipc_tables::IpcTableMap> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the EL1 region mapping outlives the carrier; the map is at an
+    // aligned offset inside it and all-zero is an empty map.
+    Some(unsafe { &*((ptr + EL1_IPC_TABLE_MAP_OFFSET as usize) as *const ipc_tables::IpcTableMap) })
+}
+
+/// The IPC table map in the EL1 region, as EL1 maps it.
+#[cfg(target_os = "none")]
+pub fn ipc_table_map_guest() -> &'static ipc_tables::IpcTableMap {
+    // SAFETY: the EL1 region is mapped for EL1's lifetime.
+    unsafe { &*((EL1_REGION_BASE + EL1_IPC_TABLE_MAP_OFFSET) as *const ipc_tables::IpcTableMap) }
+}
+
 /// Host view of the shared metadata mailbox, if an EL1 region is installed.
 pub fn metadata_mailbox_host() -> Option<&'static MetadataGrantMailbox> {
     let ptr = get_el1_region_host_ptr();
@@ -3221,6 +3355,7 @@ mod tests {
     fn test_region_layout() {
         assert_eq!(EL1_REGION_BASE, 0x2D_0400_0000);
         assert_eq!(EL1_REGION_SIZE, 0x0400_0000);
+        assert_eq!(EL1_IPC_BASE, 0x2D_0C00_0000);
     }
 
     #[test]

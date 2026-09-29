@@ -909,10 +909,14 @@ impl HvfVmState {
             };
         }
         let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
+        // The first root of this carrier maps the host IPC authority's
+        // memory once, for every process the carrier runs.
+        super::stage2_backend::install_registered_ipc_window(&custody)?;
         let carrier_mappings = std::sync::Arc::new(PersistentCarrierMappings::extract(
             &mut self.mappings,
             custody,
         )?);
+
         let spec = PersistentExecutorSpec {
             vm: (*self._vm).clone(),
             carrier_mappings,
