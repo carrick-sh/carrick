@@ -785,3 +785,57 @@ fn el1_ipc_concurrent_pins_and_closes_release_exactly_once() {
         c.destroy_table(child, |_| panic!("empty")).unwrap();
     }
 }
+
+#[test]
+fn el1_ipc_install_pin_shares_cross_table_flags_offsets_and_final_release() {
+    let c = authority::<2, 4>();
+    let a = c.create_table(4, &mut storage(4)).unwrap();
+    let b = c.create_table(4, &mut storage(4)).unwrap();
+    let pin = c.create_pinned(description(71)).unwrap();
+    c.install_pin(a, Fd(1), &pin, false).unwrap();
+    c.install_pin(b, Fd(2), &pin, true).unwrap();
+    c.set_pinned_flags(
+        &pin,
+        StatusFlags {
+            nonblock: true,
+            ..StatusFlags::default()
+        },
+    )
+    .unwrap();
+    c.set_offset(a, Fd(1), Offset(12)).unwrap();
+    assert_eq!(c.get(a, Fd(1)), c.get(b, Fd(2)));
+    assert!(c.getfl(b, Fd(2)).unwrap().1.nonblock);
+    assert!(!c.getfd(a, Fd(1)).unwrap());
+    assert!(c.getfd(b, Fd(2)).unwrap());
+    assert_eq!(c.close(a, Fd(1)).unwrap(), None);
+    assert_eq!(c.close(b, Fd(2)).unwrap(), None);
+    assert_eq!(c.unpin(pin).unwrap().unwrap().backing, BackingToken(71));
+}
+
+#[test]
+fn el1_ipc_install_pin_refuses_full_table_and_stale_pin_before_effects() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(1, &mut storage(1)).unwrap();
+    let existing = c.open(table, Fd(0), description(1), false).unwrap();
+    let pin = c.create_pinned(description(2)).unwrap();
+    assert_eq!(
+        c.install_pin(table, Fd(0), &pin, false),
+        Err(Error::TooManyFiles)
+    );
+    assert_eq!(c.holds(&pin).unwrap(), (0, 1));
+    assert_eq!(c.get(table, existing).unwrap().backing, BackingToken(1));
+    let raw = pin.into_raw();
+    assert_eq!(
+        c.unpin(OfdPin::from_raw(raw)).unwrap().unwrap().backing,
+        BackingToken(2)
+    );
+    let stale = OfdPin::from_raw(raw);
+    assert_eq!(
+        c.install_pin(table, Fd(0), &stale, false),
+        Err(Error::StalePin)
+    );
+    assert_eq!(
+        c.set_pinned_flags(&stale, StatusFlags::default()),
+        Err(Error::StalePin)
+    );
+}
