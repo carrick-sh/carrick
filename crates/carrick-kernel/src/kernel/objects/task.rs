@@ -93,6 +93,10 @@ impl ThreadResources {
         Arc::clone(&self.files)
     }
 
+    pub(crate) fn files_ref(&self) -> &Arc<FileTable> {
+        &self.files
+    }
+
     pub fn fs_context(&self) -> Arc<FsContext> {
         Arc::clone(&self.fs_context)
     }

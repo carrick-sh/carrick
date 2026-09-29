@@ -62,7 +62,11 @@ contracts = ["kernel.fork.filetable"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects/task.rs"
-contracts = ["kernel.fork.filetable"]
+contracts = ["kernel.fork.filetable", "kernel.dispatch.resource-scope"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/resources.rs"
+contracts = ["kernel.dispatch.resource-scope"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/operations.rs"
