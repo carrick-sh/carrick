@@ -340,12 +340,17 @@ pub enum GuestPreparedCommitError {
     NotPrepared,
     WrongBacking,
     PermissionDenied,
+    /// A failed commit could not restore its pre-image: editor exclusion
+    /// was violated and the MM's table graph is indeterminate.
+    RollbackFailed,
 }
 
 /// Validate an existing prepared L3 leaf without changing its output or
 /// permission tags. The grant owner must have published stage 2 and its frame
 /// inventory before the leaf became prepared. VALID is the residency truth.
 /// The caller holds the exact-MM editor through the following ASID TLBI.
+/// This is a one-page [`descriptor_txn::DescriptorOp::Publish`] through the
+/// shared transaction executor, with no table grants.
 ///
 /// # Safety
 ///
@@ -359,45 +364,48 @@ pub unsafe fn commit_existing_el1_prepared_page(
     expected_ipa: u64,
     access: LeafAccess,
 ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
-    use core::sync::atomic::Ordering;
+    use descriptor_txn::{DescriptorOp, DescriptorOutcome, DescriptorRefusal, PageSpan};
 
-    if words.is_null()
-        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
-        || !physical_base.is_multiple_of(PT_PAGE)
-        || !va.is_multiple_of(PT_PAGE)
-        || !expected_ipa.is_multiple_of(PT_PAGE)
-    {
+    let maintenance = descriptor_txn::CallerInvalidatesAsid;
+    let Ok(live) = (unsafe {
+        descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+    }) else {
         return Err(GuestPreparedCommitError::BadAddress);
-    }
-    let leaf =
-        unsafe { existing_l3_descriptor(words, physical_base, byte_len, va) }.map_err(|error| {
-            match error {
-                GuestLeafPublicationError::TableOutsidePrimary => {
-                    GuestPreparedCommitError::TableOutsidePrimary
-                }
-                _ => GuestPreparedCommitError::MissingTable,
-            }
-        })?;
-    let descriptor = unsafe { (*leaf).load(Ordering::Acquire) };
-    if descriptor & PA_MASK_4KIB != expected_ipa {
-        return Err(GuestPreparedCommitError::WrongBacking);
-    }
-    match el1_private_leaf_state(descriptor) {
-        El1PrivateLeafState::Resident => {
-            if terminal_descriptor_permits_el0(descriptor, access) {
-                Ok(GuestPreparedCommit::AlreadyResident)
-            } else {
-                Err(GuestPreparedCommitError::PermissionDenied)
-            }
-        }
-        El1PrivateLeafState::Prepared => {
-            if !terminal_descriptor_permits_el0(descriptor | VALID, access) {
-                return Err(GuestPreparedCommitError::PermissionDenied);
-            }
-            unsafe { (*leaf).store(descriptor | VALID, Ordering::Release) };
+    };
+    let mut journal = descriptor_txn::InlineJournal::new();
+    let outcome = descriptor_txn::execute_descriptor_op(
+        &live,
+        SubstrateGpa(physical_base),
+        DescriptorOp::Publish {
+            span: PageSpan::new(va, PT_PAGE),
+            expected_ipa: SubstrateGpa(expected_ipa),
+            access,
+        },
+        &descriptor_txn::TableGrants::NONE,
+        &mut journal,
+    );
+    match outcome {
+        DescriptorOutcome::Applied(applied) if applied.live_stores != 0 => {
             Ok(GuestPreparedCommit::Committed)
         }
-        _ => Err(GuestPreparedCommitError::NotPrepared),
+        DescriptorOutcome::Applied(_) => Ok(GuestPreparedCommit::AlreadyResident),
+        DescriptorOutcome::Indeterminate(_) => Err(GuestPreparedCommitError::RollbackFailed),
+        DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            Err(match refusal {
+                DescriptorRefusal::BadRange | DescriptorRefusal::StaleRoot => {
+                    GuestPreparedCommitError::BadAddress
+                }
+                DescriptorRefusal::TableOutsidePrimary => {
+                    GuestPreparedCommitError::TableOutsidePrimary
+                }
+                DescriptorRefusal::MissingTable | DescriptorRefusal::TablesExhausted => {
+                    GuestPreparedCommitError::MissingTable
+                }
+                DescriptorRefusal::WrongBacking => GuestPreparedCommitError::WrongBacking,
+                DescriptorRefusal::PermissionDenied => GuestPreparedCommitError::PermissionDenied,
+                _ => GuestPreparedCommitError::NotPrepared,
+            })
+        }
     }
 }
 
@@ -669,10 +677,14 @@ pub unsafe fn publish_existing_invalid_private_pages(
 }
 
 /// Apply one permission transition to existing L1/L2 blocks or L3 leaves
-/// carrying EL1's private-anonymous authority. The complete range, terminal
-/// coverage, and permission ceiling are checked before the first store; no
-/// metadata or table allocation occurs. A partially covered block is rejected
-/// so its split can remain an explicit host-owned fallback.
+/// carrying EL1's private-anonymous authority, prepared or resident (a
+/// prepared leaf stays invalid; its AP/UXN govern its later commit and host
+/// buffer access). The complete range, terminal coverage, and permission
+/// ceiling are checked before the first store; COW-armed leaves report
+/// `PermissionWidening`. This entry point carries no table grants, so a
+/// partially covered block is refused; a host submission carrying grants
+/// splits it (see [`descriptor_txn`]). A rolled-back edit restores every
+/// word; the caller still invalidates the ASID only after success.
 ///
 /// # Safety
 ///
@@ -684,78 +696,47 @@ pub unsafe fn protect_existing_el1_private_pages(
     byte_len: usize,
     edit: GuestPermissionEdit,
 ) -> Result<usize, GuestPermissionEditError> {
-    use core::sync::atomic::Ordering;
+    use descriptor_txn::{DescriptorOp, DescriptorOutcome, DescriptorRefusal};
 
-    if words.is_null()
-        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
-        || !physical_base.is_multiple_of(PT_PAGE)
-        || !edit.va.is_multiple_of(PT_PAGE)
-        || edit.len == 0
-        || !edit.len.is_multiple_of(PT_PAGE)
-        || edit.va.checked_add(edit.len).is_none()
-    {
+    let maintenance = descriptor_txn::CallerInvalidatesAsid;
+    let Ok(live) = (unsafe {
+        descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+    }) else {
         return Err(GuestPermissionEditError::BadRange);
-    }
-    let pages =
-        usize::try_from(edit.len / PT_PAGE).map_err(|_| GuestPermissionEditError::BadRange)?;
-    let terminal_for = |va| unsafe {
-        existing_terminal_descriptor(words, physical_base, byte_len, va).map_err(
-            |error| match error {
-                GuestLeafPublicationError::TableOutsidePrimary => {
+    };
+    let mut journal = descriptor_txn::InlineJournal::new();
+    match descriptor_txn::execute_descriptor_op(
+        &live,
+        SubstrateGpa(physical_base),
+        DescriptorOp::Protect(edit),
+        &descriptor_txn::TableGrants::NONE,
+        &mut journal,
+    ) {
+        DescriptorOutcome::Applied(applied) => {
+            usize::try_from(applied.pages).map_err(|_| GuestPermissionEditError::BadRange)
+        }
+        DescriptorOutcome::Indeterminate(_) => Err(GuestPermissionEditError::RollbackFailed),
+        DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            Err(match refusal {
+                DescriptorRefusal::BadRange => GuestPermissionEditError::BadRange,
+                DescriptorRefusal::TableOutsidePrimary => {
                     GuestPermissionEditError::TableOutsidePrimary
                 }
-                GuestLeafPublicationError::MissingTable => GuestPermissionEditError::MissingTable,
+                DescriptorRefusal::MissingTable => GuestPermissionEditError::MissingTable,
+                DescriptorRefusal::PermissionWidening | DescriptorRefusal::CowArmed => {
+                    GuestPermissionEditError::PermissionWidening
+                }
                 _ => GuestPermissionEditError::NotPrivateAnonymous,
-            },
-        )
-    };
-
-    let end = edit.va + edit.len;
-    let mut current = edit.va;
-    while current < end {
-        let terminal = terminal_for(current)?;
-        let terminal_end = terminal
-            .semantic_base
-            .checked_add(terminal.span)
-            .ok_or(GuestPermissionEditError::BadRange)?;
-        if terminal.semantic_base < edit.va || terminal_end > end {
-            return Err(GuestPermissionEditError::NotPrivateAnonymous);
+            })
         }
-        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        if el1_private_leaf_state(descriptor) != El1PrivateLeafState::Resident {
-            return Err(GuestPermissionEditError::NotPrivateAnonymous);
-        }
-        if el1_cow(descriptor)
-            || (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
-            || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
-        {
-            return Err(GuestPermissionEditError::PermissionWidening);
-        }
-        current = terminal_end;
     }
-
-    current = edit.va;
-    while current < end {
-        let terminal = terminal_for(current)?;
-        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        let (ap, uxn) = if !(edit.readable || edit.writable || edit.executable) {
-            (AP_PRIV_RO, UXN)
-        } else if edit.writable {
-            (AP_RW, if edit.executable { 0 } else { UXN })
-        } else {
-            (AP_RO, if edit.executable { 0 } else { UXN })
-        };
-        let updated = (descriptor & !AP_MASK & !UXN) | ap | uxn | VALID;
-        unsafe { (*terminal.word).store(updated, Ordering::Release) };
-        current = terminal.semantic_base + terminal.span;
-    }
-    Ok(pages)
 }
 
 /// Retire existing L1/L2 blocks or L3 leaves carrying EL1's
 /// private-anonymous authority. The complete range and every terminal are
-/// checked before the first store. A partial coarse block is refused rather
-/// than allocating a split table on the syscall path.
+/// checked before the first store. This entry point carries no table grants,
+/// so a partial coarse block is refused rather than split on the syscall
+/// path; a host submission carrying grants splits it (see [`descriptor_txn`]).
 ///
 /// The output address and permission ceiling remain in each invalid retired
 /// descriptor so the host's authenticated bulk-return path can reconcile its
@@ -774,60 +755,37 @@ pub unsafe fn retire_existing_el1_private_pages(
     va: u64,
     len: u64,
 ) -> Result<usize, GuestRetirementError> {
-    use core::sync::atomic::Ordering;
+    use descriptor_txn::{DescriptorOp, DescriptorOutcome, DescriptorRefusal, PageSpan};
 
-    if words.is_null()
-        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
-        || !physical_base.is_multiple_of(PT_PAGE)
-        || !va.is_multiple_of(PT_PAGE)
-        || len == 0
-        || !len.is_multiple_of(PT_PAGE)
-        || va.checked_add(len).is_none()
-    {
+    let maintenance = descriptor_txn::CallerInvalidatesAsid;
+    let Ok(live) = (unsafe {
+        descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+    }) else {
         return Err(GuestRetirementError::BadRange);
-    }
-    let pages = usize::try_from(len / PT_PAGE).map_err(|_| GuestRetirementError::BadRange)?;
-    let terminal_for = |address| unsafe {
-        existing_terminal_descriptor(words, physical_base, byte_len, address).map_err(|error| {
-            match error {
-                GuestLeafPublicationError::TableOutsidePrimary => {
-                    GuestRetirementError::TableOutsidePrimary
-                }
-                GuestLeafPublicationError::MissingTable => GuestRetirementError::MissingTable,
-                _ => GuestRetirementError::NotPrivateAnonymous,
-            }
-        })
     };
-
-    let end = va + len;
-    let mut current = va;
-    while current < end {
-        let terminal = terminal_for(current)?;
-        let terminal_end = terminal
-            .semantic_base
-            .checked_add(terminal.span)
-            .ok_or(GuestRetirementError::BadRange)?;
-        if terminal.semantic_base < va || terminal_end > end {
-            return Err(GuestRetirementError::NotPrivateAnonymous);
+    let mut journal = descriptor_txn::InlineJournal::new();
+    match descriptor_txn::execute_descriptor_op(
+        &live,
+        SubstrateGpa(physical_base),
+        DescriptorOp::Retire(PageSpan::new(va, len)),
+        &descriptor_txn::TableGrants::NONE,
+        &mut journal,
+    ) {
+        DescriptorOutcome::Applied(applied) => {
+            usize::try_from(applied.pages).map_err(|_| GuestRetirementError::BadRange)
         }
-        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        if !matches!(
-            el1_private_leaf_state(descriptor),
-            El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
-        ) {
-            return Err(GuestRetirementError::NotPrivateAnonymous);
-        }
-        current = terminal_end;
+        // A rolled-back (or, under a violated editor exclusion,
+        // unrestorable) retirement forwards to the host path; the syscall
+        // layer has no rollback-failure disposition for retirement yet.
+        DescriptorOutcome::Refused(refusal)
+        | DescriptorOutcome::RolledBack(refusal)
+        | DescriptorOutcome::Indeterminate(refusal) => Err(match refusal {
+            DescriptorRefusal::BadRange => GuestRetirementError::BadRange,
+            DescriptorRefusal::TableOutsidePrimary => GuestRetirementError::TableOutsidePrimary,
+            DescriptorRefusal::MissingTable => GuestRetirementError::MissingTable,
+            _ => GuestRetirementError::NotPrivateAnonymous,
+        }),
     }
-
-    current = va;
-    while current < end {
-        let terminal = terminal_for(current)?;
-        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        unsafe { (*terminal.word).store((descriptor & !VALID) | SW_RETIRED, Ordering::Release) };
-        current = terminal.semantic_base + terminal.span;
-    }
-    Ok(pages)
 }
 
 /// The outcome of attempting to resolve a COW fault in EL1.

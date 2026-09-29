@@ -7,7 +7,7 @@
 //! host-facing engine operation that would edit live descriptors (bulk grant
 //! preparation, permission changes, retirement, copyout residency and fork
 //! COW repointing) is described as one [`DescriptorTxn`], submitted through a
-//! [`DescriptorTxnSlot`], executed in EL1 by `execute_descriptor_txn` under
+//! [`DescriptorTxnSlot`], executed in EL1 by [`execute_descriptor_txn`] under
 //! the exact-MM editor, and answered with one [`DescriptorReceipt`]. The host
 //! manager on that lane is marked [`super::LiveDescriptorOwner::Guest`] and
 //! refuses every live store (`sync_to_host`, snapshot restore and rollback
@@ -47,7 +47,7 @@
 //!
 //! # Atomicity and rollback
 //!
-//! `execute_descriptor_txn` validates the complete range, grant need and
+//! [`execute_descriptor_txn`] validates the complete range, grant need and
 //! journal capacity before the first live store. New hierarchy and split
 //! tables are filled while unlinked and published child-before-parent after a
 //! store barrier; replacing a valid block with a table is break-before-make.
@@ -76,7 +76,11 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use alloc::vec::Vec;
 
 use super::{
-    GuestLeafPublication, GuestPermissionEdit, LeafAccess, PA_MASK_4KIB, PT_PAGE, SubstrateGpa,
+    AP_MASK, AP_PRIV_RO, AP_RO, AP_RW, El1PrivateLeafState, GuestLeafPublication,
+    GuestPermissionEdit, LeafAccess, NON_GLOBAL, PA_MASK_1GIB, PA_MASK_2MIB, PA_MASK_4KIB,
+    PA_MASK_TABLE, PT_PAGE, SW_EL1_COW, SW_EL1_MAY_EXEC, SW_EL1_MAY_WRITE, SW_EL1_PRIVATE,
+    SW_RETIRED, SubstrateGpa, TYPE_BITS, TYPE_BLOCK, TYPE_TABLE_OR_PAGE, USER_PAGE_FLAGS, UXN,
+    VALID, el1_cow, el1_private_leaf_state, terminal_descriptor_permits_el0,
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
@@ -1136,6 +1140,659 @@ impl ClaimedDescriptorTxn<'_> {
     }
 }
 
+/// Architectural maintenance a live table editor issues. EL1 implements it
+/// with `DSB ISHST` and ASID-scoped `TLBI VAE1IS`; host tests record it.
+pub trait TableMaintenance {
+    fn publish_barrier(&self);
+    fn invalidate_range(&self, va: u64, len: u64);
+}
+
+/// Maintenance for callers that edit only existing terminals and perform
+/// their own trailing ASID invalidation. Such a transaction never links a
+/// table, so it never needs a publication barrier or break-before-make; the
+/// executor guarantees that by refusing any grant need when it has no grants.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CallerInvalidatesAsid;
+
+impl TableMaintenance for CallerInvalidatesAsid {
+    fn publish_barrier(&self) {}
+    fn invalidate_range(&self, _va: u64, _len: u64) {}
+}
+
+/// The EL1-reachable primary table arena as an aligned array of atomics.
+pub struct PrimaryTableWords<'m, M: TableMaintenance + ?Sized> {
+    words: *mut AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    maintenance: &'m M,
+}
+
+impl<'m, M: TableMaintenance + ?Sized> PrimaryTableWords<'m, M> {
+    /// # Safety
+    ///
+    /// `words` must be an aligned, writable, hardware-visible array of
+    /// descriptor words covering `byte_len` bytes of the primary table arena
+    /// whose first byte is `physical_base`, valid for this value's lifetime.
+    /// The caller holds the exact-MM editor for every graph it edits here.
+    pub unsafe fn new(
+        words: *mut AtomicU64,
+        physical_base: u64,
+        byte_len: usize,
+        maintenance: &'m M,
+    ) -> Result<Self, DescriptorRefusal> {
+        if words.is_null()
+            || !(words as usize).is_multiple_of(core::mem::align_of::<AtomicU64>())
+            || !physical_base.is_multiple_of(PT_PAGE)
+        {
+            return Err(DescriptorRefusal::BadRange);
+        }
+        Ok(Self {
+            words,
+            physical_base,
+            byte_len,
+            maintenance,
+        })
+    }
+
+    fn word(&self, pa: u64) -> Result<&AtomicU64, DescriptorRefusal> {
+        let offset = pa
+            .checked_sub(self.physical_base)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
+        if !offset.is_multiple_of(core::mem::size_of::<u64>())
+            || offset
+                .checked_add(core::mem::size_of::<u64>())
+                .is_none_or(|end| end > self.byte_len)
+        {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        // SAFETY: `new`'s contract covers `byte_len`; the checked, aligned
+        // offset stays inside it.
+        Ok(unsafe { &*self.words.add(offset / core::mem::size_of::<u64>()) })
+    }
+}
+
+impl<M: TableMaintenance + ?Sized> LiveDescriptorWords for PrimaryTableWords<'_, M> {
+    fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+        Ok(self.word(pa)?.load(Ordering::Acquire))
+    }
+
+    fn compare_exchange(&self, pa: u64, current: u64, new: u64) -> Result<bool, DescriptorRefusal> {
+        Ok(self
+            .word(pa)?
+            .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok())
+    }
+
+    fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+        self.word(pa)?.store(value, Ordering::Release);
+        Ok(())
+    }
+
+    fn publish_barrier(&self) {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        self.maintenance.publish_barrier();
+    }
+
+    fn invalidate_range(&self, va: u64, len: u64) {
+        self.maintenance.invalidate_range(va, len);
+    }
+}
+
+const fn entry_span(level: usize) -> u64 {
+    match level {
+        0 => 1 << 39,
+        1 => 1 << 30,
+        2 => 1 << 21,
+        _ => PT_PAGE,
+    }
+}
+
+const fn output_mask(level: usize) -> u64 {
+    match level {
+        1 => PA_MASK_1GIB,
+        2 => PA_MASK_2MIB,
+        3 => PA_MASK_4KIB,
+        _ => 0,
+    }
+}
+
+fn is_table(descriptor: u64, level: usize) -> bool {
+    level < 3 && descriptor & VALID != 0 && descriptor & TYPE_BITS == TYPE_TABLE_OR_PAGE
+}
+
+/// Child `index` of a split L1/L2 terminal, exactly as the host editor
+/// splits one: same attributes, stride-advanced output, invalid children of
+/// an invalid parent, and empty children of an empty parent.
+fn expand(parent: u64, level: usize, index: u64) -> u64 {
+    let (parent_mask, child_mask, stride, child_type) = match level {
+        1 => (PA_MASK_1GIB, PA_MASK_2MIB, 1u64 << 21, TYPE_BLOCK),
+        _ => (PA_MASK_2MIB, PA_MASK_4KIB, PT_PAGE, TYPE_TABLE_OR_PAGE),
+    };
+    let base = parent & parent_mask;
+    let valid = parent & VALID != 0;
+    if !valid && base == 0 {
+        return 0;
+    }
+    let child =
+        ((base + index * stride) & child_mask) | (parent & !parent_mask & !TYPE_BITS) | child_type;
+    if valid { child } else { child & !VALID }
+}
+
+#[derive(Clone, Copy)]
+enum Loc {
+    /// A word reachable by hardware walkers: journaled compare-exchange.
+    Live(u64),
+    /// A word in a granted table not yet linked; `None` while planning.
+    Fresh(Option<u64>),
+}
+
+struct Executor<'a, W: ?Sized, J: ?Sized> {
+    words: &'a W,
+    op: DescriptorOp,
+    start: u64,
+    end: u64,
+    apply: bool,
+    grants: &'a [u64],
+    grants_used: usize,
+    journal: &'a mut J,
+    planned_live_stores: usize,
+}
+
+impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_, W, J> {
+    fn visit_live_table(
+        &mut self,
+        table_pa: u64,
+        level: usize,
+        table_base: u64,
+    ) -> Result<(), DescriptorRefusal> {
+        let span = entry_span(level);
+        let coverage_end = table_base.saturating_add(span.saturating_mul(512));
+        let lo = self.start.max(table_base);
+        let hi = self.end.min(coverage_end);
+        if lo >= hi {
+            return Ok(());
+        }
+        for index in (lo - table_base) / span..=(hi - 1 - table_base) / span {
+            let pa = table_pa + index * 8;
+            let descriptor = self.words.load(pa)?;
+            self.visit_entry(level, Loc::Live(pa), descriptor, table_base + index * span)?;
+        }
+        Ok(())
+    }
+
+    fn visit_entry(
+        &mut self,
+        level: usize,
+        loc: Loc,
+        descriptor: u64,
+        base: u64,
+    ) -> Result<(), DescriptorRefusal> {
+        let span = entry_span(level);
+        if is_table(descriptor, level) {
+            return match loc {
+                Loc::Live(_) => self.visit_live_table(descriptor & PA_MASK_TABLE, level + 1, base),
+                Loc::Fresh(_) => Err(DescriptorRefusal::Malformed),
+            };
+        }
+        if level == 0 {
+            if descriptor != 0 {
+                return Err(DescriptorRefusal::Malformed);
+            }
+            if !matches!(self.op, DescriptorOp::Prepare { .. }) {
+                return Err(DescriptorRefusal::MissingTable);
+            }
+        }
+        let covers_entry = self.start <= base && base + span <= self.end;
+        if level == 3 || (level > 0 && covers_entry && self.op_edits_blocks()) {
+            let updated = self.edit(descriptor, level, base)?;
+            if updated != descriptor {
+                self.store(loc, descriptor, updated, None)?;
+            }
+            return Ok(());
+        }
+        self.descend(level, loc, descriptor, base)
+    }
+
+    fn op_edits_blocks(&self) -> bool {
+        matches!(
+            self.op,
+            DescriptorOp::Publish { .. } | DescriptorOp::Protect(_) | DescriptorOp::Retire(_)
+        )
+    }
+
+    /// Replace a coarse or empty entry by a granted table, filled while
+    /// unlinked, edited, then linked child-before-parent.
+    fn descend(
+        &mut self,
+        level: usize,
+        loc: Loc,
+        descriptor: u64,
+        base: u64,
+    ) -> Result<(), DescriptorRefusal> {
+        let valid = descriptor & VALID != 0;
+        let empty = !valid && descriptor & output_mask(level) == 0;
+        if level > 0 && !valid && descriptor & (TYPE_TABLE_OR_PAGE & !VALID) != 0 {
+            // An invalidated table pointer records no output to split.
+            return Err(DescriptorRefusal::Malformed);
+        }
+        if empty && !matches!(self.op, DescriptorOp::Prepare { .. }) {
+            return Err(DescriptorRefusal::MissingTable);
+        }
+        let grant = self.take_grant()?;
+        if let Some(table) = grant {
+            for index in 0..512 {
+                let child = if level == 0 {
+                    0
+                } else {
+                    expand(descriptor, level, index)
+                };
+                self.words.store_unlinked(table + index * 8, child)?;
+            }
+        }
+        let child_span = entry_span(level + 1);
+        let lo = self.start.max(base);
+        let hi = self.end.min(base + entry_span(level));
+        for index in (lo - base) / child_span..=(hi - 1 - base) / child_span {
+            let child = if level == 0 {
+                0
+            } else {
+                expand(descriptor, level, index)
+            };
+            let child_loc = Loc::Fresh(grant.map(|table| table + index * 8));
+            self.visit_entry(level + 1, child_loc, child, base + index * child_span)?;
+        }
+        let table_descriptor = grant.map_or(TYPE_TABLE_OR_PAGE, |table| {
+            (table & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE
+        });
+        let span = entry_span(level);
+        match loc {
+            Loc::Fresh(_) => self.store(loc, descriptor, table_descriptor, None),
+            Loc::Live(_) => {
+                if self.apply {
+                    self.words.publish_barrier();
+                }
+                if valid {
+                    // Break-before-make: a valid block becomes invalid and
+                    // is invalidated before the equivalent table appears.
+                    self.store(loc, descriptor, 0, None)?;
+                    if self.apply {
+                        self.words.invalidate_range(base, span);
+                    }
+                    self.store(loc, 0, table_descriptor, Some((base, span)))
+                } else {
+                    self.store(loc, descriptor, table_descriptor, Some((base, span)))
+                }
+            }
+        }
+    }
+
+    fn take_grant(&mut self) -> Result<Option<u64>, DescriptorRefusal> {
+        let index = self.grants_used;
+        self.grants_used += 1;
+        if !self.apply {
+            return Ok(None);
+        }
+        self.grants
+            .get(index)
+            .copied()
+            .map(Some)
+            .ok_or(DescriptorRefusal::TablesExhausted)
+    }
+
+    fn store(
+        &mut self,
+        loc: Loc,
+        before: u64,
+        after: u64,
+        undo_invalidate: Option<(u64, u64)>,
+    ) -> Result<(), DescriptorRefusal> {
+        match loc {
+            Loc::Fresh(None) => Ok(()),
+            Loc::Fresh(Some(pa)) => self.words.store_unlinked(pa, after),
+            Loc::Live(pa) => {
+                if !self.apply {
+                    self.planned_live_stores += 1;
+                    return Ok(());
+                }
+                if !self.words.compare_exchange(pa, before, after)? {
+                    return Err(DescriptorRefusal::Contended);
+                }
+                let (bbm_va, bbm_len) = undo_invalidate.unwrap_or((0, 0));
+                if !self.journal.push(JournalEntry {
+                    pa,
+                    before,
+                    after,
+                    bbm_va,
+                    bbm_len,
+                }) {
+                    // Capacity was reserved from the plan; a shortfall means
+                    // the graph changed underneath. Undo this store now.
+                    let _ = self.words.compare_exchange(pa, after, before);
+                    return Err(DescriptorRefusal::JournalCapacity);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn edit(&self, descriptor: u64, level: usize, base: u64) -> Result<u64, DescriptorRefusal> {
+        let state = el1_private_leaf_state(descriptor);
+        match self.op {
+            DescriptorOp::Prepare {
+                publication,
+                resident,
+                ..
+            } => {
+                if descriptor & VALID != 0 {
+                    return Err(DescriptorRefusal::AlreadyValid);
+                }
+                match state {
+                    El1PrivateLeafState::Prepared => return Err(DescriptorRefusal::Occupied),
+                    El1PrivateLeafState::Malformed => return Err(DescriptorRefusal::Malformed),
+                    _ => {}
+                }
+                let output = (publication.ipa + (base - publication.va)) & PA_MASK_4KIB;
+                let residency = if resident.contains(base) { VALID } else { 0 };
+                Ok(output | prepared_flags(publication) | residency)
+            }
+            DescriptorOp::Publish {
+                span,
+                expected_ipa,
+                access,
+            } => {
+                let expected = expected_ipa.raw() + (base - span.va);
+                if descriptor & output_mask(level) != expected {
+                    return Err(DescriptorRefusal::WrongBacking);
+                }
+                match state {
+                    El1PrivateLeafState::Prepared
+                        if terminal_descriptor_permits_el0(descriptor | VALID, access) =>
+                    {
+                        Ok(descriptor | VALID)
+                    }
+                    El1PrivateLeafState::Resident
+                        if terminal_descriptor_permits_el0(descriptor, access) =>
+                    {
+                        Ok(descriptor)
+                    }
+                    El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident => {
+                        Err(DescriptorRefusal::PermissionDenied)
+                    }
+                    _ => Err(DescriptorRefusal::NotPrepared),
+                }
+            }
+            DescriptorOp::Protect(edit) => {
+                if !matches!(
+                    state,
+                    El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
+                ) {
+                    return Err(DescriptorRefusal::NotPrivateAnonymous);
+                }
+                if el1_cow(descriptor) {
+                    return Err(DescriptorRefusal::CowArmed);
+                }
+                if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
+                    || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
+                {
+                    return Err(DescriptorRefusal::PermissionWidening);
+                }
+                let (ap, uxn) = if !(edit.readable || edit.writable || edit.executable) {
+                    (AP_PRIV_RO, UXN)
+                } else if edit.writable {
+                    (AP_RW, if edit.executable { 0 } else { UXN })
+                } else {
+                    (AP_RO, if edit.executable { 0 } else { UXN })
+                };
+                Ok((descriptor & !AP_MASK & !UXN) | ap | uxn)
+            }
+            DescriptorOp::Retire(_) => match state {
+                El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident => {
+                    Ok((descriptor & !VALID) | SW_RETIRED)
+                }
+                _ => Err(DescriptorRefusal::NotPrivateAnonymous),
+            },
+            DescriptorOp::CowRepoint {
+                old_ipa, new_ipa, ..
+            } => {
+                if state != El1PrivateLeafState::Resident || !el1_cow(descriptor) {
+                    return Err(DescriptorRefusal::NotCowArmed);
+                }
+                if descriptor & PA_MASK_4KIB != old_ipa.raw() {
+                    return Err(DescriptorRefusal::WrongBacking);
+                }
+                if descriptor & SW_EL1_MAY_WRITE == 0 || descriptor & AP_MASK == AP_PRIV_RO {
+                    return Err(DescriptorRefusal::PermissionDenied);
+                }
+                Ok((descriptor & !PA_MASK_4KIB & !SW_EL1_COW & !AP_MASK) | new_ipa.raw() | AP_RW)
+            }
+        }
+    }
+}
+
+/// The L3 prepared-leaf encoding of the host grant publisher: Linux
+/// permissions in AP/UXN, per-MM nG, EL1 private authority and its write /
+/// execute ceilings; VALID clear until residency.
+fn prepared_flags(publication: GuestLeafPublication) -> u64 {
+    let mut flags = if publication.writable {
+        USER_PAGE_FLAGS | NON_GLOBAL
+    } else {
+        (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
+    };
+    flags |= SW_EL1_PRIVATE;
+    if publication.writable {
+        flags |= SW_EL1_MAY_WRITE;
+    }
+    if publication.executable {
+        flags |= SW_EL1_MAY_EXEC;
+    } else {
+        flags |= UXN;
+    }
+    flags & !VALID
+}
+
+fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
+    let span = op.span();
+    if !span.is_well_formed() {
+        return Err(DescriptorRefusal::BadRange);
+    }
+    let aligned = |raw: u64| raw != 0 && raw.is_multiple_of(PT_PAGE) && raw & !PA_MASK_4KIB == 0;
+    let ok = match *op {
+        DescriptorOp::Prepare {
+            publication,
+            resident,
+            ..
+        } => {
+            aligned(publication.ipa)
+                && publication.ipa.checked_add(publication.len).is_some()
+                && resident.va.is_multiple_of(PT_PAGE)
+                && resident.len.is_multiple_of(PT_PAGE)
+                && span.contains_span(resident)
+        }
+        DescriptorOp::Publish { expected_ipa, .. } => {
+            aligned(expected_ipa.raw()) && expected_ipa.raw().checked_add(span.len).is_some()
+        }
+        DescriptorOp::Protect(_) | DescriptorOp::Retire(_) => true,
+        DescriptorOp::CowRepoint {
+            old_ipa, new_ipa, ..
+        } => aligned(old_ipa.raw()) && aligned(new_ipa.raw()) && old_ipa != new_ipa,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(DescriptorRefusal::BadRange)
+    }
+}
+
+fn roll_back<W: LiveDescriptorWords + ?Sized>(words: &W, journal: &[JournalEntry]) -> bool {
+    for entry in journal.iter().rev() {
+        if words.compare_exchange(entry.pa, entry.after, entry.before) != Ok(true) {
+            return false;
+        }
+        if entry.bbm_len != 0 {
+            words.invalidate_range(entry.bbm_va, entry.bbm_len);
+        }
+    }
+    words.publish_barrier();
+    true
+}
+
+/// Apply one descriptor operation to the live graph rooted at `root`.
+///
+/// The complete span, table-grant need and journal capacity are validated
+/// by a read-only plan before the first live store; the same walk then
+/// applies it. Guest-originated edits (first-touch commit, EL1-served
+/// `mprotect`/`munmap`) and host submissions share this one implementation.
+///
+/// The caller holds the exact-MM editor for `root` and, after any outcome
+/// with `flush_required` (or a rollback), invalidates the MM's ASID.
+pub fn execute_descriptor_op<W, J>(
+    words: &W,
+    root: SubstrateGpa,
+    op: DescriptorOp,
+    tables: &TableGrants,
+    journal: &mut J,
+) -> DescriptorOutcome
+where
+    W: LiveDescriptorWords + ?Sized,
+    J: DescriptorJournal + ?Sized,
+{
+    if let Err(refusal) = validate_op(&op) {
+        return DescriptorOutcome::Refused(refusal);
+    }
+    let root = root.raw();
+    if root == 0 || !root.is_multiple_of(PT_PAGE) {
+        return DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot);
+    }
+    for &grant in tables.as_slice() {
+        if grant == root || words.load(grant).is_err() || words.load(grant + PT_PAGE - 8).is_err() {
+            return DescriptorOutcome::Refused(DescriptorRefusal::BadTableGrant);
+        }
+    }
+    let span = op.span();
+    let Some(end) = span.end() else {
+        return DescriptorOutcome::Refused(DescriptorRefusal::BadRange);
+    };
+    let mut plan = Executor {
+        words,
+        op,
+        start: span.va,
+        end,
+        apply: false,
+        grants: tables.as_slice(),
+        grants_used: 0,
+        journal: &mut *journal,
+        planned_live_stores: 0,
+    };
+    if let Err(refusal) = plan.visit_live_table(root, 0, 0) {
+        return DescriptorOutcome::Refused(refusal);
+    }
+    let (grants_needed, live_stores) = (plan.grants_used, plan.planned_live_stores);
+    if grants_needed > tables.len() {
+        return DescriptorOutcome::Refused(DescriptorRefusal::TablesExhausted);
+    }
+    if !journal.reserve(live_stores) {
+        return DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity);
+    }
+    let mut apply = Executor {
+        words,
+        op,
+        start: span.va,
+        end,
+        apply: true,
+        grants: tables.as_slice(),
+        grants_used: 0,
+        journal: &mut *journal,
+        planned_live_stores: 0,
+    };
+    let result = apply.visit_live_table(root, 0, 0);
+    let tables_linked = apply.grants_used;
+    match result {
+        Ok(()) => {
+            let stored = journal.entries().len();
+            DescriptorOutcome::Applied(DescriptorApplied {
+                pages: span.len / PT_PAGE,
+                resident: match op {
+                    DescriptorOp::Prepare { resident, .. } => resident,
+                    DescriptorOp::Publish { span, .. } => span,
+                    _ => PageSpan::EMPTY,
+                },
+                tables_linked: u8::try_from(tables_linked).unwrap_or(u8::MAX),
+                live_stores: u32::try_from(stored).unwrap_or(u32::MAX),
+                flush_required: stored != 0,
+            })
+        }
+        Err(refusal) => {
+            let restored = roll_back(words, journal.entries());
+            journal.clear();
+            if restored {
+                DescriptorOutcome::RolledBack(refusal)
+            } else {
+                DescriptorOutcome::Indeterminate(refusal)
+            }
+        }
+    }
+}
+
+/// Apply one authenticated host submission. `root` is the root EL1 itself
+/// authenticated for `txn.id.mm_key` from its published address space; a
+/// submission naming any other root is refused before any store.
+pub fn execute_descriptor_txn<W, J>(
+    words: &W,
+    root: SubstrateGpa,
+    txn: &DescriptorTxn,
+    journal: &mut J,
+) -> DescriptorReceipt
+where
+    W: LiveDescriptorWords + ?Sized,
+    J: DescriptorJournal + ?Sized,
+{
+    let outcome = if txn.root != root {
+        DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot)
+    } else {
+        execute_descriptor_op(words, root, txn.op, &txn.tables, journal)
+    };
+    DescriptorReceipt {
+        id: txn.id,
+        digest: txn.digest(),
+        outcome,
+    }
+}
+
+/// EL1: claim, execute and answer the submission in `slot` for `mm_key`.
+/// The caller holds `mm_key`'s exact editor, passes the root it
+/// authenticated for that MM, and invalidates the ASID when the returned
+/// receipt's outcome stored anything.
+pub fn apply_submitted_descriptor_txn<W, J>(
+    slot: &DescriptorTxnSlot,
+    mm_key: u64,
+    words: &W,
+    root: SubstrateGpa,
+    journal: &mut J,
+) -> Option<DescriptorReceipt>
+where
+    W: LiveDescriptorWords + ?Sized,
+    J: DescriptorJournal + ?Sized,
+{
+    let claimed = slot.claim_for_mm(mm_key)?;
+    let outcome = match claimed.txn() {
+        Ok(txn) => execute_descriptor_txn(words, root, txn, journal).outcome,
+        Err(refusal) => DescriptorOutcome::Refused(refusal),
+    };
+    Some(claimed.complete(outcome))
+}
+
+/// Whether a receipt's outcome changed live descriptors and therefore needs
+/// the caller's ASID invalidation.
+#[must_use]
+pub fn outcome_requires_invalidation(outcome: &DescriptorOutcome) -> bool {
+    match outcome {
+        DescriptorOutcome::Applied(applied) => applied.flush_required,
+        DescriptorOutcome::Refused(_) => false,
+        DescriptorOutcome::RolledBack(_) | DescriptorOutcome::Indeterminate(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1424,5 +2081,848 @@ mod tests {
         assert!(fixed.push(JournalEntry::default()));
         assert!(fixed.push(JournalEntry::default()));
         assert!(!fixed.push(JournalEntry::default()));
+    }
+
+    mod executor {
+        use super::super::*;
+        use super::backing;
+        use crate::aarch64::{AP_EL0_ACCESS, arm_existing_el1_fork_pages, indices};
+        use core::cell::{Cell, RefCell};
+        use std::vec;
+        use std::vec::Vec;
+
+        const ROOT: u64 = 0x8800_0000_0000;
+        const PAGES: usize = 16;
+        const VA: u64 = 0x4000_0000;
+        const IPA: u64 = 0x009b_4000_0000;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Event {
+            Unlinked(u64),
+            Cas { pa: u64, before: u64, after: u64 },
+            Barrier,
+            Invalidate(u64, u64),
+        }
+
+        /// Host-memory live table arena that logs every store and can make
+        /// the n-th forward compare-exchange observe a concurrent writer.
+        struct TestWords {
+            words: Vec<AtomicU64>,
+            log: RefCell<Vec<Event>>,
+            fail_cas_at: Cell<Option<usize>>,
+            forward_cas: Cell<usize>,
+        }
+
+        impl TestWords {
+            fn new() -> Self {
+                Self {
+                    words: (0..PAGES * 512).map(|_| AtomicU64::new(0)).collect(),
+                    log: RefCell::new(Vec::new()),
+                    fail_cas_at: Cell::new(None),
+                    forward_cas: Cell::new(0),
+                }
+            }
+            fn index(pa: u64) -> usize {
+                ((pa - ROOT) / 8) as usize
+            }
+            fn get(&self, pa: u64) -> u64 {
+                self.words[Self::index(pa)].load(Ordering::Relaxed)
+            }
+            fn set(&self, pa: u64, value: u64) {
+                self.words[Self::index(pa)].store(value, Ordering::Relaxed);
+            }
+            fn image(&self) -> Vec<u64> {
+                self.words
+                    .iter()
+                    .map(|w| w.load(Ordering::Relaxed))
+                    .collect()
+            }
+            fn live_cas(&self) -> Vec<Event> {
+                self.log
+                    .borrow()
+                    .iter()
+                    .copied()
+                    .filter(|e| matches!(e, Event::Cas { .. }))
+                    .collect()
+            }
+        }
+
+        impl LiveDescriptorWords for TestWords {
+            fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+                if pa < ROOT || pa >= ROOT + (PAGES as u64) * PT_PAGE || !pa.is_multiple_of(8) {
+                    return Err(DescriptorRefusal::TableOutsidePrimary);
+                }
+                Ok(self.get(pa))
+            }
+            fn compare_exchange(
+                &self,
+                pa: u64,
+                current: u64,
+                new: u64,
+            ) -> Result<bool, DescriptorRefusal> {
+                self.load(pa)?;
+                let n = self.forward_cas.get();
+                self.forward_cas.set(n + 1);
+                if self.fail_cas_at.get() == Some(n) {
+                    self.fail_cas_at.set(None);
+                    return Ok(false);
+                }
+                let ok = self.words[Self::index(pa)]
+                    .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+                if ok {
+                    self.log.borrow_mut().push(Event::Cas {
+                        pa,
+                        before: current,
+                        after: new,
+                    });
+                }
+                Ok(ok)
+            }
+            fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+                self.load(pa)?;
+                self.set(pa, value);
+                self.log.borrow_mut().push(Event::Unlinked(pa));
+                Ok(())
+            }
+            fn publish_barrier(&self) {
+                self.log.borrow_mut().push(Event::Barrier);
+            }
+            fn invalidate_range(&self, va: u64, len: u64) {
+                self.log.borrow_mut().push(Event::Invalidate(va, len));
+            }
+        }
+
+        fn page(n: u64) -> u64 {
+            ROOT + n * PT_PAGE
+        }
+
+        fn table(n: u64) -> u64 {
+            page(n) | TYPE_TABLE_OR_PAGE
+        }
+
+        /// L0 -> L1 -> L2 -> L3 for `VA`, down to `depth` linked levels.
+        fn fixture(depth: usize) -> TestWords {
+            let words = TestWords::new();
+            let idx = indices(VA);
+            if depth >= 1 {
+                words.set(page(0) + idx[0] as u64 * 8, table(1));
+            }
+            if depth >= 2 {
+                words.set(page(1) + idx[1] as u64 * 8, table(2));
+            }
+            if depth >= 3 {
+                words.set(page(2) + idx[2] as u64 * 8, table(3));
+            }
+            words
+        }
+
+        fn leaf_pa(va: u64) -> u64 {
+            let idx = indices(va);
+            page(3) + idx[3] as u64 * 8
+        }
+
+        fn grants(pages: &[u64]) -> TableGrants {
+            let pages: Vec<SubstrateGpa> = pages.iter().map(|&n| SubstrateGpa(page(n))).collect();
+            TableGrants::new(&pages).unwrap()
+        }
+
+        fn prepare(len_pages: u64, resident: PageSpan, writable: bool) -> DescriptorOp {
+            DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: VA,
+                    ipa: IPA,
+                    len: len_pages * PT_PAGE,
+                    writable,
+                    executable: false,
+                },
+                resident,
+                backing: backing(40),
+            }
+        }
+
+        fn run(words: &TestWords, op: DescriptorOp, tables: &TableGrants) -> DescriptorOutcome {
+            let mut journal = InlineJournal::new();
+            execute_descriptor_op(words, SubstrateGpa(ROOT), op, tables, &mut journal)
+        }
+
+        fn applied(outcome: DescriptorOutcome) -> DescriptorApplied {
+            match outcome {
+                DescriptorOutcome::Applied(applied) => applied,
+                other => panic!("expected an applied outcome, got {other:?}"),
+            }
+        }
+
+        fn nz(value: u64) -> NonZeroU64 {
+            NonZeroU64::new(value).unwrap()
+        }
+
+        #[test]
+        fn prepare_publishes_the_grant_and_exactly_the_resident_page() {
+            let words = fixture(3);
+            let resident = PageSpan::new(VA + PT_PAGE, PT_PAGE);
+            let result = applied(run(&words, prepare(4, resident, true), &TableGrants::NONE));
+            assert_eq!(result.resident, resident);
+            assert_eq!(result.pages, 4);
+            assert_eq!(result.live_stores, 4);
+            for n in 0..4 {
+                let d = words.get(leaf_pa(VA + n * PT_PAGE));
+                assert_eq!(d & PA_MASK_4KIB, IPA + n * PT_PAGE);
+                assert_ne!(d & NON_GLOBAL, 0);
+                assert_ne!(d & UXN, 0);
+                let expected = if n == 1 {
+                    El1PrivateLeafState::Resident
+                } else {
+                    El1PrivateLeafState::Prepared
+                };
+                assert_eq!(el1_private_leaf_state(d), expected, "page {n}");
+                assert!(terminal_descriptor_permits_el0(
+                    d | VALID,
+                    LeafAccess::Write
+                ));
+            }
+            // A second prepare over the same span is refused whole.
+            let image = words.image();
+            assert_eq!(
+                run(
+                    &words,
+                    prepare(4, PageSpan::EMPTY, true),
+                    &TableGrants::NONE
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::Occupied)
+            );
+            assert_eq!(
+                run(
+                    &words,
+                    DescriptorOp::Prepare {
+                        publication: GuestLeafPublication {
+                            va: VA + PT_PAGE,
+                            ipa: IPA,
+                            len: PT_PAGE,
+                            writable: true,
+                            executable: false,
+                        },
+                        resident: PageSpan::EMPTY,
+                        backing: backing(50),
+                    },
+                    &TableGrants::NONE
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::AlreadyValid)
+            );
+            assert_eq!(words.image(), image);
+        }
+
+        #[test]
+        fn prepare_builds_missing_hierarchy_from_grants_child_before_parent() {
+            let words = fixture(1);
+            let before = words.image();
+            // Missing L2 and L3 need two grants; one is refused before any store.
+            assert_eq!(
+                run(
+                    &words,
+                    prepare(4, PageSpan::new(VA, PT_PAGE), true),
+                    &grants(&[8])
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::TablesExhausted)
+            );
+            assert_eq!(words.image(), before);
+            assert!(words.log.borrow().is_empty());
+
+            let result = applied(run(
+                &words,
+                prepare(4, PageSpan::new(VA, PT_PAGE), true),
+                &grants(&[8, 9, 10]),
+            ));
+            assert_eq!(result.tables_linked, 2);
+            assert_eq!(
+                result.live_stores, 1,
+                "only the L1 link touches the live graph"
+            );
+            let idx = indices(VA);
+            let l1_entry = page(1) + idx[1] as u64 * 8;
+            assert_eq!(words.get(l1_entry), table(8));
+            assert_eq!(words.get(page(8) + idx[2] as u64 * 8), table(9));
+            let leaf = words.get(page(9) + idx[3] as u64 * 8);
+            assert_eq!(el1_private_leaf_state(leaf), El1PrivateLeafState::Resident);
+            // Every unlinked fill precedes the barrier, which precedes the link.
+            let log = words.log.borrow();
+            let barrier = log.iter().position(|e| *e == Event::Barrier).unwrap();
+            let link = log
+                .iter()
+                .position(|e| matches!(e, Event::Cas { pa, .. } if *pa == l1_entry))
+                .unwrap();
+            assert!(barrier < link);
+            assert!(
+                log[..barrier]
+                    .iter()
+                    .all(|e| matches!(e, Event::Unlinked(_)))
+            );
+            assert_eq!(log.len(), barrier + 2, "nothing is stored after the link");
+            // The unused third grant is untouched.
+            assert!((0..512).all(|i| words.get(page(10) + i * 8) == 0));
+        }
+
+        #[test]
+        fn tables_outside_the_primary_arena_refuse_before_any_store() {
+            let words = fixture(2);
+            let idx = indices(VA);
+            // The L2 entry points into an extension arena EL1 cannot reach.
+            words.set(
+                page(2) + idx[2] as u64 * 8,
+                0x9900_0000_0000 | TYPE_TABLE_OR_PAGE,
+            );
+            let before = words.image();
+            assert_eq!(
+                run(&words, prepare(2, PageSpan::EMPTY, true), &grants(&[8])),
+                DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary)
+            );
+            let foreign = TableGrants::new(&[SubstrateGpa(0x9900_0000_0000)]).unwrap();
+            assert_eq!(
+                run(&words, prepare(2, PageSpan::EMPTY, true), &foreign),
+                DescriptorOutcome::Refused(DescriptorRefusal::BadTableGrant)
+            );
+            assert_eq!(
+                run(&words, prepare(2, PageSpan::EMPTY, true), &grants(&[0])),
+                DescriptorOutcome::Refused(DescriptorRefusal::BadTableGrant),
+                "the root itself is never a grant"
+            );
+            assert_eq!(words.image(), before);
+            assert!(words.live_cas().is_empty());
+        }
+
+        #[test]
+        fn protect_serves_mixed_prepared_and_resident_ranges() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(4, PageSpan::new(VA, 2 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            let readonly = GuestPermissionEdit {
+                va: VA,
+                len: 4 * PT_PAGE,
+                readable: true,
+                writable: false,
+                executable: false,
+            };
+            applied(run(
+                &words,
+                DescriptorOp::Protect(readonly),
+                &TableGrants::NONE,
+            ));
+            for n in 0..4 {
+                let d = words.get(leaf_pa(VA + n * PT_PAGE));
+                assert_eq!(d & AP_MASK, AP_RO, "page {n}");
+                assert_eq!(d & PA_MASK_4KIB, IPA + n * PT_PAGE);
+                assert_eq!(d & VALID != 0, n < 2, "protection never changes residency");
+                assert!(!terminal_descriptor_permits_el0(
+                    d | VALID,
+                    LeafAccess::Write
+                ));
+            }
+            // The ceiling survives: RW is restorable, execute is widening.
+            let rw = GuestPermissionEdit {
+                writable: true,
+                ..readonly
+            };
+            applied(run(&words, DescriptorOp::Protect(rw), &TableGrants::NONE));
+            let before = words.image();
+            assert_eq!(
+                run(
+                    &words,
+                    DescriptorOp::Protect(GuestPermissionEdit {
+                        executable: true,
+                        ..rw
+                    }),
+                    &TableGrants::NONE
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+            );
+            // PROT_NONE denies EL0 and host buffers on both states.
+            applied(run(
+                &words,
+                DescriptorOp::Protect(GuestPermissionEdit {
+                    readable: false,
+                    writable: false,
+                    executable: false,
+                    ..rw
+                }),
+                &TableGrants::NONE,
+            ));
+            for n in 0..4 {
+                let d = words.get(leaf_pa(VA + n * PT_PAGE));
+                assert!(!crate::aarch64::terminal_descriptor_permits_host_buffer(
+                    d,
+                    LeafAccess::Read
+                ));
+                assert_eq!(d & AP_EL0_ACCESS, 0);
+            }
+            let _ = before;
+            // A COW-armed resident leaf belongs to the COW transaction.
+            applied(run(&words, DescriptorOp::Protect(rw), &TableGrants::NONE));
+            let byte_len = words.words.len() * 8;
+            unsafe {
+                arm_existing_el1_fork_pages(
+                    words.words.as_ptr().cast_mut(),
+                    ROOT,
+                    byte_len,
+                    VA,
+                    PT_PAGE,
+                )
+            }
+            .unwrap();
+            let armed = words.image();
+            assert_eq!(
+                run(&words, DescriptorOp::Protect(readonly), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::CowArmed)
+            );
+            assert_eq!(words.image(), armed);
+        }
+
+        fn resident_block(words: &TestWords, output: u64) -> u64 {
+            let idx = indices(VA);
+            let entry = page(2) + idx[2] as u64 * 8;
+            let block = (output & PA_MASK_2MIB)
+                | (crate::aarch64::USER_BLOCK_FLAGS & !AP_MASK)
+                | AP_RW
+                | NON_GLOBAL
+                | UXN
+                | SW_EL1_PRIVATE
+                | SW_EL1_MAY_WRITE;
+            words.set(entry, block);
+            entry
+        }
+
+        #[test]
+        fn partial_valid_block_protect_splits_with_break_before_make() {
+            let words = fixture(2);
+            let entry = resident_block(&words, 0x009c_0000_0000);
+            let block = words.get(entry);
+            let target = VA + 5 * PT_PAGE;
+            let edit = GuestPermissionEdit {
+                va: target,
+                len: PT_PAGE,
+                readable: true,
+                writable: false,
+                executable: false,
+            };
+            assert_eq!(
+                run(&words, DescriptorOp::Protect(edit), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::TablesExhausted)
+            );
+            assert_eq!(words.get(entry), block);
+
+            let result = applied(run(&words, DescriptorOp::Protect(edit), &grants(&[8])));
+            assert_eq!(result.tables_linked, 1);
+            assert_eq!(words.get(entry), table(8));
+            for n in 0..512u64 {
+                let d = words.get(page(8) + n * 8);
+                assert_eq!(d & PA_MASK_4KIB, 0x009c_0000_0000 + n * PT_PAGE);
+                assert!(terminal_descriptor_permits_el0(d, LeafAccess::Read));
+                assert_eq!(
+                    terminal_descriptor_permits_el0(d, LeafAccess::Write),
+                    n != 5,
+                    "only the edited page loses write"
+                );
+            }
+            assert_eq!(
+                words.live_cas(),
+                vec![
+                    Event::Cas {
+                        pa: entry,
+                        before: block,
+                        after: 0
+                    },
+                    Event::Cas {
+                        pa: entry,
+                        before: 0,
+                        after: table(8)
+                    },
+                ]
+            );
+            let log = words.log.borrow();
+            let breaks = log
+                .iter()
+                .position(|e| matches!(e, Event::Cas { after: 0, .. }))
+                .unwrap();
+            assert_eq!(log[breaks + 1], Event::Invalidate(VA, 1 << 21));
+        }
+
+        #[test]
+        fn partial_prepared_block_retire_splits_without_break_before_make() {
+            let words = fixture(2);
+            let entry = resident_block(&words, 0x009c_0000_0000);
+            let prepared_block = words.get(entry) & !VALID;
+            words.set(entry, prepared_block);
+            let result = applied(run(
+                &words,
+                DescriptorOp::Retire(PageSpan::new(VA, 2 * PT_PAGE)),
+                &grants(&[8]),
+            ));
+            assert_eq!(result.live_stores, 1);
+            assert!(
+                !words
+                    .log
+                    .borrow()
+                    .iter()
+                    .any(|e| matches!(e, Event::Invalidate(..))),
+                "an invalid block has no translation to break"
+            );
+            for n in 0..512u64 {
+                let d = words.get(page(8) + n * 8);
+                assert_eq!(d & PA_MASK_4KIB, 0x009c_0000_0000 + n * PT_PAGE);
+                let expected = if n < 2 {
+                    El1PrivateLeafState::Retired
+                } else {
+                    El1PrivateLeafState::Prepared
+                };
+                assert_eq!(el1_private_leaf_state(d), expected, "page {n}");
+            }
+            // A complete block is edited in place without a grant.
+            let words = fixture(2);
+            let entry = resident_block(&words, 0x009c_0000_0000);
+            let result = applied(run(
+                &words,
+                DescriptorOp::Retire(PageSpan::new(VA, 1 << 21)),
+                &TableGrants::NONE,
+            ));
+            assert_eq!(result.tables_linked, 0);
+            assert_eq!(
+                el1_private_leaf_state(words.get(entry)),
+                El1PrivateLeafState::Retired
+            );
+            assert_eq!(words.get(entry) & PA_MASK_2MIB, 0x009c_0000_0000);
+        }
+
+        #[test]
+        fn rollback_after_publication_failure_restores_the_exact_preimage() {
+            // Leaf stores: the third live store observes a concurrent writer.
+            let words = fixture(3);
+            let before = words.image();
+            words.fail_cas_at.set(Some(2));
+            assert_eq!(
+                run(
+                    &words,
+                    prepare(4, PageSpan::new(VA, PT_PAGE), true),
+                    &TableGrants::NONE
+                ),
+                DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+            );
+            assert_eq!(words.image(), before);
+
+            // Split: the table link fails after the block was broken.
+            let words = fixture(2);
+            let entry = resident_block(&words, 0x009c_0000_0000);
+            let before = words.image();
+            words.fail_cas_at.set(Some(1));
+            let edit = GuestPermissionEdit {
+                va: VA,
+                len: PT_PAGE,
+                readable: true,
+                writable: false,
+                executable: false,
+            };
+            let outcome = run(&words, DescriptorOp::Protect(edit), &grants(&[8]));
+            assert_eq!(
+                outcome,
+                DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+            );
+            assert!(outcome_requires_invalidation(&outcome));
+            assert_eq!(words.get(entry), before[TestWords::index(entry)]);
+            for (index, value) in words.image().iter().enumerate() {
+                if index >= TestWords::index(page(8)) && index < TestWords::index(page(9)) {
+                    continue; // the unlinked grant's contents are not state
+                }
+                assert_eq!(*value, before[index], "word {index}");
+            }
+
+            // A journal that cannot hold the planned stores refuses up front.
+            let words = fixture(3);
+            let before = words.image();
+            let mut storage = [JournalEntry::default(); 2];
+            let mut journal = SliceJournal::new(&mut storage);
+            assert_eq!(
+                execute_descriptor_op(
+                    &words,
+                    SubstrateGpa(ROOT),
+                    prepare(4, PageSpan::EMPTY, true),
+                    &TableGrants::NONE,
+                    &mut journal,
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity)
+            );
+            assert_eq!(words.image(), before);
+        }
+
+        #[test]
+        fn stale_root_mm_and_owner_generation_cannot_mutate_the_graph() {
+            let words = fixture(3);
+            let before = words.image();
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(7),
+                    generation: nz(1),
+                },
+                root: SubstrateGpa(ROOT + PT_PAGE),
+                op: prepare(2, PageSpan::EMPTY, true),
+                tables: TableGrants::NONE,
+            };
+            let mut journal = InlineJournal::new();
+            let receipt = execute_descriptor_txn(&words, SubstrateGpa(ROOT), &txn, &mut journal);
+            assert_eq!(
+                receipt.outcome,
+                DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot)
+            );
+            assert_eq!(words.image(), before);
+
+            // Wrong MM: the slot never hands the submission to another MM.
+            let slot = DescriptorTxnSlot::new();
+            let txn = DescriptorTxn {
+                root: SubstrateGpa(ROOT),
+                ..txn
+            };
+            assert!(slot.submit(&txn));
+            assert!(
+                apply_submitted_descriptor_txn(&slot, 8, &words, SubstrateGpa(ROOT), &mut journal)
+                    .is_none()
+            );
+            assert_eq!(words.image(), before);
+            let receipt =
+                apply_submitted_descriptor_txn(&slot, 7, &words, SubstrateGpa(ROOT), &mut journal)
+                    .unwrap();
+            let host_receipt = slot.take_receipt(txn.id).unwrap();
+            assert_eq!(host_receipt, receipt);
+            assert!(txn.verify_receipt(&host_receipt).is_ok());
+            // A host whose inventory moved to a new owner generation cannot
+            // consume the receipt of the older submission.
+            let mut moved = txn;
+            if let DescriptorOp::Prepare {
+                ref mut backing, ..
+            } = moved.op
+            {
+                backing.owner_generation = nz(99);
+            }
+            assert_eq!(
+                moved.verify_receipt(&host_receipt),
+                Err(ReceiptError::DigestMismatch)
+            );
+            // Publishing against a stale expected output is refused.
+            let before = words.image();
+            assert_eq!(
+                run(
+                    &words,
+                    DescriptorOp::Publish {
+                        span: PageSpan::new(VA, PT_PAGE),
+                        expected_ipa: SubstrateGpa(IPA + 0x10_0000),
+                        access: LeafAccess::Read,
+                    },
+                    &TableGrants::NONE
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking)
+            );
+            assert_eq!(words.image(), before);
+        }
+
+        #[test]
+        fn host_copyout_publish_is_exact_and_permission_checked() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(4, PageSpan::EMPTY, true),
+                &TableGrants::NONE,
+            ));
+            let publish = |va, access| DescriptorOp::Publish {
+                span: PageSpan::new(va, PT_PAGE),
+                expected_ipa: SubstrateGpa(IPA + (va - VA)),
+                access,
+            };
+            let result = applied(run(
+                &words,
+                publish(VA + 2 * PT_PAGE, LeafAccess::Write),
+                &TableGrants::NONE,
+            ));
+            assert_eq!(result.resident, PageSpan::new(VA + 2 * PT_PAGE, PT_PAGE));
+            for n in 0..4 {
+                let state = el1_private_leaf_state(words.get(leaf_pa(VA + n * PT_PAGE)));
+                let expected = if n == 2 {
+                    El1PrivateLeafState::Resident
+                } else {
+                    El1PrivateLeafState::Prepared
+                };
+                assert_eq!(state, expected, "page {n}");
+            }
+            // Already resident: no store.
+            assert_eq!(
+                applied(run(
+                    &words,
+                    publish(VA + 2 * PT_PAGE, LeafAccess::Read),
+                    &TableGrants::NONE
+                ))
+                .live_stores,
+                0
+            );
+            // Read-only prepared page refuses a write copyout.
+            applied(run(
+                &words,
+                DescriptorOp::Protect(GuestPermissionEdit {
+                    va: VA,
+                    len: PT_PAGE,
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                }),
+                &TableGrants::NONE,
+            ));
+            assert_eq!(
+                run(&words, publish(VA, LeafAccess::Write), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied)
+            );
+            // A retired lease is not prepared backing.
+            applied(run(
+                &words,
+                DescriptorOp::Retire(PageSpan::new(VA + 3 * PT_PAGE, PT_PAGE)),
+                &TableGrants::NONE,
+            ));
+            assert_eq!(
+                run(
+                    &words,
+                    publish(VA + 3 * PT_PAGE, LeafAccess::Read),
+                    &TableGrants::NONE
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared)
+            );
+        }
+
+        #[test]
+        fn cow_repoint_installs_the_private_copy_and_restores_write() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(2, PageSpan::new(VA, 2 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            let repoint = |old, new| DescriptorOp::CowRepoint {
+                va: VA,
+                old_ipa: SubstrateGpa(old),
+                new_ipa: SubstrateGpa(new),
+                backing: backing(80),
+            };
+            let copy = 0x009d_0000_0000;
+            assert_eq!(
+                run(&words, repoint(IPA, copy), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::NotCowArmed)
+            );
+            let byte_len = words.words.len() * 8;
+            unsafe {
+                arm_existing_el1_fork_pages(
+                    words.words.as_ptr().cast_mut(),
+                    ROOT,
+                    byte_len,
+                    VA,
+                    2 * PT_PAGE,
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                run(&words, repoint(IPA + PT_PAGE, copy), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking)
+            );
+            let result = applied(run(&words, repoint(IPA, copy), &TableGrants::NONE));
+            assert_eq!(result.live_stores, 1);
+            let d = words.get(leaf_pa(VA));
+            assert_eq!(d & PA_MASK_4KIB, copy);
+            assert!(!el1_cow(d));
+            assert!(terminal_descriptor_permits_el0(d, LeafAccess::Write));
+            // The sibling stays shared and armed.
+            assert!(el1_cow(words.get(leaf_pa(VA + PT_PAGE))));
+            assert_eq!(
+                words.get(leaf_pa(VA + PT_PAGE)) & PA_MASK_4KIB,
+                IPA + PT_PAGE
+            );
+        }
+
+        #[test]
+        fn two_live_roots_with_identical_vas_edit_only_their_own_graph() {
+            // Root A uses pages 0..=3; root B uses pages 4..=7 for the same VA.
+            let words = fixture(3);
+            let idx = indices(VA);
+            words.set(page(4) + idx[0] as u64 * 8, table(5));
+            words.set(page(5) + idx[1] as u64 * 8, table(6));
+            words.set(page(6) + idx[2] as u64 * 8, table(7));
+            let mut journal = InlineJournal::new();
+            let outcome = execute_descriptor_op(
+                &words,
+                SubstrateGpa(page(4)),
+                prepare(1, PageSpan::new(VA, PT_PAGE), true),
+                &TableGrants::NONE,
+                &mut journal,
+            );
+            applied(outcome);
+            assert_eq!(words.get(leaf_pa(VA)), 0, "root A is untouched");
+            let b_leaf = words.get(page(7) + idx[3] as u64 * 8);
+            assert_eq!(
+                el1_private_leaf_state(b_leaf),
+                El1PrivateLeafState::Resident
+            );
+        }
+
+        #[test]
+        fn existing_leaf_wrappers_share_the_transaction_executor() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(2, PageSpan::EMPTY, true),
+                &TableGrants::NONE,
+            ));
+            let byte_len = words.words.len() * 8;
+            let ptr = words.words.as_ptr().cast_mut();
+            assert_eq!(
+                unsafe {
+                    crate::aarch64::commit_existing_el1_prepared_page(
+                        ptr,
+                        ROOT,
+                        byte_len,
+                        VA,
+                        IPA,
+                        LeafAccess::Write,
+                    )
+                },
+                Ok(crate::aarch64::GuestPreparedCommit::Committed)
+            );
+            // Mixed prepared/resident protection is guest-served.
+            assert_eq!(
+                unsafe {
+                    crate::aarch64::protect_existing_el1_private_pages(
+                        ptr,
+                        ROOT,
+                        byte_len,
+                        GuestPermissionEdit {
+                            va: VA,
+                            len: 2 * PT_PAGE,
+                            readable: true,
+                            writable: false,
+                            executable: false,
+                        },
+                    )
+                },
+                Ok(2)
+            );
+            assert_eq!(
+                unsafe {
+                    crate::aarch64::retire_existing_el1_private_pages(
+                        ptr,
+                        ROOT,
+                        byte_len,
+                        VA,
+                        2 * PT_PAGE,
+                    )
+                },
+                Ok(2)
+            );
+            assert_eq!(
+                el1_private_leaf_state(words.get(leaf_pa(VA + PT_PAGE))),
+                El1PrivateLeafState::Retired
+            );
+        }
     }
 }
