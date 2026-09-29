@@ -469,6 +469,7 @@ impl std::fmt::Debug for ContainerRootPublicationBarriers {
 /// One backend-neutral Linux kernel instance.
 #[derive(Debug)]
 pub struct Kernel {
+    ipc: Mutex<Option<Arc<crate::el1_ipc::HostIpc>>>,
     domain: Arc<KernelDomain>,
     registry: Registry,
     ids: IdRegistry,
@@ -1259,6 +1260,18 @@ impl std::fmt::Debug for TaskExitSubscribers {
 }
 
 impl Kernel {
+    /// Shared IPC storage retained by this kernel and any runtime mapping.
+    pub fn ipc(&self) -> Result<Arc<crate::el1_ipc::HostIpc>, crate::el1_ipc::AdmissionError> {
+        let mut ipc = self.ipc.lock();
+        if let Some(owner) = ipc.as_ref() {
+            return Ok(Arc::clone(owner));
+        }
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(
+            crate::el1_ipc::HostIpc::DEFAULT_POOL_BYTES,
+        )?);
+        *ipc = Some(Arc::clone(&owner));
+        Ok(owner)
+    }
     /// The execution backend's host-signal bridge this kernel was booted with.
     pub fn host_signal(&self) -> &Arc<dyn HostSignalBridge> {
         &self.host_signal
@@ -1405,6 +1418,7 @@ impl Kernel {
             object_ids,
             frame_inventory: FrameInventoryAuthority::new(),
             fd_ceiling,
+            ipc: Mutex::new(None),
             hvpatch_child_token_issuer,
             hvpatch_child_token_verifier,
             observations: Mutex::new(observations),
