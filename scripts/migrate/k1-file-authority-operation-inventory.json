@@ -7,7 +7,7 @@
     "description_backing": 24,
     "epoll": 421,
     "stream": 179,
-    "mapping": 1185,
+    "mapping": 1192,
     "lifecycle": 30
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 9,
     "epoll": 160,
     "stream": 123,
-    "mapping": 780,
+    "mapping": 786,
     "lifecycle": 16
   },
   "files": {
@@ -25,7 +25,7 @@
     "description_backing": 8,
     "epoll": 42,
     "stream": 21,
-    "mapping": 98,
+    "mapping": 99,
     "lifecycle": 9
   },
   "entries": [
@@ -4993,6 +4993,60 @@
       "scope_kind": "production_callsite"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/projection.rs",
+      "line": 58,
+      "categories": [
+        "mapping"
+      ],
+      "text": "model.observe_mappings(&mut |mapping| {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/projection.rs",
+      "line": 59,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if mapping.anonymous {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/projection.rs",
+      "line": 60,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let prot = mapping.protection.bits();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/projection.rs",
+      "line": 62,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping.range.start() < layout.brk && mapping.range.end() > layout.heap.start();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/projection.rs",
+      "line": 64,
+      "categories": [
+        "mapping"
+      ],
+      "text": "start: mapping.range.start(),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/projection.rs",
+      "line": 65,
+      "categories": [
+        "mapping"
+      ],
+      "text": "end: mapping.range.end(),",
+      "scope_kind": "production_callsite"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
       "line": 11,
       "categories": [
@@ -5012,7 +5066,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 292,
+      "line": 457,
+      "categories": [
+        "mapping"
+      ],
+      "text": "assert_eq!(changed.generation(), guest.mapping(va).unwrap().generation);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
+      "line": 502,
       "categories": [
         "mapping"
       ],
@@ -5021,7 +5084,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 355,
+      "line": 565,
       "categories": [
         "mapping"
       ],
@@ -5030,7 +5093,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 364,
+      "line": 574,
       "categories": [
         "mapping"
       ],
@@ -5039,7 +5102,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 384,
+      "line": 594,
       "categories": [
         "mapping"
       ],
@@ -5048,7 +5111,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 386,
+      "line": 596,
       "categories": [
         "mapping"
       ],
@@ -5057,7 +5120,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 389,
+      "line": 599,
       "categories": [
         "mapping"
       ],

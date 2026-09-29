@@ -133,6 +133,9 @@ impl MemView<'_> {
         if permit.mm() != self.mm_authority().mm_id {
             return Err(Refusal::Stale);
         }
+        if !self.mm_authority().has_reservation_provider() {
+            return Err(Refusal::ForeignMapping);
+        }
         let _exclusion = self.begin_host_alias_dispatch(permit);
         let mm = ReservationMm::new(permit.mm().raw()).ok_or(Refusal::Invalid)?;
         let table = shared_host().ok_or(Refusal::Stale)?;
@@ -277,6 +280,213 @@ mod tests {
     }
 
     #[test]
+    fn reservation_proc_provider_rejects_wrong_mm_guard_and_wrong_permit() {
+        struct View {
+            table: Arc<SharedReservations>,
+            index: usize,
+            mm: ReservationMm,
+        }
+        impl PreparedHostReservations for View {
+            fn lock(&self, _mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
+                self.table.lock(self.index, self.mm)
+            }
+        }
+        let table: Arc<SharedReservations> = Arc::from(shared());
+        let mem = snapshot();
+        let a = publish(&table, &mem, 0);
+        let b = publish(&table, &mem, 1);
+        for (index, mm) in [(0, a), (1, b)] {
+            import_snapshot(
+                &mut table.lock(index, mm).unwrap(),
+                &mem,
+                (u64::MAX, u64::MAX),
+            )
+            .unwrap();
+        }
+        let mm_id = |key: ReservationMm| {
+            crate::kernel::MmId::from_registry_allocation(
+                std::num::NonZeroU64::new(key.raw()).unwrap(),
+            )
+        };
+        let authority = crate::dispatch::mm_authority::DispatchMmAuthority::new(mm_id(a));
+        let peer = crate::dispatch::mm_authority::DispatchMmAuthority::new(mm_id(b));
+        struct Provider {
+            table: Arc<SharedReservations>,
+            index: usize,
+            mm: ReservationMm,
+        }
+        impl HostReservationProvider for Provider {
+            fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
+                Ok(Box::new(View {
+                    table: Arc::clone(&self.table),
+                    index: self.index,
+                    mm: self.mm,
+                }))
+            }
+        }
+        authority
+            .install_reservation_provider(Arc::new(Provider {
+                table: Arc::clone(&table),
+                index: 0,
+                mm: a,
+            }))
+            .unwrap();
+        peer.install_reservation_provider(Arc::new(Provider {
+            table: Arc::clone(&table),
+            index: 0,
+            mm: a,
+        }))
+        .unwrap();
+        let defective = crate::dispatch::mm_authority::DispatchMmAuthority::new(mm_id(a));
+        defective
+            .install_reservation_provider(Arc::new(Provider {
+                table,
+                index: 1,
+                mm: b,
+            }))
+            .unwrap();
+        let own = authority.prepare_el1_reservations().unwrap();
+        let wrong = peer.prepare_el1_reservations().unwrap();
+        let mismatched_mm = defective.prepare_el1_reservations().unwrap();
+        let host = NonAnonymousVmas::try_from((a, VmaMap::new())).unwrap();
+        crate::dispatch::mm_mutation::test_support::with_permit(
+            Arc::clone(&authority.mutation_coordinator),
+            |permit| {
+                assert_eq!(
+                    authority
+                        .observe_el1_proc_maps(permit, &own, &host)
+                        .unwrap()
+                        .mm(),
+                    a
+                );
+                assert!(matches!(
+                    authority.observe_el1_proc_maps(permit, &wrong, &host),
+                    Err(Refusal::Stale)
+                ));
+            },
+        );
+        crate::dispatch::mm_mutation::test_support::with_permit(
+            Arc::clone(&peer.mutation_coordinator),
+            |permit| {
+                assert!(matches!(
+                    authority.observe_el1_proc_maps(permit, &own, &host),
+                    Err(Refusal::Stale)
+                ));
+            },
+        );
+        crate::dispatch::mm_mutation::test_support::with_permit(
+            Arc::clone(&defective.mutation_coordinator),
+            |permit| {
+                assert!(matches!(
+                    defective.observe_el1_proc_maps(permit, &mismatched_mm, &host),
+                    Err(Refusal::Stale)
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn reservation_proc_projection_rejects_a_second_anonymous_owner() {
+        let mem = snapshot();
+        assert!(matches!(
+            NonAnonymousVmas::try_from((
+                ReservationMm::new(41).unwrap(),
+                mem.semantic_vmas.clone()
+            )),
+            Err(Refusal::ForeignMapping)
+        ));
+    }
+
+    #[test]
+    fn reservation_proc_projection_tracks_two_mm_generations_and_rollback() {
+        let table = shared();
+        let mem = snapshot();
+        let va = mem.layout.mmap_base;
+        let a = publish(&table, &mem, 0);
+        let b = publish(&table, &mem, 1);
+        let host = NonAnonymousVmas::try_from((a, VmaMap::new())).unwrap();
+        for (index, mm) in [(0, a), (1, b)] {
+            import_snapshot(
+                &mut table.lock(index, mm).unwrap(),
+                &mem,
+                (u64::MAX, u64::MAX),
+            )
+            .unwrap();
+        }
+        let initial = ReservationProcMaps::capture(&mut table.lock(0, a).unwrap(), &host).unwrap();
+        let mut guest = table.lock(0, a).unwrap();
+        let Decision::Work(request) = guest
+            .mprotect(
+                ReservationRange::new(va, va + 4096).unwrap(),
+                ReservationProtection::NONE,
+            )
+            .unwrap()
+        else {
+            panic!("expected descriptor work")
+        };
+        let pending = ReservationProcMaps::capture(&mut guest, &host).unwrap();
+        assert_eq!(pending.generation(), initial.generation());
+        assert!(pending.maps()[0].write);
+        guest.refuse(request).unwrap();
+        let rolled_back = ReservationProcMaps::capture(&mut guest, &host).unwrap();
+        assert_eq!(rolled_back.generation(), initial.generation());
+        assert!(rolled_back.maps()[0].write);
+        let Decision::Work(request) = guest
+            .mprotect(
+                ReservationRange::new(va, va + 4096).unwrap(),
+                ReservationProtection::NONE,
+            )
+            .unwrap()
+        else {
+            panic!("expected descriptor work")
+        };
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: 1,
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        guest.complete(completion).unwrap();
+        let changed = ReservationProcMaps::capture(&mut guest, &host).unwrap();
+        assert_eq!(changed.mm(), a);
+        assert_eq!(changed.generation(), guest.mapping(va).unwrap().generation);
+        assert_ne!(changed.generation(), initial.generation());
+        assert!(!changed.maps()[0].read);
+        assert!(!changed.maps()[0].write);
+        assert_eq!(changed.brk_current(), mem.layout.heap_base);
+        drop(guest);
+        let mut peer = table.lock(1, b).unwrap();
+        assert!(matches!(
+            ReservationProcMaps::capture(&mut peer, &host),
+            Err(Refusal::Stale)
+        ));
+        let host = NonAnonymousVmas::try_from((b, VmaMap::new())).unwrap();
+        let unchanged = ReservationProcMaps::capture(&mut peer, &host).unwrap();
+        assert_eq!(unchanged.mm(), b);
+        assert_eq!(unchanged.generation(), initial.generation());
+        assert!(unchanged.maps()[0].write);
+        assert_eq!(
+            unchanged.generation(),
+            peer.fault_plan(va, 4096, ReservationProtection::READ_WRITE)
+                .unwrap()
+                .generation
+        );
+
+        let mut conflicting = mem.semantic_vmas.clone().into_vec();
+        conflicting[0].provenance = VmaBackingProvenance::SharedFile;
+        let conflicting = NonAnonymousVmas::try_from((b, VmaMap::from_vec(conflicting))).unwrap();
+        assert!(matches!(
+            ReservationProcMaps::capture(&mut peer, &conflicting),
+            Err(Refusal::ForeignMapping)
+        ));
+    }
+
+    #[test]
     fn reservation_legacy_host_authority_refuses_both_mm_admissions() {
         let table = shared();
         let mem = snapshot();
@@ -389,3 +599,12 @@ mod tests {
         assert!(model.mapping(mem.layout.mmap_base).is_some());
     }
 }
+
+#[path = "el1_reservations/projection.rs"]
+mod projection;
+pub use projection::{NonAnonymousVmas, ReservationProcMaps};
+
+#[path = "el1_reservations/provider.rs"]
+mod provider;
+pub(in crate::dispatch) use provider::ReservationProviderSlot;
+pub use provider::{HostReservationProvider, PreparedHostReservations, PreparedReservationSession};

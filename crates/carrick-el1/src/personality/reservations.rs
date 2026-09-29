@@ -399,6 +399,34 @@ impl Reservations<'_> {
         }
         None
     }
+    /// Observe one committed generation in address order, with one node read
+    /// per mapping. The root guard excludes publication for the whole walk;
+    /// a pending proposal is not part of this committed observation.
+    pub fn observe_mappings(&mut self, visit: &mut dyn FnMut(Mapping)) -> Result<(), Refusal> {
+        if !self.is_admitted() {
+            return Err(Refusal::Stale);
+        }
+        self.observe_tree(self.state().tree, visit);
+        Ok(())
+    }
+
+    fn observe_tree(&mut self, id: u32, visit: &mut dyn FnMut(Mapping)) {
+        if id == 0 {
+            return;
+        }
+        let node = self.read(id);
+        self.observe_tree(node.left, visit);
+        // Nodes are only constructed from validated ABI ranges/protections.
+        visit(Mapping {
+            range: ReservationRange::new(node.start, node.end).expect("reservation range"),
+            protection: ReservationProtection::from_bits(node.prot)
+                .expect("reservation protection"),
+            anonymous: node.anonymous != 0,
+            generation: self.generation(),
+        });
+        self.observe_tree(node.right, visit);
+    }
+
     pub fn fault_plan(
         &mut self,
         address: u64,
@@ -1068,6 +1096,58 @@ mod tests {
         .unwrap();
         guard.complete(receipt).unwrap()
     }
+    #[test]
+    fn reservation_observer_walk_is_linear_and_generation_exact_for_two_mms() {
+        let table = table();
+        for index in 0..2 {
+            let mm = ReservationMm::new(index as u64 + 91).unwrap();
+            table.publish(index, mm, layout()).unwrap();
+            let mut model = table.lock(index, mm).unwrap();
+            for page in 0..128 {
+                let start = 0x100000 + page * 8192;
+                model
+                    .import(
+                        ReservationRange::new(start, start + 4096).unwrap(),
+                        if index == 0 {
+                            ReservationProtection::READ_WRITE
+                        } else {
+                            ReservationProtection::NONE
+                        },
+                        true,
+                    )
+                    .unwrap();
+            }
+            let mut visits = 0;
+            assert_eq!(
+                model.observe_mappings(&mut |_| visits += 1),
+                Err(Refusal::Stale)
+            );
+            assert_eq!(visits, 0);
+            model.finish_import().unwrap();
+            let generation = model.generation();
+            let before = model.work;
+            let mut previous_end = 0;
+            model
+                .observe_mappings(&mut |mapping| {
+                    assert!(mapping.range.start() >= previous_end);
+                    previous_end = mapping.range.end();
+                    assert_eq!(mapping.generation, generation);
+                    assert_eq!(
+                        mapping.protection,
+                        if index == 0 {
+                            ReservationProtection::READ_WRITE
+                        } else {
+                            ReservationProtection::NONE
+                        }
+                    );
+                    visits += 1;
+                })
+                .unwrap();
+            assert_eq!(visits, 128);
+            assert_eq!(model.work - before, 128, "one node read per output mapping");
+        }
+    }
+
     #[test]
     fn reservation_metadata_required_does_not_become_linux_enomem() {
         let table = table();
