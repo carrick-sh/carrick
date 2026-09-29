@@ -268,6 +268,11 @@ fn a_wait_with_nothing_runnable_idles_until_host_work() {
     );
     assert_eq!(zone.counters.el1_idle_entries.load(Ordering::Relaxed), 1);
     assert_eq!(zone.counters.el1_idle_exits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counters.exit_reasons[carrick_el1_abi::El1ExitReason::IdleHostWork as usize]
+            .load(Ordering::Relaxed),
+        1
+    );
     let home = zone
         .slot(SLOT)
         .host_record()
@@ -706,12 +711,31 @@ fn host_runnable(zone: &ZoneTables, slot: SlotId, tid: u64) -> RecordId {
     record
 }
 
+/// A host-owned service record has an executor on its placement slot. An
+/// unrelated idle vCPU cannot serve it and must leave that queue alone.
+#[test]
+fn an_idle_vcpu_does_not_steal_host_service_work() {
+    const OTHER: SlotId = SlotId::new(4);
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let service = host_runnable(&zone, SLOT, 303);
+    host_publish(&zone, OTHER, MM, Some(1), 0);
+    zone.enter_guest(OTHER);
+
+    assert!(zone.steal(OTHER).is_none());
+    assert_eq!(zone.runnable_head(SLOT), Some(service));
+    assert_eq!(zone.runnable_head(OTHER), None);
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 0);
+}
+
 /// A wait with a host-runnable thread at the head of the run queue parks
 /// the waiter and leaves for the host with no thread on the vCPU: EL1 never
 /// runs that thread at EL0.
 #[test]
 fn a_park_before_a_host_runnable_thread_leaves_for_the_host() {
     let zone = zone();
+    let counters = counters();
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
@@ -720,7 +744,7 @@ fn a_park_before_a_host_runnable_thread_leaves_for_the_host() {
     let service = host_runnable(&zone, SLOT, 303);
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
     assert_eq!(
-        serve(&mut frame, &task, &zone, &mut cpu),
+        serve_on(SLOT, &mut frame, &task, &zone, &mut cpu, counters),
         Some(Served::Idle)
     );
     assert_eq!(zone.slot(SLOT).current(), None);
@@ -729,6 +753,11 @@ fn a_park_before_a_host_runnable_thread_leaves_for_the_host() {
     assert!(zone.head_needs_host(SLOT));
     assert_eq!(zone.runnable_head(SLOT), Some(service));
     assert_eq!(zone.counters.el1_service_exits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counters.exit_reasons[carrick_el1_abi::El1ExitReason::Service as usize]
+            .load(Ordering::Relaxed),
+        1
+    );
     assert_eq!(cpu.wfis, 0, "it did not idle");
 }
 

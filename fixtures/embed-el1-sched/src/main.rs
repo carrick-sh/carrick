@@ -75,6 +75,9 @@
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+mod sample_buffer;
+use sample_buffer::measured_samples;
+
 const SYS_FUTEX: u64 = 98;
 const SYS_EXIT_GROUP: u64 = 94;
 const SYS_GETTID: u64 = 178;
@@ -210,7 +213,7 @@ fn pingpong(iters: usize) -> i32 {
             let _ = futex_wake(&TURN, 1);
         }
     });
-    let mut samples = Vec::with_capacity(iters);
+    let mut samples = measured_samples(iters, 55_000);
     for i in 0..WARMUP + iters {
         let t0 = cntvct();
         TURN.store(1, Ordering::Release);
@@ -522,7 +525,7 @@ fn timed_wait(iters: usize) -> i32 {
     let timeout = Duration::from_millis(1);
     let freq = cntfrq();
     let timeout_ticks = (freq as u128 * timeout.as_nanos() / 1_000_000_000) as u64;
-    let mut lateness = Vec::with_capacity(iters);
+    let mut lateness = measured_samples(iters, 1_200);
     let mut wrong = 0usize;
     let mut early = 0usize;
     for _ in 0..iters {
