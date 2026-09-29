@@ -165,3 +165,16 @@ expanded timeout is introduced. Both retained reds are ordinary tests now;
 additional controls cover enrolled wait/timer rollback, requests after park
 publication, and requested preemption/unswitch. Full task A acceptance remains
 open, including post-publication retirement/restore and signed proof.
+
+
+## Deferred scheduler wake correction in validation
+
+A captured zone thread key can outlive registry retirement: the unchanged
+post-capture publication body issued untyped wake even when exact thread
+lookup failed. The deterministic red records Reaped in the existing auditor.
+Both zone publication and direct adoption now prepare an exact target under
+the thread execution lock and use wake_exact, retaining a matching registered
+continuation ID across control quanta. No auditor rule changes. Positive
+controls cover current continuation delivery, mismatched incarnation refusal,
+and pre-registration owner kick. See exact-zone-wake receipts; this does not
+close service lifetime, historical attribution or signed acceptance.

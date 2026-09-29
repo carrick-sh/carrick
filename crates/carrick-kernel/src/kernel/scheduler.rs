@@ -3736,12 +3736,19 @@ impl Scheduler {
         let Some(key) = crate::el1_zone::thread_key_of(record) else {
             return;
         };
-        if let Some(thread) = self.kernel.exact_thread_for_scheduler(key) {
-            let _ = thread.publish_zone_ready(record);
-        }
-        // A rejected wake names a generation that has already retired (exit
-        // or exec won the record); `wake` audits it and nothing is owed.
-        let _ = self.wake(key);
+        self.publish_zone_thread_handback(record, key);
+    }
+
+    fn publish_zone_thread_handback(&self, record: carrick_el1_abi::RecordRef, key: ThreadKey) {
+        let Some(thread) = self.kernel.exact_thread_for_scheduler(key) else {
+            return;
+        };
+        let Some(target) = thread.prepare_zone_handback(record) else {
+            return;
+        };
+        // A delayed handback can outlive its task or continuation. The exact
+        // target drops that retired notification without weakening auditors.
+        let _ = self.wake_exact(target);
     }
 
     pub fn wake(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
@@ -4393,9 +4400,11 @@ impl Scheduler {
         let Some(thread) = self.kernel.exact_thread_for_scheduler(key) else {
             return Ok(None);
         };
+        let Some(target) = thread.prepare_zone_handback(record) else {
+            return Ok(None);
+        };
         self.queue.inner.zone_adopt.lock().insert(key);
-        let _ = thread.publish_zone_ready(record);
-        let _ = self.wake(key);
+        let _ = self.wake_exact(target);
         let held = self.queue.inner.zone_adopt.lock().remove(&key);
         if held {
             // The wake did not queue a row (it coalesced or was refused):
@@ -5795,6 +5804,137 @@ mod tests {
             .wake_exact(target)
             .expect("wake_exact should succeed");
         assert_eq!(disposition, WakeDisposition::Queued);
+    }
+
+    /// The zone publisher has captured the exact thread key, but the task
+    /// is reaped before it can publish readiness and issue its scheduler wake.
+    #[test]
+    fn a_deferred_zone_handback_does_not_audit_a_reaped_target() {
+        let (kernel, root) = bootstrap(12_465);
+        let child = process_child(&kernel, &root, 9_465, "zone-handback-reaped");
+        let captured_key = child.thread().key();
+        let child_task = child.task().key();
+        let zone = HeapZone::new();
+        let id = zone
+            .alloc_record(carrick_el1_abi::ThreadIdentity {
+                tid: captured_key.tid.raw() as u64,
+                serial: captured_key.serial.raw(),
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let captured_record = zone.record_ref(id);
+        let recorder = Arc::new(RecordingWakeAuditor::default());
+        kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![
+            Arc::clone(&recorder) as Arc<dyn crate::observe::KernelAuditor>,
+        ])));
+        drop(child);
+        kernel
+            .exit_task_key_eventually(child_task, LinuxWaitStatus::from_wait_encoding(0))
+            .unwrap();
+        kernel
+            .wait_child(
+                root.task().key().id,
+                Some(child_task.id),
+                crate::kernel::WaitMode::Consume,
+            )
+            .unwrap();
+        assert!(!kernel.task_exists(child_task.id));
+        // The real continuation may have retired/reused its record while
+        // this already-captured thread key was waiting for publication.
+        zone.free_record(id);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        scheduler.publish_zone_thread_handback(captured_record, captured_key);
+        assert!(
+            recorder.rejections.lock().is_empty(),
+            "late zone handback must not issue an untyped wake: {:?}",
+            *recorder.rejections.lock()
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+    }
+
+    #[test]
+    fn zone_handback_authenticates_the_registered_continuation() {
+        let (kernel, root) = bootstrap(12_466);
+        publish(&root, 31);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(Arc::clone(&scheduler));
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        let record = carrick_el1_abi::RecordRef {
+            id: carrick_el1_abi::RecordId::from_raw(1).unwrap(),
+            incarnation: 7,
+        };
+        let current = root
+            .task_binding()
+            .capture(root.thread().key().tid)
+            .unwrap();
+        let continuation = BlockedContinuation::from_zone_park(
+            ContinuationCapture::from_lease(
+                &current,
+                running.lease(),
+                SyscallRequest::new(98, SyscallArgs([0; 6])),
+                RestartClass::Never,
+            )
+            .unwrap(),
+            crate::kernel::continuation::ZoneWait::new(record, 1),
+            None,
+        );
+        let id = continuation.id();
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).unwrap();
+        scheduler
+            .settle_blocked_continuation(running, continuation, registration)
+            .unwrap();
+        let generation = root.thread().execution_state().generation().unwrap();
+        let other = carrick_el1_abi::RecordRef {
+            incarnation: 8,
+            ..record
+        };
+        assert!(root.thread().prepare_zone_handback(other).is_none());
+        assert_eq!(scheduler.queued_len(), 0);
+        let target = root.thread().prepare_zone_handback(record).unwrap();
+        assert_eq!(
+            target,
+            ExactWakeTarget::new(root.task().key(), root.thread().key(), generation)
+                .for_continuation(id)
+        );
+        assert_eq!(
+            scheduler.wake_exact(target).unwrap(),
+            WakeDisposition::Queued
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+    }
+
+    #[test]
+    fn zone_handback_before_registration_kicks_the_running_owner_once() {
+        let (kernel, root) = bootstrap(12_467);
+        publish(&root, 32);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let executor = scheduler.register_executor(kick.clone()).unwrap();
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        let record = carrick_el1_abi::RecordRef {
+            id: carrick_el1_abi::RecordId::from_raw(1).unwrap(),
+            incarnation: 9,
+        };
+        scheduler.publish_zone_thread_handback(record, root.thread().key());
+        assert_eq!(kick.tokens.lock().len(), 1);
+        assert_eq!(scheduler.queued_len(), 0);
+        assert!(matches!(
+            root.thread().execution_state(),
+            ThreadExecutionState::Running {
+                wake_pending: true,
+                ..
+            }
+        ));
+        scheduler.settle_exited(running).unwrap();
     }
 
     #[derive(Debug, Default)]
