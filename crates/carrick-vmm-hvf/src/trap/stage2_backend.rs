@@ -950,6 +950,7 @@ pub fn reset_el1_counters() {
     *LAST_EL1_COUNTERS.lock() = None;
     EL1_REGION_HOST_PTR.store(0, std::sync::atomic::Ordering::Release);
     carrick_el1_abi::record_el1_region_host_ptr(0);
+    carrick_el1_abi::record_ipc_window_host(None);
 }
 
 /// GIC interrupts with `intid` EL1 has taken in the live carrier so far.
@@ -1307,18 +1308,7 @@ fn stage2_map_refuses_the_gic_window() {
     assert_eq!(rc, 0, "the page below the window is ordinary");
 }
 
-/// The host IPC authority's memory, shaped like the kernel authority's
-/// accessors (`directory_ptr/len`, `pool_ptr/len`). The carrier maps it into
-/// the kernel-only IPC window: the directory at
-/// [`carrick_el1_abi::EL1_IPC_BASE`], the pool at
-/// [`carrick_el1_abi::EL1_IPC_POOL_BASE`]. The mapping retains the owner
-/// (its `Arc`) for as long as the memory is mapped.
-pub trait IpcWindowBacking: Send + Sync {
-    fn directory_ptr(&self) -> *mut u8;
-    fn directory_len(&self) -> usize;
-    fn pool_ptr(&self) -> *mut u8;
-    fn pool_len(&self) -> usize;
-}
+pub use carrick_el1_abi::IpcWindowBacking;
 
 /// Stage-2 granule of the host (16 KiB on Apple silicon).
 const IPC_WINDOW_GRANULE: usize = 0x4000;
@@ -1378,7 +1368,7 @@ pub(crate) fn registered_ipc_window_backing() -> Option<std::sync::Arc<dyn IpcWi
 /// The IPC window mapped into one carrier VM: its stage-2 records and the
 /// owner of the memory, retained until the VM that maps it is destroyed.
 pub(crate) struct IpcWindowInstallation {
-    /// Retained, never read: the memory's owner outlives the mapping.
+    /// The memory's owner, retained while the VM maps it.
     _backing: std::sync::Arc<dyn IpcWindowBacking>,
     pub(crate) records: [CarrierStage2RecordIdentity; 2],
 }
@@ -1481,7 +1471,17 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
             }
         },
     )?;
+    // SAFETY: validated geometry; the installation retains the memory.
+    let window = unsafe {
+        carrick_el1_abi::IpcWindow::new(
+            installed._backing.directory_ptr() as usize,
+            installed._backing.directory_len(),
+            installed._backing.pool_ptr() as usize,
+            installed._backing.pool_len(),
+        )
+    };
     *INSTALLED_IPC_WINDOW.lock() = Some(installed);
+    carrick_el1_abi::record_ipc_window_host(window);
     // Only now may EL1 touch the window (its header decides the rest).
     if let Some(map) = carrick_el1_abi::ipc_table_map_host() {
         map.publish_window();

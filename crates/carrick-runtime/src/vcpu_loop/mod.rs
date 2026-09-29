@@ -886,6 +886,9 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// in-guest zone serves its private futexes; refreshed from the loaded
     /// task binding at every poll ([`zone`]).
     pub(super) zone_mm: Option<u64>,
+    /// An IPC operation this boundary's handback left waiting: the syscall
+    /// service parks the thread on its object queue ([`zone`]).
+    pub(super) pending_ipc_park: Option<zone::IpcPark>,
     #[cfg(test)]
     pub(in crate::vcpu_loop) exec_terminal_context_failpoint:
         Option<exec::ExecTerminalContextFailpoint>,
@@ -972,6 +975,7 @@ where
             fatal_image_generation,
             service_kernel_context: None,
             zone_mm: None,
+            pending_ipc_park: None,
             #[cfg(test)]
             exec_terminal_context_failpoint: None,
             #[cfg(test)]
@@ -1451,9 +1455,31 @@ where
             );
         }
         self.service_kernel_context = Some(kernel_context.retain_exact());
-        let request = SyscallRequest::from_raw(frame)
+        let mut request = SyscallRequest::from_raw(frame)
             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
             .with_guest_sp_fallback(|| engine.get_reg(carrick_hal::Reg::Sp).ok());
+        // An EL1 IPC handback: the original call (restored into `request`)
+        // completes, restarts on the host path, or parks with its owned
+        // operation; it is never replayed from its numeric fd.
+        let mut ipc_prepared = None;
+        if request.number.raw() == carrick_el1_abi::ipc::IPC_HANDBACK_NR {
+            match zone::ipc_handback_route(
+                kernel,
+                &kernel_context,
+                self.this_tid,
+                engine,
+                self.zone_mm,
+                &mut request,
+            )? {
+                zone::IpcHandbackRoute::Complete(outcome) => ipc_prepared = Some(outcome),
+                zone::IpcHandbackRoute::Restart => {}
+                zone::IpcHandbackRoute::Park(park) => {
+                    self.pending_ipc_park = Some(park);
+                    // Placeholder: the service parks instead of completing.
+                    ipc_prepared = Some(DispatchOutcome::Returned { value: 0 });
+                }
+            }
+        }
 
         let served_with_work = if let Some(slot) = engine.mailbox_slot() {
             let served = carrick_kernel::el1_delegation::take_served_with_work(slot);
@@ -1466,10 +1492,18 @@ where
             // An in-guest enqueue may have forced this boundary to wake a
             // host waiter it could not signal from EL1.
             carrick_kernel::el1_inotify::deliver_owed_wakes();
+            // An EL1 pipe/eventfd change may owe host subscribers a wake.
+            carrick_kernel::kernel::continuation::ipc::deliver_owed_host_wakes();
             CENSUS_EL1_BOUNDARY.with(|flag| flag.set(true));
         }
 
-        let (syscall, prepared_outcome) = if served_with_work {
+        let (syscall, prepared_outcome) = if let Some(outcome) = ipc_prepared {
+            let syscall = PreparedSyscall {
+                original_args: request.args,
+                request,
+            };
+            (syscall, Some(outcome))
+        } else if served_with_work {
             let mut original_args = request.args;
             if let Some(slot) = engine.mailbox_slot() {
                 original_args.0[0] = carrick_kernel::el1_delegation::get_orig_arg0(slot);

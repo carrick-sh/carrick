@@ -19,11 +19,13 @@
 use carrick_abi::{LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EPIPE, LinuxErrno};
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{PrefixCopy, StepStatus, transfer};
+pub use carrick_el1::substrate::ipc::{from_sched_token, to_sched_token, wait_key};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
     IpcError, IpcHandback, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
     IpcRegion, IpcReleased, OfdPin, RawIpcOpToken,
 };
+pub use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
 
 /// The host waits for the short sections other parties hold object and
 /// descriptor-table locks for (the zone's host lock policy).
@@ -34,6 +36,103 @@ pub use crate::el1_zone::HostLockWait as HostIpcWait;
 /// placement boundary). Called with no IPC lock held.
 pub trait IpcHostWake {
     fn wake(&self, object: IpcObjectHandle, lanes: WakeSet);
+}
+
+/// The production host wake: the scheduler's host placement for object
+/// queues (`notify_object_host`), never impersonating a running guest slot.
+/// Placed waiters run in the guest (their slot rescheduled when owed);
+/// waiters no slot admits are handed to their host continuations.
+pub struct ZoneHostWake;
+
+impl IpcHostWake for ZoneHostWake {
+    fn wake(&self, object: IpcObjectHandle, lanes: WakeSet) {
+        let Some(zone) = crate::el1_zone::zone() else {
+            return;
+        };
+        for (lane, due) in [
+            (WaitFor::Readable, lanes.readers),
+            (WaitFor::Writable, lanes.writers),
+        ] {
+            let Some(key) = due.then(|| wait_key(object, lane)).flatten() else {
+                continue;
+            };
+            let mut handed = Vec::new();
+            let mut placed = Vec::new();
+            {
+                // A queue never bound to this incarnation has no waiters.
+                let Ok(guard) = zone.object_wait(key, &HostIpcWait) else {
+                    continue;
+                };
+                let _ = guard.notify_object_host(
+                    &mut |record| handed.push(zone.record_ref(record)),
+                    &mut |placement| placed.push(placement),
+                );
+            }
+            for placement in placed {
+                if placement.resched {
+                    crate::el1_zone::resched_slot(placement.slot);
+                }
+            }
+            crate::el1_zone::hand_back(&handed);
+        }
+    }
+}
+
+/// The host IPC authority's memory for the carrier to map into the IPC
+/// window, or `None` while the kernel has no authority (every IPC path then
+/// stays closed: nothing is mapped, EL1 never attaches, no table is
+/// published).
+///
+/// Bridge to the host authority's owner (checkpoint-3 T4, `Kernel::ipc()`
+/// / `HostIpc`): it returns that authority adapted to
+/// [`carrick_el1_abi::IpcWindowBacking`]. The runtime registers the result
+/// with the carrier before its first persistent root.
+pub fn host_window_backing(
+    _dispatcher: &crate::dispatch::SyscallDispatcher,
+) -> Option<std::sync::Arc<dyn carrick_el1_abi::IpcWindowBacking>> {
+    None
+}
+
+/// Owed host readiness wakes (an EL1 change while host subscribers were
+/// registered) are delivered at the next host boundary by the host
+/// subscription registry that knows the subscribed objects (T4); it
+/// registers its delivery here.
+static OWED_WAKE_DELIVERY: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the host subscription registry's owed-wake delivery (once).
+pub fn register_owed_host_wake_delivery(deliver: fn()) {
+    let _ = OWED_WAKE_DELIVERY.set(deliver);
+}
+
+/// Deliver owed IPC host wakes at a host boundary EL1 forced for them.
+pub fn deliver_owed_host_wakes() {
+    if let Some(deliver) = OWED_WAKE_DELIVERY.get() {
+        deliver();
+    }
+}
+
+/// The host's view of the shared IPC authority, once the carrier mapped
+/// its window and the authority published its directory; `None` otherwise
+/// (every IPC path then stays closed).
+pub fn host_region() -> Option<IpcRegion<'static>> {
+    carrick_el1_abi::ipc_window_host()?.attach().ok()
+}
+
+/// The wait-queue snapshots of both lanes of `object`, taken BEFORE its
+/// readiness is checked under the object lock (binding each queue to this
+/// incarnation on first use), so a park after a failed check can never miss
+/// a notification in between.
+pub fn lane_snapshots(
+    zone: &carrick_el1_abi::ZoneTables,
+    object: IpcObjectHandle,
+) -> [Option<ObjectWaitSnapshot>; 2] {
+    [WaitFor::Readable, WaitFor::Writable].map(|lane| {
+        let key = wait_key(object, lane)?;
+        let _ = zone.bind_object_wait(key, &HostIpcWait);
+        zone.object_wait(key, &HostIpcWait)
+            .ok()
+            .map(|guard| guard.snapshot())
+    })
 }
 
 /// Why a parked or handed-back operation stops before completing.

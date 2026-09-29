@@ -4409,6 +4409,9 @@ where
                 .signal_pump
                 .start_signal_pump(&self.state.kicker, &self.state.platform_futex);
         }
+        if let Some(park) = self.state.pending_ipc_park.take() {
+            return self.ipc_park(engine, control, frame, park);
+        }
         self.service_outcome(engine, control, frame, outcome)
     }
 

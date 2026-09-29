@@ -2471,6 +2471,49 @@ impl IpcWindow {
     }
 }
 
+/// The host IPC authority's memory, in the shape of the kernel authority's
+/// accessors: what the carrier maps into the IPC window (the directory at
+/// [`EL1_IPC_BASE`], the pool at [`EL1_IPC_POOL_BASE`]).
+pub trait IpcWindowBacking: Send + Sync {
+    fn directory_ptr(&self) -> *mut u8;
+    fn directory_len(&self) -> usize;
+    fn pool_ptr(&self) -> *mut u8;
+    fn pool_len(&self) -> usize;
+}
+
+static IPC_WINDOW_HOST: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+static IPC_WINDOW_HOST_LIVE: AtomicU32 = AtomicU32::new(0);
+
+/// Record the host's view of the window the carrier mapped (`None`: the
+/// carrier retired it). Recorded by the mapping owner only.
+pub fn record_ipc_window_host(window: Option<IpcWindow>) {
+    IPC_WINDOW_HOST_LIVE.store(0, Ordering::Release);
+    if let Some(w) = window {
+        IPC_WINDOW_HOST[0].store(w.directory, Ordering::Relaxed);
+        IPC_WINDOW_HOST[1].store(w.directory_len, Ordering::Relaxed);
+        IPC_WINDOW_HOST[2].store(w.pool, Ordering::Relaxed);
+        IPC_WINDOW_HOST[3].store(w.pool_len, Ordering::Relaxed);
+        IPC_WINDOW_HOST_LIVE.store(1, Ordering::Release);
+    }
+}
+
+/// The host's view of the mapped IPC window, if the carrier mapped one.
+pub fn ipc_window_host() -> Option<IpcWindow> {
+    if IPC_WINDOW_HOST_LIVE.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    // SAFETY: recorded by the mapping owner, which retains the memory while
+    // the record is live.
+    unsafe {
+        IpcWindow::new(
+            IPC_WINDOW_HOST[0].load(Ordering::Relaxed),
+            IPC_WINDOW_HOST[1].load(Ordering::Relaxed),
+            IPC_WINDOW_HOST[2].load(Ordering::Relaxed),
+            IPC_WINDOW_HOST[3].load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// EL1's view of the IPC window (identity mapped kernel-only).
 #[cfg(target_os = "none")]
 pub fn ipc_window_guest() -> Option<IpcWindow> {
