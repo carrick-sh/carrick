@@ -26,6 +26,11 @@ const PREFIX: &str = "HVPCARRIERATTR";
 pub(crate) const PROGRAM_SHA256_PLACEHOLDER: &str =
     "/* CARRICK_HVPCARRIERCPUATTR_PROGRAM_SHA256 */";
 
+/// The capture-bound placeholder slot, substituted by
+/// `render_profile_capture_bound` when `--profile-bound-seconds` overrides
+/// the shipped 90 s default for long workloads (e.g. `go build`).
+pub(crate) const BOUND_PLACEHOLDER: &str = "/* CARRICK_HVPCARRIERCPUATTR_BOUND */";
+
 /// Render the bundled template's immutable digest into the raw-stream header.
 pub(crate) const MAX_INSTRUMENTATION_SHARE: f64 = 0.05;
 
@@ -75,6 +80,11 @@ impl FaultClass {
 pub(crate) enum CpuCategory {
     GuestExecution,
     HostSyscall(String),
+    /// Completion of a threaded syscall's return path
+    /// (`HvfAarch64Vcpu::complete_syscall_return` and its callees): distinct
+    /// from `HostSyscall` dispatch/service because it is carrier-side return
+    /// bookkeeping, not the host call itself.
+    SyscallReturn,
     FaultService(FaultClass),
     El1Mailbox,
     ExecutorScheduling,
@@ -545,9 +555,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::HostSyscall("socket".to_owned()));
     }
     if frame.contains("complete_syscall_return") || frame.contains("complete_returned") {
-        return Some(CpuCategory::HostSyscall(
-            "syscall-return-completion".to_owned(),
-        ));
+        return Some(CpuCategory::SyscallReturn);
     }
     if frame.contains("service_outcome")
         || frame.contains("service_threaded_syscall")
@@ -602,6 +610,7 @@ pub(crate) struct HvpatchCarrierCpuAttributionSummary {
     pub(crate) image_text_base: String,
     pub(crate) guest_execution_samples: u64,
     pub(crate) host_syscall_samples: u64,
+    pub(crate) syscall_return_samples: u64,
     pub(crate) fault_service_samples: u64,
     pub(crate) el1_mailbox_samples: u64,
     pub(crate) executor_scheduling_samples: u64,
@@ -638,6 +647,7 @@ impl HvpatchCarrierCpuAttributionSummary {
 
         let mut guest_execution_samples = 0_u64;
         let mut host_syscall_samples = 0_u64;
+        let mut syscall_return_samples = 0_u64;
         let mut fault_service_samples = 0_u64;
         let mut el1_mailbox_samples = 0_u64;
         let mut executor_scheduling_samples = 0_u64;
@@ -799,6 +809,11 @@ impl HvpatchCarrierCpuAttributionSummary {
                         .ok_or_else(|| anyhow!("host syscall overflow"))?;
                     *syscall_classes.entry(class).or_insert(0_u64) += count;
                 }
+                CpuCategory::SyscallReturn => {
+                    syscall_return_samples = syscall_return_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("syscall return overflow"))?;
+                }
                 CpuCategory::FaultService(class) => {
                     fault_service_samples = fault_service_samples
                         .checked_add(count)
@@ -858,6 +873,7 @@ impl HvpatchCarrierCpuAttributionSummary {
             image_text_base,
             guest_execution_samples,
             host_syscall_samples,
+            syscall_return_samples,
             fault_service_samples,
             el1_mailbox_samples,
             executor_scheduling_samples,
@@ -877,6 +893,10 @@ impl HvpatchCarrierCpuAttributionSummary {
 
     pub(crate) fn host_syscall_share(&self) -> f64 {
         share(self.host_syscall_samples, self.sample_population)
+    }
+
+    pub(crate) fn syscall_return_share(&self) -> f64 {
+        share(self.syscall_return_samples, self.sample_population)
     }
 
     pub(crate) fn fault_service_share(&self) -> f64 {
@@ -927,6 +947,11 @@ impl HvpatchCarrierCpuAttributionSummary {
                 share(*count, self.sample_population) * 100.0
             ));
         }
+        out.push_str(&format!(
+            "  syscall_return:      {:>8} ({:>5.1}%)\n",
+            self.syscall_return_samples,
+            self.syscall_return_share() * 100.0
+        ));
         out.push_str(&format!(
             "  fault_service:       {:>8} ({:>5.1}%)\n",
             self.fault_service_samples,
@@ -1139,6 +1164,11 @@ mod tests {
             "              carrick`carrick_kernel::dispatch::SyscallDispatcher::dispatch+0x100",
             "              10",
             "",
+            // Syscall return completion: 3 samples
+            "              carrick`carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu::complete_syscall_return+0x10",
+            "              carrick`carrick_runtime::vcpu_loop::ThreadRuntimeState::complete_returned+0x20",
+            "              3",
+            "",
             // Fault: first touch: 6 samples
             "              carrick`carrick_kernel::dispatch::mem::fault::commit_resident_fault+0x50",
             "              carrick`carrick_runtime::vcpu_loop::signal::resolve_mutating_fault+0x80",
@@ -1179,9 +1209,9 @@ mod tests {
             "              carrick`carrick_observability::probes::real::hvpatch_executor_claim+0x10",
             "              2",
             "",
-            // Other: 5 samples
+            // Other: 2 samples
             "              carrick`some_other_helper+0x10",
-            "              5",
+            "              2",
             "",
         ]
         .join("\n")
@@ -1196,15 +1226,16 @@ mod tests {
 
         assert_eq!(summary.sample_population, 100);
         assert_eq!(summary.stack_population, 100);
-        assert_eq!(summary.stack_count, 12);
+        assert_eq!(summary.stack_count, 13);
         assert_eq!(summary.guest_execution_samples, 38);
         assert_eq!(summary.host_syscall_samples, 20);
+        assert_eq!(summary.syscall_return_samples, 3);
         assert_eq!(summary.fault_service_samples, 15);
         assert_eq!(summary.el1_mailbox_samples, 5);
         assert_eq!(summary.executor_scheduling_samples, 8);
         assert_eq!(summary.lock_wait_samples, 7);
         assert_eq!(summary.instrumentation_samples, 2);
-        assert_eq!(summary.other_samples, 5);
+        assert_eq!(summary.other_samples, 2);
 
         assert_eq!(summary.syscall_classes.get("openat"), Some(&10));
         assert_eq!(summary.syscall_classes.get("mmap"), Some(&10));
@@ -1220,12 +1251,13 @@ mod tests {
         // Shares
         assert!((summary.guest_execution_share() - 0.38).abs() < 1e-6);
         assert!((summary.host_syscall_share() - 0.20).abs() < 1e-6);
+        assert!((summary.syscall_return_share() - 0.03).abs() < 1e-6);
         assert!((summary.fault_service_share() - 0.15).abs() < 1e-6);
         assert!((summary.el1_mailbox_share() - 0.05).abs() < 1e-6);
         assert!((summary.executor_scheduling_share() - 0.08).abs() < 1e-6);
         assert!((summary.lock_wait_share() - 0.07).abs() < 1e-6);
         assert!((summary.instrumentation_share() - 0.02).abs() < 1e-6);
-        assert!((summary.other_share() - 0.05).abs() < 1e-6);
+        assert!((summary.other_share() - 0.02).abs() < 1e-6);
 
         // Human output check
         let human = summary.render_human();
@@ -1236,6 +1268,8 @@ mod tests {
         assert!(human.contains("20 ( 20.0%)"));
         assert!(human.contains("openat"));
         assert!(human.contains("10 ( 10.0%)"));
+        assert!(human.contains("syscall_return:"));
+        assert!(human.contains("3 (  3.0%)"));
         assert!(human.contains("first-touch"));
         assert!(human.contains("6 (  6.0%)"));
         assert!(human.contains("instrumentation:"));
@@ -1329,7 +1363,7 @@ mod tests {
         ];
         assert_eq!(
             classify_stack(&return_comp_stack),
-            CpuCategory::HostSyscall("syscall-return-completion".to_owned())
+            CpuCategory::SyscallReturn
         );
 
         // 3. Syscall dispatch frame (outermost dispatcher when no deeper handler is active)
