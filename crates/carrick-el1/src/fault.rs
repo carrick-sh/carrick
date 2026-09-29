@@ -4,6 +4,9 @@ use carrick_el1_abi::{
     Action, Counters, CurrentTask, EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox,
     FrameGrantMailboxes, FrameGrantRequest, TrapFrame,
 };
+use carrick_mmu_core::aarch64::descriptor_txn::{
+    DescriptorOutcome, DescriptorReceipt, DescriptorTxnSlot,
+};
 use carrick_mmu_core::aarch64::{GuestPreparedCommit, GuestPreparedCommitError, LeafAccess};
 use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
@@ -114,7 +117,6 @@ impl PreparedPageResolver for HardwarePreparedResolver {
         expected_ipa: u64,
         access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
-        const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let outcome = unsafe {
             carrick_mmu_core::aarch64::commit_existing_el1_prepared_page(
                 carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
@@ -138,7 +140,6 @@ pub struct HardwareCowResolver;
 #[cfg(target_os = "none")]
 impl CowResolver for HardwareCowResolver {
     fn resolve_cow(&mut self, ttbr0: u64, far: u64) -> bool {
-        const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let physical_base = ttbr0 & TTBR_BADDR_MASK;
         let words =
             carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64;
@@ -161,6 +162,168 @@ impl CowResolver for HardwareCowResolver {
             Err(_) => false,
         }
     }
+}
+
+/// EL1 execution of host-submitted live descriptor transactions.
+pub trait DescriptorTxnApplier {
+    /// Claim and execute the submission in `slot` for `mm_key` against the
+    /// live graph rooted at `ttbr0`'s table base, invalidating `ttbr0`'s ASID
+    /// when the outcome stored anything. The caller holds the exact editor.
+    fn apply(
+        &mut self,
+        slot: &DescriptorTxnSlot,
+        mm_key: u64,
+        ttbr0: u64,
+    ) -> Option<DescriptorReceipt>;
+}
+
+/// The descriptor-transaction slots EL1 serves, plus the executor.
+pub struct DescriptorTxnPath<'a, X: DescriptorTxnApplier> {
+    pub slots: &'a [DescriptorTxnSlot],
+    pub applier: &'a mut X,
+}
+
+#[cfg(target_os = "none")]
+const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+#[cfg(target_os = "none")]
+struct El1TableMaintenance {
+    ttbr0: u64,
+}
+
+#[cfg(target_os = "none")]
+impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for El1TableMaintenance {
+    fn publish_barrier(&self) {
+        // The reviewed ASID maintenance sequence begins with `dsb ishst`,
+        // which completes the unlinked table fills for every walker in the
+        // Inner Shareable domain before the following link store. Links are
+        // rare (hierarchy growth and splits), so the trailing TLBI is cheap.
+        let mut cpu = crate::sched::HardwareCpu;
+        crate::sched::ThreadCpu::invalidate_asid(&mut cpu, self.ttbr0);
+    }
+
+    fn invalidate_range(&self, _va: u64, _len: u64) {
+        // Break-before-make needs the broken translation gone from every PE
+        // before the replacement appears. The MM's whole ASID is a superset.
+        let mut cpu = crate::sched::HardwareCpu;
+        crate::sched::ThreadCpu::invalidate_asid(&mut cpu, self.ttbr0);
+    }
+}
+
+#[cfg(target_os = "none")]
+pub struct HardwareDescriptorTxnApplier;
+
+#[cfg(target_os = "none")]
+impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
+    fn apply(
+        &mut self,
+        slot: &DescriptorTxnSlot,
+        mm_key: u64,
+        ttbr0: u64,
+    ) -> Option<DescriptorReceipt> {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            InlineJournal, PrimaryTableWords, apply_submitted_descriptor_txn,
+            outcome_requires_invalidation,
+        };
+        let maintenance = El1TableMaintenance { ttbr0 };
+        let words = unsafe {
+            PrimaryTableWords::new(
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut AtomicU64,
+                ttbr0 & TTBR_BADDR_MASK,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+                &maintenance,
+            )
+        }
+        .ok()?;
+        let mut journal = InlineJournal::new();
+        let receipt = apply_submitted_descriptor_txn(
+            slot,
+            mm_key,
+            &words,
+            carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
+            &mut journal,
+        )?;
+        if let DescriptorOutcome::Indeterminate(refusal) = receipt.outcome {
+            panic!("EL1 descriptor transaction rollback failed: {refusal:?}");
+        }
+        if outcome_requires_invalidation(&receipt.outcome) {
+            let mut cpu = crate::sched::HardwareCpu;
+            crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+        }
+        Some(receipt)
+    }
+}
+
+/// Execute every host submission for the faulting MM under its exact
+/// editor. A fault inside an applied submission's span retries (`Served`):
+/// its descriptor now exists or was refused and the retry takes the normal
+/// path. `None` leaves the fault to the ordinary dispatch.
+pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
+    frame: &TrapFrame,
+    current_tasks: &[CurrentTask],
+    spaces: &AddressSpaces,
+    path: &mut DescriptorTxnPath<'_, X>,
+) -> Option<Action> {
+    let mm_key = current_tasks
+        .get(frame.slot as usize)?
+        .zone_mm
+        .load(Ordering::Acquire);
+    if mm_key == 0 || !path.slots.iter().any(|slot| slot.submitted_for(mm_key)) {
+        return None;
+    }
+    let index = spaces.find(mm_key)?;
+    let grant = spaces.grant(index, mm_key)?;
+    let owner = NonZeroU64::new(frame.slot + 1)?;
+    // A closed gate (host pause or retirement) leaves the submission for the
+    // host boundary, which recognizes it as in flight.
+    let _editor = spaces.try_begin_edit(index, mm_key, owner)?;
+    let mut covered = false;
+    for slot in path.slots {
+        if !slot.submitted_for(mm_key) {
+            continue;
+        }
+        let covers = slot.pending_covering(mm_key, frame.far);
+        if let Some(receipt) = path.applier.apply(slot, mm_key, grant.ttbr0) {
+            covered |= covers && matches!(receipt.outcome, DescriptorOutcome::Applied(_));
+        }
+    }
+    covered.then_some(Action::Served)
+}
+
+/// [`dispatch_fault_with_prepared`] after serving host descriptor
+/// transactions for the faulting MM.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fault_with_descriptor_txns<P, C, X>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    spaces: &AddressSpaces,
+    mut txns: Option<DescriptorTxnPath<'_, X>>,
+    mailboxes: GrantMailboxes<'_>,
+    prepared: Option<PreparedFaultPath<'_, P>>,
+    cow_resolver: &mut C,
+) -> Action
+where
+    P: PreparedPageResolver,
+    C: CowResolver,
+    X: DescriptorTxnApplier,
+{
+    if let Some(action) = txns
+        .as_mut()
+        .and_then(|path| serve_descriptor_txns(frame, current_tasks, spaces, path))
+    {
+        counters.fault_taken.fetch_add(1, Ordering::Relaxed);
+        return action;
+    }
+    dispatch_fault_with_prepared(
+        frame,
+        counters,
+        current_tasks,
+        spaces,
+        mailboxes,
+        prepared,
+        cow_resolver,
+    )
 }
 
 /// Dispatch an EL0 data abort at EL1.
@@ -323,6 +486,9 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
                 return Action::Served;
             }
             Ok(GuestPreparedCommit::AlreadyResident) => return Action::Served,
+            Err(GuestPreparedCommitError::RollbackFailed) => {
+                panic!("EL1 prepared-page commit rollback failed")
+            }
             Err(_) => {}
         }
     }
@@ -858,5 +1024,240 @@ mod tests {
         assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
         assert_eq!(counters.forwarded[42].load(Ordering::Relaxed), 0);
         assert_eq!(counters.served[42].load(Ordering::Relaxed), 0);
+    }
+
+    mod descriptor_txns {
+        use super::*;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            BackingIdentity, DescriptorOp, DescriptorRefusal, DescriptorTxn, DescriptorTxnId,
+            InlineJournal, PageSpan, PrimaryTableWords, TableGrants, TableMaintenance,
+            apply_submitted_descriptor_txn, outcome_requires_invalidation,
+        };
+        use carrick_mmu_core::aarch64::{
+            El1PrivateLeafState, GuestLeafPublication, SubstrateGpa, el1_private_leaf_state,
+            indices,
+        };
+        use core::cell::RefCell;
+
+        const ROOT: u64 = 0x8800_0000_0000;
+        const ASID: u64 = 5 << 48;
+        const VA: u64 = 0x4000_0000;
+        const IPA: u64 = 0x009b_4000_0000;
+
+        struct Arena {
+            words: Vec<AtomicU64>,
+        }
+
+        impl Arena {
+            /// L0 -> L1 -> L2 -> L3 for `VA` in pages 0..=3 of a 16-page arena.
+            fn new() -> Self {
+                let words: Vec<AtomicU64> = (0..16 * 512).map(|_| AtomicU64::new(0)).collect();
+                let idx = indices(VA);
+                words[idx[0]].store((ROOT + 0x1000) | 0b11, Ordering::Relaxed);
+                words[512 + idx[1]].store((ROOT + 0x2000) | 0b11, Ordering::Relaxed);
+                words[1024 + idx[2]].store((ROOT + 0x3000) | 0b11, Ordering::Relaxed);
+                Self { words }
+            }
+            fn leaf(&self, va: u64) -> u64 {
+                self.words[1536 + indices(va)[3]].load(Ordering::Acquire)
+            }
+            fn image(&self) -> Vec<u64> {
+                self.words
+                    .iter()
+                    .map(|w| w.load(Ordering::Relaxed))
+                    .collect()
+            }
+        }
+
+        struct NoBarrier;
+        impl TableMaintenance for NoBarrier {
+            fn publish_barrier(&self) {}
+            fn invalidate_range(&self, _va: u64, _len: u64) {}
+        }
+
+        /// The EL1 applier over host memory, recording ASID invalidations.
+        struct ArenaApplier<'a> {
+            arena: &'a Arena,
+            invalidated: RefCell<Vec<u64>>,
+        }
+
+        impl DescriptorTxnApplier for ArenaApplier<'_> {
+            fn apply(
+                &mut self,
+                slot: &DescriptorTxnSlot,
+                mm_key: u64,
+                ttbr0: u64,
+            ) -> Option<DescriptorReceipt> {
+                let words = unsafe {
+                    PrimaryTableWords::new(
+                        self.arena.words.as_ptr().cast_mut(),
+                        ROOT,
+                        self.arena.words.len() * 8,
+                        &NoBarrier,
+                    )
+                }
+                .unwrap();
+                let mut journal = InlineJournal::new();
+                let receipt = apply_submitted_descriptor_txn(
+                    slot,
+                    mm_key,
+                    &words,
+                    SubstrateGpa(ttbr0 & 0x0000_FFFF_FFFF_F000),
+                    &mut journal,
+                )?;
+                if outcome_requires_invalidation(&receipt.outcome) {
+                    self.invalidated.borrow_mut().push(ttbr0);
+                }
+                Some(receipt)
+            }
+        }
+
+        fn nz(value: u64) -> NonZeroU64 {
+            NonZeroU64::new(value).unwrap()
+        }
+
+        fn grant_txn(mm: u64, root: u64, fault: u64) -> DescriptorTxn {
+            DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(mm),
+                    generation: nz(1),
+                },
+                root: SubstrateGpa(root),
+                op: DescriptorOp::Prepare {
+                    publication: GuestLeafPublication {
+                        va: VA,
+                        ipa: IPA,
+                        len: 4 * 4096,
+                        writable: true,
+                        executable: false,
+                    },
+                    resident: PageSpan::new(fault, 4096),
+                    backing: BackingIdentity {
+                        frame_id: nz(1),
+                        mapping_id: nz(2),
+                        owner_generation: nz(3),
+                        inventory_revision: nz(4),
+                    },
+                },
+                tables: TableGrants::NONE,
+            }
+        }
+
+        fn dispatch(
+            mm: u64,
+            spaces: &AddressSpaces,
+            slots: &[DescriptorTxnSlot],
+            applier: &mut ArenaApplier<'_>,
+            fault: u64,
+            counters: &Counters,
+        ) -> Action {
+            let task = CurrentTask::new();
+            task.zone_mm.store(mm, Ordering::Release);
+            let mut frame = write_translation_fault(0, fault);
+            dispatch_fault_with_descriptor_txns(
+                &mut frame,
+                counters,
+                &[task],
+                spaces,
+                Some(DescriptorTxnPath { slots, applier }),
+                GrantMailboxes::own(&FrameGrantMailbox::new()),
+                None::<PreparedFaultPath<'_, NoopPreparedResolver>>,
+                &mut NoopCowResolver,
+            )
+        }
+
+        #[test]
+        fn submitted_grant_is_applied_by_its_mm_and_serves_the_faulting_retry() {
+            let mm = 77;
+            let arena = Arena::new();
+            let fault = VA + 2 * 4096;
+            let txn = grant_txn(mm, ROOT, fault);
+            let slots = [DescriptorTxnSlot::new(), DescriptorTxnSlot::new()];
+            assert!(slots[1].submit(&txn));
+            let spaces = published_space(mm, ROOT | ASID);
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            let counters = Counters::default();
+            assert_eq!(
+                dispatch(mm, &spaces, &slots, &mut applier, fault, &counters),
+                Action::Served
+            );
+            assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
+            assert_eq!(*applier.invalidated.borrow(), vec![ROOT | ASID]);
+            for page in 0..4 {
+                let expected = if VA + page * 4096 == fault {
+                    El1PrivateLeafState::Resident
+                } else {
+                    El1PrivateLeafState::Prepared
+                };
+                assert_eq!(
+                    el1_private_leaf_state(arena.leaf(VA + page * 4096)),
+                    expected
+                );
+            }
+            let receipt = slots[1].take_receipt(txn.id).expect("receipt for the host");
+            let verified = txn.verify_receipt(&receipt).expect("authentic");
+            assert_eq!(verified.resident(), PageSpan::new(fault, 4096));
+        }
+
+        #[test]
+        fn another_mm_or_a_closed_gate_never_applies_a_submission() {
+            let arena = Arena::new();
+            let before = arena.image();
+            let txn = grant_txn(77, ROOT, VA);
+            let slots = [DescriptorTxnSlot::new()];
+            assert!(slots[0].submit(&txn));
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            // A different MM's fault takes the ordinary path.
+            let other = published_space(78, ROOT | ASID);
+            assert_eq!(
+                dispatch(78, &other, &slots, &mut applier, VA, &Counters::default()),
+                Action::Forward
+            );
+            // The right MM behind a closed (paused/retiring) gate leaves the
+            // submission for the host boundary.
+            let closed = AddressSpaces::new();
+            closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
+            assert_eq!(
+                dispatch(77, &closed, &slots, &mut applier, VA, &Counters::default()),
+                Action::Forward
+            );
+            assert!(slots[0].submitted_for(77));
+            assert_eq!(arena.image(), before);
+            assert!(applier.invalidated.borrow().is_empty());
+        }
+
+        #[test]
+        fn a_stale_root_submission_is_refused_without_a_store() {
+            let mm = 77;
+            let arena = Arena::new();
+            let before = arena.image();
+            // Built against a root this MM no longer publishes.
+            let txn = grant_txn(mm, ROOT + 0x4000, VA);
+            let slots = [DescriptorTxnSlot::new()];
+            assert!(slots[0].submit(&txn));
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            let spaces = published_space(mm, ROOT | ASID);
+            assert_eq!(
+                dispatch(mm, &spaces, &slots, &mut applier, VA, &Counters::default()),
+                Action::Forward,
+                "a refused transaction does not serve the fault"
+            );
+            assert_eq!(arena.image(), before);
+            let receipt = slots[0].take_receipt(txn.id).unwrap();
+            assert_eq!(
+                receipt.outcome,
+                DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot)
+            );
+            assert!(applier.invalidated.borrow().is_empty());
+        }
     }
 }
