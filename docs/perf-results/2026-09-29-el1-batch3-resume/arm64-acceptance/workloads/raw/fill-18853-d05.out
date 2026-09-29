@@ -1,0 +1,388 @@
+== CPython 3.12.13 (main, Aug 5 2026, 03:49:12) [GCC 14.2.0]
+== Linux-7.0.14-linuxkit-aarch64-with-glibc2.41 little-endian
+== Python build: release shared LTO+PGO
+== cwd: /tmp/test_python_worker_1æ
+== CPU count: 10
+== encodings: locale=UTF-8 FS=utf-8
+== resources: all test resources are disabled, use -u option to unskip tests
+
+Using random seed: 0
+0:00:00 load avg: 0.10 Run 1 test sequentially in a single process
+0:00:00 load avg: 0.10 [1/1] test_subprocess
+test_noshell_sequence_with_spaces (test.test_subprocess.CommandsWithSpaces.test_noshell_sequence_with_spaces) ... skipped 'Windows-specific tests'
+test_noshell_string_with_spaces (test.test_subprocess.CommandsWithSpaces.test_noshell_string_with_spaces) ... skipped 'Windows-specific tests'
+test_shell_sequence_with_spaces (test.test_subprocess.CommandsWithSpaces.test_shell_sequence_with_spaces) ... skipped 'Windows-specific tests'
+test_shell_string_with_spaces (test.test_subprocess.CommandsWithSpaces.test_shell_string_with_spaces) ... skipped 'Windows-specific tests'
+test_broken_pipe_cleanup (test.test_subprocess.ContextManagerTests.test_broken_pipe_cleanup)
+Broken pipe error should not prevent wait() (Issue 21619) ... ok
+test_communicate_stdin (test.test_subprocess.ContextManagerTests.test_communicate_stdin) ... ok
+test_invalid_args (test.test_subprocess.ContextManagerTests.test_invalid_args) ... ok
+test_pipe (test.test_subprocess.ContextManagerTests.test_pipe) ... ok
+test_returncode (test.test_subprocess.ContextManagerTests.test_returncode) ... ok
+test__all__ (test.test_subprocess.MiscTests.test__all__)
+Ensure that __all__ is populated properly. ... ok
+test_call_keyboardinterrupt_no_kill (test.test_subprocess.MiscTests.test_call_keyboardinterrupt_no_kill) ... ok
+test_context_manager_keyboardinterrupt_no_kill (test.test_subprocess.MiscTests.test_context_manager_keyboardinterrupt_no_kill) ... ok
+test_getoutput (test.test_subprocess.MiscTests.test_getoutput) ... ok
+test_run_keyboardinterrupt_no_kill (test.test_subprocess.MiscTests.test_run_keyboardinterrupt_no_kill) ... ok
+test_CalledProcessError_str_non_zero (test.test_subprocess.POSIXProcessTestCase.test_CalledProcessError_str_non_zero) ... ok
+test_CalledProcessError_str_signal (test.test_subprocess.POSIXProcessTestCase.test_CalledProcessError_str_signal) ... ok
+test_CalledProcessError_str_unknown_signal (test.test_subprocess.POSIXProcessTestCase.test_CalledProcessError_str_unknown_signal) ... ok
+test_args_string (test.test_subprocess.POSIXProcessTestCase.test_args_string) ... ok
+test_bytes_program (test.test_subprocess.POSIXProcessTestCase.test_bytes_program) ... ok
+test_call_string (test.test_subprocess.POSIXProcessTestCase.test_call_string) ... ok
+test_close_fd_0 (test.test_subprocess.POSIXProcessTestCase.test_close_fd_0) ... ok
+test_close_fd_1 (test.test_subprocess.POSIXProcessTestCase.test_close_fd_1) ... ok
+test_close_fd_2 (test.test_subprocess.POSIXProcessTestCase.test_close_fd_2) ... ok
+test_close_fds (test.test_subprocess.POSIXProcessTestCase.test_close_fds) ... ok
+test_close_fds_0_1 (test.test_subprocess.POSIXProcessTestCase.test_close_fds_0_1) ... ok
+test_close_fds_0_1_2 (test.test_subprocess.POSIXProcessTestCase.test_close_fds_0_1_2) ... ok
+test_close_fds_0_2 (test.test_subprocess.POSIXProcessTestCase.test_close_fds_0_2) ... ok
+test_close_fds_1_2 (test.test_subprocess.POSIXProcessTestCase.test_close_fds_1_2) ... ok
+test_close_fds_after_preexec (test.test_subprocess.POSIXProcessTestCase.test_close_fds_after_preexec) ... ok
+test_close_fds_when_max_fd_is_lowered (test.test_subprocess.POSIXProcessTestCase.test_close_fds_when_max_fd_is_lowered)
+Confirm that issue21618 is fixed (may fail under valgrind). ... ok
+test_communicate_BrokenPipeError_stdin_close (test.test_subprocess.POSIXProcessTestCase.test_communicate_BrokenPipeError_stdin_close) ... ok
+test_communicate_BrokenPipeError_stdin_close_with_timeout (test.test_subprocess.POSIXProcessTestCase.test_communicate_BrokenPipeError_stdin_close_with_timeout) ... ok
+test_communicate_BrokenPipeError_stdin_flush (test.test_subprocess.POSIXProcessTestCase.test_communicate_BrokenPipeError_stdin_flush) ... ok
+test_communicate_BrokenPipeError_stdin_write (test.test_subprocess.POSIXProcessTestCase.test_communicate_BrokenPipeError_stdin_write) ... ok
+test_communicate_repeated_call_after_stdout_close (test.test_subprocess.POSIXProcessTestCase.test_communicate_repeated_call_after_stdout_close) ... ok
+test_exception_bad_args_0 (test.test_subprocess.POSIXProcessTestCase.test_exception_bad_args_0)
+Test error in the child raised in the parent for a bad args[0]. ... ok
+test_exception_bad_executable (test.test_subprocess.POSIXProcessTestCase.test_exception_bad_executable)
+Test error in the child raised in the parent for a bad executable. ... ok
+test_exception_cwd (test.test_subprocess.POSIXProcessTestCase.test_exception_cwd)
+Test error in the child raised in the parent for a bad cwd. ... ok
+test_exception_errpipe_bad_data (test.test_subprocess.POSIXProcessTestCase.test_exception_errpipe_bad_data)
+Test error passing done through errpipe_write where its not ... ok
+test_exception_errpipe_normal (test.test_subprocess.POSIXProcessTestCase.test_exception_errpipe_normal)
+Test error passing done through errpipe_write in the good case ... ok
+test_extra_groups (test.test_subprocess.POSIXProcessTestCase.test_extra_groups) ... ok
+test_extra_groups_empty_list (test.test_subprocess.POSIXProcessTestCase.test_extra_groups_empty_list) ... ok
+test_extra_groups_invalid_gid_t_values (test.test_subprocess.POSIXProcessTestCase.test_extra_groups_invalid_gid_t_values) ... ok
+test_fork_exec (test.test_subprocess.POSIXProcessTestCase.test_fork_exec) ... ok
+test_fork_exec_sorted_fd_sanity_check (test.test_subprocess.POSIXProcessTestCase.test_fork_exec_sorted_fd_sanity_check) ... ok
+test_group (test.test_subprocess.POSIXProcessTestCase.test_group) ... ok
+test_group_error (test.test_subprocess.POSIXProcessTestCase.test_group_error) ... skipped 'setregid() available on platform'
+test_invalid_args (test.test_subprocess.POSIXProcessTestCase.test_invalid_args) ... ok
+test_kill (test.test_subprocess.POSIXProcessTestCase.test_kill) ... ok
+test_kill_dead (test.test_subprocess.POSIXProcessTestCase.test_kill_dead) ... ok
+test_leak_fast_process_del_killed (test.test_subprocess.POSIXProcessTestCase.test_leak_fast_process_del_killed) ... ok
+test_pass_fds (test.test_subprocess.POSIXProcessTestCase.test_pass_fds) ... ok
+test_pass_fds_inheritable (test.test_subprocess.POSIXProcessTestCase.test_pass_fds_inheritable) ... ok
+test_pass_fds_redirected (test.test_subprocess.POSIXProcessTestCase.test_pass_fds_redirected)
+Regression test for https://bugs.python.org/issue32270. ... ok
+test_pipe_cloexec (test.test_subprocess.POSIXProcessTestCase.test_pipe_cloexec) ... ok
+test_pipe_cloexec_real_tools (test.test_subprocess.POSIXProcessTestCase.test_pipe_cloexec_real_tools) ... ok
+test_preexec (test.test_subprocess.POSIXProcessTestCase.test_preexec) ... ok
+test_preexec_at_exit (test.test_subprocess.POSIXProcessTestCase.test_preexec_at_exit) ... ok
+test_preexec_errpipe_does_not_double_close_pipes (test.test_subprocess.POSIXProcessTestCase.test_preexec_errpipe_does_not_double_close_pipes)
+Issue16140: Don't double close pipes on preexec error. ... ok
+test_preexec_exception (test.test_subprocess.POSIXProcessTestCase.test_preexec_exception) ... ok
+test_preexec_fork_failure (test.test_subprocess.POSIXProcessTestCase.test_preexec_fork_failure) ... skipped 'RLIMIT_NPROC had no effect; probably superuser'
+test_preexec_gc_module_failure (test.test_subprocess.POSIXProcessTestCase.test_preexec_gc_module_failure) ... ok
+test_process_group_0 (test.test_subprocess.POSIXProcessTestCase.test_process_group_0) ... ok
+test_remapping_std_fds (test.test_subprocess.POSIXProcessTestCase.test_remapping_std_fds) ... ok
+test_restore_signals (test.test_subprocess.POSIXProcessTestCase.test_restore_signals) ... ok
+test_run_abort (test.test_subprocess.POSIXProcessTestCase.test_run_abort) ... ok
+test_select_unbuffered (test.test_subprocess.POSIXProcessTestCase.test_select_unbuffered) ... ok
+test_send_signal (test.test_subprocess.POSIXProcessTestCase.test_send_signal) ... ok
+test_send_signal_dead (test.test_subprocess.POSIXProcessTestCase.test_send_signal_dead) ... ok
+test_send_signal_race (test.test_subprocess.POSIXProcessTestCase.test_send_signal_race) ... ok
+test_send_signal_race2 (test.test_subprocess.POSIXProcessTestCase.test_send_signal_race2) ... ok
+test_shell_sequence (test.test_subprocess.POSIXProcessTestCase.test_shell_sequence) ... ok
+test_shell_string (test.test_subprocess.POSIXProcessTestCase.test_shell_string) ... ok
+test_small_errpipe_write_fd (test.test_subprocess.POSIXProcessTestCase.test_small_errpipe_write_fd)
+Issue #15798: Popen should work when stdio fds are available. ... ok
+test_specific_shell (test.test_subprocess.POSIXProcessTestCase.test_specific_shell) ... ok
+test_start_new_session (test.test_subprocess.POSIXProcessTestCase.test_start_new_session) ... ok
+test_stderr_stdin_are_single_inout_fd (test.test_subprocess.POSIXProcessTestCase.test_stderr_stdin_are_single_inout_fd) ... ok
+test_stdout_stderr_are_single_inout_fd (test.test_subprocess.POSIXProcessTestCase.test_stdout_stderr_are_single_inout_fd) ... ok
+test_stdout_stdin_are_single_inout_fd (test.test_subprocess.POSIXProcessTestCase.test_stdout_stdin_are_single_inout_fd) ... ok
+test_stopped (test.test_subprocess.POSIXProcessTestCase.test_stopped)
+Test wait() behavior when waitpid returns WIFSTOPPED; issue29335. ... ok
+test_surrogates_error_message (test.test_subprocess.POSIXProcessTestCase.test_surrogates_error_message) ... ok
+test_swap_fds (test.test_subprocess.POSIXProcessTestCase.test_swap_fds) ... ok
+test_swap_std_fds_with_one_closed (test.test_subprocess.POSIXProcessTestCase.test_swap_std_fds_with_one_closed) ... ok
+test_terminate (test.test_subprocess.POSIXProcessTestCase.test_terminate) ... ok
+test_terminate_dead (test.test_subprocess.POSIXProcessTestCase.test_terminate_dead) ... ok
+test_umask (test.test_subprocess.POSIXProcessTestCase.test_umask) ... ok
+test_undecodable_env (test.test_subprocess.POSIXProcessTestCase.test_undecodable_env) ... ok
+test_user (test.test_subprocess.POSIXProcessTestCase.test_user) ... ok
+test_user_error (test.test_subprocess.POSIXProcessTestCase.test_user_error) ... skipped 'setreuid() available on platform'
+test_wait_when_sigchild_ignored (test.test_subprocess.POSIXProcessTestCase.test_wait_when_sigchild_ignored) ... ok
+test_zombie_fast_process_del (test.test_subprocess.POSIXProcessTestCase.test_zombie_fast_process_del) ... ok
+test__use_vfork (test.test_subprocess.ProcessTestCase.test__use_vfork) ... ok
+test_bufsize_equal_one_binary_mode (test.test_subprocess.ProcessTestCase.test_bufsize_equal_one_binary_mode) ... ok
+test_bufsize_equal_one_text_mode (test.test_subprocess.ProcessTestCase.test_bufsize_equal_one_text_mode) ... ok
+test_bufsize_is_none (test.test_subprocess.ProcessTestCase.test_bufsize_is_none) ... ok
+test_bytes_executable (test.test_subprocess.ProcessTestCase.test_bytes_executable) ... ok
+test_bytes_executable_replaces_shell (test.test_subprocess.ProcessTestCase.test_bytes_executable_replaces_shell) ... ok
+test_call_kwargs (test.test_subprocess.ProcessTestCase.test_call_kwargs) ... ok
+test_call_seq (test.test_subprocess.ProcessTestCase.test_call_seq) ... ok
+test_call_timeout (test.test_subprocess.ProcessTestCase.test_call_timeout) ... ok
+test_check_call_nonzero (test.test_subprocess.ProcessTestCase.test_check_call_nonzero) ... ok
+test_check_call_zero (test.test_subprocess.ProcessTestCase.test_check_call_zero) ... ok
+test_check_output (test.test_subprocess.ProcessTestCase.test_check_output) ... ok
+test_check_output_input_arg (test.test_subprocess.ProcessTestCase.test_check_output_input_arg) ... ok
+test_check_output_input_none (test.test_subprocess.ProcessTestCase.test_check_output_input_none)
+input=None has a legacy meaning of input='' on check_output. ... ok
+test_check_output_input_none_encoding_errors (test.test_subprocess.ProcessTestCase.test_check_output_input_none_encoding_errors) ... ok
+test_check_output_input_none_text (test.test_subprocess.ProcessTestCase.test_check_output_input_none_text) ... ok
+test_check_output_input_none_universal_newlines (test.test_subprocess.ProcessTestCase.test_check_output_input_none_universal_newlines) ... ok
+test_check_output_nonzero (test.test_subprocess.ProcessTestCase.test_check_output_nonzero) ... ok
+test_check_output_stderr (test.test_subprocess.ProcessTestCase.test_check_output_stderr) ... ok
+test_check_output_stdin_arg (test.test_subprocess.ProcessTestCase.test_check_output_stdin_arg) ... ok
+test_check_output_stdin_with_input_arg (test.test_subprocess.ProcessTestCase.test_check_output_stdin_with_input_arg) ... ok
+test_check_output_stdout_arg (test.test_subprocess.ProcessTestCase.test_check_output_stdout_arg) ... ok
+test_check_output_timeout (test.test_subprocess.ProcessTestCase.test_check_output_timeout) ... ok
+test_class_getitems (test.test_subprocess.ProcessTestCase.test_class_getitems) ... ok
+test_communicate (test.test_subprocess.ProcessTestCase.test_communicate) ... ok
+test_communicate_eintr (test.test_subprocess.ProcessTestCase.test_communicate_eintr) ... ok
+test_communicate_epipe (test.test_subprocess.ProcessTestCase.test_communicate_epipe) ... ok
+test_communicate_epipe_only_stdin (test.test_subprocess.ProcessTestCase.test_communicate_epipe_only_stdin) ... ok
+test_communicate_errors (test.test_subprocess.ProcessTestCase.test_communicate_errors) ... ok
+test_communicate_pipe_buf (test.test_subprocess.ProcessTestCase.test_communicate_pipe_buf) ... ok
+test_communicate_pipe_fd_leak (test.test_subprocess.ProcessTestCase.test_communicate_pipe_fd_leak) ... ok
+test_communicate_returns (test.test_subprocess.ProcessTestCase.test_communicate_returns) ... ok
+test_communicate_stderr (test.test_subprocess.ProcessTestCase.test_communicate_stderr) ... ok
+test_communicate_stdin (test.test_subprocess.ProcessTestCase.test_communicate_stdin) ... ok
+test_communicate_stdout (test.test_subprocess.ProcessTestCase.test_communicate_stdout) ... ok
+test_communicate_timeout (test.test_subprocess.ProcessTestCase.test_communicate_timeout) ... ok
+test_communicate_timeout_large_output (test.test_subprocess.ProcessTestCase.test_communicate_timeout_large_output) ... ok
+test_cwd (test.test_subprocess.ProcessTestCase.test_cwd) ... ok
+test_cwd_with_absolute_arg (test.test_subprocess.ProcessTestCase.test_cwd_with_absolute_arg) ... ok
+test_cwd_with_bytes (test.test_subprocess.ProcessTestCase.test_cwd_with_bytes) ... ok
+test_cwd_with_pathlike (test.test_subprocess.ProcessTestCase.test_cwd_with_pathlike) ... ok
+test_cwd_with_relative_arg (test.test_subprocess.ProcessTestCase.test_cwd_with_relative_arg) ... ok
+test_cwd_with_relative_executable (test.test_subprocess.ProcessTestCase.test_cwd_with_relative_executable) ... ok
+test_double_close_on_error (test.test_subprocess.ProcessTestCase.test_double_close_on_error) ... ok
+test_empty_env (test.test_subprocess.ProcessTestCase.test_empty_env)
+Verify that env={} is as empty as possible. ... skipped 'The Python shared library cannot be loaded with an empty environment.'
+test_env (test.test_subprocess.ProcessTestCase.test_env) ... ok
+test_executable (test.test_subprocess.ProcessTestCase.test_executable) ... ok
+test_executable_replaces_shell (test.test_subprocess.ProcessTestCase.test_executable_replaces_shell) ... ok
+test_executable_takes_precedence (test.test_subprocess.ProcessTestCase.test_executable_takes_precedence) ... ok
+test_executable_with_cwd (test.test_subprocess.ProcessTestCase.test_executable_with_cwd) ... ok
+test_executable_without_cwd (test.test_subprocess.ProcessTestCase.test_executable_without_cwd) ... ok
+test_failed_child_execute_fd_leak (test.test_subprocess.ProcessTestCase.test_failed_child_execute_fd_leak)
+Test for the fork() failure fd leak reported in issue16327. ... ok
+test_file_not_found_includes_filename (test.test_subprocess.ProcessTestCase.test_file_not_found_includes_filename) ... ok
+test_file_not_found_with_bad_cwd (test.test_subprocess.ProcessTestCase.test_file_not_found_with_bad_cwd) ... ok
+test_handles_closed_on_exception (test.test_subprocess.ProcessTestCase.test_handles_closed_on_exception) ... ok
+test_invalid_args (test.test_subprocess.ProcessTestCase.test_invalid_args) ... ok
+test_invalid_bufsize (test.test_subprocess.ProcessTestCase.test_invalid_bufsize) ... ok
+test_invalid_cmd (test.test_subprocess.ProcessTestCase.test_invalid_cmd) ... ok
+test_invalid_env (test.test_subprocess.ProcessTestCase.test_invalid_env) ... ok
+test_io_buffered_by_default (test.test_subprocess.ProcessTestCase.test_io_buffered_by_default) ... ok
+test_io_unbuffered_works (test.test_subprocess.ProcessTestCase.test_io_unbuffered_works) ... ok
+test_issue8780 (test.test_subprocess.ProcessTestCase.test_issue8780) ... ok
+test_leaking_fds_on_error (test.test_subprocess.ProcessTestCase.test_leaking_fds_on_error) ... skipped "resource 'cpu' is not enabled"
+test_list2cmdline (test.test_subprocess.ProcessTestCase.test_list2cmdline) ... ok
+test_no_leaking (test.test_subprocess.ProcessTestCase.test_no_leaking) ... skipped 'failed to reach the file descriptor limit (tried 1026)'
+test_nonexisting_with_pipes (test.test_subprocess.ProcessTestCase.test_nonexisting_with_pipes) ... skipped 'need msvcrt.CrtSetReportMode'
+test_one_environment_variable (test.test_subprocess.ProcessTestCase.test_one_environment_variable) ... skipped 'The Python shared library cannot be loaded without some system environments.'
+test_pathlike_executable (test.test_subprocess.ProcessTestCase.test_pathlike_executable) ... ok
+test_pathlike_executable_replaces_shell (test.test_subprocess.ProcessTestCase.test_pathlike_executable_replaces_shell) ... ok
+test_pipesize_default (test.test_subprocess.ProcessTestCase.test_pipesize_default) ... ok
+test_pipesizes (test.test_subprocess.ProcessTestCase.test_pipesizes) ... ok
+test_poll (test.test_subprocess.ProcessTestCase.test_poll) ... ok
+test_repr (test.test_subprocess.ProcessTestCase.test_repr) ... ok
+test_stderr_devnull (test.test_subprocess.ProcessTestCase.test_stderr_devnull) ... ok
+test_stderr_filedes (test.test_subprocess.ProcessTestCase.test_stderr_filedes) ... ok
+test_stderr_fileobj (test.test_subprocess.ProcessTestCase.test_stderr_fileobj) ... ok
+test_stderr_none (test.test_subprocess.ProcessTestCase.test_stderr_none) ... ok
+test_stderr_pipe (test.test_subprocess.ProcessTestCase.test_stderr_pipe) ... ok
+test_stderr_redirect_with_no_stdout_redirect (test.test_subprocess.ProcessTestCase.test_stderr_redirect_with_no_stdout_redirect) ... ok
+test_stdin_devnull (test.test_subprocess.ProcessTestCase.test_stdin_devnull) ... ok
+test_stdin_filedes (test.test_subprocess.ProcessTestCase.test_stdin_filedes) ... ok
+test_stdin_fileobj (test.test_subprocess.ProcessTestCase.test_stdin_fileobj) ... ok
+test_stdin_none (test.test_subprocess.ProcessTestCase.test_stdin_none) ... ok
+test_stdin_pipe (test.test_subprocess.ProcessTestCase.test_stdin_pipe) ... ok
+test_stdout_devnull (test.test_subprocess.ProcessTestCase.test_stdout_devnull) ... ok
+test_stdout_filedes (test.test_subprocess.ProcessTestCase.test_stdout_filedes) ... ok
+test_stdout_filedes_of_stdout (test.test_subprocess.ProcessTestCase.test_stdout_filedes_of_stdout) ... ok
+test_stdout_fileobj (test.test_subprocess.ProcessTestCase.test_stdout_fileobj) ... ok
+test_stdout_none (test.test_subprocess.ProcessTestCase.test_stdout_none) ... ok
+test_stdout_pipe (test.test_subprocess.ProcessTestCase.test_stdout_pipe) ... ok
+test_stdout_stderr_file (test.test_subprocess.ProcessTestCase.test_stdout_stderr_file) ... ok
+test_stdout_stderr_pipe (test.test_subprocess.ProcessTestCase.test_stdout_stderr_pipe) ... ok
+test_threadsafe_wait (test.test_subprocess.ProcessTestCase.test_threadsafe_wait)
+Issue21291: Popen.wait() needs to be threadsafe for returncode. ... ok
+test_universal_newlines_and_text (test.test_subprocess.ProcessTestCase.test_universal_newlines_and_text) ... ok
+test_universal_newlines_communicate (test.test_subprocess.ProcessTestCase.test_universal_newlines_communicate) ... ok
+test_universal_newlines_communicate_encodings (test.test_subprocess.ProcessTestCase.test_universal_newlines_communicate_encodings) ... ok
+test_universal_newlines_communicate_input_none (test.test_subprocess.ProcessTestCase.test_universal_newlines_communicate_input_none) ... ok
+test_universal_newlines_communicate_stdin (test.test_subprocess.ProcessTestCase.test_universal_newlines_communicate_stdin) ... ok
+test_universal_newlines_communicate_stdin_stdout_stderr (test.test_subprocess.ProcessTestCase.test_universal_newlines_communicate_stdin_stdout_stderr) ... ok
+test_wait (test.test_subprocess.ProcessTestCase.test_wait) ... ok
+test_wait_negative_timeout (test.test_subprocess.ProcessTestCase.test_wait_negative_timeout) ... skipped 'need subprocess._winapi'
+test_wait_timeout (test.test_subprocess.ProcessTestCase.test_wait_timeout) ... ok
+test_win32_duplicate_envs (test.test_subprocess.ProcessTestCase.test_win32_duplicate_envs) ... skipped 'Windows only issue'
+test_win32_invalid_env (test.test_subprocess.ProcessTestCase.test_win32_invalid_env) ... skipped 'Windows only issue'
+test_writes_before_communicate (test.test_subprocess.ProcessTestCase.test_writes_before_communicate) ... ok
+test__use_vfork (test.test_subprocess.ProcessTestCaseNoPoll.test__use_vfork) ... ok
+test_bufsize_equal_one_binary_mode (test.test_subprocess.ProcessTestCaseNoPoll.test_bufsize_equal_one_binary_mode) ... ok
+test_bufsize_equal_one_text_mode (test.test_subprocess.ProcessTestCaseNoPoll.test_bufsize_equal_one_text_mode) ... ok
+test_bufsize_is_none (test.test_subprocess.ProcessTestCaseNoPoll.test_bufsize_is_none) ... ok
+test_bytes_executable (test.test_subprocess.ProcessTestCaseNoPoll.test_bytes_executable) ... ok
+test_bytes_executable_replaces_shell (test.test_subprocess.ProcessTestCaseNoPoll.test_bytes_executable_replaces_shell) ... ok
+test_call_kwargs (test.test_subprocess.ProcessTestCaseNoPoll.test_call_kwargs) ... ok
+test_call_seq (test.test_subprocess.ProcessTestCaseNoPoll.test_call_seq) ... ok
+test_call_timeout (test.test_subprocess.ProcessTestCaseNoPoll.test_call_timeout) ... ok
+test_check_call_nonzero (test.test_subprocess.ProcessTestCaseNoPoll.test_check_call_nonzero) ... ok
+test_check_call_zero (test.test_subprocess.ProcessTestCaseNoPoll.test_check_call_zero) ... ok
+test_check_output (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output) ... ok
+test_check_output_input_arg (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_input_arg) ... ok
+test_check_output_input_none (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_input_none)
+input=None has a legacy meaning of input='' on check_output. ... ok
+test_check_output_input_none_encoding_errors (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_input_none_encoding_errors) ... ok
+test_check_output_input_none_text (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_input_none_text) ... ok
+test_check_output_input_none_universal_newlines (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_input_none_universal_newlines) ... ok
+test_check_output_nonzero (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_nonzero) ... ok
+test_check_output_stderr (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_stderr) ... ok
+test_check_output_stdin_arg (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_stdin_arg) ... ok
+test_check_output_stdin_with_input_arg (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_stdin_with_input_arg) ... ok
+test_check_output_stdout_arg (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_stdout_arg) ... ok
+test_check_output_timeout (test.test_subprocess.ProcessTestCaseNoPoll.test_check_output_timeout) ... ok
+test_class_getitems (test.test_subprocess.ProcessTestCaseNoPoll.test_class_getitems) ... ok
+test_communicate (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate) ... ok
+test_communicate_eintr (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_eintr) ... ok
+test_communicate_epipe (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_epipe) ... ok
+test_communicate_epipe_only_stdin (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_epipe_only_stdin) ... ok
+test_communicate_errors (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_errors) ... ok
+test_communicate_pipe_buf (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_pipe_buf) ... ok
+test_communicate_pipe_fd_leak (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_pipe_fd_leak) ... ok
+test_communicate_returns (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_returns) ... ok
+test_communicate_stderr (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_stderr) ... ok
+test_communicate_stdin (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_stdin) ... ok
+test_communicate_stdout (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_stdout) ... ok
+test_communicate_timeout (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_timeout) ... ok
+test_communicate_timeout_large_output (test.test_subprocess.ProcessTestCaseNoPoll.test_communicate_timeout_large_output) ... ok
+test_cwd (test.test_subprocess.ProcessTestCaseNoPoll.test_cwd) ... ok
+test_cwd_with_absolute_arg (test.test_subprocess.ProcessTestCaseNoPoll.test_cwd_with_absolute_arg) ... ok
+test_cwd_with_bytes (test.test_subprocess.ProcessTestCaseNoPoll.test_cwd_with_bytes) ... ok
+test_cwd_with_pathlike (test.test_subprocess.ProcessTestCaseNoPoll.test_cwd_with_pathlike) ... ok
+test_cwd_with_relative_arg (test.test_subprocess.ProcessTestCaseNoPoll.test_cwd_with_relative_arg) ... ok
+test_cwd_with_relative_executable (test.test_subprocess.ProcessTestCaseNoPoll.test_cwd_with_relative_executable) ... ok
+test_double_close_on_error (test.test_subprocess.ProcessTestCaseNoPoll.test_double_close_on_error) ... ok
+test_empty_env (test.test_subprocess.ProcessTestCaseNoPoll.test_empty_env)
+Verify that env={} is as empty as possible. ... skipped 'The Python shared library cannot be loaded with an empty environment.'
+test_env (test.test_subprocess.ProcessTestCaseNoPoll.test_env) ... ok
+test_executable (test.test_subprocess.ProcessTestCaseNoPoll.test_executable) ... ok
+test_executable_replaces_shell (test.test_subprocess.ProcessTestCaseNoPoll.test_executable_replaces_shell) ... ok
+test_executable_takes_precedence (test.test_subprocess.ProcessTestCaseNoPoll.test_executable_takes_precedence) ... ok
+test_executable_with_cwd (test.test_subprocess.ProcessTestCaseNoPoll.test_executable_with_cwd) ... ok
+test_executable_without_cwd (test.test_subprocess.ProcessTestCaseNoPoll.test_executable_without_cwd) ... ok
+test_failed_child_execute_fd_leak (test.test_subprocess.ProcessTestCaseNoPoll.test_failed_child_execute_fd_leak)
+Test for the fork() failure fd leak reported in issue16327. ... ok
+test_file_not_found_includes_filename (test.test_subprocess.ProcessTestCaseNoPoll.test_file_not_found_includes_filename) ... ok
+test_file_not_found_with_bad_cwd (test.test_subprocess.ProcessTestCaseNoPoll.test_file_not_found_with_bad_cwd) ... ok
+test_handles_closed_on_exception (test.test_subprocess.ProcessTestCaseNoPoll.test_handles_closed_on_exception) ... ok
+test_invalid_args (test.test_subprocess.ProcessTestCaseNoPoll.test_invalid_args) ... ok
+test_invalid_bufsize (test.test_subprocess.ProcessTestCaseNoPoll.test_invalid_bufsize) ... ok
+test_invalid_cmd (test.test_subprocess.ProcessTestCaseNoPoll.test_invalid_cmd) ... ok
+test_invalid_env (test.test_subprocess.ProcessTestCaseNoPoll.test_invalid_env) ... ok
+test_io_buffered_by_default (test.test_subprocess.ProcessTestCaseNoPoll.test_io_buffered_by_default) ... ok
+test_io_unbuffered_works (test.test_subprocess.ProcessTestCaseNoPoll.test_io_unbuffered_works) ... ok
+test_issue8780 (test.test_subprocess.ProcessTestCaseNoPoll.test_issue8780) ... ok
+test_leaking_fds_on_error (test.test_subprocess.ProcessTestCaseNoPoll.test_leaking_fds_on_error) ... skipped "resource 'cpu' is not enabled"
+test_list2cmdline (test.test_subprocess.ProcessTestCaseNoPoll.test_list2cmdline) ... ok
+test_no_leaking (test.test_subprocess.ProcessTestCaseNoPoll.test_no_leaking) ... skipped 'failed to reach the file descriptor limit (tried 1026)'
+test_nonexisting_with_pipes (test.test_subprocess.ProcessTestCaseNoPoll.test_nonexisting_with_pipes) ... skipped 'need msvcrt.CrtSetReportMode'
+test_one_environment_variable (test.test_subprocess.ProcessTestCaseNoPoll.test_one_environment_variable) ... skipped 'The Python shared library cannot be loaded without some system environments.'
+test_pathlike_executable (test.test_subprocess.ProcessTestCaseNoPoll.test_pathlike_executable) ... ok
+test_pathlike_executable_replaces_shell (test.test_subprocess.ProcessTestCaseNoPoll.test_pathlike_executable_replaces_shell) ... ok
+test_pipesize_default (test.test_subprocess.ProcessTestCaseNoPoll.test_pipesize_default) ... ok
+test_pipesizes (test.test_subprocess.ProcessTestCaseNoPoll.test_pipesizes) ... ok
+test_poll (test.test_subprocess.ProcessTestCaseNoPoll.test_poll) ... ok
+test_repr (test.test_subprocess.ProcessTestCaseNoPoll.test_repr) ... ok
+test_stderr_devnull (test.test_subprocess.ProcessTestCaseNoPoll.test_stderr_devnull) ... ok
+test_stderr_filedes (test.test_subprocess.ProcessTestCaseNoPoll.test_stderr_filedes) ... ok
+test_stderr_fileobj (test.test_subprocess.ProcessTestCaseNoPoll.test_stderr_fileobj) ... ok
+test_stderr_none (test.test_subprocess.ProcessTestCaseNoPoll.test_stderr_none) ... ok
+test_stderr_pipe (test.test_subprocess.ProcessTestCaseNoPoll.test_stderr_pipe) ... ok
+test_stderr_redirect_with_no_stdout_redirect (test.test_subprocess.ProcessTestCaseNoPoll.test_stderr_redirect_with_no_stdout_redirect) ... ok
+test_stdin_devnull (test.test_subprocess.ProcessTestCaseNoPoll.test_stdin_devnull) ... ok
+test_stdin_filedes (test.test_subprocess.ProcessTestCaseNoPoll.test_stdin_filedes) ... ok
+test_stdin_fileobj (test.test_subprocess.ProcessTestCaseNoPoll.test_stdin_fileobj) ... ok
+test_stdin_none (test.test_subprocess.ProcessTestCaseNoPoll.test_stdin_none) ... ok
+test_stdin_pipe (test.test_subprocess.ProcessTestCaseNoPoll.test_stdin_pipe) ... ok
+test_stdout_devnull (test.test_subprocess.ProcessTestCaseNoPoll.test_stdout_devnull) ... ok
+test_stdout_filedes (test.test_subprocess.ProcessTestCaseNoPoll.test_stdout_filedes) ... ok
+test_stdout_filedes_of_stdout (test.test_subprocess.ProcessTestCaseNoPoll.test_stdout_filedes_of_stdout) ... ok
+test_stdout_fileobj (test.test_subprocess.ProcessTestCaseNoPoll.test_stdout_fileobj) ... ok
+test_stdout_none (test.test_subprocess.ProcessTestCaseNoPoll.test_stdout_none) ... ok
+test_stdout_pipe (test.test_subprocess.ProcessTestCaseNoPoll.test_stdout_pipe) ... ok
+test_stdout_stderr_file (test.test_subprocess.ProcessTestCaseNoPoll.test_stdout_stderr_file) ... ok
+test_stdout_stderr_pipe (test.test_subprocess.ProcessTestCaseNoPoll.test_stdout_stderr_pipe) ... ok
+test_threadsafe_wait (test.test_subprocess.ProcessTestCaseNoPoll.test_threadsafe_wait)
+Issue21291: Popen.wait() needs to be threadsafe for returncode. ... ok
+test_universal_newlines_and_text (test.test_subprocess.ProcessTestCaseNoPoll.test_universal_newlines_and_text) ... ok
+test_universal_newlines_communicate (test.test_subprocess.ProcessTestCaseNoPoll.test_universal_newlines_communicate) ... ok
+test_universal_newlines_communicate_encodings (test.test_subprocess.ProcessTestCaseNoPoll.test_universal_newlines_communicate_encodings) ... ok
+test_universal_newlines_communicate_input_none (test.test_subprocess.ProcessTestCaseNoPoll.test_universal_newlines_communicate_input_none) ... ok
+test_universal_newlines_communicate_stdin (test.test_subprocess.ProcessTestCaseNoPoll.test_universal_newlines_communicate_stdin) ... ok
+test_universal_newlines_communicate_stdin_stdout_stderr (test.test_subprocess.ProcessTestCaseNoPoll.test_universal_newlines_communicate_stdin_stdout_stderr) ... ok
+test_wait (test.test_subprocess.ProcessTestCaseNoPoll.test_wait) ... ok
+test_wait_negative_timeout (test.test_subprocess.ProcessTestCaseNoPoll.test_wait_negative_timeout) ... skipped 'need subprocess._winapi'
+test_wait_timeout (test.test_subprocess.ProcessTestCaseNoPoll.test_wait_timeout) ... ok
+test_win32_duplicate_envs (test.test_subprocess.ProcessTestCaseNoPoll.test_win32_duplicate_envs) ... skipped 'Windows only issue'
+test_win32_invalid_env (test.test_subprocess.ProcessTestCaseNoPoll.test_win32_invalid_env) ... skipped 'Windows only issue'
+test_writes_before_communicate (test.test_subprocess.ProcessTestCaseNoPoll.test_writes_before_communicate) ... ok
+test_capture_output (test.test_subprocess.RunFuncTestCase.test_capture_output) ... ok
+test_capture_stderr (test.test_subprocess.RunFuncTestCase.test_capture_stderr) ... ok
+test_capture_stdout (test.test_subprocess.RunFuncTestCase.test_capture_stdout) ... ok
+test_check (test.test_subprocess.RunFuncTestCase.test_check) ... ok
+test_check_output_input_arg (test.test_subprocess.RunFuncTestCase.test_check_output_input_arg) ... ok
+test_check_output_stdin_arg (test.test_subprocess.RunFuncTestCase.test_check_output_stdin_arg) ... ok
+test_check_output_stdin_with_input_arg (test.test_subprocess.RunFuncTestCase.test_check_output_stdin_with_input_arg) ... ok
+test_check_output_timeout (test.test_subprocess.RunFuncTestCase.test_check_output_timeout) ... ok
+test_check_zero (test.test_subprocess.RunFuncTestCase.test_check_zero) ... ok
+test_encoding_warning (test.test_subprocess.RunFuncTestCase.test_encoding_warning) ... ok
+test_returncode (test.test_subprocess.RunFuncTestCase.test_returncode) ... ok
+test_run_kwargs (test.test_subprocess.RunFuncTestCase.test_run_kwargs) ... ok
+test_run_with_an_empty_env (test.test_subprocess.RunFuncTestCase.test_run_with_an_empty_env) ... skipped 'Maybe test trigger a leak on Ubuntu'
+test_run_with_bytes_path_and_arguments (test.test_subprocess.RunFuncTestCase.test_run_with_bytes_path_and_arguments) ... ok
+test_run_with_pathlike_path (test.test_subprocess.RunFuncTestCase.test_run_with_pathlike_path) ... ok
+test_run_with_pathlike_path_and_arguments (test.test_subprocess.RunFuncTestCase.test_run_with_pathlike_path_and_arguments) ... ok
+test_run_with_shell_timeout_and_capture_output (test.test_subprocess.RunFuncTestCase.test_run_with_shell_timeout_and_capture_output)
+Output capturing after a timeout mustn't hang forever on open filehandles. ... ok
+test_stderr_with_capture_output_arg (test.test_subprocess.RunFuncTestCase.test_stderr_with_capture_output_arg) ... ok
+test_stdout_with_capture_output_arg (test.test_subprocess.RunFuncTestCase.test_stdout_with_capture_output_arg) ... ok
+test_timeout (test.test_subprocess.RunFuncTestCase.test_timeout) ... ok
+test_call_string (test.test_subprocess.Win32ProcessTestCase.test_call_string) ... skipped 'Windows specific tests'
+test_close_fds (test.test_subprocess.Win32ProcessTestCase.test_close_fds) ... skipped 'Windows specific tests'
+test_close_fds_with_stdio (test.test_subprocess.Win32ProcessTestCase.test_close_fds_with_stdio) ... skipped 'Windows specific tests'
+test_creationflags (test.test_subprocess.Win32ProcessTestCase.test_creationflags) ... skipped 'Windows specific tests'
+test_empty_attribute_list (test.test_subprocess.Win32ProcessTestCase.test_empty_attribute_list) ... skipped 'Windows specific tests'
+test_empty_handle_list (test.test_subprocess.Win32ProcessTestCase.test_empty_handle_list) ... skipped 'Windows specific tests'
+test_invalid_args (test.test_subprocess.Win32ProcessTestCase.test_invalid_args) ... skipped 'Windows specific tests'
+test_issue31471 (test.test_subprocess.Win32ProcessTestCase.test_issue31471) ... skipped 'Windows specific tests'
+test_kill (test.test_subprocess.Win32ProcessTestCase.test_kill) ... skipped 'Windows specific tests'
+test_kill_dead (test.test_subprocess.Win32ProcessTestCase.test_kill_dead) ... skipped 'Windows specific tests'
+test_send_signal (test.test_subprocess.Win32ProcessTestCase.test_send_signal) ... skipped 'Windows specific tests'
+test_send_signal_dead (test.test_subprocess.Win32ProcessTestCase.test_send_signal_dead) ... skipped 'Windows specific tests'
+test_shell_encodings (test.test_subprocess.Win32ProcessTestCase.test_shell_encodings) ... skipped 'Windows specific tests'
+test_shell_sequence (test.test_subprocess.Win32ProcessTestCase.test_shell_sequence) ... skipped 'Windows specific tests'
+test_shell_string (test.test_subprocess.Win32ProcessTestCase.test_shell_string) ... skipped 'Windows specific tests'
+test_startupinfo (test.test_subprocess.Win32ProcessTestCase.test_startupinfo) ... skipped 'Windows specific tests'
+test_startupinfo_copy (test.test_subprocess.Win32ProcessTestCase.test_startupinfo_copy) ... skipped 'Windows specific tests'
+test_startupinfo_keywords (test.test_subprocess.Win32ProcessTestCase.test_startupinfo_keywords) ... skipped 'Windows specific tests'
+test_terminate (test.test_subprocess.Win32ProcessTestCase.test_terminate) ... skipped 'Windows specific tests'
+test_terminate_dead (test.test_subprocess.Win32ProcessTestCase.test_terminate_dead) ... skipped 'Windows specific tests'
+
+----------------------------------------------------------------------
+Ran 341 tests in 20.005s
+
+OK (skipped=44)
+0:00:20 load avg: 0.14 [1/1] test_subprocess passed
+
+== Tests result: SUCCESS ==
+
+1 test OK.
+
+Total duration: 20.1 sec
+Total tests: run=341 skipped=44
+Total test files: run=1/1
+Result: SUCCESS

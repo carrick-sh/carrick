@@ -1,0 +1,24 @@
+oracle: all 8 selected suite(s) cached; running carrick-only
+phase 1/4: 8 carrick runs (workers=8, cpython-workers=4, fast-timeout=5s; cached slow rows get 2x oracle + 2s; hard-cap=None)
+  [carrick] cpython-mmap
+  [carrick] cpython-fork1
+  [carrick] cpython-threading
+  [carrick] cpython-wait3
+  [carrick] cpython-subprocess
+  [carrick] cpython-wait4
+  [carrick] cpython-multiprocessing_fork
+  [carrick] cpython-concurrent_futures
+phase 2/4: 0 docker run(s), 8 cached oracle(s) (workers=8, cpython-workers=4)
+phase 3/4: classify
+
+=== summary ===
+  ok   MATCH          cpython-concurrent_futures               carrick[237/237] oracle[237/237]
+  ok   MATCH          cpython-fork1                            carrick[4/4] oracle[4/4]
+  ok   MATCH          cpython-mmap                             carrick[38/38] oracle[38/38]
+  ok   MATCH          cpython-multiprocessing_fork             carrick[344/344] oracle[344/344]
+  ok   MATCH          cpython-subprocess                       carrick[297/297] oracle[297/297]
+  ok   MATCH          cpython-threading                        carrick[206/206] oracle[206/206]
+  ok   MATCH          cpython-wait3                            carrick[3/3] oracle[3/3]
+  ok   MATCH          cpython-wait4                            carrick[2/2] oracle[2/2]
+
+OK: no regressions

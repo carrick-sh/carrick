@@ -1,0 +1,2 @@
+carrick: FATAL: detached address-space retirement failed (the MM-authority drop abort that follows is a CONSEQUENCE of this, not the cause): hypervisor operation failed: publish detached terminal inventory retirement receipt: frame FrameId(2697) still has live mappings
+carrick fatal [hvpatch::mm_authority]: drop HVPatch MM authority (phase=active mm_root_slot=Some((661433352192, 2097152)) kernel_mm=Some(14) holder=registration-cleanup): hypervisor operation failed: published HVPatch inventory dropped before exact retirement (phase=active)
