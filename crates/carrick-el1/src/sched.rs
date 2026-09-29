@@ -13,6 +13,9 @@ const EL1_ZONE_LOCK_SPINS: u32 = 1024;
 /// not be served (a busy lock, a full run queue) is retried after this.
 const TIMER_RETRY_NS: u64 = 50_000;
 
+#[path = "sched/object_wait.rs"]
+pub mod object_wait;
+
 /// The CPU state and the per-vCPU hardware the in-guest scheduler uses.
 pub trait ThreadCpu {
     /// Save the running thread's `frame` and live state into `ctx`.

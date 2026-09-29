@@ -1174,3 +1174,157 @@ fn the_idle_entry_runs_no_thread_itself() {
     assert_eq!(zone.installed_space(idle), 0);
     assert!(!zone.executor_has_task(idle));
 }
+
+#[test]
+fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
+    use super::object_wait::OperationResumePc;
+    use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let key_a = ObjectWaitKey::new(1, 3).unwrap();
+    let key_b = ObjectWaitKey::new(2, 3).unwrap();
+    zone.bind_object_wait(key_a, &HostWait).unwrap();
+    zone.bind_object_wait(key_b, &HostWait).unwrap();
+    let b = zone
+        .alloc_record(ThreadIdentity {
+            mm: OTHER_MM,
+            ..identity(202)
+        })
+        .unwrap();
+    // Same user VA and numeric fd in two different processes. The operation
+    // handles, task generations and saved MM decide which buffer is touched.
+    let mut b_ctx = thread_ctx(0xb, 0x4000);
+    b_ctx.x[0] = 5;
+    b_ctx.x[1] = 0x4000;
+    b_ctx.pc = 0x8000;
+    // SAFETY: freshly allocated, unpublished record.
+    unsafe { *zone.record(b).ctx_mut() = b_ctx };
+    let guard = zone.object_wait(key_b, &HostWait).unwrap();
+    guard
+        .park(guard.snapshot(), b, OperationToken::new(202, 4).unwrap())
+        .unwrap();
+    drop(guard);
+
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xa, 0x4000, FUTEX_WAIT_PRIVATE, 0);
+    frame.x[0] = 5;
+    frame.x[1] = 0x4000;
+    let a_args = frame.x;
+    let a_pc = OperationResumePc::new(0x9000).unwrap();
+    let counter = counters();
+    let mut sched = Sched {
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counter,
+    };
+    let (report, effects) = sched.notify_object(key_b).unwrap();
+    assert_eq!(report.queued, 1);
+    sched.finish_object_wake(effects);
+    let snapshot = sched.observe_object(key_a).unwrap();
+    let parked = sched
+        .park_object(
+            &frame,
+            key_a,
+            snapshot,
+            a_pc,
+            OperationToken::new(101, 4).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        sched.resume_after_object_park(&mut frame, parked, 0),
+        SWITCHED
+    );
+    assert_eq!(frame.x, b_ctx.x);
+    assert_eq!(frame.elr, b_ctx.pc);
+    assert_eq!(sched.cpu.ttbr, (TTBR_OTHER, TTBR_OTHER));
+    assert_eq!(task.zone_mm.load(Ordering::Acquire), OTHER_MM);
+    assert_eq!(sched.take_object_operation(), OperationToken::new(202, 4));
+    assert_eq!(sched.take_object_operation(), None);
+    let (report, effects) = sched.notify_object(key_a).unwrap();
+    assert_eq!(report.queued, 1);
+    sched.finish_object_wake(effects);
+    let snapshot = sched.observe_object(key_b).unwrap();
+    let parked = sched
+        .park_object(
+            &frame,
+            key_b,
+            snapshot,
+            OperationResumePc::new(b_ctx.pc).unwrap(),
+            OperationToken::new(202, 5).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        sched.resume_after_object_park(&mut frame, parked, 0),
+        SWITCHED
+    );
+    assert_eq!(frame.x, a_args);
+    assert_eq!(frame.elr, 0x9000);
+    assert_eq!(sched.cpu.ttbr, (TTBR_MM, TTBR_MM));
+    assert_eq!(task.task_id.load(Ordering::Acquire), 101);
+    assert_eq!(sched.take_object_operation(), OperationToken::new(101, 4));
+    assert_eq!(
+        zone.counters
+            .host_service_placements
+            .load(Ordering::Acquire),
+        0
+    );
+    assert_eq!(zone.counters.el1_service_exits.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
+    use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+
+    let zone = zone();
+    let other = SlotId::new(4);
+    for slot in [SLOT, other] {
+        host_publish(&zone, slot, MM, None, 0);
+        zone.enter_guest(slot);
+    }
+    let target = super::sgi_target_of(0x8000_0004);
+    zone.slot(other).set_sgi_target(target);
+    let key = ObjectWaitKey::new(1, 1).unwrap();
+    zone.bind_object_wait(key, &HostWait).unwrap();
+    let record = zone.current_or_new(other, identity(202)).unwrap();
+    let guard = zone.object_wait(key, &HostWait).unwrap();
+    guard
+        .park(
+            guard.snapshot(),
+            record,
+            OperationToken::new(202, 1).unwrap(),
+        )
+        .unwrap();
+    drop(guard);
+    let task = task_for(101);
+    let mut cpu = FakeCpu::default();
+    let mut sched = Sched {
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counters(),
+    };
+    let (report, effects) = sched.notify_object(key).unwrap();
+    assert_eq!(report.queued, 1);
+    assert_eq!(zone.slot(other).queued(), 1);
+    assert!(sched.cpu.sgis.is_empty());
+    // Lock reacquisition proves the notification returned with no lock held.
+    drop(
+        zone.object_wait(key, &carrick_sched_core::BoundedSpin(0))
+            .unwrap(),
+    );
+    sched.finish_object_wake(effects);
+    assert_eq!(
+        sched.cpu.sgis,
+        [target | (u64::from(GIC_RESCHED_INTID) << 24)]
+    );
+    assert!(!task.has_pending_host_work());
+}

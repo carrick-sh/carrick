@@ -80,6 +80,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod object_wait;
 pub mod occupancy;
 pub mod spaces;
 
@@ -421,6 +422,7 @@ pub struct ZoneRecord {
     /// CNTVCT deadline of the current park (0: untimed).
     deadline: AtomicU64,
     affinity: AtomicU64,
+    object: object_wait::ObjectRecord,
     ctx: UnsafeCell<ThreadCtx>,
 }
 
@@ -478,7 +480,9 @@ impl ZoneRecord {
     /// the host asked for it back while EL1 held it: EL1 never runs such a
     /// thread at EL0, it leaves the vCPU for the executor instead.
     pub fn needs_host(&self) -> bool {
-        self.handback() == Some(Handback::Service) || self.host_wanted()
+        self.handback() == Some(Handback::Service)
+            || self.host_wanted()
+            || (self.is_cancelled() && self.has_object_operation())
     }
 
     /// The host asked for the thread back while EL1 held its record.
@@ -807,6 +811,7 @@ pub struct ZoneTables {
     pub occupancy: Occupancy,
     /// Address spaces EL1 may install itself, with their gates.
     pub spaces: AddressSpaces,
+    object_waits: [object_wait::ObjectQueue; object_wait::OBJECT_WAIT_QUEUES],
 }
 
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
@@ -964,7 +969,8 @@ pub struct HostPlacement {
 /// The outcome of [`ZoneTables::handback_current`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CurrentHandback {
-    /// Host-owned with [`Handback::Resumed`]: publish it to its thread.
+    /// Host-owned: publish it to its thread. Usually [`Handback::Resumed`];
+    /// a cancelled pending object operation requires adapter cleanup first.
     HandedBack,
     /// Its thread was retired: host-owned, for the caller to free.
     Discard,
@@ -1133,6 +1139,10 @@ impl ZoneTables {
             return None;
         }
         self.remove_locked(&guard, record);
+        if rec.is_cancelled() && rec.has_object_operation() {
+            rec.handback
+                .store(Handback::Cancelled as u32, Ordering::Release);
+        }
         drop(guard);
         if rec.handback() == Some(Handback::Service) {
             self.counters
@@ -1266,7 +1276,10 @@ impl ZoneTables {
             let record = RecordId(cursor);
             let rec = self.record(record);
             cursor = rec.next.load(Ordering::Relaxed);
-            if rec.host_wanted.load(Ordering::Acquire) == 0 || rec.is_cancelled() {
+            if (rec.host_wanted.load(Ordering::Acquire) == 0
+                && !(rec.is_cancelled() && rec.has_object_operation()))
+                || (rec.is_cancelled() && !rec.has_object_operation())
+            {
                 continue;
             }
             let Claim::Queued { slot: owner, seq } = rec.claim() else {
@@ -1275,7 +1288,10 @@ impl ZoneTables {
             if owner == slot && rec.cas(Claim::Queued { slot, seq }, Claim::Host { seq }) {
                 self.remove_locked(&guard, record);
                 rec.host_wanted.store(0, Ordering::Release);
-                if !matches!(rec.handback(), Some(Handback::Resumed | Handback::Service)) {
+                if rec.is_cancelled() {
+                    rec.handback
+                        .store(Handback::Cancelled as u32, Ordering::Release);
+                } else if !matches!(rec.handback(), Some(Handback::Resumed | Handback::Service)) {
                     rec.handback
                         .store(Handback::Woken as u32, Ordering::Release);
                 }
@@ -1298,7 +1314,7 @@ impl ZoneTables {
             let record = RecordId(cursor);
             let rec = self.record(record);
             cursor = rec.next.load(Ordering::Relaxed);
-            if !rec.is_cancelled() {
+            if !rec.is_cancelled() || rec.has_object_operation() {
                 continue;
             }
             let Claim::Queued { slot: owner, seq } = rec.claim() else {
@@ -1319,6 +1335,12 @@ impl ZoneTables {
     /// party that allocated it and never published a park).
     pub fn free_record(&self, id: RecordId) {
         let record = self.record(id);
+        // A pending operation owns an external endpoint pin. Keep this
+        // record reachable until its adapter consumes/cancels that token;
+        // recycling it would lose the only completion authority.
+        if record.has_object_operation() {
+            return;
+        }
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         record.incarnation.fetch_add(1, Ordering::AcqRel);
         Self::free_bit(&self.record_map, id.raw());
@@ -1636,6 +1658,18 @@ impl ZoneTables {
         waker: SlotId,
         effects: &mut WakeEffects,
     ) -> bool {
+        self.claim_for_el1_with(record, seq, index, waker, effects, || {})
+    }
+
+    fn claim_for_el1_with(
+        &self,
+        record: RecordId,
+        seq: u32,
+        index: u64,
+        waker: SlotId,
+        effects: &mut WakeEffects,
+        detach: impl FnOnce(),
+    ) -> bool {
         let rec = self.record(record);
         let home = rec.home();
         if let Some(target) = self.placement(record, waker)
@@ -1652,6 +1686,7 @@ impl ZoneTables {
                 if !rec.cas(Claim::Parked { seq }, Claim::Queued { slot: target, seq }) {
                     return false;
                 }
+                detach();
                 self.mark_woken(rec, index);
                 let state = self.slot(target).state();
                 self.push_locked(&slot_guard, record, None);
@@ -1674,6 +1709,7 @@ impl ZoneTables {
         if !rec.cas(Claim::Parked { seq }, Claim::Queued { slot: waker, seq }) {
             return false;
         }
+        detach();
         self.mark_woken(rec, index);
         self.push_locked(&slot_guard, record, None);
         drop(slot_guard);
@@ -1691,8 +1727,15 @@ impl ZoneTables {
 
     fn mark_woken(&self, rec: &ZoneRecord, result: u64) {
         rec.result.store(result, Ordering::Relaxed);
-        rec.handback
-            .store(Handback::Woken as u32, Ordering::Release);
+        // Readiness schedules the saved operation entry, never a synthetic
+        // syscall result. The operation's exact endpoint remains pinned by
+        // its token until the adapter resumes or cancels it.
+        let kind = if rec.has_object_operation() {
+            Handback::Resumed
+        } else {
+            Handback::Woken
+        };
+        rec.handback.store(kind as u32, Ordering::Release);
     }
 
     /// The record `entry` wakes for `(mm, uaddr, bitset)`, if it is a live
@@ -1739,6 +1782,7 @@ impl ZoneTables {
     /// record's owner calls this: the host after a claim, or a parker undoing
     /// a park it never published.
     pub fn unlink_all(&self, record: RecordId, wait: &impl LockWait) {
+        self.unlink_object(record, wait);
         let rec = self.record(record);
         loop {
             let entry_id = rec.first_entry.load(Ordering::Acquire);
@@ -1880,7 +1924,7 @@ impl ZoneTables {
         while cursor != NIL {
             let record = RecordId(cursor);
             let rec = self.record(record);
-            if !rec.is_cancelled() {
+            if !rec.is_cancelled() || rec.has_object_operation() {
                 return matches!(rec.claim(), Claim::Queued { slot: owner, .. } if owner == slot)
                     .then_some(record);
             }
@@ -2333,8 +2377,13 @@ impl ZoneTables {
             if rec.is_cancelled() {
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
-                drain.discarded += 1;
-                take(record, true);
+                let discard = !rec.has_object_operation();
+                if discard {
+                    drain.discarded += 1;
+                } else {
+                    drain.woken += 1;
+                }
+                take(record, discard);
                 continue;
             }
             if !matches!(rec.handback(), Some(Handback::Resumed | Handback::Service)) {
@@ -2370,7 +2419,11 @@ impl ZoneTables {
         if rec.is_cancelled() {
             rec.handback
                 .store(Handback::Cancelled as u32, Ordering::Release);
-            return CurrentHandback::Discard;
+            return if rec.has_object_operation() {
+                CurrentHandback::HandedBack
+            } else {
+                CurrentHandback::Discard
+            };
         }
         rec.handback
             .store(Handback::Resumed as u32, Ordering::Release);
@@ -2383,6 +2436,9 @@ impl ZoneTables {
     /// The switched-in record of `slot` is the thread the executor loaded:
     /// it is simply running again, so its record is done.
     pub fn release_current(&self, slot: SlotId, record: RecordId) {
+        if self.record(record).has_object_operation() {
+            return;
+        }
         let s = self.slot(slot);
         s.current.store(NIL, Ordering::Release);
         if s.host_record.load(Ordering::Acquire) == record.raw() {
@@ -2972,7 +3028,8 @@ impl ZoneTables {
                     // A thread woken or preempted keeps what it resumes with
                     // (its wake's result, or its registers); the claimant's
                     // action (a signal, a control request) follows its resume.
-                    if kind == Handback::Cancelled
+                    if rec.has_object_operation()
+                        || kind == Handback::Cancelled
                         || !matches!(rec.handback(), Some(Handback::Woken | Handback::Resumed))
                     {
                         rec.handback.store(kind as u32, Ordering::Release);
