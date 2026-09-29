@@ -179,7 +179,7 @@ pub trait DescriptorTxnApplier {
 
 /// The descriptor-transaction slots EL1 serves, plus the executor.
 pub struct DescriptorTxnPath<'a, X: DescriptorTxnApplier> {
-    pub slots: &'a [DescriptorTxnSlot],
+    pub slots: &'a carrick_el1_abi::DescriptorTxnSlots,
     pub applier: &'a mut X,
 }
 
@@ -268,7 +268,7 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
         .get(frame.slot as usize)?
         .zone_mm
         .load(Ordering::Acquire);
-    if mm_key == 0 || !path.slots.iter().any(|slot| slot.submitted_for(mm_key)) {
+    if mm_key == 0 || path.slots.submitted_for(mm_key).next().is_none() {
         return None;
     }
     let index = spaces.find(mm_key)?;
@@ -278,10 +278,7 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
     // host boundary, which recognizes it as in flight.
     let _editor = spaces.try_begin_edit(index, mm_key, owner)?;
     let mut covered = false;
-    for slot in path.slots {
-        if !slot.submitted_for(mm_key) {
-            continue;
-        }
+    for slot in path.slots.submitted_for(mm_key) {
         let covers = slot.pending_covering(mm_key, frame.far);
         if let Some(receipt) = path.applier.apply(slot, mm_key, grant.ttbr0) {
             covered |= covers && matches!(receipt.outcome, DescriptorOutcome::Applied(_));
@@ -346,11 +343,15 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             counters.fault_taken.fetch_add(1, Ordering::Relaxed);
             return Action::Forward;
         };
-        dispatch_fault_with_prepared(
+        dispatch_fault_with_descriptor_txns(
             frame,
             counters,
             current_tasks,
             &zone.spaces,
+            Some(DescriptorTxnPath {
+                slots: carrick_el1_abi::descriptor_txn_slots_guest(),
+                applier: &mut HardwareDescriptorTxnApplier,
+            }),
             GrantMailboxes {
                 own: mailbox,
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
@@ -1146,7 +1147,7 @@ mod tests {
         fn dispatch(
             mm: u64,
             spaces: &AddressSpaces,
-            slots: &[DescriptorTxnSlot],
+            slots: &carrick_el1_abi::DescriptorTxnSlots,
             applier: &mut ArenaApplier<'_>,
             fault: u64,
             counters: &Counters,
@@ -1172,8 +1173,8 @@ mod tests {
             let arena = Arena::new();
             let fault = VA + 2 * 4096;
             let txn = grant_txn(mm, ROOT, fault);
-            let slots = [DescriptorTxnSlot::new(), DescriptorTxnSlot::new()];
-            assert!(slots[1].submit(&txn));
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(1, &txn));
             let spaces = published_space(mm, ROOT | ASID);
             let mut applier = ArenaApplier {
                 arena: &arena,
@@ -1197,7 +1198,7 @@ mod tests {
                     expected
                 );
             }
-            let receipt = slots[1].take_receipt(txn.id).expect("receipt for the host");
+            let receipt = slots.take_receipt(1, txn.id).expect("receipt for the host");
             let verified = txn.verify_receipt(&receipt).expect("authentic");
             assert_eq!(verified.resident(), PageSpan::new(fault, 4096));
         }
@@ -1207,8 +1208,8 @@ mod tests {
             let arena = Arena::new();
             let before = arena.image();
             let txn = grant_txn(77, ROOT, VA);
-            let slots = [DescriptorTxnSlot::new()];
-            assert!(slots[0].submit(&txn));
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(0, &txn));
             let mut applier = ArenaApplier {
                 arena: &arena,
                 invalidated: RefCell::new(Vec::new()),
@@ -1227,7 +1228,7 @@ mod tests {
                 dispatch(77, &closed, &slots, &mut applier, VA, &Counters::default()),
                 Action::Forward
             );
-            assert!(slots[0].submitted_for(77));
+            assert_eq!(slots.submitted_for(77).count(), 1);
             assert_eq!(arena.image(), before);
             assert!(applier.invalidated.borrow().is_empty());
         }
@@ -1239,8 +1240,8 @@ mod tests {
             let before = arena.image();
             // Built against a root this MM no longer publishes.
             let txn = grant_txn(mm, ROOT + 0x4000, VA);
-            let slots = [DescriptorTxnSlot::new()];
-            assert!(slots[0].submit(&txn));
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(0, &txn));
             let mut applier = ArenaApplier {
                 arena: &arena,
                 invalidated: RefCell::new(Vec::new()),
@@ -1252,7 +1253,7 @@ mod tests {
                 "a refused transaction does not serve the fault"
             );
             assert_eq!(arena.image(), before);
-            let receipt = slots[0].take_receipt(txn.id).unwrap();
+            let receipt = slots.take_receipt(0, txn.id).unwrap();
             assert_eq!(
                 receipt.outcome,
                 DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot)

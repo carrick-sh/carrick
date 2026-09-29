@@ -197,6 +197,9 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
             | GuestRetirementError::MissingTable
             | GuestRetirementError::NotPrivateAnonymous,
         ) => MunmapDisposition::Forward,
+        Err(GuestRetirementError::RollbackFailed) => {
+            panic!("EL1 anonymous retirement rollback failed")
+        }
     }
 }
 

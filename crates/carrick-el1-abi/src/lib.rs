@@ -16,6 +16,9 @@
 
 #![no_std]
 
+mod descriptor_txn;
+pub use descriptor_txn::*;
+
 use core::cell::UnsafeCell;
 
 /// Guest VA/IPA base of the 64 MiB EL1 kernel region.
@@ -406,8 +409,12 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
     ];
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
-    while i < facts.len() {
-        let mut word = facts[i];
+    while i < facts.len() + DESCRIPTOR_TXN_LAYOUT_FACTS.len() {
+        let mut word = if i < facts.len() {
+            facts[i]
+        } else {
+            DESCRIPTOR_TXN_LAYOUT_FACTS[i - facts.len()]
+        };
         let mut b = 0;
         while b < 8 {
             hash ^= word & 0xff;

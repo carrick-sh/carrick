@@ -493,6 +493,9 @@ pub enum GuestRetirementError {
     TableOutsidePrimary,
     MissingTable,
     NotPrivateAnonymous,
+    /// A failed retirement could not restore its pre-image: editor
+    /// exclusion was violated and the MM's table graph is indeterminate.
+    RollbackFailed,
 }
 
 unsafe fn live_primary_descriptor(
@@ -794,17 +797,15 @@ pub unsafe fn retire_existing_el1_private_pages(
         DescriptorOutcome::Applied(applied) => {
             usize::try_from(applied.pages).map_err(|_| GuestRetirementError::BadRange)
         }
-        // A rolled-back (or, under a violated editor exclusion,
-        // unrestorable) retirement forwards to the host path; the syscall
-        // layer has no rollback-failure disposition for retirement yet.
-        DescriptorOutcome::Refused(refusal)
-        | DescriptorOutcome::RolledBack(refusal)
-        | DescriptorOutcome::Indeterminate(refusal) => Err(match refusal {
-            DescriptorRefusal::BadRange => GuestRetirementError::BadRange,
-            DescriptorRefusal::TableOutsidePrimary => GuestRetirementError::TableOutsidePrimary,
-            DescriptorRefusal::MissingTable => GuestRetirementError::MissingTable,
-            _ => GuestRetirementError::NotPrivateAnonymous,
-        }),
+        DescriptorOutcome::Indeterminate(_) => Err(GuestRetirementError::RollbackFailed),
+        DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            Err(match refusal {
+                DescriptorRefusal::BadRange => GuestRetirementError::BadRange,
+                DescriptorRefusal::TableOutsidePrimary => GuestRetirementError::TableOutsidePrimary,
+                DescriptorRefusal::MissingTable => GuestRetirementError::MissingTable,
+                _ => GuestRetirementError::NotPrivateAnonymous,
+            })
+        }
     }
 }
 
