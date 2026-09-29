@@ -1448,10 +1448,13 @@ fn readv_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr() {
     );
     assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"abcd");
     assert_eq!(memory.read_bytes(0x4300, 5).unwrap(), b"efghi");
+    // The per-iovec fallback reads each iovec with its own host read; an
+    // iovec that has a host pointer is filled in place, so only the one
+    // lacking it is copied through `write_bytes`.
     assert_eq!(
         memory.watched_writes(),
-        2,
-        "fallback readv should write each filled payload through write_bytes"
+        1,
+        "fallback readv should stage only the iovec without a host pointer"
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
