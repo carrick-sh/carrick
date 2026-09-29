@@ -1,0 +1,2 @@
+eventfd=3 writev=8 errno=0
+readv=8 errno=0 value=42
