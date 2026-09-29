@@ -183,6 +183,72 @@ impl El1FrameGrantLedger {
 #[cfg(test)]
 mod allocator_stats_tests {
     use super::*;
+    use crate::trap::frame_inventory_backend_tests::global_frame_allocator_test_lock;
+
+    #[test]
+    fn el1_lifecycle_regrant_requires_a_return_receipt_at_three_scales() {
+        let mut observations = Vec::new();
+        for scale in [1, 8, 64] {
+            let mut ledger = El1FrameGrantLedger::default();
+            let length = CowArmedRanges::COMPOUND_SIZE;
+            for index in 0..scale {
+                let base = 0x8000_0000 + index * length;
+                ledger.mark_grant(base, length).unwrap();
+                let before = ledger.stats;
+                let rejected = ledger.mark_grant(base, length).is_err();
+                observations.push((scale, rejected && ledger.stats == before));
+            }
+        }
+        assert!(
+            observations.iter().all(|(_, valid)| *valid),
+            "{observations:?}"
+        );
+    }
+
+    #[test]
+    fn el1_lifecycle_exit_without_munmap_accounts_at_three_scales() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        let mut observations = Vec::new();
+        for scale in [1, 8, 64] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let before = snapshot_el1_frame_grant_stats();
+            let length = CowArmedRanges::COMPOUND_SIZE;
+            for _ in 0..scale {
+                let mut lease = GlobalFrameStage2Lease::reserve(length, length).unwrap();
+                let (base, length) = lease.key();
+                lease.mark_test_mapped_without_backend();
+                let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    length as usize,
+                    crate::host_mapping::HostMappingKind::PerMmKernelState,
+                )
+                .unwrap();
+                register_global_frame_host_owner_in(&custody, lease, host, 3).unwrap();
+                mark_el1_frame_grant_in(&custody, base, length).unwrap();
+            }
+            let generation = custody.setup_generation().unwrap();
+            custody.begin_destroy(generation).unwrap();
+            custody.commit_destroy(generation).unwrap();
+            finalize_carrier_exit_global_frame_owners_in_using(
+                &custody,
+                &mut release_retired_stage2_ipa,
+            )
+            .unwrap();
+            let after = snapshot_el1_frame_grant_stats();
+            assert_eq!(after.grants_succeeded - before.grants_succeeded, scale);
+            observations.push((
+                scale,
+                after.returns_completed - before.returns_completed,
+                after.bytes_returned - before.bytes_returned,
+            ));
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|&(scale, returns, bytes)| returns == scale
+                    && bytes == scale * CowArmedRanges::COMPOUND_SIZE),
+            "{observations:?}"
+        );
+    }
 
     #[test]
     fn el1_grant_stats_count_owned_and_pooled_return_and_reuse() {
