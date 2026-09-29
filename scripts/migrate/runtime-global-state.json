@@ -3760,6 +3760,14 @@
       "fingerprint": "b68e8a880e18b3ff27c942aefc072ed53953de8ef3a1a2608edf1b7135f1c36b",
       "classification": "carrier_infra",
       "rationale": "Process-global registration of the host IPC authority's memory for the carrier; the first persistent root maps it into the IPC window."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "symbol": "OWED_WAKE_DELIVERY",
+      "fingerprint": "4906ab939256b4d99e171cb767799d26c91b10dfa2c55069cce2c5dbef8720fd",
+      "classification": "carrier_infra",
+      "rationale": "Process-global, set-once delivery hook of the host IPC subscription registry: the carrier's one host authority delivers owed readiness wakes for its subscribed objects at an EL1-forced host boundary."
     }
   ]
 }

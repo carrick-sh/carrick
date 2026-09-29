@@ -549,6 +549,44 @@ where
         let rec = zone.live(record).ok_or_else(|| {
             RuntimeError::Configuration(format!("EL1 zone resume: record {record:?} is gone"))
         })?;
+        if rec.has_object_operation() {
+            // An IPC operation parked with this thread: the thread is at its
+            // SVC with the original registers; the operation (not a wake
+            // value) decides the result.
+            let handback = rec.handback();
+            // SAFETY: the host owns this handed-back record, all of its
+            // registrations are unlinked, and this executor loaded its exact
+            // task and address space.
+            let taken = unsafe { rec.take_object_operation() };
+            zone.free_record(record.id);
+            self.state.service_kernel_context = Some(context.retain_exact());
+            let token = taken.and_then(host_ipc::from_sched_token).ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "EL1 zone resume: IPC operation token is not ours".to_owned(),
+                )
+            })?;
+            if let Some(exit) =
+                self.resume_ipc_operation(engine, control, handback, token, reserved.as_ref())?
+            {
+                return Ok(exit);
+            }
+            let pc = engine.current_pc()?;
+            if let Some(outcome) = service_signals_threaded(
+                &self.kernel,
+                &context,
+                engine,
+                self.state.this_tid,
+                self.state.fatal_image_generation,
+                None,
+                Some(pc),
+                None,
+                reserved,
+                self.traps,
+            )? {
+                return Ok(self.enter_terminal_with_outcome(engine, outcome));
+            }
+            return Ok(executor::ExecutorExit::Syscall);
+        }
         let x0: Option<i64> = match rec.handback() {
             Some(Handback::Woken) => Some(rec.result() as i64),
             Some(Handback::Resumed) => None,
@@ -592,5 +630,556 @@ where
             return Ok(self.enter_terminal_with_outcome(engine, outcome));
         }
         Ok(executor::ExecutorExit::Syscall)
+    }
+}
+
+// ------------------------------------------------------------------ IPC
+
+use carrick_el1_abi::ipc::pipe::WaitFor;
+use carrick_el1_abi::ipc::{IpcMmKey, IpcObjectHandle, IpcOpToken};
+use carrick_kernel::kernel::continuation::ipc as host_ipc;
+use host_ipc::ObjectWaitSnapshot;
+
+/// What the host does with an EL1 handback frame, decided at the syscall
+/// boundary (the frame's `x0`/`x8` already restored to the original call).
+pub(super) enum IpcHandbackRoute {
+    /// The call is complete with this outcome (SIGPIPE already marked).
+    Complete(DispatchOutcome),
+    /// The call took no effect: dispatch the original call on the host path.
+    Restart,
+    /// The call must keep waiting: park the thread with its owned operation.
+    Park(IpcPark),
+}
+
+/// An owned operation the host parks on an object wait queue.
+#[derive(Debug)]
+pub(crate) struct IpcPark {
+    token: IpcOpToken,
+    object: IpcObjectHandle,
+    lane: WaitFor,
+    snapshot: ObjectWaitSnapshot,
+}
+
+fn lane_index(lane: WaitFor) -> usize {
+    match lane {
+        WaitFor::Readable => 0,
+        WaitFor::Writable => 1,
+    }
+}
+
+fn ipc_error(what: &str, error: impl std::fmt::Debug) -> RuntimeError {
+    RuntimeError::Configuration(format!("IPC {what}: {error:?}"))
+}
+
+/// Map a completed host IPC outcome onto the syscall result, marking
+/// SIGPIPE for the calling thread when owed (unless ignored).
+fn ipc_complete(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    context: &carrick_kernel::kernel::KernelContext,
+    tid: ThreadId,
+    result: i64,
+    sigpipe: bool,
+) -> DispatchOutcome {
+    if sigpipe && !dispatcher.signal_is_ignored(context, carrick_abi::LINUX_SIGPIPE) {
+        dispatcher.mark_signal_pending(context, tid, carrick_abi::LINUX_SIGPIPE);
+    }
+    match LinuxErrno::from_guest_retval(result) {
+        Some(errno) => DispatchOutcome::Errno { errno },
+        None => DispatchOutcome::Returned { value: result },
+    }
+}
+
+/// Decode an [`carrick_el1_abi::ipc::IPC_HANDBACK_NR`] frame: restore the
+/// original call in `request` and in the vCPU's `x0`/`x8`, then complete,
+/// restart or park the owned operation. Wait-queue snapshots are taken
+/// before the operation's readiness is checked, so a park cannot miss a
+/// notification in between.
+pub(super) fn ipc_handback_route<E: ThreadedEngine>(
+    kernel: &Kernel,
+    context: &carrick_kernel::kernel::KernelContext,
+    tid: ThreadId,
+    engine: &mut E,
+    zone_mm: Option<u64>,
+    request: &mut SyscallRequest,
+) -> Result<IpcHandbackRoute, RuntimeError> {
+    let region = host_ipc::host_region().ok_or_else(|| {
+        RuntimeError::Configuration("IPC handback without a published IPC window".to_owned())
+    })?;
+    let (token, op) = host_ipc::take_handback(&region, request.arg(0))
+        .map_err(|error| ipc_error("handback names no live operation", error))?;
+    request.number = carrick_abi::CanonicalNr(u64::from(op.nr));
+    request.native_number = carrick_abi::NativeNr(u64::from(op.nr));
+    request.args.0[0] = op.orig_x0;
+    engine
+        .set_reg(carrick_hal::Reg::X(8), u64::from(op.nr))
+        .map_err(|error| ipc_error("restore x8", error))?;
+    engine
+        .set_reg(carrick_hal::Reg::X(0), op.orig_x0)
+        .map_err(|error| ipc_error("restore x0", error))?;
+    let object = IpcObjectHandle::from_raw(op.object);
+    let snapshots =
+        carrick_kernel::el1_zone::zone().map(|zone| host_ipc::lane_snapshots(zone, object));
+    let outcome = host_ipc::complete_handback(
+        &region,
+        token,
+        IpcMmKey(zone_mm.unwrap_or(0)),
+        engine,
+        None,
+        &host_ipc::ZoneHostWake,
+    )
+    .map_err(|error| ipc_error("handback completion", error))?;
+    ipc_route(&kernel.dispatcher, context, tid, outcome, snapshots)
+}
+
+fn ipc_route(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    context: &carrick_kernel::kernel::KernelContext,
+    tid: ThreadId,
+    outcome: host_ipc::IpcHostOutcome,
+    snapshots: Option<[Option<ObjectWaitSnapshot>; 2]>,
+) -> Result<IpcHandbackRoute, RuntimeError> {
+    Ok(match outcome {
+        host_ipc::IpcHostOutcome::Complete { result, sigpipe } => {
+            IpcHandbackRoute::Complete(ipc_complete(dispatcher, context, tid, result, sigpipe))
+        }
+        host_ipc::IpcHostOutcome::Restart { .. } => IpcHandbackRoute::Restart,
+        host_ipc::IpcHostOutcome::Blocked {
+            token,
+            object,
+            lane,
+            ..
+        } => {
+            let snapshot = snapshots.and_then(|s| s[lane_index(lane)]).ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "IPC operation must wait but its wait queue is unavailable".to_owned(),
+                )
+            })?;
+            IpcHandbackRoute::Park(IpcPark {
+                token,
+                object,
+                lane,
+                snapshot,
+            })
+        }
+    })
+}
+
+/// How an attempt to park an IPC operation ended.
+enum IpcParkAttempt {
+    Parked(executor::ExecutorExit),
+    /// Readiness changed between the check and the park: the operation
+    /// (token returned) runs again.
+    Changed(IpcOpToken),
+}
+
+impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopJob<E>
+where
+    E::SiblingSpec: 'static,
+{
+    /// Park this job's thread on the object wait queue of an IPC operation
+    /// the host could not finish: the record holds the thread at its SVC with
+    /// the original registers (`request`) and owns the operation token, so an
+    /// in-guest wake resumes it in EL1 (the adapter takes the token before
+    /// any fd lookup) and a host claim resumes it in [`Self::resume_zone`].
+    fn ipc_park_attempt(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        exit: ZoneExit,
+        request: SyscallRequest,
+        park: IpcPark,
+    ) -> Result<IpcParkAttempt, ProductionHvpatchPollError> {
+        let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
+            return Err(RuntimeError::Configuration(
+                "IPC park without in-guest zone tables".to_owned(),
+            )
+            .into());
+        };
+        let context = self
+            .kernel
+            .dispatcher
+            .capture_kernel_context(self.state.linux_tid)
+            .map_err(|error| ipc_error("park context", error))?;
+        let identity = ThreadIdentity {
+            tid: carrick_el1_abi::El1TaskId::from_linux_tid(self.state.linux_tid.raw()).raw(),
+            serial: context.thread().key().serial.raw(),
+            mm,
+            file_table: context.resources().files().id().raw(),
+            generation: control
+                .current_submission_key()
+                .map(|(_, generation)| generation.raw())
+                .unwrap_or(0),
+            affinity: context.thread().affinity().words()[0],
+        };
+        let state = engine.snapshot_guest_state_for_publication()?;
+        // Resume at the SVC with the original call's registers.
+        let mut ctx = zone_ctx_from_state(&state, exit)?;
+        ctx.x[0] = request.args.0[0];
+        ctx.x[8] = request.number.raw();
+        let key = host_ipc::wait_key(park.object, park.lane)
+            .ok_or_else(|| ipc_error("wait key", park.object))?;
+        let parked = {
+            let guard = zone
+                .object_wait(key, &HostLockWait)
+                .map_err(|error| ipc_error("wait queue", error))?;
+            let record = zone
+                .alloc_record(identity)
+                .map_err(|error| ipc_error("park record", error))?;
+            // SAFETY: freshly allocated and not yet published.
+            unsafe { *zone.record(record).ctx_mut() = ctx };
+            let token = host_ipc::to_sched_token(park.token)
+                .map_err(|_| RuntimeError::Configuration("IPC token conversion".to_owned()))?;
+            // The park's sequence (the same one `park` publishes).
+            let seq = zone.next_seq(record);
+            match guard.park(park.snapshot, record, token) {
+                Ok(()) => Ok((record, seq)),
+                Err((error, token)) => {
+                    zone.free_record(record);
+                    Err((error, token))
+                }
+            }
+        };
+        match parked {
+            Ok((record, seq)) => {
+                zone.counters
+                    .host_parks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if matches!(exit, ZoneExit::Syscall { .. }) {
+                    engine.discard_terminal_syscall_continuation()?;
+                    self.state.retire_syscall()?;
+                }
+                let record = zone.record_ref(record);
+                self.settle_into_zone(control, state, record, seq, None, request)
+                    .map(IpcParkAttempt::Parked)
+            }
+            Err((host_ipc::ObjectWaitError::Changed, token)) => {
+                let token = host_ipc::from_sched_token(token).ok_or_else(|| {
+                    RuntimeError::Configuration("IPC token conversion".to_owned())
+                })?;
+                Ok(IpcParkAttempt::Changed(token))
+            }
+            Err((error, _token)) => Err(ipc_error("park refused", error).into()),
+        }
+    }
+
+    /// Run the owned operation again on the host (no signal is pending at
+    /// this boundary), with fresh wait snapshots taken before the check.
+    fn ipc_continue(
+        &mut self,
+        engine: &mut E,
+        token: IpcOpToken,
+    ) -> Result<IpcHandbackRoute, ProductionHvpatchPollError> {
+        let region = host_ipc::host_region().ok_or_else(|| {
+            RuntimeError::Configuration("IPC continuation without a published window".to_owned())
+        })?;
+        let op = region
+            .operation(&token)
+            .map_err(|error| ipc_error("continuation", error))?;
+        let object = IpcObjectHandle::from_raw(op.object);
+        let snapshots =
+            carrick_kernel::el1_zone::zone().map(|zone| host_ipc::lane_snapshots(zone, object));
+        let outcome = host_ipc::complete_handback(
+            &region,
+            token,
+            IpcMmKey(self.state.zone_mm.unwrap_or(0)),
+            engine,
+            None,
+            &host_ipc::ZoneHostWake,
+        )
+        .map_err(|error| ipc_error("continuation", error))?;
+        let context = self
+            .kernel
+            .dispatcher
+            .capture_kernel_context(self.state.linux_tid)
+            .map_err(|error| ipc_error("continuation context", error))?;
+        Ok(ipc_route(
+            &self.kernel.dispatcher,
+            &context,
+            self.state.this_tid,
+            outcome,
+            snapshots,
+        )?)
+    }
+
+    /// The handback's operation must wait: park it; a readiness change
+    /// before the park runs it again (completing the syscall if it can).
+    pub(super) fn ipc_park(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        mut park: IpcPark,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let request = self
+            .state
+            .syscall_completion
+            .guest("IPC park lost its prepared completion token")?
+            .syscall()
+            .request;
+        loop {
+            match self.ipc_park_attempt(
+                engine,
+                control,
+                ZoneExit::Syscall { completed: false },
+                request,
+                park,
+            )? {
+                IpcParkAttempt::Parked(exit) => return Ok(exit),
+                IpcParkAttempt::Changed(token) => match self.ipc_continue(engine, token)? {
+                    IpcHandbackRoute::Park(next) => park = next,
+                    IpcHandbackRoute::Complete(outcome) => {
+                        return self.service_outcome(engine, control, frame, outcome);
+                    }
+                    IpcHandbackRoute::Restart => {
+                        return Err(RuntimeError::Configuration(
+                            "IPC continuation restarted after taking effect".to_owned(),
+                        )
+                        .into());
+                    }
+                },
+            }
+        }
+    }
+
+    /// A zone record holding an IPC operation was loaded from its record
+    /// (the thread is at its SVC with the original registers): decide the
+    /// operation by how the wait ended. `Some(exit)`: it parked again.
+    fn resume_ipc_operation(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        handback: Option<Handback>,
+        token: IpcOpToken,
+        reserved: Option<&carrick_kernel::kernel::continuation::ReservedSignal>,
+    ) -> Result<Option<executor::ExecutorExit>, ProductionHvpatchPollError> {
+        let region = host_ipc::host_region().ok_or_else(|| {
+            RuntimeError::Configuration("IPC resume without a published window".to_owned())
+        })?;
+        let mut op = region
+            .operation(&token)
+            .map_err(|error| ipc_error("resume", error))?;
+        let request = SyscallRequest::new(
+            u64::from(op.nr),
+            carrick_observability::compat::SyscallArgs([
+                op.orig_x0,
+                engine.get_reg(carrick_hal::Reg::X(1)).unwrap_or(0),
+                engine.get_reg(carrick_hal::Reg::X(2)).unwrap_or(0),
+                engine.get_reg(carrick_hal::Reg::X(3)).unwrap_or(0),
+                engine.get_reg(carrick_hal::Reg::X(4)).unwrap_or(0),
+                engine.get_reg(carrick_hal::Reg::X(5)).unwrap_or(0),
+            ]),
+        );
+        let cause = match handback {
+            Some(Handback::Signal) => {
+                // SA_RESTART of the handler about to run (signal(7)).
+                let restart = reserved.is_some_and(|signal| {
+                    let action = signal.action();
+                    action.sa_handler != carrick_abi::LINUX_SIG_DFL
+                        && action.sa_handler != carrick_abi::LINUX_SIG_IGN
+                        && action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0
+                });
+                Some(host_ipc::IpcCause::Signal { restart })
+            }
+            Some(Handback::Control | Handback::Timeout | Handback::Cancelled) => {
+                Some(host_ipc::IpcCause::Control)
+            }
+            Some(Handback::Woken | Handback::Resumed) => None,
+            Some(Handback::Service) | None => {
+                return Err(RuntimeError::Configuration(format!(
+                    "IPC resume with handback {handback:?}"
+                ))
+                .into());
+            }
+        };
+        let mut route = match cause {
+            Some(cause) => {
+                let outcome = host_ipc::interrupt(&region, token, cause, &host_ipc::ZoneHostWake)
+                    .map_err(|error| ipc_error("interrupt", error))?;
+                let context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| ipc_error("interrupt context", error))?;
+                ipc_route(
+                    &self.kernel.dispatcher,
+                    &context,
+                    self.state.this_tid,
+                    outcome,
+                    None,
+                )?
+            }
+            None => {
+                // Readiness changed: continue the owned operation here.
+                op.handback = carrick_el1_abi::ipc::IpcHandback::Continue;
+                region
+                    .update_operation(&token, op)
+                    .map_err(|error| ipc_error("resume", error))?;
+                self.ipc_continue(engine, token)?
+            }
+        };
+        loop {
+            match route {
+                IpcHandbackRoute::Complete(outcome) => {
+                    let value = match outcome {
+                        DispatchOutcome::Errno { errno } => errno.guest_retval(),
+                        DispatchOutcome::Returned { value } => value,
+                        _ => 0,
+                    };
+                    let pc = engine.current_pc()?;
+                    engine
+                        .set_reg(carrick_hal::Reg::X(0), value as u64)
+                        .map_err(|error| ipc_error("resume x0", error))?;
+                    engine
+                        .set_reg(carrick_hal::Reg::Pc, pc.wrapping_add(4))
+                        .map_err(|error| ipc_error("resume pc", error))?;
+                    return Ok(None);
+                }
+                // At the SVC with the original registers: the call runs
+                // again after any handler (it took no effect).
+                IpcHandbackRoute::Restart => return Ok(None),
+                IpcHandbackRoute::Park(park) => {
+                    match self.ipc_park_attempt(engine, control, ZoneExit::El0, request, park)? {
+                        IpcParkAttempt::Parked(exit) => return Ok(Some(exit)),
+                        IpcParkAttempt::Changed(token) => {
+                            route = self.ipc_continue(engine, token)?
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ipc_tests {
+    //! Host-level bindings for kernel.el1.ipc-continuation at the runtime
+    //! boundary: result mapping, SIGPIPE, and the park decision.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use carrick_el1_abi::ipc::{EventMode, IpcDirectory, IpcOperation, IpcRegion};
+    use carrick_kernel::dispatch::SyscallDispatcher;
+    use std::alloc::Layout;
+
+    fn dispatcher_and_context() -> (
+        SyscallDispatcher,
+        carrick_kernel::kernel::KernelContext,
+        ThreadId,
+    ) {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let tid = ThreadId::synthetic_for_tests(context.thread().key().tid.raw());
+        (dispatcher, context, tid)
+    }
+
+    fn sigpipe_pending(context: &carrick_kernel::kernel::KernelContext) -> bool {
+        context
+            .thread()
+            .signal_state()
+            .pending()
+            .contains(carrick_abi::LINUX_SIGPIPE)
+    }
+
+    fn region() -> &'static IpcRegion<'static> {
+        let dir = unsafe { std::alloc::alloc_zeroed(Layout::new::<IpcDirectory>()).cast() };
+        let pool_len = 1 << 20;
+        let pool =
+            unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
+        Box::leak(Box::new(
+            unsafe { IpcRegion::initialize(dir, pool, pool_len, 3) }.unwrap(),
+        ))
+    }
+
+    fn zone() -> Box<ZoneTables> {
+        // SAFETY: all-zero is the valid empty zone.
+        unsafe { Box::from_raw(std::alloc::alloc_zeroed(Layout::new::<ZoneTables>()).cast()) }
+    }
+
+    #[test]
+    fn el1_ipc_completion_maps_results_and_marks_sigpipe_unless_ignored() {
+        let (dispatcher, context, tid) = dispatcher_and_context();
+        assert_eq!(
+            ipc_complete(&dispatcher, &context, tid, 65536, true),
+            DispatchOutcome::Returned { value: 65536 }
+        );
+        assert!(sigpipe_pending(&context), "SIGPIPE after a partial write");
+        context
+            .thread()
+            .update_signal_state(|s| s.replace_pending_entries(&[]));
+        let epipe = carrick_abi::LINUX_EPIPE.guest_retval();
+        assert_eq!(
+            ipc_complete(&dispatcher, &context, tid, epipe, false),
+            DispatchOutcome::Errno {
+                errno: carrick_abi::LINUX_EPIPE
+            }
+        );
+        assert!(!sigpipe_pending(&context), "no SIGPIPE unless requested");
+        let mut ign = carrick_abi::LinuxSigaction::empty();
+        ign.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        let signal =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGPIPE)
+                .unwrap();
+        context.shared().sighand().install_action(signal, ign);
+        ipc_complete(&dispatcher, &context, tid, epipe, true);
+        assert!(!sigpipe_pending(&context), "SIG_IGN suppresses SIGPIPE");
+    }
+
+    #[test]
+    fn el1_ipc_blocked_operation_parks_with_its_lane_snapshot_or_fails_closed() {
+        let (dispatcher, context, tid) = dispatcher_and_context();
+        let region = region();
+        let zone = zone();
+        let object = region
+            .create_eventfd(0, EventMode::Counter, &HostLockWait)
+            .unwrap();
+        let blocked = |token| host_ipc::IpcHostOutcome::Blocked {
+            token,
+            object,
+            lane: WaitFor::Writable,
+            x0: 3,
+            nr: 64,
+        };
+        // Snapshots taken before the readiness check, both lanes.
+        let snapshots = host_ipc::lane_snapshots(&zone, object);
+        assert!(snapshots.iter().all(Option::is_some));
+        let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
+        let route = ipc_route(&dispatcher, &context, tid, blocked(token), Some(snapshots)).unwrap();
+        let IpcHandbackRoute::Park(park) = route else {
+            panic!("a blocked operation parks");
+        };
+        assert_eq!(park.lane, WaitFor::Writable);
+        assert_eq!(
+            Some(park.snapshot),
+            snapshots[1],
+            "the writer lane's snapshot"
+        );
+        assert_eq!(park.object, object);
+        // A notification between the check and the park is never missed:
+        // the park is refused as Changed and the operation runs again.
+        let key = host_ipc::wait_key(object, WaitFor::Writable).unwrap();
+        {
+            let guard = zone.object_wait(key, &HostLockWait).unwrap();
+            guard.notify_object_host(&mut |_| {}, &mut |_| {}).unwrap();
+        }
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 1,
+                serial: 1,
+                mm: 7,
+                file_table: 5,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let guard = zone.object_wait(key, &HostLockWait).unwrap();
+        let token = host_ipc::to_sched_token(park.token).unwrap();
+        let refused = guard.park(park.snapshot, record, token);
+        assert!(matches!(
+            refused,
+            Err((host_ipc::ObjectWaitError::Changed, _))
+        ));
+        drop(guard);
+        // Without a wait queue, a blocked operation fails closed.
+        let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
+        assert!(ipc_route(&dispatcher, &context, tid, blocked(token), None).is_err());
     }
 }
