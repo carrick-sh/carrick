@@ -762,3 +762,71 @@ fn el1_ipc_operation_tokens_own_their_record_and_reject_stale_copies() {
         fx.region.finish_operation(t).unwrap();
     }
 }
+
+#[test]
+fn el1_ipc_live_pipe_storage_replacement_preserves_both_venues() {
+    let fx = fixture(256 * 1024);
+    let table = fx.table();
+    let (_, _, object) = fx.pipe(table);
+    let old = {
+        let mut guard = fx.region.lock(object, &Spin).unwrap();
+        let step = guard.pipe().unwrap().try_write(b"one authority");
+        assert_eq!(step.result, Ok(13));
+        guard.publish(step.wake);
+        guard.storage()
+    };
+    let mut next = IpcPipeStorage {
+        offset: 0,
+        ring_bytes: 131072,
+        pages: 32,
+    };
+    next.offset = fx.bump(next.footprint());
+    let supplied = next;
+    {
+        let mut host = fx.region.lock(object, &Spin).unwrap();
+        host.replace_pipe_storage(&mut next).unwrap();
+        assert_eq!(next, old);
+        assert_eq!(host.storage(), supplied);
+        assert_eq!(
+            host.pipe().unwrap().set_capacity(131072, 131072).result,
+            Ok(131072)
+        );
+    }
+    let mut guest = fx.region.lock(object, &EL1).unwrap();
+    let mut output = [0; 13];
+    assert_eq!(guest.pipe().unwrap().try_read(&mut output).result, Ok(13));
+    assert_eq!(&output, b"one authority");
+}
+
+#[test]
+fn el1_ipc_live_pipe_storage_replacement_refuses_overlap_and_bounds() {
+    let fx = fixture(256 * 1024);
+    let table = fx.table();
+    let (_, _, object) = fx.pipe(table);
+    let mut guard = fx.region.lock(object, &Spin).unwrap();
+    let old = guard.storage();
+    for mut invalid in [
+        old,
+        IpcPipeStorage {
+            offset: old.offset + 4096,
+            ..old
+        },
+        IpcPipeStorage {
+            offset: fx.pool_len,
+            ..old
+        },
+        IpcPipeStorage { offset: 1, ..old },
+        IpcPipeStorage {
+            pages: u64::MAX,
+            ..old
+        },
+    ] {
+        let before = invalid;
+        assert_eq!(
+            guard.replace_pipe_storage(&mut invalid),
+            Err(IpcError::BadStorage)
+        );
+        assert_eq!(invalid, before);
+        assert_eq!(guard.storage(), old);
+    }
+}
