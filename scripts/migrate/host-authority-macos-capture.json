@@ -11402,15 +11402,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 20164,
-        "byte_start": 20146,
+        "byte_end": 21049,
+        "byte_start": 21031,
         "column": 17,
         "column_end": 35,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/vcpu_loop/crash.rs",
-        "line": 469,
-        "line_end": 469,
-        "line_start": 469
+        "line": 481,
+        "line_end": 481,
+        "line_start": 481
       }
     },
     {
@@ -11880,9 +11880,9 @@
       }
     }
   ],
-  "rows_sha256": "0e5c01dc48cc30d81783b4686d3b1c1fa9438d0f29ee5564c82f8adbc01f325a",
+  "rows_sha256": "adfb20770025f7f06b64cf0af1b751d91185965eba043d8d2b92f0120004ec4b",
   "schema": 1,
-  "source_head": "caa966609bb80165e383eb40d84031893bd4ee62",
+  "source_head": "f33a454b74970ff2ecb43c5a299b086b5ea066ff",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
