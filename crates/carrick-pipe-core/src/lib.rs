@@ -136,7 +136,7 @@ struct Work {
 }
 
 fn validate_page_size(page_size: usize) -> Result<(), Error> {
-    if page_size < PIPE_BUF || page_size > MAX_PAGE_SIZE || !page_size.is_power_of_two() {
+    if !(PIPE_BUF..=MAX_PAGE_SIZE).contains(&page_size) || !page_size.is_power_of_two() {
         return Err(Error::Invalid);
     }
     Ok(())

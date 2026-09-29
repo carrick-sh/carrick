@@ -1,20 +1,62 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use super::*;
-use std::{boxed::Box, vec};
+use std::sync::{Mutex, OnceLock};
+use std::{boxed::Box, vec::Vec};
 
-// Only test fixtures allocate; the substrate receives borrowed slices.
-fn storage(capacity: usize) -> TableStorage<'static> {
-    TableStorage::new(
-        Box::leak(vec![DescriptorSlot::default(); capacity].into_boxed_slice()),
-        Box::leak(vec![0; bitmap_words(capacity)].into_boxed_slice()),
-    )
-    .unwrap()
+// Only test fixtures allocate; the substrate receives resolved slices.
+// One process-wide arena of leaked extents: token = index + 1.
+type Backing = (&'static [DescriptorSlot], &'static [AtomicU64]);
+fn arena() -> &'static Mutex<Vec<Backing>> {
+    static ARENA: OnceLock<Mutex<Vec<Backing>>> = OnceLock::new();
+    ARENA.get_or_init(|| Mutex::new(Vec::new()))
+}
+pub(crate) struct TestArena;
+impl SlotBacking for TestArena {
+    fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
+        let (slots, bitmap) = *arena()
+            .lock()
+            .unwrap()
+            .get(extent.token.checked_sub(1)? as usize)?;
+        (slots.len() as u64 == extent.capacity).then_some((slots, bitmap))
+    }
+}
+pub(crate) fn storage(capacity: usize) -> Extent {
+    let slots: &'static [DescriptorSlot] = Box::leak(
+        (0..capacity)
+            .map(|_| DescriptorSlot::default())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let bitmap: &'static [AtomicU64] = Box::leak(
+        (0..bitmap_words(capacity))
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let mut arena = arena().lock().unwrap();
+    arena.push((slots, bitmap));
+    Extent {
+        token: arena.len() as u64,
+        capacity: capacity as u64,
+    }
+}
+pub(crate) struct Spin;
+impl LockWait for Spin {
+    fn wait(&self, _attempt: u32) -> bool {
+        core::hint::spin_loop();
+        true
+    }
+}
+pub(crate) type View<const T: usize, const O: usize> = Authority<'static, TestArena, Spin, T, O>;
+pub(crate) fn authority<const T: usize, const O: usize>() -> View<T, O> {
+    let core: &'static Core<T, O> = Box::leak(Box::new(Core::new().unwrap()));
+    core.bind(&TestArena, Spin)
 }
 
 #[test]
 fn lowest_free_and_ceiling() {
-    let mut core = Core::<2, 8>::new().unwrap();
+    let core = authority::<2, 8>();
     let table = core.create_table(4, &mut storage(4)).unwrap();
     for expected in 0..4 {
         assert_eq!(
@@ -44,7 +86,7 @@ fn description(token: u64) -> Description {
 #[test]
 fn dup_variants_and_atomic_replacement() {
     for cloexec in [false, true] {
-        let mut c = Core::<2, 4>::new().unwrap();
+        let c = authority::<2, 4>();
         let t = c.create_table(8, &mut storage(8)).unwrap();
         let a = c.open(t, Fd(0), description(10), true).unwrap();
         let b = c.open(t, Fd(0), description(20), false).unwrap();
@@ -75,7 +117,7 @@ fn dup_variants_and_atomic_replacement() {
 
 #[test]
 fn bad_descriptors_and_minimum_errors() {
-    let mut c = Core::<1, 1>::new().unwrap();
+    let c = authority::<1, 1>();
     let t = c.create_table(4, &mut storage(4)).unwrap();
     let a = c.open(t, Fd(0), description(1), false).unwrap();
     for bad in [Fd(-1), Fd(1), Fd(4), Fd(i32::MAX)] {
@@ -106,7 +148,7 @@ fn bad_descriptors_and_minimum_errors() {
 
 #[test]
 fn fork_shares_description_but_not_descriptor_flags() {
-    let mut c = Core::<3, 4>::new().unwrap();
+    let c = authority::<3, 4>();
     let t = c.create_table(8, &mut storage(8)).unwrap();
     let a = c.open(t, Fd(0), description(1), false).unwrap();
     let alias = c.dup(t, a).unwrap();
@@ -146,7 +188,7 @@ fn setfl_preserves_immutable_flags_and_access() {
         AccessMode::WriteOnly,
         AccessMode::ReadWrite,
     ] {
-        let mut c = Core::<1, 2>::new().unwrap();
+        let c = authority::<1, 2>();
         let t = c.create_table(4, &mut storage(4)).unwrap();
         let initial = StatusFlags {
             dsync: true,
@@ -193,7 +235,7 @@ fn setfl_preserves_immutable_flags_and_access() {
             assert_eq!(c.getfd(t, a), Ok(true));
         }
     }
-    let mut c = Core::<1, 1>::new().unwrap();
+    let c = authority::<1, 1>();
     let t = c.create_table(1, &mut storage(1)).unwrap();
     let a = c
         .open(
@@ -209,7 +251,7 @@ fn setfl_preserves_immutable_flags_and_access() {
 #[test]
 fn close_range_and_exec_sweep() {
     for cloexec in [false, true] {
-        let mut c = Core::<2, 8>::new().unwrap();
+        let c = authority::<2, 8>();
         let t = c.create_table(8, &mut storage(8)).unwrap();
         for fd in 0..8 {
             c.open(t, Fd(0), description(fd), false).unwrap();
@@ -245,7 +287,7 @@ fn close_range_and_exec_sweep() {
 
 #[test]
 fn lowered_limit_preserves_existing_entries_and_exec() {
-    let mut c = Core::<2, 8>::new().unwrap();
+    let c = authority::<2, 8>();
     let t = c.create_table(8, &mut storage(8)).unwrap();
     let high = c.open(t, Fd(7), description(7), true).unwrap();
     c.set_limit(t, 0).unwrap();
@@ -266,8 +308,10 @@ fn lowered_limit_preserves_existing_entries_and_exec() {
 
 #[test]
 fn capacity_failures_are_transactional_and_reclaim_storage() {
-    assert!(TableStorage::new(&mut [DescriptorSlot::default(); 65], &mut [0; 2]).is_err());
-    let mut c = Core::<1, 1>::new().unwrap();
+    let slots: Vec<DescriptorSlot> = (0..65).map(|_| DescriptorSlot::default()).collect();
+    let words = [AtomicU64::new(0), AtomicU64::new(0)];
+    assert!(TableStorage::new(&slots, &words).is_err());
+    let c = authority::<1, 1>();
     assert_eq!(
         c.create_table(MAX_DESCRIPTORS + 1, &mut storage(4)),
         Err(Error::InvalidArgument)
@@ -288,7 +332,7 @@ fn capacity_failures_are_transactional_and_reclaim_storage() {
     c.destroy_table(t, |_| {}).unwrap();
     let t = c.create_table(4, &mut storage(4)).unwrap();
     assert_eq!(c.open(t, Fd(0), description(3), false), Ok(Fd(0)));
-    let mut empty = Core::<1, 0>::new().unwrap();
+    let empty = authority::<1, 0>();
     let t = empty.create_table(1, &mut storage(1)).unwrap();
     assert_eq!(
         empty.open(t, Fd(0), description(0), false),
@@ -297,7 +341,7 @@ fn capacity_failures_are_transactional_and_reclaim_storage() {
 }
 
 fn structural<const F: usize>() {
-    let mut c = Core::<1, 1>::new().unwrap();
+    let c = authority::<1, 1>();
     let t = c.create_table(F, &mut storage(F)).unwrap();
     c.open(t, Fd(0), description(0), false).unwrap();
     for i in 1..F {
@@ -306,13 +350,9 @@ fn structural<const F: usize>() {
     assert_eq!(c.dup(t, Fd(0)), Err(Error::TooManyFiles));
     for i in (1..F).rev() {
         assert!(c.close(t, Fd(i as i32)).unwrap().is_none());
-        let table = c.table(t).unwrap();
-        let (found, words) = table.lowest(0);
+        let (found, words, levels) = c.probe_lowest(t, 0);
         assert_eq!(found, Some(i));
-        assert!(
-            words < 2 * table.storage.levels,
-            "bitmap work must be logarithmic"
-        );
+        assert!(words < 2 * levels, "bitmap work must be logarithmic");
         assert_eq!(c.dup(t, Fd(0)), Ok(Fd(i as i32)));
         assert_eq!(c.get(t, Fd(i as i32)).unwrap().backing, BackingToken(0));
     }
@@ -321,10 +361,10 @@ fn structural<const F: usize>() {
         let _ = c.close(t, Fd(fd as i32)).unwrap();
     }
     for min in 0..F {
-        let (actual, words) = c.table(t).unwrap().lowest(min);
+        let (actual, words, levels) = c.probe_lowest(t, min);
         let expected = (min..F).find(|fd| fd % 3 == 0);
         assert_eq!(actual, expected);
-        assert!(words < 2 * c.table(t).unwrap().storage.levels);
+        assert!(words < 2 * levels);
     }
 }
 
@@ -340,8 +380,8 @@ fn logarithmic_work_at_four_scales_without_an_allocator() {
 
 #[test]
 fn table_identity_cannot_cross_authorities() {
-    let mut a = Core::<1, 1>::new().unwrap();
-    let mut b = Core::<1, 1>::new().unwrap();
+    let a = authority::<1, 1>();
+    let b = authority::<1, 1>();
     let ta = a.create_table(4, &mut storage(4)).unwrap();
     let tb = b.create_table(4, &mut storage(4)).unwrap();
     a.open(ta, Fd(0), description(1), false).unwrap();
@@ -353,7 +393,7 @@ fn table_identity_cannot_cross_authorities() {
 #[test]
 fn unshare_close_range_keeps_siblings_intact() {
     for cloexec in [false, true] {
-        let mut c = Core::<2, 1>::new().unwrap();
+        let c = authority::<2, 1>();
         let parent = c.create_table(4, &mut storage(4)).unwrap();
         let a = c.open(parent, Fd(0), description(1), false).unwrap();
         assert_eq!(
@@ -385,13 +425,13 @@ fn unshare_close_range_keeps_siblings_intact() {
 
 #[test]
 fn configured_ceiling_is_independent_of_backing() {
-    let mut c = Core::<1, 1>::new().unwrap();
+    let c = authority::<1, 1>();
     assert!(c.create_table(65_536, &mut storage(4)).is_ok());
 }
 
 #[test]
 fn growth_preserves_identity_references_flags_and_lowest_holes() {
-    let mut c = Core::<2, 2>::new().unwrap();
+    let c = authority::<2, 2>();
     let t = c.create_table(65_536, &mut storage(4)).unwrap();
     let a = c.open(t, Fd(0), description(1), true).unwrap();
     for fd in 1..4 {
@@ -423,12 +463,12 @@ fn growth_preserves_identity_references_flags_and_lowest_holes() {
     );
     let mut too_small = storage(3);
     assert_eq!(c.grow_table(t, &mut too_small), Err(Error::InvalidArgument));
-    assert_eq!(too_small.capacity(), 3);
+    assert_eq!(too_small.capacity, 3);
     assert_eq!(c.refcount(t, a), Ok(4));
     assert_eq!(c.close(t, Fd(2)), Ok(None));
     let mut larger = storage(65_536);
     c.grow_table(t, &mut larger).unwrap();
-    assert_eq!(larger.capacity(), 4);
+    assert_eq!(larger.capacity, 4);
     assert_eq!(c.refcount(t, a), Ok(3));
     assert_eq!(c.getfd(t, a), Ok(true));
     assert_eq!(c.get(t, a).unwrap().offset, Offset(91));
@@ -451,7 +491,7 @@ fn growth_preserves_identity_references_flags_and_lowest_holes() {
 
 #[test]
 fn empty_backing_and_fork_growth_refuse_without_side_effects() {
-    let mut c = Core::<2, 1>::new().unwrap();
+    let c = authority::<2, 1>();
     let parent = c.create_table(1_048_576, &mut storage(0)).unwrap();
     assert_eq!(
         c.open(parent, Fd(0), description(1), false),
@@ -465,7 +505,7 @@ fn empty_backing_and_fork_growth_refuse_without_side_effects() {
         c.fork(parent, &mut small),
         Err(Error::NeedsBacking { descriptors: 65 })
     );
-    assert_eq!(small.capacity(), 64);
+    assert_eq!(small.capacity, 64);
     assert_eq!(c.refcount(parent, a), Ok(1));
     let child = c.fork(parent, &mut storage(130)).unwrap();
     c.grow_table(parent, &mut storage(65_536)).unwrap();
@@ -484,7 +524,264 @@ fn empty_backing_and_fork_growth_refuse_without_side_effects() {
     let mut count = 0;
     let backing = c.destroy_table(parent, |_| count += 1).unwrap();
     assert_eq!(count, 1);
-    let (slots, bitmap) = backing.into_parts();
+    let (slots, bitmap) = TestArena.resolve(backing).unwrap();
     assert_eq!(slots.len(), 65_536);
     assert_eq!(bitmap.len(), bitmap_words(65_536));
+}
+
+// ---- contract kernel.el1.ipc-fd-authority (VM-free bindings) ----
+
+fn table_with<const T: usize, const O: usize>(c: &View<T, O>, fds: i32) -> TableId {
+    let t = c.create_table(1024, &mut storage(64)).unwrap();
+    for i in 0..fds {
+        assert_eq!(
+            c.open(t, Fd(0), description(100 + i as u64), false),
+            Ok(Fd(i))
+        );
+    }
+    t
+}
+
+#[test]
+fn el1_ipc_fd_reuse_during_blocked_io_keeps_pinned_description() {
+    let c = authority::<2, 8>();
+    let t = table_with(&c, 3);
+    let a = c.open(t, Fd(0), description(7), false).unwrap();
+    assert_eq!(a, Fd(3));
+    let (pin, seen) = c.pin(t, a).unwrap();
+    assert_eq!(seen.backing, BackingToken(7));
+    // The blocked syscall's fd is closed and the number reused.
+    assert_eq!(c.close(t, a), Ok(None), "a pinned description is not final");
+    let b = c.open(t, Fd(0), description(8), false).unwrap();
+    assert_eq!(b, a);
+    assert_eq!(c.get(t, b).unwrap().backing, BackingToken(8));
+    assert_ne!(
+        pin.key(),
+        c.pin(t, b)
+            .map(|(p, _)| {
+                let key = p.key();
+                assert_eq!(c.unpin(p), Ok(None));
+                key
+            })
+            .unwrap()
+    );
+    // The suspended operation still resolves exactly its own description.
+    assert_eq!(c.pinned(&pin).unwrap().backing, BackingToken(7));
+    assert_eq!(c.holds(&pin), Ok((0, 1)));
+    assert_eq!(c.unpin(pin).unwrap().unwrap().backing, BackingToken(7));
+    assert_eq!(c.get(t, b).unwrap().backing, BackingToken(8));
+}
+
+#[test]
+fn el1_ipc_final_close_versus_inflight_pin_releases_once() {
+    let c = authority::<3, 4>();
+    let t = table_with(&c, 0);
+    let a = c.open(t, Fd(0), description(1), false).unwrap();
+    let alias = c.dup(t, a).unwrap();
+    let child = c.fork(t, &mut storage(64)).unwrap();
+    let (first, _) = c.pin(child, alias).unwrap();
+    let (second, _) = c.pin(t, a).unwrap();
+    assert_eq!(c.holds(&first), Ok((4, 2)));
+    let raw = second.into_raw();
+    // Every descriptor goes away while two operations are in flight.
+    c.destroy_table(child, |_| panic!("pinned description finalized"))
+        .unwrap();
+    assert_eq!(c.close(t, a), Ok(None));
+    assert_eq!(c.close(t, alias), Ok(None));
+    assert_eq!(c.holds(&first), Ok((0, 2)));
+    assert_eq!(c.unpin(first), Ok(None));
+    let released = c.unpin(OfdPin::from_raw(raw)).unwrap();
+    assert_eq!(
+        released.unwrap().backing,
+        BackingToken(1),
+        "one final release"
+    );
+    // A copied raw pin is not a second pin: it fails closed, changes nothing.
+    assert_eq!(c.unpin(OfdPin::from_raw(raw)), Err(Error::StalePin));
+    assert_eq!(c.open(t, Fd(0), description(2), false), Ok(Fd(0)));
+    assert_eq!(c.unpin(OfdPin::from_raw(raw)), Err(Error::StalePin));
+    assert_eq!(c.refcount(t, Fd(0)), Ok(1));
+}
+
+#[test]
+fn el1_ipc_fork_shares_status_flags_not_descriptor_flags() {
+    let c = authority::<2, 2>();
+    let parent = table_with(&c, 0);
+    let a = c.open(parent, Fd(0), description(5), true).unwrap();
+    let child = c.fork(parent, &mut storage(64)).unwrap();
+    let (pin, before) = c.pin(parent, a).unwrap();
+    assert!(!before.flags.nonblock);
+    let nonblock = StatusFlags {
+        nonblock: true,
+        ..StatusFlags::default()
+    };
+    c.setfl(child, a, nonblock).unwrap();
+    assert_eq!(c.getfl(parent, a).unwrap().1, nonblock);
+    // A suspended operation observes the shared description's new flags.
+    assert!(c.pinned(&pin).unwrap().flags.nonblock);
+    c.setfd(child, a, false).unwrap();
+    assert_eq!(c.getfd(parent, a), Ok(true));
+    c.exec(parent, |_| panic!("child still references"))
+        .unwrap();
+    assert_eq!(c.getfd(child, a), Ok(false));
+    assert_eq!(c.unpin(pin), Ok(None));
+    let mut released = 0;
+    c.destroy_table(child, |_| released += 1).unwrap();
+    assert_eq!(released, 1);
+}
+
+#[test]
+fn el1_ipc_growth_and_refusals_roll_back() {
+    let c = authority::<2, 4>();
+    let t = c.create_table(1024, &mut storage(2)).unwrap();
+    let a = c.open(t, Fd(0), description(1), false).unwrap();
+    c.dup(t, a).unwrap();
+    assert_eq!(c.dup(t, a), Err(Error::NeedsBacking { descriptors: 3 }));
+    // An unresolvable extent refuses with nothing consumed or changed.
+    let mut bogus = Extent {
+        token: u64::MAX,
+        capacity: 8,
+    };
+    assert_eq!(c.grow_table(t, &mut bogus), Err(Error::BadBacking));
+    assert_eq!(bogus.token, u64::MAX);
+    assert_eq!(c.fork(t, &mut bogus), Err(Error::BadBacking));
+    assert_eq!(c.refcount(t, a), Ok(2));
+    // Table identities exhausted: fork refuses without retaining.
+    let other = c.create_table(4, &mut storage(4)).unwrap();
+    let mut spare = storage(8);
+    assert_eq!(c.fork(t, &mut spare), Err(Error::NoMemory));
+    assert_eq!(spare.capacity, 8);
+    assert_eq!(c.refcount(t, a), Ok(2));
+    c.destroy_table(other, |_| {}).unwrap();
+    // Growth then succeeds and preserves references and holes.
+    let mut larger = storage(8);
+    c.grow_table(t, &mut larger).unwrap();
+    assert_eq!(larger.capacity, 2, "the retired extent is handed back");
+    assert_eq!(c.dup(t, a), Ok(Fd(2)));
+    assert_eq!(c.refcount(t, a), Ok(3));
+}
+
+#[test]
+fn el1_ipc_stale_generations_are_rejected() {
+    let c = authority::<1, 2>();
+    let t = table_with(&c, 1);
+    let raw = t.to_raw();
+    assert_eq!(TableId::from_raw(raw), t);
+    c.destroy_table(t, |_| {}).unwrap();
+    assert_eq!(c.get(t, Fd(0)), Err(Error::StaleTable));
+    let reused = c.create_table(4, &mut storage(4)).unwrap();
+    assert_eq!(
+        reused.to_raw().index,
+        raw.index,
+        "same slot, new incarnation"
+    );
+    assert_eq!(
+        c.open(TableId::from_raw(raw), Fd(0), description(1), false),
+        Err(Error::StaleTable)
+    );
+    let forged = TableId::from_raw(RawTableId {
+        authority: raw.authority ^ 1,
+        ..reused.to_raw()
+    });
+    assert_eq!(c.get(forged, Fd(0)), Err(Error::StaleTable));
+    // A pin from another authority never resolves here.
+    let other = authority::<1, 2>();
+    let ot = table_with(&other, 1);
+    let (foreign, _) = other.pin(ot, Fd(0)).unwrap();
+    let raw_foreign = foreign.into_raw();
+    assert_eq!(
+        c.pinned(&OfdPin::from_raw(raw_foreign)),
+        Err(Error::StalePin)
+    );
+    assert_eq!(other.unpin(OfdPin::from_raw(raw_foreign)), Ok(None));
+}
+
+#[test]
+fn el1_ipc_unpublished_core_fails_closed_and_initializes_in_place() {
+    // Shared memory starts zeroed: a valid but unpublished core.
+    let zeroed: Box<core::mem::MaybeUninit<Core<2, 4>>> = Box::new_zeroed();
+    // SAFETY: every field of Core is an atomic or integer; all-zero is valid.
+    let core: &'static Core<2, 4> = Box::leak(unsafe { zeroed.assume_init() });
+    let c = core.bind(&TestArena, Spin);
+    assert_eq!(c.create_table(4, &mut storage(4)), Err(Error::StaleTable));
+    assert_eq!(core.initialize(0), Err(Error::InvalidArgument));
+    core.initialize(0xC0DE).unwrap();
+    assert_eq!(core.initialize(0xC0DE), Err(Error::InvalidArgument));
+    assert_eq!(core.identity(), 0xC0DE);
+    let t = c.create_table(4, &mut storage(4)).unwrap();
+    assert_eq!(c.open(t, Fd(0), description(1), false), Ok(Fd(0)));
+    // Two venues bound to one core share one authority, not copies.
+    let host_view = core.bind(&TestArena, BoundedSpin(64));
+    assert_eq!(host_view.get(t, Fd(0)).unwrap().backing, BackingToken(1));
+}
+
+#[test]
+fn el1_ipc_contended_table_lock_refuses_before_effects() {
+    let core: &'static Core<1, 2> = Box::leak(Box::new(Core::new().unwrap()));
+    let host = core.bind(&TestArena, Spin);
+    let el1 = core.bind(&TestArena, BoundedSpin(16));
+    let t = host.create_table(4, &mut storage(4)).unwrap();
+    host.open(t, Fd(0), description(1), false).unwrap();
+    core.tables[0].lock.store(1, Ordering::Release); // another venue holds it
+    assert_eq!(el1.dup(t, Fd(0)).map(|_| ()), Err(Error::Contended));
+    assert_eq!(el1.pin(t, Fd(0)).map(|_| ()), Err(Error::Contended));
+    core.tables[0].lock.store(0, Ordering::Release);
+    assert_eq!(el1.refcount(t, Fd(0)), Ok(1));
+    assert_eq!(el1.getfd(t, Fd(1)), Err(Error::BadFd));
+}
+
+#[test]
+fn el1_ipc_direct_lookup_reads_one_slot_at_every_scale() {
+    for scale in [65usize, 4096, 65_536] {
+        let c = authority::<1, 1>();
+        let t = c.create_table(scale, &mut storage(scale)).unwrap();
+        c.open(t, Fd(0), description(3), false).unwrap();
+        for _ in 1..scale {
+            c.dup(t, Fd(0)).unwrap();
+        }
+        for fd in [0, scale / 2, scale - 1] {
+            let before = SLOT_READS.with(|n| n.get());
+            let (pin, _) = c.pin(t, Fd(fd as i32)).unwrap();
+            assert_eq!(SLOT_READS.with(|n| n.get()) - before, 1, "scale {scale}");
+            assert_eq!(c.unpin(pin), Ok(None));
+        }
+    }
+}
+
+#[test]
+fn el1_ipc_concurrent_pins_and_closes_release_exactly_once() {
+    use std::sync::atomic::AtomicUsize;
+    let core: &'static Core<2, 4> = Box::leak(Box::new(Core::new().unwrap()));
+    for round in 0..200u64 {
+        let c = core.bind(&TestArena, Spin);
+        let parent = c.create_table(16, &mut storage(16)).unwrap();
+        let fd = c.open(parent, Fd(0), description(round), false).unwrap();
+        let child = c.fork(parent, &mut storage(16)).unwrap();
+        let releases = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for table in [parent, child] {
+                let releases = &releases;
+                s.spawn(move || {
+                    let c = core.bind(&TestArena, Spin);
+                    for _ in 0..8 {
+                        match c.pin(table, fd) {
+                            Ok((pin, d)) => {
+                                assert_eq!(d.backing, BackingToken(round));
+                                if c.unpin(pin).unwrap().is_some() {
+                                    releases.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) => assert_eq!(e, Error::BadFd),
+                        }
+                    }
+                    if c.close(table, fd).unwrap().is_some() {
+                        releases.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(releases.load(Ordering::Relaxed), 1, "round {round}");
+        c.destroy_table(parent, |_| panic!("empty")).unwrap();
+        c.destroy_table(child, |_| panic!("empty")).unwrap();
+    }
 }
