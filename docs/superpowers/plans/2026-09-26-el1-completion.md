@@ -282,8 +282,13 @@ cases also retain served-write bound failures. Negative entitlement and
 cleanup pass. Exact executable/census preserved in adapter
 `processes-wake-fix*`; do not claim full liveness or zero-exit closure.
 
-Immediate next action is existing kernel post-mortem/event-ring capture of
-the remaining eventfd64 workers to identify exact wait ownership. This qualifies
+Existing post-mortem capture on the preserved artifact reproduces the stall
+at eventfd8, showing two enrolled zone continuations and one remaining
+shared eventfd pair (two tables, fd9/10, exact descriptions301/302).
+Capture is untruncated, cleanup zero; see adapter `processes-capture/`.
+Counter values and saved IPC operation payloads are absent from this graph.
+Next is bounded LLDB inspection of those existing values, to distinguish
+missed notification from consumed/replayed progress before another edit. This qualifies
 as a direct dependency, unlike the stopped historical capture investigation.
 Do not label the counters a diagnosis or reopen unrelated lifecycle work.
 
