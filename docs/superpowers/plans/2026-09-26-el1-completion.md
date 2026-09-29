@@ -173,7 +173,7 @@ do not overwrite it with that branch's pre-refresh controller.
 | `wt-cp2-return` / `work/cp2-elastic-return` | `8f268dee4` | Review candidate; scoped grant/return accounting and signed green are handoff claims |
 | `wt-cp2-tests` / `work/cp2-ownership-tests` | `45fa94124` | Contains deliberately red ownership witnesses; dedicated host-COW accessor still panics |
 | `wt-cp2-reserve` / `work/cp2-el1-reservations` | `f2efa3716` | Explicit unverified WIP; reservation provider/projection and host authority work incomplete |
-| `wt-cp3-adapter` / `work/cp3-ipc-adapter` | `ab5ec3e1d` (signed source `e6e2ab3bf`) | Live pipe/eventfd routing proven for one single-thread round-trip population; full vertical unaccepted |
+| `wt-cp3-adapter` / `work/cp3-ipc-adapter` | `c1c17d963` (latest signed population source) | Live routing and blocking 1/8/64-pair data populations demonstrated; forwarding variability and full vertical acceptance open |
 | `wt-cp3-host` / `work/cp3-ipc-host` | `77b6f40a1` | Shared backing/lifetime foundation; descriptor-table integration and host blocking continuation open |
 | `wt-cp3-fixture` / `work/cp3-ipc-fixture` | `fd27e748d` | Five signed acceptance tests plus report validators/contracts; baseline red is a handoff claim |
 | `wt-cp3-objects` / `work/cp3-ipc-shared-objects` | `bb93917a4` | Ancestry-confirmed in adapter branch |
@@ -191,12 +191,12 @@ and saving recoverable state. Never sweep shared probe/build storage.
 
 ### Immediate deliverable and drift check
 
-The next deliverable is a real signed pipe/eventfd round trip through EL1,
-with production FileTable publication and observed guest execution. The
-existing helper/core tests are prerequisites, not this deliverable. No new
-checkpoint has been accepted by the IPC development commits.
+The first production-routing deliverable is demonstrated, including real
+blocking pipe/eventfd populations at 1/8/64 pairs. The next deliverable is
+correct descriptor close/reuse while an operation is blocked, plus two-live-
+process IPC. No checkpoint has been accepted by these focused results.
 
-Execute these steps in order:
+Development sequence (steps 1 and 2 demonstrated; step 3 active):
 1. Connect HostTable to the real FileTable: complete initial namespace,
    implicit stdio, incremental mutation, fork/exec and functional retirement.
    A partially published namespace is invalid because missing slots become
@@ -251,13 +251,26 @@ unentitled negative control, with zero scoped leftovers. Tested SHA-256
 independently matched to the official manifest and its bytes preserved.
 The first failed run, fixture-lock delta and failing executable remain saved.
 
-**Next implementation/qualification step:** real blocking/park/wake and
-close/reuse witnesses, then mixed-venue and signals/partial progress at the
-required scales and two-process shapes. Do not return to historical lifecycle
-attribution unless it blocks these. This is the first live pipe/eventfd
-routing milestone, not scoped zero-exit proof, a timing ratio, full CI or
-checkpoint acceptance. Main is unchanged; x86 remains deferred. All build
-and execution handles from this interval are terminal.
+**Latest blocking evidence:** signed source `c1c17d963`, run
+`el1-ipc-pairs-20260929-b`, completed pipe and eventfd at 1/8/64 pairs,
+128 rounds each, with checked payloads and real guest parks. All six cases,
+entitlement negative control and scoped cleanup passed. Exact manifest,
+raw output and preserved-artifact location are in the adapter's
+`docs/perf-results/2026-09-29-el1-ipc-integration/pairs-population*` receipts.
+
+The earlier pipe-eight served-write shortfall remains unresolved; no product
+fix separates that red from this green. Whole-run counters do not establish
+unique completed syscalls or zero IPC-caused host exits. Do not retry this
+population to manufacture acceptance or build a new observation framework.
+
+**Next implementation/qualification step:** blocked close/reuse and two-live-
+process witnesses, then mixed venue and signals/partial progress. Keep the
+forwarding/counter issue as an explicit acceptance blocker while independent
+functional migration proceeds. Any investigation must name its blocked
+capability, a decisive experiment and a stopping condition. After two failed
+fixture designs or two supporting-only intervals, reassess before more work.
+Full suites belong at stable integration boundaries; focused contracts guide
+implementation. Main is unchanged; x86 remains deferred.
 
 **Priority reset, explicitly requested by the user on 2026-09-29:** stop the
 expanding deferred-capture investigation and resume work on guest capabilities.
