@@ -40,8 +40,10 @@ impl Channel {
 }
 impl Drop for Channel {
     fn drop(&mut self) {
-        assert_eq!(unsafe { libc::close(self.read) }, 0, "close reader");
-        if self.write != self.read {
+        if self.read >= 0 {
+            assert_eq!(unsafe { libc::close(self.read) }, 0, "close reader");
+        }
+        if self.write >= 0 && self.write != self.read {
             assert_eq!(unsafe { libc::close(self.write) }, 0, "close writer");
         }
     }
@@ -147,5 +149,62 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
     assert!(libc::WIFEXITED(status), "child status {status}");
     assert_eq!(libc::WEXITSTATUS(status), 0, "child status {status}");
     println!("ipc-processes kind={kind} pairs={pairs} rounds={rounds} completed={completed}");
+    0
+}
+
+/// Separate fork tables share descriptions. Replacing a parent slot must not
+/// redirect the child's inherited endpoint; final writer close must yield EOF.
+pub fn lifetime() -> i32 {
+    const ROUNDS: u64 = 128;
+    let mut request = Channel::new(false);
+    let mut response = Channel::new(false);
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork");
+    if pid == 0 {
+        assert_eq!(unsafe { libc::close(request.write) }, 0);
+        request.write = -1;
+        assert_eq!(unsafe { libc::close(response.read) }, 0);
+        response.read = -1;
+        for round in 1..=ROUNDS {
+            assert_eq!(request.receive(), round);
+            response.send(round ^ 0x1000);
+        }
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe { libc::read(request.read, (&mut byte as *mut u8).cast(), 1) },
+            0,
+            "final writer close must produce EOF"
+        );
+        response.send(0xeeee);
+        drop(request);
+        drop(response);
+        unsafe { libc::_exit(0) }
+    }
+    assert_eq!(unsafe { libc::close(response.write) }, 0);
+    response.write = -1;
+    let replacement = unsafe { libc::eventfd(42, libc::EFD_NONBLOCK) };
+    assert!(replacement >= 0 && replacement != request.read);
+    assert_eq!(
+        unsafe { libc::dup2(replacement, request.read) },
+        request.read
+    );
+    assert_eq!(unsafe { libc::close(replacement) }, 0);
+    assert_eq!(request.receive(), 42, "parent replacement identity");
+    for round in 1..=ROUNDS {
+        request.send(round);
+        assert_eq!(
+            response.receive(),
+            round ^ 0x1000,
+            "child retained original endpoint"
+        );
+    }
+    assert_eq!(unsafe { libc::close(request.write) }, 0);
+    request.write = -1;
+    assert_eq!(response.receive(), 0xeeee, "child observed EOF");
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    println!("ipc-lifetime completed=128 reused=1 eof=1 child_exit=0");
     0
 }

@@ -799,6 +799,27 @@ fn el1_sched_pstate_seen_by_the_guest_is_unchanged() {
     );
 }
 
+/// Independent inherited-table replacement and final-close qualification.
+#[test]
+fn el1_ipc_inherited_descriptor_lifetime() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(&carrier, &["ipc-lifetime"], Duration::from_secs(60));
+    println!(
+        "IPC lifetime zone={:?} forwarded={:?} {}",
+        measured.zone,
+        measured.forwarded_syscalls,
+        describe(&measured)
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert_eq!(
+        measured.result.stdout_utf8().trim(),
+        "ipc-lifetime completed=128 reused=1 eof=1 child_exit=0"
+    );
+    assert!(measured.zone.el1_parks >= 128, "{:?}", measured.zone);
+}
+
 /// Concurrent production pipe/eventfd pairs. Whole-run counters establish
 /// repeated guest blocking; exact scoped work/exit acceptance remains separate.
 #[test]
