@@ -806,6 +806,10 @@ pub use rootfs_helpers::linux_errno;
 pub(crate) use rootfs_helpers::*;
 pub mod io_buffers;
 pub(in crate::dispatch) use io_buffers::*;
+#[cfg(test)]
+pub(crate) mod allocation_meter;
+#[cfg(test)]
+pub(crate) mod budget_meter;
 pub mod mm_authority;
 pub mod mm_quiesce;
 pub mod native_execution;

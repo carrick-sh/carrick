@@ -886,6 +886,7 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
     }
     fn host_signal(&self) -> &dyn HostSignalBridge;
     fn detach_fd_from_epolls(&self, _fd: i32) {}
+    fn detach_open_file_from_epolls(&self, _fd: i32, _open_file: &OpenFile) {}
     fn close_open_file_and_free_pty(&self, _open_file: &OpenFile) {}
     fn mqueue_owner_alias_closed(
         &self,
@@ -1032,6 +1033,9 @@ impl FsCrossSubsystem for SyscallDispatcher {
     }
     fn detach_fd_from_epolls(&self, fd: i32) {
         self.detach_fd_from_epolls(fd);
+    }
+    fn detach_open_file_from_epolls(&self, fd: i32, open_file: &OpenFile) {
+        self.detach_open_file_from_epolls(fd, open_file);
     }
     fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
         self.close_open_file_and_free_pty(open_file);

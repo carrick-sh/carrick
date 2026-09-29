@@ -358,6 +358,8 @@ impl<'a> FsView<'a> {
     }
 
     pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_lookup();
         self.captured_file_table()
             .read_open_files()
             .get(&fd)
@@ -374,6 +376,8 @@ impl<'a> FsView<'a> {
     }
 
     pub(in crate::dispatch) fn fd_table_contains(&self, fd: i32) -> bool {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_lookup();
         self.captured_file_table()
             .read_open_files()
             .contains_key(&fd)
@@ -586,15 +590,26 @@ impl<'a> FsView<'a> {
     /// name=basename) — the kernel reports a child file's IN_ACCESS/IN_MODIFY to
     /// the directory watch with the child's name. No-op when nothing is watched,
     /// when `fd` has no recorded path, or when `fd` is a pipe/socket/anon inode.
+    #[allow(dead_code)]
     pub(in crate::dispatch) fn inotify_emit_for_fd(&self, fd: i32, mask: u32) {
         if self.fs.inotify_registry.is_empty() {
             return;
         }
-        // Only regular files / directories generate these events. Skip the
-        // non-file descriptions early so a pipe/socket read doesn't misfire.
         let Some(open_file) = self.open_file(fd) else {
             return;
         };
+        self.inotify_emit_for_open_file(fd, &open_file, mask);
+    }
+
+    pub(in crate::dispatch) fn inotify_emit_for_open_file(
+        &self,
+        fd: i32,
+        open_file: &OpenFile,
+        mask: u32,
+    ) {
+        if self.fs.inotify_registry.is_empty() {
+            return;
+        }
         let is_dir = {
             let Some(open) = open_file.description.inspect() else {
                 return;
@@ -631,6 +646,13 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return;
         };
+        self.inotify_close_for_open_file(fd, &open_file);
+    }
+
+    pub(in crate::dispatch) fn inotify_close_for_open_file(&self, fd: i32, open_file: &OpenFile) {
+        if self.fs.inotify_registry.is_empty() {
+            return;
+        }
         // Writability and kind are fixed at open: inspect without recalling.
         let Some(Some((mask, is_dir))) = open_file.description.inspect_kind(|open| {
             let writable = match open {
@@ -711,6 +733,7 @@ impl<'a> FsView<'a> {
     /// `FAN_MODIFY`), mirroring [`Self::inotify_emit_for_fd`]. Only regular
     /// files and directories generate these, and only when the fd's open path
     /// is recoverable.
+    #[allow(dead_code)]
     pub(in crate::dispatch) fn fanotify_emit_for_fd(
         &self,
         context: &crate::kernel::KernelContext,
@@ -723,6 +746,19 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return;
         };
+        self.fanotify_emit_for_open_file(context, fd, &open_file, events);
+    }
+
+    pub(in crate::dispatch) fn fanotify_emit_for_open_file(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        open_file: &OpenFile,
+        events: carrick_abi::LinuxFanotifyEvents,
+    ) {
+        if self.fs.fanotify_registry.is_empty() {
+            return;
+        }
         let is_dir = {
             let Some(open) = open_file.description.inspect() else {
                 return;
@@ -758,6 +794,18 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return;
         };
+        self.fanotify_close_for_open_file(context, fd, &open_file);
+    }
+
+    pub(in crate::dispatch) fn fanotify_close_for_open_file(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        open_file: &OpenFile,
+    ) {
+        if self.fs.fanotify_registry.is_empty() {
+            return;
+        }
         let (events, is_dir) = {
             let Some(open) = open_file.description.inspect() else {
                 return;
