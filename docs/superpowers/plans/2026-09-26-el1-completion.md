@@ -167,7 +167,11 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   74, ABI 32, kernel/semantics 2,459, serial-host 109, runtime 630; existing
   ignores unchanged). Fresh signed proof and the remaining retirement/restore
   lifetime audit are still required; see the `owned-transfer/` receipt.
-  RecordRef preserves identity but does not grant exclusive field access.
+  Cancellation-before-El1Held and delayed flag writes now have red-first
+  repairs using incarnation-bound requests; incarnation exhaustion is also
+  fail-closed. Core62/EL1host74/ABI32 and the broader VM-free regressions
+  passed; see `tagged-requests/`. RecordRef still does not grant exclusive
+  field access; post-publication retirement/restore audit remains open.
   Close all producer publication/cancellation boundaries and then audit
   scheduler handback wakes; historical crash attribution remains separate.
 - [ ] Reduce Python's `SnapshotRestoreFailed`: record 1/incarnation 35925 was

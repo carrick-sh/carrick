@@ -355,6 +355,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<FrameGrantResidencyTable>() as u64,
         core::mem::offset_of!(FrameGrantResidencyRecord, committed) as u64,
         EL1_ZONE_OFFSET,
+        carrick_sched_core::HOST_REQUEST_PROTOCOL,
         // Claim protocol semantics participate even when record layout is
         // unchanged: older images must not decode a transfer as Free.
         carrick_sched_core::Claim::Transferring {

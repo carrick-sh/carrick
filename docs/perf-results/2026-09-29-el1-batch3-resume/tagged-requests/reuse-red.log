@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 1 test
+
+thread 'tests::an_admitted_cancel_request_does_not_cancel_a_reused_record' (33334922) panicked at crates/carrick-sched-core/src/tests.rs:1982:5:
+late cancellation reached replacement
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::an_admitted_cancel_request_does_not_cancel_a_reused_record ... FAILED
+
+failures:
+
+failures:
+    tests::an_admitted_cancel_request_does_not_cancel_a_reused_record
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-sched-core --lib`

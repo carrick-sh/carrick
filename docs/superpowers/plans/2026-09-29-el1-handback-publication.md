@@ -110,11 +110,26 @@ This is not final lifecycle acceptance. Continue step 4 before promotion:
   check, including take_unplaced_service, cancellation after public Host,
   runtime adoption/restore, and discard callbacks that still transfer a
   ready reference plus a separate free decision.
-- OnCpu host-request and cancellation flags remain out-of-band; authenticate
-  their lifetime through concurrent handback and reuse.
+- OnCpu cancellation now records intent before returning El1Held; deferred
+  cancellation/host-request words are bound to non-wrapping incarnations.
+  The handback-before-follow-up and delayed-write/reuse reds pass. Continue
+  auditing owner-side clearing and public Host consumption boundaries.
 - Park sequence wrap behavior is unchanged; do not assume it provides an
   unbounded incarnation guarantee for a later ownership CAS.
 - Complete exact scheduler handback wake targeting, deterministic signed
   bindings, structural observations, historical attribution and all A gates.
 The restored VM-free witnesses establish the named producer-cleanup boundary;
 they do not prove those remaining lifetime boundaries.
+
+
+### Restoration ownership evidence to carry forward
+
+Source inspection: RunnableTask borrows ThreadExecutionLease. Claiming the
+thread moves its boxed blocked continuation out of the thread record into
+that lease; ZoneWait is non-Clone and its Drop is the cancellation producer.
+This protects the normal loader from concurrent destruction of that same
+continuation, but does not by itself prove all producer/service paths safe.
+Backend load and wait_for_materialized can call materialize_zone, which still
+checks live+Host before copying context. Service records are distinct from
+ZoneWait records; settle_vacated only re-places Service records. Audit those
+ownership classes separately before adding or claiming a universal read lease.

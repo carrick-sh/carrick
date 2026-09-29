@@ -1,3 +1,7 @@
+# Request-lifetime follow-up: request words now carry 64-bit incarnation
+# identities and HOST_REQUEST_PROTOCOL participates in ABI hashing. Record
+# layout/hash regression bindings remain required; no new GIC/fault/page-table
+# behavior is asserted by the request lifetime tests.
 # Transfer-protocol review: the shared ABI hash now includes transfer claim
 # encodings, so older images cannot decode an in-flight transfer as Free.
 # No GIC, fault, metadata or page-table layout/algorithm changed here; retain

@@ -552,7 +552,8 @@ fn a_cancelled_record_is_discarded_not_run() {
     let _ = wake(&zone, 0x1000, 2, Waker::El1 { slot: SLOT }).unwrap();
     // The host retired `a`'s thread while EL1 held it (a vCPU was running
     // it when the claim was refused; it is queued again since).
-    zone.record(a).request_cancel();
+    zone.record(a)
+        .request_cancel(zone.record_ref(a).incarnation);
     assert_eq!(
         zone.runnable_head(SLOT),
         Some(b),
@@ -1177,7 +1178,8 @@ fn an_executor_sweeps_cancelled_records_and_takes_its_service_head() {
     enter(&zone, SLOT, 0);
     let a = park(&zone, 1, 0x1000);
     let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
-    zone.record(a).request_cancel();
+    zone.record(a)
+        .request_cancel(zone.record_ref(a).incarnation);
     let service = zone.alloc_host_runnable(identity(2)).unwrap();
     assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(SLOT));
     zone.leave_guest(SLOT, &HostWait);
@@ -1283,7 +1285,8 @@ fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
 
     // Nowhere to go: host owned and handed back, a retired thread discarded.
     zone.leave_guest(OTHER, &HostWait);
-    zone.record(b).request_cancel();
+    zone.record(b)
+        .request_cancel(zone.record_ref(b).incarnation);
     let moved = zone.relocate(
         OTHER,
         None,
@@ -1945,4 +1948,87 @@ fn a_host_request_during_transfer_prevents_guest_relocation() {
     };
     assert_eq!(transfer.finish(&HostWait), Some(original));
     assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
+}
+
+#[test]
+fn cancelled_on_cpu_claim_is_retired_by_the_next_handback() {
+    let zone = zone();
+    let record = park(&zone, 1, 0x1000);
+    let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    assert_eq!(zone.switch_in(SLOT), Some(record));
+    let original = zone.record_ref(record);
+    assert_eq!(
+        zone.claim_for_host(original, None, Handback::Cancelled, &HostWait),
+        HostClaim::El1Held { slot: SLOT }
+    );
+    // The vCPU can hand it back before the host handles El1Held. The
+    // cancellation intent must already belong to this incarnation.
+    assert_eq!(
+        zone.handback_current(SLOT, record),
+        CurrentHandback::Retired
+    );
+    assert!(zone.live(original).is_none());
+    assert_eq!(zone.alloc_record(identity(2)).unwrap(), record);
+}
+
+#[test]
+fn an_admitted_cancel_request_does_not_cancel_a_reused_record() {
+    let zone = zone();
+    let record = service_record(&zone, 1);
+    let original = zone.record_ref(record);
+    let admitted = zone.live(original).unwrap();
+    // Preemption between the live check and the request store, as in the
+    // host's former El1Held cancellation follow-up.
+    zone.free_record(record);
+    assert_eq!(zone.alloc_host_runnable(identity(2)).unwrap(), record);
+    admitted.request_cancel(original.incarnation);
+    assert!(
+        !zone.record(record).is_cancelled(),
+        "late cancellation reached replacement"
+    );
+}
+
+#[test]
+fn exhausted_record_incarnation_is_never_reallocated() {
+    let zone = zone();
+    let record = zone.alloc_host_runnable(identity(1)).unwrap();
+    zone.record(record)
+        .incarnation
+        .store(u64::MAX, Ordering::Release);
+    zone.free_record(record);
+    assert_eq!(
+        zone.record(record).incarnation(),
+        u64::MAX,
+        "incarnation exhaustion must not wrap to an old request identity"
+    );
+    assert_ne!(zone.alloc_host_runnable(identity(2)).unwrap(), record);
+}
+
+#[test]
+fn late_host_requests_neither_target_nor_mask_a_new_incarnation() {
+    let zone = zone();
+    let record = park(&zone, 1, 0x1000);
+    let original = zone.record_ref(record);
+    let admitted = zone.live(original).unwrap();
+    assert_eq!(
+        zone.claim_for_host(original, None, Handback::Control, &HostWait),
+        HostClaim::Claimed
+    );
+    zone.free_record(record);
+    assert_eq!(park(&zone, 2, 0x1000), record);
+    let replacement = zone.record_ref(record);
+    admitted.host_wanted.publish(original.incarnation);
+    assert!(!zone.record(record).host_wanted());
+    admitted.host_wanted.publish(replacement.incarnation);
+    admitted.host_wanted.publish(original.incarnation);
+    assert!(
+        zone.record(record).host_wanted(),
+        "old publisher masked current request"
+    );
+    admitted.cancelled.publish(replacement.incarnation);
+    admitted.cancelled.publish(original.incarnation);
+    assert!(
+        zone.record(record).is_cancelled(),
+        "old publisher masked current cancellation"
+    );
 }

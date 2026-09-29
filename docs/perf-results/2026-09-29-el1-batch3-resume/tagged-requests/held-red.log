@@ -1,0 +1,21 @@
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-sched-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.56s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 1 test
+
+thread 'tests::cancelled_on_cpu_claim_is_retired_by_the_next_handback' (33334896) panicked at crates/carrick-sched-core/src/tests.rs:1963:5:
+assertion `left == right` failed
+  left: HandedBack
+ right: Retired
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::cancelled_on_cpu_claim_is_retired_by_the_next_handback ... FAILED
+
+failures:
+
+failures:
+    tests::cancelled_on_cpu_claim_is_retired_by_the_next_handback
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-sched-core --lib`
