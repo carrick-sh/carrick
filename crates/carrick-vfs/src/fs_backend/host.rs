@@ -5176,7 +5176,9 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let rel_norm = NormalizedRelPath::from_normalized_relative(rel.to_path_buf());
-        self.remove_entry_at(None, None, &rel_norm, false)
+        // The path-only entry point has no admitted kind. Keep the conservative
+        // directory-cache eviction in case it removes a symlinked path.
+        self.remove_entry_at(None, None, &rel_norm, false, true)
     }
 
     fn remove_entry_at(
@@ -5185,6 +5187,7 @@ impl FsBackend for HostFsBackend {
         leaf_c: Option<&std::ffi::CStr>,
         rel: &NormalizedRelPath,
         is_dir: bool,
+        may_alias_directory: bool,
     ) -> Result<bool, BackendError> {
         use std::os::fd::AsRawFd;
         let _mutation = self.archive_mutation_gate.mutation();
@@ -5225,7 +5228,9 @@ impl FsBackend for HostFsBackend {
                 self.evict_dir_cache_subtree(rel.as_path());
                 self.evict_stat_cache_subtree(rel.as_path());
             } else {
-                self.evict_dir_cache_subtree(rel.as_path());
+                if may_alias_directory {
+                    self.evict_dir_cache_subtree(rel.as_path());
+                }
                 if self.use_stat_cache {
                     self.stat_cache.lock().remove(rel.as_path());
                 }
@@ -5522,8 +5527,10 @@ impl FsBackend for HostFsBackend {
             self.dir_gen_for(dst_rel.as_path())
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.evict_dir_cache_subtree(src_rel.as_path());
-        self.evict_dir_cache_subtree(dst_rel.as_path());
+        if changes_dir_topology {
+            self.evict_dir_cache_subtree(src_rel.as_path());
+            self.evict_dir_cache_subtree(dst_rel.as_path());
+        }
         self.evict_stat_cache_subtree(src_rel.as_path());
         self.evict_stat_cache_subtree(dst_rel.as_path());
         Ok(OverlayRenameOutcome::Renamed)
