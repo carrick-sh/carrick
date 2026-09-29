@@ -204,8 +204,10 @@ must provide those witnesses where applicable.
 ### A. Close batch-3 lifecycle blockers
 
 Next bounded proof: [signed deferred handback ordering](2026-09-29-el1-signed-handback-proof.md).
-Capture must precede the stale-record filter; start with one real guest
-retirement/reuse ordering before expanding populations. The parked-restore
+The capture hook is implemented with VM-free red/green and lock-release
+controls. Its first signed two-process trigger failed with zero captures
+on `497096b2f`; retain that fixture failure and establish actual queued-record
+evacuation before adding retirement/reuse ordering or expanding populations. The parked-restore
 admission fixture now confirms generic and exact wakes cannot queue a parked
 record; this is negative coverage, not historical crash attribution.
 
