@@ -158,6 +158,58 @@ struct HostWakeEntry {
     target: HostWakeTarget,
 }
 
+/// Host ownership of one description in the shared fd core. Numeric tables
+/// and in-flight guest operations retain this same OFD, rather than creating
+/// additional owners of its backing. Dropping the host pin releases backing
+/// only if no descriptor or operation in either venue still holds it.
+#[derive(Debug)]
+pub struct HostDescription {
+    owner: std::sync::Arc<HostIpc>,
+    pin: Option<fd::OfdPin>,
+}
+
+impl HostDescription {
+    /// Install the exact admitted description into a shared table. Caller
+    /// supplies already-provisioned capacity and serializes slot admission.
+    pub fn install(
+        &self,
+        table: fd::TableId,
+        target: fd::Fd,
+        cloexec: bool,
+    ) -> Result<(), fd::Error> {
+        self.owner.region().fd(HostLockWait).install_pin(
+            table,
+            target,
+            self.pin.as_ref().ok_or(fd::Error::StalePin)?,
+            cloexec,
+        )
+    }
+}
+
+impl Drop for HostDescription {
+    fn drop(&mut self) {
+        let Some(pin) = self.pin.take() else {
+            return;
+        };
+        let description = self
+            .owner
+            .region()
+            .fd(HostLockWait)
+            .unpin(pin)
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::description", "invalid owned description pin")
+            });
+        if let Some(description) = description {
+            self.owner.release(description.backing).unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!(
+                    "ipc::description",
+                    "invalid final description backing"
+                )
+            });
+        }
+    }
+}
+
 /// One kernel's IPC authority and all memory needed by both venues.
 /// Runtime mappings must retain an `Arc<HostIpc>` for their entire lifetime.
 /// The pool reserves virtual address space; anonymous pages are committed by
@@ -454,6 +506,19 @@ impl HostIpc {
             capacity: capacity as u64,
         })
     }
+    /// Admit an owned host description before installing any numeric fd.
+    /// On refusal the caller still owns and must release the backing.
+    pub fn admit_description(
+        self: &std::sync::Arc<Self>,
+        description: fd::Description,
+    ) -> Result<HostDescription, fd::Error> {
+        let pin = self.region().fd(HostLockWait).create_pinned(description)?;
+        Ok(HostDescription {
+            owner: std::sync::Arc::clone(self),
+            pin: Some(pin),
+        })
+    }
+
     pub fn create_table(
         &self,
         limit: usize,
