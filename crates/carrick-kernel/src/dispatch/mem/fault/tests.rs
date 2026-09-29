@@ -730,6 +730,53 @@ fn frame_grant_sparse_mincore_tracks_only_faulting_pages() {
 }
 
 #[test]
+fn reconciled_el1_commit_joins_host_residency_and_disarms_first_touch() {
+    let dispatcher = SyscallDispatcher::new();
+    let base = LINUX_MMAP_BASE;
+    let page = dispatcher.linux_page_size();
+    let prot = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    dispatcher.record_dynamic_mapping(base, 3 * page, prot, ProcMapSharing::Private, String::new());
+    dispatcher.track_resident_fault_range(base, 3 * page, prot);
+    let memory = LinearMemory::new(base, vec![0; 3 * page as usize]);
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base, 3 * page, |plan| {
+            dispatcher.commit_resident_frame_grant(plan);
+        })
+        .unwrap();
+    let mut executor = dispatcher.enter_mm_executor().unwrap();
+    let guard = crate::dispatch::mm_mutation::from_executor(&mut executor).unwrap();
+    assert!(dispatcher.reconcile_el1_resident_page(&guard, base + page));
+    assert_eq!(
+        dispatcher.mincore_residency_vector(&memory, base, 3, page),
+        Some(vec![1, 1, 0])
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base + page, |_| ())
+            .is_none()
+    );
+    drop(guard);
+    drop(executor);
+    let child = dispatcher.fork_clone_in_process(
+        crate::thread::ThreadId::synthetic_for_tests(783),
+        crate::thread::ThreadId::synthetic_for_tests(784),
+        783,
+        784,
+    );
+    assert_eq!(
+        child.mincore_residency_vector(&memory, base, 3, page),
+        Some(vec![1, 1, 0])
+    );
+    dispatcher
+        .mem_view()
+        .mark_range_nonresident(base + page, page);
+    assert_eq!(
+        dispatcher.mincore_residency_vector(&memory, base, 3, page),
+        Some(vec![1, 0, 0])
+    );
+}
+
+#[test]
 fn forked_private_file_grant_excludes_wholly_beyond_eof_page() {
     let parent = SyscallDispatcher::new();
     let base = LINUX_MMAP_BASE;

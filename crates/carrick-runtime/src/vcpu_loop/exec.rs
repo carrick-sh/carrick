@@ -1987,6 +1987,9 @@ where
                 .map(Some);
             };
             if let Some(retired_commit) = retired_commit {
+                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                    table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);
+                }
                 if let Err(error) = process
                     .kernel_graph()
                     .frame_inventory()

@@ -311,6 +311,82 @@ pub fn terminal_descriptor_is_prepared_private(descriptor: u64) -> bool {
     el1_private_leaf_state(descriptor) == El1PrivateLeafState::Prepared
 }
 
+/// Result of committing one host-owned, zero-filled prepared page in EL1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestPreparedCommit {
+    Committed,
+    AlreadyResident,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestPreparedCommitError {
+    BadAddress,
+    MissingTable,
+    TableOutsidePrimary,
+    NotPrepared,
+    WrongBacking,
+    PermissionDenied,
+}
+
+/// Validate an existing prepared L3 leaf without changing its output or
+/// permission tags. The grant owner must have published stage 2 and its frame
+/// inventory before the leaf became prepared. VALID is the residency truth.
+/// The caller holds the exact-MM editor through the following ASID TLBI.
+///
+/// # Safety
+///
+/// `words` names the writable primary table arena for `physical_base`; the
+/// exact-MM editor excludes every other host or guest mutation of this graph.
+pub unsafe fn commit_existing_el1_prepared_page(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    va: u64,
+    expected_ipa: u64,
+    access: LeafAccess,
+) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+    use core::sync::atomic::Ordering;
+
+    if words.is_null()
+        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
+        || !physical_base.is_multiple_of(PT_PAGE)
+        || !va.is_multiple_of(PT_PAGE)
+        || !expected_ipa.is_multiple_of(PT_PAGE)
+    {
+        return Err(GuestPreparedCommitError::BadAddress);
+    }
+    let leaf =
+        unsafe { existing_l3_descriptor(words, physical_base, byte_len, va) }.map_err(|error| {
+            match error {
+                GuestLeafPublicationError::TableOutsidePrimary => {
+                    GuestPreparedCommitError::TableOutsidePrimary
+                }
+                _ => GuestPreparedCommitError::MissingTable,
+            }
+        })?;
+    let descriptor = unsafe { (*leaf).load(Ordering::Acquire) };
+    if descriptor & PA_MASK_4KIB != expected_ipa {
+        return Err(GuestPreparedCommitError::WrongBacking);
+    }
+    match el1_private_leaf_state(descriptor) {
+        El1PrivateLeafState::Resident => {
+            if terminal_descriptor_permits_el0(descriptor, access) {
+                Ok(GuestPreparedCommit::AlreadyResident)
+            } else {
+                Err(GuestPreparedCommitError::PermissionDenied)
+            }
+        }
+        El1PrivateLeafState::Prepared => {
+            if !terminal_descriptor_permits_el0(descriptor | VALID, access) {
+                return Err(GuestPreparedCommitError::PermissionDenied);
+            }
+            unsafe { (*leaf).store(descriptor | VALID, Ordering::Release) };
+            Ok(GuestPreparedCommit::Committed)
+        }
+        _ => Err(GuestPreparedCommitError::NotPrepared),
+    }
+}
+
 /// Extend the guest permission ceiling after an authorized host protection edit.
 /// Fork COW must not call this: its hardware restriction is not an mprotect.
 fn private_permission_tags(descriptor: u64, writable: bool, executable: bool) -> u64 {
@@ -9929,6 +10005,69 @@ mod tests {
         words[l3].store(readonly_private, Ordering::Relaxed);
         let res3 = unsafe { resolve_existing_el1_cow_page(words.as_mut_ptr(), root, byte_len, va) };
         assert_eq!(res3, Err(GuestCowError::PermissionDenied));
+    }
+
+    #[test]
+    fn prepared_private_leaf_commits_only_on_authorized_first_touch() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x009b_4000_0000;
+        let mut words: Vec<AtomicU64> = (0..(4 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[1024 + indexes[2]].store((root + 0x3000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let leaf = 1536 + indexes[3];
+        let prepared = (ipa & PA_MASK_4KIB)
+            | (USER_PAGE_FLAGS & !VALID)
+            | NON_GLOBAL
+            | UXN
+            | SW_EL1_PRIVATE
+            | SW_EL1_MAY_WRITE;
+        words[leaf].store(prepared, Ordering::Relaxed);
+        let len = words.len() * core::mem::size_of::<AtomicU64>();
+        let commit = |words: &mut Vec<AtomicU64>, expected_ipa, access| unsafe {
+            commit_existing_el1_prepared_page(
+                words.as_mut_ptr(),
+                root,
+                len,
+                va,
+                expected_ipa,
+                access,
+            )
+        };
+
+        assert_eq!(
+            commit(&mut words, ipa + PT_PAGE, LeafAccess::Read),
+            Err(GuestPreparedCommitError::WrongBacking)
+        );
+        assert_eq!(words[leaf].load(Ordering::Acquire) & VALID, 0);
+        assert_eq!(
+            commit(&mut words, ipa, LeafAccess::Read),
+            Ok(GuestPreparedCommit::Committed)
+        );
+        assert_eq!(
+            el1_private_leaf_state(words[leaf].load(Ordering::Acquire)),
+            El1PrivateLeafState::Resident
+        );
+        assert_eq!(
+            commit(&mut words, ipa, LeafAccess::Write),
+            Ok(GuestPreparedCommit::AlreadyResident)
+        );
+        words[leaf].store((prepared & !AP_MASK) | AP_PRIV_RO, Ordering::Relaxed);
+        assert_eq!(
+            commit(&mut words, ipa, LeafAccess::Read),
+            Err(GuestPreparedCommitError::PermissionDenied)
+        );
+        assert_eq!(words[leaf].load(Ordering::Acquire) & VALID, 0);
+        words[leaf].store(prepared | SW_RETIRED, Ordering::Relaxed);
+        assert_eq!(
+            commit(&mut words, ipa, LeafAccess::Read),
+            Err(GuestPreparedCommitError::NotPrepared)
+        );
+        assert_eq!(words[leaf].load(Ordering::Acquire) & VALID, 0);
     }
 
     #[test]

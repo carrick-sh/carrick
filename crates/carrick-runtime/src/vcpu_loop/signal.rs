@@ -447,6 +447,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     };
     let ring_tid = tid.raw();
     let mm_key = mutation.host_alias_permit().mm().raw();
+    reconcile_guest_frame_commits(dispatcher, engine, mutation);
     if !el1_frame_grants_enabled() {
         cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
     }
@@ -556,6 +557,16 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     return Ok(true);
                 };
                 let fault_page = plan.fault_page();
+                let residency_identity = carrick_el1_abi::FrameGrantResidencyIdentity {
+                    mm_key: request.mm_key,
+                    semantic_base: service.semantic_base,
+                    physical_ipa: ready.physical_ipa,
+                    len: service.len,
+                    mapping_id: ready.mapping_id,
+                    frame_id: ready.frame_id,
+                    owner_generation: ready.owner_generation,
+                    inventory_revision: ready.inventory_revision,
+                };
                 let completed = mailbox.complete_grant(
                     carrick_el1_abi::FrameGrantReady {
                         mm_key: request.mm_key,
@@ -578,7 +589,15 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             grant.permissions,
                         )
                     },
-                    || dispatcher.commit_resident_frame_grant(plan),
+                    || {
+                        dispatcher.commit_resident_frame_grant(plan);
+                        // A full journal is safe: prepared leaves still use
+                        // the existing host first-touch path. Publish only
+                        // after stage-1, stage-2 and inventory are live.
+                        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                            let _ = table.publish(residency_identity);
+                        }
+                    },
                 )?;
                 if !completed {
                     publish_frame_grant_refusal(
@@ -700,6 +719,36 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     }
     ring::rec_first_touch(&first_touch);
     Ok(retried)
+}
+
+/// Adopt only guest-marked pages whose current hardware-visible leaf still
+/// validates the exact IPA. The caller's MM guard excludes EL1 editors, so
+/// host and guest cannot commit the same page concurrently.
+pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    engine: &E,
+    mutation: &carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
+) {
+    let Some(table) = carrick_el1_abi::frame_grant_residency_host() else {
+        return;
+    };
+    table.for_each_dirty_mm(mutation.mm_id().raw(), |slot, identity, bits| {
+        for (word_index, mut word) in bits.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as u64;
+                word &= word - 1;
+                let page = identity.semantic_base + (word_index as u64 * 64 + bit) * 4096;
+                if page >= identity.semantic_base + identity.len {
+                    continue;
+                }
+                let expected_ipa = identity.physical_ipa + page - identity.semantic_base;
+                if engine.live_el1_grant_page(page, expected_ipa) {
+                    let _ = dispatcher.reconcile_el1_resident_page(mutation, page);
+                }
+            }
+        }
+        let _ = table.ack_dirty(slot, identity);
+    });
 }
 
 /// `CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1`: turn the first synchronous
