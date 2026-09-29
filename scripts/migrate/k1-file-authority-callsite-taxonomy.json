@@ -907,7 +907,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/locks.rs",
-      "line": 1603,
+      "line": 1607,
       "categories": [
         "table_guard"
       ],
@@ -918,7 +918,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/locks.rs",
-      "line": 1614,
+      "line": 1618,
       "categories": [
         "table_guard"
       ],
@@ -929,7 +929,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/locks.rs",
-      "line": 1627,
+      "line": 1631,
       "categories": [
         "table_guard"
       ],
@@ -940,7 +940,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/locks.rs",
-      "line": 1645,
+      "line": 1649,
       "categories": [
         "description_guard"
       ],
@@ -951,7 +951,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/locks.rs",
-      "line": 1713,
+      "line": 1717,
       "categories": [
         "description_guard"
       ],
@@ -962,7 +962,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/locks.rs",
-      "line": 1986,
+      "line": 1990,
       "categories": [
         "description_guard"
       ],
