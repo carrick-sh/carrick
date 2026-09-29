@@ -390,16 +390,30 @@ pub(crate) struct Task {
 }
 
 impl Task {
+    /// Whether this exact thread generation is still live in a task-group
+    /// that itself still exists in the kernel's registry.
+    ///
+    /// Both halves are required, checked together: a sibling's `exit_group`
+    /// can retire the whole task-group from the registry (`task_is_live`
+    /// turns false) before this thread's own captured `TaskRef` has its
+    /// membership updated (`exact_thread_is_live` can still read stale-true
+    /// for a beat). Every liveness guard on this backend's driving path must
+    /// use this exact combined check — checking `exact_thread_is_live()`
+    /// alone after a failed registry lookup reintroduces the race, since
+    /// that half can lag the other under real scheduling contention.
+    pub(crate) fn is_live(&self) -> bool {
+        self.context.exact_thread_is_live()
+            && self
+                .process
+                .kernel_graph()
+                .task_is_live(self.process.task_id())
+    }
+
     /// Run `script` to its `exit_group`, returning the exit code.
     fn run(&mut self, script: &[Step], shared: &Arc<Shared>) -> Result<i32, ExampleError> {
         let mut steps = script.iter();
         while let Some(step) = steps.next() {
-            if !self.context.exact_thread_is_live()
-                || !self
-                    .process
-                    .kernel_graph()
-                    .task_is_live(self.process.task_id())
-            {
+            if !self.is_live() {
                 return Ok(0);
             }
             match step {
