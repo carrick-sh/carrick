@@ -1,0 +1,22 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.71s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 1 test
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close ... FAILED
+
+failures:
+
+---- dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close stdout ----
+
+thread 'dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close' (34261301) panicked at crates/carrick-kernel/src/dispatch/fd_table.rs:3962:14:
+host description must install its shared identity: StalePin
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2323 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

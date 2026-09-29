@@ -148,29 +148,13 @@ pub(crate) struct EpollInterest {
 
 use crate::kernel::objects::ListenerReadinessSample;
 
-#[derive(Debug)]
-struct EventFdObject {
-    owner: Arc<crate::el1_ipc::HostIpc>,
-    object: carrick_el1_abi::ipc::IpcObjectHandle,
-}
-impl Drop for EventFdObject {
-    fn drop(&mut self) {
-        let _ = self.owner.release(
-            carrick_el1_abi::ipc::IpcBacking::EventFd {
-                object: self.object,
-            }
-            .encode(),
-        );
-    }
-}
-
 /// Host view of the shared eventfd record. Host waiters subscribe directly to
 /// the object queue; the counter and semaphore mode have no host-side copy.
 #[derive(Debug)]
 pub(crate) struct EventFdState {
     owner: Arc<crate::el1_ipc::HostIpc>,
     object: carrick_el1_abi::ipc::IpcObjectHandle,
-    lifetime: Mutex<Option<EventFdObject>>,
+    lifetime: Mutex<Option<crate::el1_ipc::HostDescription>>,
     pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 impl EventFdState {
@@ -180,12 +164,24 @@ impl EventFdState {
         mode: carrick_el1_abi::ipc::pipe::EventMode,
     ) -> Result<Self, crate::el1_ipc::AdmissionError> {
         let object = owner.create_eventfd(initial, mode)?;
+        let backing = carrick_el1_abi::ipc::IpcBacking::EventFd { object }.encode();
+        let description = carrick_el1_abi::ipc::fd::Description::new(
+            backing,
+            carrick_el1_abi::ipc::fd::AccessMode::ReadWrite,
+            carrick_el1_abi::ipc::fd::StatusFlags::default(),
+        );
+        let lifetime = match owner.admit_description(description) {
+            Ok(lifetime) => lifetime,
+            Err(error) => {
+                owner.release(backing).unwrap_or_else(|_| {
+                    carrick_fatal!("ipc::eventfd", "failed to roll back object admission")
+                });
+                return Err(error.into());
+            }
+        };
         let wait_queue = owner.wait_queue(object);
         Ok(Self {
-            lifetime: Mutex::new(Some(EventFdObject {
-                owner: Arc::clone(&owner),
-                object,
-            })),
+            lifetime: Mutex::new(Some(lifetime)),
             owner,
             object,
             wait_queue,
@@ -3940,6 +3936,85 @@ mod tests {
                 "eventfd admission allocated host readiness without a subscriber (initial={initial})"
             );
         }
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close() {
+        use crate::el1_zone::HostLockWait;
+        use carrick_el1_abi::ipc::{EventMode, IpcError, fd};
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let state = EventFdState::create(Arc::clone(&owner), 7, EventMode::Counter).unwrap();
+        let table = owner.create_table(64, 4).unwrap();
+        state
+            .lifetime
+            .lock()
+            .as_ref()
+            .unwrap()
+            .install(table, fd::Fd(0), false)
+            .expect("host description must install its shared identity");
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        let (guest_pin, _) = authority.pin(table, fd::Fd(0)).unwrap();
+        assert!(authority.close(table, fd::Fd(0)).unwrap().is_none());
+        assert_eq!(authority.holds(&guest_pin).unwrap(), (0, 2));
+        state.close();
+        assert_eq!(authority.holds(&guest_pin).unwrap(), (0, 1));
+        assert!(authority.pinned(&guest_pin).is_ok());
+        assert_eq!(
+            region
+                .lock(state.object, &HostLockWait)
+                .unwrap()
+                .eventfd()
+                .unwrap()
+                .try_read()
+                .result,
+            Ok(7)
+        );
+        let description = authority
+            .unpin(guest_pin)
+            .unwrap()
+            .expect("last pin owns release");
+        owner.release(description.backing).unwrap();
+        assert!(matches!(
+            region.lock(state.object, &HostLockWait),
+            Err(IpcError::Stale)
+        ));
+        let extent = authority
+            .destroy_table(table, |_| panic!("empty table"))
+            .unwrap();
+        owner.reclaim_descriptors(extent);
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_eventfd_description_refusal_rolls_back_object() {
+        use carrick_el1_abi::ipc::{EventMode, IPC_OBJECTS, IPC_OFDS, IpcBacking, fd};
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let descriptions: Vec<_> = (0..IPC_OFDS)
+            .map(|_| {
+                let token = owner.retain_host_resource(Box::new(())).unwrap();
+                owner
+                    .admit_description(fd::Description::new(
+                        IpcBacking::Host(token).encode(),
+                        fd::AccessMode::ReadWrite,
+                        fd::StatusFlags::default(),
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        for _ in 0..4 {
+            assert!(EventFdState::create(Arc::clone(&owner), 0, EventMode::Counter).is_err());
+        }
+        // Admission failure must not strand any of the finite object slots.
+        let objects: Vec<_> = (0..IPC_OBJECTS)
+            .map(|_| owner.create_eventfd(0, EventMode::Counter).unwrap())
+            .collect();
+        for object in objects {
+            owner
+                .release(IpcBacking::EventFd { object }.encode())
+                .unwrap();
+        }
+        drop(descriptions);
+        assert!(EventFdState::create(owner, 0, EventMode::Counter).is_ok());
     }
 
     #[test]

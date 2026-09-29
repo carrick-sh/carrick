@@ -69,3 +69,40 @@ Descriptor tables are still unpublished: FileTable has no shared descriptor
 binding. Next integration must connect its admission, mutation, fork/unshare,
 CLOEXEC and destruction to the shared core before publishing IpcTableMap entries;
 a one-time snapshot would leave a competing stale namespace and is insufficient.
+
+## Descriptor lifetime admission
+
+Eventfd admission now creates one pinned shared description. The host owns that
+pin; installed shared slots and guest operations retain the same OFD. Last host
+close drops its pin instead of freeing the object directly. Only the shared
+core's final release retires the backing. Failed OFD admission releases the
+new object before returning an error.
+
+The admission witness first failed at the explicitly missing shared-install
+bridge (StalePin); after implementation it proves that a guest operation keeps
+the eventfd alive across closing its shared slot and the last host reference.
+It verifies exact holds (two pins then one), preserved counter contents, and
+retirement after the final guest pin. An exhaustion test fills all 2048 OFDs,
+refuses eventfd admission, then proves all 1024 object slots remain available.
+Final kernel IPC: 60 pass, one existing ignored. This does not publish a table
+or complete flag/fork/unshare ownership. Receipt: description-final.log.
+
+## Fixture branch review: not accepted
+
+Source-reviewed `work/cp3-ipc-fixture` at fd27e748d; not merged. In
+fixtures/embed-el1-sched/src/ipc.rs, run_threads_topology and
+run_two_process_topology derive guest_parks/resumes and host counts from
+is_el1_ipc_active and the loop count, rather than observing them. Output fixes
+carrier/task/object generations to 1 and labels the window steady-state.
+The signal-restart mode runs the same exchange without installing/sending a
+signal or exercising partial writes. fd-lifetime duplicates descriptors but
+falls back silently on failed dup and does not force blocked-close/reuse.
+The embed runner samples whole-container counters, including startup/teardown,
+while describing those measurements as the steady-state window.
+
+These fixture reports cannot establish the named acceptance obligations.
+Retain their useful workload scaffolding/contracts, but replace these claims
+with actual semantic cases and scoped observations before signed acceptance.
+Do not add a control response that simply turns the derived counters green.
+This review changes qualification planning, not the implementation priority:
+continue shared table/description ownership; repair fixtures at that boundary.
