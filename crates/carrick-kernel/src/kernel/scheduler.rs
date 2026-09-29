@@ -4400,10 +4400,11 @@ impl Scheduler {
         let Some(thread) = self.kernel.exact_thread_for_scheduler(key) else {
             return Ok(None);
         };
+        self.queue.inner.zone_adopt.lock().insert(key);
         let Some(target) = thread.prepare_zone_handback(record) else {
+            self.queue.inner.zone_adopt.lock().remove(&key);
             return Ok(None);
         };
-        self.queue.inner.zone_adopt.lock().insert(key);
         let _ = self.wake_exact(target);
         let held = self.queue.inner.zone_adopt.lock().remove(&key);
         if held {
