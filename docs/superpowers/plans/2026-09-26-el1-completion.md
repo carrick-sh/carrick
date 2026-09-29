@@ -162,6 +162,11 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   The guest placement preparation now moves futex unlinking before target
   queue-lock release; its 1/8/32-waiter witness was red and is green. This
   does not repair the host-transfer red or close this checklist item.
+  The producer-transfer implementation now passes the two restored red-first
+  witnesses, waitv/cancellation and host-request controls (core 58, EL1 host
+  74, ABI 32, kernel/semantics 2,459, serial-host 109, runtime 630; existing
+  ignores unchanged). Fresh signed proof and the remaining retirement/restore
+  lifetime audit are still required; see the `owned-transfer/` receipt.
   RecordRef preserves identity but does not grant exclusive field access.
   Close all producer publication/cancellation boundaries and then audit
   scheduler handback wakes; historical crash attribution remains separate.
