@@ -18,6 +18,26 @@ use alloc::vec::Vec;
 
 pub mod descriptor_txn;
 
+/// Why the host could not build a guest descriptor transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTxnPrepareError {
+    /// The image is on the host-owned lane; edit it directly.
+    NotGuestOwned,
+    /// The image has no live primary arena to plan against.
+    NotLive,
+    /// EL1 would refuse the operation; nothing was reserved or submitted.
+    Refused(descriptor_txn::DescriptorRefusal),
+    /// Table grants could not be reserved.
+    Manager(PageTableError),
+}
+
+/// Why a guest descriptor receipt did not settle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTxnSettleError {
+    Receipt(descriptor_txn::ReceiptError),
+    Manager(PageTableError),
+}
+
 /// Which venue may store to an image's live, hardware-visible descriptor
 /// words. `Guest` selects the lane on which guest EL1 is the only live
 /// writer: host edits may stage and validate, but every store to live
@@ -1826,6 +1846,94 @@ impl PageTableManager {
             .retain(|pa| !pages[..from_free].contains(&SubstrateGpa(*pa)));
         self.arenas[0].next_free = bump_end;
         Ok(grants)
+    }
+
+    /// Build the guest descriptor transaction for `op` on this guest-owned
+    /// live image: plan it against the live primary arena without storing,
+    /// then reserve exactly the table grants it needs. The caller submits the
+    /// result and later settles its receipt with
+    /// [`Self::settle_guest_descriptor_receipt`] (or
+    /// [`Self::abandon_guest_descriptor_txn`] if it is withdrawn unclaimed).
+    pub fn prepare_guest_descriptor_txn(
+        &mut self,
+        id: descriptor_txn::DescriptorTxnId,
+        op: descriptor_txn::DescriptorOp,
+    ) -> Result<descriptor_txn::DescriptorTxn, GuestTxnPrepareError> {
+        if self.live_descriptor_owner != LiveDescriptorOwner::Guest {
+            return Err(GuestTxnPrepareError::NotGuestOwned);
+        }
+        let Some(primary) = self.arenas.first().filter(|arena| arena.is_live()) else {
+            return Err(GuestTxnPrepareError::NotLive);
+        };
+        let (base, capacity) = (primary.base, primary.capacity);
+        let resolver = self
+            .resolver
+            .as_ref()
+            .ok_or(GuestTxnPrepareError::NotLive)?;
+        let host = resolver.host_const_ptr_for_range(base, capacity).ok_or(
+            GuestTxnPrepareError::Manager(PageTableError::UnresolvedArena(base)),
+        )?;
+        let maintenance = descriptor_txn::CallerInvalidatesAsid;
+        // SAFETY: the resolver contract makes `host` a resident, aligned
+        // mapping of the whole primary arena. Planning only loads.
+        let words = unsafe {
+            descriptor_txn::PrimaryTableWords::new(
+                host.cast_mut().cast::<core::sync::atomic::AtomicU64>(),
+                base,
+                capacity,
+                &maintenance,
+            )
+        }
+        .map_err(GuestTxnPrepareError::Refused)?;
+        let root = SubstrateGpa(self.base());
+        let plan = descriptor_txn::plan_descriptor_op(&words, root, op)
+            .map_err(GuestTxnPrepareError::Refused)?;
+        let tables = self
+            .reserve_primary_table_grants(plan.table_grants)
+            .map_err(GuestTxnPrepareError::Manager)?;
+        Ok(descriptor_txn::DescriptorTxn {
+            id,
+            root,
+            op,
+            tables,
+        })
+    }
+
+    /// Authenticate EL1's receipt for `txn` and return the table grants it
+    /// did not link. Grants of a refused or rolled-back transaction all
+    /// return; after an unauthenticated or indeterminate receipt they stay
+    /// reserved, because their linkage is unknown.
+    pub fn settle_guest_descriptor_receipt(
+        &mut self,
+        txn: &descriptor_txn::DescriptorTxn,
+        receipt: &descriptor_txn::DescriptorReceipt,
+    ) -> Result<descriptor_txn::VerifiedDescriptorReceipt, GuestTxnSettleError> {
+        use descriptor_txn::{DescriptorOutcome, ReceiptError};
+        match txn.verify_receipt(receipt) {
+            Ok(verified) => {
+                self.release_table_grants(verified.unused_table_grants())
+                    .map_err(GuestTxnSettleError::Manager)?;
+                Ok(verified)
+            }
+            Err(
+                error @ ReceiptError::NotApplied(
+                    DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_),
+                ),
+            ) => {
+                self.release_table_grants(txn.tables.as_slice())
+                    .map_err(GuestTxnSettleError::Manager)?;
+                Err(GuestTxnSettleError::Receipt(error))
+            }
+            Err(error) => Err(GuestTxnSettleError::Receipt(error)),
+        }
+    }
+
+    /// Return every grant of a submission withdrawn before EL1 claimed it.
+    pub fn abandon_guest_descriptor_txn(
+        &mut self,
+        txn: &descriptor_txn::DescriptorTxn,
+    ) -> Result<(), PageTableError> {
+        self.release_table_grants(txn.tables.as_slice())
     }
 
     /// Return table grants that a transaction did not link. The pages stay
@@ -10820,5 +10928,196 @@ mod tests {
         );
         assert_eq!(mgr.free_tables, free_before);
         assert_eq!(mgr.arenas[0].next_free, cursor_before);
+    }
+
+    #[derive(Default)]
+    struct RecordingMaintenance {
+        barriers: core::cell::Cell<usize>,
+        invalidations: core::cell::RefCell<Vec<(u64, u64)>>,
+    }
+
+    impl descriptor_txn::TableMaintenance for RecordingMaintenance {
+        fn publish_barrier(&self) {
+            self.barriers.set(self.barriers.get() + 1);
+        }
+        fn invalidate_range(&self, va: u64, len: u64) {
+            self.invalidations.borrow_mut().push((va, len));
+        }
+    }
+
+    /// Execute a submitted transaction as EL1 would: over the live primary
+    /// arena, rooted at the root it authenticated for the MM.
+    fn guest_apply(
+        resolver: &MockLiveResolver,
+        slot: &descriptor_txn::DescriptorTxnSlot,
+        mm_key: u64,
+        maintenance: &RecordingMaintenance,
+    ) -> Option<descriptor_txn::DescriptorReceipt> {
+        let host = resolver
+            .host_ptr_for_range(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize)
+            .unwrap();
+        let words = unsafe {
+            descriptor_txn::PrimaryTableWords::new(
+                host.cast::<core::sync::atomic::AtomicU64>(),
+                LINUX_PAGE_TABLES_BASE,
+                LINUX_PAGE_TABLES_SIZE as usize,
+                maintenance,
+            )
+        }
+        .unwrap();
+        let mut journal = descriptor_txn::InlineJournal::new();
+        descriptor_txn::apply_submitted_descriptor_txn(
+            slot,
+            mm_key,
+            &words,
+            SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+            &mut journal,
+        )
+    }
+
+    fn txn_backing(seed: u64) -> descriptor_txn::BackingIdentity {
+        let nz = |v| core::num::NonZeroU64::new(v).unwrap();
+        descriptor_txn::BackingIdentity {
+            frame_id: nz(seed),
+            mapping_id: nz(seed + 1),
+            owner_generation: nz(seed + 2),
+            inventory_revision: nz(seed + 3),
+        }
+    }
+
+    #[test]
+    fn guest_owned_lane_publishes_a_grant_only_through_el1_transactions() {
+        use descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, DescriptorTxnId, DescriptorTxnSlot, PageSpan,
+        };
+        let (mut mgr, resolver) = create_live_fixture();
+        mgr.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        // A fresh 2 MiB window inside the reserved sparse mmap arena: the
+        // boot image covers it with invalid coarse reservation blocks, so the
+        // grant needs split tables from the host allocator.
+        let va = LINUX_MMAP_BASE + 0x80_0000;
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
+        let fault = va + 3 * PT_PAGE;
+        let op = DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va,
+                ipa,
+                len: 8 * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(fault, PT_PAGE),
+            backing: txn_backing(10),
+        };
+        let id = DescriptorTxnId {
+            mm_key: core::num::NonZeroU64::new(41).unwrap(),
+            generation: core::num::NonZeroU64::new(1).unwrap(),
+        };
+        let before = live_arena_bytes(&resolver);
+        let txn = mgr
+            .prepare_guest_descriptor_txn(id, op)
+            .expect("plan and reserve");
+        assert_eq!(
+            live_arena_bytes(&resolver),
+            before,
+            "planning and grant reservation store nothing"
+        );
+        assert!(
+            !txn.tables.is_empty(),
+            "the reservation block must be split"
+        );
+
+        let slot = DescriptorTxnSlot::new();
+        assert!(slot.submit(&txn));
+        assert!(slot.pending_covering(41, fault));
+        let maintenance = RecordingMaintenance::default();
+        // Another MM's EL1 editor cannot apply it.
+        assert!(guest_apply(&resolver, &slot, 42, &maintenance).is_none());
+        let receipt = guest_apply(&resolver, &slot, 41, &maintenance).expect("claimed");
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        assert!(
+            maintenance.barriers.get() >= 1,
+            "links follow a publish barrier"
+        );
+        let host_receipt = slot.take_receipt(id).unwrap();
+        let verified = mgr
+            .settle_guest_descriptor_receipt(&txn, &host_receipt)
+            .expect("authentic receipt");
+        assert_eq!(verified.resident(), PageSpan::new(fault, PT_PAGE));
+
+        // The host live view observes exactly the guest's publication.
+        assert_eq!(mgr.translate(fault), Some(ipa + 3 * PT_PAGE));
+        for page in 0..8 {
+            let address = va + page * PT_PAGE;
+            let leaf = terminal_descriptor(mgr.debug_walk(address));
+            assert_eq!(leaf & PA_MASK_4KIB, ipa + page * PT_PAGE);
+            assert_eq!(
+                el1_private_leaf_state(leaf),
+                if address == fault {
+                    El1PrivateLeafState::Resident
+                } else {
+                    El1PrivateLeafState::Prepared
+                },
+                "page {page}"
+            );
+        }
+        // Reserved grants the guest linked are never reissued by the host.
+        let next = mgr.alloc_table_for_test().unwrap();
+        assert!(!txn.tables.as_slice().contains(&next));
+
+        // Host copyout into a prepared page is a guest Publish, not a store.
+        let copyout = DescriptorOp::Publish {
+            span: PageSpan::new(va, PT_PAGE),
+            expected_ipa: SubstrateGpa(ipa),
+            access: LeafAccess::Write,
+        };
+        let id2 = DescriptorTxnId {
+            generation: core::num::NonZeroU64::new(2).unwrap(),
+            ..id
+        };
+        let copyout_txn = mgr.prepare_guest_descriptor_txn(id2, copyout).unwrap();
+        assert!(copyout_txn.tables.is_empty());
+        let before = live_arena_bytes(&resolver);
+        assert!(slot.submit(&copyout_txn));
+        assert_eq!(live_arena_bytes(&resolver), before);
+        guest_apply(&resolver, &slot, 41, &maintenance).unwrap();
+        let receipt = slot.take_receipt(id2).unwrap();
+        let verified = mgr
+            .settle_guest_descriptor_receipt(&copyout_txn, &receipt)
+            .unwrap();
+        assert_eq!(verified.resident(), PageSpan::new(va, PT_PAGE));
+        assert_eq!(mgr.translate(va), Some(ipa));
+
+        // A refused submission returns every grant it carried.
+        let id3 = DescriptorTxnId {
+            generation: core::num::NonZeroU64::new(3).unwrap(),
+            ..id
+        };
+        let occupied = mgr.prepare_guest_descriptor_txn(id3, op);
+        assert_eq!(
+            occupied,
+            Err(GuestTxnPrepareError::Refused(
+                descriptor_txn::DescriptorRefusal::AlreadyValid
+            ))
+        );
+    }
+
+    #[test]
+    fn host_lane_images_never_build_guest_transactions() {
+        let (mut mgr, _resolver) = create_live_fixture();
+        let id = descriptor_txn::DescriptorTxnId {
+            mm_key: core::num::NonZeroU64::new(1).unwrap(),
+            generation: core::num::NonZeroU64::new(1).unwrap(),
+        };
+        assert_eq!(
+            mgr.prepare_guest_descriptor_txn(
+                id,
+                descriptor_txn::DescriptorOp::Retire(descriptor_txn::PageSpan::new(
+                    LINUX_MMAP_BASE,
+                    PT_PAGE
+                ))
+            ),
+            Err(GuestTxnPrepareError::NotGuestOwned)
+        );
     }
 }

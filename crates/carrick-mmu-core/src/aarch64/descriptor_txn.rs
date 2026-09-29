@@ -1637,6 +1637,65 @@ fn roll_back<W: LiveDescriptorWords + ?Sized>(words: &W, journal: &[JournalEntry
     true
 }
 
+/// Work a descriptor operation needs, from a read-only walk of the live graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorPlan {
+    /// Unlinked table pages the operation will fill and link.
+    pub table_grants: usize,
+    /// Journaled live descriptor stores.
+    pub live_stores: usize,
+}
+
+fn plan_validated<W>(
+    words: &W,
+    root: u64,
+    op: DescriptorOp,
+) -> Result<DescriptorPlan, DescriptorRefusal>
+where
+    W: LiveDescriptorWords + ?Sized,
+{
+    let span = op.span();
+    let end = span.end().ok_or(DescriptorRefusal::BadRange)?;
+    let mut no_journal = SliceJournal::new(&mut []);
+    let mut plan = Executor {
+        words,
+        op,
+        start: span.va,
+        end,
+        apply: false,
+        grants: &[],
+        grants_used: 0,
+        journal: &mut no_journal,
+        planned_live_stores: 0,
+    };
+    plan.visit_live_table(root, 0, 0)?;
+    Ok(DescriptorPlan {
+        table_grants: plan.grants_used,
+        live_stores: plan.planned_live_stores,
+    })
+}
+
+/// Validate `op` against the live graph at `root` without storing, and
+/// report the table grants and journal capacity it needs. The host uses this
+/// to reserve exactly the grants a submission carries; EL1 re-plans against
+/// the graph it actually edits, so a graph that changed in between refuses
+/// rather than overrunning its grants.
+pub fn plan_descriptor_op<W>(
+    words: &W,
+    root: SubstrateGpa,
+    op: DescriptorOp,
+) -> Result<DescriptorPlan, DescriptorRefusal>
+where
+    W: LiveDescriptorWords + ?Sized,
+{
+    validate_op(&op)?;
+    let root = root.raw();
+    if root == 0 || !root.is_multiple_of(PT_PAGE) {
+        return Err(DescriptorRefusal::StaleRoot);
+    }
+    plan_validated(words, root, op)
+}
+
 /// Apply one descriptor operation to the live graph rooted at `root`.
 ///
 /// The complete span, table-grant need and journal capacity are validated
@@ -1669,25 +1728,13 @@ where
             return DescriptorOutcome::Refused(DescriptorRefusal::BadTableGrant);
         }
     }
+    let plan = match plan_validated(words, root, op) {
+        Ok(plan) => plan,
+        Err(refusal) => return DescriptorOutcome::Refused(refusal),
+    };
     let span = op.span();
-    let Some(end) = span.end() else {
-        return DescriptorOutcome::Refused(DescriptorRefusal::BadRange);
-    };
-    let mut plan = Executor {
-        words,
-        op,
-        start: span.va,
-        end,
-        apply: false,
-        grants: tables.as_slice(),
-        grants_used: 0,
-        journal: &mut *journal,
-        planned_live_stores: 0,
-    };
-    if let Err(refusal) = plan.visit_live_table(root, 0, 0) {
-        return DescriptorOutcome::Refused(refusal);
-    }
-    let (grants_needed, live_stores) = (plan.grants_used, plan.planned_live_stores);
+    let end = span.va + span.len;
+    let (grants_needed, live_stores) = (plan.table_grants, plan.live_stores);
     if grants_needed > tables.len() {
         return DescriptorOutcome::Refused(DescriptorRefusal::TablesExhausted);
     }
