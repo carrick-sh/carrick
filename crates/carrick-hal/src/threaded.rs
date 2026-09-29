@@ -3187,6 +3187,15 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         Ok(())
     }
 
+    /// Guest-owned lane: take the parent's fork-COW arm transactions so the
+    /// runtime submits them to EL1 before any parent thread resumes EL0.
+    /// `commit_process_fork` refuses while any remain untaken.
+    fn take_guest_fork_arm_txns(
+        &mut self,
+    ) -> Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
+        Vec::new()
+    }
+
     /// Restore parent stage-1 and COW-arm metadata after a recoverable child
     /// spawn/materialization failure.
     fn rollback_process_fork(&mut self) -> Result<(), TrapError> {

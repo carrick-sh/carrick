@@ -106,6 +106,55 @@ fn guest_frame_grant_submission(
     }
 }
 
+/// The guest-owned lane's parent fork-COW arm: one EL1 transaction per newly
+/// armed range, each with the host editor's exact per-descriptor rule and
+/// exactly the table grants it needs. Nothing is stored. A refusal returns
+/// every grant already reserved and fails the fork before it commits.
+fn guest_fork_arm_txns(
+    page_tables: &Stage1Authority,
+    mm_key: u64,
+    ranges: &[crate::vmm::ForkCowRange],
+) -> Result<Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>, TrapError> {
+    let mm_key = std::num::NonZeroU64::new(mm_key).ok_or_else(|| {
+        TrapError::Hypervisor("guest fork arm lacks the parent MM identity".to_owned())
+    })?;
+    let mut txns = Vec::new();
+    for range in ranges {
+        let op = page_tables
+            .with_manager(|manager| {
+                manager.fork_arm_op(
+                    range.va,
+                    range.len as u64,
+                    range.kernel_only,
+                    range.executable,
+                )
+            })
+            .ok_or_else(|| {
+                TrapError::Hypervisor("guest fork arm lost the parent stage-1 image".to_owned())
+            });
+        let txn = op.and_then(|op| {
+            page_tables
+                .prepare_guest_descriptor_txn(mm_key, op)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "prepare guest fork arm at VA 0x{:x}: {error:?}",
+                        range.va
+                    ))
+                })
+        });
+        match txn {
+            Ok(txn) => txns.push(txn),
+            Err(error) => {
+                for txn in &txns {
+                    let _ = page_tables.abandon_guest_descriptor_txn(txn);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(txns)
+}
+
 /// A host live-table edit attempted on the lane where guest EL1 owns the live
 /// descriptors. The caller must submit a guest descriptor transaction.
 fn guest_owned_live_edit_error() -> MemoryError {
@@ -654,6 +703,10 @@ fn ensure_sparse_page_table_editor(
 
 struct ParentForkCowRollback {
     armed_ranges: Vec<crate::vmm::ForkCowRange>,
+    /// Guest-owned lane: the parent's fork-COW arm as EL1 transactions, one
+    /// per newly armed range. Nothing was stored; rollback returns their
+    /// grants, and commit refuses unless the runtime took them for EL1.
+    guest_arm: Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>,
 }
 
 fn aarch64_task_state_from_snapshot(
@@ -3974,7 +4027,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // no mmap/mprotect edit has already done so. The no-op edit publishes
         // nothing and performs no TLBI.
         let stage_started = std::time::Instant::now();
+        let guest_lane = self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest;
         let page_tables_absent = self.page_tables.is_none();
+        if page_tables_absent && guest_lane {
+            return Err(TrapError::Hypervisor(
+                "guest-owned MM forked before its live stage-1 manager exists".to_owned(),
+            ));
+        }
         if page_tables_absent {
             self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
                 .map_err(|error| {
@@ -4008,13 +4067,26 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // range (Go's heap arenas are not all in that list), and the child
         // image is cloned from this copy. The walk skips empty subtrees, so
         // its cost follows the populated tables, not the span.
+        // On the guest-owned lane the manager reads hardware-visible tables
+        // directly (a live image has nothing to adopt), and the live edit
+        // funnel refuses there.
         const USER_ADDRESS_SPACE: usize = 1 << 48;
-        self.pt_edit_locked_after_adopting(Some((0, USER_ADDRESS_SPACE)), |_| {
-            Ok(PageTableApplyOutcome::default())
-        })
-        .map_err(|error| {
-            memory_error_to_trap_error(error, "adopt live stage-1 tables before fork")
-        })?;
+        if !guest_lane {
+            self.pt_edit_locked_after_adopting(Some((0, USER_ADDRESS_SPACE)), |_| {
+                Ok(PageTableApplyOutcome::default())
+            })
+            .map_err(|error| {
+                memory_error_to_trap_error(error, "adopt live stage-1 tables before fork")
+            })?;
+        } else if !self
+            .page_tables
+            .with_manager(PageTableManager::is_live)
+            .unwrap_or(false)
+        {
+            return Err(TrapError::Hypervisor(
+                "guest-owned MM fork requires a live stage-1 manager".to_owned(),
+            ));
+        }
         let cow_ranges = if request.shares_mm() {
             Vec::new()
         } else {
@@ -4171,7 +4243,21 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             process_asid: child_asid,
         };
 
-        if !cow_ranges.is_empty() {
+        if !cow_ranges.is_empty() && guest_lane {
+            let stage_started = std::time::Instant::now();
+            let guest_arm =
+                guest_fork_arm_txns(&self.page_tables, self.mm_generation, &unarmed_ranges)?;
+            self.vm.arm_frame_cow_ranges(&unarmed_ranges);
+            self.pending_process_fork = Some(ParentForkCowRollback {
+                armed_ranges: parent_armed_snapshot,
+                guest_arm,
+            });
+            emit_stage(
+                HvpatchForkProcessSpecStagePhase::ParentCowPublication,
+                stage_started,
+                unarmed_ranges.len() as u64,
+            );
+        } else if !cow_ranges.is_empty() {
             let stage_started = std::time::Instant::now();
             // Final publication transaction. All child allocation, mapping-plan,
             // ASID, snapshot, and wrapper work is complete. Open an undo journal
@@ -4289,6 +4375,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             self.vm.arm_frame_cow_ranges(&unarmed_ranges);
             self.pending_process_fork = Some(ParentForkCowRollback {
                 armed_ranges: parent_armed_snapshot,
+                guest_arm: Vec::new(),
             });
             emit_stage(
                 HvpatchForkProcessSpecStagePhase::ParentCowPublication,
@@ -4330,15 +4417,51 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn commit_process_fork(&mut self) -> Result<(), TrapError> {
+        if self
+            .pending_process_fork
+            .as_ref()
+            .is_some_and(|pending| !pending.guest_arm.is_empty())
+        {
+            // Committing without handing the arm to EL1 would let the parent
+            // write frames the child shares. Refuse; the caller rolls back.
+            return Err(TrapError::Hypervisor(
+                "guest-owned fork committed before its parent arm was submitted to EL1".to_owned(),
+            ));
+        }
         let _ = self.pending_process_fork.take();
         self.page_tables.commit_undo();
         Ok(())
+    }
+
+    fn take_guest_fork_arm_txns(
+        &mut self,
+    ) -> Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
+        self.pending_process_fork
+            .as_mut()
+            .map(|pending| std::mem::take(&mut pending.guest_arm))
+            .unwrap_or_default()
     }
 
     fn rollback_process_fork(&mut self) -> Result<(), TrapError> {
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };
+        if !rollback.guest_arm.is_empty() {
+            // Nothing reached the live tables: return the grants and restore
+            // the backend's armed-range metadata.
+            for txn in &rollback.guest_arm {
+                self.page_tables
+                    .abandon_guest_descriptor_txn(txn)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "return guest fork-arm grants after failed fork: {error:?}"
+                        ))
+                    })?;
+            }
+            self.vm
+                .restore_frame_cow_arm_snapshot(rollback.armed_ranges);
+            return Ok(());
+        }
         self.pt_rollback_undo_and_flush().map_err(|error| {
             TrapError::Hypervisor(format!(
                 "restore parent after failed in-process fork: {error}"
@@ -4822,6 +4945,34 @@ mod tests {
         assert!(submit_body.contains("prepare_guest_descriptor_txn"));
         assert!(!submit_body.contains("pt_edit"));
         assert!(!submit_body.contains("sync_to_host"));
+
+        // Fork: the guest lane arms the parent with EL1 transactions, before
+        // and instead of the host publication edit, and commit refuses while
+        // the arm has not been handed to EL1.
+        let fork = production
+            .split("fn build_process_spec(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn materialize_process").next())
+            .expect("fork spec");
+        let guest_arm = fork
+            .find("guest_fork_arm_txns(")
+            .expect("guest lane builds fork-arm transactions");
+        let host_arm = fork.find("self.pt_edit_and_flush(").expect("host lane arm");
+        assert!(guest_arm < host_arm);
+        assert!(fork.contains("if !guest_lane {"));
+        let arm_body = production
+            .split("fn guest_fork_arm_txns")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("guest fork arm");
+        assert!(arm_body.contains("fork_arm_op("));
+        assert!(!arm_body.contains("pt_edit"));
+        let commit = production
+            .split("fn commit_process_fork")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("commit");
+        assert!(commit.contains("guest_arm.is_empty()"));
     }
 
     #[test]

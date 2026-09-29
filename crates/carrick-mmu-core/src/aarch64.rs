@@ -983,6 +983,184 @@ pub enum PtOp {
     KernelReadOnly { exec: bool },
 }
 
+/// Build the leaf descriptor for `op` covering `base_pa` at `level`.
+fn pt_desc_for(asid_scoped_leaves: bool, op: PtOp, base_pa: u64, level: usize) -> u64 {
+    let (_, mask) = PageTableManager::level_span(level);
+    // Block at L1/L2, page at L3 (type bit differs; USER_PAGE_FLAGS adds it).
+    let kernel_only = matches!(op, PtOp::KernelReadOnly { .. });
+    let flags = if level == 3 {
+        if kernel_only {
+            KERNEL_PAGE_FLAGS
+        } else {
+            USER_PAGE_FLAGS
+        }
+    } else if kernel_only {
+        KERNEL_BLOCK_FLAGS
+    } else {
+        USER_BLOCK_FLAGS
+    };
+    let base = base_pa & mask;
+    let scope = if asid_scoped_leaves { NON_GLOBAL } else { 0 };
+    // UXN (bit 54) is set for a non-exec leaf; cleared for an exec one.
+    // USER_*_FLAGS start UXN-clear (executable), so OR in UXN when !exec.
+    let uxn = |exec: bool| if exec { 0 } else { UXN };
+    match op {
+        PtOp::Invalidate => base | (flags & !VALID) | scope,
+        PtOp::Retire => base | (flags & !VALID) | scope | SW_RETIRED,
+        PtOp::ReadWrite { exec } => base | flags | uxn(exec) | scope,
+        PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec) | scope,
+        PtOp::ForkReadOnly => {
+            // Fork arming is a permission restriction, not a remap: a
+            // PROT_NONE descriptor must remain invalid while gaining nG so
+            // a later mprotect-to-write still inherits ASID scoping. An
+            // absent leaf has no execute state to preserve; arm it NX.
+            base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | UXN
+        }
+        PtOp::KernelReadOnly { exec } => base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec) | scope,
+    }
+}
+
+/// Does a leaf with `(valid, ap, uxn_set)` already satisfy `op`? Includes the
+/// UXN (execute) bit so a re-protect that only flips PROT_EXEC still applies.
+fn pt_satisfies(
+    asid_scoped_leaves: bool,
+    op: PtOp,
+    valid: bool,
+    ap: u64,
+    uxn_set: bool,
+    non_global: bool,
+    retired: bool,
+) -> bool {
+    let scoped = !asid_scoped_leaves || non_global;
+    match op {
+        PtOp::Invalidate => !valid && scoped,
+        PtOp::Retire => !valid && scoped && retired,
+        PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec && scoped,
+        PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec && scoped,
+        PtOp::ForkReadOnly => (ap == AP_RO || ap == AP_PRIV_RO) && non_global,
+        PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec && scoped,
+    }
+}
+
+/// The descriptor `op` makes of one covering terminal at `level` whose
+/// semantic block starts at `block_start`, or `None` when the terminal
+/// already satisfies `op` (then its whole span is skipped, never split).
+/// The host editor's `apply` and guest fork-arm transactions share this one
+/// definition; callers check the GIC window for descriptors they store.
+pub(crate) fn pt_terminal_edit(
+    asid_scoped_leaves: bool,
+    op: PtOp,
+    desc: u64,
+    level: usize,
+    block_start: u64,
+) -> Option<u64> {
+    let empty = !PageTableManager::records_output(desc, level);
+    let tagged = match op {
+        PtOp::ReadWrite { exec } => private_permission_tags(desc & !SW_EL1_COW, true, exec),
+        PtOp::ReadOnly { exec } | PtOp::KernelReadOnly { exec } => {
+            private_permission_tags(desc & !SW_EL1_COW, false, exec)
+        }
+        PtOp::ForkReadOnly => arm_private_cow(desc),
+        PtOp::Invalidate | PtOp::Retire => desc,
+    };
+    let already = tagged == desc
+        && match op {
+            // An EMPTY descriptor is already as invalid as it can be, and
+            // nothing about it (nG, retirement) survives to a revalidation
+            // — which rebuilds it from scratch. Writing anything into it
+            // would turn "no output recorded" into a descriptor that a
+            // later in-place edit or split treats as carrying one.
+            PtOp::Invalidate | PtOp::Retire if empty => true,
+            // A speculative EL1 grant leaf has no live EL0 write
+            // permission to revoke at fork. Keep its current AP as
+            // Linux intent until first touch publishes the page under
+            // the backend's armed physical COW authority.
+            PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
+                desc & NON_GLOBAL != 0
+            }
+            _ => pt_satisfies(
+                asid_scoped_leaves,
+                op,
+                desc & VALID != 0,
+                desc & AP_MASK,
+                desc & UXN != 0,
+                desc & NON_GLOBAL != 0,
+                desc & SW_RETIRED != 0,
+            ),
+        };
+    if already {
+        return None;
+    }
+    let new_desc = match op {
+        PtOp::Invalidate | PtOp::Retire => {
+            let scope = if asid_scoped_leaves { NON_GLOBAL } else { 0 };
+            let retired = if matches!(op, PtOp::Retire) {
+                SW_RETIRED
+            } else {
+                0
+            };
+            (desc & !VALID & !if el1_cow(desc) { SW_EL1_COW } else { 0 }) | scope | retired
+        }
+        PtOp::ReadOnly { .. }
+        | PtOp::ForkReadOnly
+        | PtOp::ReadWrite { .. }
+        | PtOp::KernelReadOnly { .. }
+            if !empty =>
+        {
+            let ap = match op {
+                PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
+                    desc & AP_MASK
+                }
+                PtOp::ForkReadOnly if desc & AP_MASK == AP_PRIV_RO => AP_PRIV_RO,
+                PtOp::ReadOnly { .. } | PtOp::ForkReadOnly => AP_RO,
+                PtOp::KernelReadOnly { .. } => AP_PRIV_RO,
+                _ => AP_RW,
+            };
+            // Fork arming keeps the leaf's own execute permission;
+            // every other edit sets it from the requested prot.
+            let uxn = match op {
+                PtOp::ForkReadOnly => desc & UXN,
+                PtOp::ReadOnly { exec }
+                | PtOp::ReadWrite { exec }
+                | PtOp::KernelReadOnly { exec } => {
+                    if exec {
+                        0
+                    } else {
+                        UXN
+                    }
+                }
+                PtOp::Invalidate | PtOp::Retire => unreachable!(),
+            };
+            let non_global = if asid_scoped_leaves || matches!(op, PtOp::ForkReadOnly) {
+                NON_GLOBAL
+            } else {
+                0
+            };
+            let validity = if matches!(op, PtOp::ForkReadOnly) {
+                desc & VALID
+            } else {
+                VALID
+            };
+            // A revalidated output is live again by definition;
+            // retirement only survives an edit that keeps the
+            // leaf invalid.
+            let retired = if validity == 0 {
+                desc & SW_RETIRED
+            } else if matches!(op, PtOp::ForkReadOnly) {
+                tagged & SW_EL1_COW
+            } else {
+                0
+            };
+            (tagged & !AP_MASK & !UXN & !SW_RETIRED) | ap | uxn | non_global | validity | retired
+        }
+        PtOp::ReadOnly { .. }
+        | PtOp::ForkReadOnly
+        | PtOp::ReadWrite { .. }
+        | PtOp::KernelReadOnly { .. } => pt_desc_for(asid_scoped_leaves, op, block_start, level),
+    };
+    Some(new_desc)
+}
+
 /// The outcome of an edit applied to a page-table range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PageTableApplyOutcome {
@@ -1898,6 +2076,28 @@ impl PageTableManager {
             op,
             tables,
         })
+    }
+
+    /// The guest descriptor operation that arms `[va, va + len)` for fork COW
+    /// exactly as [`Self::set_fork_readonly`] (or [`Self::set_kernel_readonly`]
+    /// for a kernel-only range) would on this image.
+    pub fn fork_arm_op(
+        &self,
+        va: u64,
+        len: u64,
+        kernel_only: bool,
+        executable: bool,
+    ) -> descriptor_txn::DescriptorOp {
+        descriptor_txn::DescriptorOp::ForkArm {
+            span: descriptor_txn::PageSpan::new(va, len),
+            arm: descriptor_txn::ForkArmMode {
+                kernel_only,
+                executable,
+                asid_scoped: self.asid_scoped_leaves,
+                excluded_ipa: self.layout.excluded_ipa_start,
+                excluded_len: self.layout.excluded_ipa_len,
+            },
+        }
     }
 
     /// Authenticate EL1's receipt for `txn` and return the table grants it
@@ -4110,71 +4310,6 @@ impl PageTableManager {
         desc & mask != 0
     }
 
-    /// Build the leaf descriptor for `op` covering `base_pa` at `level`.
-    fn desc_for(&self, op: PtOp, base_pa: u64, level: usize) -> u64 {
-        let (_, mask) = Self::level_span(level);
-        // Block at L1/L2, page at L3 (type bit differs; USER_PAGE_FLAGS adds it).
-        let kernel_only = matches!(op, PtOp::KernelReadOnly { .. });
-        let flags = if level == 3 {
-            if kernel_only {
-                KERNEL_PAGE_FLAGS
-            } else {
-                USER_PAGE_FLAGS
-            }
-        } else if kernel_only {
-            KERNEL_BLOCK_FLAGS
-        } else {
-            USER_BLOCK_FLAGS
-        };
-        let base = base_pa & mask;
-        let scope = if self.asid_scoped_leaves {
-            NON_GLOBAL
-        } else {
-            0
-        };
-        // UXN (bit 54) is set for a non-exec leaf; cleared for an exec one.
-        // USER_*_FLAGS start UXN-clear (executable), so OR in UXN when !exec.
-        let uxn = |exec: bool| if exec { 0 } else { UXN };
-        match op {
-            PtOp::Invalidate => base | (flags & !VALID) | scope,
-            PtOp::Retire => base | (flags & !VALID) | scope | SW_RETIRED,
-            PtOp::ReadWrite { exec } => base | flags | uxn(exec) | scope,
-            PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec) | scope,
-            PtOp::ForkReadOnly => {
-                // Fork arming is a permission restriction, not a remap: a
-                // PROT_NONE descriptor must remain invalid while gaining nG so
-                // a later mprotect-to-write still inherits ASID scoping. An
-                // absent leaf has no execute state to preserve; arm it NX.
-                base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | UXN
-            }
-            PtOp::KernelReadOnly { exec } => {
-                base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec) | scope
-            }
-        }
-    }
-
-    /// Does a leaf with `(valid, ap, uxn_set)` already satisfy `op`? Includes the
-    /// UXN (execute) bit so a re-protect that only flips PROT_EXEC still applies.
-    fn satisfies(
-        &self,
-        op: PtOp,
-        valid: bool,
-        ap: u64,
-        uxn_set: bool,
-        non_global: bool,
-        retired: bool,
-    ) -> bool {
-        let scoped = !self.asid_scoped_leaves || non_global;
-        match op {
-            PtOp::Invalidate => !valid && scoped,
-            PtOp::Retire => !valid && scoped && retired,
-            PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec && scoped,
-            PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec && scoped,
-            PtOp::ForkReadOnly => (ap == AP_RO || ap == AP_PRIV_RO) && non_global,
-            PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec && scoped,
-        }
-    }
-
     /// Apply `op` to `[va, va+len)` at the COARSEST granularity possible: edit a
     /// covering block descriptor in place when the whole block lies inside the
     /// range, and split one level finer only at an unaligned range edge. This
@@ -4199,127 +4334,17 @@ impl PageTableManager {
             let block_start = cur & mask;
             let block_end = block_start + span;
             let desc = self.read_desc(off)?;
-            let empty = !Self::records_output(desc, level);
-            let tagged = match op {
-                PtOp::ReadWrite { exec } => private_permission_tags(desc & !SW_EL1_COW, true, exec),
-                PtOp::ReadOnly { exec } | PtOp::KernelReadOnly { exec } => {
-                    private_permission_tags(desc & !SW_EL1_COW, false, exec)
-                }
-                PtOp::ForkReadOnly => arm_private_cow(desc),
-                PtOp::Invalidate | PtOp::Retire => desc,
-            };
-            let already = tagged == desc
-                && match op {
-                    // An EMPTY descriptor is already as invalid as it can be, and
-                    // nothing about it (nG, retirement) survives to a revalidation
-                    // — which rebuilds it from scratch. Writing anything into it
-                    // would turn "no output recorded" into a descriptor that a
-                    // later in-place edit or split treats as carrying one.
-                    PtOp::Invalidate | PtOp::Retire if empty => true,
-                    // A speculative EL1 grant leaf has no live EL0 write
-                    // permission to revoke at fork. Keep its current AP as
-                    // Linux intent until first touch publishes the page under
-                    // the backend's armed physical COW authority.
-                    PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
-                        desc & NON_GLOBAL != 0
-                    }
-                    _ => self.satisfies(
-                        op,
-                        desc & VALID != 0,
-                        desc & AP_MASK,
-                        desc & UXN != 0,
-                        desc & NON_GLOBAL != 0,
-                        desc & SW_RETIRED != 0,
-                    ),
-                };
-            if already {
+            let edited = pt_terminal_edit(self.asid_scoped_leaves, op, desc, level, block_start);
+            if edited.is_none() {
                 // The covering block is ALREADY at the target — skip its whole
                 // span with no split (this is what keeps RW-on-already-RW, and a
                 // re-protect of an unchanged range, free).
                 cur = block_end;
-            } else if block_start >= va && block_end <= end {
+            } else if let Some(new_desc) = edited.filter(|_| block_start >= va && block_end <= end)
+            {
                 // The whole covering block is inside the range and needs the
                 // change: edit it in place at this level (no split).
                 let previously_valid = desc & VALID != 0;
-                let new_desc = match op {
-                    PtOp::Invalidate | PtOp::Retire => {
-                        let scope = if self.asid_scoped_leaves {
-                            NON_GLOBAL
-                        } else {
-                            0
-                        };
-                        let retired = if matches!(op, PtOp::Retire) {
-                            SW_RETIRED
-                        } else {
-                            0
-                        };
-                        (desc & !VALID & !if el1_cow(desc) { SW_EL1_COW } else { 0 })
-                            | scope
-                            | retired
-                    }
-                    PtOp::ReadOnly { .. }
-                    | PtOp::ForkReadOnly
-                    | PtOp::ReadWrite { .. }
-                    | PtOp::KernelReadOnly { .. }
-                        if !empty =>
-                    {
-                        let ap = match op {
-                            PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
-                                desc & AP_MASK
-                            }
-                            PtOp::ForkReadOnly if desc & AP_MASK == AP_PRIV_RO => AP_PRIV_RO,
-                            PtOp::ReadOnly { .. } | PtOp::ForkReadOnly => AP_RO,
-                            PtOp::KernelReadOnly { .. } => AP_PRIV_RO,
-                            _ => AP_RW,
-                        };
-                        // Fork arming keeps the leaf's own execute permission;
-                        // every other edit sets it from the requested prot.
-                        let uxn = match op {
-                            PtOp::ForkReadOnly => desc & UXN,
-                            PtOp::ReadOnly { exec }
-                            | PtOp::ReadWrite { exec }
-                            | PtOp::KernelReadOnly { exec } => {
-                                if exec {
-                                    0
-                                } else {
-                                    UXN
-                                }
-                            }
-                            PtOp::Invalidate | PtOp::Retire => unreachable!(),
-                        };
-                        let non_global =
-                            if self.asid_scoped_leaves || matches!(op, PtOp::ForkReadOnly) {
-                                NON_GLOBAL
-                            } else {
-                                0
-                            };
-                        let validity = if matches!(op, PtOp::ForkReadOnly) {
-                            desc & VALID
-                        } else {
-                            VALID
-                        };
-                        // A revalidated output is live again by definition;
-                        // retirement only survives an edit that keeps the
-                        // leaf invalid.
-                        let retired = if validity == 0 {
-                            desc & SW_RETIRED
-                        } else if matches!(op, PtOp::ForkReadOnly) {
-                            tagged & SW_EL1_COW
-                        } else {
-                            0
-                        };
-                        (tagged & !AP_MASK & !UXN & !SW_RETIRED)
-                            | ap
-                            | uxn
-                            | non_global
-                            | validity
-                            | retired
-                    }
-                    PtOp::ReadOnly { .. }
-                    | PtOp::ForkReadOnly
-                    | PtOp::ReadWrite { .. }
-                    | PtOp::KernelReadOnly { .. } => self.desc_for(op, block_start, level),
-                };
                 // A valid leaf whose output lies in the in-kernel GIC's window
                 // would expose the distributor or a redistributor as memory,
                 // whether the output was rebuilt from the identity VA or kept.
@@ -11120,5 +11145,120 @@ mod tests {
             ),
             Err(GuestTxnPrepareError::NotGuestOwned)
         );
+    }
+
+    /// A guest fork-arm transaction and the host editor produce the same
+    /// terminal descriptor for every page of every armed range and of their
+    /// neighbours, across prepared/resident EL1 grants, untagged host
+    /// aliases, fully and partially covered coarse blocks, kernel-only
+    /// ranges and never-populated reservations.
+    #[test]
+    fn guest_fork_arm_matches_the_host_editor_page_for_page() {
+        use core::sync::atomic::AtomicU64;
+        use descriptor_txn::{
+            CallerInvalidatesAsid, DescriptorOutcome, InlineJournal, PrimaryTableWords,
+            TableGrants, execute_descriptor_op,
+        };
+        const TWO_MIB: u64 = 1 << 21;
+        let mut image = hvpatch_manager();
+        let grant_va = LINUX_MMAP_BASE + 0x40_0000;
+        image
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va: grant_va,
+                    ipa: LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+                    len: 4 * PT_PAGE,
+                    writable: true,
+                    executable: false,
+                },
+                grant_va + PT_PAGE,
+                None,
+            )
+            .unwrap();
+        let block_va = LINUX_MMAP_BASE + 4 * TWO_MIB;
+        image
+            .set_rw(block_va, 2 * TWO_MIB as usize, false, None)
+            .unwrap();
+        image.declare_live_hardware_image();
+        // (va, len, kernel_only, executable)
+        let ranges = [
+            (grant_va, 4 * PT_PAGE, false, false),
+            (block_va, TWO_MIB, false, false),
+            (block_va + TWO_MIB + 3 * PT_PAGE, 5 * PT_PAGE, false, false),
+            (block_va + TWO_MIB + 64 * PT_PAGE, 2 * PT_PAGE, true, false),
+            (
+                LINUX_MMAP_BASE + 16 * TWO_MIB + PT_PAGE,
+                3 * PT_PAGE,
+                false,
+                false,
+            ),
+        ];
+
+        let mut host = image.snapshot_image().unwrap();
+        host.declare_live_hardware_image();
+        for &(va, len, kernel_only, executable) in &ranges {
+            if kernel_only {
+                host.set_kernel_readonly(va, len as usize, executable, None)
+                    .unwrap();
+            } else {
+                host.set_fork_readonly(va, len as usize, None).unwrap();
+            }
+        }
+
+        let mut guest = image;
+        let base = guest.base();
+        let mut bytes = guest.as_bytes().to_vec();
+        bytes.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let words: Vec<AtomicU64> = bytes
+            .chunks_exact(8)
+            .map(|w| AtomicU64::new(u64::from_le_bytes(w.try_into().unwrap())))
+            .collect();
+        let maintenance = CallerInvalidatesAsid;
+        let live = unsafe {
+            PrimaryTableWords::new(
+                words.as_ptr().cast_mut(),
+                base,
+                words.len() * 8,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        let mut linked_total = 0;
+        for &(va, len, kernel_only, executable) in &ranges {
+            let op = guest.fork_arm_op(va, len, kernel_only, executable);
+            let plan = descriptor_txn::plan_descriptor_op(&live, SubstrateGpa(base), op).unwrap();
+            let grants: TableGrants = guest
+                .reserve_primary_table_grants(plan.table_grants)
+                .unwrap();
+            let outcome = execute_descriptor_op(
+                &live,
+                SubstrateGpa(base),
+                op,
+                &grants,
+                &mut InlineJournal::new(),
+            );
+            let DescriptorOutcome::Applied(applied) = outcome else {
+                panic!("fork arm {va:#x} not applied: {outcome:?}");
+            };
+            linked_total += usize::from(applied.tables_linked);
+        }
+        assert!(linked_total >= 2, "range edges inside coarse blocks split");
+
+        let guest_bytes: Vec<u8> = words
+            .iter()
+            .flat_map(|w| w.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes())
+            .collect();
+        for &(va, len, _, _) in &ranges {
+            let mut page = va.saturating_sub(2 * PT_PAGE);
+            while page < va + len + 2 * PT_PAGE {
+                let host_leaf = terminal_descriptor(host.debug_walk(page));
+                let guest_leaf = terminal_descriptor(walk_descriptors(&guest_bytes, base, page));
+                assert_eq!(
+                    host_leaf, guest_leaf,
+                    "page {page:#x}: host {host_leaf:#x} guest {guest_leaf:#x}"
+                );
+                page += PT_PAGE;
+            }
+        }
     }
 }

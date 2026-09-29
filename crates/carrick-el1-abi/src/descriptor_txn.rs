@@ -125,8 +125,8 @@ impl Default for DescriptorTxnSlots {
     }
 }
 
-/// Offset of [`DescriptorTxnSlots`] in the EL1 region: the tail half of the
-/// counters area.
+/// Offset of [`DescriptorTxnSlots`] in the EL1 region: its assigned
+/// `[0x180000, 0x1A0000)` window of the counters area.
 pub const EL1_DESCRIPTOR_TXN_OFFSET: u64 = EL1_COUNTERS_OFFSET + 0x8_0000;
 pub const EL1_DESCRIPTOR_TXN_BASE: u64 = EL1_REGION_BASE + EL1_DESCRIPTOR_TXN_OFFSET;
 
@@ -137,6 +137,13 @@ const _: () = assert!(
 const _: () = assert!(
     EL1_DESCRIPTOR_TXN_OFFSET + core::mem::size_of::<DescriptorTxnSlots>() as u64
         <= EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE
+);
+// Counters-area assignment: counters [0x100000, 0x120000), shared
+// reservations [0x120000, 0x180000), descriptor-txn slots [0x180000, 0x1A0000).
+const _: () = assert!(EL1_DESCRIPTOR_TXN_OFFSET >= EL1_COUNTERS_OFFSET + 0x8_0000);
+const _: () = assert!(
+    EL1_DESCRIPTOR_TXN_OFFSET + core::mem::size_of::<DescriptorTxnSlots>() as u64
+        <= EL1_COUNTERS_OFFSET + 0xA_0000
 );
 
 /// Layout facts folded into [`crate::EL1_ABI_LAYOUT_HASH`].
