@@ -5,6 +5,21 @@
 use super::*;
 use carrick_fatal::carrick_fatal;
 
+/// Refuse before allocating, copying, staging inventory or editing a live
+/// image. A synchronous host adapter cannot complete guest-owned COW: its
+/// caller must suspend until EL1 has copied and returned a descriptor receipt.
+pub(crate) fn require_host_cow_lane(
+    authority: &carrick_aarch64::Stage1Authority,
+) -> Result<(), TrapError> {
+    if authority.live_descriptor_owner() == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest {
+        return Err(TrapError::Hypervisor(
+            "guest-owned COW requires a guest copy continuation and verified descriptor receipt"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum AliasRetirementAuthorityState {
     Pending,
@@ -291,6 +306,7 @@ impl HvfVmState {
         overlay_ipa: u64,
         len: usize,
     ) -> Result<(), TrapError> {
+        require_host_cow_lane(&self.page_tables_authority())?;
         let overlay_end = overlay_ipa.checked_add(len as u64).ok_or_else(|| {
             TrapError::Hypervisor("private repoint semantic IPA overflow".to_owned())
         })?;
@@ -1001,6 +1017,10 @@ impl HvfVmState {
         let mut retirement = if replacement_leases.is_empty() {
             None
         } else {
+            // Fresh grants only prepare backing. Replacement additionally
+            // retires an old owner, which the guest lane may authorize only
+            // after its descriptor receipt has been settled.
+            require_host_cow_lane(&self.page_tables_authority())?;
             let planned =
                 self.plan_process_alias_retirement(request.semantic_base, semantic_len)?;
             if planned.inventory.is_none()
@@ -1390,6 +1410,7 @@ impl HvfVmState {
         requested_end: u64,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<Option<u64>, TrapError> {
+        require_host_cow_lane(&self.page_tables_authority())?;
         const PAGE_SIZE: u64 = 4 * 1024;
         const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
         const VALID: u64 = 1;
@@ -1842,6 +1863,7 @@ impl HvfTaskState {
         target_ipa: u64,
         len: usize,
     ) -> Result<(), TrapError> {
+        require_host_cow_lane(&self.page_tables_authority())?;
         let target_end = target_ipa.checked_add(len as u64).ok_or_else(|| {
             TrapError::Hypervisor("shared repoint target IPA overflow".to_owned())
         })?;
@@ -2211,6 +2233,7 @@ impl HvfTaskState {
         trigger: FrameCowTrigger,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
+        require_host_cow_lane(&self.page_tables_authority())?;
         let identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch frame COW has no bound mm identity".to_owned())
         })?;
@@ -3183,6 +3206,7 @@ impl HvfTaskState {
             );
         }
         self.cow_armed.lock().disarm(span);
+        self.mm_access.host_cow_stats.record_host_cow_resolution();
         Ok(true)
     }
 
