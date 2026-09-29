@@ -9470,6 +9470,30 @@ mod tests {
                 carrick_el1_abi::Claim::Parked { .. }
             ));
 
+            // A notification is not ownership of the parked EL1 context.
+            // Exercise both scheduler entry points before the control owner
+            // claims the record; neither may admit a host restore.
+            let blocked = root.thread().execution_state();
+            let target = ExactWakeTarget::new(
+                root.task().key(),
+                root.thread().key(),
+                blocked.generation().unwrap(),
+            )
+            .for_continuation(continuation_id);
+            for exact in [false, true] {
+                if exact {
+                    scheduler.wake_exact(target).unwrap();
+                } else {
+                    scheduler.wake(root.thread().key()).unwrap();
+                }
+                assert_eq!(root.thread().execution_state(), blocked);
+                assert_eq!(scheduler.queued_len(), 0);
+                assert!(matches!(
+                    zone.live(record).unwrap().claim(),
+                    carrick_el1_abi::Claim::Parked { seq: parked } if parked == seq
+                ));
+            }
+
             scheduler.wake_control(root.thread().key()).unwrap();
             assert!(matches!(
                 zone.live(record).unwrap().claim(),

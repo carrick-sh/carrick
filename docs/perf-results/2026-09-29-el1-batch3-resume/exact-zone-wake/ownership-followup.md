@@ -100,3 +100,20 @@ This is a test/descriptor-only extension to the prior red-first repair.
 This closes the retired-delivery publication-count observation gap only. It
 does not bound queue visits or total work, observe live guest execution,
 attribute historical failures, or close signed structural/lifecycle acceptance.
+
+## Parked restore admission control
+
+The existing failed-load witness now first sends both a generic scheduler
+wake and an exact wake bound to the owned continuation while the synthetic
+record is Parked. Both leave the execution state unchanged, queue no task
+and retain the same park sequence. Only the subsequent control claim makes
+the record Host-owned before lease acquisition. The existing exact retirement
+and stale-after-reuse assertions still pass. See `restore-admission.log`.
+
+This is additional negative coverage of existing behavior, not a newly
+reproduced kernel defect or attribution of the historical Python crash. No
+production code changed. The sandboxed compile was blocked by DTrace provider
+generation; the unrestricted focused serial invocation passed one test.
+Do not repeat this source audit absent new evidence: the next missing proof
+is the signed evacuation/retirement/reuse interleaving, not another generic
+wake smoke test.
