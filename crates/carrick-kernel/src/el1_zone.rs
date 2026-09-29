@@ -680,6 +680,21 @@ mod tests {
     /// only, never a new waiter that reused the record number.
     #[test]
     fn deferred_slot_handback_does_not_wake_a_reused_record() {
+        use carrick_conformance_contract::{
+            Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+            SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+        };
+        use sha2::{Digest, Sha256};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let registry = ContractRegistry::load(root).unwrap();
+        let contract = registry
+            .require("kernel.el1.deferred-handback-identity")
+            .unwrap();
+        let mut observations = Vec::new();
         for count in [1, 8, 32] {
             let zone = heap_zone();
             let slot = SlotId::new(3);
@@ -745,6 +760,55 @@ mod tests {
             for (record, seq) in replacements {
                 assert_eq!(zone.record(record).claim(), Claim::Parked { seq });
             }
+            // Count the actual publication callback in this one zone's
+            // deferred delivery window, not a process-global counter delta.
+            let mut work = WorkSnapshot::new();
+            work.insert(WorkMetric::WakePublications, published.len() as u64)
+                .unwrap();
+            observations.push(ContractObservation {
+                contract_id: ContractId::new("kernel.el1.deferred-handback-identity").unwrap(),
+                layer: ExecutionLayer::VmFree,
+                implementation_revision: format!(
+                    "sha256:{:x}",
+                    Sha256::new()
+                        .chain_update(include_bytes!("el1_zone.rs"))
+                        .chain_update(include_bytes!("../../carrick-sched-core/src/lib.rs"))
+                        .chain_update(include_bytes!("../../carrick-el1-abi/src/lib.rs"))
+                        .finalize()
+                ),
+                fixture_identity: "unit:deferred_slot_handback_does_not_wake_a_reused_record"
+                    .into(),
+                scale: count,
+                semantic_assertions: vec![SemanticAssertion::pass("replacement_remains_parked")],
+                work: Some(work),
+                timing: None,
+                completeness: Completeness::Complete,
+            });
+        }
+        evaluate(contract, &observations).unwrap();
+        for observation in &observations {
+            println!("{}", serde_json::to_string(observation).unwrap());
+        }
+        // The bound must reject even one extra publication at every scale.
+        for index in 0..observations.len() {
+            let mut extra = observations.clone();
+            let mut work = WorkSnapshot::new();
+            work.insert(WorkMetric::WakePublications, 1).unwrap();
+            extra[index].work = Some(work);
+            assert!(
+                matches!(
+                    evaluate(contract, &extra),
+                    Err(
+                        carrick_conformance_contract::ContractFailure::WorkBudgetExceeded {
+                            metric: WorkMetric::WakePublications,
+                            actual: 1,
+                            maximum: 0,
+                            ..
+                        }
+                    )
+                ),
+                "extra wake escaped the structural budget"
+            );
         }
     }
 

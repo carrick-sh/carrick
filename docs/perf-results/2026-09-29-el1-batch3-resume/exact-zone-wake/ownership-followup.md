@@ -79,3 +79,24 @@ an actual HVF load refusal. It proves the valid-record control/failed-load
 path; it does not certify stale association handling, every terminal path,
 park-sequence exhaustion or deterministic signed interleavings. No production
 code changed and no new signed regression was run for this test-only change.
+
+## Scoped retired-delivery work observation
+
+The existing red-first deferred-slot witness now evaluates the registered
+contract at populations 1, 8 and 32. It counts actual publication callback
+invocations within one synthetic zone's deferred-delivery window: all three
+observations report zero wakes and retain parked replacements. The contract
+enforces an exact zero budget for this VM-free window. For each population,
+a negative observation containing one extra wake must fail specifically with
+WorkBudgetExceeded for WakePublications (actual 1, maximum 0). The separate
+live-record control still requires one publication.
+
+The receipt contains three ContractObservation rows with complete WorkSnapshot
+metadata and a combined SHA-256 of el1_zone.rs, shared scheduler lib.rs and ABI
+lib.rs. The saved hash was independently recomputed from those source files.
+Both focused tests, kernel all-target Clippy and the 68-contract registry pass.
+This is a test/descriptor-only extension to the prior red-first repair.
+
+This closes the retired-delivery publication-count observation gap only. It
+does not bound queue visits or total work, observe live guest execution,
+attribute historical failures, or close signed structural/lifecycle acceptance.
