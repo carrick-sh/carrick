@@ -16,11 +16,11 @@
 //! - [`Claim::Parked`]: queued on one or more futex wait queues. Nobody runs
 //!   it. Any waker (EL1 or host) may claim it, as may the host for a signal,
 //!   a timeout or a teardown; exactly one CAS wins.
-//! - [`Claim::Queued`] / [`Claim::OnCpu`]: an EL1 waker on vCPU slot `s`
+//! - [`Claim::Queued`] / [`Claim::OnCpu`] / [`Claim::OnCpuRequested`]: an EL1 waker on vCPU slot `s`
 //!   claimed it; it waits on, or runs from, `s`'s run queue. Only `s` may
 //!   touch it: EL1 while `s`'s vCPU runs, the executor holding `s` while it is
-//!   stopped at an exit. The host reaches it by kicking `s` (an exit), never
-//!   by writing it.
+//!   stopped at an exit. A host request closes new park admission atomically
+//!   with OnCpuRequested, then kicks `s`; it never writes the live context.
 //! - [`Claim::Transferring`]: a producer owns cleanup and payload publication.
 //!   Host requests/cancellation are recorded atomically; nobody may load or
 //!   free it until the producer publishes readiness or retires it.
@@ -228,6 +228,8 @@ pub enum Claim {
     Queued { slot: SlotId, seq: u32 },
     /// Running on `slot` (EL1 switched it in); the record's context is stale.
     OnCpu { slot: SlotId, seq: u32 },
+    /// Still running, but a host request has atomically closed park admission.
+    OnCpuRequested { slot: SlotId, seq: u32 },
     /// An exclusive producer is finishing a host handback. Cancellation
     /// delegates retirement to that producer; this is never readiness.
     Transferring {
@@ -247,6 +249,7 @@ const STATE_HOST: u64 = 4;
 const STATE_TRANSFERRING: u64 = 5;
 const STATE_TRANSFER_CANCELLED: u64 = 6;
 const STATE_TRANSFER_REQUESTED: u64 = 7;
+const STATE_ONCPU_REQUESTED: u64 = 8;
 
 impl Claim {
     pub const fn encode(self) -> u64 {
@@ -258,6 +261,9 @@ impl Claim {
             }
             Self::OnCpu { slot, seq } => {
                 STATE_ONCPU | ((slot.0 as u64) << 8) | ((seq as u64) << 16)
+            }
+            Self::OnCpuRequested { slot, seq } => {
+                STATE_ONCPU_REQUESTED | ((slot.0 as u64) << 8) | ((seq as u64) << 16)
             }
             Self::Host { seq } => STATE_HOST | ((seq as u64) << 16),
             Self::Transferring {
@@ -283,6 +289,7 @@ impl Claim {
             STATE_PARKED => Self::Parked { seq },
             STATE_QUEUED => Self::Queued { slot, seq },
             STATE_ONCPU => Self::OnCpu { slot, seq },
+            STATE_ONCPU_REQUESTED => Self::OnCpuRequested { slot, seq },
             STATE_HOST => Self::Host { seq },
             STATE_TRANSFERRING => Self::Transferring {
                 seq,
@@ -310,6 +317,7 @@ impl Claim {
             Self::Parked { seq }
             | Self::Queued { seq, .. }
             | Self::OnCpu { seq, .. }
+            | Self::OnCpuRequested { seq, .. }
             | Self::Host { seq }
             | Self::Transferring { seq, .. } => seq,
         }
@@ -1660,17 +1668,56 @@ impl ZoneTables {
         if seq == 0 { 1 } else { seq }
     }
 
-    /// Publish `record` as parked (claimable) under park `seq`. The caller
-    /// wrote the context and queued every entry, and still holds the lock of
-    /// every bucket it queued on.
+    /// Publish a privately allocated `record` as parked under `seq`. The
+    /// caller wrote the context and queued every entry, and still holds the
+    /// lock of every bucket it queued on. A switched-in running record must
+    /// use [`Self::publish_guest_park`] to arbitrate with host requests.
     pub fn publish_park(&self, record: RecordId, seq: u32) {
         let rec = self.record(record);
-        // A host claim refused while EL1 held it is retried on this park.
+        // This allocation has not been exposed to a host requester.
         rec.host_wanted.clear();
         rec.last_seq.store(seq, Ordering::Relaxed);
         rec.handback.store(0, Ordering::Relaxed);
         rec.claim
             .store(Claim::Parked { seq }.encode(), Ordering::Release);
+    }
+
+    /// Publish a single-entry guest park, or undo its enrollment when a
+    /// host request won OnCpu first. The caller owns the running context
+    /// and the entry's bucket lock. No record access follows a successful CAS.
+    #[must_use]
+    pub fn publish_guest_park(
+        &self,
+        guard: &BucketGuard<'_>,
+        slot: SlotId,
+        record: RecordId,
+        seq: u32,
+    ) -> bool {
+        let rec = self.record(record);
+        let from = rec.claim();
+        let previous_seq = rec.last_seq.load(Ordering::Relaxed);
+        let previous_handback = rec.handback.load(Ordering::Relaxed);
+        rec.last_seq.store(seq, Ordering::Relaxed);
+        rec.handback.store(0, Ordering::Relaxed);
+        if matches!(from, Claim::Free | Claim::OnCpu { .. }) && rec.cas(from, Claim::Parked { seq })
+        {
+            return true;
+        }
+        // Only the running owner can leave OnCpuRequested. The host waits
+        // for this slot's exit; it cannot consume this unpublished entry.
+        let entry = rec.first_entry.load(Ordering::Relaxed);
+        if entry != NIL {
+            self.unlink(guard, entry);
+            self.drop_entry(rec, entry);
+        }
+        rec.last_seq.store(previous_seq, Ordering::Relaxed);
+        rec.handback.store(previous_handback, Ordering::Relaxed);
+        rec.deadline.store(0, Ordering::Relaxed);
+        let s = self.slot(slot);
+        if s.timer_record.load(Ordering::Relaxed) == record.raw() {
+            s.timer_record.store(NIL, Ordering::Release);
+        }
+        false
     }
 
     /// Set the CNTVCT deadline of `record`'s next park (0: untimed). The
@@ -2222,7 +2269,9 @@ impl ZoneTables {
     /// ([`Self::take_service_head`]).
     pub fn unswitch(&self, slot: SlotId, record: RecordId) {
         let rec = self.record(record);
-        let Claim::OnCpu { slot: owner, seq } = rec.claim() else {
+        let from = rec.claim();
+        let (Claim::OnCpu { slot: owner, seq } | Claim::OnCpuRequested { slot: owner, seq }) = from
+        else {
             return;
         };
         if owner != slot {
@@ -2231,7 +2280,12 @@ impl ZoneTables {
         let Some(guard) = self.slot_lock(slot, &SpinForever) else {
             return;
         };
-        if !rec.cas(Claim::OnCpu { slot, seq }, Claim::Queued { slot, seq }) {
+        if !rec.cas(from, Claim::Queued { slot, seq })
+            && !rec.cas(
+                Claim::OnCpuRequested { slot, seq },
+                Claim::Queued { slot, seq },
+            )
+        {
             return;
         }
         let s = self.slot(slot);
@@ -2358,10 +2412,22 @@ impl ZoneTables {
     /// registers as they were. Room was made by the switch that follows (the
     /// caller switched the head in first).
     pub fn requeue_preempted(&self, slot: SlotId, record: RecordId) {
+        // The claim and queue membership become visible together to a host
+        // requester. It must not observe Queued before push_locked.
+        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+            return;
+        };
         let rec = self.record(record);
         let queued = match rec.claim() {
-            Claim::OnCpu { slot: owner, seq } if owner == slot => {
-                rec.cas(Claim::OnCpu { slot, seq }, Claim::Queued { slot, seq })
+            from @ (Claim::OnCpu { slot: owner, seq }
+            | Claim::OnCpuRequested { slot: owner, seq })
+                if owner == slot =>
+            {
+                rec.cas(from, Claim::Queued { slot, seq })
+                    || rec.cas(
+                        Claim::OnCpuRequested { slot, seq },
+                        Claim::Queued { slot, seq },
+                    )
             }
             Claim::Free => {
                 // A new home record: it was never parked, so it goes straight
@@ -2384,9 +2450,7 @@ impl ZoneTables {
         if s.current.load(Ordering::Acquire) == record.raw() {
             s.current.store(NIL, Ordering::Release);
         }
-        if let Some(guard) = self.slot_lock(slot, &SpinForever) {
-            self.push_locked(&guard, record, None);
-        }
+        self.push_locked(&guard, record, None);
         self.counters
             .el1_preemptions
             .fetch_add(1, Ordering::Relaxed);
@@ -2638,14 +2702,22 @@ impl ZoneTables {
         let rec = self.record(record);
         let s = self.slot(slot);
         s.current.store(NIL, Ordering::Release);
-        let Claim::OnCpu { slot: owner, seq } = rec.claim() else {
+        let from = rec.claim();
+        let (Claim::OnCpu { slot: owner, seq } | Claim::OnCpuRequested { slot: owner, seq }) = from
+        else {
             return CurrentHandback::Lost;
         };
         if owner != slot {
             return CurrentHandback::Lost;
         }
-        let Some(transfer) =
-            self.begin_host_transfer(self.record_ref(record), Claim::OnCpu { slot, seq })
+        let Some(transfer) = self
+            .begin_host_transfer(self.record_ref(record), from)
+            .or_else(|| {
+                self.begin_host_transfer(
+                    self.record_ref(record),
+                    Claim::OnCpuRequested { slot, seq },
+                )
+            })
         else {
             return CurrentHandback::Lost;
         };
@@ -2675,7 +2747,7 @@ impl ZoneTables {
         if s.host_record.load(Ordering::Acquire) == record.raw() {
             s.host_record.store(NIL, Ordering::Release);
         }
-        if matches!(self.record(record).claim(), Claim::OnCpu { slot: owner, .. } if owner == slot)
+        if matches!(self.record(record).claim(), Claim::OnCpu { slot: owner, .. } | Claim::OnCpuRequested { slot: owner, .. } if owner == slot)
         {
             self.free_record(record);
         }
@@ -3338,9 +3410,9 @@ impl ZoneTables {
                         HostClaim::Stale
                     };
                 }
-                Claim::OnCpu { slot, .. } => {
+                Claim::OnCpu { slot, seq } | Claim::OnCpuRequested { slot, seq } => {
                     rec.host_wanted.publish(r.incarnation);
-                    if rec.claim() != claim {
+                    if !rec.cas(claim, Claim::OnCpuRequested { slot, seq }) {
                         continue;
                     }
                     self.counters
