@@ -211,6 +211,33 @@ mod allocator_stats_tests {
     }
 
     #[test]
+    fn el1_lifecycle_unpublished_custodies_do_not_leak_into_current_carrier() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        let mut observed = Vec::new();
+        for scale in [1, 8, 64] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            for _ in 0..scale {
+                let (base, owner) = grant_owned(&custody);
+                assert!(
+                    retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        base,
+                        owner.length(),
+                        owner.generation(),
+                        &mut |_, _| Ok(()),
+                    )
+                    .is_retired()
+                );
+            }
+            observed.push((scale, snapshot_el1_frame_grant_stats().bytes_granted));
+        }
+        assert!(
+            observed.iter().all(|&(_, bytes)| bytes == 0),
+            "{observed:?}"
+        );
+    }
+
+    #[test]
     fn el1_lifecycle_pins_failed_unmap_and_reuse_at_three_scales() {
         let _guard = global_frame_allocator_test_lock().lock();
         for scale in [1, 8, 64] {
