@@ -479,6 +479,7 @@ pub(crate) struct CarrierVmCustodyState {
 #[derive(Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) struct CarrierVmCustody {
+    pub(crate) el1_frame_grants: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
@@ -533,6 +534,9 @@ impl Default for CarrierVmCustody {
 impl CarrierVmCustody {
     pub(crate) fn new() -> Self {
         Self {
+            el1_frame_grants: std::sync::Arc::new(parking_lot::Mutex::new(
+                El1FrameGrantLedger::default(),
+            )),
             metadata_aperture: parking_lot::Mutex::new(
                 crate::metadata_grant::HostApertureState::new(),
             ),

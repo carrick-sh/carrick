@@ -5,6 +5,144 @@
 use super::*;
 use crate::trap::frame_inventory_backend_tests::*;
 
+/// Model the inventory after one 4 KiB semantic discard in each 16 KiB
+/// compound, with a fork peer still retaining the complete compound. This
+/// exercises inventory/physical retirement, not the guest DONTNEED adapter.
+#[test]
+fn el1_partial_discard_peer_retention_three_scales() {
+    let _guard = global_frame_allocator_test_lock().lock();
+    for scale in [1_u64, 8, 64] {
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let observer = El1FrameGrantObserver::new(&custody);
+        let mut parent = HvpatchFrameInventory::default();
+        let mut child = HvpatchFrameInventory {
+            frames: std::sync::Arc::clone(&parent.frames),
+            ..Default::default()
+        };
+        let mut physical = Vec::new();
+        for index in 0..scale {
+            let mut lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
+            let (base, length) = lease.key();
+            lease.mark_mapped();
+            let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                length as usize,
+                crate::host_mapping::HostMappingKind::FrameCow,
+            )
+            .unwrap();
+            let address = host.as_ptr() as usize;
+            unsafe {
+                std::ptr::write_bytes(host.as_ptr(), 0x7c, length as usize);
+            }
+            let generation = register_global_frame_host_owner_in(&custody, lease, host, 3).unwrap();
+            mark_el1_frame_grant_in(&custody, base, length, 1, generation).unwrap();
+            let frame = carrick_hal::FrameId::from_kernel_allocation(id(index + 1));
+            for (inventory, start, len, mapping) in [
+                (&mut parent, base + 0x1000, 0x3000, 2 * index + 1),
+                (&mut child, base, length, 2 * index + 2),
+            ] {
+                inventory.extents.insert(
+                    (start, len),
+                    InventoryExtent {
+                        frame,
+                        mapping: carrick_hal::MappingId::from_kernel_allocation(id(mapping)),
+                        backing: InventoryBackingIdentity::Private(index),
+                        stage2_base: base,
+                        stage2_length: length,
+                        stage2_owner: InventoryStage2OwnerIdentity {
+                            host_addr: address,
+                            generation,
+                        },
+                    },
+                );
+                let mut frames = inventory.frames.lock();
+                *frames.references.entry(frame).or_default() += 1;
+                *frames
+                    .extent_references
+                    .entry((frame, start, len))
+                    .or_default() += 1;
+                *frames.stage2_references.entry((base, length)).or_default() += 1;
+            }
+            physical.push((base, length, generation, address));
+        }
+        let reservation = |serial| {
+            carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                carrick_hal::FrameInventoryProvenance::from_kernel_entropy([99; 32]),
+                carrick_hal::FrameInventoryBatch::prepare(
+                    carrick_hal::KernelTransactionId::from_kernel_allocation(id(serial)),
+                    carrick_hal::FrameEventCapacity::for_event_count(2 * scale as usize).unwrap(),
+                )
+                .unwrap(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let parent_candidates = HvfVmState::stage_retirement(
+            &mut parent,
+            &mut reservation(1),
+            &TestFrameMappingCount::Exact(2),
+        )
+        .unwrap();
+        assert!(parent_candidates.is_empty());
+        assert_eq!(observer.snapshot().bytes_returned, 0);
+        assert_eq!(
+            observer.snapshot().retained_backing_bytes(),
+            Some(scale * 0x4000)
+        );
+        for &(base, length, generation, address) in &physical {
+            assert_eq!(
+                global_frame_host_owner_identity_in(&custody, base, length),
+                Some((address, generation))
+            );
+            assert!(
+                unsafe { std::slice::from_raw_parts(address as *const u8, length as usize) }
+                    .iter()
+                    .all(|byte| *byte == 0x7c)
+            );
+        }
+        let child_candidates = HvfVmState::stage_retirement(
+            &mut child,
+            &mut reservation(2),
+            &TestFrameMappingCount::Exact(1),
+        )
+        .unwrap();
+        assert_eq!(child_candidates.len(), scale as usize);
+        let mut unmaps = 0;
+        for (base, length, generation, _) in physical {
+            assert!(child_candidates.contains(&(base, length)));
+            assert!(
+                HvfVmState::retire_stage2_candidate_if_unreferenced(
+                    &child.frames,
+                    (base, length),
+                    || {
+                        let outcome = retire_global_frame_host_owner_if_generation_in_using(
+                            &custody,
+                            base,
+                            length,
+                            generation,
+                            &mut |_, _| {
+                                unmaps += 1;
+                                Ok(())
+                            },
+                        );
+                        assert!(outcome.is_retired());
+                        Ok(())
+                    }
+                )
+                .unwrap()
+            );
+        }
+        let after = observer
+            .snapshot_mm(El1FrameGrantMm::new(1).unwrap())
+            .unwrap();
+        assert!(after.complete);
+        assert_eq!(unmaps, scale);
+        assert_eq!(after.returns_completed, scale);
+        assert_eq!(after.ipa_bytes_returned, scale * 0x4000);
+        assert_eq!(after.host_backing_released_bytes, scale * 0x4000);
+        assert_eq!(after.retained_backing_bytes(), Some(0));
+    }
+}
+
 #[test]
 fn lease_retirement_visits_only_the_selected_extents() {
     let mut observations = Vec::new();
@@ -3265,6 +3403,8 @@ fn partial_unmap_preserves_stale_generation_on_both_local_fragments() {
 #[test]
 fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+    let observer = El1FrameGrantObserver::new(legacy_test_carrier_vm_custody());
+    let before = observer.snapshot();
     let mut lease =
         GlobalFrameStage2Lease::reserve(0x4000, 0x4000).expect("reserve global frame IPA");
     let key = lease.key();
@@ -3302,6 +3442,14 @@ fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() 
     let stage2_owner = mapped_region_stage2_owner_identity(&region)
         .expect("published exec region has a physical owner identity");
     disarm_test_owner_stage2_unmap(key, owner_generation);
+    mark_el1_frame_grant_in(
+        legacy_test_carrier_vm_custody(),
+        key.0,
+        key.1,
+        12,
+        owner_generation,
+    )
+    .unwrap();
 
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
@@ -3358,6 +3506,16 @@ fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() 
     assert!(
         !global_frame_ipa_allocator().lock().is_live(key.0, key.1),
         "allocator-reserved IPA must be freed after terminal retirement"
+    );
+
+    let after = observer.snapshot();
+    assert!(after.complete);
+    assert_eq!(after.returns_completed - before.returns_completed, 1);
+    assert_eq!(after.bytes_returned - before.bytes_returned, key.1);
+    assert_eq!(after.ipa_bytes_returned - before.ipa_bytes_returned, key.1);
+    assert_eq!(
+        after.host_backing_released_bytes - before.host_backing_released_bytes,
+        key.1
     );
 
     // Prove the allocator can re-allocate a fresh lease and register a successor owner
