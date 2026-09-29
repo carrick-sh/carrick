@@ -432,6 +432,18 @@ where
                                     file.tid == fatal.tid && fatal.code > 0;
                                 let (resume_pc, resume_pstate) =
                                     core_note_resume_pair(&registers, synchronous_fatal_owner);
+                                // `resume_pc` may still address an HvPatch
+                                // syscall island's return branch rather than
+                                // guest `.text`: the host-parked path already
+                                // corrects it at its source
+                                // (`aarch64_core_registers`), but a thread
+                                // EL1 itself parked mid-syscall has no such
+                                // correction available where its `ThreadCtx`
+                                // is read (see `guest_visible_resume_pc`'s
+                                // doc comment). Applying it here uniformly
+                                // is a safe no-op for an already-correct
+                                // value.
+                                let resume_pc = guest_visible_resume_pc(engine, resume_pc);
                                 gregs[32] = resume_pc;
                                 gregs[33] = carrick_hal::el0_visible_pstate(resume_pstate);
                                 Ok(carrick_kernel::core_dump::ThreadState {

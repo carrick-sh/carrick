@@ -403,7 +403,7 @@ pub(crate) use terminal::{
     CloneAdmissionChangeSubscription, CloneAdmissionGate, CloneAdmissionPermit, CloneEnrollment,
     ExecCloneAdmission, ExecTerminalHandoff, FatalSignalAuthority, FatalSignalRecord,
     ForkCloneAdmission, ForkCloseAttempt, ProcessExitClaimReceipt, VcpuLoopOutcome,
-    core_note_resume_pair, try_claim_persistent_process_exit_with,
+    core_note_resume_pair, guest_visible_resume_pc, try_claim_persistent_process_exit_with,
 };
 
 pub(crate) mod outcome;
