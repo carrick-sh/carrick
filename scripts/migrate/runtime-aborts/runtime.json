@@ -2515,6 +2515,17 @@
       "rationale": "Host-alias coordinator released with no recorded holder: alias_active accounting is corrupt, so later dispatchers could enter concurrently or wait forever.",
       "sink": "fatal",
       "domain": "dispatch::mm_mutation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "function": "retire_reservation_root",
+      "ordinal_in_function": 1,
+      "fingerprint": "6baa265f6424a7f7fd48ebe83ca313a89272e01117175bd8158a65fc71b2f87b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_occupancy",
+      "rationale": "Final-MM settlement follows admission closure and occupant drain; a surviving reservation guard or pending descriptor/backing receipt means completion ownership was lost. Reusing the root would expose a stale reservation generation or free metadata still owned by an unfinished transaction. Ordinary proposal refusal is handled before settlement.",
+      "sink": "fatal",
+      "domain": "kernel::mm_occupancy"
     }
   ]
 }
