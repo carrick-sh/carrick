@@ -704,11 +704,15 @@ impl Reservations<'_> {
         if self.pending().is_some() {
             return Err(Refusal::Busy);
         }
+        if len == 0
+            || matches!(placement, Placement::Fixed(addr) | Placement::NoReplace(addr) if !addr.is_multiple_of(4096))
+        {
+            return Err(Refusal::Invalid);
+        }
         let len = len
             .checked_add(4095)
             .map(|v| v & !4095)
-            .filter(|v| *v != 0)
-            .ok_or(Refusal::Invalid)?;
+            .ok_or(Refusal::Limit)?;
         let address = match placement {
             Placement::Fixed(addr) | Placement::NoReplace(addr) => addr,
             Placement::Anywhere => self.first_fit(len).ok_or(Refusal::Limit)?,
@@ -726,10 +730,8 @@ impl Reservations<'_> {
                 }
             }
         };
-        let range = address
-            .checked_add(len)
-            .and_then(|end| ReservationRange::new(address, end))
-            .ok_or(Refusal::Invalid)?;
+        let end = address.checked_add(len).ok_or(Refusal::Limit)?;
+        let range = ReservationRange::new(address, end).ok_or(Refusal::Invalid)?;
         if matches!(placement, Placement::NoReplace(_))
             && self.next(address).is_some_and(|n| n.start < range.end())
         {
@@ -1359,6 +1361,61 @@ mod tests {
             assert_eq!(counters.forwarded[222].load(Ordering::Relaxed), 0);
         }
     }
+    #[test]
+    fn reservation_mmap_overflow_preserves_linux_errno() {
+        use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+        let table = table();
+        let mm = ReservationMm::new(17).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut model = table.lock(0, mm).unwrap();
+        model.finish_import().unwrap();
+        let current = CurrentTask::new();
+        current.task_id.store(1, Ordering::Relaxed);
+        current.thread_serial.store(11, Ordering::Relaxed);
+        current.zone_mm.store(mm.raw(), Ordering::Relaxed);
+        let counters = Counters::default();
+        for (address, length, flags, errno) in [
+            (0, 0, 0x22, 22),
+            (0, u64::MAX, 0x22, 12),
+            (0x100001, 4096, 0x32, 22),
+            (u64::MAX & !4095, 8192, 0x32, 12),
+        ] {
+            let mut frame = TrapFrame::default();
+            frame.x[8] = 222;
+            frame.x[..6].copy_from_slice(&[address, length, 3, flags, u64::MAX, 0]);
+            assert!(matches!(
+                dispatch_anonymous_with_reservations(&mut frame, &counters, &current, &mut model),
+                AnonymousReservationRoute::Action(Action::Served)
+            ));
+            assert_eq!(frame.x[0] as i64, -errno);
+            assert!(model.pending().is_none());
+        }
+        assert_eq!(counters.served[222].load(Ordering::Relaxed), 4);
+        assert_eq!(counters.forwarded[222].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reservation_unadmitted_root_never_serves_a_syscall() {
+        use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+        let table = table();
+        let mm = ReservationMm::new(17).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut model = table.lock(0, mm).unwrap();
+        let current = CurrentTask::new();
+        current.task_id.store(1, Ordering::Relaxed);
+        current.thread_serial.store(11, Ordering::Relaxed);
+        current.zone_mm.store(mm.raw(), Ordering::Relaxed);
+        let counters = Counters::default();
+        let mut frame = TrapFrame::default();
+        frame.x[8] = 222;
+        frame.x[3] = 0x22;
+        assert!(matches!(
+            dispatch_anonymous_with_reservations(&mut frame, &counters, &current, &mut model),
+            AnonymousReservationRoute::Unavailable(Refusal::Stale)
+        ));
+        assert_eq!(counters.served[222].load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
         use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};

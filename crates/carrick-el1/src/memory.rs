@@ -140,7 +140,7 @@ pub fn decide_anonymous_syscall(
     let Some(origin) = ReservationOrigin::capture(current) else {
         return ReservationDisposition::Unavailable(Refusal::Stale);
     };
-    if origin.mm != model.mm() {
+    if origin.mm != model.mm() || !model.is_admitted() {
         return ReservationDisposition::Unavailable(Refusal::Stale);
     }
     let nr = frame.x[8];
