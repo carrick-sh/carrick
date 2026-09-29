@@ -1257,7 +1257,7 @@ mod tests {
         assert_eq!(w.task.zone_mm.load(Ordering::Relaxed), OTHER_MM);
         // The host closes A's fd and the number is reused.
         assert_eq!(w.host().close(a, Fd(r)), Ok(None), "A's pin keeps it");
-        let reused = w.eventfd(a, 0, EventMode::Counter, BLOCK);
+        let reused = w.eventfd(a, 42, EventMode::Counter, BLOCK);
         assert_eq!(reused, r);
         // B returns from the futex wait it was queued from, then writes.
         assert_eq!(f.elr, B_SVC);
@@ -1276,6 +1276,16 @@ mod tests {
         assert_eq!(allocated, 0, "no allocation for admitted I/O");
         assert_eq!(host_calls(&w), 0, "no host exit or adapter call");
         assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), 2);
+        assert_eq!(g.elr, A_SVC + 4, "completed read returns past its SVC");
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(!w.zone.record(current).has_object_operation());
+        // The next call at the same libc SVC must resolve the reused number,
+        // not replay the finished pipe operation or return its old count.
+        let mut next = syscall(SYS_READ, reused, va, 8, A_SVC);
+        assert_eq!((w.call(&mut next), next.x[0]), (RETURNED, 8));
+        assert_eq!(w.mem.read(MM, va, 8), 42u64.to_ne_bytes());
+        assert_eq!(next.elr, A_SVC + 4);
+        assert!(!w.zone.record(current).has_object_operation());
     }
 
     /// A blocking write larger than the pipe suspends with its progress and
