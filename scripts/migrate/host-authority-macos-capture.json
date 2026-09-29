@@ -11785,15 +11785,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1699,
-        "byte_start": 1677,
+        "byte_end": 4644,
+        "byte_start": 4622,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-kernel/src/el1_zone.rs",
-        "line": 36,
-        "line_end": 36,
-        "line_start": 36
+        "line": 111,
+        "line_end": 111,
+        "line_start": 111
       }
     },
     {
@@ -11937,9 +11937,9 @@
       }
     }
   ],
-  "rows_sha256": "867cbe3689e979a3d6dee574cbf0aef0d0d4963e9a18b8d3513967d6746d6ffd",
+  "rows_sha256": "c2d36f1a7197f62d277e1b28e321d90e17281b5c1248e2d2c4e7579a8421c753",
   "schema": 1,
-  "source_head": "2fa5e96c0f2fadfe67c5d394c31145e18e20962e",
+  "source_head": "77bee4216c57da2e45cdea48452b6ada98f9ea7f",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
