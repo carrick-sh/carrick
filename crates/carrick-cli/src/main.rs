@@ -131,7 +131,6 @@ mod debug_core;
 mod debug_el1_census;
 mod debug_exec_stamps;
 mod fs_setup;
-mod hvpatch_carrier_cpu_attribution_profile;
 mod hvpatch_carrier_cpu_low_rate_profile;
 mod hvpatch_core_profile;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
