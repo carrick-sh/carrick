@@ -364,9 +364,11 @@ fn field(stdout: &str, key: &str) -> f64 {
         .unwrap_or_else(|| panic!("no {key}= in {stdout:?}"))
 }
 
-/// Contract `kernel.el1.futex-handoff`: two threads of one process that
-/// ping-pong through `FUTEX_WAIT_PRIVATE`/`FUTEX_WAKE_PRIVATE` switch inside
-/// the guest. The budget is affine in the round-trip count: runs of `SHORT`
+/// Contract `kernel.el1.futex-handoff`: two threads of one process, pinned
+/// to one guest CPU, that ping-pong through
+/// `FUTEX_WAIT_PRIVATE`/`FUTEX_WAKE_PRIVATE` switch inside the guest (the
+/// cross-vCPU handoff is `el1_sched_cross_vcpu_handoff_has_no_host_exits`).
+/// The budget is affine in the round-trip count: runs of `SHORT`
 /// and `LONG` round trips differ by `LONG - SHORT` round trips, and the
 /// carrier's host exits (every `hv_vcpu_run` return) over that difference
 /// must be zero in steady state (below 0.01 per round trip: a host

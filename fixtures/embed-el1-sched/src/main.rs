@@ -4,8 +4,10 @@
 //! raw return value (not libc's errno) is what the checks read.
 //!
 //! Modes:
-//! - `pingpong <iters>`: two threads hand off through
-//!   `FUTEX_WAIT_PRIVATE`/`FUTEX_WAKE_PRIVATE`; prints the round-trip latency.
+//! - `pingpong <iters>`: two threads pinned to guest CPU 0 hand off through
+//!   `FUTEX_WAIT_PRIVATE`/`FUTEX_WAKE_PRIVATE`, so every handoff parks one
+//!   thread and switches to the other on that vCPU; prints the round-trip
+//!   latency. (`pinned-pingpong` is the cross-vCPU handoff.)
 //! - `signal`: signals a thread parked in a futex wait, once with a handler
 //!   without `SA_RESTART` (the handler runs and the wait returns `EINTR`) and
 //!   once with `SA_RESTART` (the handler runs; the wait then returns `EINTR`
@@ -198,10 +200,17 @@ fn sleep_ms(ms: u64) {
 // pingpong
 
 static TURN: AtomicU32 = AtomicU32::new(0); // 0: A acts, 1: B acts, 2: stop
+static TURN_PIN: AtomicI64 = AtomicI64::new(i64::MIN);
 
+/// Both threads share guest CPU 0: unpinned, EL1 places a woken thread on
+/// an idle vCPU, and two threads on two vCPUs can finish a round trip
+/// without either parking, which makes the number of handoffs (the thing
+/// measured) depend on timing.
 fn pingpong(iters: usize) -> i32 {
     const WARMUP: usize = 2000;
+    let pin_a = pin(0);
     let b = std::thread::spawn(|| {
+        TURN_PIN.store(pin(0), Ordering::Release);
         loop {
             while TURN.load(Ordering::Acquire) == 0 {
                 let _ = futex_wait(&TURN, 0);
@@ -228,6 +237,11 @@ fn pingpong(iters: usize) -> i32 {
     TURN.store(2, Ordering::Release);
     let _ = futex_wake(&TURN, 1);
     b.join().expect("pingpong partner exits");
+    let pin_b = TURN_PIN.load(Ordering::Acquire);
+    if pin_a != 0 || pin_b != 0 {
+        println!("pingpong sched_setaffinity failed: main={pin_a} partner={pin_b}");
+        return 1;
+    }
     let ns = 1e9 / cntfrq() as f64;
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2] as f64 * ns;
