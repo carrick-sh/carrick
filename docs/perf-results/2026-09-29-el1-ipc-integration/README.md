@@ -239,3 +239,22 @@ Final development regression: just test-kernel passed (2,198 kernel tests,
 one existing ignore, then all kernel-semantics suites); serial host tests
 passed 138/138. No guest execution was concurrent. Affected ABI/kernel/runtime/
 embed Clippy passed before the final test-only O_RDWR expectation correction.
+
+
+The first signed routing run on 5cc3b64a6 completed correct data transfers but
+failed: served read=6/write=0, forwarded read=2052/write=2049. Entitlement
+negative control passed; both scoped cleanup populations were zero. The
+runner did not publish its failed manifest, so the still-unchanged failing
+executable was copied and independently fingerprinted before any rebuild;
+see live-routing-red-artifact.json and the preserved target path. The
+prerequisite scheduler fixture lockfile gained the fd/pipe core dependencies;
+its exact delta is retained separately. No promotion claim uses this run.
+
+Source tracing found the direct routing blocker: IPC backing was registered
+from the loader's temporary bootstrap Kernel before initialize_root_process
+rebound the dispatcher to the authoritative HVPatch graph. Exact-owner
+publication therefore correctly refused the mapped foreign authority.
+Registration now occurs at the authoritative executor launch before window
+installation, and that root's FileTable is published after mapping, before
+its start gate opens. The earlier bootstrap registration/publication is
+removed. The same signed witness must now prove this correction.

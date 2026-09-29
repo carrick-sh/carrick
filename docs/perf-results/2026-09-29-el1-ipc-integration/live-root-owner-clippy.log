@@ -1,0 +1,4 @@
+    Checking carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-runtime)
+    Checking carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-engine)
+    Checking carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-embed)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.52s

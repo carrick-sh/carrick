@@ -1,0 +1,36 @@
+diff --git a/fixtures/embed-el1-sched/Cargo.lock b/fixtures/embed-el1-sched/Cargo.lock
+index 379f47961..49bac7cf6 100644
+--- a/fixtures/embed-el1-sched/Cargo.lock
++++ b/fixtures/embed-el1-sched/Cargo.lock
+@@ -6,7 +6,9 @@ version = 4
+ name = "carrick-el1-abi"
+ version = "0.1.0"
+ dependencies = [
++ "carrick-fd-core",
+  "carrick-inotify-core",
++ "carrick-pipe-core",
+  "carrick-sched-core",
+ ]
+ 
+@@ -18,10 +20,21 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "carrick-fd-core"
++version = "0.1.0"
++dependencies = [
++ "carrick-sched-core",
++]
++
+ [[package]]
+ name = "carrick-inotify-core"
+ version = "0.1.0"
+ 
++[[package]]
++name = "carrick-pipe-core"
++version = "0.1.0"
++
+ [[package]]
+ name = "carrick-sched-core"
+ version = "0.1.0"

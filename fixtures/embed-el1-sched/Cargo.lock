@@ -6,7 +6,9 @@ version = 4
 name = "carrick-el1-abi"
 version = "0.1.0"
 dependencies = [
+ "carrick-fd-core",
  "carrick-inotify-core",
+ "carrick-pipe-core",
  "carrick-sched-core",
 ]
 
@@ -19,7 +21,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-fd-core"
+version = "0.1.0"
+dependencies = [
+ "carrick-sched-core",
+]
+
+[[package]]
 name = "carrick-inotify-core"
+version = "0.1.0"
+
+[[package]]
+name = "carrick-pipe-core"
 version = "0.1.0"
 
 [[package]]

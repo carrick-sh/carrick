@@ -747,14 +747,6 @@ fn run_address_space_with_hvf_and_dispatcher(
     let mut run = (|| -> Result<RunResult, RuntimeError> {
         // Build the engine (create VM + vCPU, map the address space, park at the EL0
         // trampoline) — the shared `Aarch64EngineCore<HvfAarch64Vmm>` bring-up.
-        // The host IPC authority's memory, mapped into the carrier's IPC
-        // window by its first persistent root (none: IPC stays host-served).
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some(backing) =
-            carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher)
-        {
-            carrick_vmm_hvf::register_ipc_window_backing(backing).map_err(RuntimeError::Trap)?;
-        }
         let mut trap = crate::trap::new_hvf_trap_engine(&image)?;
         carrick_hal::ThreadedEngine::set_persistent_vm_lifecycle(&mut trap, true);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -772,7 +764,6 @@ fn run_address_space_with_hvf_and_dispatcher(
         let boot_context = dispatcher.capture_one_task_context().map_err(|error| {
             RuntimeError::Configuration(format!("capture boot identity Kernel context: {error}"))
         })?;
-        carrick_kernel::kernel::continuation::ipc::publish_file_table(&boot_context);
         let _ = stamp_identity_page(&mut trap, &dispatcher, &boot_context);
         drop(boot_context);
         let mut completion = run_threaded_hvf_loop(trap, dispatcher, max_traps, &carrier);

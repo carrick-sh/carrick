@@ -1,0 +1,368 @@
+   Compiling libc v0.2.189
+   Compiling carrick-embed-interceptor-probe v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/fixtures/embed-interceptor-probe)
+    Finished `release` profile [optimized] target(s) in 0.95s
+build-embed-interceptor-probe: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/interceptor-probe-aarch64
+   Compiling carrick-embed-zone-readers v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/fixtures/embed-zone-readers)
+    Finished `release` profile [optimized] target(s) in 0.22s
+build-embed-zone-readers: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/zone-readers-aarch64
+     Locking 2 packages to latest Rust 1.96.0 compatible versions
+      Adding carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fd-core)
+      Adding carrick-pipe-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-pipe-core)
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-sched-core)
+   Compiling libc v0.2.189
+   Compiling carrick-inotify-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-inotify-core)
+   Compiling carrick-pipe-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-pipe-core)
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fd-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+   Compiling carrick-embed-el1-sched v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/fixtures/embed-el1-sched)
+    Finished `release` profile [optimized] target(s) in 1.07s
+build-embed-el1-sched: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/el1-sched-aarch64
+   Compiling quote v1.0.45
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling serde v1.0.228
+   Compiling serde_core v1.0.228
+   Compiling itoa v1.0.18
+   Compiling thiserror v2.0.20
+   Compiling memchr v2.8.0
+   Compiling zmij v1.0.21
+   Compiling smallvec v1.15.1
+   Compiling portable-atomic v1.13.1
+   Compiling serde_json v1.0.149
+   Compiling critical-section v1.2.0
+   Compiling log v0.4.29
+   Compiling bitflags v2.11.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling version_check v0.9.5
+   Compiling pin-project-lite v0.2.17
+   Compiling generic-array v0.14.7
+   Compiling ucd-trie v0.1.7
+   Compiling zerocopy v0.8.48
+   Compiling subtle v2.6.1
+   Compiling pest v2.8.6
+   Compiling typenum v1.20.0
+   Compiling errno v0.3.14
+   Compiling shlex v1.3.0
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling find-msvc-tools v0.1.9
+   Compiling bytes v1.11.1
+   Compiling once_cell v1.21.4
+   Compiling cc v1.2.62
+   Compiling parking_lot_core v0.9.12
+   Compiling futures-core v0.3.32
+   Compiling signal-hook-registry v1.4.8
+   Compiling carrick-fatal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fatal)
+   Compiling pest_meta v2.8.6
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling scopeguard v1.2.0
+   Compiling writeable v0.6.3
+   Compiling litemap v0.8.2
+   Compiling lock_api v0.4.14
+   Compiling tracing-core v0.1.36
+   Compiling mio v1.2.0
+   Compiling socket2 v0.6.3
+   Compiling cpufeatures v0.2.17
+   Compiling icu_normalizer_data v2.2.0
+   Compiling utf8_iter v1.0.4
+   Compiling plain v0.2.3
+   Compiling thiserror-impl v2.0.20
+   Compiling usdt-impl v0.6.0
+   Compiling icu_properties_data v2.2.0
+   Compiling rustix v1.1.4
+   Compiling sha2 v0.10.9
+   Compiling thread-id v5.1.0
+   Compiling parking_lot v0.12.5
+   Compiling ring v0.17.14
+   Compiling getrandom v0.3.4
+   Compiling percent-encoding v2.3.2
+   Compiling byteorder v1.5.0
+   Compiling synstructure v0.13.2
+   Compiling pest_generator v2.8.6
+   Compiling http v1.4.0
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-sched-core)
+   Compiling pretty-hex v0.4.2
+   Compiling ident_case v1.0.1
+   Compiling zeroize v1.8.2
+   Compiling strsim v0.11.1
+   Compiling serde_derive v1.0.228
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling zerocopy-derive v0.8.48
+   Compiling displaydoc v0.2.5
+   Compiling pest_derive v2.8.6
+   Compiling zerofrom v0.1.8
+   Compiling scroll_derive v0.13.1
+   Compiling tokio-macros v2.7.0
+   Compiling yoke v0.8.2
+   Compiling dtrace-parser v0.3.0
+   Compiling tracing-attributes v0.1.31
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling tokio v1.52.3
+   Compiling scroll v0.13.0
+   Compiling fnv v1.0.7
+   Compiling darling_core v0.20.11
+   Compiling goblin v0.10.5
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling serde_tokenstream v0.2.3
+   Compiling icu_provider v2.2.0
+   Compiling tracing v0.1.44
+   Compiling http-body v1.0.1
+   Compiling rustls-pki-types v1.14.1
+   Compiling futures-macro v0.3.32
+   Compiling icu_normalizer v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fd-core)
+   Compiling getrandom v0.2.17
+   Compiling foldhash v0.1.5
+   Compiling carrick-pipe-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-pipe-core)
+   Compiling slab v0.4.12
+   Compiling carrick-inotify-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-inotify-core)
+   Compiling futures-task v0.3.32
+   Compiling httparse v1.10.1
+   Compiling carrick-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-guest-mem)
+   Compiling untrusted v0.9.0
+   Compiling fastrand v2.4.1
+   Compiling dof v0.4.0
+   Compiling tempfile v3.27.0
+   Compiling futures-util v0.3.32
+   Compiling idna_adapter v1.2.2
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+   Compiling hashbrown v0.15.5
+   Compiling darling_macro v0.20.11
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+   Compiling form_urlencoded v1.2.2
+   Compiling memmap2 v0.9.10
+   Compiling aho-corasick v1.1.4
+   Compiling tower-service v0.3.3
+   Compiling heck v0.5.0
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+   Compiling regex-syntax v0.8.10
+   Compiling rustls v0.23.40
+   Compiling try-lock v0.2.5
+   Compiling mach2 v0.6.0
+   Compiling want v0.3.1
+   Compiling usdt v0.6.0
+   Compiling regex-automata v0.4.14
+   Compiling darling v0.20.11
+   Compiling carrick-mmu-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mmu-core)
+   Compiling rustls-webpki v0.103.13
+   Compiling idna v1.1.0
+   Compiling futures-channel v0.3.32
+   Compiling atomic-waker v1.1.2
+   Compiling tinyvec_macros v0.1.1
+   Compiling autocfg v1.5.0
+   Compiling ipnet v2.12.0
+   Compiling num-traits v0.2.19
+   Compiling hyper v1.9.0
+   Compiling tinyvec v1.11.0
+   Compiling url v2.5.8
+   Compiling derive_builder_core v0.20.2
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-observability)
+   Compiling sync_wrapper v1.0.2
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling base64 v0.22.1
+   Compiling unicode-xid v0.2.6
+   Compiling tower-layer v0.3.3
+   Compiling konst_macro_rules v0.2.19
+   Compiling carrick-signal-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-signal-core)
+   Compiling konst v0.2.20
+   Compiling carrick-signal-linux v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-signal-linux)
+   Compiling tower v0.5.3
+   Compiling const_format_proc_macros v0.2.34
+   Compiling hyper-util v0.1.20
+   Compiling proc-macro-error2 v2.0.1
+   Compiling derive_builder_macro v0.20.2
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling webpki-roots v1.0.7
+   Compiling lazy_static v1.5.0
+   Compiling carrick-timer-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-timer-core)
+   Compiling ryu v1.0.23
+   Compiling futures-sink v0.3.32
+   Compiling core-foundation-sys v0.8.7
+   Compiling serde_urlencoded v0.7.1
+   Compiling tokio-util v0.7.18
+   Compiling tokio-rustls v0.26.4
+   Compiling iana-time-zone v0.1.65
+   Compiling derive_builder v0.20.2
+   Compiling hyper-rustls v0.27.9
+   Compiling getset v0.1.6
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling const_format v0.2.36
+   Compiling tower-http v0.6.10
+   Compiling unicode-normalization v0.1.25
+   Compiling regex v1.12.3
+   Compiling strum_macros v0.27.2
+   Compiling http-body-util v0.1.3
+   Compiling hmac v0.12.1
+   Compiling carrick-kernel-arena v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel-arena)
+   Compiling camino v1.2.2
+   Compiling strum v0.27.2
+   Compiling base64 v0.13.1
+   Compiling jwt v0.16.0
+   Compiling carrick-host v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host)
+   Compiling oci-spec v0.8.4
+   Compiling reqwest v0.12.28
+   Compiling olpc-cjson v0.1.4
+   Compiling chrono v0.4.44
+   Compiling http-auth v0.1.10
+   Compiling rand_core v0.10.1
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling utf8parse v0.2.2
+   Compiling getrandom v0.4.2
+   Compiling unicase v2.9.0
+   Compiling crc32fast v1.5.0
+   Compiling anstyle-parse v1.0.0
+   Compiling filetime v0.2.29
+   Compiling anstyle-query v1.1.5
+   Compiling colorchoice v1.0.5
+   Compiling rustversion v1.0.22
+   Compiling anstyle v1.0.14
+   Compiling adler2 v2.0.1
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling simd-adler32 v0.3.9
+   Compiling anstream v1.0.0
+   Compiling oci-client v0.15.0
+   Compiling miniz_oxide v0.8.9
+   Compiling tar v0.4.45
+   Compiling chacha20 v0.10.1
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling anyhow v1.0.102
+   Compiling carrick-spec v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-spec)
+   Compiling clap_lex v1.1.0
+   Compiling clap_builder v4.6.0
+   Compiling rand v0.10.1
+   Compiling flate2 v1.1.9
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling clap_derive v4.6.1
+   Compiling fd-lock v4.0.4
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vmm-hvf)
+   Compiling carrick-portable v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-portable)
+   Compiling applevisor-sys v1.0.0
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling hashbrown v0.17.1
+   Compiling signal-hook v0.4.4
+   Compiling data-encoding v2.11.0
+   Compiling equivalent v1.0.2
+   Compiling indexmap v2.14.0
+   Compiling clap v4.6.1
+   Compiling hickory-proto v0.26.1
+   Compiling applevisor v1.0.0
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+   Compiling arc-swap v1.9.2
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-aarch64)
+   Compiling sharded-slab v0.1.7
+   Compiling matchers v0.2.0
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling nu-ansi-term v0.50.3
+   Compiling winnow v0.7.15
+   Compiling toml_write v0.1.2
+   Compiling tracing-subscriber v0.3.23
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling carrick-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-image)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-conformance-contract)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3m 20s
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/write_seek_contract-ae3942d64d36dd47.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/write_seek_contract-ae3942d64d36dd47
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/pt_pause_drain_pressure-e1f729ebc91cdf7d.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/pt_pause_drain_pressure-e1f729ebc91cdf7d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/wedge_capture_ladder-c184a6d912502b10.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/wedge_capture_ladder-c184a6d912502b10
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_preemption-fec5a6ce0c55a5db.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_preemption-fec5a6ce0c55a5db
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/discard_fork_threads-40d01799be59a0ad.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/discard_fork_threads-40d01799be59a0ad
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/fault_budget_guest-b05d4abe5fb16d7c.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/fault_budget_guest-b05d4abe5fb16d7c
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_race-3690085b56dad18b.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_race-3690085b56dad18b
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_kick_served_loop-9721202fdb30b811.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_kick_served_loop-9721202fdb30b811
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/kernel_abort-201c922b6ee92d74.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/kernel_abort-201c922b6ee92d74
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_transparent-2ea7e87d7d389879.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_transparent-2ea7e87d7d389879
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/realtime_calibration-ab4ec1be5f00ad51.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/realtime_calibration-ab4ec1be5f00ad51
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/shared_buffer_futex-f5fc4aac3288eaab.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/shared_buffer_futex-f5fc4aac3288eaab
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/conformance_contracts-e010d7eaa8826e2d.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/conformance_contracts-e010d7eaa8826e2d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/host_wait_policy-728fed50fb490be5.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/host_wait_policy-728fed50fb490be5
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/inotify_hotpath_contract-447c6fd266adf039.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/inotify_hotpath_contract-447c6fd266adf039
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/guest_smoke-820ee32ef5a9e9d3.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/guest_smoke-820ee32ef5a9e9d3
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify-8d58401ad14f61d2.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify-8d58401ad14f61d2
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_embed-ac5091a89d42fbfc.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_embed-ac5091a89d42fbfc
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_files-f14f7a86ea8287c9.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_files-f14f7a86ea8287c9
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/crash_parked_thread-daaf29baf92b16c3.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/crash_parked_thread-daaf29baf92b16c3
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify09_probe-8ab374e06b8cf677.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify09_probe-8ab374e06b8cf677
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_gic-08087e1d0b8bdf2e.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_gic-08087e1d0b8bdf2e
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/perf_regression-c77a40a76f722eca.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/perf_regression-c77a40a76f722eca
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_vcpu_lifetime-16462fe60de7b299.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_vcpu_lifetime-16462fe60de7b299
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/two_process_parallelism-266adc1a3cc33999.tmp.88687: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/two_process_parallelism-266adc1a3cc33999
+test-signed: resolved exact filter el1_ipc_live_routing -> el1_ipc_live_routing
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12 el1_ipc_live_routing --exact --nocapture
+
+running 1 test
+test el1_ipc_live_routing ... whole-run routing observation: served read=6 write=0, forwarded read=2052 write=2049
+
+thread 'el1_ipc_live_routing' (34389378) panicked at crates/carrick-embed/tests/el1_ipc_routing.rs:62:5:
+pipe/eventfd loop did not execute in EL1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_ipc_live_routing
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.noent.88687: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.noent.88687
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id el1-ipc-routing-20260929-a) = 0
+remaining carrick procs (run-id el1-ipc-routing-20260929-a-cli) = 0
