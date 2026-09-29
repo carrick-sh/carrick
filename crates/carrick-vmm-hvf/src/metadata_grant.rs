@@ -29,8 +29,24 @@ pub struct MetadataGrantStats {
 }
 
 #[derive(Debug)]
+struct MetadataBacking(OwnedHostMapping);
+// SAFETY: this wrapper shares only ownership and raw addresses, never Rust
+// references to the bytes. All access requires the metadata consumer's locks;
+// the final Arc drops the mapping after every pin has released ownership.
+unsafe impl Send for MetadataBacking {}
+unsafe impl Sync for MetadataBacking {}
+impl MetadataBacking {
+    fn as_ptr(&self) -> *mut u8 {
+        self.0.as_ptr()
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Debug)]
 struct GrantedSlotRecord {
-    backing: Arc<OwnedHostMapping>,
+    backing: Arc<MetadataBacking>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     identity: crate::trap::CarrierStage2RecordIdentity,
     num_slots: usize,
@@ -42,7 +58,8 @@ struct GrantedSlotRecord {
 /// record. Ordinary grant return is refused before stage-2 unmap while pinned.
 pub struct HostMetadataExtentPin {
     extent: MetadataExtent,
-    backing: Arc<OwnedHostMapping>,
+    base: core::ptr::NonNull<u8>,
+    _backing: Arc<MetadataBacking>,
 }
 
 // SAFETY: the Arc owns the mapped bytes. Normal return checks outstanding pins;
@@ -52,7 +69,7 @@ unsafe impl PinnedMetadataExtent for HostMetadataExtentPin {
         self.extent
     }
     fn host_base(&self) -> core::ptr::NonNull<u8> {
-        core::ptr::NonNull::new(self.backing.as_ptr()).expect("owned mapping")
+        self.base
     }
 }
 
@@ -119,7 +136,9 @@ impl HostApertureState {
         }
         Ok(HostMetadataExtentPin {
             extent,
-            backing: Arc::clone(&record.backing),
+            base: core::ptr::NonNull::new(record.backing.as_ptr())
+                .ok_or(MetadataResolutionError::InvalidExtent)?,
+            _backing: Arc::clone(&record.backing),
         })
     }
 
@@ -431,7 +450,7 @@ fn service_metadata_operation(
             }
         };
         state.slots[slot_idx] = Some(GrantedSlotRecord {
-            backing: Arc::new(backing),
+            backing: Arc::new(MetadataBacking(backing)),
             identity,
             num_slots,
             token,
@@ -591,7 +610,7 @@ mod tests {
         state.reserve_slots(0, 1);
         state.slots[0] = Some(GrantedSlotRecord {
             identity: test_record(&custody, generation, &backing, 19),
-            backing: Arc::new(backing),
+            backing: Arc::new(MetadataBacking(backing)),
             num_slots: 1,
             token: 19,
             generation: generation.0,
@@ -691,7 +710,7 @@ mod tests {
             assert_eq!(aperture.find_and_reserve_slots(1), Some(0));
             aperture.slots[0] = Some(GrantedSlotRecord {
                 identity: test_record(&custody, first, &backing, 91),
-                backing: Arc::new(backing),
+                backing: Arc::new(MetadataBacking(backing)),
                 num_slots: 1,
                 token: 91,
                 generation: first.0,
@@ -755,7 +774,7 @@ mod tests {
         unsafe { ptr.write(0xa5) };
         state.slots[slot] = Some(GrantedSlotRecord {
             identity: test_record(&custody, generation, &backing, 7),
-            backing: Arc::new(backing),
+            backing: Arc::new(MetadataBacking(backing)),
             num_slots: 2,
             token: 7,
             generation: 1,

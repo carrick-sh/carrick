@@ -8,12 +8,15 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+mod storage;
+pub use storage::ResolvedReservationNodes;
+
 const ROOTS: usize = carrick_sched_core::spaces::ADDRESS_SPACES;
 const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -136,6 +139,7 @@ pub struct SharedReservations {
     allocated: AtomicU32,
     free: AtomicU64,
     nodes: [Node; NODES],
+    storage: storage::Storage,
 }
 
 const LAYOUT_HASH: u64 = {
@@ -148,6 +152,7 @@ const LAYOUT_HASH: u64 = {
         core::mem::size_of::<Pending>() as u64,
         core::mem::offset_of!(SharedReservations, roots) as u64,
         core::mem::offset_of!(SharedReservations, nodes) as u64,
+        core::mem::offset_of!(SharedReservations, storage) as u64,
         core::mem::offset_of!(Root, state) as u64,
         core::mem::offset_of!(State, pending) as u64,
         core::mem::offset_of!(State, layout) as u64,
@@ -175,6 +180,8 @@ pub struct Reservations<'a> {
     root: &'a Root,
     mm: ReservationMm,
     pub work: usize,
+    banks: Option<&'a dyn storage::NodeBanks>,
+    node_capacity: u32,
 }
 impl Drop for Reservations<'_> {
     fn drop(&mut self) {
@@ -225,6 +232,16 @@ impl SharedReservations {
     }
 
     pub fn lock(&self, index: usize, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
+        self.lock_using(index, mm, None, cfg!(target_os = "none"))
+    }
+
+    fn lock_using<'a>(
+        &'a self,
+        index: usize,
+        mm: ReservationMm,
+        banks: Option<&'a dyn storage::NodeBanks>,
+        identity: bool,
+    ) -> Result<Reservations<'a>, Refusal> {
         if self.layout_hash.load(Ordering::Acquire) != LAYOUT_HASH {
             return Err(Refusal::Stale);
         }
@@ -241,22 +258,35 @@ impl SharedReservations {
             root,
             mm,
             work: 0,
+            banks,
+            node_capacity: self.storage.capacity(),
         };
+        if (banks.is_none() && !identity && self.storage.capacity() > NODES as u32)
+            || banks.is_some_and(|banks| banks.count() < self.storage.bank_count())
+        {
+            return Err(Refusal::MetadataRequired);
+        }
         if guard.state().version != VERSION {
             return Err(Refusal::Stale);
         }
         Ok(guard)
     }
 
-    fn allocate(&self) -> Result<u32, Refusal> {
+    fn allocate(
+        &self,
+        banks: Option<&dyn storage::NodeBanks>,
+        capacity: u32,
+    ) -> Result<u32, Refusal> {
         // One bounded attempt: contention/capacity must unwind to admission,
         // not spin on another MM while retaining this MM's authority.
+
         let head = self.free.load(Ordering::Acquire);
         let index = head as u32;
+        if index > capacity {
+            return Err(Refusal::MetadataRequired);
+        }
         if index != 0 {
-            let next = self.nodes[index as usize - 1]
-                .next_free
-                .load(Ordering::Relaxed);
+            let next = self.node(index, banks).next_free.load(Ordering::Relaxed);
             let generation = (head >> 32)
                 .checked_add(1)
                 .filter(|v| *v <= u32::MAX as u64)
@@ -269,17 +299,17 @@ impl SharedReservations {
         }
         self.allocated
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
-                (n < NODES as u32).then_some(n + 1)
+                (n < capacity).then_some(n + 1)
             })
             .map(|n| n + 1)
             .map_err(|_| Refusal::MetadataRequired)
     }
 
-    fn release(&self, index: u32) {
+    fn release(&self, index: u32, banks: Option<&dyn storage::NodeBanks>) {
         if index == 0 {
             return;
         }
-        let node = &self.nodes[index as usize - 1];
+        let node = self.node(index, banks);
         // Return uses a lock-free stack. Failed CAS reflects another completed
         // return, not polling for a guest/host event while holding a worker.
         let mut head = self.free.load(Ordering::Acquire);
@@ -338,12 +368,12 @@ impl Reservations<'_> {
             return NodeData::default();
         }
         // SAFETY: indices are private to the admitted tree and root guard.
-        unsafe { *self.table.nodes[id as usize - 1].data.get() }
+        unsafe { *self.table.node(id, self.banks).data.get() }
     }
     fn write(&mut self, id: u32, node: NodeData) {
         self.work += 1;
         unsafe {
-            *self.table.nodes[id as usize - 1].data.get() = node;
+            *self.table.node(id, self.banks).data.get() = node;
         }
     }
     pub fn mapping(&mut self, address: u64) -> Option<Mapping> {
@@ -668,11 +698,11 @@ impl Reservations<'_> {
             if !needed[slot] {
                 continue;
             }
-            let node = match self.table.allocate() {
+            let node = match self.table.allocate(self.banks, self.node_capacity) {
                 Ok(node) => node,
                 Err(reason) => {
                     for node in nodes {
-                        self.table.release(node);
+                        self.table.release(node, self.banks);
                     }
                     return Err(reason);
                 }
@@ -836,7 +866,7 @@ impl Reservations<'_> {
             }
             let (tree, freed) = self.erase(self.state().tree, n.start);
             self.state_mut().tree = tree;
-            self.table.release(freed);
+            self.table.release(freed, self.banks);
         }
         let mut pieces = [None; 3];
         pieces[0] = first.map(|mut n| {
@@ -863,7 +893,7 @@ impl Reservations<'_> {
                 self.write(id, n);
                 self.insert_coalescing(id);
             } else {
-                self.table.release(id);
+                self.table.release(id, self.banks);
             }
         }
         self.state_mut().layout.brk = pending.new_brk;
@@ -877,7 +907,7 @@ impl Reservations<'_> {
             return Err(Refusal::Stale);
         }
         for node in pending.nodes {
-            self.table.release(node);
+            self.table.release(node, self.banks);
         }
         self.state_mut().pending = None;
         Ok(())
@@ -904,7 +934,7 @@ impl Reservations<'_> {
         {
             return Err(Refusal::Collision);
         }
-        let id = self.table.allocate()?;
+        let id = self.table.allocate(self.banks, self.node_capacity)?;
         self.write(
             id,
             NodeData {
@@ -927,7 +957,7 @@ impl Reservations<'_> {
         {
             let (tree, freed) = self.erase(self.state().tree, left.start);
             self.state_mut().tree = tree;
-            self.table.release(freed);
+            self.table.release(freed, self.banks);
             n.start = left.start;
         }
         if let Some(right) = self.next(n.end)
@@ -937,7 +967,7 @@ impl Reservations<'_> {
         {
             let (tree, freed) = self.erase(self.state().tree, right.start);
             self.state_mut().tree = tree;
-            self.table.release(freed);
+            self.table.release(freed, self.banks);
             n.end = right.end;
         }
         self.write(id, n);
@@ -994,7 +1024,7 @@ impl Reservations<'_> {
         let n = self.read(id);
         self.release_tree(n.left);
         self.release_tree(n.right);
-        self.table.release(id);
+        self.table.release(id, self.banks);
     }
 }
 
@@ -1037,6 +1067,47 @@ mod tests {
         .unwrap();
         guard.complete(receipt).unwrap()
     }
+    #[test]
+    fn reservation_metadata_required_does_not_become_linux_enomem() {
+        let table = table();
+        let mm = ReservationMm::new(71).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut model = table.lock(0, mm).unwrap();
+        model.finish_import().unwrap();
+        for page in 0..NODES {
+            let decision = model
+                .mmap(
+                    Placement::Fixed(0x100000 + page as u64 * 8192),
+                    4096,
+                    ReservationProtection::READ_WRITE,
+                )
+                .unwrap();
+            complete(&mut model, decision);
+        }
+        assert_eq!(
+            model.mmap(Placement::Anywhere, 4096, ReservationProtection::READ_WRITE),
+            Err(Refusal::MetadataRequired)
+        );
+        assert!(model.pending().is_none());
+        let mut backing = vec![0u8; 2 * 1024 * 1024];
+        let allocator = crate::alloc::MetadataStorage::new();
+        allocator
+            .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
+            .unwrap();
+        model.provision_metadata(&allocator).unwrap();
+        let mut model = table.lock_identity_for_test(0, mm).unwrap();
+        let decision = model
+            .mmap(Placement::Anywhere, 4096, ReservationProtection::READ_WRITE)
+            .unwrap();
+        let request = match decision {
+            Decision::Work(request) => request,
+            _ => panic!(),
+        };
+        assert!(model.mapping(request.range.start()).is_none());
+        complete(&mut model, decision);
+        assert!(model.mapping(request.range.start()).is_some());
+    }
+
     #[test]
     fn reservation_two_mm_shared_observers_and_refusal() {
         let table = table();
