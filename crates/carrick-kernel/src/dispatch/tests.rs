@@ -58,6 +58,54 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use crate::kernel::continuation::{BlockedContinuation, CarrierWaitService,
+            ContinuationCapture, RestartClass, fold_continuation_completion, test_support};
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
+        let reporter = CompatReporter::default();
+        let create = dispatcher.dispatch(&context, SyscallRequest::new(19, SyscallArgs([0; 6])),
+            &mut memory, &reporter).unwrap();
+        let DispatchOutcome::Returned { value: fd } = create else { panic!("eventfd creation: {create:?}"); };
+        let write = SyscallRequest::new(64, SyscallArgs([fd as u64, 0x4000, 8, 0, 0, 0]));
+        memory.write_bytes(0x4000, &(u64::MAX - 1).to_ne_bytes()).unwrap();
+        assert_eq!(dispatcher.dispatch(&context, write, &mut memory, &reporter).unwrap(),
+            DispatchOutcome::Returned { value: 8 });
+        memory.write_bytes(0x4000, &7u64.to_ne_bytes()).unwrap();
+        let blocked = dispatcher.dispatch(&context, write, &mut memory, &reporter).unwrap();
+        assert!(!matches!(blocked, DispatchOutcome::Errno { .. } | DispatchOutcome::Returned { .. }),
+            "blocking eventfd write must yield an owned continuation: {blocked:?}");
+        let generation = test_support::publish(&context, 0x1ecfd);
+        let capture = ContinuationCapture::new(&context, generation, write, RestartClass::RestartSyscall).unwrap();
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(blocked, capture).unwrap();
+        let service = CarrierWaitService::new(Arc::new(crate::kernel::Scheduler::new(Arc::clone(context.kernel()))));
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).unwrap();
+        let token = registration.wake_token();
+        continuation.attach_registration(registration).unwrap();
+        // A peer drains capacity. The parked writer owns the copied value;
+        // changing its original user buffer must not replay a different write.
+        let read = SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4020, 8, 0, 0, 0]));
+        assert_eq!(dispatcher.dispatch(&context, read, &mut memory, &reporter).unwrap(),
+            DispatchOutcome::Returned { value: 8 });
+        memory.write_bytes(0x4000, &99u64.to_ne_bytes()).unwrap();
+        let mut event = std::pin::pin!(service.event(token));
+        let Poll::Ready(Ok(event)) = event.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            panic!("draining capacity must wake the owned eventfd writer");
+        };
+        let completion = continuation.resume(event, &context).unwrap().completion;
+        assert_eq!(fold_continuation_completion(completion, &dispatcher, &context, &mut memory).unwrap(),
+            Some(DispatchOutcome::Returned { value: 8 }));
+        assert_eq!(dispatcher.dispatch(&context, read, &mut memory, &reporter).unwrap(),
+            DispatchOutcome::Returned { value: 8 });
+        let delivered = memory.read_bytes(0x4020, 8).unwrap();
+        assert_eq!(u64::from_ne_bytes(delivered.try_into().unwrap()), 7);
+    }
+
+    #[test]
     fn eventfd_write_records_the_host_readiness_transition() {
         const EVENTFD_WRITE_EVENT: u8 = 21;
         let dispatcher = SyscallDispatcher::new();
