@@ -253,6 +253,7 @@ pub fn record_runs(record: RecordRef) -> Option<bool> {
         }
         carrick_el1_abi::Claim::Queued { .. }
         | carrick_el1_abi::Claim::OnCpu { .. }
+        | carrick_el1_abi::Claim::OnCpuRequested { .. }
         | carrick_el1_abi::Claim::Host { .. } => Some(true),
         _ => None,
     }

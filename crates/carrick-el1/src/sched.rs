@@ -226,7 +226,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if deadline.is_some() {
             zone.arm_timer(slot, record, seq);
         }
-        zone.publish_park(record, seq);
+        if !zone.publish_guest_park(&guard, slot, record, seq) {
+            drop(guard);
+            if fresh {
+                zone.discard_unpublished(slot, record);
+            }
+            return None;
+        }
         drop(guard);
         zone.clear_current(slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);

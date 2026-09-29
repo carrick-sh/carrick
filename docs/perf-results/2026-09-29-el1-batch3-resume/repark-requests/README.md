@@ -61,3 +61,33 @@ belong to 40a707ba0, not this newer implementation.
 Baseline control after removing the witness: all 74 existing EL1 host
 tests passed (`baseline.log`). The formatted witness applies cleanly to
 the unchanged source. Red-log line numbers precede rustfmt of the patch.
+
+## Correction and current validation
+
+The retained witness patch describes the pre-fix red. Both tests are now
+ordinary regression tests. OnCpuRequested makes host-request admission part
+of the atomic claim, and publish_guest_park uses CAS instead of overwriting
+a running claim. A losing guest park removes its unpublished wait entry and
+timer, keeps the current owner and forwards the original syscall/frame.
+A winning guest park has no later producer record writes; the host then
+claims the published wait through the existing transfer protocol.
+
+Handback, unswitch, preemption and release recognize the requested running
+state. Owner transitions allow the one possible OnCpu-to-OnCpuRequested
+change, with at most two CAS attempts. Preemption's existing slot lock now
+spans Queued publication and insertion. The shared ABI hash includes the
+new encoding; the contract bindings include the regression tests.
+
+Additional controls cover a request after enrollment, timer rollback,
+a request after successful park publication, and preemption/unswitch of a
+requested thread. The actual EL1 test requires forwarding to preserve every
+frame register and execute zero WFIs. There is no global scan, added lock,
+polling continuation, enlarged timeout or reduced workload concurrency.
+
+VM-free validation: scheduler core 65, EL1 host 76, ABI 32, kernel/semantics
+2,459 (21 binaries, one existing ignore), kernel serial 109 (four nested child
+runs), runtime 630 (eight existing ignores, one nested child run). All passed.
+Affected all-target Clippy with warnings denied and the 68-contract registry
+passed. Logs are retained here. Signed guest proof remains outstanding.
+This does not close the retirement/restore lifetime audit, exact scheduler
+wakes, park-sequence wrap, WorkObservation or full task-A acceptance.

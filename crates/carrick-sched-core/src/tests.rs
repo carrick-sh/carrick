@@ -127,6 +127,10 @@ fn claim_word_round_trips() {
             slot: SlotId::new(1),
             seq: 2,
         },
+        Claim::OnCpuRequested {
+            slot: SlotId::new(255),
+            seq: u32::MAX,
+        },
         Claim::Host { seq: 77 },
         Claim::Transferring {
             seq: u32::MAX,
@@ -2031,4 +2035,94 @@ fn late_host_requests_neither_target_nor_mask_a_new_incarnation() {
         zone.record(record).is_cancelled(),
         "old publisher masked current cancellation"
     );
+}
+
+#[test]
+fn host_request_wins_against_enrolled_guest_park() {
+    for kind in [Handback::Signal, Handback::Control, Handback::Cancelled] {
+        let zone = zone();
+        let record = park(&zone, 1, 0x1000);
+        wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        let original = zone.record_ref(record);
+        let guard = zone
+            .lock(ZoneTables::bucket_of(MM, 0x2000), &HostWait)
+            .unwrap();
+        let seq = zone.next_seq(record);
+        zone.enqueue(&guard, record, seq, MM, 0x2000, u32::MAX, 0)
+            .unwrap();
+        zone.set_deadline(record, 100);
+        zone.arm_timer(SLOT, record, seq);
+        assert_eq!(
+            zone.claim_for_host(original, None, kind, &HostWait),
+            HostClaim::El1Held { slot: SLOT }
+        );
+        assert!(!zone.publish_guest_park(&guard, SLOT, record, seq));
+        assert_eq!(zone.record(record).entry_count(), 0);
+        assert!(zone.slot(SLOT).timer().is_none());
+        assert_eq!(zone.slot(SLOT).current(), Some(record));
+        drop(guard);
+        assert_eq!(
+            zone.handback_current(SLOT, record),
+            if kind == Handback::Cancelled {
+                CurrentHandback::Retired
+            } else {
+                CurrentHandback::HandedBack
+            }
+        );
+    }
+}
+
+#[test]
+fn host_request_after_guest_park_claims_the_published_wait() {
+    let zone = zone();
+    let record = park(&zone, 1, 0x1000);
+    wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    assert_eq!(zone.switch_in(SLOT), Some(record));
+    let original = zone.record_ref(record);
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x2000), &HostWait)
+        .unwrap();
+    let seq = zone.next_seq(record);
+    zone.enqueue(&guard, record, seq, MM, 0x2000, u32::MAX, 0)
+        .unwrap();
+    assert!(zone.publish_guest_park(&guard, SLOT, record, seq));
+    drop(guard);
+    zone.clear_current(SLOT);
+    assert_eq!(
+        zone.claim_for_host(original, None, Handback::Signal, &HostWait),
+        HostClaim::Claimed
+    );
+    assert_eq!(zone.record(record).entry_count(), 0);
+    assert_eq!(zone.record(record).handback(), Some(Handback::Signal));
+}
+
+#[test]
+fn requested_running_records_survive_preemption_and_unswitch() {
+    for preempt in [false, true] {
+        let zone = zone();
+        let record = park(&zone, 1, 0x1000);
+        wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        let original = zone.record_ref(record);
+        assert_eq!(
+            zone.claim_for_host(original, None, Handback::Signal, &HostWait),
+            HostClaim::El1Held { slot: SLOT }
+        );
+        if preempt {
+            zone.requeue_preempted(SLOT, record);
+        } else {
+            zone.unswitch(SLOT, record);
+        }
+        assert_eq!(zone.slot(SLOT).current(), None);
+        assert_eq!(zone.slot(SLOT).queued(), 1);
+        let mut handed = Vec::new();
+        assert_eq!(
+            zone.take_host_wanted(SLOT, &mut |ready| handed.push(ready)),
+            1
+        );
+        assert_eq!(handed, [original]);
+        assert_eq!(zone.slot(SLOT).queued(), 0);
+        assert_eq!(zone.record(record).entry_count(), 0);
+    }
 }

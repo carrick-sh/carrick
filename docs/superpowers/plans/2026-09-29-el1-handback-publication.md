@@ -145,3 +145,23 @@ The next change must atomically arbitrate park admission against the host
 request and audit all OnCpu transitions; see that receipt for the proposed
 claim-protocol correction and required controls. The existing tagged request
 fix remains useful but does not close request lifetime across re-park.
+
+
+## Re-park correction in validation
+
+OnCpuRequested now records host-request admission in the same atomic word
+as ownership. Guest park publication uses CAS: winning publishes Parked for
+the host to claim; losing removes the unpublished single wait entry and timer
+and forwards with the live syscall/register state intact. There is no record
+write after successful guest park publication. The ABI hash includes the new
+claim encoding. Tagged host intent remains necessary across queued transfer.
+
+Handback, unswitch, release and preemption recognize the requested running
+state. Handback/queue transitions tolerate the one-way running-request CAS
+without abandoning the current record. Preemption holds its existing queue
+lock across both Queued publication and insertion, so a requester cannot
+consume a partially linked record. No new lock, global scan, polling or
+expanded timeout is introduced. Both retained reds are ordinary tests now;
+additional controls cover enrolled wait/timer rollback, requests after park
+publication, and requested preemption/unswitch. Full task A acceptance remains
+open, including post-publication retirement/restore and signed proof.
