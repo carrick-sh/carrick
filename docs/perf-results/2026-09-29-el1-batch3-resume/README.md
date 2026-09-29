@@ -143,3 +143,11 @@ witnesses and the 49-execution signed EL1 regression gate at `40a707ba0` are
 recorded in [core-handback/README.md](core-handback/README.md). The separate
 capacity-test publication race is documented there. Historical crash
 attribution, producer lifetime and full batch acceptance remain open.
+
+## Open producer lifetime defect
+
+The follow-up audit now has a deterministic red: cancellation/reuse while
+`claim_for_host` is unlinking lets the old producer remove a replacement
+waiter's queue entry. See [host-publication/README.md](host-publication/README.md)
+for both retained witnesses and the exact limits of the finding. This is a
+newly reduced acceptance blocker despite the earlier signed regression pass.

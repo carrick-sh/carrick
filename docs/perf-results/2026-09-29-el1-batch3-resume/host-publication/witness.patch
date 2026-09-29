@@ -1,0 +1,119 @@
+diff --git a/crates/carrick-sched-core/src/tests.rs b/crates/carrick-sched-core/src/tests.rs
+index effdca1b3..f92a08b4e 100644
+--- a/crates/carrick-sched-core/src/tests.rs
++++ b/crates/carrick-sched-core/src/tests.rs
+@@ -1628,3 +1628,114 @@ fn read_parked_context_reports_not_parked_for_an_unmatched_identity() {
+     };
+     assert!(matches!(no_longer_parked, ParkedContextRead::NotParked));
+ }
++
++#[test]
++fn host_claim_is_not_published_before_queue_cleanup() {
++    struct ObserveWait(std::sync::mpsc::Sender<()>);
++    impl LockWait for ObserveWait {
++        fn wait(&self, attempt: u32) -> bool {
++            if attempt == 1 {
++                let _ = self.0.send(());
++            }
++            std::thread::yield_now();
++            true
++        }
++    }
++    let zone = zone();
++    let id = park(&zone, 1, 0x1000);
++    let original = zone.record_ref(id);
++    let guard = zone
++        .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
++        .unwrap();
++    let (tx, rx) = std::sync::mpsc::channel();
++    let observed = std::thread::scope(|scope| {
++        let zone = &zone;
++        let producer = scope
++            .spawn(move || zone.claim_for_host(original, None, Handback::Signal, &ObserveWait(tx)));
++        // Observe the real unlink lock boundary, without sleeps or a guest
++        // scheduler hook. Release the bucket before assertions or joining.
++        let reached = rx.recv_timeout(std::time::Duration::from_secs(5));
++        let claim = zone.record(id).claim();
++        let entries = zone.record(id).entry_count();
++        drop(guard);
++        let result = producer.join().unwrap();
++        reached.unwrap();
++        assert_eq!(result, HostClaim::Claimed);
++        (claim, entries)
++    });
++    assert_eq!(zone.record(id).entry_count(), 0);
++    assert_eq!(zone.record(id).handback(), Some(Handback::Signal));
++    assert_eq!(observed.1, 1, "producer paused before queue cleanup");
++    assert!(
++        !matches!(observed.0, Claim::Host { .. }),
++        "Host exposed while producer still owns queue cleanup: {:?}",
++        observed.0
++    );
++}
++
++#[test]
++fn host_claim_cleanup_does_not_unlink_a_replacement_waiter() {
++    struct ObserveWait(std::sync::mpsc::Sender<()>);
++    impl LockWait for ObserveWait {
++        fn wait(&self, attempt: u32) -> bool {
++            if attempt == 1 {
++                let _ = self.0.send(());
++            }
++            std::thread::yield_now();
++            true
++        }
++    }
++    let zone = zone();
++    let address = 0x1000;
++    let id = park(&zone, 1, address);
++    let original = zone.record_ref(id);
++    let bucket = ZoneTables::bucket_of(MM, address);
++    let replacement_address = (0x2000..0x3000)
++        .step_by(4)
++        .find(|addr| ZoneTables::bucket_of(MM, *addr) != bucket)
++        .unwrap();
++    let guard = zone.lock(bucket, &HostWait).unwrap();
++    let (tx, rx) = std::sync::mpsc::channel();
++    let replacement = std::thread::scope(|scope| {
++        let zone = &zone;
++        let producer = scope
++            .spawn(move || zone.claim_for_host(original, None, Handback::Signal, &ObserveWait(tx)));
++        let reached = rx.recv_timeout(std::time::Duration::from_secs(5));
++        if reached.is_err() {
++            drop(guard);
++            let _ = producer.join();
++            panic!("claim did not reach queue cleanup");
++        }
++        // Same cancellation decision as el1_zone::cancel: AlreadyHost
++        // permits free, although this producer is still in unlink_all.
++        let cancellation = zone.claim_for_host(original, None, Handback::Cancelled, &HostWait);
++        let replacement = if matches!(cancellation, HostClaim::Claimed | HostClaim::AlreadyHost) {
++            zone.free_record(id);
++            Some(park(zone, 2, replacement_address))
++        } else {
++            None
++        };
++        drop(guard);
++        assert_eq!(producer.join().unwrap(), HostClaim::Claimed);
++        replacement
++    });
++    if let Some(replacement) = replacement {
++        assert_eq!(replacement, id, "fixture must reuse the retired slot");
++        assert_ne!(zone.record_ref(replacement), original);
++        assert!(matches!(
++            zone.record(replacement).claim(),
++            Claim::Parked { .. }
++        ));
++        assert_eq!(
++            zone.record(replacement).entry_count(),
++            1,
++            "old producer removed the replacement waiter's queue entry"
++        );
++        assert_eq!(
++            wake(&zone, replacement_address, 1, Waker::Host).unwrap(),
++            [replacement]
++        );
++    } else {
++        assert_eq!(zone.record(id).entry_count(), 0);
++    }
++}
