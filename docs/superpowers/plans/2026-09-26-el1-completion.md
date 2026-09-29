@@ -359,6 +359,55 @@ Consumes reviewed adapter, host and fixture branches; produces live in-guest
 pipe/eventfd service with exact descriptor/operation lifetime. Checkpoint 3
 still includes the broader work in E.
 
+Development update (2026-09-29): `wt-cp3-adapter` is clean at local development
+merge `923c55550` (adapter `b0313df83` + host `77b6f40a1`). Runtime backing now
+retains the same kernel IPC authority. Blocking-eventfd writes own their value
+and functional description lease, use object-queue enrollment, survive fd reuse
+and enrollment gaps, and avoid the host-fd reactor population. Guest-produced
+host wakes now drain an indexed pending set through the exact kernel; the
+unregistered global callback is removed. ABI v3 authenticates that layout.
+Final wake-stage checks: 21 ABI IPC pass; 58 kernel IPC pass, one pre-existing
+ignored; ABI/kernel/runtime Clippy and formatting pass. The prior continuation
+stage passed 90 regression tests. Receipts live in that worktree's
+`docs/perf-results/2026-09-29-el1-ipc-integration/`. No signed qualification or
+main integration is claimed. Table publication/lifecycle, fixture integration
+and the five signed witnesses remain open. Refresh compiler captures only at
+the stable qualification boundary.
+
+Descriptor-lifetime follow-up at development commit `7a44fa384`:
+Eventfd host ownership is a shared OFD pin; last host close no longer directly
+retires backing held by a guest pin. Admission refusal rolls back its object.
+Kernel IPC: 60 pass, one existing ignored; kernel/runtime Clippy and fmt pass.
+Pipe OFD lifetime is committed at `964c48bb4`: both endpoint
+pins are admitted transactionally; guest writer pins prevent premature EOF after
+last host close. Second-OFD refusal rolls back endpoints, OFD and storage.
+Pipe regressions passed 87/87; final IPC 62 pass, one existing ignored;
+kernel/runtime Clippy and formatting pass. Shared supported mutable flags and
+access mode are bound at `3721ff3a3`; host/guest changes use one OFD and terminal observations do
+not retain functional pins. Native ARM64 Linux confirmed eventfd O_RDWR reporting.
+Final IPC 64 pass/one existing ignore, pipe 89, eventfd 9 and fcntl 6 pass;
+populations overlap. Affected Clippy and formatting pass. Full table lifecycle
+and publication remain open. These remain development receipts, not signed
+migration acceptance.
+
+Current IPC development head is `375dddee3` in clean `wt-cp3-adapter`.
+Atomic pinned replacement reuses dup2's transaction; HostTable now owns shared
+create/grow/fork/replace/close/exec/destroy and releases backing after core locks.
+Red-first replacement/retirement witnesses are retained. Descriptor core 27/27,
+kernel IPC 67 pass/one existing ignore, affected Clippy and formatting pass.
+HostTable is not yet attached to the kernel FileTable, and nothing new is
+published to EL1. Connect live namespace mutations, implicit stdio, fork/exec
+and functional retirement next; do not equate diagnostic Arc lifetime with
+functional table lifetime. Signed qualification remains pending.
+
+Fixture review rejected `fd27e748d` as acceptance evidence: guest parks/resumes
+and host counts are calculated from a feature flag and loop count, generations
+are fixed to 1, the signal mode lacks signal/partial-write operations, and the
+embed runner labels whole-container counters as a steady-state window. Do not
+merge or enable these reports unchanged. Retain useful scaffolding/contracts,
+replace the invalid observations and missing semantic cases at qualification;
+continue descriptor ownership rather than starting another diagnostics detour.
+
 - [ ] Review and reconcile adapter + host + fixture on one integration base.
   T1 objects and T2 waits are already ancestors of the adapter. Host prerequisite
   subsets were merged; do not assume the complete host branch is integrated.
