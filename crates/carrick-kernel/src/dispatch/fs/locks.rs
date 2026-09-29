@@ -1518,14 +1518,18 @@ impl<'a> FsView<'a> {
                     if arg > i32::MAX as u64 {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    let page = LINUX_PAGE_SIZE;
-                    let requested = arg.max(1);
-                    let rounded = requested.div_ceil(page).saturating_mul(page);
-                    if rounded > PIPE_MAX_SIZE {
+                    if arg > PIPE_MAX_SIZE {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
+                    let rounded = match carrick_el1_abi::ipc::pipe::Pipe::rounded_capacity(
+                        LINUX_PAGE_SIZE as usize,
+                        arg as usize,
+                    ) {
+                        Ok(capacity) => capacity,
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    };
                     let capacity = match crate::file_authority::PipeCapacity::bounded(
-                        rounded.max(page) as u32,
+                        rounded as u32,
                     ) {
                         Ok(cap) => cap,
                         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),

@@ -7386,6 +7386,47 @@ fn fcntl_pipe_set_capacity_routes_through_canonical_authority() {
 }
 
 #[test]
+fn serial_host_el1_ipc_pipe_capacity_admission_matches_shared_rounding() {
+    let mut rig = SpliceTestRig::new(0x10000);
+    rig.dispatcher
+        .activate_file_authority(rig.dispatcher.captured_file_table())
+        .expect("activate authority");
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+
+    // Admission and the shared record must use the same power-of-two size.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_SETPIPE_SZ, 12288, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 16384 }
+    );
+    for fd in [read_fd, write_fd] {
+        assert_eq!(
+            rig.run(
+                SpliceTestRig::SYS_FCNTL,
+                [fd, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 16384 }
+        );
+    }
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_SETPIPE_SZ, 1024 * 1024 + 1, 0, 0, 0],
+        ),
+        DispatchOutcome::errno(LINUX_EPERM)
+    );
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 16384 }
+    );
+}
+
+#[test]
 fn fcntl_pipe_set_capacity_semantic_errors() {
     let mut rig = SpliceTestRig::new(0x10000);
     rig.dispatcher
