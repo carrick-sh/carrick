@@ -285,6 +285,9 @@ impl<'a> FsView<'a> {
             let (open_file, epoll_reservation) = {
                 let mut table = files.write_open_files();
                 let Some(open_file) = table.remove(&fd.0) else {
+                    // Release the table guard first: the stdio path below
+                    // re-reads the table (`discard_splice_pushback_if_final`).
+                    drop(table);
                     return Ok(if is_stdio_fd(fd.0) {
                         // Guest closing its own stdio at exit: there's nothing for
                         // us to do (host fd stays open under StdioSink::Inherit so
