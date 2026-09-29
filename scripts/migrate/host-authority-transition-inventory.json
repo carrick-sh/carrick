@@ -14437,18 +14437,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4645 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4648 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 198930,
-      "byte_start": 198905,
+      "byte_end": 199069,
+      "byte_start": 199044,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 4645,
-      "line_end": 4645,
-      "line_start": 4645
+      "line": 4648,
+      "line_end": 4648,
+      "line_start": 4648
     }
   },
   {
@@ -15953,18 +15953,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:1198 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:1206 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
     "review_id": "HA-000637",
     "source": {
-      "byte_end": 48922,
-      "byte_start": 48900,
+      "byte_end": 49375,
+      "byte_start": 49353,
       "column": 17,
       "column_end": 39,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1198,
-      "line_end": 1198,
-      "line_start": 1198
+      "line": 1206,
+      "line_end": 1206,
+      "line_start": 1206
     }
   },
   {
