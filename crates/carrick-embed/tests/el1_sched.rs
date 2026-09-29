@@ -2206,3 +2206,44 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
         state.events, state.markers
     );
 }
+
+/// Feasibility witness for the deferred-capture auditor on real guest work.
+/// This does not establish retirement/reuse ordering or close the contract.
+#[test]
+fn el1_sched_deferred_handback_capture_observes_guest_records() {
+    use carrick_kernel::observe::{AuditVerdict, KernelAuditor};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Capture {
+        records: Mutex<Vec<carrick_el1_abi::RecordRef>>,
+    }
+    impl KernelAuditor for Capture {
+        fn zone_handbacks_captured(&self, records: &[carrick_el1_abi::RecordRef]) -> AuditVerdict {
+            self.records.lock().unwrap().extend_from_slice(records);
+            AuditVerdict::Continue
+        }
+    }
+
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(30));
+    let carrier = carrier_or_fail();
+    let capture = Arc::new(Capture::default());
+    let result = common::run_or_fail(
+        carrier
+            .container(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([FIXTURE, "two-process", "200"])
+            .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+            .auditor(capture.clone())
+            .run_blocking(),
+    );
+    assert!(result.success(), "{}", result.stdout_utf8());
+    assert!(result.stdout_utf8().contains("child_ok=true"));
+    let records = capture.records.lock().unwrap();
+    println!("deferred handback real guest captures: {records:?}");
+    assert!(
+        !records.is_empty(),
+        "guest workload did not exercise the deferred capture boundary"
+    );
+}

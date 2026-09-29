@@ -17,7 +17,7 @@
 //! - [`wake`] / [`requeue`]: host wakes, whose woken records the runtime then
 //!   hands back to their threads.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use carrick_el1_abi::{
     Handback, HostClaim, LockWait, RecordRef, SlotId, Waker, ZoneTables, zone_tables,
@@ -489,7 +489,15 @@ pub fn service_key(
 /// How the host hands a zone thread back to its host continuation (its zone
 /// wait becomes ready and the scheduler makes it runnable). Registered by
 /// the carrier with its scheduler.
-pub type HandbackPublisher = Box<dyn Fn(RecordRef) + Send + Sync>;
+#[derive(Clone, Copy, Debug)]
+pub enum HandbackEvent<'a> {
+    /// Queue evacuation finished; deferred identity filtering has not begun.
+    DeferredCaptured(&'a [RecordRef]),
+    /// A host-owned record can be offered to its continuation.
+    Ready(RecordRef),
+}
+
+pub type HandbackPublisher = Arc<dyn Fn(HandbackEvent<'_>) + Send + Sync>;
 
 static HANDBACK_PUBLISHER: parking_lot::RwLock<Option<HandbackPublisher>> =
     parking_lot::RwLock::new(None);
@@ -516,8 +524,21 @@ fn publish_handback(record: RecordRef) {
             .host_handbacks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Some(publisher) = HANDBACK_PUBLISHER.read().as_ref() {
-        publisher(record);
+    deliver_handback_event(HandbackEvent::Ready(record));
+}
+
+fn deliver_handback_event(event: HandbackEvent<'_>) {
+    // An auditor may hold a deferred delivery while another execution lane
+    // progresses. Never retain the registration lock across its callback.
+    let publisher = HANDBACK_PUBLISHER.read().clone();
+    if let Some(publisher) = publisher {
+        publisher(event);
+    }
+}
+
+fn capture_handbacks(records: &[RecordRef]) {
+    if !records.is_empty() {
+        deliver_handback_event(HandbackEvent::DeferredCaptured(records));
     }
 }
 
@@ -572,7 +593,14 @@ pub fn step_away_from_slot(slot: SlotId, driver: u64) {
         &mut |record| records.push(record),
         &mut |placement| placements.push(placement),
     ) {
-        settle_vacated(zone, Some(slot), records, placements, &mut publish_handback);
+        settle_vacated(
+            zone,
+            Some(slot),
+            records,
+            placements,
+            &mut publish_handback,
+            &mut capture_handbacks,
+        );
     }
 }
 
@@ -604,7 +632,14 @@ pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<S
         &mut |record| records.push(record),
         &mut |placement| placements.push(placement),
     ) {
-        settle_vacated(zone, now, records, placements, &mut publish_handback);
+        settle_vacated(
+            zone,
+            now,
+            records,
+            placements,
+            &mut publish_handback,
+            &mut capture_handbacks,
+        );
     }
 }
 
@@ -618,10 +653,13 @@ fn settle_vacated(
     records: Vec<RecordRef>,
     placements: Vec<carrick_el1_abi::HostPlacement>,
     publish: &mut impl FnMut(RecordRef),
+    captured: &mut impl FnMut(&[RecordRef]),
 ) {
     for placement in placements {
         deliver_placement(Some(placement));
     }
+    // Deliver already-owed kicks before an observer can delay this batch.
+    captured(&records);
     for record in records {
         let Some(rec) = zone.live(record) else {
             continue;
@@ -750,9 +788,16 @@ mod tests {
                 replacements.push((record, seq));
             }
             let mut published = Vec::new();
-            settle_vacated(&zone, None, records, placements, &mut |record| {
-                published.push(record);
-            });
+            settle_vacated(
+                &zone,
+                None,
+                records,
+                placements,
+                &mut |record| {
+                    published.push(record);
+                },
+                &mut |_| {},
+            );
             assert!(
                 published.is_empty(),
                 "delayed handback targeted replacement: {published:?}"
@@ -812,6 +857,98 @@ mod tests {
         }
     }
 
+    mod serial_host {
+        use super::*;
+
+        #[test]
+        fn deferred_capture_does_not_hold_publisher_registration() {
+            struct Restore(Option<HandbackPublisher>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    *HANDBACK_PUBLISHER.write() = self.0.take();
+                }
+            }
+            let _restore = Restore(HANDBACK_PUBLISHER.write().take());
+            let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_observed = Arc::clone(&observed);
+            let record = RecordRef {
+                id: carrick_el1_abi::RecordId::from_raw(1).unwrap(),
+                incarnation: 7,
+            };
+            register_handback_publisher(Arc::new(move |event| {
+                let HandbackEvent::DeferredCaptured(records) = event else {
+                    panic!("expected deferred capture");
+                };
+                assert_eq!(records, &[record]);
+                let registration = HANDBACK_PUBLISHER.try_write();
+                assert!(
+                    registration.is_some(),
+                    "callback retained registration lock"
+                );
+                callback_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+            capture_handbacks(&[record]);
+            assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn deferred_capture_precedes_filter_and_releases_queue_authority() {
+        let zone = heap_zone();
+        let slot = SlotId::new(3);
+        zone.drive(slot, 7);
+        let old_id = zone.alloc_host_runnable(identity(1)).unwrap();
+        let old = zone.record_ref(old_id);
+        assert!(zone.requeue_on(slot, old_id));
+        let mut records = Vec::new();
+        let mut placements = Vec::new();
+        assert!(zone.leave_slot(
+            slot,
+            7,
+            &mut |record| records.push(record),
+            &mut |placement| placements.push(placement),
+        ));
+        let mut captured = Vec::new();
+        let mut published = Vec::new();
+        let mut replacement = None;
+        settle_vacated(
+            &zone,
+            None,
+            records,
+            placements,
+            &mut |record| published.push(record),
+            &mut |records| {
+                struct RefuseWait;
+                impl LockWait for RefuseWait {
+                    fn wait(&self, _: u32) -> bool {
+                        false
+                    }
+                }
+                let queue = zone.slot_lock(slot, &RefuseWait);
+                assert!(queue.is_some(), "capture retained queue authority");
+                drop(queue);
+                captured.extend_from_slice(records);
+                assert_eq!(records, &[old]);
+                // The core evacuation has returned; the hook can retire and
+                // reuse this allocation before deferred filtering runs.
+                zone.free_record(old.id);
+                let next = zone.alloc_record(identity(2)).unwrap();
+                assert_eq!(next, old.id);
+                let seq = zone.next_seq(next);
+                zone.publish_park(next, seq);
+                replacement = Some((zone.record_ref(next), seq));
+            },
+        );
+        assert_eq!(captured, [old]);
+        assert!(published.is_empty());
+        let (replacement, seq) = replacement.unwrap();
+        assert_ne!(replacement, old);
+        assert_eq!(
+            zone.live(replacement).unwrap().claim(),
+            Claim::Parked { seq }
+        );
+    }
+
     #[test]
     fn deferred_slot_handback_preserves_live_records() {
         let zone = heap_zone();
@@ -829,9 +966,16 @@ mod tests {
             &mut |placement| placements.push(placement),
         ));
         let mut published = Vec::new();
-        settle_vacated(&zone, None, records, placements, &mut |record| {
-            published.push(record);
-        });
+        settle_vacated(
+            &zone,
+            None,
+            records,
+            placements,
+            &mut |record| {
+                published.push(record);
+            },
+            &mut |_| {},
+        );
         assert_eq!(published, [expected]);
         assert!(matches!(
             zone.live(expected).unwrap().claim(),
