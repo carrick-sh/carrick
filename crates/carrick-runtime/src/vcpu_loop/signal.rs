@@ -747,7 +747,7 @@ impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
         }
         let offset = carrick_el1_abi::descriptor_drain_frame_offset(frame.slot as usize)
             .ok_or_else(|| unavailable("slot out of range"))?;
-        // SAFETY: the EL1 region owner keeps the mapping alive while it is
+        // SAFETY: the EL1 region owner keeps the region alive while it is
         // installed; the header is its first 32 bytes.
         let header = carrick_el1_abi::ImageHeader::read_from_prefix(unsafe {
             std::slice::from_raw_parts(
