@@ -1043,6 +1043,16 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
         cloexec: bool,
     ) -> Result<Option<Description>, Error> {
         let entry = t.entry(old)?;
+        self.replace_exact(t, entry.ofd, new, cloexec)
+    }
+
+    fn replace_exact(
+        &self,
+        t: &Table<'a>,
+        ofd: u32,
+        new: Fd,
+        cloexec: bool,
+    ) -> Result<Option<Description>, Error> {
         if new.0 < 0 || new.0 as usize >= t.limit {
             return Err(Error::BadFd);
         }
@@ -1052,19 +1062,13 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
             });
         }
         // Retain first, so replacing an alias cannot temporarily finalize it.
-        self.retain(entry.ofd, REF)?;
+        self.retain(ofd, REF)?;
         let released = match self.close_locked(t, new) {
             Ok(d) => d,
             Err(Error::BadFd) => None,
             Err(e) => return Err(e),
         };
-        t.storage.set(
-            new.0 as usize,
-            Some(Entry {
-                ofd: entry.ofd,
-                cloexec,
-            }),
-        );
+        t.storage.set(new.0 as usize, Some(Entry { ofd, cloexec }));
         Ok(released)
     }
     /// Remove `fd`. Returns the description exactly when this removed its
@@ -1330,6 +1334,23 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
             }),
         );
         Ok(())
+    }
+
+    /// Atomically install a pinned description, replacing any target slot.
+    /// Uses the same replacement transaction as dup2/dup3; no intermediate
+    /// absent slot is visible. A displaced description is returned only on
+    /// its final hold and must be released outside the table lock.
+    #[must_use = "the displaced last-hold description owns backing resources"]
+    pub fn replace_pin(
+        &self,
+        table: TableId,
+        target: Fd,
+        pin: &OfdPin,
+        cloexec: bool,
+    ) -> Result<Option<Description>, Error> {
+        self.check_pin(pin)?;
+        let (_guard, t) = self.lock(table)?;
+        self.replace_exact(&t, pin.key.index, target, cloexec)
     }
 
     /// F_SETFL-class mutation through an owned description, independent of

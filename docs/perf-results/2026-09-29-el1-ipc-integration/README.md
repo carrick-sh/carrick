@@ -159,3 +159,35 @@ and workspace formatting passed. Flags logs are retained alongside this file.
 The initial Clippy check found ambiguous arithmetic/bitwise precedence; explicit
 parentheses corrected it before the final checks. Shared descriptor table
 publication/create/mutation/fork/unshare/CLOEXEC/destroy remains unfinished.
+
+## Atomic slot replacement and owned table lifecycle
+
+The shared core previously exposed only empty-slot pin installation. The new
+replace_pin uses the same locked replacement transaction as dup2/dup3; retaining
+the incoming description first prevents alias retirement. An occupied target
+now changes atomically, without a close/install gap. Final displaced backing
+is returned to the venue for release outside the descriptor lock. The initial
+witnesses failed with TooManyFiles; final core tests pass 27/27, including
+foreign-pin and capacity refusals with unchanged contents/flags/holds.
+
+HostTable owns one admitted shared table and its storage. It supports growth,
+fork, atomic replacement, close, exec and destruction through the existing core.
+The retirement witness initially observed BadFd after dropping an empty child,
+instead of StaleTable: the table identity had not been reclaimed. Teardown now
+invalidates the table and returns its extent. Collected final releases run only
+after leaving core locks; storage for the collection is reserved before locking,
+bounded by min(table capacity, OFD capacity). A bounded-lock reentry witness
+checks final host-resource destructors after exec and table destruction.
+
+Additional checks prove a replaced operation pin still accesses its original
+eventfd, fork preserves its slots, CLOEXEC does not touch the parent's successor,
+and repeated fork/grow/drop cycles beyond the 256-table identity capacity recycle
+all storage. Review caught a consumed-extent trap in the initial fork adapter:
+on success the source extent is cleared, and its token zero must NOT be reclaimed
+because pool offset zero may belong to the live parent. Reclamation is now only
+on failed fork; the storage witness checks three distinct live allocations.
+Final kernel IPC filter: 67 passed, one pre-existing ignored.
+
+HostTable is not yet attached to kernel FileTable. Table publication and the live
+namespace mutation/lifecycle wiring remain open. These are development checks,
+not signed guest execution or checkpoint acceptance.

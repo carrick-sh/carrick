@@ -58,6 +58,10 @@ Shared-record rules (VM-free bindings: this crate's `el1_ipc_*` tests):
   `into_raw`/`from_raw` move the one ownership into and out of a shared
   continuation record; a stale, copied or foreign raw pin fails `StalePin`
   and changes nothing.
+- **Pinned replacement.** `replace_pin` uses the same locked replacement as
+  dup2/dup3. It retains the incoming OFD before retiring the displaced slot,
+  so aliases never reach zero and readers see no intermediate absent slot.
+  Refusal preserves destination flags, contents and incoming hold counts.
 - **Generations.** Table IDs carry authority, index and a non-wrapping
   generation; OFD records advance their generation when freed, so reused
   indices never match stale keys. Exhausted generations retire the slot.

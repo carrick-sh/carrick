@@ -1,0 +1,32 @@
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 45.06s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 1 test
+test el1_ipc::table::tests::serial_host_el1_ipc_owned_table_fork_replace_exec_and_retire ... FAILED
+
+failures:
+
+---- el1_ipc::table::tests::serial_host_el1_ipc_owned_table_fork_replace_exec_and_retire stdout ----
+
+thread 'el1_ipc::table::tests::serial_host_el1_ipc_owned_table_fork_replace_exec_and_retire' (34308091) panicked at crates/carrick-kernel/src/el1_ipc/table.rs:115:9:
+assertion `left == right` failed: dropping an owned table must invalidate its generation
+  left: Err(BadFd)
+ right: Err(StaleTable)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    el1_ipc::table::tests::serial_host_el1_ipc_owned_table_fork_replace_exec_and_retire
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2329 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`
