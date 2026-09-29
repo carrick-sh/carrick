@@ -1499,10 +1499,12 @@ fn next_runnable<F: PersistentExecutor>(
         return Ok(scheduler.try_take(registration)?);
     }
     if let Some(record) = zone.take_service_head(slot) {
-        if zone.record(record).handback() != Some(carrick_el1_abi::Handback::Service) {
+        if zone.live(record).and_then(|rec| rec.handback())
+            != Some(carrick_el1_abi::Handback::Service)
+        {
             // A thread ready at EL0 in another address space: this executor
             // loads it, exactly as the thread it took off its vCPU.
-            let taken = scheduler.adopt_zone_handback(registration, zone.record_ref(record))?;
+            let taken = scheduler.adopt_zone_handback(registration, record)?;
             if taken.is_none() {
                 zone.counters
                     .lost_adoptions
@@ -1510,10 +1512,12 @@ fn next_runnable<F: PersistentExecutor>(
             }
             return Ok(taken);
         }
-        let key = carrick_kernel::el1_zone::service_key(zone.record_ref(record));
-        zone.free_record(record);
+        let key = carrick_kernel::el1_zone::service_key(record);
         let taken = match key {
-            Some((thread, generation)) => scheduler.take_zone(registration, thread, generation)?,
+            Some((thread, generation)) => {
+                zone.free_record(record.id);
+                scheduler.take_zone(registration, thread, generation)?
+            }
             None => None,
         };
         if taken.is_none() {

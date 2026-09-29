@@ -1061,7 +1061,7 @@ fn a_raised_gate_sends_the_thread_to_its_executor() {
     assert_eq!(zone.installed_space(SLOT), MM);
     assert!(cpu.translations.is_empty());
     assert_eq!(
-        zone.take_service_head(SLOT),
+        zone.take_service_head(SLOT).map(|r| r.id),
         Some(b),
         "the executor takes B"
     );
