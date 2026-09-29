@@ -43,7 +43,18 @@ impl HvpatchRuntimeEndpoint {
         };
         let mut delivered = false;
         for thread in snapshot.threads() {
-            match scheduler.wake(thread.key()) {
+            let Some(generation) = thread.execution_state().generation() else {
+                continue;
+            };
+            // Snapshot capture does not pin the parent's lifecycle. Exit,
+            // reap or exec can retire this thread before notification arrives;
+            // only its exact task and execution generation may be nudged.
+            let target = carrick_kernel::kernel::scheduler::ExactWakeTarget::new(
+                self.task_binding.task_key(),
+                thread.key(),
+                generation,
+            );
+            match scheduler.wake_exact(target) {
                 Ok(_) => delivered = true,
                 Err(
                     carrick_kernel::kernel::scheduler::SchedulerError::Thread(
@@ -1715,6 +1726,80 @@ mod tests {
             "post-exec parent with caught SIGCHLD receives pending SIGCHLD upon child exit"
         );
         directory.notify_child_exit(task, post_exec.kernel());
+    }
+
+    #[test]
+    fn child_exit_notification_snapshot_cannot_wake_a_reaped_parent() {
+        use carrick_kernel::kernel::{ClonePlan, LinuxWaitStatus, Scheduler, WaitMode};
+        use carrick_kernel::observe::{
+            AuditReason, AuditVerdict, KernelAuditor, WakeRejectionReason,
+        };
+
+        struct RejectReapedWake;
+        impl KernelAuditor for RejectReapedWake {
+            fn wake_rejected(
+                &self,
+                target: carrick_kernel::kernel::TaskKey,
+                reason: WakeRejectionReason,
+            ) -> AuditVerdict {
+                if reason == WakeRejectionReason::Reaped {
+                    AuditVerdict::Abort(AuditReason::WakeOfReapedTask { target })
+                } else {
+                    AuditVerdict::Continue
+                }
+            }
+        }
+
+        let dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().expect("root");
+        let graph = Arc::clone(root.kernel());
+        let parent = graph
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).expect("fork plan"),
+                "notification-parent".to_owned(),
+                None,
+            )
+            .expect("reserve parent")
+            .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(19_703))
+            .expect("prepare parent")
+            .commit()
+            .expect("commit parent")
+            .start_child()
+            .expect("start parent")
+            .into_parts()
+            .0;
+        let parent_key = parent.task().key();
+        let endpoint = HvpatchRuntimeEndpoint {
+            kernel: Weak::new(),
+            task_binding: parent.task_binding(),
+            scheduler: Some(Arc::new(Scheduler::new(Arc::clone(&graph)))),
+        };
+        let snapshot = endpoint
+            .task_binding
+            .capture_signal_snapshot()
+            .expect("capture notification before parent retirement");
+        let auditors = Arc::new(carrick_kernel::observe::AuditorChain::new(vec![Arc::new(
+            RejectReapedWake,
+        )]));
+        graph.set_auditors(Arc::clone(&auditors));
+        drop(parent);
+        graph
+            .exit_task_key_eventually(parent_key, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("parent exits before notification delivery");
+        graph
+            .wait_child(root.task().key().id, Some(parent_key.id), WaitMode::Consume)
+            .expect("reap parent before notification delivery");
+        assert!(!graph.task_exists(parent_key.id));
+
+        endpoint
+            .wake_scheduler_exact(&snapshot)
+            .expect("retired notification is a no-op");
+        assert_eq!(
+            auditors.abort_reason(),
+            None,
+            "a captured notification must not use a reaped parent's wake authority"
+        );
     }
 
     #[test]

@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.wait.child-exit-notification-lifecycle"
+title = "Delayed child-exit notification retains exact parent authority"
+guest_surfaces = ["syscall:wait4", "scheduler:lifecycle", "signal:SIGCHLD"]
+semantic_authority = ["man 2 waitpid", "man 2 sigaction"]
+fixture = "unit:child_exit_notification_snapshot_cannot_wake_a_reaped_parent"
+scale_points = [1]
+structural_budgets = []
+rationale = "A child-exit notification captured before its parent exits may arrive after that parent is reaped. The delayed scheduler nudge must authenticate the exact task, thread and execution generation, without waking a successor or aborting the carrier. Durable child waitability and wait-subscription publication remain authoritative. The correction adds no polling, retry or population scan."
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::wait_wake::tests::child_exit_notification_snapshot_cannot_wake_a_reaped_parent"
+
+[bindings.unresolved]
+embed_structural = "No deterministic signed delayed-parent notification fixture or structural observation is registered yet."
+embed = "otmpfileforkexec exposed a reaped-task wake in the original batch-3 gate, but attribution to this notification path and a deterministic signed interleaving remain open."
+docker = "The delayed host notification interleaving is internal; pinned Linux fork/exec/wait probe output remains the guest semantic control."
+observation = "The VM-free regression asserts no reaped-task auditor abort. Live notification queueing is covered by hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation. WorkObservation and deterministic work-counter bindings remain pending; empty budgets do not confer structural acceptance."

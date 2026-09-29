@@ -1,0 +1,10 @@
+  sectname __dof_carrick
+   segname __TEXT
+      addr 0x00000001014d3e5f
+      size 0x000000000000d54a
+    offset 21839455
+     align 2^0 (1)
+    reloff 0
+    nreloc 0
+     flags 0x0000000f
+ reserved1 0
