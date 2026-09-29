@@ -103,10 +103,14 @@ pub enum WorkMetric {
     AllocatorMergesPerformed,
     /// Bytes of allocator capacity admitted by the observed fixture.
     AllocatorCapacityBytes,
+    /// Retained snapshot threads visited by child-exit notification delivery.
+    ChildExitNotificationThreadVisits,
+    /// Calls to the exact scheduler wake authority from that delivery path.
+    ChildExitNotificationWakeAttempts,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 48;
+    pub const COUNT: usize = 50;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -156,6 +160,8 @@ impl WorkMetric {
         Self::AllocatorSplitsPerformed,
         Self::AllocatorMergesPerformed,
         Self::AllocatorCapacityBytes,
+        Self::ChildExitNotificationThreadVisits,
+        Self::ChildExitNotificationWakeAttempts,
     ];
 }
 

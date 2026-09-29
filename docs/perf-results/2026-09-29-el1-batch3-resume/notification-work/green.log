@@ -1,0 +1,9 @@
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.68s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-69b4e828d490bdcd)
+
+running 1 test
+test vcpu_loop::wait_wake::tests::child_exit_notification_snapshot_cannot_wake_a_reaped_parent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 641 filtered out; finished in 0.02s
+

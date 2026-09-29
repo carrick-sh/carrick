@@ -1,0 +1,4 @@
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-conformance-contract)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running `target/debug/check-contracts --root .`
+conformance contracts checked: 68 contracts, 15 claims, 148 surfaces (inventory: 338 syscalls, 14 with claims)

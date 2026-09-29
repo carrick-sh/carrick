@@ -2120,17 +2120,19 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
     let _guard = common::guest_lock();
     let _watchdog = common::Watchdog::start(Duration::from_secs(30));
     let carrier = carrier_or_fail();
+    #[cfg(feature = "conformance-metrics")]
+    let scope = carrick_observability::work_meter::WorkMeter::default().new_scope();
     let gate = Arc::new(Gate::default());
-    let result = common::run_or_fail(
-        carrier
-            .container(common::SMOKE_IMAGE)
-            .pull_policy(PullPolicy::Missing)
-            .command([FIXTURE, "delayed-parent-notification"])
-            .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
-            .auditor(gate.clone())
-            .interceptor(gate.clone())
-            .run_blocking(),
-    );
+    let builder = carrier
+        .container(common::SMOKE_IMAGE)
+        .pull_policy(PullPolicy::Missing)
+        .command([FIXTURE, "delayed-parent-notification"])
+        .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+        .auditor(gate.clone())
+        .interceptor(gate.clone());
+    #[cfg(feature = "conformance-metrics")]
+    let builder = builder.work_scope(scope.clone());
+    let result = common::run_or_fail(builder.run_blocking());
     assert!(result.success(), "{}", result.stdout_utf8());
     assert!(
         result
@@ -2149,6 +2151,54 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
         state.reaped_wake_rejections, 0,
         "delayed notification used reaped wake authority"
     );
+    #[cfg(feature = "conformance-metrics")]
+    {
+        use carrick_conformance_contract::{
+            Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+            SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+        };
+        use sha2::{Digest, Sha256};
+        let registry = ContractRegistry::load(&common::repo_root()).unwrap();
+        let contract = registry
+            .require("kernel.wait.child-exit-notification-lifecycle")
+            .unwrap();
+        let observation = ContractObservation {
+            contract_id: ContractId::new("kernel.wait.child-exit-notification-lifecycle").unwrap(),
+            layer: ExecutionLayer::EmbedStructural,
+            implementation_revision: format!(
+                "sha256:{:x}",
+                Sha256::new()
+                    .chain_update(include_bytes!("el1_sched.rs"))
+                    .chain_update(include_bytes!(
+                        "../../carrick-runtime/src/vcpu_loop/wait_wake.rs"
+                    ))
+                    .finalize()
+            ),
+            fixture_identity: contract.fixture.clone(),
+            scale: 1,
+            semantic_assertions: vec![SemanticAssertion::pass(
+                "captured_reaped_released_without_stale_wake",
+            )],
+            work: Some(scope.snapshot().expect("complete scoped notification work")),
+            timing: None,
+            completeness: Completeness::Complete,
+        };
+        println!("{}", serde_json::to_string(&observation).unwrap());
+        evaluate(contract, std::slice::from_ref(&observation)).unwrap();
+        for (visits, attempts) in [(3, 1), (2, 2)] {
+            let mut excess = observation.clone();
+            let mut work = WorkSnapshot::new();
+            work.insert(WorkMetric::ChildExitNotificationThreadVisits, visits)
+                .unwrap();
+            work.insert(WorkMetric::ChildExitNotificationWakeAttempts, attempts)
+                .unwrap();
+            excess.work = Some(work);
+            assert!(
+                evaluate(contract, &[excess]).is_err(),
+                "excess notification work escaped"
+            );
+        }
+    }
     println!(
         "el1 delayed notification ordering={:?} markers={}",
         state.events, state.markers

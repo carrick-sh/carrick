@@ -41,8 +41,17 @@ impl HvpatchRuntimeEndpoint {
         let Some(scheduler) = self.scheduler.as_ref() else {
             return Ok(false);
         };
+        #[cfg(feature = "conformance-metrics")]
+        let work = scheduler.kernel().work_scope();
         let mut delivered = false;
         for thread in snapshot.threads() {
+            #[cfg(feature = "conformance-metrics")]
+            if let Some(scope) = &work {
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::ChildExitNotificationThreadVisits,
+                    1,
+                );
+            }
             let Some(generation) = thread.execution_state().generation() else {
                 continue;
             };
@@ -54,6 +63,13 @@ impl HvpatchRuntimeEndpoint {
                 thread.key(),
                 generation,
             );
+            #[cfg(feature = "conformance-metrics")]
+            if let Some(scope) = &work {
+                let _ = scope.add(
+                    carrick_observability::work_meter::WorkMetric::ChildExitNotificationWakeAttempts,
+                    1,
+                );
+            }
             match scheduler.wake_exact(target) {
                 Ok(_) => delivered = true,
                 Err(
@@ -1751,56 +1767,126 @@ mod tests {
             }
         }
 
-        let dispatcher = SyscallDispatcher::new();
-        let root = dispatcher.capture_one_task_context().expect("root");
-        let graph = Arc::clone(root.kernel());
-        let parent = graph
-            .reserve_fork(
-                &root,
-                ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).expect("fork plan"),
-                "notification-parent".to_owned(),
-                None,
-            )
-            .expect("reserve parent")
-            .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(19_703))
-            .expect("prepare parent")
-            .commit()
-            .expect("commit parent")
-            .start_child()
-            .expect("start parent")
-            .into_parts()
-            .0;
-        let parent_key = parent.task().key();
-        let endpoint = HvpatchRuntimeEndpoint {
-            kernel: Weak::new(),
-            task_binding: parent.task_binding(),
-            scheduler: Some(Arc::new(Scheduler::new(Arc::clone(&graph)))),
-        };
-        let snapshot = endpoint
-            .task_binding
-            .capture_signal_snapshot()
-            .expect("capture notification before parent retirement");
-        let auditors = Arc::new(carrick_kernel::observe::AuditorChain::new(vec![Arc::new(
-            RejectReapedWake,
-        )]));
-        graph.set_auditors(Arc::clone(&auditors));
-        drop(parent);
-        graph
-            .exit_task_key_eventually(parent_key, LinuxWaitStatus::from_wait_encoding(0))
-            .expect("parent exits before notification delivery");
-        graph
-            .wait_child(root.task().key().id, Some(parent_key.id), WaitMode::Consume)
-            .expect("reap parent before notification delivery");
-        assert!(!graph.task_exists(parent_key.id));
+        for deliveries in [1, 8, 32] {
+            let dispatcher = SyscallDispatcher::new();
+            let root = dispatcher.capture_one_task_context().expect("root");
+            let graph = Arc::clone(root.kernel());
+            let parent = graph
+                .reserve_fork(
+                    &root,
+                    ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                        .expect("fork plan"),
+                    "notification-parent".to_owned(),
+                    None,
+                )
+                .expect("reserve parent")
+                .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(19_703))
+                .expect("prepare parent")
+                .commit()
+                .expect("commit parent")
+                .start_child()
+                .expect("start parent")
+                .into_parts()
+                .0;
+            let parent_key = parent.task().key();
+            let endpoint = HvpatchRuntimeEndpoint {
+                kernel: Weak::new(),
+                task_binding: parent.task_binding(),
+                scheduler: Some(Arc::new(Scheduler::new(Arc::clone(&graph)))),
+            };
+            let snapshot = endpoint
+                .task_binding
+                .capture_signal_snapshot()
+                .expect("capture notification before parent retirement");
+            let auditors = Arc::new(carrick_kernel::observe::AuditorChain::new(vec![Arc::new(
+                RejectReapedWake,
+            )]));
+            graph.set_auditors(Arc::clone(&auditors));
+            drop(parent);
+            graph
+                .exit_task_key_eventually(parent_key, LinuxWaitStatus::from_wait_encoding(0))
+                .expect("parent exits before notification delivery");
+            graph
+                .wait_child(root.task().key().id, Some(parent_key.id), WaitMode::Consume)
+                .expect("reap parent before notification delivery");
+            assert!(!graph.task_exists(parent_key.id));
 
-        endpoint
-            .wake_scheduler_exact(&snapshot)
-            .expect("retired notification is a no-op");
-        assert_eq!(
-            auditors.abort_reason(),
-            None,
-            "a captured notification must not use a reaped parent's wake authority"
-        );
+            #[cfg(feature = "conformance-metrics")]
+            let scope = {
+                let scope = carrick_observability::work_meter::WorkMeter::default().new_scope();
+                graph.set_work_scope(scope.clone());
+                scope
+            };
+            for _ in 0..deliveries {
+                endpoint
+                    .wake_scheduler_exact(&snapshot)
+                    .expect("retired notification is a no-op");
+            }
+            #[cfg(feature = "conformance-metrics")]
+            {
+                use carrick_observability::work_meter::WorkMetric;
+                let work = scope.snapshot().expect("complete scoped notification work");
+                assert_eq!(
+                    work.get(WorkMetric::ChildExitNotificationThreadVisits),
+                    Some(deliveries)
+                );
+                assert_eq!(
+                    work.get(WorkMetric::ChildExitNotificationWakeAttempts),
+                    Some(0)
+                );
+                use carrick_conformance_contract::{
+                    Completeness, ContractId, ContractObservation, ContractRegistry,
+                    ExecutionLayer, SemanticAssertion, WorkSnapshot, evaluate,
+                };
+                use sha2::{Digest, Sha256};
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap();
+                let registry = ContractRegistry::load(root).unwrap();
+                let contract = registry
+                    .require("kernel.wait.child-exit-notification-lifecycle")
+                    .unwrap();
+                let observation = ContractObservation {
+                    contract_id: ContractId::new("kernel.wait.child-exit-notification-lifecycle")
+                        .unwrap(),
+                    layer: ExecutionLayer::VmFree,
+                    implementation_revision: format!(
+                        "sha256:{:x}",
+                        Sha256::digest(include_bytes!("wait_wake.rs"))
+                    ),
+                    fixture_identity: contract.fixture.clone(),
+                    scale: deliveries,
+                    semantic_assertions: vec![SemanticAssertion::pass(
+                        "reaped_parent_has_no_wake_authority",
+                    )],
+                    work: Some(work),
+                    timing: None,
+                    completeness: Completeness::Complete,
+                };
+                evaluate(contract, std::slice::from_ref(&observation)).unwrap();
+                println!("{}", serde_json::to_string(&observation).unwrap());
+                for (visits, attempts) in [(deliveries + 1, 0), (deliveries, 1)] {
+                    let mut excess = observation.clone();
+                    let mut work = WorkSnapshot::new();
+                    work.insert(WorkMetric::ChildExitNotificationThreadVisits, visits)
+                        .unwrap();
+                    work.insert(WorkMetric::ChildExitNotificationWakeAttempts, attempts)
+                        .unwrap();
+                    excess.work = Some(work);
+                    assert!(
+                        evaluate(contract, &[excess]).is_err(),
+                        "excess notification work escaped"
+                    );
+                }
+            }
+            assert_eq!(
+                auditors.abort_reason(),
+                None,
+                "a captured notification must not use a reaped parent's wake authority"
+            );
+        }
     }
 
     #[test]

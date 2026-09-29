@@ -270,6 +270,11 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   This is producer proof, not attribution of the original otmp failure.
 - [ ] Close the notification contract's scoped structural observation gap;
   run the complete batch gate below on the final candidate.
+  The new graph-scoped counters have red/green VM-free observations at 1/8/32
+  deliveries: one retained thread visit per delivery, zero scheduler attempts
+  after reap, plus a live-parent positive control and excess-work rejections.
+  Signed whole-fixture work assertions are implemented but not yet qualified.
+  See `notification-work/`; no total scheduler work or timing claim is made.
 - [ ] Accept and integrate locally only when all blockers/gates close.
 
 Receipt on branch `integ/batch3`:
