@@ -299,6 +299,20 @@ while preserving this acceptance blocker. This qualifies
 as a direct dependency, unlike the stopped historical capture investigation.
 Do not label the counters a diagnosis or reopen unrelated lifecycle work.
 
+**Independent lifetime result:** source4a7d705bc signed inherited-table
+replacement/EOF witness passes128 payload roundtrips with257 guest parks;
+negative entitlement and cleanup pass, exact artifact retained. Bounded
+resumption reduction passes without reproducing the liveness issue.
+
+**New concrete coherence defect:** source50b2a6dc1 mixed-venue pipe case
+passes128 roundtrips with128 host readv/writev each and127 guest parks.
+Eventfd fails at writev. Native ARM64 Docker accepts eventfd vector I/O;
+Carrick readv explicitly rejects this description. Exact red artifact and
+oracle retained in adapter IPC integration receipts. Next is red-first
+VM-free vector-eventfd coverage, multi-iovec/fault oracle semantics, and
+routing through the existing shared eventfd authority. Do not resume the
+broad parked-worker investigation before this direct defect is handled.
+
 **Following implementation/qualification step:** blocked close/reuse and two-live-
 process witnesses, then mixed venue and signals/partial progress. Keep the
 forwarding/counter issue as an explicit acceptance blocker while independent
