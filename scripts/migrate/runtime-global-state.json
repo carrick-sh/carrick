@@ -3680,6 +3680,54 @@
       "fingerprint": "01d48838d3f02daf38e4e4d4a4fb2bdd5658df122fdedd08f234c4b8ffecac7f",
       "classification": "test_only",
       "rationale": "Test-support per-thread counter of OCI layer merges, read by the getdents64 structural budget tests; compiled only with cfg(test) or the test-support feature."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_HVC_NOT_SVC_BY_EC",
+      "fingerprint": "7a37bd48f23a5de3746282103309f8861e84d0d8597be30de88e2db79ad35dc3",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter VCPU_HVC_NOT_SVC_BY_EC in crates/carrick-vmm-hvf/src/trap.rs counting non-SVC HVC exits by ESR exception class, read by the EL1 scheduler embed tests to attribute host exits; monotonic atomic, carrier VM scope like VCPU_RUN_EXITS_TOTAL."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_HVC_NOT_SVC_EMULATED_SYS64",
+      "fingerprint": "b4fb9df355826d95faec74e5e8c8ef80bd69d5543ba9c0c7e45dd8abefe96b0d",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter VCPU_HVC_NOT_SVC_EMULATED_SYS64 in crates/carrick-vmm-hvf/src/trap.rs counting non-SVC HVC exits resolved by 64-bit system instruction emulation, read by the EL1 scheduler embed tests to attribute host exits; monotonic atomic, carrier VM scope like VCPU_RUN_EXITS_TOTAL."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_HVC_NOT_SVC_FAULT_STATUS",
+      "fingerprint": "432726625e49327d102759fce250363d9e4190c478ed534ffaff206eac322d2d",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter VCPU_HVC_NOT_SVC_FAULT_STATUS in crates/carrick-vmm-hvf/src/trap.rs counting non-SVC HVC data/instruction aborts by fault status code, read by the EL1 scheduler embed tests to attribute host exits; monotonic atomic, carrier VM scope like VCPU_RUN_EXITS_TOTAL."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_HVC_NOT_SVC_SYSREG",
+      "fingerprint": "d45ced6995ac75af19955bccee2589d41a302ba044786cbd3e195b9f8510edc5",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter VCPU_HVC_NOT_SVC_SYSREG in crates/carrick-vmm-hvf/src/trap.rs counting non-SVC HVC system-register traps by register, read by the EL1 scheduler embed tests to attribute host exits; monotonic atomic, carrier VM scope like VCPU_RUN_EXITS_TOTAL."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_HVC_NOT_SVC_TOTAL",
+      "fingerprint": "c071e9122122f5abf300fa1dd553cbc639f006ad579459ca33e1b0ef3efdc25c",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter VCPU_HVC_NOT_SVC_TOTAL in crates/carrick-vmm-hvf/src/trap.rs counting non-SVC HVC exits (EL1 hypercalls and lower-EL aborts routed through HVC #2), read by the EL1 scheduler embed tests to attribute host exits; monotonic atomic, carrier VM scope like VCPU_RUN_EXITS_TOTAL."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_RUN_EXIT_CLASSES",
+      "fingerprint": "2df4d0a57520d985ef32abc001fbf264f54d467822807e6ff2b5cd6aa1c9cd0d",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter VCPU_RUN_EXIT_CLASSES in crates/carrick-vmm-hvf/src/trap.rs counting every hv_vcpu_run return by host exit class, read by the EL1 scheduler embed tests to attribute host exits; monotonic atomic, carrier VM scope like VCPU_RUN_EXITS_TOTAL."
     }
   ]
 }
