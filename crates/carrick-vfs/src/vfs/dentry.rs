@@ -636,7 +636,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.insert_inode_record(dev, ino, record);
+            self.insert_inode_record_unchecked(dev, ino, record);
 
             return Ok(ResolvedDentry {
                 dentry: PositiveDentry {
@@ -720,6 +720,9 @@ impl DentryCache {
         let mut symlinks_followed = 0;
         let mut components = raw_components;
         let mut comp_idx = 0;
+        let mut walk_generation = self.walk_generation();
+        let mut uncached = false;
+        let mut restarts = 0;
 
         while comp_idx < components.len() {
             let name = &components[comp_idx];
@@ -734,6 +737,11 @@ impl DentryCache {
                     match self.resolve_dir_id(current_id, backend, rootfs) {
                         Ok(r) => return Ok(r),
                         Err(LINUX_EAGAIN) => {
+                            self.restart_missing_dir(
+                                &mut walk_generation,
+                                &mut uncached,
+                                &mut restarts,
+                            )?;
                             current_id = DentryId::ROOT;
                             comp_idx = 0;
                             continue;
@@ -756,6 +764,11 @@ impl DentryCache {
                     match self.resolve_dir_id(current_id, backend, rootfs) {
                         Ok(r) => return Ok(r),
                         Err(LINUX_EAGAIN) => {
+                            self.restart_missing_dir(
+                                &mut walk_generation,
+                                &mut uncached,
+                                &mut restarts,
+                            )?;
                             current_id = DentryId::ROOT;
                             comp_idx = 0;
                             continue;
@@ -836,6 +849,12 @@ impl DentryCache {
                         )
                     }
                     None => {
+                        drop(dirs);
+                        self.restart_missing_dir(
+                            &mut walk_generation,
+                            &mut uncached,
+                            &mut restarts,
+                        )?;
                         current_id = DentryId::ROOT;
                         comp_idx = 0;
                         continue;
@@ -843,7 +862,9 @@ impl DentryCache {
                 }
             };
 
-            let cached_node = {
+            let cached_node = if uncached {
+                None
+            } else {
                 let entries = self.entries.read();
                 entries.get(&(current_id, name.clone())).cloned()
             };
@@ -966,7 +987,11 @@ impl DentryCache {
                                         rdev: 0,
                                         dev_type: 0,
                                     };
-                                    self.insert_inode_record(st.st_dev as u64, st.st_ino, record);
+                                    self.insert_inode_record_unchecked(
+                                        st.st_dev as u64,
+                                        st.st_ino,
+                                        record,
+                                    );
                                     Some(pos)
                                 } else {
                                     if let Some(removed) =
@@ -1069,6 +1094,12 @@ impl DentryCache {
                             d
                         }
                         None => {
+                            drop(dirs);
+                            self.restart_missing_dir(
+                                &mut walk_generation,
+                                &mut uncached,
+                                &mut restarts,
+                            )?;
                             current_id = DentryId::ROOT;
                             comp_idx = 0;
                             continue;
@@ -1101,6 +1132,40 @@ impl DentryCache {
         }
 
         Err(LINUX_ENOENT)
+    }
+
+    fn walk_generation(&self) -> (u64, u64, u64) {
+        (
+            self.mutation_gen.load(Ordering::SeqCst),
+            crate::fs_resolve_cache::current_generation(),
+            crate::fs_resolve_cache::current_process_generation(),
+        )
+    }
+
+    /// A missing directory id may come from a concurrent cache reset or an
+    /// orphaned positive dentry. Only the former justifies reusing cache hits.
+    fn restart_missing_dir(
+        &self,
+        walk_generation: &mut (u64, u64, u64),
+        uncached: &mut bool,
+        restarts: &mut usize,
+    ) -> Result<(), LinuxErrno> {
+        const MAX_RESTARTS: usize = 8;
+        if *restarts >= MAX_RESTARTS {
+            debug_assert!(false, "dentry walk exhausted restart bound");
+            return Err(LINUX_EAGAIN);
+        }
+        *restarts += 1;
+        let now = self.walk_generation();
+        if now != *walk_generation {
+            self.check_fork();
+            *walk_generation = self.walk_generation();
+        } else {
+            // Reprobe every component from its parent. Replaying an orphaned
+            // positive dentry without a generation change cannot make progress.
+            *uncached = true;
+        }
+        Ok(())
     }
 
     fn insert_positive(&self, parent_id: DentryId, name: &str, pos: PositiveDentry) {
@@ -1452,7 +1517,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.insert_inode_record(st.st_dev as u64, st.st_ino, record);
+            self.insert_inode_record_unchecked(st.st_dev as u64, st.st_ino, record);
             let pos = PositiveDentry {
                 id: None,
                 kind: RootFsEntryKind::Symlink,
@@ -1587,7 +1652,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.insert_inode_record(st.st_dev as u64, st.st_ino, record);
+            self.insert_inode_record_unchecked(st.st_dev as u64, st.st_ino, record);
             let pos = PositiveDentry {
                 id: Some(new_dir_id),
                 kind: RootFsEntryKind::Directory,
@@ -1645,7 +1710,7 @@ impl DentryCache {
             rdev: 0,
             dev_type: 0,
         };
-        self.insert_inode_record(st.st_dev as u64, st.st_ino, record);
+        self.insert_inode_record_unchecked(st.st_dev as u64, st.st_ino, record);
         let pos = PositiveDentry {
             id: None,
             kind,
@@ -1819,7 +1884,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.insert_inode_record(0, rs.ino, record);
+            self.insert_inode_record_unchecked(0, rs.ino, record);
             let pos = PositiveDentry {
                 id: dir_id,
                 kind: rs.kind,
@@ -1922,7 +1987,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.insert_inode_record(0, ino, record);
+            self.insert_inode_record_unchecked(0, ino, record);
             let pos = PositiveDentry {
                 id: dir_id,
                 kind: md.kind,
@@ -2083,7 +2148,7 @@ impl DentryCache {
                     rdev: 0,
                     dev_type: 0,
                 };
-                self.insert_inode_record(dev, ino, record);
+                self.insert_inode_record_unchecked(dev, ino, record);
                 let pos = PositiveDentry {
                     id: dir_id,
                     kind: md.kind,
@@ -2415,6 +2480,10 @@ impl DentryCache {
     /// Insert or update inode record for `(dev, ino)`.
     pub fn insert_inode_record(&self, dev: u64, ino: u64, record: InodeRecord) {
         self.check_fork();
+        self.insert_inode_record_unchecked(dev, ino, record);
+    }
+
+    fn insert_inode_record_unchecked(&self, dev: u64, ino: u64, record: InodeRecord) {
         self.inodes.write().insert((dev, ino), record);
     }
 
@@ -3086,6 +3155,49 @@ mod tests {
             .readlink("/link1.txt", &backend, None)
             .expect("readlink link1.txt");
         assert_eq!(target, "target.txt");
+    }
+
+    #[test]
+    fn test_unicode_symlink_orphaned_directory_recovers() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("dir_é");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("target"), b"target").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false);
+
+        assert_eq!(
+            cache
+                .stat("/dir_é/link", false, &backend, None)
+                .unwrap()
+                .kind,
+            RootFsEntryKind::Symlink
+        );
+        cache
+            .fast_open("/dir_é/link", false, &backend, None)
+            .unwrap();
+
+        fs::write(dir.join("sibling"), b"sibling").unwrap();
+        cache.entry_created("/dir_é/sibling", None);
+
+        // Model a reset between publishing the positive parent dentry and
+        // reading its directory record. The old walk must not reuse this id.
+        let dir_id = cache.path_to_dir_id.write().remove("/dir_é").unwrap();
+        cache.dirs.write().remove(&dir_id).unwrap();
+        *cache.fast_path.write() = FastPathCache::default();
+
+        assert_eq!(
+            cache
+                .stat("/dir_é/link", false, &backend, None)
+                .unwrap()
+                .kind,
+            RootFsEntryKind::Symlink
+        );
+        let (_, stat, _, _) = cache
+            .fast_open("/dir_é/link", false, &backend, None)
+            .unwrap();
+        assert_eq!(stat.kind, RootFsEntryKind::File);
     }
 
     #[test]
