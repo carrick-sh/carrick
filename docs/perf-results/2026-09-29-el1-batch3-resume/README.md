@@ -116,3 +116,20 @@ Compiler-backed inventory reconciliation at `3981c0366` retained all 595
 authority rows and all other inventory positions unchanged; only the source
 revision stamp changed. Its first sandboxed run failed because clang could
 not create a temporary assembly file; the authorized unrestricted run passed.
+
+Signed regression source `0542e2d2f`: all 14 `el1_sched` tests passed, the
+negative entitlement control passed, and the runner found zero remaining
+processes for both scoped IDs. Full output is `deferred-handback/signed.log`;
+`signed-artifacts.jsonl` contains one execution row per selected test and
+the exact executable identities. The invoked scheduler executable has SHA-256
+`5f2d5f10a70e897315368fa583f191c19de062b55abd8032ce9f982835f58082`,
+CDHash `a09c781bb1bedffa492cf21cd1d6721d49f45e47`, UUID
+`A5F4951D-63B1-310E-9D81-7B1F00EF4583`, entitlement and DOF present.
+This is signed regression coverage, not a forced version of the new race.
+`just lint-domains` passed (`lint.log`), explicitly reporting its host-authority
+census as the macOS subset, with the six non-macOS profiles pending.
+
+The original Python confirmation's two raw streams are preserved here as
+`historical-python.err` and `historical-python.out` from
+`target/conformance/raw/conf-89705-s03.{err,out}`. No original failure is
+converted into acceptance by the successful diagnostics or focused suites.

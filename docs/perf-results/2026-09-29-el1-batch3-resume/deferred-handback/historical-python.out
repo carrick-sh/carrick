@@ -1,0 +1,185 @@
+== CPython 3.12.13 (main, Aug 5 2026, 03:49:12) [GCC 14.2.0]
+== Linux-6.12.0-carrick-aarch64-with-glibc2.41 little-endian
+== Python build: release shared LTO+PGO
+== cwd: /tmp/test_python_worker_1æ
+== CPU count: 4
+== encodings: locale=UTF-8 FS=utf-8
+== resources: all test resources are disabled, use -u option to unskip tests
+
+Using random seed: 0
+0:00:00 load avg: 0.00 Run 4 tests sequentially in a single process
+0:00:00 load avg: 0.00 [1/4] test_multiprocessing_fork.test_processes
+test_array (test.test_multiprocessing_fork.test_processes.WithProcessesTestArray.test_array) ... ok
+test_array_from_size (test.test_multiprocessing_fork.test_processes.WithProcessesTestArray.test_array_from_size) ... ok
+test_getobj_getlock_obj (test.test_multiprocessing_fork.test_processes.WithProcessesTestArray.test_getobj_getlock_obj) ... ok
+test_rawarray (test.test_multiprocessing_fork.test_processes.WithProcessesTestArray.test_rawarray) ... ok
+test_abort (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_abort)
+Test that an abort will put the barrier in a broken state ... ok
+test_abort_and_reset (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_abort_and_reset)
+Test that a barrier can be reset after being broken. ... ok
+test_action (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_action)
+Test the 'action' callback ... ok
+test_barrier (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_barrier)
+Test that a barrier is passed in lockstep ... ok
+test_barrier_10 (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_barrier_10)
+Test that a barrier works for 10 consecutive runs ... ok
+test_default_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_default_timeout)
+Test the barrier's default timeout ... ok
+test_reset (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_reset)
+Test that a 'reset' on a barrier frees the waiting threads ... ok
+test_single_thread (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_single_thread) ... ok
+test_thousand (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_thousand) ... ok
+test_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_timeout)
+Test wait(timeout) ... ok
+test_wait_return (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_wait_return)
+test the return value from barrier.wait ... ok
+test_notify (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_notify) ... ok
+test_notify_all (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_notify_all) ... ok
+test_notify_n (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_notify_n) ... ok
+test_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_timeout) ... ok
+test_wait_result (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_wait_result) ... ok
+test_waitfor (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_waitfor) ... ok
+test_waitfor_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_waitfor_timeout) ... ok
+test_connection (test.test_multiprocessing_fork.test_processes.WithProcessesTestConnection.test_connection) ... ok
+test_context (test.test_multiprocessing_fork.test_processes.WithProcessesTestConnection.test_context) ... ok
+test_duplex_false (test.test_multiprocessing_fork.test_processes.WithProcessesTestConnection.test_duplex_false) ... ok
+test_fd_transfer (test.test_multiprocessing_fork.test_processes.WithProcessesTestConnection.test_fd_transfer) ... ok
+test_large_fd_transfer (test.test_multiprocessing_fork.test_processes.WithProcessesTestConnection.test_large_fd_transfer) ... ok
+test_missing_fd_transfer (test.test_multiprocessing_fork.test_processes.WithProcessesTestConnection.test_missing_fd_transfer) ... ok
+test_sendbytes (test.test_multiprocessing_fork.test_processes.WithProcessesTestConnection.test_sendbytes) ... ok
+test_spawn_close (test.test_multiprocessing_fork.test_processes.WithProcessesTestConnection.test_spawn_close) ... ok
+test_event (test.test_multiprocessing_fork.test_processes.WithProcessesTestEvent.test_event) ... ok
+test_repr (test.test_multiprocessing_fork.test_processes.WithProcessesTestEvent.test_repr) ... ok
+test_finalize (test.test_multiprocessing_fork.test_processes.WithProcessesTestFinalize.test_finalize) ... ok
+test_thread_safety (test.test_multiprocessing_fork.test_processes.WithProcessesTestFinalize.test_thread_safety) ... skipped "resource 'cpu' is not enabled"
+test_free_from_gc (test.test_multiprocessing_fork.test_processes.WithProcessesTestHeap.test_free_from_gc) ... ok
+test_heap (test.test_multiprocessing_fork.test_processes.WithProcessesTestHeap.test_heap) ... ok
+test_abstract_socket (test.test_multiprocessing_fork.test_processes.WithProcessesTestListener.test_abstract_socket) ... ok
+test_context (test.test_multiprocessing_fork.test_processes.WithProcessesTestListener.test_context) ... ok
+test_empty_authkey (test.test_multiprocessing_fork.test_processes.WithProcessesTestListener.test_empty_authkey) ... ok
+test_multiple_bind (test.test_multiprocessing_fork.test_processes.WithProcessesTestListener.test_multiple_bind) ... ok
+test_issue14725 (test.test_multiprocessing_fork.test_processes.WithProcessesTestListenerClient.test_issue14725) ... ok
+test_issue16955 (test.test_multiprocessing_fork.test_processes.WithProcessesTestListenerClient.test_issue16955) ... ok
+test_listener_client (test.test_multiprocessing_fork.test_processes.WithProcessesTestListenerClient.test_listener_client) ... ok
+test_lock (test.test_multiprocessing_fork.test_processes.WithProcessesTestLock.test_lock) ... ok
+test_lock_context (test.test_multiprocessing_fork.test_processes.WithProcessesTestLock.test_lock_context) ... ok
+test_repr_lock (test.test_multiprocessing_fork.test_processes.WithProcessesTestLock.test_repr_lock) ... ok
+test_repr_rlock (test.test_multiprocessing_fork.test_processes.WithProcessesTestLock.test_repr_rlock) ... ok
+test_rlock (test.test_multiprocessing_fork.test_processes.WithProcessesTestLock.test_rlock) ... ok
+test_enable_logging (test.test_multiprocessing_fork.test_processes.WithProcessesTestLogging.test_enable_logging) ... ok
+test_filename (test.test_multiprocessing_fork.test_processes.WithProcessesTestLogging.test_filename) ... ok
+test_level (test.test_multiprocessing_fork.test_processes.WithProcessesTestLogging.test_level) ... ok
+test_rapid_restart (test.test_multiprocessing_fork.test_processes.WithProcessesTestManagerRestart.test_rapid_restart) ... ok
+test_access (test.test_multiprocessing_fork.test_processes.WithProcessesTestPicklingConnections.test_access) ... ok
+test_pickling (test.test_multiprocessing_fork.test_processes.WithProcessesTestPicklingConnections.test_pickling) ... ok
+test_boundaries (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoll.test_boundaries) ... ok
+test_dont_merge (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoll.test_dont_merge) ... ok
+test_empty_string (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoll.test_empty_string) ... ok
+test_strings (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoll.test_strings) ... ok
+test_poll_eintr (test.test_multiprocessing_fork.test_processes.WithProcessesTestPollEintr.test_poll_eintr) ... ok
+test_apply (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_apply) ... ok
+test_async (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_async) ... ok
+test_async_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_async_timeout) ... ok
+test_context (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_context) ... ok
+test_empty_iterable (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_empty_iterable) ... ok
+test_enter (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_enter) ... ok
+test_imap (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_imap) ... ok
+test_imap_handle_iterable_exception (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_imap_handle_iterable_exception) ... ok
+test_imap_unordered (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_imap_unordered) ... ok
+test_imap_unordered_handle_iterable_exception (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_imap_unordered_handle_iterable_exception) ... ok
+test_make_pool (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_make_pool) ... ok
+test_map (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_map) ... ok
+test_map_async (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_map_async) ... ok
+test_map_async_callbacks (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_map_async_callbacks) ... ok
+test_map_chunksize (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_map_chunksize) ... ok
+test_map_handle_iterable_exception (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_map_handle_iterable_exception) ... ok
+test_map_no_failfast (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_map_no_failfast) ... ok
+test_map_unplicklable (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_map_unplicklable) ... ok
+test_release_task_refs (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_release_task_refs) ... ok
+test_resource_warning (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_resource_warning) ... ok
+test_starmap (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_starmap) ... ok
+test_starmap_async (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_starmap_async) ... ok
+test_terminate (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_terminate) ... ok
+test_traceback (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_traceback) ... ok
+test_wrapped_exception (test.test_multiprocessing_fork.test_processes.WithProcessesTestPool.test_wrapped_exception) ... ok
+test_async_error_callback (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoolWorkerErrors.test_async_error_callback) ... ok
+test_unpickleable_result (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoolWorkerErrors.test_unpickleable_result) ... ok
+test_pool_maxtasksperchild_invalid (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoolWorkerLifetime.test_pool_maxtasksperchild_invalid) ... ok
+test_pool_worker_lifetime (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoolWorkerLifetime.test_pool_worker_lifetime) ... ok
+test_pool_worker_lifetime_early_close (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoolWorkerLifetime.test_pool_worker_lifetime_early_close) ... ok
+test_worker_finalization_via_atexit_handler_of_multiprocessing (test.test_multiprocessing_fork.test_processes.WithProcessesTestPoolWorkerLifetime.test_worker_finalization_via_atexit_handler_of_multiprocessing) ... ok
+test_active_children (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_active_children) ... ok
+test_args_argument (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_args_argument) ... skipped "resource 'cpu' is not enabled"
+test_child_fd_inflation (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_child_fd_inflation) ... skipped 'test not appropriate for fork'
+test_close (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_close) ... ok
+test_cpu_count (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_cpu_count) ... ok
+test_current (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_current) ... ok
+test_daemon_argument (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_daemon_argument) ... ok
+test_error_on_stdio_flush_1 (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_error_on_stdio_flush_1) ... ok
+test_error_on_stdio_flush_2 (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_error_on_stdio_flush_2) ... ok
+test_forkserver_sigint (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_forkserver_sigint) ... skipped 'test not appropriate for fork'
+test_forkserver_sigkill (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_forkserver_sigkill) ... skipped 'test not appropriate for fork'
+test_kill (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_kill) ... ok
+test_lose_target_ref (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_lose_target_ref) ... ok
+test_many_processes (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_many_processes) ... skipped "resource 'walltime' is not enabled"
+test_parent_process (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_parent_process) ... ok
+test_parent_process_attributes (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_parent_process_attributes) ... ok
+test_process (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_process) ... ok
+test_process_mainthread_native_id (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_process_mainthread_native_id) ... ok
+test_recursion (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_recursion) ... ok
+test_sentinel (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_sentinel) ... ok
+test_set_executable (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_set_executable) ... ok
+test_terminate (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_terminate) ... ok
+test_wait_for_threads (test.test_multiprocessing_fork.test_processes.WithProcessesTestProcess.test_wait_for_threads) ... ok
+test_closed_queue_empty_exceptions (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_closed_queue_empty_exceptions) ... ok
+test_closed_queue_put_get_exceptions (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_closed_queue_put_get_exceptions) ... ok
+test_fork (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_fork) ... ok
+test_get (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_get) ... ok
+test_no_import_lock_contention (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_no_import_lock_contention) ... ok
+test_put (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_put) ... ok
+test_qsize (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_qsize) ... ok
+test_queue_feeder_donot_stop_onexc (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_queue_feeder_donot_stop_onexc) ... ok
+test_queue_feeder_on_queue_feeder_error (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_queue_feeder_on_queue_feeder_error) ... ok
+test_task_done (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_task_done) ... ok
+test_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestQueue.test_timeout) ... ok
+test_bounded_semaphore (test.test_multiprocessing_fork.test_processes.WithProcessesTestSemaphore.test_bounded_semaphore) ... ok
+test_semaphore (test.test_multiprocessing_fork.test_processes.WithProcessesTestSemaphore.test_semaphore) ... ok
+test_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestSemaphore.test_timeout) ... ok
+test_copy (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedCTypes.test_copy) ... ok
+test_sharedctypes (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedCTypes.test_sharedctypes) ... ok
+test_synchronize (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedCTypes.test_synchronize) ... ok
+test_invalid_shared_memory_creation (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_invalid_shared_memory_creation) ... ok
+test_shared_memory_ShareableList_basics (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_ShareableList_basics) ... ok
+test_shared_memory_ShareableList_pickling (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_ShareableList_pickling) ... ok
+test_shared_memory_ShareableList_pickling_dead_object (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_ShareableList_pickling_dead_object) ... ok
+test_shared_memory_SharedMemoryManager_basics (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_SharedMemoryManager_basics) ... ok
+test_shared_memory_SharedMemoryManager_reuses_resource_tracker (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_SharedMemoryManager_reuses_resource_tracker) ... ok
+test_shared_memory_SharedMemoryServer_ignores_sigint (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_SharedMemoryServer_ignores_sigint) ... ok
+test_shared_memory_across_processes (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_across_processes) ... ok
+test_shared_memory_basics (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_basics) ... ok
+test_shared_memory_cleaned_after_process_termination (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_cleaned_after_process_termination) ... ok
+test_shared_memory_name_with_embedded_null (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_name_with_embedded_null) ... ok
+test_shared_memory_pickle_unpickle (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_pickle_unpickle) ... ok
+test_shared_memory_pickle_unpickle_dead_object (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_pickle_unpickle_dead_object) ... ok
+test_shared_memory_recreate (test.test_multiprocessing_fork.test_processes.WithProcessesTestSharedMemory.test_shared_memory_recreate) ... ok
+test_stderr_flush (test.test_multiprocessing_fork.test_processes.WithProcessesTestSubclassingProcess.test_stderr_flush) ... ok
+test_subclassing (test.test_multiprocessing_fork.test_processes.WithProcessesTestSubclassingProcess.test_subclassing) ... ok
+test_sys_exit (test.test_multiprocessing_fork.test_processes.WithProcessesTestSubclassingProcess.test_sys_exit) ... ok
+test_getobj_getlock (test.test_multiprocessing_fork.test_processes.WithProcessesTestValue.test_getobj_getlock) ... ok
+test_rawvalue (test.test_multiprocessing_fork.test_processes.WithProcessesTestValue.test_rawvalue) ... ok
+test_value (test.test_multiprocessing_fork.test_processes.WithProcessesTestValue.test_value) ... ok
+
+----------------------------------------------------------------------
+Ran 150 tests in 40.226s
+
+OK (skipped=6)
+0:00:41 load avg: 0.00 [1/4/1] test_multiprocessing_fork.test_processes failed (env changed) in 41.3 sec
+0:00:41 load avg: 0.00 [2/4/1] test_multiprocessing_fork.test_manager
+test_abort (test.test_multiprocessing_fork.test_manager.WithManagerTestBarrier.test_abort)
+Test that an abort will put the barrier in a broken state ... ok
+test_abort_and_reset (test.test_multiprocessing_fork.test_manager.WithManagerTestBarrier.test_abort_and_reset)
+Test that a barrier can be reset after being broken. ... ok
+test_action (test.test_multiprocessing_fork.test_manager.WithManagerTestBarrier.test_action)
+Test the 'action' callback ... ok
+test_barrier (test.test_multiprocessing_fork.test_manager.WithManagerTestBarrier.test_barrier)
+Test that a barrier is passed in lockstep ... 
