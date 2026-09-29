@@ -569,7 +569,7 @@ contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/el1_zone.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"

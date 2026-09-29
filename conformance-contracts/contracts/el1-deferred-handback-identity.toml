@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.el1.deferred-handback-identity"
+title = "Deferred slot handback cannot acquire a reused record's identity"
+guest_surfaces = ["syscall:futex", "scheduler:lifecycle", "syscall:exit_group"]
+semantic_authority = ["man 2 futex: wake applies to the selected waiters", "man 2 exit_group: terminate all threads in the process"]
+fixture = "unit:deferred_slot_handback_does_not_wake_a_reused_record"
+scale_points = [1, 8, 32]
+structural_budgets = []
+rationale = "An evacuated record may be claimed, retired and reused before its deferred handback is published. The deferred work must retain the original incarnation and may never manufacture readiness for a replacement waiter. The deterministic schedule evacuates N records, retires and replaces each, then delivers the saved handbacks, asserting zero replacement publications and unchanged parked ownership. This is a reduction of a concrete identity gap, not attribution of the historical Python crash. No timing or structural-observation closure is claimed."
+
+[bindings]
+vm_free = "carrick-kernel::el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record"
+
+[bindings.unresolved]
+embed = "Deterministic signed evacuation/retirement/reuse interleaving remains to be bound."
+embed_structural = "Scoped WorkObservation for deferred handback dispatch is not registered yet."
+docker = "This internal record-identity interleaving is VM-free; guest futex/lifecycle differential coverage and pinned Python comparison remain required."
+observation = "Direct assertions cover replacement publication and parked ownership at three populations; WorkObservation budget binding remains open."

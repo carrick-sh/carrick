@@ -141,7 +141,12 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   aborted. Compare against main before calling it a batch regression.
 - [ ] Capture carrier stacks, event ring and core on reproduction; prove the
   failing ownership transition in a deterministic contract, then fix it.
-  Bare RecordId collection during deferred evacuation is only a hypothesis.
+  Deferred evacuation now has a deterministic red-first identity reduction:
+  after cancellation/reuse, a saved bare RecordId publishes the replacement
+  incarnation. Retaining RecordRef fixes that reduction at 1/8/32 records.
+  Attribution to the historical Python crash is still open; see the branch
+  receipt's deferred-handback section. A rebuilt, pinned Python run at
+  `5ce5bd059` passed (395 tests, 51 skips), with no fatal capture triggered.
 - [ ] Close the notification contract's signed-interleaving and structural
   observation gaps; run the complete batch gate below on the final candidate.
 - [ ] Accept and integrate locally only when all blockers/gates close.

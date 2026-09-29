@@ -71,7 +71,39 @@ the Python parked-record failure; full batch
 gate, exact-artifact promotion, and landing. Checkpoint 2/3 integration and
 the remaining EL1 controller obligations are untouched.
 
-One unproven lead for Python is deferred slot evacuation: it saves bare
-RecordIds and reconstructs RecordRefs later in `settle_vacated`. Investigate
-record retirement/reuse across that interval with a deterministic witness;
-do not treat this observation as a demonstrated cause or patch it blindly.
+## Deferred handback identity reduction
+
+The rebuilt signed CLI at `5ce5bd059` completed the Python diagnostic on
+native-arm64 image digest
+`3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30`:
+395 tests, 51 skipped, SUCCESS. No fatal capture triggered; a scoped process
+census found no remaining carrier or helpers. Exact executable identity,
+command and full guest output are in `deferred-handback/python-before-*`
+and `deferred-handback/python-before.log`. The first UUID command used the
+wrong dwarfdump executable; the appended `xcrun dwarfdump` result supplies
+the actual UUID. This is a pre-correction diagnostic, not acceptance or timing.
+
+Deferred slot evacuation had a separately demonstrated identity defect.
+The production path collected bare RecordIds, then reconstructed their
+incarnations in `settle_vacated`. The deterministic witness evacuates a
+woken waiter, lets cancellation claim and free its host-owned record,
+parks a replacement in the reused record, then delivers the saved batch.
+The old implementation publishes the replacement incarnation 3:
+`deferred-handback/red.log`. This schedule demonstrates the gap; it does
+not attribute the historical Python crash to that exact interleaving.
+
+The correction retains RecordRef at collection and skips retired references
+at settlement. It publishes the saved reference rather than reconstructing
+one after the delay. The witness passes at 1/8/32 records and the live
+service handback control still publishes exactly once (`green.log`). No
+polling, retries, timeout changes or concurrency reduction were added.
+
+Validation: `just test-kernel` passed 2,459 tests with one existing ignore
+across 21 binaries; the separate serial-host kernel run passed 109 tests.
+Kernel all-target Clippy with warnings denied, serial-host classification,
+and contract registry validation (68 contracts) passed. Raw logs are in
+`deferred-handback/`. Contract `kernel.el1.deferred-handback-identity` leaves
+deterministic signed interleaving and WorkObservation bindings unresolved.
+The producer-side transition to host ownership and every other handback
+producer still need review; this correction only closes the demonstrated
+deferred-batch identity gap. Batch 3 and migration acceptance remain open.
