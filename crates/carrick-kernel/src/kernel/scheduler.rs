@@ -201,6 +201,13 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     /// The executor's blocking inline host wait ended and it has its guest
     /// CPU back.
     fn host_wait_ended(&self) {}
+
+    /// The executor, on its own thread and holding no scheduler lock, is
+    /// about to park with no guest CPU (a spare that never had one, or gave
+    /// a lent one back): it will not come back to the vCPU it drove until it
+    /// borrows a CPU again, so it stops driving that vCPU's slot and nothing
+    /// waits there for it.
+    fn parking_spare(&self) {}
 }
 
 pub trait DiscardRecorder: Send + Sync {
@@ -466,6 +473,7 @@ impl Default for AtomicResidencyFlushRequest {
 #[derive(Clone, Debug)]
 pub struct ExecutorRegistration {
     id: ExecutorId,
+    kick: Arc<dyn ExecutorKick>,
     placement: Arc<Mutex<ExecutorPlacement>>,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
@@ -571,7 +579,7 @@ impl ExecutorDirectory {
         state.entries.insert(
             id,
             ExecutorEntry {
-                kick,
+                kick: Arc::clone(&kick),
                 placement: Arc::clone(&placement),
                 close_observation_epoch: Arc::clone(&close_observation_epoch),
                 control_observation_epoch: Arc::clone(&control_observation_epoch),
@@ -580,6 +588,7 @@ impl ExecutorDirectory {
         );
         Ok(ExecutorRegistration {
             id,
+            kick,
             placement,
             close_observation_epoch,
             control_observation_epoch,
@@ -2756,8 +2765,13 @@ impl RunQueue {
 
     /// An unbound `M` parks until it can acquire a relinquished slot, or until
     /// a control, residency-flush, or close request needs servicing.
+    ///
+    /// Before it first sleeps it gives up the zone slot its vCPU drove
+    /// ([`ExecutorKick::parking_spare`], outside the lock: settling what was
+    /// queued there may publish rows), then rechecks everything.
     fn park_spare(&self, executor: &ExecutorRegistration) -> Result<(), RunQueueError> {
         let mut state = self.inner.state.lock();
+        let mut slot_released = false;
         loop {
             if executor.flush_requested() {
                 return Err(RunQueueError::FlushRequested);
@@ -2791,6 +2805,11 @@ impl RunQueue {
                     self.inner.maybe_finish_close(&mut state);
                 }
                 return Err(RunQueueError::Closed);
+            }
+            if !slot_released {
+                slot_released = true;
+                parking_lot::MutexGuard::unlocked(&mut state, || executor.kick.parking_spare());
+                continue;
             }
             state.spare_waiters = state.spare_waiters.checked_add(1).unwrap_or_else(|| {
                 carrick_fatal!("kernel::run_queue", "spare_waiters overflow in park_spare");
@@ -8098,6 +8117,202 @@ mod tests {
         assert_eq!(cpu, None);
         assert_eq!(owner.bound_cpu(), Some(GuestCpuId::new(0)));
         scheduler.settle_exited(running).unwrap();
+    }
+
+    /// Zone tables on the heap for a host-only test: all-zero is the valid
+    /// empty state, exactly as the carrier maps them in the EL1 region.
+    struct HeapZone(std::ptr::NonNull<carrick_el1_abi::ZoneTables>);
+
+    // SAFETY: ZoneTables is atomics plus claim-protected context, shared by
+    // design between host threads and vCPUs.
+    unsafe impl Send for HeapZone {}
+    // SAFETY: as above.
+    unsafe impl Sync for HeapZone {}
+
+    impl HeapZone {
+        fn new() -> Self {
+            let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+            // SAFETY: a non-zero-sized layout; all-zero is a valid ZoneTables.
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            Self(std::ptr::NonNull::new(ptr.cast()).expect("zone allocation"))
+        }
+    }
+
+    impl std::ops::Deref for HeapZone {
+        type Target = carrick_el1_abi::ZoneTables;
+
+        fn deref(&self) -> &Self::Target {
+            // SAFETY: allocated in `new`, freed only in `drop`.
+            unsafe { self.0.as_ref() }
+        }
+    }
+
+    impl Drop for HeapZone {
+        fn drop(&mut self) {
+            let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+            // SAFETY: allocated in `new` with this layout.
+            unsafe { std::alloc::dealloc(self.0.as_ptr().cast(), layout) };
+        }
+    }
+
+    /// The executor side of one zone vCPU slot: the runtime's executor kick
+    /// gives up the slot it drives when the run queue parks it as a spare.
+    #[derive(Debug)]
+    struct SlotDrivingKick {
+        inner: RecordingKick,
+        zone: Arc<HeapZone>,
+        slot: carrick_el1_abi::SlotId,
+        driver: u64,
+    }
+
+    impl std::fmt::Debug for HeapZone {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("HeapZone")
+        }
+    }
+
+    impl ExecutorKick for SlotDrivingKick {
+        fn try_bind(&self, binding: super::ExecutorBinding) -> bool {
+            self.inner.try_bind(binding)
+        }
+
+        fn unbind(&self, binding: super::ExecutorBinding) {
+            self.inner.unbind(binding);
+        }
+
+        fn rebind_exact_with(
+            &self,
+            predecessor: super::ExecutorBinding,
+            successor: super::ExecutorBinding,
+            publish: &mut dyn FnMut() -> bool,
+        ) -> bool {
+            self.inner
+                .rebind_exact_with(predecessor, successor, publish)
+        }
+
+        fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
+            self.inner.deliver_exact(token)
+        }
+
+        fn current_binding(&self) -> Option<super::ExecutorBinding> {
+            self.inner.current_binding()
+        }
+
+        fn parking_spare(&self) {
+            crate::el1_zone::leave_slot_in(&self.zone, self.slot, self.driver, None);
+        }
+    }
+
+    /// Contract kernel.el1.slot-liveness: a zone slot takes work that needs
+    /// an executor only while an executor that will come back to it drives
+    /// it. A spare borrowing a host waiter's CPU drives a slot while it
+    /// waits in the guest; when the owner is ready to return and the spare
+    /// rescans, the run queue takes the CPU back inside `try_take` and parks
+    /// the spare. Before this, the slot stayed live: the host, finding no
+    /// vCPU in the guest, placed a service thread on that stopped slot, and
+    /// no executor ever came back to serve it (cpython `concurrent_futures`
+    /// wedged with the record on a `state=Host live=1` slot whose executor
+    /// sat in `park_spare`). No vCPU enters the guest here, so no idle vCPU
+    /// can rescue the record: the placement itself must refuse the slot.
+    #[test]
+    fn a_spare_gives_up_its_zone_slot_before_it_parks() {
+        let (kernel, context) = bootstrap(12_408);
+        publish(&context, 51);
+        let scheduler = scheduler_with_cpus(kernel, 1);
+        let zone = Arc::new(HeapZone::new());
+        let slot = carrick_el1_abi::SlotId::new(8);
+        let owner = scheduler
+            .register_executor_bound(
+                Arc::new(RecordingKick::default()),
+                Some(GuestCpuId::new(0)),
+                false,
+            )
+            .unwrap();
+        let borrower = scheduler
+            .register_executor_bound(
+                Arc::new(SlotDrivingKick {
+                    inner: RecordingKick::default(),
+                    zone: Arc::clone(&zone),
+                    slot,
+                    driver: 2,
+                }),
+                None,
+                true,
+            )
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&owner).unwrap();
+        let token = scheduler.begin_host_wait(&running, &owner).unwrap();
+        assert!(scheduler.try_take(&borrower).unwrap().is_none());
+        assert!(
+            borrower.bound_cpu().is_some(),
+            "the spare holds the lent CPU"
+        );
+        // The spare waits in the guest on its slot, as its executor does,
+        // then its vCPU leaves for the host.
+        zone.drive(slot, 2);
+        zone.publish_slot(slot, 0, Some(0), 0);
+        zone.enter_guest(slot);
+        zone.leave_guest(slot, &crate::el1_zone::HostLockWait);
+        assert!(zone.slot(slot).is_live());
+
+        // The spare rescans only once its lent CPU is wanted back, so the
+        // run queue (not the caller's own check) takes the CPU back inside
+        // `try_take` and parks it as a spare until the queue closes.
+        let borrower_side = {
+            let scheduler = Arc::clone(&scheduler);
+            let borrower = borrower.clone();
+            thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !scheduler.queue.inner.lent_cpu_wanted_back(borrower.id())
+                    && std::time::Instant::now() < deadline
+                {
+                    thread::yield_now();
+                }
+                scheduler.try_take(&borrower).map(|taken| taken.is_some())
+            })
+        };
+        // The owner returns from its host wait; it gets its CPU back once the
+        // spare gives it up.
+        drop(token);
+        assert_eq!(owner.bound_cpu(), Some(GuestCpuId::new(0)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scheduler.queue.inner.state.lock().spare_waiters == 0
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(borrower.bound_cpu(), None, "the spare gave the CPU back");
+        assert_eq!(
+            scheduler.queue.inner.state.lock().spare_waiters,
+            1,
+            "the spare parks"
+        );
+
+        // Every vCPU is out of the guest: the host places a service thread.
+        let service = zone
+            .alloc_host_runnable(carrick_el1_abi::ThreadIdentity {
+                tid: 77,
+                serial: 770,
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let placed = zone
+            .place_from_host(service)
+            .map(|placement| placement.slot);
+        assert_eq!(
+            placed, None,
+            "the service thread was stranded on the slot of a parked spare"
+        );
+        assert!(!zone.slot(slot).is_live());
+
+        scheduler.settle_exited(running).unwrap();
+        scheduler.close();
+        let rescan = borrower_side.join().unwrap();
+        assert!(matches!(rescan, Err(RunQueueError::Closed)), "{rescan:?}");
     }
 
     #[test]

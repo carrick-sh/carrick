@@ -635,16 +635,37 @@ pub struct ZoneSlot {
     /// The host queued a thread here and forced the vCPU out: its run loop
     /// owes it a reschedule SGI before the vCPU runs on ([`ZoneTables::take_resched`]).
     resched_owed: AtomicU32,
-    /// An executor drives this slot's vCPU (set when the host first loads or
-    /// enters it): the host may queue a thread that needs its executor here.
-    live: AtomicU32,
-    /// Host only: the executor that last published this slot (0: none). A
-    /// slot follows its mailbox lease, which a task can carry from one
-    /// executor to another; only the executor still driving it may vacate it.
-    driver: AtomicU64,
+    /// Who drives this slot's vCPU: 0 nobody, else the driving executor's
+    /// identity, with [`SLOT_AWAY`] set while it waits on the host with its
+    /// guest CPU lent. The slot's only liveness authority, written under
+    /// `lock` ([`ZoneTables::drive`], [`ZoneTables::leave_slot`],
+    /// [`ZoneTables::step_away`], [`ZoneTables::step_back`]): the host queues
+    /// a thread that needs an executor on a slot only while an executor
+    /// drives it and is not away, because only that executor comes back to
+    /// the slot to serve it.
+    drive: AtomicU64,
 }
 
+/// The bit of [`ZoneSlot`]'s drive word set while its driver waits on the
+/// host ([`ZoneTables::step_away`]); driver identities never use it.
+pub const SLOT_AWAY: u64 = 1 << 63;
+
 impl ZoneSlot {
+    /// The executor driving this slot, whether or not it is away.
+    pub fn driver(&self) -> Option<u64> {
+        match self.drive.load(Ordering::Acquire) & !SLOT_AWAY {
+            0 => None,
+            driver => Some(driver),
+        }
+    }
+
+    /// Whether an executor drives this slot and is not away on the host: the
+    /// host may queue a thread that needs an executor here.
+    pub fn is_live(&self) -> bool {
+        let drive = self.drive.load(Ordering::Acquire);
+        drive != 0 && drive & SLOT_AWAY == 0
+    }
+
     /// The record EL1 switched in, if any.
     pub fn current(&self) -> Option<RecordId> {
         RecordId::from_raw(self.current.load(Ordering::Acquire))
@@ -1171,17 +1192,9 @@ impl ZoneTables {
         Some(record)
     }
 
-    /// The executor of `slot` is back from a blocking host wait: placements
-    /// may choose its slot again.
-    pub fn revive_slot(&self, slot: SlotId) {
-        if let Some(_guard) = self.slot_lock(slot, &SpinForever) {
-            self.slot(slot).live.store(1, Ordering::Release);
-        }
-    }
-
     /// Queue the host-owned `record` back on `slot`, whether or not the slot
     /// is live: a service thread no other slot will take waits for this
-    /// slot's executor.
+    /// slot's driver, which is away on the host or about to drive it.
     pub fn requeue_on(&self, slot: SlotId, record: RecordId) -> bool {
         let rec = self.record(record);
         let Claim::Host { seq } = rec.claim() else {
@@ -1197,35 +1210,65 @@ impl ZoneTables {
         true
     }
 
-    /// The executor of `slot` is about to wait on the host with its vCPU
-    /// stopped (a spare with no guest CPU to run): it stops taking threads
-    /// (no placement chooses it), and every thread queued there leaves:
-    /// threads ready at EL0 straight to other slots (their reschedules to
-    /// `placed`), the rest host-owned, passed to `take` for the caller to
-    /// place or hand back.
-    pub fn retire_slot(
+    /// Executor `driver` (never 0, never with [`SLOT_AWAY`]) drives `slot`
+    /// from now on: it loaded a thread there, or waits in the guest on it,
+    /// and comes back to the slot at every exit. This is the only way a slot
+    /// becomes live; another executor that drove it before has lost it.
+    pub fn drive(&self, slot: SlotId, driver: u64) {
+        debug_assert!(driver != 0 && driver & SLOT_AWAY == 0);
+        if let Some(_guard) = self.slot_lock(slot, &SpinForever) {
+            self.slot(slot).drive.store(driver, Ordering::Release);
+        }
+    }
+
+    /// Executor `driver` is about to wait on the host with `slot`'s vCPU
+    /// stopped and its guest CPU lent (a blocking host wait): until
+    /// [`Self::step_back`] no placement chooses the slot, and every thread
+    /// queued there leaves as for [`Self::leave_slot`]. The slot stays
+    /// `driver`'s: a service thread no live slot takes may wait here for it
+    /// ([`Self::requeue_on`]). False (nothing done) if `driver` does not
+    /// drive the slot.
+    pub fn step_away(
         &self,
         slot: SlotId,
+        driver: u64,
         take: &mut impl FnMut(RecordId),
         placed: &mut impl FnMut(HostPlacement),
-    ) {
+    ) -> bool {
         let s = self.slot(slot);
-        if let Some(_guard) = self.slot_lock(slot, &SpinForever) {
-            s.live.store(0, Ordering::Release);
+        {
+            let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
+                return false;
+            };
+            if s.driver() != Some(driver) {
+                return false;
+            }
+            s.drive.store(driver | SLOT_AWAY, Ordering::Release);
         }
         self.vacate(slot, take, placed);
+        true
     }
 
-    /// Record that executor `driver` publishes `slot` (it loaded a thread
-    /// there, or waits in the guest on it).
-    pub fn set_driver(&self, slot: SlotId, driver: u64) {
-        self.slot(slot).driver.store(driver, Ordering::Release);
+    /// Executor `driver` is back from the host wait [`Self::step_away`]
+    /// began, with its guest CPU: placements may choose `slot` again, if it
+    /// still drives it.
+    pub fn step_back(&self, slot: SlotId, driver: u64) {
+        let s = self.slot(slot);
+        if let Some(_guard) = self.slot_lock(slot, &SpinForever)
+            && s.driver() == Some(driver)
+        {
+            s.drive.store(driver, Ordering::Release);
+        }
     }
 
-    /// Executor `driver` stopped driving `slot` (the mailbox lease went with
-    /// the task it unloaded): if nobody took the slot over since, it stops
-    /// taking threads and its queue leaves as for [`Self::retire_slot`].
-    /// False if another executor drives it now.
+    /// Executor `driver` stops driving `slot`: its vCPU's mailbox lease moved
+    /// on, or it parks with no guest CPU (a spare) and will not come back to
+    /// the vCPU. If it still drives the slot (nobody took it over since) and
+    /// the vCPU is stopped, the slot stops taking threads and every thread
+    /// queued there leaves: threads ready at EL0 straight to other slots
+    /// (their reschedules to `placed`), the rest host-owned, passed to `take`
+    /// for the caller to place or hand back. False if another executor
+    /// drives it now.
     pub fn leave_slot(
         &self,
         slot: SlotId,
@@ -1238,11 +1281,10 @@ impl ZoneTables {
             let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
                 return false;
             };
-            if s.driver.load(Ordering::Acquire) != driver || s.state().in_guest() {
+            if s.driver() != Some(driver) || s.state().in_guest() {
                 return false;
             }
-            s.live.store(0, Ordering::Release);
-            s.driver.store(0, Ordering::Release);
+            s.drive.store(0, Ordering::Release);
         }
         self.vacate(slot, take, placed);
         true
@@ -2305,10 +2347,10 @@ impl ZoneTables {
     }
 
     /// The executor is about to run `slot`'s vCPU: other vCPUs may queue on
-    /// it again.
+    /// it again. (Whether the host may queue work that needs an executor here
+    /// is the slot's drive, not its state: [`Self::drive`].)
     pub fn enter_guest(&self, slot: SlotId) {
         let s = self.slot(slot);
-        s.live.store(1, Ordering::Relaxed);
         s.state.store(SlotState::Running as u32, Ordering::Release);
     }
 
@@ -2470,7 +2512,6 @@ impl ZoneTables {
     /// (`None`: any) and the loaded thread's affinity mask (0: any).
     pub fn publish_slot(&self, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
         let s = self.slot(slot);
-        s.live.store(1, Ordering::Relaxed);
         s.mm.store(mm, Ordering::Release);
         s.cpu.store(
             cpu.map_or(0, |cpu| cpu.saturating_add(1)),
@@ -2508,9 +2549,9 @@ impl ZoneTables {
         let cpu = self.slot(thief).cpu.load(Ordering::Relaxed);
         // A victim in the guest reaches its own run queue (it polls it, or
         // owes a reschedule), so work only its executor can serve stays
-        // there. A stopped victim's executor is on the host and may not
-        // return to this vCPU (a spare, a blocking host call): what waits
-        // on it is stranded unless an idle vCPU takes it.
+        // there. A stopped victim's driver comes back to it, but only when
+        // its host work ends (a long host call, a host wait it stepped away
+        // for): an idle vCPU takes what waits there sooner.
         let victim_stopped = !s.state().in_guest();
         let mut cursor = s.head.load(Ordering::Acquire);
         while cursor != NIL {
@@ -2639,9 +2680,10 @@ impl ZoneTables {
             };
             let state = self.slot(slot).state();
             let fits = if service {
-                // A retired slot (its executor waits on the host) takes
-                // nothing: checked under the lock `retire_slot` holds.
-                self.slot(slot).live.load(Ordering::Acquire) != 0
+                // Only a slot whose driver comes back to it takes a thread
+                // that needs an executor: checked under the lock every drive
+                // change holds.
+                self.slot(slot).is_live()
                     && rec.allows_cpu(self.slot(slot).cpu.load(Ordering::Relaxed))
             } else {
                 state.in_guest() && self.accepts_running(slot, rec)
@@ -2896,7 +2938,7 @@ impl ZoneTables {
                 continue;
             }
             let s = self.slot(slot);
-            if s.live.load(Ordering::Relaxed) == 0 {
+            if !s.is_live() {
                 continue;
             }
             if in_guest && !s.state().in_guest() {
@@ -3092,7 +3134,8 @@ impl ZoneTables {
     pub fn write_census(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
         for index in 0..ZONE_SLOTS {
             let s = &self.slots[index];
-            if s.live.load(Ordering::Relaxed) == 0 {
+            let drive = s.drive.load(Ordering::Relaxed);
+            if drive == 0 && s.len.load(Ordering::Relaxed) == 0 {
                 continue;
             }
             let mut queue = [0u32; 16];
@@ -3105,8 +3148,10 @@ impl ZoneTables {
             }
             writeln!(
                 out,
-                "zone slot {index}: state={:?} mm={} installed={} cpu+1={} current={} host_record={} len={} queue={:?} resched={} timer_cval={}",
+                "zone slot {index}: state={:?} driver={} away={} mm={} installed={} cpu+1={} current={} host_record={} len={} queue={:?} resched={} timer_cval={}",
                 s.state(),
+                drive & !SLOT_AWAY,
+                drive & SLOT_AWAY != 0,
                 s.mm(),
                 self.occupancy
                     .running_raw(ExecutionSlot::zone(SlotId::new(index as u8))),
