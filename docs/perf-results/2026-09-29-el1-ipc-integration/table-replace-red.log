@@ -1,0 +1,31 @@
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fd-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running unittests src/lib.rs (target/debug/deps/carrick_fd_core-443787c3a50ba848)
+
+running 2 tests
+test tests::el1_ipc_replace_pin_preserves_alias_and_displaced_operation ... FAILED
+test tests::el1_ipc_replace_pin_refusal_leaves_destination_and_holds_unchanged ... FAILED
+
+failures:
+
+---- tests::el1_ipc_replace_pin_preserves_alias_and_displaced_operation stdout ----
+
+thread 'tests::el1_ipc_replace_pin_preserves_alias_and_displaced_operation' (34302973) panicked at crates/carrick-fd-core/src/tests.rs:850:5:
+assertion `left == right` failed
+  left: Err(TooManyFiles)
+ right: Ok(None)
+
+---- tests::el1_ipc_replace_pin_refusal_leaves_destination_and_holds_unchanged stdout ----
+
+thread 'tests::el1_ipc_replace_pin_refusal_leaves_destination_and_holds_unchanged' (34302974) panicked at crates/carrick-fd-core/src/tests.rs:879:66:
+called `Result::unwrap()` on an `Err` value: TooManyFiles
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::el1_ipc_replace_pin_preserves_alias_and_displaced_operation
+    tests::el1_ipc_replace_pin_refusal_leaves_destination_and_holds_unchanged
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-fd-core --lib`

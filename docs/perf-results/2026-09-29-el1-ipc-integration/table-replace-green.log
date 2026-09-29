@@ -1,0 +1,41 @@
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-fd-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running unittests src/lib.rs (target/debug/deps/carrick_fd_core-443787c3a50ba848)
+
+running 27 tests
+test tests::configured_ceiling_is_independent_of_backing ... ok
+test tests::el1_ipc_contended_table_lock_refuses_before_effects ... ok
+test tests::capacity_failures_are_transactional_and_reclaim_storage ... ok
+test tests::el1_ipc_final_close_versus_inflight_pin_releases_once ... ok
+test tests::el1_ipc_fd_reuse_during_blocked_io_keeps_pinned_description ... ok
+test tests::close_range_and_exec_sweep ... ok
+test tests::bad_descriptors_and_minimum_errors ... ok
+test tests::el1_ipc_growth_and_refusals_roll_back ... ok
+test tests::el1_ipc_fork_shares_status_flags_not_descriptor_flags ... ok
+test tests::dup_variants_and_atomic_replacement ... ok
+test tests::el1_ipc_install_pin_refuses_full_table_and_stale_pin_before_effects ... ok
+test tests::el1_ipc_install_pin_shares_cross_table_flags_offsets_and_final_release ... ok
+test tests::el1_ipc_replace_pin_preserves_alias_and_displaced_operation ... ok
+test tests::el1_ipc_replace_pin_refusal_leaves_destination_and_holds_unchanged ... ok
+test tests::el1_ipc_stale_generations_are_rejected ... ok
+test tests::el1_ipc_unpublished_core_fails_closed_and_initializes_in_place ... ok
+test tests::fork_shares_description_but_not_descriptor_flags ... ok
+test tests::lowered_limit_preserves_existing_entries_and_exec ... ok
+test tests::lowest_free_and_ceiling ... ok
+test tests::table_identity_cannot_cross_authorities ... ok
+test tests::setfl_preserves_immutable_flags_and_access ... ok
+test tests::unshare_close_range_keeps_siblings_intact ... ok
+test tests::growth_preserves_identity_references_flags_and_lowest_holes ... ok
+test tests::el1_ipc_concurrent_pins_and_closes_release_exactly_once ... ok
+test tests::el1_ipc_direct_lookup_reads_one_slot_at_every_scale ... ok
+test tests::empty_backing_and_fork_growth_refuse_without_side_effects ... ok
+test tests::logarithmic_work_at_four_scales_without_an_allocator ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+   Doc-tests carrick_fd_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

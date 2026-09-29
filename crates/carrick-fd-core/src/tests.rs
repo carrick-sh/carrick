@@ -839,3 +839,68 @@ fn el1_ipc_install_pin_refuses_full_table_and_stale_pin_before_effects() {
         Err(Error::StalePin)
     );
 }
+
+#[test]
+fn el1_ipc_replace_pin_preserves_alias_and_displaced_operation() {
+    let c = authority::<2, 4>();
+    let table = c.create_table(8, &mut storage(8)).unwrap();
+    let target = c.open(table, Fd(0), description(10), false).unwrap();
+    let (old_pin, _) = c.pin(table, target).unwrap();
+    let replacement = c.create_pinned(description(20)).unwrap();
+    assert_eq!(c.replace_pin(table, target, &replacement, true), Ok(None));
+    assert_eq!(c.get(table, target).unwrap().backing, BackingToken(20));
+    assert_eq!(c.pinned(&old_pin).unwrap().backing, BackingToken(10));
+    assert_eq!(c.holds(&old_pin).unwrap(), (0, 1));
+    assert_eq!(c.holds(&replacement).unwrap(), (1, 1));
+    assert_eq!(c.getfd(table, target), Ok(true));
+    assert_eq!(c.replace_pin(table, target, &replacement, false), Ok(None));
+    assert_eq!(c.holds(&replacement).unwrap(), (1, 1));
+    assert_eq!(c.getfd(table, target), Ok(false));
+    assert_eq!(c.unpin(old_pin).unwrap().unwrap().backing, BackingToken(10));
+    assert_eq!(c.close(table, target), Ok(None));
+    assert_eq!(
+        c.unpin(replacement).unwrap().unwrap().backing,
+        BackingToken(20)
+    );
+}
+
+#[test]
+fn el1_ipc_replace_pin_refusal_leaves_destination_and_holds_unchanged() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(8, &mut storage(2)).unwrap();
+    let target = c.open(table, Fd(0), description(10), true).unwrap();
+    let replacement = c.create_pinned(description(20)).unwrap();
+    assert_eq!(
+        c.replace_pin(table, Fd(4), &replacement, false),
+        Err(Error::NeedsBacking { descriptors: 5 })
+    );
+    assert_eq!(
+        c.replace_pin(table, Fd(8), &replacement, false),
+        Err(Error::BadFd)
+    );
+    let foreign = authority::<1, 4>();
+    let foreign_pin = foreign.create_pinned(description(30)).unwrap();
+    assert_eq!(
+        c.replace_pin(table, target, &foreign_pin, false),
+        Err(Error::StalePin)
+    );
+    assert_eq!(c.holds(&replacement).unwrap(), (0, 1));
+    assert_eq!(c.get(table, target).unwrap().backing, BackingToken(10));
+    assert_eq!(c.getfd(table, target), Ok(true));
+    assert_eq!(
+        c.replace_pin(table, target, &replacement, false)
+            .unwrap()
+            .unwrap()
+            .backing,
+        BackingToken(10)
+    );
+    assert_eq!(c.close(table, target), Ok(None));
+    assert_eq!(
+        c.unpin(replacement).unwrap().unwrap().backing,
+        BackingToken(20)
+    );
+    assert_eq!(
+        foreign.unpin(foreign_pin).unwrap().unwrap().backing,
+        BackingToken(30)
+    );
+}
