@@ -149,52 +149,128 @@ pub(crate) struct EpollInterest {
 use crate::kernel::objects::ListenerReadinessSample;
 
 #[derive(Debug)]
-pub(crate) struct EventFdState {
-    /// Slot in the cross-process counter slab (`crate::eventfd_shm`) — the
-    /// counter must be FORK-COHERENT (carrick forks real host processes;
-    /// LTP eventfd2_03's children semaphore-ping-pong across the fork), so it
-    /// lives in `MAP_SHARED` host memory, not in this (per-process) struct.
-    /// `None` = slab unavailable/exhausted → `local` fallback (correct within
-    /// one process, silently non-coherent across forks — the pre-slab
-    /// behavior).
-    slot: Option<usize>,
-    local: std::sync::atomic::AtomicU64,
-    pub(super) read_fd: Option<HostFdRef>,
-    pub(super) write_fd: Option<HostFdRef>,
-    pub(super) wait_queue: Arc<crate::kernel::WaitQueue>,
+struct EventFdObject {
+    owner: Arc<crate::el1_ipc::HostIpc>,
+    object: carrick_el1_abi::ipc::IpcObjectHandle,
+}
+impl Drop for EventFdObject {
+    fn drop(&mut self) {
+        let _ = self.owner.release(
+            carrick_el1_abi::ipc::IpcBacking::EventFd {
+                object: self.object,
+            }
+            .encode(),
+        );
+    }
 }
 
+/// Host view of the shared eventfd record. Host waiters subscribe directly to
+/// the object queue; the counter and semaphore mode have no host-side copy.
+#[derive(Debug)]
+pub(crate) struct EventFdState {
+    owner: Arc<crate::el1_ipc::HostIpc>,
+    object: carrick_el1_abi::ipc::IpcObjectHandle,
+    lifetime: Mutex<Option<EventFdObject>>,
+    pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
+}
 impl EventFdState {
+    pub(super) fn create(
+        owner: Arc<crate::el1_ipc::HostIpc>,
+        initial: u32,
+        mode: carrick_el1_abi::ipc::pipe::EventMode,
+    ) -> Result<Self, crate::el1_ipc::AdmissionError> {
+        let object = owner.create_eventfd(initial, mode)?;
+        let wait_queue = owner.wait_queue(object);
+        Ok(Self {
+            lifetime: Mutex::new(Some(EventFdObject {
+                owner: Arc::clone(&owner),
+                object,
+            })),
+            owner,
+            object,
+            wait_queue,
+        })
+    }
+    #[cfg(test)]
     pub(super) fn new(counter: u64) -> Self {
-        let (read_fd, write_fd) = match make_readiness_pipe() {
-            Some((r, w)) => (Some(r), Some(w)),
-            None => (None, None),
-        };
-        if counter > 0 {
-            if let Some(w) = &write_fd {
-                let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
-            }
-        }
-        Self {
-            slot: crate::eventfd_shm::alloc(counter),
-            local: std::sync::atomic::AtomicU64::new(counter),
-            read_fd,
-            write_fd,
-            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
-        }
+        let state = Self::create(
+            Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap()),
+            0,
+            carrick_el1_abi::ipc::pipe::EventMode::Counter,
+        )
+        .unwrap();
+        state.write_value(counter).unwrap();
+        state
     }
-
-    /// The eventfd counter — the shared-slab slot when available (coherent
-    /// across forked guest processes), else the per-process fallback.
-    pub(super) fn counter_ref(&self) -> &std::sync::atomic::AtomicU64 {
-        self.slot
-            .and_then(crate::eventfd_shm::counter)
-            .unwrap_or(&self.local)
+    fn close(&self) {
+        let object = self.lifetime.lock().take();
+        drop(object);
     }
-
-    /// Current counter value (racy snapshot — poll/epoll readiness only).
     pub(super) fn counter_value(&self) -> u64 {
-        self.counter_ref().load(std::sync::atomic::Ordering::SeqCst)
+        let region = self.owner.region();
+        match region.lock(self.object, &crate::el1_zone::HostLockWait) {
+            Ok(mut guard) => guard.eventfd().map(|event| event.value()).unwrap_or(0),
+            Err(carrick_el1_abi::ipc::IpcError::Stale) => 0,
+            Err(_) => carrick_fatal!("ipc::eventfd", "invalid counter observation"),
+        }
+    }
+    fn finish<T>(
+        &self,
+        mut guard: carrick_el1_abi::ipc::IpcObjectGuard<'_>,
+        step: carrick_el1_abi::ipc::pipe::Step<T>,
+    ) -> Result<T, LinuxErrno> {
+        let wake = guard.publish(step.wake);
+        let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+        delivery.collect(wake);
+        drop(guard);
+        delivery.deliver();
+        if wake.host_owed {
+            self.owner.service_host_wake(self.object);
+        }
+        step.result.map_err(|error| match error {
+            carrick_el1_abi::ipc::pipe::Error::WouldBlock(_) => carrick_abi::LINUX_EAGAIN,
+            carrick_el1_abi::ipc::pipe::Error::Fault => carrick_abi::LINUX_EFAULT,
+            carrick_el1_abi::ipc::pipe::Error::Invalid => carrick_abi::LINUX_EINVAL,
+            _ => carrick_fatal!("ipc::eventfd", "invalid eventfd operation"),
+        })
+    }
+    pub(crate) fn read_with(&self, copy: impl FnOnce(u64) -> bool) -> Result<u64, LinuxErrno> {
+        let region = self.owner.region();
+        let mut guard = region
+            .lock(self.object, &crate::el1_zone::HostLockWait)
+            .map_err(|_| carrick_abi::LINUX_EBADF)?;
+        let event = guard.eventfd().map_err(|_| carrick_abi::LINUX_EBADF)?;
+        let before = event.value();
+        let step = event.read_with(copy);
+        let after = event.value();
+        if step.result.is_ok() {
+            crate::event_ring::rec(
+                crate::event_ring::EFDREAD,
+                -1,
+                before as u32 as i32,
+                after as u32 as i32,
+            );
+        }
+        self.finish(guard, step)
+    }
+    pub(crate) fn write_value(&self, value: u64) -> Result<(), LinuxErrno> {
+        let region = self.owner.region();
+        let mut guard = region
+            .lock(self.object, &crate::el1_zone::HostLockWait)
+            .map_err(|_| carrick_abi::LINUX_EBADF)?;
+        let event = guard.eventfd().map_err(|_| carrick_abi::LINUX_EBADF)?;
+        let before = event.value();
+        let step = event.try_write(value);
+        let after = event.value();
+        if step.result.is_ok() {
+            crate::event_ring::rec(
+                crate::event_ring::EFDWRITE,
+                -1,
+                before as u32 as i32,
+                after as u32 as i32,
+            );
+        }
+        self.finish(guard, step)
     }
 }
 
@@ -385,6 +461,7 @@ pub(crate) struct OpenDescriptionBase {
     /// test_subprocess.test_pipesizes sets on the write end, reads on the read
     /// ends). `pipe2` hands the same `Arc` to both ends; `None` everywhere else.
     pipe_capacity_shared: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    shared_pipe: Option<PipeRef>,
     /// Guest-intended SO_REUSEADDR / SO_REUSEPORT, tracked so getsockopt reports
     /// what the guest set — NOT the host SO_REUSEPORT carrick silently turns on
     /// to emulate Linux UDP wildcard-rebind from SO_REUSEADDR. (audit M4)
@@ -477,6 +554,7 @@ impl OpenDescriptionBase {
             send_timeout: None,
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
             pipe_capacity_shared: None,
+            shared_pipe: None,
             inzone_listener: None,
             inzone_cleanup: None,
         }
@@ -506,6 +584,7 @@ impl OpenDescriptionBase {
     }
 
     /// Route pipe capacity through a cell shared with the pipe's other end.
+    #[cfg(test)]
     pub(super) fn set_pipe_capacity_cell(
         &mut self,
         cell: std::sync::Arc<std::sync::atomic::AtomicI64>,
@@ -513,7 +592,14 @@ impl OpenDescriptionBase {
         self.pipe_capacity_shared = Some(cell);
     }
 
+    pub(super) fn set_shared_pipe(&mut self, pipe: PipeRef) {
+        self.shared_pipe = Some(pipe);
+    }
+
     pub(super) fn pipe_capacity(&self) -> i64 {
+        if let Some(pipe) = &self.shared_pipe {
+            return pipe.get_capacity() as i64;
+        }
         match &self.pipe_capacity_shared {
             Some(cell) => cell.load(std::sync::atomic::Ordering::Relaxed),
             None => self.pipe_capacity,
@@ -1290,7 +1376,6 @@ pub(crate) enum OpenDescription {
     EventFd {
         base: OpenDescriptionBase,
         state: Arc<EventFdState>,
-        semaphore: bool,
     },
     TimerFd {
         base: OpenDescriptionBase,
@@ -1592,15 +1677,26 @@ impl Drop for HostFdOwner {
 /// drop closes the fd via [`OwnedFd`]. Borrow the number for a libc call via [`HostFdRef::raw`]
 /// or as the Copy view type via [`HostFdRef::view`].
 #[derive(Debug, Clone)]
-pub struct HostFdRef(Arc<HostFdOwner>);
+pub struct HostFdRef {
+    owner: Arc<HostFdOwner>,
+    _ipc_subscription: Option<Arc<crate::el1_ipc::HostSubscription>>,
+}
 
 impl std::os::fd::AsFd for HostFdRef {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        std::os::fd::AsFd::as_fd(&self.0.fd)
+        std::os::fd::AsFd::as_fd(&self.owner.fd)
     }
 }
 
 impl HostFdRef {
+    pub(crate) fn with_ipc_subscription(
+        mut self,
+        subscription: Arc<crate::el1_ipc::HostSubscription>,
+    ) -> Self {
+        self._ipc_subscription = Some(subscription);
+        self
+    }
+
     pub(crate) fn new(fd: i32) -> Self {
         Self::with_private_file_source(fd, carrick_guest_mem::PrivateFileSource::Mutable)
     }
@@ -1611,12 +1707,15 @@ impl HostFdRef {
     ) -> Self {
         // SAFETY: `fd` is a host descriptor whose lifetime is owned by this `HostFdRef`.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Self(Arc::new(HostFdOwner {
-            fd,
-            private_file_source,
-            offset_may_be_nonzero: std::sync::atomic::AtomicBool::new(false),
-            inode_identity: std::sync::OnceLock::new(),
-        }))
+        Self {
+            owner: Arc::new(HostFdOwner {
+                fd,
+                private_file_source,
+                offset_may_be_nonzero: std::sync::atomic::AtomicBool::new(false),
+                inode_identity: std::sync::OnceLock::new(),
+            }),
+            _ipc_subscription: None,
+        }
     }
 
     /// Adopt a freshly opened host descriptor and read its device/inode ONCE.
@@ -1644,18 +1743,18 @@ impl HostFdRef {
     ) -> (Self, Option<carrick_vfs::vfs::InodeIdentity>) {
         let owner = Self::with_private_file_source(fd, private_file_source);
         if let Some(identity) = known {
-            let _ = owner.0.inode_identity.set(identity);
+            let _ = owner.owner.inode_identity.set(identity);
         }
         let identity = owner.inode_identity();
         (owner, identity)
     }
 
     pub(super) fn private_file_source(&self) -> carrick_guest_mem::PrivateFileSource {
-        self.0.private_file_source
+        self.owner.private_file_source
     }
 
     pub(super) fn inode_identity(&self) -> Option<carrick_vfs::vfs::InodeIdentity> {
-        if let Some(identity) = self.0.inode_identity.get() {
+        if let Some(identity) = self.owner.inode_identity.get() {
             return Some(*identity);
         }
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -1666,13 +1765,13 @@ impl HostFdRef {
         let identity = carrick_vfs::vfs::InodeIdentity::new(stat.st_dev as u64, stat.st_ino);
         // Concurrent first readers may both query the same live descriptor.
         // They publish the same identity; failures are never cached.
-        let _ = self.0.inode_identity.set(identity);
+        let _ = self.owner.inode_identity.set(identity);
         Some(identity)
     }
 
     #[inline]
     pub(super) fn offset_may_be_nonzero(&self) -> bool {
-        self.0
+        self.owner
             .offset_may_be_nonzero
             .load(std::sync::atomic::Ordering::Acquire)
     }
@@ -1680,7 +1779,7 @@ impl HostFdRef {
     /// Record an absolute host-file position returned by lseek(2).
     #[inline]
     pub(super) fn record_absolute_offset(&self, offset: i64) {
-        self.0
+        self.owner
             .offset_may_be_nonzero
             .store(offset != 0, std::sync::atomic::Ordering::Release);
     }
@@ -1689,7 +1788,7 @@ impl HostFdRef {
     /// host-file position beyond a later truncation boundary.
     #[inline]
     pub(super) fn record_sequential_io(&self) {
-        self.0
+        self.owner
             .offset_may_be_nonzero
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1698,14 +1797,14 @@ impl HostFdRef {
     /// keep a `HostFdRef` alive for as long as the number is used).
     #[inline]
     pub(crate) fn raw(&self) -> i32 {
-        self.0.fd.as_raw_fd()
+        self.owner.fd.as_raw_fd()
     }
 
     /// The Copy borrowed VIEW of this fd (see [`HostFd`]); same liveness
     /// caveat as [`HostFdRef::raw`].
     #[inline]
     pub(super) fn view(&self) -> HostFd {
-        HostFd(self.0.fd.as_raw_fd())
+        HostFd(self.owner.fd.as_raw_fd())
     }
 }
 
@@ -2654,9 +2753,9 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::PerfEvent { .. } => LinuxEpollEvents::empty(),
             OpenDescription::FsContext { .. } => LinuxEpollEvents::empty(),
             OpenDescription::PipeReader { pipe, .. } => {
-                let state = pipe.state.lock();
+                let state = pipe.snapshot();
                 let mut ready = LinuxEpollEvents::empty();
-                if !state.buffer.is_empty() {
+                if state.unread != 0 {
                     ready |= LinuxEpollEvents::IN;
                 }
                 if state.writers == 0 {
@@ -2665,7 +2764,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let state = pipe.state.lock();
+                let state = pipe.snapshot();
                 let mut ready = LinuxEpollEvents::empty();
                 if state.readers == 0 {
                     ready |= LinuxEpollEvents::ERR;
@@ -2870,38 +2969,29 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         let description = self.read();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
-                let mut state = pipe.state.lock();
-                state.readers = state.readers.saturating_add(1);
-                pipe.update_readiness_locked(&state);
+                pipe.retain_endpoint(carrick_el1_abi::ipc::pipe::End::Reader)
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let mut state = pipe.state.lock();
-                state.writers = state.writers.saturating_add(1);
-                pipe.update_readiness_locked(&state);
+                pipe.retain_endpoint(carrick_el1_abi::ipc::pipe::End::Writer)
             }
             _ => {}
         }
     }
-
     fn on_last_fd_ref(&self) {
-        let description = self.read();
+        let mut description = self.write();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
-                let mut state = pipe.state.lock();
-                state.readers = state.readers.saturating_sub(1);
-                pipe.update_readiness_locked(&state);
-                drop(state);
-                pipe.changed.notify_all();
+                pipe.release_endpoint(carrick_el1_abi::ipc::pipe::End::Reader)
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let mut state = pipe.state.lock();
-                state.writers = state.writers.saturating_sub(1);
-                pipe.update_readiness_locked(&state);
-                drop(state);
-                pipe.changed.notify_all();
+                pipe.release_endpoint(carrick_el1_abi::ipc::pipe::End::Writer)
             }
-            _ => {}
+            OpenDescription::EventFd { state, .. } => state.close(),
+            _ => return,
         }
+        // Retire IPC backing and its host observation atomically under the
+        // description guard; later observers must not dereference a freed record.
+        *description = OpenDescription::Closed { was_epoll: false };
     }
 
     fn on_last_resource_ref(&self) {
@@ -3011,8 +3101,8 @@ impl crate::kernel::FileDescription {
         let OpenDescription::PipeReader { pipe, .. } = &*open else {
             return false;
         };
-        let state = pipe.state.lock();
-        state.buffer.is_empty() && state.writers != 0
+        let state = pipe.snapshot();
+        state.unread == 0 && state.writers != 0
     }
 
     pub(in crate::dispatch) fn host_socket_authority(
@@ -3699,13 +3789,13 @@ impl InMemoryPipeTestFixture {
     pub(crate) fn new(pipe_id: u64, capacity: usize) -> Self {
         let pipe = Arc::new(super::fs::pipe::PipeInner::new_connected(pipe_id, capacity));
         let mut read_base = OpenDescriptionBase::new(0);
-        read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        read_base.set_shared_pipe(Arc::clone(&pipe));
         let read_desc = OpenDescription::PipeReader {
             base: read_base,
             pipe: Arc::clone(&pipe),
         };
         let mut write_base = OpenDescriptionBase::new(0);
-        write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        write_base.set_shared_pipe(Arc::clone(&pipe));
         let write_desc = OpenDescription::PipeWriter {
             base: write_base,
             pipe: Arc::clone(&pipe),
@@ -3748,8 +3838,7 @@ impl InMemoryPipeTestFixture {
     }
 
     pub(crate) fn enqueue_bytes(&self, bytes: &[u8]) {
-        let mut state = self.pipe.state.lock();
-        state.buffer.extend(bytes);
+        assert_eq!(self.pipe.write_bytes(bytes), Ok(bytes.len()));
     }
 }
 
@@ -3841,13 +3930,47 @@ mod tests {
     #[test]
     fn serial_host_el1_ipc_guest_only_eventfd_has_no_host_readiness() {
         for initial in [0, 1] {
-            let state = EventFdState::new(initial);
-            assert_eq!(state.counter_value(), initial);
-            assert!(
-                state.read_fd.is_none() && state.write_fd.is_none(),
+            let (_, budget) = crate::dispatch::budget_meter::measure(|| {
+                let state = EventFdState::new(initial);
+                assert_eq!(state.counter_value(), initial);
+                drop(state);
+            });
+            assert_eq!(
+                budget.host_closes, 0,
                 "eventfd admission allocated host readiness without a subscriber (initial={initial})"
             );
         }
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_eventfd_mixed_subscriber_wakes_once() {
+        use crate::el1_zone::HostLockWait;
+        use carrick_el1_abi::ipc::pipe::EventMode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let state = EventFdState::create(Arc::clone(&owner), 0, EventMode::Semaphore).unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let subscription = state.wait_queue.enroll_callback(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let region = owner.region();
+        let mut guest = region.lock(state.object, &HostLockWait).unwrap();
+        let step = guest.eventfd().unwrap().try_write(3);
+        assert!(guest.publish(step.wake).host_owed);
+        drop(guest);
+        assert!(owner.service_host_wake(state.object));
+        assert!(!owner.service_host_wake(state.object));
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(state.read_with(|value| value == 1), Ok(1));
+        assert_eq!(state.counter_value(), 2);
+        drop(subscription);
+        let observed = wakes.load(Ordering::Relaxed);
+        state.write_value(7).unwrap();
+        assert_eq!(wakes.load(Ordering::Relaxed), observed);
+        let mut guest = region.lock(state.object, &HostLockWait).unwrap();
+        assert_eq!(guest.eventfd().unwrap().try_read().result, Ok(1));
+        assert_eq!(guest.host_subscribers(), 0);
     }
 
     #[test]

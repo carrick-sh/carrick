@@ -49,12 +49,176 @@ mod overlay_dispatch_tests {
         OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(counter)),
-                semaphore: false,
+
                 base: OpenDescriptionBase::new(0),
             })),
             crate::linux_abi::LINUX_O_RDWR,
             0,
         )
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity() {
+        blocking_eventfd_owned_write(false, false);
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_blocking_eventfd_write_survives_fd_reuse() {
+        blocking_eventfd_owned_write(true, false);
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_blocking_eventfd_write_closes_enrollment_gap() {
+        blocking_eventfd_owned_write(false, true);
+    }
+
+    fn blocking_eventfd_owned_write(reuse_fd: bool, drain_before_enrollment: bool) {
+        use crate::kernel::continuation::{
+            BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass,
+            fold_continuation_completion, test_support,
+        };
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
+        let reporter = CompatReporter::default();
+        let create = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(19, SyscallArgs([0; 6])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        let DispatchOutcome::Returned { value: fd } = create else {
+            panic!("eventfd creation: {create:?}");
+        };
+        let write = SyscallRequest::new(64, SyscallArgs([fd as u64, 0x4000, 8, 0, 0, 0]));
+        memory
+            .write_bytes(0x4000, &(u64::MAX - 1).to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, write, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        memory.write_bytes(0x4000, &7u64.to_ne_bytes()).unwrap();
+        let blocked = dispatcher
+            .dispatch(&context, write, &mut memory, &reporter)
+            .unwrap();
+        assert!(
+            !matches!(
+                blocked,
+                DispatchOutcome::Errno { .. } | DispatchOutcome::Returned { .. }
+            ),
+            "blocking eventfd write must yield an owned continuation: {blocked:?}"
+        );
+        let mut peer_fd = fd;
+        if reuse_fd {
+            let duplicate = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(23, SyscallArgs([fd as u64, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            let DispatchOutcome::Returned { value } = duplicate else {
+                panic!("dup: {duplicate:?}");
+            };
+            peer_fd = value;
+            assert_eq!(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(57, SyscallArgs([fd as u64, 0, 0, 0, 0, 0])),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            let replacement = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([23, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            assert_eq!(replacement, DispatchOutcome::Returned { value: fd });
+        }
+        let read = SyscallRequest::new(63, SyscallArgs([peer_fd as u64, 0x4020, 8, 0, 0, 0]));
+        if drain_before_enrollment {
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+            memory.write_bytes(0x4000, &99u64.to_ne_bytes()).unwrap();
+        }
+        let generation = test_support::publish(&context, 0x1ecfd);
+        let capture =
+            ContinuationCapture::new(&context, generation, write, RestartClass::RestartSyscall)
+                .unwrap();
+        let mut continuation =
+            BlockedContinuation::from_dispatch_outcome(blocked, capture).unwrap();
+        assert!(
+            !crate::kernel::continuation::ReadinessProbe::from_continuation(&continuation)
+                .contributes_pollfds(),
+            "object waits must not enter the host-fd reactor scan"
+        );
+        let service = CarrierWaitService::new(Arc::new(crate::kernel::Scheduler::new(Arc::clone(
+            context.kernel(),
+        ))));
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).unwrap();
+        let token = registration.wake_token();
+        continuation.attach_registration(registration).unwrap();
+        // A peer drains capacity. The parked writer owns the copied value;
+        // changing its original user buffer must not replay a different write.
+        if !drain_before_enrollment {
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+            memory.write_bytes(0x4000, &99u64.to_ne_bytes()).unwrap();
+        }
+        let mut event = std::pin::pin!(service.event(token));
+        let Poll::Ready(Ok(event)) = event.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("draining capacity must wake the owned eventfd writer");
+        };
+        let completion = continuation.resume(event, &context).unwrap().completion;
+        assert_eq!(
+            fold_continuation_completion(completion, &dispatcher, &context, &mut memory).unwrap(),
+            Some(DispatchOutcome::Returned { value: 8 })
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, read, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        let delivered = memory.read_bytes(0x4020, 8).unwrap();
+        assert_eq!(u64::from_ne_bytes(delivered.try_into().unwrap()), 7);
+        if reuse_fd {
+            let read_replacement =
+                SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4020, 8, 0, 0, 0]));
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read_replacement, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+            let delivered = memory.read_bytes(0x4020, 8).unwrap();
+            assert_eq!(u64::from_ne_bytes(delivered.try_into().unwrap()), 23);
+        }
     }
 
     #[test]
@@ -383,7 +547,7 @@ mod overlay_dispatch_tests {
             OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::EventFd {
                     state: Arc::new(EventFdState::new(2)),
-                    semaphore: false,
+
                     base: OpenDescriptionBase::new(0),
                 })),
                 crate::linux_abi::LINUX_O_RDWR,
@@ -546,7 +710,7 @@ mod overlay_dispatch_tests {
         let description = kernel_file_description(
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(1)),
-                semaphore: false,
+
                 base: OpenDescriptionBase::new(0),
             })),
             crate::linux_abi::LINUX_O_RDWR,
@@ -4098,8 +4262,9 @@ mod overlay_dispatch_tests {
 
         // Drain the backing to its Closed identity shell. Reaching this state used
         // to abort the process through OpenDescription::base().
-        *description.write_for_io().expect("open description write guard") =
-            OpenDescription::Closed { was_epoll: false };
+        *description
+            .write_for_io()
+            .expect("open description write guard") = OpenDescription::Closed { was_epoll: false };
 
         assert_eq!(description.common().fd_refs(), 1);
         assert_eq!(
@@ -5481,7 +5646,7 @@ mod tests {
             let eventfd = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::EventFd {
                     state: Arc::new(EventFdState::new(1)),
-                    semaphore: false,
+
                     base: OpenDescriptionBase::new(0),
                 })),
                 crate::linux_abi::LINUX_O_RDWR,
@@ -7963,9 +8128,9 @@ fn closing_unpolled_pipe_does_not_materialize_readiness_fds() {
     let dispatcher = SyscallDispatcher::new();
     let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(41, 65536));
     let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
-    read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    read_base.set_shared_pipe(Arc::clone(&pipe));
     let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
-    write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    write_base.set_shared_pipe(Arc::clone(&pipe));
     let read_file = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::PipeReader {
             base: read_base,
@@ -8011,9 +8176,9 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     let parent = SyscallDispatcher::new();
     let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(42, 65536));
     let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
-    read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    read_base.set_shared_pipe(Arc::clone(&pipe));
     let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
-    write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    write_base.set_shared_pipe(Arc::clone(&pipe));
 
     let read_desc = Arc::new(RwLock::new(OpenDescription::PipeReader {
         base: read_base,
@@ -8045,14 +8210,16 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
         .expect("write file")
         .description();
 
-    let read_poll_fd = pipe.read_poll_fd().expect("read poll fd").raw();
-    let write_poll_fd = pipe.write_poll_fd().expect("write poll fd").raw();
+    let read_poll_lease = pipe.read_poll_fd().expect("read poll fd");
+    let read_poll_fd = read_poll_lease.raw();
+    let write_poll_lease = pipe.write_poll_fd().expect("write poll fd");
+    let write_poll_fd = write_poll_lease.raw();
 
     // 1. Initial installation activates exactly one reader/writer endpoint and readiness state.
     assert_eq!(read_description.common().fd_refs(), 1);
     assert_eq!(write_description.common().fd_refs(), 1);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(state.readers, 1);
         assert_eq!(state.writers, 1);
     }
@@ -8076,7 +8243,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     assert_eq!(read_description.common().fd_refs(), 2);
     assert_eq!(write_description.common().fd_refs(), 2);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(
             state.readers, 1,
             "fork copy must not increment backing reader endpoint count"
@@ -8096,7 +8263,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     parent.close_fd_for_internal_rollback(write_fd);
     assert_eq!(write_description.common().fd_refs(), 1);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(
             state.writers, 1,
             "intermediate close must retain backing writer count"
@@ -8116,7 +8283,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     child.close_fd_for_internal_rollback(write_fd);
     assert_eq!(write_description.common().fd_refs(), 0);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(
             state.writers, 0,
             "final release must decrement backing writer count to 0"
@@ -8135,7 +8302,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     parent.close_fd_for_internal_rollback(read_fd);
     assert_eq!(read_description.common().fd_refs(), 1);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(
             state.readers, 1,
             "intermediate close must retain backing reader count"
@@ -8151,10 +8318,9 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     child.close_fd_for_internal_rollback(read_fd);
     assert_eq!(read_description.common().fd_refs(), 0);
     {
-        let state = pipe.state.lock();
-        assert_eq!(
-            state.readers, 0,
-            "final release must decrement backing reader count to 0"
+        assert!(
+            pipe.is_retired(),
+            "final release retires the shared incarnation"
         );
         assert!(
             matches!(&*read_desc.read(), OpenDescription::Closed { .. }),
@@ -8605,7 +8771,7 @@ mod scm_rights_tests {
         let state = Arc::new(EventFdState::new(0));
         let desc = Arc::new(RwLock::new(OpenDescription::EventFd {
             state,
-            semaphore: false,
+
             base: OpenDescriptionBase::new(0),
         }));
         let common = Arc::new(crate::kernel::DescriptionCommon::new(0));
@@ -10399,7 +10565,8 @@ fn exec_image_cache_builds_distinct_keys_without_serializing() {
     for count in [1, 8, 32] {
         let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
         let (entered, arrivals) = std::sync::mpsc::channel();
-        let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         std::thread::scope(|scope| {
             for index in 0..count {
                 let dispatcher = std::sync::Arc::clone(&dispatcher);
@@ -10422,7 +10589,10 @@ fn exec_image_cache_builds_distinct_keys_without_serializing() {
             drop(entered);
             let mut admitted = 0;
             for _ in 0..count {
-                if arrivals.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+                if arrivals
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_err()
+                {
                     break;
                 }
                 admitted += 1;

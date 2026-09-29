@@ -6199,9 +6199,9 @@ impl TestInMemoryPipe {
         let dispatcher = SyscallDispatcher::new();
         let pipe = Arc::new(PipeInner::new_connected(pipe_id, capacity));
         let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
-        read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        read_base.set_shared_pipe(Arc::clone(&pipe));
         let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
-        write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        write_base.set_shared_pipe(Arc::clone(&pipe));
 
         let read_open = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::PipeReader {
@@ -6231,9 +6231,7 @@ impl TestInMemoryPipe {
     }
 
     fn fill(&self, bytes: usize) {
-        let mut state = self.pipe.state.lock();
-        state.buffer.extend(vec![0x7f; bytes]);
-        self.pipe.update_readiness_locked(&state);
+        assert_eq!(self.pipe.write_bytes(&vec![0x7f; bytes]), Ok(bytes));
     }
 
     fn dispatch_vmsplice(&self, payload_len: usize, flags: u64) -> DispatchOutcome {
@@ -6361,6 +6359,7 @@ fn vmsplice_in_memory_pipe_writer_full_blocking_parks_on_write_readiness_pollin(
         panic!("drain pipe bytes");
     };
     assert_eq!(drained.len(), PIPE_BUF);
+    drained.commit(PIPE_BUF);
 
     let ready_after_drain = unsafe { libc::poll(&mut poll_fd_struct, 1, 0) };
     assert_eq!(
@@ -6368,6 +6367,41 @@ fn vmsplice_in_memory_pipe_writer_full_blocking_parks_on_write_readiness_pollin(
         "pipe must become write-ready after reader drains PIPE_BUF"
     );
     assert_ne!(poll_fd_struct.revents & libc::POLLIN, 0);
+}
+
+#[test]
+fn serial_host_el1_ipc_splice_endpoint_survives_final_slot_close() {
+    let pair = TestPipePair::new(65536, 65536);
+    pair.fill_in(b"retained");
+    let (endpoint, _) = pair
+        .dispatcher
+        .fs_view()
+        .pipe_reader(pair.in_read_fd)
+        .unwrap();
+    pair.dispatcher
+        .close_fd_for_internal_rollback(pair.in_read_fd);
+    pair.dispatcher
+        .close_fd_for_internal_rollback(pair.in_write_fd);
+    assert!(
+        !pair.in_pipe.is_retired(),
+        "captured transfer retains its exact endpoint"
+    );
+    let mut bytes = [0; 8];
+    assert_eq!(
+        pipe::read_pipe_bytes(
+            &mut bytes,
+            &endpoint,
+            0,
+            crate::thread::ThreadId::synthetic_for_tests(1)
+        ),
+        Ok(8)
+    );
+    assert_eq!(&bytes, b"retained");
+    drop(endpoint);
+    assert!(
+        pair.in_pipe.is_retired(),
+        "observation alone does not retain the endpoint"
+    );
 }
 
 struct TestPipePair {
@@ -6389,13 +6423,13 @@ impl TestPipePair {
 
     fn with_flags(in_cap: usize, in_flags: u64, out_cap: usize, out_flags: u64) -> Self {
         let dispatcher = SyscallDispatcher::new();
-        let in_pipe = Arc::new(PipeInner::new_connected(2001, in_cap));
-        let out_pipe = Arc::new(PipeInner::new_connected(2002, out_cap));
+        let in_pipe = Arc::new(PipeInner::new(2001, in_cap));
+        let out_pipe = Arc::new(PipeInner::new(2002, out_cap));
 
         let make_pair = |pipe: &PipeRef, r_flags, w_flags| {
             let desc = |flags, is_reader| {
                 let mut base = OpenDescriptionBase::new(flags);
-                base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+                base.set_shared_pipe(Arc::clone(pipe));
                 let d = if is_reader {
                     OpenDescription::PipeReader {
                         base,
@@ -6436,15 +6470,11 @@ impl TestPipePair {
     }
 
     fn fill_in(&self, bytes: &[u8]) {
-        let mut s = self.in_pipe.state.lock();
-        s.buffer.extend(bytes);
-        self.in_pipe.update_readiness_locked(&s);
+        assert_eq!(self.in_pipe.write_bytes(bytes), Ok(bytes.len()));
     }
 
     fn fill_out(&self, bytes: usize) {
-        let mut s = self.out_pipe.state.lock();
-        s.buffer.extend(vec![0x7f; bytes]);
-        self.out_pipe.update_readiness_locked(&s);
+        assert_eq!(self.out_pipe.write_bytes(&vec![0x7f; bytes]), Ok(bytes));
     }
 
     fn dispatch_tee(&self, in_fd: i32, out_fd: i32, len: u64, flags: u64) -> DispatchOutcome {
@@ -6585,9 +6615,8 @@ fn tee_in_memory_empty_source_backpressure_and_eof() {
     );
 
     // EOF: writers = 0
-    pair.in_pipe.state.lock().writers = 0;
-    pair.in_pipe
-        .update_readiness_locked(&pair.in_pipe.state.lock());
+    pair.dispatcher
+        .close_fd_for_internal_rollback(pair.in_write_fd);
     assert_eq!(
         pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, 0),
         DispatchOutcome::Returned { value: 0 }
@@ -6626,9 +6655,8 @@ fn tee_in_memory_full_destination_backpressure() {
 fn tee_in_memory_destination_reader_closed_epipe_and_sigpipe() {
     let pair = TestPipePair::new(65536, 65536);
     // Destination readers = 0 wins even when source is empty (precedence)
-    pair.out_pipe.state.lock().readers = 0;
-    pair.out_pipe
-        .update_readiness_locked(&pair.out_pipe.state.lock());
+    pair.dispatcher
+        .close_fd_for_internal_rollback(pair.out_read_fd);
 
     let ctx = pair.dispatcher.capture_one_task_context().unwrap();
     let outcome = pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, 0);
@@ -7354,6 +7382,47 @@ fn fcntl_pipe_set_capacity_routes_through_canonical_authority() {
             [write_fd, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]
         ),
         DispatchOutcome::Returned { value: 131072 }
+    );
+}
+
+#[test]
+fn serial_host_el1_ipc_pipe_capacity_admission_matches_shared_rounding() {
+    let mut rig = SpliceTestRig::new(0x10000);
+    rig.dispatcher
+        .activate_file_authority(rig.dispatcher.captured_file_table())
+        .expect("activate authority");
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+
+    // Admission and the shared record must use the same power-of-two size.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_SETPIPE_SZ, 12288, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 16384 }
+    );
+    for fd in [read_fd, write_fd] {
+        assert_eq!(
+            rig.run(
+                SpliceTestRig::SYS_FCNTL,
+                [fd, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 16384 }
+        );
+    }
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_SETPIPE_SZ, 1024 * 1024 + 1, 0, 0, 0],
+        ),
+        DispatchOutcome::errno(LINUX_EPERM)
+    );
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 16384 }
     );
 }
 

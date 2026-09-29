@@ -1744,7 +1744,25 @@ where
         match outcome {
             DispatchOutcome::BlockingWrite(mut write) => {
                 waiter.ensure_full();
+                // The single-task runner bridges an object queue to its existing
+                // interruptible host waiter. Production carrier continuations
+                // subscribe directly and release executor capacity.
+                let object_wake = if let Some(queue) = write.wait_queue() {
+                    let Some(pipe) = carrick_kernel::kernel::wait_set::ExecutorWakePipe::new()
+                    else {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOMEM));
+                    };
+                    let pipe = std::sync::Arc::new(pipe);
+                    let wake = std::sync::Arc::clone(&pipe);
+                    let enrollment = queue.enroll_callback(move |_| wake.wake());
+                    Some((pipe, enrollment))
+                } else {
+                    None
+                };
                 loop {
+                    if let Some((pipe, _)) = &object_wake {
+                        pipe.drain();
+                    }
                     match carrick_kernel::dispatch::drive_blocking_write(
                         &mut write,
                         &*dispatcher.host_signal,
@@ -1759,10 +1777,16 @@ where
                         }
                         carrick_kernel::dispatch::BlockingWriteStep::Wait => {
                             match waiter.wait(
-                                &[carrick_hal::WaitFd::raw(
-                                    write.poll_fd(),
-                                    write.poll_events(),
-                                )],
+                                &write
+                                    .poll_fd()
+                                    .map(|fd| carrick_hal::WaitFd::raw(fd, write.poll_events()))
+                                    .or_else(|| {
+                                        object_wake.as_ref().map(|(pipe, _)| {
+                                            carrick_hal::WaitFd::raw(pipe.read_fd(), libc::POLLIN)
+                                        })
+                                    })
+                                    .into_iter()
+                                    .collect::<Vec<_>>(),
                                 None,
                                 carrick_abi::SigBlockMask::NONE,
                             ) {

@@ -16,6 +16,36 @@ use std::cell::{Cell, RefCell};
 const MM: IpcMmKey = IpcMmKey(7);
 const BUF: u64 = 0x10_0000;
 
+#[test]
+fn serial_host_el1_ipc_runtime_backing_retains_the_kernel_authority() {
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = context.kernel().ipc().unwrap();
+    let object = owner
+        .create_eventfd(7, carrick_el1_abi::ipc::pipe::EventMode::Counter)
+        .unwrap();
+    let backing = host_window_backing(&dispatcher).expect("runtime IPC backing");
+    assert_eq!(backing.directory_ptr(), owner.directory_ptr().cast());
+    assert_eq!(backing.pool_ptr(), owner.pool_ptr());
+    assert_eq!(backing.directory_len(), owner.directory_len());
+    assert_eq!(backing.pool_len(), owner.pool_len());
+    let weak = std::sync::Arc::downgrade(&owner);
+    drop(owner);
+    drop(context);
+    drop(dispatcher);
+    let retained = weak.upgrade().expect("mapping retains IPC authority");
+    let region = retained.region();
+    let mut guard = region.lock(object, &HostIpcWait).unwrap();
+    assert_eq!(guard.eventfd().unwrap().try_read().result, Ok(7));
+    drop(guard);
+    retained
+        .release(IpcBacking::EventFd { object }.encode())
+        .unwrap();
+    drop(retained);
+    drop(backing);
+    assert!(weak.upgrade().is_none());
+}
+
 struct World {
     region: &'static IpcRegion<'static>,
     next: Cell<u64>,
@@ -358,4 +388,101 @@ fn el1_ipc_exit_cancellation_releases_the_last_pin_and_wakes_the_peer() {
     assert_eq!(g.pipe().unwrap().references(End::Reader), 0);
     drop(g);
     let _ = wfd;
+}
+
+#[test]
+fn serial_host_el1_ipc_guest_wake_delivered_at_its_kernel_boundary() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let other = crate::dispatch::SyscallDispatcher::new();
+    let other_context = other.capture_one_task_context().unwrap();
+    let owner = context.kernel().ipc().unwrap();
+    let object = owner
+        .create_eventfd(0, carrick_el1_abi::ipc::EventMode::Counter)
+        .unwrap();
+    let queue = owner.wait_queue(object);
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&wakes);
+    let enrollment = queue.enroll_callback(move |_| {
+        seen.fetch_add(1, Ordering::Relaxed);
+    });
+    // The guest updates the shared core and publishes under its object lock;
+    // it cannot call the host subscription registry directly.
+    {
+        let region = owner.region();
+        let mut guard = region.lock(object, &HostIpcWait).unwrap();
+        let step = guard.eventfd().unwrap().try_write(7);
+        assert!(guard.publish(step.wake).host_owed);
+    }
+    assert_eq!(wakes.load(Ordering::Relaxed), 0);
+    deliver_owed_host_wakes(other_context.kernel());
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        0,
+        "another kernel cannot consume this wake"
+    );
+    deliver_owed_host_wakes(context.kernel());
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        1,
+        "host boundary must deliver the guest wake"
+    );
+    deliver_owed_host_wakes(context.kernel());
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        1,
+        "consume each owed notification once"
+    );
+    // Leave an indexed wake behind, then retire and reuse its object slot.
+    {
+        let region = owner.region();
+        let mut guard = region.lock(object, &HostIpcWait).unwrap();
+        let step = guard.eventfd().unwrap().try_write(1);
+        assert!(guard.publish(step.wake).host_owed);
+    }
+    drop(enrollment);
+    owner
+        .release(IpcBacking::EventFd { object }.encode())
+        .unwrap();
+    let replacement = owner
+        .create_eventfd(0, carrick_el1_abi::ipc::EventMode::Counter)
+        .unwrap();
+    assert_eq!(replacement.index(), object.index());
+    assert_ne!(replacement, object);
+    let queue = owner.wait_queue(replacement);
+    let seen = Arc::clone(&wakes);
+    let enrollment = queue.enroll_callback(move |_| {
+        seen.fetch_add(1, Ordering::Relaxed);
+    });
+    deliver_owed_host_wakes(context.kernel());
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        1,
+        "retired notification cannot wake a reused object"
+    );
+    {
+        let region = owner.region();
+        let mut guard = region.lock(replacement, &HostIpcWait).unwrap();
+        let step = guard.eventfd().unwrap().try_write(1);
+        assert!(guard.publish(step.wake).host_owed);
+    }
+    deliver_owed_host_wakes(context.kernel());
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        2,
+        "successor keeps its own notification"
+    );
+    drop(enrollment);
+    owner
+        .release(
+            IpcBacking::EventFd {
+                object: replacement,
+            }
+            .encode(),
+        )
+        .unwrap();
 }

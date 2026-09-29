@@ -2515,6 +2515,237 @@
       "rationale": "Host-alias coordinator released with no recorded holder: alias_active accounting is corrupt, so later dispatchers could enter concurrently or wait forever.",
       "sink": "fatal",
       "domain": "dispatch::mm_mutation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "function": "EventFdState::counter_value",
+      "ordinal_in_function": 1,
+      "fingerprint": "5f14cb0b791646bf3bc99b8d19c68076e724908d041913f830c718ac65900742",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::eventfd",
+      "rationale": "An authenticated eventfd handle must name an eventfd record; stale observations return zero before this check.",
+      "sink": "fatal",
+      "domain": "ipc::eventfd"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "function": "EventFdState::finish",
+      "ordinal_in_function": 1,
+      "fingerprint": "e1dd6aeed532c91c813b75f682f10c7a995d487262b668c38f0e011ab37818a8",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::eventfd",
+      "rationale": "The host eventfd adapter handles Linux errors explicitly; any remaining object error violates the admitted eventfd state invariant.",
+      "sink": "fatal",
+      "domain": "ipc::eventfd"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "object_error",
+      "ordinal_in_function": 1,
+      "fingerprint": "e9961261e75f1d9f8d4896a964bd34258a8213681312c70c82c5400c1567c9da",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "The pipe adapter lowers supported Linux failures; other core errors indicate an invalid admitted pipe state.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeInner::lock",
+      "ordinal_in_function": 1,
+      "fingerprint": "a0b0f23a6cd13a38a81e2941be6b631f1558097d7eadf02897177820ae0cbefe",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "An active pipe operation owns a functional endpoint lease. A stale handle here means endpoint ownership was released before its operation ended.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeInner::snapshot_locked",
+      "ordinal_in_function": 1,
+      "fingerprint": "cf78791cab1cabd93602e1774fa5aac7d1f36bd76218eec780f7022f48388510",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "A host PipeInner is constructed only from a shared pipe record; a different kind under its authenticated handle is corruption.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeInner::buffered_bytes",
+      "ordinal_in_function": 1,
+      "fingerprint": "623b50f40f1ec3bf10dee47c286e4e80494eada46bc532ca6aaa2e7afd37c1bf",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "A retired observation explicitly returns zero; other lookup failures indicate shared directory corruption.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeInner::write_bytes",
+      "ordinal_in_function": 1,
+      "fingerprint": "dc95cc571ac4f0e054f0812fa6fef4d81db40b3c2a85ec4322c4abc634ea049a",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "A writer binding must reference a shared pipe record after acquiring its object lock.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeInner::read_with",
+      "ordinal_in_function": 1,
+      "fingerprint": "6107663ffa4b155befd55f3bdfdeff045a4db7b3b912c41fcd188e8ea6fe3529",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "A reader binding must reference a shared pipe record after acquiring its object lock.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeInner::retain_endpoint",
+      "ordinal_in_function": 1,
+      "fingerprint": "039806d8aed9debff5596999acf7eb5adabd1eef797b8db388f41d7f342d2d25",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "A live description must acquire its endpoint before publication, serialized with its final release.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeInner::release_endpoint",
+      "ordinal_in_function": 1,
+      "fingerprint": "4b01b44afb1482be2a90ee9d0b2e38737dbd19f977ed9beb825c0afdd79c5ab6",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "Each functional pipe description releases its authenticated endpoint exactly once; a stale release violates lifecycle ownership.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeRead<'_>::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "3855770e7f8b9d1b7d68764cab9dbb08dd299611c2f99a8e376bb8261fe7a982",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "The source object guard retains the exact peeked prefix through destination delivery; a wrong record kind or invalid committed length violates the transfer transaction.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "PipeRead<'_>::commit",
+      "ordinal_in_function": 2,
+      "fingerprint": "2e78e73734730c856e7ac9e95c4a970b61b08ad0c6c61851a24315ae795f9925",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "The source object guard retains the exact peeked prefix through destination delivery; a wrong record kind or invalid committed length violates the transfer transaction.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "take_pipe_bytes",
+      "ordinal_in_function": 1,
+      "fingerprint": "1023f63ef37a209af0f278bd0a57be1d0e76466cd1f9d7e027433b93f41e4b68",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "A captured transfer owns a functional reader and a shared object guard; wrong kind or failure to peek the observed prefix is an internal invariant violation.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "take_pipe_bytes",
+      "ordinal_in_function": 2,
+      "fingerprint": "2d95d6f1b9df354c219cb043a38fafeec091d44caddad71da471541751eb5b17",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "A captured transfer owns a functional reader and a shared object guard; wrong kind or failure to peek the observed prefix is an internal invariant violation.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "transfer_in_memory_pipes",
+      "ordinal_in_function": 1,
+      "fingerprint": "bdc8fc6c2339b8aed69a58d2be8fe8944e22053652a81e0125a4415dbab6833b",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "Both exact endpoints are retained and their object guards are ordered; record-kind mismatch or failure to consume the delivered prefix violates the shared transfer transaction.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "transfer_in_memory_pipes",
+      "ordinal_in_function": 2,
+      "fingerprint": "bdc8fc6c2339b8aed69a58d2be8fe8944e22053652a81e0125a4415dbab6833b",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "Both exact endpoints are retained and their object guards are ordered; record-kind mismatch or failure to consume the delivered prefix violates the shared transfer transaction.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "function": "transfer_in_memory_pipes",
+      "ordinal_in_function": 3,
+      "fingerprint": "6f7d2951a0dc3333f6883c522f8bdd99b719d87b0d32039308b646a941419963",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::pipe",
+      "rationale": "Both exact endpoints are retained and their object guards are ordered; record-kind mismatch or failure to consume the delivered prefix violates the shared transfer transaction.",
+      "sink": "fatal",
+      "domain": "ipc::pipe"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "function": "HostIpc::region",
+      "ordinal_in_function": 1,
+      "fingerprint": "eaf52543f1fea9b23d6465654b2011ab1ae5f62aa5d3f445a69e6c400eb1f619",
+      "verdict": "carrier_fault",
+      "failure_domain": "IPC",
+      "rationale": "An owned initialized IPC mapping must retain its format and extent invariants for its entire lifetime.",
+      "sink": "fatal",
+      "domain": "IPC"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "function": "HostIpc::bind_waits",
+      "ordinal_in_function": 1,
+      "fingerprint": "ccaa87e40fc87ba28221e0cc5ba2145402546f64eb81d5f69d1bb59cdcbadfbd",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::admission",
+      "rationale": "An object incarnation may be recycled only after its predecessor has no functional endpoints or enrolled operations; a wait-generation collision violates ownership.",
+      "sink": "fatal",
+      "domain": "ipc::admission"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "function": "ObjectWakeDelivery::collect",
+      "ordinal_in_function": 1,
+      "fingerprint": "24ef7be01daca4aa20cc16f18e9dd0cf2cf15585255923c4639f949dced6c5bb",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::wake",
+      "rationale": "Shared object wake claims must be unique and fit the fixed record population; duplicate delivery or an invalid ownership transition is a scheduler invariant failure.",
+      "sink": "fatal",
+      "domain": "ipc::wake"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "function": "ObjectWakeDelivery::collect",
+      "ordinal_in_function": 2,
+      "fingerprint": "24ef7be01daca4aa20cc16f18e9dd0cf2cf15585255923c4639f949dced6c5bb",
+      "verdict": "carrier_fault",
+      "failure_domain": "ipc::wake",
+      "rationale": "Shared object wake claims must be unique and fit the fixed record population; duplicate delivery or an invalid ownership transition is a scheduler invariant failure.",
+      "sink": "fatal",
+      "domain": "ipc::wake"
     }
   ]
 }

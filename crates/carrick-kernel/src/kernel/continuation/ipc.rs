@@ -88,27 +88,17 @@ impl IpcHostWake for ZoneHostWake {
 /// [`carrick_el1_abi::IpcWindowBacking`]. The runtime registers the result
 /// with the carrier before its first persistent root.
 pub fn host_window_backing(
-    _dispatcher: &crate::dispatch::SyscallDispatcher,
+    dispatcher: &crate::dispatch::SyscallDispatcher,
 ) -> Option<std::sync::Arc<dyn carrick_el1_abi::IpcWindowBacking>> {
-    None
+    let owner = dispatcher.kernel_binding.read().kernel().ipc().ok()?;
+    Some(owner)
 }
 
-/// Owed host readiness wakes (an EL1 change while host subscribers were
-/// registered) are delivered at the next host boundary by the host
-/// subscription registry that knows the subscribed objects (T4); it
-/// registers its delivery here.
-static OWED_WAKE_DELIVERY: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
-
-/// Register the host subscription registry's owed-wake delivery (once).
-pub fn register_owed_host_wake_delivery(deliver: fn()) {
-    let _ = OWED_WAKE_DELIVERY.set(deliver);
-}
-
-/// Deliver owed IPC host wakes at a host boundary EL1 forced for them.
-pub fn deliver_owed_host_wakes() {
-    if let Some(deliver) = OWED_WAKE_DELIVERY.get() {
-        deliver();
-    }
+/// Deliver guest-produced IPC readiness at this kernel's host boundary.
+/// Kernel identity is explicit: no process-global callback can select another
+/// container's authority or silently leave this kernel's subscribers asleep.
+pub fn deliver_owed_host_wakes(kernel: &crate::kernel::Kernel) {
+    kernel.deliver_ipc_host_wakes();
 }
 
 /// The host's view of the shared IPC authority, once the carrier mapped

@@ -5445,7 +5445,7 @@ fn controller_carrier_wait_service_cancellation_and_retirement() {
     let outcome = dispatcher
         .dispatch(&context, req, &mut memory, &reporter)
         .unwrap();
-    assert!(matches!(&outcome, DispatchOutcome::WaitOnFds { .. }));
+    assert!(matches!(&outcome, DispatchOutcome::BlockingFdWait { .. }));
 
     let generation = publish(&context, 0x984);
     let mut continuation =
@@ -5587,13 +5587,40 @@ fn controller_in_flight_callback_rejected_on_retired_or_recycled_registration() 
         "capture the actual installed service closure"
     );
 
-    // Simulate wake event on continuation1 and resume (consuming it)
-    let receipt1 = service.publish_ready(token1);
-    assert!(receipt1.accepted(), "first publish accepted");
+    // A real eventfd producer invokes the installed service callback.
+    memory.write_bytes(0x4200, &1u64.to_le_bytes()).unwrap();
+    assert_eq!(
+        returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(64, SyscallArgs([efd as u64, 0x4200, 8, 0, 0, 0])),
+                    &mut memory,
+                    &reporter
+                )
+                .unwrap()
+        ),
+        8
+    );
+    assert!(
+        service
+            .inner
+            .state
+            .lock()
+            .entries
+            .get(&token1.continuation)
+            .unwrap()
+            .event
+            .is_some(),
+        "producer queued readiness on the current registration"
+    );
     let outcome1 = continuation1
         .resume(ContinuationEvent::Ready, &context)
         .unwrap();
-    assert_eq!(outcome1.completion, ContinuationCompletion::Redispatch);
+    assert!(matches!(
+        outcome1.completion,
+        ContinuationCompletion::FdWait { .. }
+    ));
 
     // Now token1 is completely retired and consumed.
     // Any in-flight callback for token1 must be rejected:
@@ -5601,6 +5628,21 @@ fn controller_in_flight_callback_rejected_on_retired_or_recycled_registration() 
     assert!(
         !in_flight_receipt.accepted(),
         "in-flight callback on consumed registration must be rejected"
+    );
+
+    // Drain the same object before the second wait; no synthetic readiness.
+    assert_eq!(
+        returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(63, SyscallArgs([efd as u64, 0x4200, 8, 0, 0, 0])),
+                    &mut memory,
+                    &reporter
+                )
+                .unwrap()
+        ),
+        8
     );
 
     // Now create continuation2 on the same thread/slot with a fresh registration generation
@@ -5655,16 +5697,40 @@ fn controller_in_flight_callback_rejected_on_retired_or_recycled_registration() 
         "retired producer closure must not queue an event for the new registration"
     );
 
-    // Proper token2 publication succeeds
-    let valid_receipt = service.publish_ready(token2);
+    // A real eventfd producer invokes the installed service callback.
+    memory.write_bytes(0x4200, &1u64.to_le_bytes()).unwrap();
+    assert_eq!(
+        returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(64, SyscallArgs([efd as u64, 0x4200, 8, 0, 0, 0])),
+                    &mut memory,
+                    &reporter
+                )
+                .unwrap()
+        ),
+        8
+    );
     assert!(
-        valid_receipt.accepted(),
-        "valid token2 publication accepted"
+        service
+            .inner
+            .state
+            .lock()
+            .entries
+            .get(&token2.continuation)
+            .unwrap()
+            .event
+            .is_some(),
+        "producer queued readiness on the current registration"
     );
     let outcome2 = continuation2
         .resume(ContinuationEvent::Ready, &context)
         .unwrap();
-    assert_eq!(outcome2.completion, ContinuationCompletion::Redispatch);
+    assert!(matches!(
+        outcome2.completion,
+        ContinuationCompletion::FdWait { .. }
+    ));
 }
 
 #[test]

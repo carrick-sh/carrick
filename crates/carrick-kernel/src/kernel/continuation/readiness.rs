@@ -369,7 +369,7 @@ pub enum ReadinessProbe {
         deadline: Option<Instant>,
     },
     BlockingWrite {
-        poll_fd: i32,
+        poll_fd: Option<i32>,
         poll_events: i16,
         write: Arc<Mutex<BlockingWrite>>,
         completion: Arc<Mutex<Option<DispatchOutcome>>>,
@@ -573,7 +573,14 @@ impl ReadinessProbe {
     /// re-examining it on every cycle is the O(live blocked tasks) scan
     /// [`super::wait_service::ReactorWorkSet`] exists to remove.
     pub(crate) const fn contributes_pollfds(&self) -> bool {
-        matches!(self, Self::Fds { .. } | Self::BlockingWrite { .. })
+        matches!(
+            self,
+            Self::Fds { .. }
+                | Self::BlockingWrite {
+                    poll_fd: Some(_),
+                    ..
+                }
+        )
     }
 
     pub(crate) fn from_continuation(continuation: &BlockedContinuation) -> Self {

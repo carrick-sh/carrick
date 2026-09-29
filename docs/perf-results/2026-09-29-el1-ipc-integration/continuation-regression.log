@@ -1,0 +1,110 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 44.05s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 90 tests
+test dispatch::net::epoll_ops::nested_epoll_readiness_tests::nested_epoll_ppoll_continuation_yield_and_wake ... ok
+test dispatch::syslog::tests::syslog_wait_on_fds_readiness_poll_and_continuation ... ok
+test event_ring::tests::hvpatch_blocked_continuation_preserves_syscall_and_family ... ok
+test kernel::continuation::ipc::tests::el1_ipc_continue_rejects_a_stale_address_space_before_copying ... ok
+test kernel::continuation::ipc::tests::el1_ipc_continue_resumes_a_write_without_replay ... ok
+test kernel::continuation::ipc::tests::el1_ipc_exit_cancellation_releases_the_last_pin_and_wakes_the_peer ... ok
+test kernel::continuation::ipc::tests::el1_ipc_partial_progress_signal_returns_the_count ... ok
+test kernel::continuation::ipc::tests::el1_ipc_sigpipe_after_partial_write_completes_exactly_once ... ok
+test kernel::continuation::ipc::tests::el1_ipc_zero_progress_interruption_restarts_or_returns_eintr ... ok
+test kernel::continuation::ipc::tests::serial_host_el1_ipc_runtime_backing_retains_the_kernel_authority ... ok
+test kernel::continuation::tests::a_reactor_cycle_visits_only_its_pollable_registrations ... ok
+test kernel::continuation::tests::cancellation_before_drive_prevents_fresh_host_work ... ok
+test kernel::continuation::tests::cancellation_during_inflight_host_write_competing_with_ready_event_drains_safely ... ok
+test kernel::continuation::tests::cancelled_contended_record_locks_do_not_consume_shared_worker_capacity ... ok
+test kernel::continuation::tests::capture_uses_live_lease_mm_and_independent_asid_authority ... ok
+test kernel::continuation::tests::carrier_wait_service_try_new_succeeds ... ok
+test kernel::continuation::tests::child_wait_enrolled_after_the_exit_edge_still_sees_it ... ok
+test kernel::continuation::tests::continuation_carried_through_unconsumed_lease_resumes_on_next_claim ... ok
+test kernel::continuation::tests::continuation_family_event_codes_are_stable_unique_and_nonzero ... ok
+test kernel::continuation::tests::continuation_publish_ready_racing_child_reap_is_dropped_without_abort ... ok
+test kernel::continuation::tests::control_quantum_preserves_sleep_poll_and_futex_until_real_readiness ... ok
+test kernel::continuation::tests::controller_carrier_wait_service_cancellation_and_retirement ... ok
+test kernel::continuation::tests::controller_in_flight_callback_rejected_on_retired_or_recycled_registration ... ok
+test kernel::continuation::tests::controller_mixed_ppoll_netlink_real_service_wake ... ok
+test kernel::continuation::tests::controller_nested_epoll_5_levels_deep_real_service_wake ... ok
+test kernel::continuation::tests::controller_nested_epoll_real_service_wake ... ok
+test kernel::continuation::tests::deterministic_rendezvous_enrollment_vs_reactor_host_write_interleaving ... ok
+test kernel::continuation::tests::diagnostic_names_the_wait_and_whether_a_producer_can_still_reach_it ... ok
+test kernel::continuation::tests::drain_waker_runs_outside_operation_gate_lock ... ok
+test kernel::continuation::tests::duplicate_ready_and_cancel_after_ready_are_rejected_without_extra_wake ... ok
+test kernel::continuation::tests::enrollment_samples_signal_pending_before_continuation_capture ... ok
+test kernel::continuation::tests::epoll_strict_owner_and_watched_source_authority_have_distinct_resume_results ... ok
+test kernel::continuation::tests::event_after_binding_clear_before_settlement_commit_queues_once ... ok
+test kernel::continuation::tests::event_after_destination_load_before_resume_kicks_exact_generation_once ... ok
+test kernel::continuation::tests::event_before_enrollment_is_durable_and_settles_runnable_once ... ok
+test kernel::continuation::tests::event_during_switching_out_save_is_durable_and_queues_once ... ok
+test kernel::continuation::tests::every_registration_mutation_goes_through_the_indexed_mutators ... ok
+test kernel::continuation::tests::exhaustive_real_dispatch_shapes_become_owned_send_static_continuations ... ok
+test kernel::continuation::tests::failed_initial_submission_retires_exact_runnable_without_queue_row ... ok
+test kernel::continuation::tests::fd_wait_subscription_rejects_close_reuse_before_redispatch ... ok
+test kernel::continuation::tests::futex_readiness_during_control_quantum_wakes_live_continuation ... ok
+test kernel::continuation::tests::futex_wait_ignores_unrelated_task_event_until_generation_changes ... ok
+test kernel::continuation::tests::hvpatch_child_enrollment_requires_a_real_task_event ... ok
+test kernel::continuation::tests::hvpatch_fd_less_wait_authorizes_empty_slot_authority ... ok
+test kernel::continuation::tests::hvpatch_fd_wait_without_explicit_slot_authority_fails_closed ... ok
+test kernel::continuation::tests::hvpatch_resolves_child_selectors_in_kernel_domain ... ok
+test kernel::continuation::tests::hvpatch_synthetic_negative_fd_wait_accepts_slot_authority_and_task_event_wakes ... ok
+test kernel::continuation::tests::idle_256_indefinite_waits_use_one_blocking_poll_without_probe_storm ... ok
+test kernel::continuation::tests::ignored_lower_signal_does_not_hide_next_exact_deliverable_reservation ... ok
+test kernel::continuation::tests::incoming_drain_waker_clone_runs_outside_registration_locks ... ok
+test kernel::continuation::tests::incoming_task_waker_clone_runs_outside_registration_locks ... ok
+test kernel::continuation::tests::indefinite_registration_has_no_synthetic_timeout_or_periodic_probe_deadline ... ok
+test kernel::continuation::tests::kernel_owned_continuation_does_not_form_a_thread_or_kernel_arc_cycle ... ok
+test kernel::continuation::tests::kernel_signal_reservation_is_atomic_across_two_waiters_and_two_instances ... ok
+test kernel::continuation::tests::kernel_signal_reservation_linearizes_disposition_and_mask_changes ... ok
+test kernel::continuation::tests::partial_blocking_write_never_restarts_after_caught_sa_restart_signal ... ok
+test kernel::continuation::tests::readiness_cancellation_race_has_one_registration_winner_and_one_cleanup ... ok
+test kernel::continuation::tests::real_readiness_between_control_queue_and_claim_is_not_lost ... ok
+test kernel::continuation::tests::recheck_registration_race_rejects_late_publication_and_requeues_reserved_signal ... ok
+test kernel::continuation::tests::replaced_drain_waker_drops_outside_registration_locks ... ok
+test kernel::continuation::tests::replaced_task_waker_drops_outside_registration_locks ... ok
+test kernel::continuation::tests::reserved_signal_keeps_exact_action_when_opposite_restart_signal_arrives_before_resume ... ok
+test kernel::continuation::tests::retained_fd_wait_rejects_close_reuse_before_sampling_its_pinned_target ... ok
+test kernel::continuation::tests::same_task_same_mm_revision_drift_reauthorizes_variant_resources ... ok
+test kernel::continuation::tests::select_and_sleep_guest_writes_revalidate_exact_mm_before_any_access ... ok
+test kernel::continuation::tests::serial_host::event_future_cancelled_observation_drains_inflight_operation_safely ... 
+running 1 test
+test kernel::continuation::tests::serial_host::event_future_cancelled_observation_drains_inflight_operation_safely ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2321 filtered out; finished in 5.01s
+
+ok
+test kernel::continuation::tests::serial_host::fd_wait_pins_exact_open_description_until_cleanup_and_rejects_reuse ... ok
+test kernel::continuation::tests::serial_host::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock ... 
+running 1 test
+test kernel::continuation::tests::serial_host::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2321 filtered out; finished in 0.00s
+
+ok
+test kernel::continuation::tests::shared_reactor_drives_write_record_signal_and_vfork_sources ... ok
+test kernel::continuation::tests::shared_reactor_observes_real_fd_and_timer_readiness_without_private_waiters ... ok
+test kernel::continuation::tests::shared_reactor_rechecks_private_futex_and_shared_word_producer_state ... ok
+test kernel::continuation::tests::shared_wait_service_is_bounded_and_blocked_tasks_own_no_executor ... ok
+test kernel::continuation::tests::shared_word_lifetime_and_safety_through_cancellation_retirement ... ok
+test kernel::continuation::tests::signal_readiness_honors_replace_additive_ignore_and_live_restart_action ... ok
+test kernel::continuation::tests::signal_restart_is_derived_from_captured_kernel_action_not_event_input ... ok
+test kernel::continuation::tests::stale_and_reused_token_rejection_prevents_cross_wait_resurrection ... ok
+test kernel::continuation::tests::stale_task_mm_fd_and_registration_generations_never_wake_successors ... ok
+test kernel::continuation::tests::syslog_read_continuation_cancellation_and_retirement ... ok
+test kernel::continuation::tests::syslog_read_continuation_real_fd_event_and_redispatch ... ok
+test kernel::continuation::tests::the_reactor_work_set_answers_exactly_what_a_full_scan_would ... ok
+test kernel::continuation::tests::timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family ... ok
+test kernel::continuation::tests::timerfd_read_continuation_waits_for_dispatcher_arm_then_completes_read ... ok
+test kernel::continuation::tests::timerfd_rearm_wakes_retained_read_before_old_deadline ... ok
+test kernel::continuation::tests::unrelated_waiter_progress_during_concurrent_host_write ... ok
+test kernel::continuation::tests::vfork_parent_owns_exact_parent_child_relationship_and_release_token ... ok
+test kernel::continuation::tests::wait_enrollment_gap::a_producer_edge_is_never_lost_whichever_side_of_enrollment_it_lands ... ok
+test kernel::continuation::tests::wait_enrollment_gap::every_wait_queue_kind_survives_a_wake_in_the_enrollment_gap ... ok
+test kernel::continuation::tests::wait_enrollment_gap::inzone_listener_wakes_from_host_kqueue_and_from_description_queue ... ok
+test kernel::continuation::tests::wait_enrollment_gap::wait_queue_kind_enumeration_is_exhaustive ... ok
+test kernel::scheduler::tests::control_wake_during_guest_retry_does_not_invent_a_blocked_continuation ... ok
+
+test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 2232 filtered out; finished in 5.47s
+

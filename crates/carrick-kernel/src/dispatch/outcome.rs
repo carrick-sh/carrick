@@ -60,6 +60,15 @@ impl Eq for PinnedHostFd {}
 pub enum BlockingWriteTarget {
     Host(Arc<PinnedHostFd>),
     InMemoryPipe(Arc<crate::dispatch::fs::pipe::PipeWriteEndpointLease>),
+    EventFd(Arc<EventFdWriteLease>),
+}
+
+/// Captured value and functional description lifetime for a parked eventfd write.
+#[derive(Debug)]
+pub struct EventFdWriteLease {
+    state: Arc<super::fd_table::EventFdState>,
+    _description: crate::kernel::objects::FileDescriptionFdLease,
+    value: u64,
 }
 
 impl PartialEq for BlockingWriteTarget {
@@ -67,6 +76,7 @@ impl PartialEq for BlockingWriteTarget {
         match (self, other) {
             (Self::Host(left), Self::Host(right)) => left == right,
             (Self::InMemoryPipe(left), Self::InMemoryPipe(right)) => Arc::ptr_eq(left, right),
+            (Self::EventFd(left), Self::EventFd(right)) => Arc::ptr_eq(left, right),
             _ => false,
         }
     }
@@ -106,10 +116,11 @@ impl BlockingWrite {
         })
     }
 
-    pub fn poll_fd(&self) -> i32 {
+    pub fn poll_fd(&self) -> Option<i32> {
         match &self.target {
-            BlockingWriteTarget::Host(host_fd) => host_fd.as_raw_fd(),
-            BlockingWriteTarget::InMemoryPipe(endpoint) => endpoint.readiness_fd().raw(),
+            BlockingWriteTarget::Host(host_fd) => Some(host_fd.as_raw_fd()),
+            BlockingWriteTarget::InMemoryPipe(endpoint) => Some(endpoint.readiness_fd().raw()),
+            BlockingWriteTarget::EventFd(_) => None,
         }
     }
 
@@ -117,6 +128,34 @@ impl BlockingWrite {
         match &self.target {
             BlockingWriteTarget::Host(_) => libc::POLLOUT,
             BlockingWriteTarget::InMemoryPipe(_) => libc::POLLIN,
+            BlockingWriteTarget::EventFd(_) => 0,
+        }
+    }
+
+    pub fn wait_queue(&self) -> Option<Arc<crate::kernel::WaitQueue>> {
+        match &self.target {
+            BlockingWriteTarget::EventFd(endpoint) => Some(Arc::clone(&endpoint.state.wait_queue)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn eventfd(
+        state: Arc<super::fd_table::EventFdState>,
+        description: crate::kernel::objects::FileDescriptionFdLease,
+        value: u64,
+        tid: crate::thread::ThreadId,
+    ) -> Self {
+        Self {
+            target: BlockingWriteTarget::EventFd(Arc::new(EventFdWriteLease {
+                state,
+                _description: description,
+                value,
+            })),
+            bytes: Vec::new(),
+            offset: 0,
+            committed_prefix: 0,
+            tid,
+            sigpipe_on_epipe: false,
         }
     }
 
@@ -252,6 +291,19 @@ pub fn drive_blocking_write(
         BlockingWriteTarget::InMemoryPipe(endpoint) => {
             drive_in_memory_pipe_write(write, &endpoint, host_signal)
         }
+        BlockingWriteTarget::EventFd(endpoint) => {
+            if write.offset == 8 {
+                return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(8));
+            }
+            match endpoint.state.write_value(endpoint.value) {
+                Ok(()) => {
+                    write.offset = 8;
+                    BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(8))
+                }
+                Err(LINUX_EAGAIN) => BlockingWriteStep::Wait,
+                Err(errno) => BlockingWriteStep::Done(DispatchOutcome::errno(errno)),
+            }
+        }
     }
 }
 
@@ -319,26 +371,18 @@ fn drive_in_memory_pipe_write(
     }
 
     let pipe = endpoint.pipe();
-    let mut state = pipe.state.lock();
-    if state.readers == 0 {
-        return if write.offset() == 0 {
-            BlockingWriteStep::Done(DispatchOutcome::errno(carrick_abi::LINUX_EPIPE))
-        } else {
-            BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()))
-        };
-    }
-    let available = state.capacity.saturating_sub(state.buffer.len());
-    if available == 0 {
-        return BlockingWriteStep::Wait;
-    }
-    let chunk = (write.bytes.len() - write.offset).min(available);
-    state
-        .buffer
-        .extend(&write.bytes[write.offset..write.offset + chunk]);
+    let chunk = match pipe.write_bytes(&write.bytes[write.offset..]) {
+        Ok(chunk) => chunk,
+        Err(carrick_abi::LINUX_EAGAIN) => return BlockingWriteStep::Wait,
+        Err(errno) => {
+            return BlockingWriteStep::Done(if write.offset() == 0 {
+                DispatchOutcome::errno(errno)
+            } else {
+                DispatchOutcome::returned_len_or_errno(write.offset())
+            });
+        }
+    };
     write.offset += chunk;
-    pipe.update_readiness_locked(&state);
-    drop(state);
-    pipe.changed.notify_all();
     endpoint.publish_progress(chunk);
     if write.offset >= write.bytes.len() {
         BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(

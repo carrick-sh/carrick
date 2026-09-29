@@ -561,11 +561,14 @@ fn probe_diagnostic(probe: &ReadinessProbe) -> (String, Vec<DiagnosticPollFd>) {
             poll_events,
             ..
         } => (
-            format!("blocking-write fd={poll_fd} events={poll_events:#x}"),
-            vec![DiagnosticPollFd {
-                fd: *poll_fd,
-                events: *poll_events,
-            }],
+            format!("blocking-write fd={poll_fd:?} events={poll_events:#x}"),
+            poll_fd
+                .iter()
+                .map(|fd| DiagnosticPollFd {
+                    fd: *fd,
+                    events: *poll_events,
+                })
+                .collect(),
         ),
         ReadinessProbe::TimerFdRead { .. } => ("timerfd-read".to_owned(), Vec::new()),
         ReadinessProbe::Semop { .. } => ("sysv-semop".to_owned(), Vec::new()),
@@ -1733,7 +1736,7 @@ impl BlockedContinuation {
             }
             ContinuationDetail::BlockingWrite(write) => {
                 let write = write.lock();
-                fingerprint ^= write.poll_fd() as u64 ^ write.offset() as u64;
+                fingerprint ^= write.poll_fd().map_or(0, |fd| fd as u64) ^ write.offset() as u64;
             }
             ContinuationDetail::BlockingOpen(open) => {
                 fingerprint ^= Arc::as_ptr(open) as usize as u64;
@@ -2044,13 +2047,14 @@ impl BlockedContinuation {
                         ContinuationCompletion::Return(index)
                     }
                     ContinuationFamily::BlockingWrite => {
-                        let offset = match &self.state().detail {
-                            ContinuationDetail::BlockingWrite(write) => {
-                                write.lock().offset() as i64
-                            }
-                            _ => 0,
+                        let write = match &self.state().detail {
+                            ContinuationDetail::BlockingWrite(write) => write.lock().clone(),
+                            _ => return Err(ContinuationResumeError::MissingContinuation),
                         };
-                        ContinuationCompletion::RedispatchWithPartial(offset)
+                        ContinuationCompletion::BlockingWrite {
+                            write,
+                            outcome: BlockingWriteOutcome::Resume,
+                        }
                     }
                     ContinuationFamily::BlockingOpen => {
                         let open = match &self.state().detail {
@@ -2426,6 +2430,7 @@ pub enum ContinuationCompletion {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockingWriteOutcome {
+    Resume,
     Return(i64),
     Errno(LinuxErrno),
 }
@@ -2541,8 +2546,17 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
             }
             Some(DispatchOutcome::Errno { errno })
         }
-        ContinuationCompletion::BlockingWrite { write, outcome } => {
+        ContinuationCompletion::BlockingWrite { mut write, outcome } => {
             let outcome = match outcome {
+                BlockingWriteOutcome::Resume => match crate::dispatch::drive_blocking_write(
+                    &mut write,
+                    &*dispatcher.host_signal,
+                ) {
+                    crate::dispatch::BlockingWriteStep::Done(outcome) => outcome,
+                    crate::dispatch::BlockingWriteStep::Wait => {
+                        return Ok(Some(DispatchOutcome::BlockingWrite(write)));
+                    }
+                },
                 BlockingWriteOutcome::Return(value) => DispatchOutcome::Returned { value },
                 BlockingWriteOutcome::Errno(errno) => DispatchOutcome::Errno { errno },
             };

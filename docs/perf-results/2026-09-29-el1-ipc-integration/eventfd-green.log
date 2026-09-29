@@ -1,0 +1,9 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.41s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 1 test
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2319 filtered out; finished in 0.02s
+
