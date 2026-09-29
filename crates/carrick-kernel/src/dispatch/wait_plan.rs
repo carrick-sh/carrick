@@ -467,11 +467,6 @@ mod tests {
                 crate::dispatch::fs::pipe::next_pipe_id(),
                 crate::dispatch::fs::pipe::DEFAULT_PIPE_CAPACITY,
             ));
-        {
-            let mut state = pipe.state.lock();
-            state.readers = 1;
-            state.writers = 1;
-        }
         let fd = install(
             &dispatcher,
             OpenDescription::PipeReader {
@@ -491,7 +486,7 @@ mod tests {
 
         // Bytes arrive BEHIND the readiness pipe's back: the host edge has not
         // fired, so the latched source reports nothing.
-        pipe.state.lock().buffer.extend(b"gap".iter().copied());
+        pipe.guest_write_for_test(b"gap");
         assert_eq!(
             revents_of(&assemble(&dispatcher, &request, true)),
             [LinuxPollEvents::empty()],
@@ -499,10 +494,7 @@ mod tests {
         );
 
         // The pipe publishes the level, which is what a real write does.
-        {
-            let state = pipe.state.lock();
-            pipe.update_readiness_locked(&state);
-        }
+        pipe.update_readiness();
         let assembly = assemble(&dispatcher, &request, true);
         assert!(matches!(assembly, WaitAssembly::Ready { .. }));
         assert_eq!(revents_of(&assembly), [LinuxPollEvents::IN]);

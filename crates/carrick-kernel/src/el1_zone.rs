@@ -28,6 +28,81 @@ use carrick_el1_abi::{
 /// which its executor always resumes to completion.
 pub struct HostLockWait;
 
+/// Effects collected while an IPC object and its waiter queue are locked.
+/// Storage is uninitialized until a waiter is affected: no population scan,
+/// per-transfer heap allocation, or delivery while shared locks are held.
+pub(crate) struct ObjectWakeDelivery {
+    handed: [std::mem::MaybeUninit<RecordRef>; carrick_sched_core::ZONE_RECORDS],
+    len: usize,
+    slots: [u64; carrick_el1_abi::ZONE_SLOTS / 64],
+}
+impl ObjectWakeDelivery {
+    pub(crate) fn new() -> Self {
+        Self {
+            handed: [const { std::mem::MaybeUninit::uninit() }; carrick_sched_core::ZONE_RECORDS],
+            len: 0,
+            slots: [0; carrick_el1_abi::ZONE_SLOTS / 64],
+        }
+    }
+    pub(crate) fn collect(&mut self, wake: carrick_el1_abi::ipc::IpcWake) {
+        let Some(zone) = zone() else {
+            return;
+        };
+        for (active, direction) in [
+            (wake.readers, carrick_el1_abi::ipc::pipe::WaitFor::Readable),
+            (wake.writers, carrick_el1_abi::ipc::pipe::WaitFor::Writable),
+        ] {
+            if !active {
+                continue;
+            }
+            let Some(key) = carrick_el1_abi::ipc::object_wait_key(wake.object, direction) else {
+                continue;
+            };
+            let Ok(queue) = zone.object_wait(key, &HostLockWait) else {
+                continue;
+            };
+            let Self { handed, len, slots } = self;
+            queue
+                .notify_object_host(
+                    &mut |record| {
+                        let Some(slot) = handed.get_mut(*len) else {
+                            carrick_fatal::carrick_fatal!(
+                                "ipc::wake",
+                                "duplicate object waiter delivery"
+                            );
+                        };
+                        slot.write(zone.record_ref(record));
+                        *len += 1;
+                    },
+                    &mut |placed| {
+                        if placed.resched {
+                            let index = usize::from(placed.slot.raw());
+                            slots[index / 64] |= 1 << (index % 64);
+                        }
+                    },
+                )
+                .unwrap_or_else(|_| {
+                    carrick_fatal::carrick_fatal!("ipc::wake", "object wake ownership failed")
+                });
+        }
+    }
+    pub(crate) fn deliver(self) {
+        for record in &self.handed[..self.len] {
+            // SAFETY: collect initialized precisely this prefix.
+            publish_handback(unsafe { record.assume_init() });
+        }
+        for (word, mut bits) in self.slots.into_iter().enumerate() {
+            while bits != 0 {
+                let index = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(slot) = SlotId::from_index(index) {
+                    resched_slot(slot);
+                }
+            }
+        }
+    }
+}
+
 impl LockWait for HostLockWait {
     fn wait(&self, attempt: u32) -> bool {
         if attempt < 128 {

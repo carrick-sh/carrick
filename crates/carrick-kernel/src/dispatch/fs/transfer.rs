@@ -312,8 +312,8 @@ impl<'a> FsView<'a> {
         let open = open_file.description.inspect()?;
         match &*open {
             OpenDescription::PipeWriter { pipe, .. } => {
-                let state = pipe.state.lock();
-                Some(state.capacity.saturating_sub(state.buffer.len()))
+                let state = pipe.snapshot();
+                Some(state.capacity.saturating_sub(state.unread))
             }
             OpenDescription::HostPipe {
                 base,
@@ -382,7 +382,7 @@ impl<'a> FsView<'a> {
     /// ([`Self::write_output_fd_partial`]): a pipe or socket that fills
     /// mid-transfer yields a short count, never a park until every byte lands.
     /// Every caller either re-stages the undelivered tail
-    /// ([`Self::restore_splice_pipe_bytes`], [`Self::restore_pipe_bytes`]) or
+    /// ([`Self::restore_splice_pipe_bytes`], the shared-source read transaction) or
     /// never consumed it (`vmsplice` gathers from guest memory), so a short
     /// count loses nothing.
     fn splice_write_out<M: CurrentMmMemory>(
@@ -577,9 +577,6 @@ impl<'a> FsView<'a> {
     /// in-memory pipe, the [`Self::restore_splice_pipe_bytes`] twin for the
     /// legacy `PipeReader` source. A short destination write must leave the
     /// source byte stream exactly as it found it minus what was delivered.
-    fn restore_pipe_bytes(pipe: &PipeRef, bytes: &[u8]) {
-        pipe::restore_pipe_bytes(pipe, bytes);
-    }
 
     /// The destination's readiness park for a blocking `splice`/`vmsplice`
     /// whose output could not take a single byte. Nothing has been consumed
@@ -1138,6 +1135,23 @@ impl<'a> FsView<'a> {
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(DispatchOutcome::errno(errno));
                 }
+                if let Some((destination, _)) = this.pipe_writer(out_fd.0) {
+                    use pipe::InMemoryTeeOutcome as Transfer;
+                    let outcome = match pipe::transfer_in_memory_pipes(&pipe, &destination, count, true) {
+                        Transfer::Transferred(n) => DispatchOutcome::returned_len_or_errno(n),
+                        Transfer::SamePipe => DispatchOutcome::errno(LINUX_EINVAL),
+                        Transfer::BrokenPipe => DispatchOutcome::errno(LINUX_EPIPE),
+                        Transfer::Eof => DispatchOutcome::Returned { value: 0 },
+                        Transfer::SourceWouldBlock => {
+                            if splice_flags.contains(LinuxSpliceFlags::NONBLOCK) || status_flags & LINUX_O_NONBLOCK != 0 {
+                                DispatchOutcome::errno(LINUX_EAGAIN)
+                            } else { wait_for_pipe_readable(&pipe, WaitFdAuthority::logical(
+                                this.captured_slot_authority(in_fd.0).ok_or(LINUX_EBADF)?)) }
+                        }
+                        Transfer::DestWouldBlock => this.splice_output_would_block(out_fd.0, out_nonblocking),
+                    };
+                    return Ok(complete_wait(outcome));
+                }
                 let bytes = match take_pipe_bytes(&pipe, count) {
                     PipeDrain::Bytes(bytes) => bytes,
                     PipeDrain::Eof => return Ok(DispatchOutcome::Returned { value: 0 }),
@@ -1158,13 +1172,11 @@ impl<'a> FsView<'a> {
                 };
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid, out_nonblocking);
                 let DispatchOutcome::Returned { value } = outcome else {
-                    Self::restore_pipe_bytes(&pipe, &bytes);
+                    drop(bytes);
                     return Ok(complete_wait(outcome));
                 };
                 let written = usize::try_from(value).unwrap_or(0).min(bytes.len());
-                if written < bytes.len() {
-                    Self::restore_pipe_bytes(&pipe, &bytes[written..]);
-                }
+                bytes.commit(written);
                 return Ok(DispatchOutcome::returned_len_or_errno(written));
             }
 
@@ -1785,10 +1797,13 @@ impl<'a> FsView<'a> {
                             .write_bytes(v.iov_base, &bytes[off..off + len])
                             .is_err()
                         {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                            bytes.commit(off);
+                            return Ok(if off == 0 { DispatchOutcome::errno(LINUX_EFAULT) }
+                                else { DispatchOutcome::returned_len_or_errno(off) });
                         }
                         off += len;
                     }
+                    bytes.commit(off);
                     Ok(DispatchOutcome::returned_len_or_errno(off))
                 }
             }

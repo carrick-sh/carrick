@@ -20,6 +20,7 @@ use crate::dispatch::fd_table::{HostFdRef, make_readiness_pipe};
 pub struct WaitEnrollment {
     token: u64,
     queue: Weak<WaitQueueInner>,
+    _subscription: Option<Box<dyn std::fmt::Debug + Send + Sync>>,
 }
 
 impl WaitEnrollment {
@@ -45,6 +46,7 @@ impl Drop for WaitEnrollment {
 pub struct WaitCallbackEnrollment {
     token: u64,
     queue: Weak<WaitQueueInner>,
+    _subscription: Option<Box<dyn std::fmt::Debug + Send + Sync>>,
 }
 
 impl WaitCallbackEnrollment {
@@ -65,11 +67,15 @@ impl Drop for WaitCallbackEnrollment {
 
 pub type WaitCallback = Arc<dyn Fn(usize) + Send + Sync + 'static>;
 
+type WaitSubscriptionFactory =
+    Arc<dyn Fn() -> Option<Box<dyn std::fmt::Debug + Send + Sync>> + Send + Sync>;
+
 #[derive(Default)]
 struct WaitQueueInner {
     waiters: Mutex<BTreeMap<u64, Weak<WaitSetInner>>>,
     callbacks: Mutex<BTreeMap<u64, WaitCallback>>,
     next_token: AtomicU64,
+    subscription: Option<WaitSubscriptionFactory>,
 }
 
 impl std::fmt::Debug for WaitQueueInner {
@@ -104,6 +110,22 @@ impl WaitQueue {
                 waiters: Mutex::new(BTreeMap::new()),
                 callbacks: Mutex::new(BTreeMap::new()),
                 next_token: AtomicU64::new(1),
+                subscription: None,
+            }),
+        }
+    }
+
+    /// Object-specific admission lease, retained exactly for each enrollment.
+    /// Ordinary queues have no hook and retain their existing behavior.
+    pub(crate) fn with_subscription(
+        subscribe: impl Fn() -> Option<Box<dyn std::fmt::Debug + Send + Sync>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::new(WaitQueueInner {
+                waiters: Mutex::new(BTreeMap::new()),
+                callbacks: Mutex::new(BTreeMap::new()),
+                next_token: AtomicU64::new(1),
+                subscription: Some(Arc::new(subscribe)),
             }),
         }
     }
@@ -111,12 +133,18 @@ impl WaitQueue {
     /// Enroll a waiter with this wait queue.
     /// Returns an RAII [`WaitEnrollment`]. Dropping the enrollment unregisters the waiter.
     pub fn enroll(&self, wait_set: &WaitSet) -> WaitEnrollment {
+        let subscription = self
+            .inner
+            .subscription
+            .as_ref()
+            .and_then(|subscribe| subscribe());
         let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
         let mut waiters = self.inner.waiters.lock();
         waiters.insert(token, Arc::downgrade(&wait_set.inner));
         WaitEnrollment {
             token,
             queue: Arc::downgrade(&self.inner),
+            _subscription: subscription,
         }
     }
 
@@ -126,12 +154,18 @@ impl WaitQueue {
         &self,
         callback: impl Fn(usize) + Send + Sync + 'static,
     ) -> WaitCallbackEnrollment {
+        let subscription = self
+            .inner
+            .subscription
+            .as_ref()
+            .and_then(|subscribe| subscribe());
         let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
         let mut callbacks = self.inner.callbacks.lock();
         callbacks.insert(token, Arc::new(callback));
         WaitCallbackEnrollment {
             token,
             queue: Arc::downgrade(&self.inner),
+            _subscription: subscription,
         }
     }
 

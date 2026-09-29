@@ -319,26 +319,18 @@ fn drive_in_memory_pipe_write(
     }
 
     let pipe = endpoint.pipe();
-    let mut state = pipe.state.lock();
-    if state.readers == 0 {
-        return if write.offset() == 0 {
-            BlockingWriteStep::Done(DispatchOutcome::errno(carrick_abi::LINUX_EPIPE))
-        } else {
-            BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()))
-        };
-    }
-    let available = state.capacity.saturating_sub(state.buffer.len());
-    if available == 0 {
-        return BlockingWriteStep::Wait;
-    }
-    let chunk = (write.bytes.len() - write.offset).min(available);
-    state
-        .buffer
-        .extend(&write.bytes[write.offset..write.offset + chunk]);
+    let chunk = match pipe.write_bytes(&write.bytes[write.offset..]) {
+        Ok(chunk) => chunk,
+        Err(carrick_abi::LINUX_EAGAIN) => return BlockingWriteStep::Wait,
+        Err(errno) => {
+            return BlockingWriteStep::Done(if write.offset() == 0 {
+                DispatchOutcome::errno(errno)
+            } else {
+                DispatchOutcome::returned_len_or_errno(write.offset())
+            });
+        }
+    };
     write.offset += chunk;
-    pipe.update_readiness_locked(&state);
-    drop(state);
-    pipe.changed.notify_all();
     endpoint.publish_progress(chunk);
     if write.offset >= write.bytes.len() {
         BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
