@@ -325,3 +325,207 @@ fn structural_copy_work_is_linear_and_storage_is_never_replaced() {
         }
     }
 }
+
+// ---- contract kernel.el1.ipc-object-state (VM-free bindings) ----
+
+fn shared_view<'a>(
+    record: &'a mut PipeRecord,
+    bytes: &'a mut [u8],
+    slots: &'a mut [Page],
+) -> Pipe<'a, &'a mut PipeRecord> {
+    Pipe::attach(record, bytes, slots).unwrap()
+}
+
+#[test]
+fn el1_ipc_shared_record_view_runs_the_same_algorithm() {
+    // The owned pipe and a view over a record kept outside the view (as in
+    // shared memory, reattached for every operation) agree byte for byte.
+    let mut owned_bytes = [0; PIPE_BUF * 4];
+    let mut owned_slots = [Page::default(); 4];
+    let mut owned =
+        Pipe::with_capacity(&mut owned_bytes, &mut owned_slots, PIPE_BUF, PIPE_BUF * 4).unwrap();
+    let mut bytes = [0; PIPE_BUF * 4];
+    let mut slots = [Page::default(); 4];
+    let mut record = PipeRecord::default();
+    Pipe::init(&mut record, &mut bytes, &mut slots, PIPE_BUF, PIPE_BUF * 4).unwrap();
+    let mut seed = 7u64;
+    for _ in 0..4000 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let n = (seed as usize >> 8) % (PIPE_BUF * 2) + 1;
+        let mut view = shared_view(&mut record, &mut bytes, &mut slots);
+        if seed & 1 == 0 {
+            let input = std::vec![(seed >> 32) as u8; n];
+            assert_eq!(view.try_write(&input), owned.try_write(&input));
+        } else {
+            let (mut a, mut b) = (std::vec![0; n], std::vec![0; n]);
+            assert_eq!(view.try_read(&mut a), owned.try_read(&mut b));
+            assert_eq!(a, b);
+        }
+        assert_eq!(view.unread_bytes(), owned.unread_bytes());
+        assert_eq!(view.readiness(End::Writer), owned.readiness(End::Writer));
+    }
+}
+
+#[test]
+fn el1_ipc_attach_rejects_records_that_do_not_describe_the_storage() {
+    let mut bytes = [0; PIPE_BUF * 2];
+    let mut slots = [Page::default(); 2];
+    let mut zero = PipeRecord::default();
+    assert!(matches!(
+        Pipe::attach(&mut zero, &mut bytes, &mut slots),
+        Err(Error::Corrupt)
+    ));
+    let good = PipeRecord::new(PIPE_BUF * 2, 2, PIPE_BUF, PIPE_BUF * 2).unwrap();
+    for bad in [
+        PipeRecord {
+            capacity_pages: 4,
+            ..good
+        },
+        PipeRecord { head: 2, ..good },
+        PipeRecord { used: 3, ..good },
+        PipeRecord {
+            unread: 1,
+            used: 0,
+            ..good
+        },
+        PipeRecord {
+            page_size: 4097,
+            ..good
+        },
+    ] {
+        let mut r = bad;
+        assert!(matches!(
+            Pipe::attach(&mut r, &mut bytes, &mut slots),
+            Err(Error::Corrupt)
+        ));
+    }
+    let mut r = good;
+    assert!(Pipe::attach(&mut r, &mut bytes, &mut slots).is_ok());
+}
+
+#[test]
+fn el1_ipc_atomic_writes_through_shared_record() {
+    let mut bytes = [0; PIPE_BUF];
+    let mut slots = [Page::default(); 1];
+    let mut record = PipeRecord::default();
+    for n in 1..=PIPE_BUF {
+        for spare in [0, n - 1, n, PIPE_BUF] {
+            Pipe::init(&mut record, &mut bytes, &mut slots, PIPE_BUF, PIPE_BUF).unwrap();
+            let mut p = shared_view(&mut record, &mut bytes, &mut slots);
+            p.try_write(&[1; PIPE_BUF][..PIPE_BUF - spare]);
+            let before = p.unread_bytes();
+            let mut fills = 0;
+            let step = p.write_with(n, |_, dst| {
+                fills += 1;
+                dst.fill(2);
+                dst.len()
+            });
+            if spare < n {
+                assert_eq!(step.result, Err(Error::WouldBlock(WaitFor::Writable)));
+                assert_eq!(fills, 0, "no byte of a refused atomic write is staged");
+                assert_eq!(p.unread_bytes(), before);
+            } else {
+                assert_eq!(step.result, Ok(n));
+                assert_eq!(fills, 1, "an atomic write lands in one chunk");
+            }
+        }
+    }
+}
+
+#[test]
+fn el1_ipc_staged_read_fault_preserves_undelivered_bytes() {
+    let mut bytes = [0; PIPE_BUF * 4];
+    let mut slots = [Page::default(); 4];
+    let mut p = Pipe::with_capacity(&mut bytes, &mut slots, PIPE_BUF, PIPE_BUF * 4).unwrap();
+    let input: std::vec::Vec<u8> = (0..PIPE_BUF * 2 + 10).map(|n| (n % 253) as u8).collect();
+    assert_eq!(p.try_write(&input).result, Ok(input.len()));
+    // Fault before the first byte: nothing consumed, no wake.
+    let step = p.read_with(100, |_| 0);
+    assert_eq!(step.result, Err(Error::Fault));
+    assert_eq!(step.wake, WakeSet::default());
+    assert_eq!(p.unread_bytes(), input.len());
+    // Fault after a delivered prefix spanning a page boundary.
+    let mut out = std::vec::Vec::new();
+    let step = p.read_with(PIPE_BUF * 2, |chunk| {
+        let take = if out.is_empty() { chunk.len() } else { 5 };
+        out.extend_from_slice(&chunk[..take]);
+        take
+    });
+    assert_eq!(step.result, Ok(PIPE_BUF + 5));
+    assert!(step.wake.writers);
+    assert_eq!(p.unread_bytes(), input.len() - PIPE_BUF - 5);
+    let mut rest = std::vec![0; input.len()];
+    let n = p.try_read(&mut rest).result.unwrap();
+    out.extend_from_slice(&rest[..n]);
+    assert_eq!(out, input, "no byte lost or duplicated across the fault");
+}
+
+#[test]
+fn el1_ipc_staged_write_fault_publishes_only_the_filled_prefix() {
+    let mut bytes = [0; PIPE_BUF * 4];
+    let mut slots = [Page::default(); 4];
+    let mut p = Pipe::with_capacity(&mut bytes, &mut slots, PIPE_BUF, PIPE_BUF * 4).unwrap();
+    assert_eq!(p.write_with(10, |_, _| 0).result, Err(Error::Fault));
+    assert_eq!(p.unread_bytes(), 0);
+    assert_eq!(p.readiness(End::Reader), Readiness::default());
+    // Large write faults 7 bytes into its second page.
+    let source: std::vec::Vec<u8> = (0..PIPE_BUF * 3).map(|n| (n % 241) as u8).collect();
+    let mut progress = WriteProgress::new(source.len() as u64);
+    let step = p.write_progress(&mut progress, |at, dst| {
+        let n = if at == 0 { dst.len() } else { 7 };
+        dst[..n].copy_from_slice(&source[at..at + n]);
+        n
+    });
+    assert_eq!(step.result, Ok(PIPE_BUF + 7));
+    assert_eq!(progress.written, (PIPE_BUF + 7) as u64);
+    // Resume from the recorded offset, never from zero.
+    let step = p.write_progress(&mut progress, |at, dst| {
+        dst.copy_from_slice(&source[at..at + dst.len()]);
+        dst.len()
+    });
+    assert!(step.result.is_ok());
+    assert!(progress.is_complete());
+    let mut out = std::vec![0; source.len()];
+    assert_eq!(p.try_read(&mut out).result, Ok(source.len()));
+    assert_eq!(out, source);
+}
+
+#[test]
+fn el1_ipc_eventfd_drain_semaphore_overflow_and_fault() {
+    // In place, as the shared record: all-zero is a zero counter.
+    let mut e = EventFd::new(0, EventMode::Counter);
+    assert_eq!(e.try_write(5).result, Ok(()));
+    assert_eq!(e.read_with(|_| false).result, Err(Error::Fault));
+    assert_eq!(e.value(), 5, "a failed copyout drains nothing");
+    assert_eq!(e.read_with(|v| v == 5).result, Ok(5));
+    let mut s = EventFd::new(3, EventMode::Semaphore);
+    assert_eq!(s.try_read().result, Ok(1));
+    assert_eq!(s.value(), 2);
+    assert_eq!(s.try_write(EVENTFD_MAX - 2).result, Ok(()));
+    assert_eq!(
+        s.try_write(1).result,
+        Err(Error::WouldBlock(WaitFor::Writable))
+    );
+    assert_eq!(s.try_write(u64::MAX).result, Err(Error::Invalid));
+    assert_eq!(s.value(), EVENTFD_MAX);
+    assert_eq!(core::mem::size_of::<EventFd>(), 16);
+}
+
+#[test]
+fn el1_ipc_copy_work_is_linear_in_delivered_bytes() {
+    for n in [1, 4096, 16384] {
+        let mut record = PipeRecord::default();
+        let mut bytes = [0; PIPE_BUF * 16];
+        let mut slots = [Page::default(); 16];
+        Pipe::init(&mut record, &mut bytes, &mut slots, PIPE_BUF, PIPE_BUF * 16).unwrap();
+        let input = [9; PIPE_BUF * 4];
+        let mut output = [0; PIPE_BUF * 4];
+        for round in 0..64 {
+            let mut p = shared_view(&mut record, &mut bytes, &mut slots);
+            assert_eq!(p.try_write(&input[..n]).result, Ok(n));
+            assert_eq!(p.try_read(&mut output[..n]).result, Ok(n));
+            assert_eq!(p.work.copied, n * 2, "round {round}");
+            assert!(p.work.visits <= 2 * n.div_ceil(PIPE_BUF) + 2);
+        }
+    }
+}
