@@ -1982,18 +1982,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:2959 in `fill_random_bytes`, `std::fs::File::open` accesses only the fixed host entropy source used for guest stack randomization used by `fill_random_bytes`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:2960 in `fill_random_bytes`, `std::fs::File::open` accesses only the fixed host entropy source used for guest stack randomization used by `fill_random_bytes`.",
     "review_id": "HA-000090",
     "source": {
-      "byte_end": 128194,
-      "byte_start": 128180,
+      "byte_end": 128344,
+      "byte_start": 128330,
       "column": 20,
       "column_end": 34,
       "column_start": 20,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 2959,
-      "line_end": 2959,
-      "line_start": 2959
+      "line": 2960,
+      "line_end": 2960,
+      "line_start": 2960
     }
   },
   {
@@ -5420,18 +5420,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:1411 in `load_elf_for`, `std::fs::read` accesses only the selected guest executable image used by `load_elf_for`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:1413 in `load_elf_for`, `std::fs::read` accesses only the selected guest executable image used by `load_elf_for`.",
     "review_id": "HA-000227",
     "source": {
-      "byte_end": 68367,
-      "byte_start": 68359,
+      "byte_end": 68518,
+      "byte_start": 68510,
       "column": 20,
       "column_end": 28,
       "column_start": 20,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 1411,
-      "line_end": 1411,
-      "line_start": 1411
+      "line": 1413,
+      "line_end": 1413,
+      "line_start": 1413
     }
   },
   {
@@ -5448,18 +5448,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:1413 in `load_elf_for`, `std::fs::read` accesses only the selected guest interpreter image used by `load_elf_for`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:1415 in `load_elf_for`, `std::fs::read` accesses only the selected guest interpreter image used by `load_elf_for`.",
     "review_id": "HA-000228",
     "source": {
-      "byte_end": 68476,
-      "byte_start": 68468,
+      "byte_end": 68627,
+      "byte_start": 68619,
       "column": 81,
       "column_end": 89,
       "column_start": 81,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 1413,
-      "line_end": 1413,
-      "line_start": 1413
+      "line": 1415,
+      "line_end": 1415,
+      "line_start": 1415
     }
   },
   {
