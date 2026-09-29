@@ -27,6 +27,8 @@ pub(crate) const PROGRAM_SHA256_PLACEHOLDER: &str =
     "/* CARRICK_HVPCARRIERCPUATTR_PROGRAM_SHA256 */";
 
 /// Render the bundled template's immutable digest into the raw-stream header.
+pub(crate) const MAX_INSTRUMENTATION_SHARE: f64 = 0.05;
+
 pub(crate) fn render_profile_script(template: &str) -> Result<String> {
     let slots = template.match_indices(PROGRAM_SHA256_PLACEHOLDER).count();
     if slots != 1 {
@@ -77,10 +79,11 @@ pub(crate) enum CpuCategory {
     El1Mailbox,
     ExecutorScheduling,
     LockWait,
+    Instrumentation,
     Other,
 }
 
-/// Find the carrick executable on the host to symbolize stack frames via `atos`.
+/// Find the carrick executable on the host to symbolize stack frames in-process.
 pub(crate) fn find_carrick_binary() -> Option<PathBuf> {
     if let Ok(var) = std::env::var("CARRICK_BIN").or_else(|_| std::env::var("CARRICK_BINARY")) {
         let p = PathBuf::from(var);
@@ -93,12 +96,26 @@ pub(crate) fn find_carrick_binary() -> Option<PathBuf> {
         if exe.file_name().and_then(|s| s.to_str()) == Some("carrick") && exe.exists() {
             return Some(exe);
         }
-        if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
-            for sub in ["release/carrick", "debug/carrick", "carrick"] {
-                let candidate = target_dir.join(sub);
-                if candidate.exists() {
-                    return Some(candidate);
-                }
+        let mut search_dirs = Vec::new();
+        let mut curr = exe.parent();
+        while let Some(dir) = curr {
+            search_dirs.push(dir.to_path_buf());
+            curr = dir.parent();
+        }
+        for dir in &search_dirs {
+            let rel = dir.join("release/carrick");
+            if rel.exists() {
+                return Some(rel);
+            }
+        }
+        for dir in &search_dirs {
+            let deb = dir.join("debug/carrick");
+            if deb.exists() {
+                return Some(deb);
+            }
+            let direct = dir.join("carrick");
+            if direct.is_file() && direct.exists() {
+                return Some(direct);
             }
         }
     }
@@ -129,7 +146,127 @@ pub(crate) fn find_carrick_binary() -> Option<PathBuf> {
     None
 }
 
-/// Offline symbol resolution of hex addresses using macOS `/usr/bin/atos`.
+/// In-process Mach-O and ELF symbol table parser.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SymbolTable {
+    symbols: Vec<(u64, String)>,
+    text_vmaddr: u64,
+}
+
+impl SymbolTable {
+    pub(crate) fn from_binary(path: &Path) -> Result<Self> {
+        let buffer =
+            fs::read(path).with_context(|| format!("read binary at {}", path.display()))?;
+        Self::parse(&buffer)
+    }
+
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
+        match goblin::mach::Mach::parse(bytes) {
+            Ok(goblin::mach::Mach::Binary(macho)) => Self::from_macho(&macho),
+            Ok(goblin::mach::Mach::Fat(multi)) => {
+                for entry in multi.into_iter().flatten() {
+                    let goblin::mach::SingleArch::MachO(macho) = entry else {
+                        continue;
+                    };
+                    if macho.header.cputype == goblin::mach::constants::cputype::CPU_TYPE_ARM64
+                        || macho.header.cputype == goblin::mach::constants::cputype::CPU_TYPE_X86_64
+                    {
+                        return Self::from_macho(&macho);
+                    }
+                }
+                for entry in multi.into_iter().flatten() {
+                    let goblin::mach::SingleArch::MachO(macho) = entry else {
+                        continue;
+                    };
+                    return Self::from_macho(&macho);
+                }
+                bail!("no usable architecture in fat Mach-O");
+            }
+            Err(_) => {
+                if let Ok(elf) = goblin::elf::Elf::parse(bytes) {
+                    return Self::from_elf(&elf);
+                }
+                bail!("binary is neither Mach-O nor ELF");
+            }
+        }
+    }
+
+    fn from_macho(macho: &goblin::mach::MachO) -> Result<Self> {
+        let mut text_vmaddr = 0x100000000;
+        for segment in &macho.segments {
+            if matches!(segment.name(), Ok("__TEXT")) {
+                text_vmaddr = segment.vmaddr;
+                break;
+            }
+        }
+
+        let mut symbols = Vec::new();
+        for (name, nlist) in macho.symbols().flatten() {
+            if nlist.is_undefined() || nlist.n_value == 0 {
+                continue;
+            }
+            let clean_name = name.strip_prefix('_').unwrap_or(name);
+            let demangled = format!("{:#}", rustc_demangle::demangle(clean_name));
+            symbols.push((nlist.n_value, demangled));
+        }
+
+        symbols.sort_by_key(|(addr, _)| *addr);
+        symbols.dedup_by_key(|(addr, _)| *addr);
+
+        Ok(Self {
+            symbols,
+            text_vmaddr,
+        })
+    }
+
+    fn from_elf(elf: &goblin::elf::Elf) -> Result<Self> {
+        let mut symbols = Vec::new();
+        for sym in &elf.syms {
+            if sym.st_value == 0 {
+                continue;
+            }
+            if let Some(name) = elf.strtab.get_at(sym.st_name) {
+                let demangled = format!("{:#}", rustc_demangle::demangle(name));
+                symbols.push((sym.st_value, demangled));
+            }
+        }
+        symbols.sort_by_key(|(addr, _)| *addr);
+        symbols.dedup_by_key(|(addr, _)| *addr);
+        Ok(Self {
+            symbols,
+            text_vmaddr: 0,
+        })
+    }
+
+    pub(crate) fn resolve(&self, text_base: u64, addr: u64) -> Option<String> {
+        if self.symbols.is_empty() {
+            return None;
+        }
+
+        let slide = text_base.saturating_sub(self.text_vmaddr);
+        let file_vmaddr = if addr >= slide {
+            addr - slide
+        } else {
+            return None;
+        };
+
+        let idx = match self.symbols.binary_search_by_key(&file_vmaddr, |(a, _)| *a) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+
+        let (sym_addr, ref sym_name) = self.symbols[idx];
+        let offset = file_vmaddr - sym_addr;
+        if offset < 1024 * 1024 {
+            Some(format!("{sym_name}+0x{offset:x} (in carrick)"))
+        } else {
+            None
+        }
+    }
+}
+
+/// In-process symbol resolution of hex addresses using binary symbol tables.
 pub(crate) fn resolve_addresses(
     binary: &Path,
     text_base: &str,
@@ -140,21 +277,22 @@ pub(crate) fn resolve_addresses(
         return resolved;
     }
 
-    for chunk in addresses.chunks(500) {
-        let mut cmd = std::process::Command::new("/usr/bin/atos");
-        cmd.arg("-o")
-            .arg(binary)
-            .arg("-l")
-            .arg(text_base)
-            .args(chunk);
-        if let Some(output) = cmd.output().ok().filter(|o| o.status.success()) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for (addr, line) in chunk.iter().zip(stdout.lines()) {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && trimmed != *addr {
-                    resolved.insert((*addr).to_owned(), trimmed.to_owned());
-                }
-            }
+    let Ok(sym_table) = SymbolTable::from_binary(binary) else {
+        return resolved;
+    };
+
+    let base_num = u64::from_str_radix(text_base.trim_start_matches("0x"), 16).unwrap_or(0);
+    if base_num == 0 {
+        return resolved;
+    }
+
+    for addr_str in addresses {
+        let trimmed = addr_str.trim();
+        let Ok(addr_num) = u64::from_str_radix(trimmed.trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        if let Some(sym) = sym_table.resolve(base_num, addr_num) {
+            resolved.insert(trimmed.to_owned(), sym);
         }
     }
 
@@ -163,7 +301,20 @@ pub(crate) fn resolve_addresses(
 
 /// Classify a single frame string into an attribution category if it matches.
 pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
-    // 1. Lock wait / contention primitives
+    // 1. Instrumentation: USDT probes, DTrace tracing hooks, and fasttrap probes
+    if frame.contains("carrick_observability::probes")
+        || frame.contains("probes::real::")
+        || frame.contains("crate::probes::")
+        || frame.contains("___dtrace_")
+        || frame.contains("dtrace_probe")
+        || frame.contains("dtrace_")
+        || frame.contains("usdt::")
+        || frame.contains("fasttrap")
+    {
+        return Some(CpuCategory::Instrumentation);
+    }
+
+    // 2. Lock wait / contention primitives
     if frame.contains("psynch_cvwait")
         || frame.contains("psynch_mutexwait")
         || frame.contains("__ulock_wait")
@@ -179,7 +330,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::LockWait);
     }
 
-    // 2. Executor scheduling / park / unpark
+    // 3. Executor scheduling / park / unpark
     if frame.contains("idle_condvar")
         || frame.contains("park_spare")
         || frame.contains("RunQueue::")
@@ -202,7 +353,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::ExecutorScheduling);
     }
 
-    // 3. Guest execution (hv_vcpu_run, vcpu execution loop)
+    // 4. Guest execution (hv_vcpu_run, vcpu execution loop)
     if frame.contains("hv_vcpu_run")
         || frame.contains("Vcpu::run")
         || frame.contains("HvfAarch64Vcpu::run")
@@ -215,7 +366,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::GuestExecution);
     }
 
-    // 4. Fault service by fault class
+    // 5. Fault service by fault class
     if frame.contains("commit_resident_frame_grant")
         || frame.contains("prepare_el1_frame_grant")
         || frame.contains("publish_el1_frame_grant_on_host")
@@ -259,7 +410,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::FaultService(FaultClass::FirstTouch));
     }
 
-    // 5. EL1 Mailbox / grant request handling
+    // 6. EL1 Mailbox / grant request handling
     if frame.contains("claim_frame_grant_request")
         || frame.contains("complete_grant")
         || frame.contains("frame_grant_mailbox")
@@ -271,7 +422,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::El1Mailbox);
     }
 
-    // 6. Host syscall service by class
+    // 7. Host syscall service by class
     if frame.contains("openat")
         || frame.contains("open_at_path")
         || frame.contains("sys_openat")
@@ -393,9 +544,12 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
     {
         return Some(CpuCategory::HostSyscall("socket".to_owned()));
     }
-    if frame.contains("complete_syscall_return")
-        || frame.contains("service_outcome")
-        || frame.contains("complete_returned")
+    if frame.contains("complete_syscall_return") || frame.contains("complete_returned") {
+        return Some(CpuCategory::HostSyscall(
+            "syscall-return-completion".to_owned(),
+        ));
+    }
+    if frame.contains("service_outcome")
         || frame.contains("service_threaded_syscall")
         || frame.contains("redispatch_threaded_syscall")
         || frame.contains("dispatch_threaded")
@@ -414,22 +568,23 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
 /// Classify a user stack (frames ordered from leaf to root) into one of the
 /// attribution categories.
 pub(crate) fn classify_stack(frames: &[&str]) -> CpuCategory {
-    // 1. Explicit check for executor parking across the stack:
-    // When a thread is idle waiting in the scheduler's run queue, its leaf frame
-    // is `wait_until_internal` or `psynch_cvwait`. Identifying the parking caller
-    // attributes this to executor scheduling rather than lock contention.
-    for frame in frames {
-        if frame.contains("idle_condvar")
-            || frame.contains("park_spare")
-            || frame.contains("RunQueue::park_spare")
-        {
-            return CpuCategory::ExecutorScheduling;
-        }
-    }
-
-    // 2. Walk leaf-to-root and take the first matched category.
+    // Walk leaf-to-root and take the first matched category.
     for frame in frames {
         if let Some(category) = classify_frame(frame) {
+            // When a thread is idle waiting in the scheduler's run queue, its leaf frame
+            // is `wait_until_internal` or `psynch_cvwait` (LockWait). If an outer caller
+            // on the stack is idle parking in the run queue, attribute to ExecutorScheduling
+            // rather than lock contention.
+            if category == CpuCategory::LockWait {
+                let is_park = frames.iter().any(|f| {
+                    f.contains("idle_condvar")
+                        || f.contains("park_spare")
+                        || f.contains("RunQueue::park_spare")
+                });
+                if is_park {
+                    return CpuCategory::ExecutorScheduling;
+                }
+            }
             return category;
         }
     }
@@ -451,6 +606,7 @@ pub(crate) struct HvpatchCarrierCpuAttributionSummary {
     pub(crate) el1_mailbox_samples: u64,
     pub(crate) executor_scheduling_samples: u64,
     pub(crate) lock_wait_samples: u64,
+    pub(crate) instrumentation_samples: u64,
     pub(crate) other_samples: u64,
     pub(crate) syscall_classes: BTreeMap<String, u64>,
     pub(crate) fault_classes: BTreeMap<String, u64>,
@@ -486,6 +642,7 @@ impl HvpatchCarrierCpuAttributionSummary {
         let mut el1_mailbox_samples = 0_u64;
         let mut executor_scheduling_samples = 0_u64;
         let mut lock_wait_samples = 0_u64;
+        let mut instrumentation_samples = 0_u64;
         let mut other_samples = 0_u64;
 
         let mut syscall_classes = BTreeMap::new();
@@ -665,6 +822,11 @@ impl HvpatchCarrierCpuAttributionSummary {
                         .checked_add(count)
                         .ok_or_else(|| anyhow!("lock wait overflow"))?;
                 }
+                CpuCategory::Instrumentation => {
+                    instrumentation_samples = instrumentation_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("instrumentation overflow"))?;
+                }
                 CpuCategory::Other => {
                     other_samples = other_samples
                         .checked_add(count)
@@ -676,6 +838,15 @@ impl HvpatchCarrierCpuAttributionSummary {
         if other_samples == sample_population && sample_population > 0 {
             bail!(
                 "{PREFIX} attribution failed closed: 100% of samples ({sample_population}) across {stack_count} distinct stacks were unclassified 'other'; carrier symbols were unresolved or unclassified"
+            );
+        }
+
+        let inst_share = share(instrumentation_samples, sample_population);
+        if inst_share > MAX_INSTRUMENTATION_SHARE && sample_population > 0 {
+            bail!(
+                "{PREFIX} attribution failed closed: instrumentation samples ({instrumentation_samples} of {sample_population}, {:>4.1}%) exceeded maximum allowed threshold ({:>4.1}%); probe trampolines contaminated profile",
+                inst_share * 100.0,
+                MAX_INSTRUMENTATION_SHARE * 100.0,
             );
         }
 
@@ -691,6 +862,7 @@ impl HvpatchCarrierCpuAttributionSummary {
             el1_mailbox_samples,
             executor_scheduling_samples,
             lock_wait_samples,
+            instrumentation_samples,
             other_samples,
             syscall_classes,
             fault_classes,
@@ -721,6 +893,10 @@ impl HvpatchCarrierCpuAttributionSummary {
 
     pub(crate) fn lock_wait_share(&self) -> f64 {
         share(self.lock_wait_samples, self.sample_population)
+    }
+
+    pub(crate) fn instrumentation_share(&self) -> f64 {
+        share(self.instrumentation_samples, self.sample_population)
     }
 
     pub(crate) fn other_share(&self) -> f64 {
@@ -778,6 +954,11 @@ impl HvpatchCarrierCpuAttributionSummary {
             "  lock_wait:           {:>8} ({:>5.1}%)\n",
             self.lock_wait_samples,
             self.lock_wait_share() * 100.0
+        ));
+        out.push_str(&format!(
+            "  instrumentation:     {:>8} ({:>5.1}%)\n",
+            self.instrumentation_samples,
+            self.instrumentation_share() * 100.0
         ));
         if self.other_samples > 0 {
             out.push_str(&format!(
@@ -941,10 +1122,10 @@ mod tests {
             "HVPCARRIERATTR|usdt|metric=frame-grants|count=4",
             "HVPCARRIERATTR|usdt|metric=stage2-aliases|count=3",
             "HVPCARRIERATTR|section=user-stacks",
-            // Guest execution (hv_vcpu_run): 40 samples
+            // Guest execution (hv_vcpu_run): 38 samples
             "              carrick`hv_vcpu_run+0x10",
             "              carrick`carrick_vmm_hvf::trap::HvfAarch64Vcpu::run_to_exit+0x120",
-            "              40",
+            "              38",
             "",
             // Host syscall: openat: 10 samples
             "              libsystem_kernel.dylib`__openat+0x8",
@@ -994,6 +1175,10 @@ mod tests {
             "              carrick`carrick_kernel::dispatch::fs::openat+0x20",
             "              7",
             "",
+            // Instrumentation: 2 samples
+            "              carrick`carrick_observability::probes::real::hvpatch_executor_claim+0x10",
+            "              2",
+            "",
             // Other: 5 samples
             "              carrick`some_other_helper+0x10",
             "              5",
@@ -1011,13 +1196,14 @@ mod tests {
 
         assert_eq!(summary.sample_population, 100);
         assert_eq!(summary.stack_population, 100);
-        assert_eq!(summary.stack_count, 11);
-        assert_eq!(summary.guest_execution_samples, 40);
+        assert_eq!(summary.stack_count, 12);
+        assert_eq!(summary.guest_execution_samples, 38);
         assert_eq!(summary.host_syscall_samples, 20);
         assert_eq!(summary.fault_service_samples, 15);
         assert_eq!(summary.el1_mailbox_samples, 5);
         assert_eq!(summary.executor_scheduling_samples, 8);
         assert_eq!(summary.lock_wait_samples, 7);
+        assert_eq!(summary.instrumentation_samples, 2);
         assert_eq!(summary.other_samples, 5);
 
         assert_eq!(summary.syscall_classes.get("openat"), Some(&10));
@@ -1032,25 +1218,28 @@ mod tests {
         assert_eq!(summary.usdt_metrics.get("vcpu-faults"), Some(&15));
 
         // Shares
-        assert!((summary.guest_execution_share() - 0.40).abs() < 1e-6);
+        assert!((summary.guest_execution_share() - 0.38).abs() < 1e-6);
         assert!((summary.host_syscall_share() - 0.20).abs() < 1e-6);
         assert!((summary.fault_service_share() - 0.15).abs() < 1e-6);
         assert!((summary.el1_mailbox_share() - 0.05).abs() < 1e-6);
         assert!((summary.executor_scheduling_share() - 0.08).abs() < 1e-6);
         assert!((summary.lock_wait_share() - 0.07).abs() < 1e-6);
+        assert!((summary.instrumentation_share() - 0.02).abs() < 1e-6);
         assert!((summary.other_share() - 0.05).abs() < 1e-6);
 
         // Human output check
         let human = summary.render_human();
         assert!(human.contains("HVPatch carrier CPU attribution"));
         assert!(human.contains("guest_execution:"));
-        assert!(human.contains("40 ( 40.0%)"));
+        assert!(human.contains("38 ( 38.0%)"));
         assert!(human.contains("host_syscall:"));
         assert!(human.contains("20 ( 20.0%)"));
         assert!(human.contains("openat"));
         assert!(human.contains("10 ( 10.0%)"));
         assert!(human.contains("first-touch"));
         assert!(human.contains("6 (  6.0%)"));
+        assert!(human.contains("instrumentation:"));
+        assert!(human.contains("2 (  2.0%)"));
     }
 
     #[test]
@@ -1131,10 +1320,20 @@ mod tests {
         ];
         assert_eq!(classify_stack(&guest_stack), CpuCategory::GuestExecution);
 
-        // 2. Syscall dispatch frame
-        let dispatch_stack = [
+        // 2. Syscall return completion: deepest carrick frame is complete_syscall_return
+        let return_comp_stack = [
             "carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu::complete_syscall_return::h4c2248377b9b7249 (in carrick) (hvf_aarch64_engine.rs:509)",
             "carrick_runtime::vcpu_loop::ThreadRuntimeState::complete_returned::h9234673c72a38347 (in carrick) (mod.rs:2017)",
+            "carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::service_outcome::h2f161280967cc2d2 (in carrick) (binding.rs:2698)",
+            "carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::poll_with_engine::h3929857070dd193c (in carrick) (binding.rs:4409)",
+        ];
+        assert_eq!(
+            classify_stack(&return_comp_stack),
+            CpuCategory::HostSyscall("syscall-return-completion".to_owned())
+        );
+
+        // 3. Syscall dispatch frame (outermost dispatcher when no deeper handler is active)
+        let dispatch_stack = [
             "carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::service_outcome::h2f161280967cc2d2 (in carrick) (binding.rs:2698)",
             "carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::poll_with_engine::h3929857070dd193c (in carrick) (binding.rs:4409)",
         ];
@@ -1143,9 +1342,9 @@ mod tests {
             CpuCategory::HostSyscall("dispatch".to_owned())
         );
 
-        // 3. Fault service: first-touch via vcpu_fault
+        // 4. Fault service: first-touch
         let fault_stack = [
-            "carrick_observability::probes::real::vcpu_fault::he21282493f7bc6e4 (in carrick) (probes.rs:4982)",
+            "carrick_vmm_hvf::trap::handle_guest_page_fault::h12345 (in carrick)",
             "carrick_vmm_hvf::trap::HvfInner::run_to_exit::h86a02940b642697e (in carrick) (trap.rs:7474)",
             "carrick_host::guest_cpu::timed_run::hc43419832bcd8d25 (in carrick) (guest_cpu.rs:191)",
         ];
@@ -1154,7 +1353,7 @@ mod tests {
             CpuCategory::FaultService(FaultClass::FirstTouch)
         );
 
-        // 4. Fault service: COW via cow_engine
+        // 5. Fault service: COW via cow_engine
         let cow_stack = [
             "carrick_vmm_hvf::trap::task_mapping_index::TaskMappingIndex::candidates_for_ipa_range::h2efd4d1d13f0246b (in carrick) (task_mapping_index.rs:820)",
             "carrick_vmm_hvf::trap::cow_engine::HvfVmState::mapping_for_ipa_range::h9c28ca89f7489c5b (in carrick) (cow_engine.rs:5073)",
@@ -1165,9 +1364,9 @@ mod tests {
             CpuCategory::FaultService(FaultClass::Cow)
         );
 
-        // 5. Fault service: frame grant
+        // 6. Fault service: frame grant
         let grant_stack = [
-            "carrick_observability::probes::real::hvpatch_el1_frame_grant_plan::hac6ed0fa9a9e3a53 (in carrick) (probes.rs:4982)",
+            "carrick_runtime::vcpu_loop::signal::prepare_el1_frame_grant::h12345 (in carrick)",
             "carrick_runtime::vcpu_loop::signal::resolve_mutating_fault::h944919999724912b (in carrick) (signal.rs:511)",
         ];
         assert_eq!(
@@ -1175,7 +1374,7 @@ mod tests {
             CpuCategory::FaultService(FaultClass::FrameGrant)
         );
 
-        // 6. Lock wait
+        // 7. Lock wait
         let lock_stack = [
             "0x18a8be50c",
             "parking_lot::condvar::Condvar::wait_until_internal::heb307538a997ec5d (in carrick) (condvar.rs:334)",
@@ -1183,7 +1382,7 @@ mod tests {
         ];
         assert_eq!(classify_stack(&lock_stack), CpuCategory::LockWait);
 
-        // 7. Executor scheduling (park_spare overrides leaf condvar wait)
+        // 8. Executor scheduling (park_spare overrides leaf condvar wait)
         let executor_stack = [
             "0x18a8be50c",
             "parking_lot::condvar::Condvar::wait_until_internal::heb307538a997ec5d (in carrick) (condvar.rs:334)",
@@ -1195,7 +1394,29 @@ mod tests {
             CpuCategory::ExecutorScheduling
         );
 
-        // 8. Host syscall: openat
+        // 9. Instrumentation: probe frames must NEVER be classified as scheduling even if park_spare is on the stack
+        let probe_executor_stack = [
+            "carrick_observability::probes::real::hvpatch_executor_claim::h12345 (in carrick) (probes.rs:100)",
+            "carrick_kernel::kernel::scheduler::RunQueue::park_spare::h15abbc763e994f34 (in carrick) (scheduler.rs:2779)",
+            "carrick_kernel::kernel::scheduler::Scheduler::try_take::h14837436f11fd1ad (in carrick) (scheduler.rs:4309)",
+        ];
+        assert_eq!(
+            classify_stack(&probe_executor_stack),
+            CpuCategory::Instrumentation
+        );
+
+        // 10. Instrumentation: probe frames in fault/syscall hooks
+        let probe_fault_stack = [
+            "carrick_observability::probes::real::vcpu_fault::he21282493f7bc6e4 (in carrick) (probes.rs:4982)",
+            "carrick_vmm_hvf::trap::HvfInner::run_to_exit::h86a02940b642697e (in carrick) (trap.rs:7474)",
+            "carrick_host::guest_cpu::timed_run::hc43419832bcd8d25 (in carrick) (guest_cpu.rs:191)",
+        ];
+        assert_eq!(
+            classify_stack(&probe_fault_stack),
+            CpuCategory::Instrumentation
+        );
+
+        // 11. Host syscall: openat
         let openat_stack = [
             "0x18a8bc5a8",
             "carrick_vfs::fs_backend::host::HostFsBackend::openat_for_guest::ha8d23ac5de91a7df (in carrick) (host.rs:1811)",
@@ -1206,7 +1427,7 @@ mod tests {
             CpuCategory::HostSyscall("openat".to_owned())
         );
 
-        // 9. Host syscall: renameat
+        // 12. Host syscall: renameat
         let renameat_stack = [
             "0x18a8c8a00",
             "carrick_vfs::fs_backend::host::HostFsBackend::rename_overlay_entry_at::h1d6a45c47169bb32 (in carrick) (host.rs:5405)",
@@ -1220,10 +1441,15 @@ mod tests {
 
     #[test]
     fn parse_real_python_trace_if_present() {
-        let trace_path = Path::new("target/cpa-python.trace");
-        if !trace_path.exists() {
+        let trace_path = [
+            Path::new("target/cpa-python.trace"),
+            Path::new("../../target/cpa-python.trace"),
+        ]
+        .into_iter()
+        .find(|p| p.exists());
+        let Some(trace_path) = trace_path else {
             return;
-        }
+        };
         if find_carrick_binary().is_none() {
             return;
         }
@@ -1236,24 +1462,51 @@ mod tests {
         assert_eq!(summary.sample_population, 1601);
         assert_eq!(summary.stack_count, 158);
         assert!(
-            summary.guest_execution_samples > 400,
-            "guest execution was {}",
-            summary.guest_execution_samples
-        );
-        assert!(
-            summary.host_syscall_samples > 400,
+            summary.host_syscall_samples > 1400,
             "host syscall was {}",
             summary.host_syscall_samples
         );
         assert!(
-            summary.fault_service_samples > 250,
-            "fault service was {}",
-            summary.fault_service_samples
-        );
-        assert!(
-            summary.other_share() < 0.10,
+            summary.other_share() < 0.05,
             "other share was {}",
             summary.other_share()
+        );
+        assert!(
+            summary.instrumentation_share() <= MAX_INSTRUMENTATION_SHARE,
+            "instrumentation share was {}",
+            summary.instrumentation_share()
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_instrumentation_overhead() {
+        let p_sha = program_sha256();
+        let stream = [
+            &format!("HVPCARRIERATTR|header|program_sha256={p_sha}"),
+            "HVPCARRIERATTR|image|host_pid=1234|text_base=0x100000000|slide=0x0",
+            "HVPCARRIERATTR|summary|status=ok|root_exited=1|bounded=0|errors=0|saw_sample=1",
+            "HVPCARRIERATTR|sample-population|count=100",
+            "HVPCARRIERATTR|section=user-stacks",
+            // Guest execution: 40 samples
+            "              carrick`hv_vcpu_run+0x10",
+            "              40",
+            "",
+            // Excessive instrumentation: 60 samples (60%)
+            "              carrick`carrick_observability::probes::real::hvf_syscall_transport+0x10",
+            "              60",
+            "",
+        ]
+        .join("\n");
+
+        let err =
+            HvpatchCarrierCpuAttributionSummary::from_raw(stream, ProfileCaptureStatus::default())
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("instrumentation samples")
+                && err
+                    .to_string()
+                    .contains("exceeded maximum allowed threshold"),
+            "expected instrumentation threshold error, got: {err}"
         );
     }
 
