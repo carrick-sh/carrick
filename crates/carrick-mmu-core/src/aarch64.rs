@@ -16,6 +16,20 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+pub mod descriptor_txn;
+
+/// Which venue may store to an image's live, hardware-visible descriptor
+/// words. `Guest` selects the lane on which guest EL1 is the only live
+/// writer: host edits may stage and validate, but every store to live
+/// backing is refused with [`PageTableError::GuestOwnsLiveDescriptors`] and
+/// must instead be submitted as a [`descriptor_txn::DescriptorTxn`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LiveDescriptorOwner {
+    #[default]
+    Host,
+    Guest,
+}
+
 /// Narrow substrate guest-physical address type for stage-1 table arena boundaries.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -1048,6 +1062,9 @@ pub enum PageTableError {
     GicWindowOutput,
     /// Metadata allocation failed or was refused.
     MetadataAllocation,
+    /// A host store to live descriptors on the lane where guest EL1 owns
+    /// them. The edit must be submitted as a guest descriptor transaction.
+    GuestOwnsLiveDescriptors,
 }
 
 impl core::fmt::Display for PageTableError {
@@ -1066,6 +1083,9 @@ impl core::fmt::Display for PageTableError {
             }
             Self::GicWindowOutput => write!(f, "output address in the in-kernel GIC window"),
             Self::MetadataAllocation => write!(f, "metadata allocation failed"),
+            Self::GuestOwnsLiveDescriptors => {
+                write!(f, "guest EL1 owns the live stage-1 descriptors")
+            }
         }
     }
 }
@@ -1626,6 +1646,8 @@ pub struct PageTableManager {
     /// content-discovered cursor would hand one page to both. EL1 publishes
     /// only into existing tables and hands the rest back to the host.
     table_allocation_forbidden: bool,
+    /// The only venue allowed to store into this image's live backing.
+    live_descriptor_owner: LiveDescriptorOwner,
 }
 
 impl core::fmt::Debug for PageTableManager {
@@ -1643,6 +1665,7 @@ impl core::fmt::Debug for PageTableManager {
             .field("staged", &self.staged)
             .field("is_live", &self.is_live())
             .field("undo", &self.undo)
+            .field("live_descriptor_owner", &self.live_descriptor_owner)
             .finish()
     }
 }
@@ -1712,6 +1735,7 @@ impl PageTableManager {
             resolver: None,
             undo: None,
             table_allocation_forbidden: false,
+            live_descriptor_owner: LiveDescriptorOwner::Host,
         }
     }
 
@@ -1759,12 +1783,106 @@ impl PageTableManager {
             resolver: Some(resolver),
             undo: None,
             table_allocation_forbidden: false,
+            live_descriptor_owner: LiveDescriptorOwner::Host,
         })
     }
 
     /// Refuse every table-page allocation (see `table_allocation_forbidden`).
     pub fn forbid_table_allocation(&mut self) {
         self.table_allocation_forbidden = true;
+    }
+
+    /// Select the venue that owns this image's live descriptor stores.
+    pub fn set_live_descriptor_owner(&mut self, owner: LiveDescriptorOwner) {
+        self.live_descriptor_owner = owner;
+    }
+
+    /// The venue that owns this image's live descriptor stores.
+    pub fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
+        self.live_descriptor_owner
+    }
+
+    fn refuse_guest_owned_live_store(&self) -> Result<(), PageTableError> {
+        if self.live_descriptor_owner == LiveDescriptorOwner::Guest {
+            return Err(PageTableError::GuestOwnsLiveDescriptors);
+        }
+        Ok(())
+    }
+
+    /// Reserve `count` unlinked table pages in the EL1-reachable primary
+    /// arena for one guest descriptor transaction. The host remains the only
+    /// allocator of table-page identity; EL1 fills and links the pages it
+    /// uses. Extension arenas are never granted: EL1 cannot reach them, so a
+    /// shortfall is `OutOfTables` and the transaction must not be submitted.
+    /// Nothing is reserved on failure.
+    pub fn reserve_primary_table_grants(
+        &mut self,
+        count: usize,
+    ) -> Result<descriptor_txn::TableGrants, PageTableError> {
+        if count > descriptor_txn::MAX_TABLE_GRANTS {
+            return Err(PageTableError::OutOfTables);
+        }
+        if self.table_allocation_forbidden || self.arenas.is_empty() {
+            return Err(PageTableError::OutOfTables);
+        }
+        let mut pages = [SubstrateGpa(0); descriptor_txn::MAX_TABLE_GRANTS];
+        let mut reserved = 0;
+        let mut from_free = 0;
+        let primary_base = self.arenas[0].base;
+        let primary_end = primary_base + self.arenas[0].capacity as u64;
+        for &pa in self.free_tables.iter().rev() {
+            if reserved == count {
+                break;
+            }
+            if pa >= primary_base && pa < primary_end {
+                pages[reserved] = SubstrateGpa(pa);
+                reserved += 1;
+            }
+        }
+        from_free += reserved;
+        let bump_needed = (count - reserved) as u64;
+        let arena = &self.arenas[0];
+        let bump_end = arena
+            .next_free
+            .checked_add(bump_needed * PT_PAGE)
+            .ok_or(PageTableError::OutOfTables)?;
+        if bump_end > arena.capacity as u64 {
+            return Err(PageTableError::OutOfTables);
+        }
+        for index in 0..bump_needed {
+            pages[reserved] = SubstrateGpa(arena.base + arena.next_free + index * PT_PAGE);
+            reserved += 1;
+        }
+        let grants =
+            descriptor_txn::TableGrants::new(&pages[..count]).ok_or(PageTableError::BadAddress)?;
+        if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[0].storage {
+            let needed = bump_end as usize;
+            if bytes.len() < needed {
+                bytes
+                    .try_reserve(needed - bytes.len())
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
+                bytes.resize(needed, 0);
+            }
+        }
+        self.free_tables
+            .retain(|pa| !pages[..from_free].contains(&SubstrateGpa(*pa)));
+        self.arenas[0].next_free = bump_end;
+        Ok(grants)
+    }
+
+    /// Return table grants that a transaction did not link. The pages stay
+    /// out of the bump range and are reused from the free list; they are
+    /// re-zeroed at handout like every other freed table.
+    pub fn release_table_grants(&mut self, pages: &[u64]) -> Result<(), PageTableError> {
+        self.free_tables
+            .try_reserve(pages.len())
+            .map_err(|_| PageTableError::MetadataAllocation)?;
+        for &pa in pages {
+            if !self.free_tables.contains(&pa) {
+                self.free_tables.push(pa);
+            }
+        }
+        Ok(())
     }
 
     /// True if this manager is bound to live hardware-visible memory.
@@ -2037,6 +2155,9 @@ impl PageTableManager {
             resolver: None,
             undo: None,
             table_allocation_forbidden: false,
+            // A snapshot is an offline image. Restoring it over a guest-owned
+            // live authority is refused by that authority, not by the copy.
+            live_descriptor_owner: LiveDescriptorOwner::Host,
         };
         self.snapshot_into(&mut target)?;
         Ok(target)
@@ -2557,6 +2678,9 @@ impl PageTableManager {
         resolver: impl HostArenaResolver,
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
+        if !self.dirty.is_empty() {
+            self.refuse_guest_owned_live_store()?;
+        }
         // An EL1 editor may have linked a table page after this live manager
         // cached its bump cursor. A host edit that reached and dirtied that page
         // has now authenticated it through the live table graph. Adopt the
@@ -3033,9 +3157,13 @@ impl PageTableManager {
         let Some(ref journal) = self.undo else {
             return Ok(Vec::new());
         };
+        // On the guest-owned lane `sync_to_host` refuses before its first
+        // store, so no journaled word ever reached live backing: discard the
+        // staged transaction without writing hardware memory.
+        let publish_preimages = self.live_descriptor_owner == LiveDescriptorOwner::Host;
 
         // Pre-validate that all touched arenas resolve before modifying recoverable state.
-        for &(loc, _) in &journal.words {
+        for &(loc, _) in journal.words.iter().filter(|_| publish_preimages) {
             if loc.arena < self.arenas.len() {
                 let arena = &self.arenas[loc.arena];
                 if resolver
@@ -3052,6 +3180,14 @@ impl PageTableManager {
         // must remain retryable and must not release newly attached arenas.
         for &(loc, previous) in journal.words.iter().rev() {
             let arena = &mut self.arenas[loc.arena];
+            if !publish_preimages {
+                if let TableArenaStorage::Owned(ref mut bytes) = arena.storage
+                    && loc.offset + 8 <= bytes.len()
+                {
+                    bytes[loc.offset..loc.offset + 8].copy_from_slice(&previous.to_le_bytes());
+                }
+                continue;
+            }
             let host = resolver
                 .host_ptr_for_range(arena.base, loc.offset + 8)
                 .ok_or(PageTableError::UnresolvedArena(arena.base))?;
@@ -3112,6 +3248,7 @@ impl PageTableManager {
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{Ordering, fence};
 
+        self.refuse_guest_owned_live_store()?;
         // Resolve the complete destination set before publishing any bytes.
         // The caller's quiescence/ownership scope must keep these mappings valid
         // through the copy pass; a second fallible lookup could reintroduce a
@@ -10616,5 +10753,114 @@ mod tests {
             .unwrap();
         assert_eq!(mgr.translate(va + 2 * PT_PAGE), Some(ipa + 2 * PT_PAGE));
         assert_eq!(mgr.translate(va + 3 * PT_PAGE), None);
+    }
+
+    fn live_arena_bytes(resolver: &MockLiveResolver) -> Vec<u8> {
+        resolver
+            .arenas
+            .lock()
+            .unwrap()
+            .get(&LINUX_PAGE_TABLES_BASE)
+            .expect("primary arena")
+            .clone()
+    }
+
+    #[test]
+    fn guest_owned_live_image_refuses_every_host_descriptor_store() {
+        let (mut mgr, resolver) = create_live_fixture();
+        let snapshot = mgr.snapshot_image().expect("offline snapshot");
+        mgr.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        let before = live_arena_bytes(&resolver);
+
+        // Ordinary host edit funnel: stage, refuse publication, discard.
+        mgr.begin_undo().unwrap();
+        mgr.set_readonly(LINUX_MMAP_BASE, 0x4000, false, None)
+            .expect("staging is not a live store");
+        assert_eq!(
+            unsafe { mgr.sync_to_host(&*resolver) },
+            Err(PageTableError::GuestOwnsLiveDescriptors)
+        );
+        unsafe { mgr.rollback_undo(&*resolver, None) }.expect("discard staged edit");
+        assert_eq!(live_arena_bytes(&resolver), before);
+        assert_eq!(
+            mgr.translate(LINUX_MMAP_BASE),
+            snapshot.translate(LINUX_MMAP_BASE),
+            "the discarded host edit is not observable through the live image"
+        );
+
+        // Guest-publication transactions are host-venue publishers too.
+        let publication = GuestLeafPublication {
+            va: LINUX_MMAP_BASE + 0x40_0000,
+            ipa: LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+            len: 2 * PT_PAGE,
+            writable: true,
+            executable: false,
+        };
+        assert_eq!(
+            mgr.publish_live_private_pages_transaction(publication),
+            Err(GuestLeafPublicationError::Manager(
+                PageTableError::GuestOwnsLiveDescriptors
+            ))
+        );
+        assert_eq!(live_arena_bytes(&resolver), before);
+
+        // Snapshot restore through a guest-owned image is refused too.
+        assert_eq!(
+            unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) },
+            Err(PageTableError::GuestOwnsLiveDescriptors)
+        );
+        assert_eq!(live_arena_bytes(&resolver), before);
+
+        // The host lane is unchanged.
+        mgr.set_live_descriptor_owner(LiveDescriptorOwner::Host);
+        mgr.begin_undo().unwrap();
+        mgr.set_readonly(LINUX_MMAP_BASE, 0x4000, false, None)
+            .unwrap();
+        unsafe { mgr.sync_to_host(&*resolver) }.expect("host lane publishes");
+        mgr.commit_undo();
+        assert_ne!(live_arena_bytes(&resolver), before);
+    }
+
+    #[test]
+    fn primary_table_grants_are_exact_reversible_and_never_extension_pages() {
+        let (mut mgr, _resolver) = create_live_fixture();
+        let cursor = mgr.arenas[0].next_free;
+        let grants = mgr.reserve_primary_table_grants(3).expect("three pages");
+        assert_eq!(
+            grants.as_slice(),
+            &[
+                LINUX_PAGE_TABLES_BASE + cursor,
+                LINUX_PAGE_TABLES_BASE + cursor + PT_PAGE,
+                LINUX_PAGE_TABLES_BASE + cursor + 2 * PT_PAGE,
+            ]
+        );
+        assert_eq!(mgr.arenas[0].next_free, cursor + 3 * PT_PAGE);
+        // The host allocator never hands a reserved page to another edit.
+        let next = mgr.alloc_table_for_test().expect("host allocation");
+        assert!(!grants.as_slice().contains(&next));
+
+        // The unused suffix returns to the allocator and is granted again.
+        mgr.release_table_grants(grants.unused_after(1)).unwrap();
+        let again = mgr.reserve_primary_table_grants(2).expect("reuse");
+        let mut reused = again.as_slice().to_vec();
+        reused.sort_unstable();
+        assert_eq!(reused, grants.as_slice()[1..].to_vec());
+
+        // A shortfall reserves nothing: EL1 cannot reach extension arenas.
+        let free_before = mgr.free_tables.clone();
+        let cursor_before = mgr.arenas[0].next_free;
+        let remaining = (mgr.arenas[0].capacity as u64 - cursor_before) / PT_PAGE;
+        if remaining < descriptor_txn::MAX_TABLE_GRANTS as u64 {
+            assert_eq!(
+                mgr.reserve_primary_table_grants(remaining as usize + 1),
+                Err(PageTableError::OutOfTables)
+            );
+        }
+        assert_eq!(
+            mgr.reserve_primary_table_grants(descriptor_txn::MAX_TABLE_GRANTS + 1),
+            Err(PageTableError::OutOfTables)
+        );
+        assert_eq!(mgr.free_tables, free_before);
+        assert_eq!(mgr.arenas[0].next_free, cursor_before);
     }
 }
