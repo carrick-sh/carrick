@@ -2607,6 +2607,11 @@ fn main() {
         "idle-carrier" => idle_carrier(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(500)),
         "wfi-signal" => wfi_signal(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100)),
         "pstate" => pstate_mode(),
+        "ipc-processes" => ipc::processes(
+            args.get(2).map(String::as_str).unwrap_or("pipe"),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(1),
+            args.get(4).and_then(|n| n.parse().ok()).unwrap_or(128),
+        ),
         "ipc-pairs" => ipc::pairs(
             args.get(2).map(String::as_str).unwrap_or("pipe"),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(1),

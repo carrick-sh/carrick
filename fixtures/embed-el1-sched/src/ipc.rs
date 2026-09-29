@@ -89,3 +89,63 @@ pub fn pairs(kind: &str, pairs: usize, rounds: usize) -> i32 {
     println!("ipc-pairs kind={kind} pairs={pairs} rounds={rounds} completed={completed}");
     i32::from(completed != pairs * rounds)
 }
+
+/// Fork before creating threads: both processes inherit the same OFDs but
+/// independently publish their descriptor namespaces to EL1.
+pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
+    assert!(matches!(kind, "pipe" | "eventfd"));
+    assert!(matches!(pairs, 1 | 8 | 64));
+    assert!(rounds > 0);
+    let channels: Vec<_> = (0..pairs)
+        .map(|_| {
+            (
+                Channel::new(kind == "eventfd"),
+                Channel::new(kind == "eventfd"),
+            )
+        })
+        .collect();
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+    let child = pid == 0;
+    let workers: Vec<_> = channels
+        .into_iter()
+        .enumerate()
+        .map(|(pair, (request, response))| {
+            std::thread::spawn(move || {
+                for round in 0..rounds {
+                    let value = ((pair as u64 + 1) << 32) | (round as u64 + 1);
+                    if child {
+                        assert_eq!(request.receive(), value, "inherited request identity");
+                        response.send(value ^ 0x1000_0000);
+                    } else {
+                        request.send(value);
+                        assert_eq!(
+                            response.receive(),
+                            value ^ 0x1000_0000,
+                            "inherited response identity"
+                        );
+                    }
+                }
+                rounds
+            })
+        })
+        .collect();
+    let completed: usize = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("cross-process IPC worker"))
+        .sum();
+    assert_eq!(completed, pairs * rounds);
+    if child {
+        unsafe { libc::_exit(0) }
+    }
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, 0) },
+        pid,
+        "wait child"
+    );
+    assert!(libc::WIFEXITED(status), "child status {status}");
+    assert_eq!(libc::WEXITSTATUS(status), 0, "child status {status}");
+    println!("ipc-processes kind={kind} pairs={pairs} rounds={rounds} completed={completed}");
+    0
+}
