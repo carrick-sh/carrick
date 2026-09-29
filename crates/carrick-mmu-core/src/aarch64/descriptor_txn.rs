@@ -1931,6 +1931,95 @@ where
     Some(claimed.complete(outcome))
 }
 
+/// One guest COW copy the host granted: the faulting page, the shared frame
+/// it still maps, and the private replacement frame whose backing and
+/// inventory are already live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowCopyGrant {
+    pub mm_key: NonZeroU64,
+    pub root: SubstrateGpa,
+    pub va: u64,
+    pub old_ipa: SubstrateGpa,
+    pub new_ipa: SubstrateGpa,
+    pub old_backing: BackingIdentity,
+    pub new_backing: BackingIdentity,
+}
+
+/// Proof that one granted COW page was copied exactly, from the frame the
+/// live leaf still maps into the granted replacement. Only
+/// [`copy_granted_cow_page`] constructs it; the repoint it authorizes is
+/// [`Self::repoint_op`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowCopyComplete {
+    grant: CowCopyGrant,
+    bytes: u64,
+}
+
+impl CowCopyComplete {
+    #[must_use]
+    pub fn grant(&self) -> CowCopyGrant {
+        self.grant
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The only descriptor operation this copy authorizes.
+    #[must_use]
+    pub fn repoint_op(&self) -> DescriptorOp {
+        DescriptorOp::CowRepoint {
+            va: self.grant.va,
+            old_ipa: self.grant.old_ipa,
+            new_ipa: self.grant.new_ipa,
+            backing: self.grant.new_backing,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CowCopyError {
+    /// The live leaf no longer is a COW-armed page mapping `old_ipa` (stale
+    /// grant): nothing was copied.
+    Refused(DescriptorRefusal),
+    /// A window is not exactly one page.
+    BadWindow,
+}
+
+/// Copy one granted COW page. The live graph at `grant.root` must still map
+/// `grant.va` COW-armed onto `grant.old_ipa` with write intent (validated by
+/// planning the repoint, without storing); only then are the 4096 bytes of
+/// `source` (the old frame) copied into `destination` (the new frame). The
+/// caller holds the exact-MM editor, so the leaf cannot change between the
+/// check and the repoint that follows.
+pub fn copy_granted_cow_page<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    grant: CowCopyGrant,
+    source: &[u8],
+    destination: &mut [u8],
+) -> Result<CowCopyComplete, CowCopyError> {
+    if source.len() != PT_PAGE as usize || destination.len() != PT_PAGE as usize {
+        return Err(CowCopyError::BadWindow);
+    }
+    let op = DescriptorOp::CowRepoint {
+        va: grant.va,
+        old_ipa: grant.old_ipa,
+        new_ipa: grant.new_ipa,
+        backing: grant.new_backing,
+    };
+    let plan = plan_descriptor_op(words, grant.root, op).map_err(CowCopyError::Refused)?;
+    if plan.table_grants != 0 {
+        // A coarse COW block needs a split: the repoint must carry grants.
+        return Err(CowCopyError::Refused(DescriptorRefusal::TablesExhausted));
+    }
+    destination.copy_from_slice(source);
+    Ok(CowCopyComplete {
+        grant,
+        bytes: PT_PAGE,
+    })
+}
+
 /// Whether a receipt's outcome changed live descriptors and therefore needs
 /// the caller's ASID invalidation.
 #[must_use]
@@ -3111,6 +3200,59 @@ mod tests {
                 el1_private_leaf_state(words.get(leaf_pa(VA + PT_PAGE))),
                 El1PrivateLeafState::Retired
             );
+        }
+
+        #[test]
+        fn a_guest_cow_copy_is_exact_and_only_from_the_still_shared_frame() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(1, PageSpan::new(VA, PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            let byte_len = words.words.len() * 8;
+            unsafe {
+                arm_existing_el1_fork_pages(
+                    words.words.as_ptr().cast_mut(),
+                    ROOT,
+                    byte_len,
+                    VA,
+                    PT_PAGE,
+                )
+            }
+            .unwrap();
+            let grant = CowCopyGrant {
+                mm_key: nz(7),
+                root: SubstrateGpa(ROOT),
+                va: VA,
+                old_ipa: SubstrateGpa(IPA),
+                new_ipa: SubstrateGpa(0x009d_0000_0000),
+                old_backing: backing(1),
+                new_backing: backing(20),
+            };
+            let source: Vec<u8> = (0..PT_PAGE).map(|i| (i * 7 % 251) as u8).collect();
+            let mut destination = vec![0xAA; PT_PAGE as usize];
+            let before = words.image();
+            // A stale grant (the leaf maps another frame) copies nothing.
+            let stale = CowCopyGrant {
+                old_ipa: SubstrateGpa(IPA + PT_PAGE),
+                ..grant
+            };
+            assert_eq!(
+                copy_granted_cow_page(&words, stale, &source, &mut destination),
+                Err(CowCopyError::Refused(DescriptorRefusal::WrongBacking))
+            );
+            assert!(destination.iter().all(|&b| b == 0xAA));
+            let copy = copy_granted_cow_page(&words, grant, &source, &mut destination).unwrap();
+            assert_eq!(destination, source);
+            assert_eq!(copy.bytes(), PT_PAGE);
+            assert_eq!(words.image(), before, "copying stores no descriptor");
+            // The copy authorizes exactly its repoint.
+            let repointed = applied(run(&words, copy.repoint_op(), &TableGrants::NONE));
+            assert_eq!(repointed.live_stores, 1);
+            assert_eq!(words.get(leaf_pa(VA)) & PA_MASK_4KIB, 0x009d_0000_0000);
+            // Once repointed, the same grant is stale.
+            assert!(copy_granted_cow_page(&words, grant, &source, &mut destination).is_err());
         }
     }
 }
