@@ -137,7 +137,7 @@ Evidence labels:
 | 0: scheduler/address-space execution | Implemented on main; batch 3 still has lifecycle blockers | Preserve scheduling, wake, GIC/timer, occupancy and address-space-switch contracts on the integrated artifact |
 | 2: memory | First-touch, resident permission and resident munmap slices historically accepted; ownership migration incomplete | Anonymous semantics, faults, COW, descriptor publication and elastic return owned in EL1; all host writers converted before pause removal |
 | 2a: host namespace cost | Earlier namespace budget work merged; full objective open | Containment/coherence plus controlled Linux ratios and native macOS I/O controls; finish before checkpoint 4 |
-| 3: descriptors/IPC/signals | Pipe/eventfd foundation and fixtures in separate branches; no checkpoint acceptance | Full descriptor lifecycle, in-zone IPC/readiness/signals and all assigned ownership obligations |
+| 3: descriptors/IPC/signals | Production pipe/eventfd routing has one signed red/green witness; blocking/lifecycle qualification and checkpoint acceptance remain open | Full descriptor lifecycle, in-zone IPC/readiness/signals and all assigned ownership obligations |
 | 4: names/page cache | Pending | EL1 name/dentry/stat/page-cache ownership with host namespace/writer coherence; retire old file zone |
 | 5: process lifecycle | Pending | EL1 fork/exec, image loading and process lifecycle; host only supplies boundary services |
 | 6: x86 venue | Deferred by user on 2026-09-29; outside the active goal | Same neutral cores in ring 0, each declared backend qualified with real execution and native x86 oracle |
@@ -173,7 +173,7 @@ do not overwrite it with that branch's pre-refresh controller.
 | `wt-cp2-return` / `work/cp2-elastic-return` | `8f268dee4` | Review candidate; scoped grant/return accounting and signed green are handoff claims |
 | `wt-cp2-tests` / `work/cp2-ownership-tests` | `45fa94124` | Contains deliberately red ownership witnesses; dedicated host-COW accessor still panics |
 | `wt-cp2-reserve` / `work/cp2-el1-reservations` | `f2efa3716` | Explicit unverified WIP; reservation provider/projection and host authority work incomplete |
-| `wt-cp3-adapter` / `work/cp3-ipc-adapter` | `b0313df83` | Explicit interrupted WIP; runtime glue exists but is not accepted |
+| `wt-cp3-adapter` / `work/cp3-ipc-adapter` | `ab5ec3e1d` (signed source `e6e2ab3bf`) | Live pipe/eventfd routing proven for one single-thread round-trip population; full vertical unaccepted |
 | `wt-cp3-host` / `work/cp3-ipc-host` | `77b6f40a1` | Shared backing/lifetime foundation; descriptor-table integration and host blocking continuation open |
 | `wt-cp3-fixture` / `work/cp3-ipc-fixture` | `fd27e748d` | Five signed acceptance tests plus report validators/contracts; baseline red is a handoff claim |
 | `wt-cp3-objects` / `work/cp3-ipc-shared-objects` | `bb93917a4` | Ancestry-confirmed in adapter branch |
@@ -233,11 +233,31 @@ Clippy passes. A stale eventfd test expected F_SETFL to erase O_RDWR; corrected
 against retained native-Linux evidence, with its failed run preserved. Exact-
 owner host-token retirement also fixes the reproduced handback leak.
 
-The first honest signed routing witness is now building/running on source
-`5cc3b64a6`, run ID `el1-ipc-routing-20260929-a`. It checks 1,024 pipe and
-1,024 eventfd round trips and reads real whole-run served/forwarded counters.
-No signed result, scoped zero-exit budget, park/wake proof or checkpoint
-acceptance is claimed yet. Main remains unchanged; x86 remains deferred.
+The first honest signed routing witness now passes on clean source
+`e6e2ab3bf` (receipt commit `ab5ec3e1d`, clean adapter head). Initial signed
+source `5cc3b64a6` transferred correct data but forwarded all 2,048 loop
+writes. The mapped IPC authority belonged to the loader's temporary bootstrap
+Kernel; root initialization later rebound the dispatcher to the authoritative
+HVPatch graph. Moving registration into authoritative executor launch before
+window installation, and publishing the root table after mapping, fixes that
+source-confirmed dependency. No extra audit hook was needed.
+
+The unchanged witness checks 1,024 pipe and 1,024 eventfd round trips. Actual
+whole-run counters: served read=2054/write=2048; forwarded read=4/write=1,
+versus prior forwarded read=2052/write=2049. Run ID
+`el1-ipc-routing-20260929-b` passed one positive signed execution plus the
+unentitled negative control, with zero scoped leftovers. Tested SHA-256
+`e1c036c86ac45cdc93b2ceec8a5c05fb7298d6afa1110d77368608b2390a010e` was
+independently matched to the official manifest and its bytes preserved.
+The first failed run, fixture-lock delta and failing executable remain saved.
+
+**Next implementation/qualification step:** real blocking/park/wake and
+close/reuse witnesses, then mixed-venue and signals/partial progress at the
+required scales and two-process shapes. Do not return to historical lifecycle
+attribution unless it blocks these. This is the first live pipe/eventfd
+routing milestone, not scoped zero-exit proof, a timing ratio, full CI or
+checkpoint acceptance. Main is unchanged; x86 remains deferred. All build
+and execution handles from this interval are terminal.
 
 **Priority reset, explicitly requested by the user on 2026-09-29:** stop the
 expanding deferred-capture investigation and resume work on guest capabilities.
@@ -440,7 +460,7 @@ populations overlap. Affected Clippy and formatting pass. Full table lifecycle
 and publication remain open. These remain development receipts, not signed
 migration acceptance.
 
-Current IPC development head is `375dddee3` in clean `wt-cp3-adapter`.
+Earlier IPC development head was `375dddee3` in `wt-cp3-adapter`; the live routing update above supersedes this snapshot.
 Atomic pinned replacement reuses dup2's transaction; HostTable now owns shared
 create/grow/fork/replace/close/exec/destroy and releases backing after core locks.
 Red-first replacement/retirement witnesses are retained. Descriptor core 27/27,
