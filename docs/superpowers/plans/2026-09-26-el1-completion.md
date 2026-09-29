@@ -9,7 +9,7 @@
 receipts. After requesting the refresh, the user explicitly said "Set the
 goal and go." The end-to-end goal is active; execution is in task A below.
 
-**Goal:** Complete the accepted EL1 migration through the x86 ring-0 venue,
+**Goal:** Complete the accepted AArch64/macOS EL1 migration,
 with one authoritative owner and one semantic implementation per object,
 verified Linux behavior, bounded work and the per-workload ≤2x native-Linux
 objective. A branch merge or a focused green test does not close a checkpoint.
@@ -21,8 +21,14 @@ Host requests are validated, batched and asynchronous; a guest wait releases
 execution capacity. Retain adapters needed by other backends until their
 replacement is accepted; delete superseded semantic paths.
 
-**Tech stack:** Rust; HVPatch/AArch64 EL1 on macOS/HVF first; shared x86 engine
-and real KVM/bhyve/NVMM execution for the x86 venue.
+**Scope decision (2026-09-29):** The user said "go all the way but don't do
+x86 for now." Continue every ARM64 ownership stage and its full acceptance
+gates. Defer checkpoint 6, x86 hardware discovery and x86 execution; preserve
+existing backend interfaces. Deferred x86 is not accepted or complete. This
+explicit decision supersedes the older goal text that includes x86.
+
+**Tech stack:** Rust; HVPatch/AArch64 EL1 on macOS/HVF. The shared x86 engine
+and real KVM/bhyve/NVMM venue remain a deferred follow-up.
 
 **Authorities:** [accepted design](../specs/2026-09-24-el1-kernel.md),
 [AGENTS.md](../../../AGENTS.md),
@@ -64,8 +70,10 @@ fixture result. This closes this producer's signed interleaving gap only; the
 49-execution receipt above predates the new audit event and is not full-tree
 acceptance for this source. Broad regressions after the audit event passed:
 kernel/semantics 2,462 (one existing ignore), serial kernel 110, runtime 630
-(eight existing ignores) and affected Clippy. Clean compiler gates remain
-pending.
+(eight existing ignores) and affected Clippy. Clean compiler reconciliation
+on `3fb63f608` retained all 595 rows and positions; `852fedd48` records the
+source stamp. Final lint and contract coverage passed on `852fedd48`. The
+compiler census remains the macOS subset; other host profiles are unqualified.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake
@@ -94,7 +102,7 @@ Evidence labels:
 | 3: descriptors/IPC/signals | Pipe/eventfd foundation and fixtures in separate branches; no checkpoint acceptance | Full descriptor lifecycle, in-zone IPC/readiness/signals and all assigned ownership obligations |
 | 4: names/page cache | Pending | EL1 name/dentry/stat/page-cache ownership with host namespace/writer coherence; retire old file zone |
 | 5: process lifecycle | Pending | EL1 fork/exec, image loading and process lifecycle; host only supplies boundary services |
-| 6: x86 venue | Pending; hardware/oracle availability not verified in this refresh | Same neutral cores in ring 0, each declared backend qualified with real execution and native x86 oracle |
+| 6: x86 venue | Deferred by user on 2026-09-29; outside the active goal | Same neutral cores in ring 0, each declared backend qualified with real execution and native x86 oracle |
 | Final acceptance | Pending | Entire declared conformance/workload denominator, provenance, cost gates, dead-path removal and unresolved-item closure |
 
 Main includes batches 1/2 (handoff batches `043ffbcc9` and `a70b40466`):
@@ -332,7 +340,7 @@ permission to overlap or silently resize regions.
 | 3 remainder | EL1 fd tables/descriptions/offsets/flags, AF_UNIX, timerfd, epoll/poll/select, signals and in-zone loopback; preserve credentials, peer/SCM identity, readiness, partial operations and cancellation under exhausted default executor capacity |
 | 4 names/cache | Authoritative EL1 dentry/stat/name resolution and host-file page cache; validated host namespace operations, host-writer/shared-alias coherence, mutation rollback; remove replaced file-zone implementation |
 | 5 lifecycle | EL1 fork/exec/address-space lifecycle and image loading; parent/child identity, vfork sharing, exec sibling drain, wait/reparent/reap, credentials/rlimits/pgrps/sessions; ptrace and core semantics with host core-file output |
-| 6 x86 | Same neutral semantic cores through shared x86 engine; native x86 oracle and real KVM/bhyve/NVMM lane evidence for the declared support matrix; no translated amd64 Docker substitute |
+| 6 x86 (deferred) | Outside the active goal; future work requires the same neutral semantic cores through shared x86 engine; native x86 oracle and real KVM/bhyve/NVMM lane evidence for the declared support matrix; no translated amd64 Docker substitute |
 
 Clocks remain guest reads of calibrated vvar/CNTVCT where appropriate; external
 sockets/DNS, contained host-file operations, shared host-file aliases, CLI
@@ -342,8 +350,8 @@ or accidentally migrated into duplicate semantics.
 
 Before each stage starts, attach its bounded source/contract/fixture brief and
 explicit acceptance population here. Keep every ownership row in the design
-assigned to a stage. Verify x86 hardware/oracle availability early enough that
-checkpoint 6 is a named dependency, not a surprise final omission.
+assigned to a stage. Checkpoint 6 and its hardware/oracle discovery are
+explicitly deferred by the user, not dependencies of ARM64 acceptance.
 
 ## Common acceptance and landing protocol
 
@@ -409,9 +417,11 @@ witnesses, completed row counts, timing controls, cleanup, removed paths and
 remaining blockers. Update this controller after each accepted batch so the
 next agent does not reconstruct state from chronological reports.
 
-The migration is complete only when checkpoints 0/2/2a/3/4/5/6 and final
-acceptance are closed on the declared support/workload population; all design
+The active ARM64 migration goal is complete only when checkpoints
+0/2/2a/3/4/5 and final acceptance are closed on the declared ARM64
+support/workload population; all in-scope design
 ownership rows have accepted owners, production routing uses them by default,
 replaced paths are removed, and no required proof is deferred. This remains
 experimental software, not a claim of a hardened boundary or production
-readiness.
+readiness. Checkpoint 6 remains explicitly deferred and must not be reported
+as accepted by ARM64 completion.
