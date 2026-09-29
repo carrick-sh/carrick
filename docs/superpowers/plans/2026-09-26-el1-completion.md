@@ -81,24 +81,30 @@ dedicated tests, retained CLI cases and both inotify routes passed. The exact
 216-row LTP population reports 215 baseline MATCHes and one allowed fanotify25
 DIFF; this is regression evidence, not strict closure. Three generic shard
 files were re-signed by the later dedicated stage; their passing receipts
-remain, but final promotion must retain the tested bytes. Fixed Python/Go,
-controlled ratios and the remaining lifecycle obligations stay open.
+remain, but final promotion must retain the tested bytes. Controlled ratios
+and the remaining lifecycle obligations stay open.
 Fixed Python8x2 now passes all16 rows against fresh native Linux, with
-normal concurrency and serial confirmation disabled. Fixed Go20 is RED:
+normal concurrency and serial confirmation disabled. The initial fixed Go20 was RED:
 round2 conf-20571-c00 aborted while publishing terminal inventory retirement
 (frame2697 still mapped; kernel_mm14). The other19 passes do not clear it.
-The immediate priority is a deterministic reduction of this live-frame
-retirement refusal; batch3 promotion is stopped. See `arm64-acceptance/workloads/`.
+This stopped batch3 promotion and triggered the reduction below.
+See `arm64-acceptance/workloads/`.
 A bounded 20-run diagnostic population on a separately debug-signed copy
 completed without reproduction or core capture. This does not clear the red
-acceptance result. Sampling is stopped; next is a deterministic two-MM
-planning/publication interleaving. See `arm64-acceptance/retirement-debug/`.
+acceptance result. Sampling was stopped in favor of the deterministic
+interleaving below. See `arm64-acceptance/retirement-debug/`.
 The deterministic backend reduction now fails red on mixed-time population
 counts and passes after moving the existing backend-registry acquisition
 before the authority query. Eleven retirement tests, serial HVF 598 (three
 existing ignores), and affected Clippy pass. This is a branch-local correction,
-not attribution or clearance of the Go failure; signed candidate acceptance
-is next. See `retirement-population/` for limits and failed invocations.
+not retrospective attribution of the Go failure. See `retirement-population/`
+for limits and failed invocations. On source `b5a751775`, full `just ci` and
+the signed rebuild pass. The corrected CLI (SHA `ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f`)
+passes all 20 fixed Go rows against the verified native ARM64 oracle, with
+no retries, diffs or leftover guests. This closes that candidate population;
+the original failure stays preserved. Prior EL1/probe receipts do not transfer
+to this executable. Signed regression qualification and remaining lifecycle
+proofs still block batch acceptance. See `retirement-acceptance/`.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake

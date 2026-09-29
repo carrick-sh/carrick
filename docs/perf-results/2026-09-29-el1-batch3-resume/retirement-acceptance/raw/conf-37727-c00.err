@@ -1,0 +1,2 @@
+2026-09-29T19:52:19.136262Z  WARN carrick::kernel::debug: kernel debug endpoint not published; `carrick debug hvpatch-kernel` is unavailable for this run error=kernel debug endpoint unavailable: kernel debug endpoint owner record is unreadable: /tmp/carrick-kernel/501/d6644c260307c69cc5c5eab2b236882d/snapshot.sock exists with no owner record
+ok
