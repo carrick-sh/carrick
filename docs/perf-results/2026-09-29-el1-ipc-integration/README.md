@@ -299,3 +299,18 @@ completed checked operations only. The embed runner reads real whole-run
 EL1 park and served/forwarded counters; no feature flag or loop count creates
 an execution observation. Scoped zero-exit, two-process, descriptor reuse,
 signal/partial-progress and full vertical acceptance remain open.
+
+
+The first committed scale run (9055c465b) passed pipe N=1, with 258 actual
+EL1 parks. Pipe N=8 completed all 1,024 checked round trips with 2,056 EL1
+parks, but only 2,047 of 2,048 writes were served in guest (one data write
+forwarded, plus the output write). Its strict whole-run served-write assertion
+failed and prevented N=64/eventfd from running. Preserve that red; no bound is
+weakened. The runner now collects the same counter failures across the fixed
+six-case population before failing, so this mismatch does not hide later
+results. This is bounded coverage discovery, not retry-to-green. Admission,
+lock contention, pending host work and phase boundaries remain hypotheses
+for the forwarding; no root-cause or scoped zero-exit claim is made.
+
+Unrelated rustfmt churn in the standalone fixture main file was removed,
+leaving only the intended module/mode additions relative to ab5ec3e1d.
