@@ -1378,3 +1378,116 @@ fn a_closed_space_is_never_installed_again() {
     assert_eq!(zone.install_space(SLOT, MM), None);
     assert_eq!(zone.installed_space(SLOT), 0);
 }
+
+/// A synthetic EL1 save area for a thread EL1 parked (a private futex wait,
+/// exactly as `park` above does it), with a distinctive, fully populated
+/// [`ThreadCtx`] so a reader must round-trip every field, not just prove
+/// SOMETHING came back.
+fn distinctive_ctx(seed: u64) -> ThreadCtx {
+    let mut ctx = ThreadCtx::ZERO;
+    for (index, slot) in ctx.x.iter_mut().enumerate() {
+        *slot = seed.wrapping_mul(0x1000).wrapping_add(index as u64);
+    }
+    ctx.pc = seed.wrapping_mul(0x2000);
+    ctx.pstate = seed.wrapping_mul(0x3000);
+    ctx.sp_el0 = seed.wrapping_mul(0x4000);
+    ctx.tpidr_el0 = seed.wrapping_mul(0x5000);
+    ctx.tpidrro_el0 = seed.wrapping_mul(0x6000);
+    ctx.contextidr_el1 = seed.wrapping_mul(0x7000);
+    for (index, slot) in ctx.v.iter_mut().enumerate() {
+        *slot = (seed as u128)
+            .wrapping_mul(0x1_0000)
+            .wrapping_add(index as u128);
+    }
+    ctx.fpsr = seed.wrapping_mul(0x8000);
+    ctx.fpcr = seed.wrapping_mul(0x9000);
+    ctx
+}
+
+/// Park `tid` (as `park` does) and overwrite its save area with a
+/// distinctive, fully populated context.
+fn park_with_ctx(zone: &ZoneTables, tid: u64, uaddr: u64, ctx: ThreadCtx) -> RecordId {
+    let record = park(zone, tid, uaddr);
+    // SAFETY: this test is the only party touching the zone; the record is
+    // `Parked` (nobody else may claim a park this test never wakes).
+    unsafe {
+        *zone.record(record).ctx_mut() = ctx;
+    }
+    record
+}
+
+/// The EL1 save-area reader crash capture relies on: a thread EL1 holds
+/// parked answers with its exact, fully populated context, attributed to
+/// the exact `(mm, tid, serial)` a post-mortem reader asked for -- and never
+/// to a DIFFERENT thread parked at the same time.
+///
+/// This is the red-first case for "parked-EL1-thread registers are absent
+/// from crash snapshots": before `ZoneTables::read_parked_context` existed,
+/// there was no way to answer this question at all, and a crash-capture
+/// quorum polling a thread in this exact state (`Claim::Parked`, no vote,
+/// not a live host safe-point participant) either hung on `Waiting` forever
+/// (if still marked a participant) or silently dropped the thread's
+/// `NT_PRSTATUS` note (if not) -- never attributed real registers to it.
+#[test]
+fn read_parked_context_finds_and_attributes_the_exact_thread() {
+    let zone = zone();
+    let ctx_a = distinctive_ctx(1);
+    let ctx_b = distinctive_ctx(2);
+    // Two threads parked at once: the reader must not confuse them.
+    let record_a = park_with_ctx(&zone, 101, 0x1000, ctx_a);
+    let record_b = park_with_ctx(&zone, 202, 0x2000, ctx_b);
+    let identity_a = zone.record(record_a).identity();
+    let identity_b = zone.record(record_b).identity();
+
+    // SAFETY: a single-threaded test with no concurrent EL1/host claimant --
+    // the authentication the real caller (crash capture) provides via a
+    // quiesce barrier holds trivially here.
+    let read_a =
+        unsafe { zone.read_parked_context(identity_a.mm, identity_a.tid, identity_a.serial) };
+    let ParkedContextRead::Found(found_a) = read_a else {
+        panic!("expected thread A's parked context, got {read_a:?}");
+    };
+    assert_eq!(found_a, ctx_a, "thread A's exact save area, not thread B's");
+
+    let read_b =
+        unsafe { zone.read_parked_context(identity_b.mm, identity_b.tid, identity_b.serial) };
+    let ParkedContextRead::Found(found_b) = read_b else {
+        panic!("expected thread B's parked context, got {read_b:?}");
+    };
+    assert_eq!(found_b, ctx_b, "thread B's exact save area, not thread A's");
+}
+
+/// A thread that is not parked (wrong identity, or truly absent) answers
+/// `NotParked`, never a synthesized or borrowed register file: the caller's
+/// own safe-point protocol (publish/withdraw) owns that thread instead.
+#[test]
+fn read_parked_context_reports_not_parked_for_an_unmatched_identity() {
+    let zone = zone();
+    let ctx = distinctive_ctx(3);
+    let record = park_with_ctx(&zone, 303, 0x3000, ctx);
+    let identity = zone.record(record).identity();
+
+    // Right mm and serial, wrong tid.
+    let wrong_tid =
+        unsafe { zone.read_parked_context(identity.mm, identity.tid + 1, identity.serial) };
+    assert!(matches!(wrong_tid, ParkedContextRead::NotParked));
+
+    // Right tid and serial, wrong mm: a different address space must never
+    // be answered from this record even if the numeric ids happen to align.
+    let wrong_mm =
+        unsafe { zone.read_parked_context(identity.mm + 1, identity.tid, identity.serial) };
+    assert!(matches!(wrong_mm, ParkedContextRead::NotParked));
+
+    // A thread EL1 woke (`Claim::Queued`, no longer `Parked`) must not
+    // answer from its now-stale-for-this-purpose record either: its
+    // registers belong to whichever safe point resumes it, not to this
+    // reader.
+    let woken = park(&zone, 505, 0x5000);
+    let woken_identity = zone.record(woken).identity();
+    assert!(wake(&zone, 0x5000, 1, Waker::El1 { slot: SLOT }).is_ok());
+    assert!(matches!(zone.record(woken).claim(), Claim::Queued { .. }));
+    let no_longer_parked = unsafe {
+        zone.read_parked_context(woken_identity.mm, woken_identity.tid, woken_identity.serial)
+    };
+    assert!(matches!(no_longer_parked, ParkedContextRead::NotParked));
+}

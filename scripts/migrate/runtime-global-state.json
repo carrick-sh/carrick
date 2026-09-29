@@ -3736,6 +3736,14 @@
       "fingerprint": "2df4d0a57520d985ef32abc001fbf264f54d467822807e6ff2b5cd6aa1c9cd0d",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide diagnostic counter VCPU_RUN_EXIT_CLASSES in crates/carrick-vmm-hvf/src/trap.rs counting every hv_vcpu_run return by host exit class, read by the EL1 scheduler embed tests to attribute host exits; monotonic atomic, carrier VM scope like VCPU_RUN_EXITS_TOTAL."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/crash_capture.rs",
+      "symbol": "tests::serial_host::TEST_LOCK",
+      "fingerprint": "b45f2e0792f4c7c840555bdf52882bf567b1f7f35998d77b3e2084e080d8479d",
+      "classification": "test_only",
+      "rationale": "Test-only mutex serializing crash-capture unit tests that install a synthetic EL1 region (record_el1_region_host_ptr, el1_zone::enable) to prove the crash quorum reads a parked thread's authoritative EL1 save area; absent from production builds."
     }
   ]
 }
