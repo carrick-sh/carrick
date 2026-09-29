@@ -803,6 +803,15 @@ fn el1_sched_pstate_seen_by_the_guest_is_unchanged() {
 /// repeated guest blocking; exact scoped work/exit acceptance remains separate.
 #[test]
 fn el1_ipc_pairs_blocking() {
+    ipc_blocking_population("ipc-pairs");
+}
+
+#[test]
+fn el1_ipc_two_processes_blocking() {
+    ipc_blocking_population("ipc-processes");
+}
+
+fn ipc_blocking_population(mode: &str) {
     const ROUNDS: u64 = 128;
     let _guard = common::guest_lock();
     reset_el1_counters();
@@ -815,7 +824,7 @@ fn el1_ipc_pairs_blocking() {
                 .unwrap_or([0; 2]);
             let measured = run_fixture(
                 &carrier,
-                &["ipc-pairs", kind, &pairs.to_string(), &ROUNDS.to_string()],
+                &[mode, kind, &pairs.to_string(), &ROUNDS.to_string()],
                 Duration::from_secs(60),
             );
             println!(
