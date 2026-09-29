@@ -790,7 +790,7 @@ mod tests {
     // ------------------------------------------------------------------
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use carrick_abi::LinuxCloneFlags;
     use carrick_guest_mem::{Gpa, GuestVa};
@@ -810,11 +810,14 @@ mod tests {
         MmRelation, SnapshotError, VmaAccess,
     };
 
-    struct LeaveGuestOnKick(Arc<carrick_hal::InGuestFlag>);
+    /// A kick that only asks the target's own thread to leave the guest, as
+    /// a real vCPU exit does: the thread observes it and runs its entry
+    /// boundary itself, so a pause cannot begin and end behind its back.
+    struct RequestExitOnKick(Arc<std::sync::atomic::AtomicBool>);
 
-    impl VcpuKickDyn for LeaveGuestOnKick {
+    impl VcpuKickDyn for RequestExitOnKick {
         fn kick(&self) {
-            self.0.leave_guest();
+            self.0.store(true, Ordering::SeqCst);
         }
     }
 
@@ -3133,15 +3136,19 @@ mod tests {
         let observer = binding.cow_invalidation_observer();
         let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
         let in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
+        let kicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         assert!(matches!(
             registry.subscribe_register(
                 active_tid,
-                Box::new(LeaveGuestOnKick(Arc::clone(&in_guest))),
+                Box::new(RequestExitOnKick(Arc::clone(&kicked))),
                 &in_guest,
                 Arc::new(|| {}),
             ),
             carrick_hal::VcpuRegistrationEnrollment::Registered
         ));
+        let cow_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_kicked = Arc::clone(&kicked);
+        let worker_cow_done = Arc::clone(&cow_done);
         let target_mm = Arc::clone(&fixture.dispatch_mm);
         let endpoint: Arc<dyn VcpuRegistry> = registry.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
@@ -3161,14 +3168,19 @@ mod tests {
                 .expect("production active target occupancy");
             in_guest.enter_guest();
             ready_tx.send(()).expect("publish active target entry");
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while !worker_quiesce.is_quiescing() {
+            // The COW must pause this target: it kicks it and cannot commit
+            // until the target leaves the guest, which only this thread does.
+            while !worker_kicked.load(Ordering::SeqCst) {
                 assert!(
-                    Instant::now() < deadline,
-                    "production target pause was never raised"
+                    !worker_cow_done.load(Ordering::SeqCst),
+                    "COW committed without pausing the active target"
                 );
                 std::thread::yield_now();
             }
+            assert!(
+                worker_quiesce.is_quiescing(),
+                "the kick comes from a raised production target pause"
+            );
             let entered =
                 crate::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation_for_test(
                     &in_guest,
@@ -3195,6 +3207,7 @@ mod tests {
                 .break_foreign_cow(mutation, &foreign, range)
                 .map(|_| ())
         });
+        cow_done.store(true, Ordering::SeqCst);
         worker
             .join()
             .expect("active target resumes after COW commit");
