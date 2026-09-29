@@ -2021,3 +2021,117 @@ fn el1_fork_cow_resolves_in_guest() {
         );
     }
 }
+
+/// Retain a real parent's notification snapshot across its guest-visible reap.
+/// The marker prevents the parent from exiting before snapshot capture; the
+/// auditor then delays only that notification until the root reaps the parent.
+#[test]
+fn el1_sched_delayed_notification_survives_parent_reap() {
+    use carrick_kernel::kernel::TaskKey;
+    use carrick_kernel::observe::{
+        AuditVerdict, ForkKind, InterceptAction, InterceptedSyscall, KernelAuditor, ProcessInfo,
+        SyscallInterceptor,
+    };
+    use std::sync::{Arc, Condvar, Mutex};
+
+    #[derive(Default)]
+    struct State {
+        target: Option<TaskKey>,
+        captured: bool,
+        reaped: bool,
+        timed_out: bool,
+        markers: usize,
+        events: Vec<&'static str>,
+    }
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<State>,
+        changed: Condvar,
+    }
+    impl KernelAuditor for Gate {
+        fn fork_admitted(&self, _parent: TaskKey, child: TaskKey, kind: ForkKind) -> AuditVerdict {
+            if matches!(kind, ForkKind::Fork) {
+                self.state.lock().unwrap().target.get_or_insert(child);
+            }
+            AuditVerdict::Continue
+        }
+
+        fn child_exit_notification_captured(&self, parent: TaskKey) -> AuditVerdict {
+            let mut state = self.state.lock().unwrap();
+            if state.target != Some(parent) {
+                return AuditVerdict::Continue;
+            }
+            state.events.push("captured");
+            state.captured = true;
+            self.changed.notify_all();
+            let (mut state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.reaped)
+                .unwrap();
+            state.timed_out |= timeout.timed_out() && !state.reaped;
+            state.events.push("released");
+            AuditVerdict::Continue
+        }
+
+        fn reaped(&self, _parent: TaskKey, child: TaskKey) -> AuditVerdict {
+            let mut state = self.state.lock().unwrap();
+            if state.target == Some(child) {
+                state.events.push("reaped");
+                state.reaped = true;
+                self.changed.notify_all();
+            }
+            AuditVerdict::Continue
+        }
+    }
+    impl SyscallInterceptor for Gate {
+        fn intercept(
+            &self,
+            _process: &ProcessInfo<'_>,
+            call: &InterceptedSyscall<'_>,
+        ) -> InterceptAction {
+            if call.name() == "sched_yield" && call.original_args().0[0] == 0x454c314e {
+                let mut state = self.state.lock().unwrap();
+                state.markers += 1;
+                let (mut state, timeout) = self
+                    .changed
+                    .wait_timeout_while(state, Duration::from_secs(5), |state| !state.captured)
+                    .unwrap();
+                state.timed_out |= timeout.timed_out() && !state.captured;
+            }
+            InterceptAction::Continue
+        }
+    }
+
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(30));
+    let carrier = carrier_or_fail();
+    let gate = Arc::new(Gate::default());
+    let result = common::run_or_fail(
+        carrier
+            .container(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([FIXTURE, "delayed-parent-notification"])
+            .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+            .auditor(gate.clone())
+            .interceptor(gate.clone())
+            .run_blocking(),
+    );
+    assert!(result.success(), "{}", result.stdout_utf8());
+    assert!(
+        result
+            .stdout_utf8()
+            .contains("delayed-parent-notification reaped=1")
+    );
+    let state = gate.state.lock().unwrap();
+    assert!(
+        !state.timed_out,
+        "lifecycle rendezvous timed out: {:?}",
+        state.events
+    );
+    assert_eq!(state.markers, 1);
+    assert_eq!(state.events, ["captured", "reaped", "released"]);
+    println!(
+        "el1 delayed notification ordering={:?} markers={}",
+        state.events, state.markers
+    );
+}
