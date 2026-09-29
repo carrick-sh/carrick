@@ -3547,6 +3547,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(El1FrameGrantPublished::OnHost)
     }
 
+    fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
+        self.page_tables.live_descriptor_owner()
+    }
+
+    fn select_live_descriptor_owner(&mut self, owner: LiveDescriptorOwner) -> bool {
+        self.page_tables.select_live_descriptor_owner(owner);
+        true
+    }
+
     fn settle_el1_descriptor_receipt(
         &mut self,
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,

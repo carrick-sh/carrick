@@ -411,6 +411,243 @@ fn el1_frame_grants_enabled() -> bool {
     })
 }
 
+/// Every host writer family that still stores live stage-1 descriptors. The
+/// guest-owned lane is admitted for an MM only when every one of them submits
+/// descriptor transactions instead; a single unconverted writer would be
+/// refused on that lane and turn an ordinary host edit into a guest fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct GuestDescriptorLanePrecondition {
+    /// The descriptor transaction slots are placed in the installed EL1 region.
+    pub(super) slots_placed: bool,
+    /// Bulk first-touch frame grants (this path).
+    pub(super) frame_grants: bool,
+    /// Host syscall copyout into prepared pages (`commit_prepared_host_write`).
+    pub(super) host_copyout: bool,
+    /// Fork parent COW arming (`build_process_spec`).
+    pub(super) fork_parent_arming: bool,
+    /// Backend COW, sparse/foreign materialization and exec publication.
+    pub(super) backend_writers: bool,
+}
+
+impl GuestDescriptorLanePrecondition {
+    /// The writer census of this build. Copyout, fork arming and the backend
+    /// writers are not converted, so no MM may select the lane yet.
+    pub(super) fn current() -> Self {
+        Self {
+            slots_placed: carrick_el1_abi::descriptor_txn_slots_host().is_some(),
+            frame_grants: true,
+            host_copyout: false,
+            fork_parent_arming: false,
+            backend_writers: false,
+        }
+    }
+
+    pub(super) fn admits(self) -> bool {
+        self.slots_placed
+            && self.frame_grants
+            && self.host_copyout
+            && self.fork_parent_arming
+            && self.backend_writers
+    }
+}
+
+/// Select the guest-owned lane for `engine`'s MM when the precondition
+/// admits it. Never demotes a guest-owned MM.
+pub(super) fn select_guest_descriptor_lane<E: ThreadedEngine>(
+    engine: &mut E,
+    precondition: GuestDescriptorLanePrecondition,
+) -> bool {
+    use carrick_mmu_core::aarch64::LiveDescriptorOwner;
+    if engine.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+        return true;
+    }
+    precondition.admits() && engine.select_live_descriptor_owner(LiveDescriptorOwner::Guest)
+}
+
+/// Host-retained copy of one submitted guest-lane frame grant: the exact
+/// transaction (never re-read from shared memory) and what the host commits
+/// once EL1's receipt verifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingGuestGrant {
+    pub(super) txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    /// The fault and span that produced the first-touch plan; settlement
+    /// re-derives the plan under the MM mutation guard and requires it
+    /// unchanged before committing.
+    pub(super) fault_va: u64,
+    pub(super) requested_len: u64,
+    pub(super) plan: (u64, u64, u64),
+    pub(super) residency: carrick_el1_abi::FrameGrantResidencyIdentity,
+}
+
+/// What settling one guest grant did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuestGrantSettlement {
+    /// EL1 published it; residency was committed for exactly this span.
+    Committed(carrick_mmu_core::aarch64::descriptor_txn::PageSpan),
+    /// EL1 refused or rolled it back; nothing was committed and its table
+    /// grants returned. The fault path starts over.
+    Refused(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal),
+}
+
+/// Per-vCPU-slot ledger of submitted guest grants, mirroring the shared
+/// `DescriptorTxnSlots`. The entry lock is held across submission so a
+/// receipt can never be settled before its host copy exists.
+pub(super) struct GuestGrantLedger {
+    pending:
+        [parking_lot::Mutex<Option<PendingGuestGrant>>; carrick_el1_abi::EL1_STACK_SLOTS as usize],
+}
+
+impl GuestGrantLedger {
+    pub(super) const fn new() -> Self {
+        Self {
+            pending: [const { parking_lot::const_mutex(None) };
+                carrick_el1_abi::EL1_STACK_SLOTS as usize],
+        }
+    }
+
+    /// Submit `pending` through `slot`. `false`: the slot is busy or out of
+    /// range; nothing was submitted.
+    pub(super) fn submit(
+        &self,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+        slot: usize,
+        pending: PendingGuestGrant,
+    ) -> bool {
+        let Some(entry) = self.pending.get(slot) else {
+            return false;
+        };
+        let mut entry = entry.lock();
+        if entry.is_some() || !slots.submit(slot, &pending.txn) {
+            return false;
+        }
+        *entry = Some(pending);
+        true
+    }
+
+    /// Settle every receipt EL1 has published for `mm_key`, in slot order.
+    /// Returns how many were settled.
+    pub(super) fn settle_ready<Err>(
+        &self,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+        mm_key: u64,
+        mut settle: impl FnMut(
+            PendingGuestGrant,
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+        ) -> Result<GuestGrantSettlement, Err>,
+    ) -> Result<usize, Err> {
+        let mut settled = 0;
+        for (slot, entry) in self.pending.iter().enumerate() {
+            let taken = {
+                let mut entry = entry.lock();
+                match *entry {
+                    Some(pending) if pending.txn.id.mm_key.get() == mm_key => {
+                        let receipt = slots.take_receipt(slot, pending.txn.id);
+                        if receipt.is_some() {
+                            *entry = None;
+                        }
+                        receipt.map(|receipt| (pending, receipt))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((pending, receipt)) = taken {
+                settle(pending, receipt)?;
+                settled += 1;
+            }
+        }
+        Ok(settled)
+    }
+}
+
+/// Carrier-wide ledger for the shared EL1 descriptor transaction slots.
+static GUEST_GRANT_LEDGER: GuestGrantLedger = GuestGrantLedger::new();
+
+/// Authenticate one guest grant receipt, then commit exactly its resident
+/// span. Residency is never committed before EL1's publication is proven,
+/// and an unauthenticated or indeterminate receipt fails stopped.
+pub(super) fn settle_guest_frame_grant(
+    pending: PendingGuestGrant,
+    receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    verify: impl FnOnce(
+        &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        TrapError,
+    >,
+    commit: impl FnOnce(
+        &PendingGuestGrant,
+        carrick_mmu_core::aarch64::descriptor_txn::PageSpan,
+    ) -> Result<(), TrapError>,
+) -> Result<GuestGrantSettlement, TrapError> {
+    use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+    match receipt.outcome {
+        DescriptorOutcome::Applied(_) => {
+            let verified = verify(&pending.txn, receipt)?;
+            commit(&pending, verified.resident())?;
+            Ok(GuestGrantSettlement::Committed(verified.resident()))
+        }
+        DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            // Settlement returns the grants of a refused transaction and
+            // reports it as not applied, which is the expected answer here.
+            let _ = verify(&pending.txn, receipt);
+            Ok(GuestGrantSettlement::Refused(refusal))
+        }
+        DescriptorOutcome::Indeterminate(refusal) => Err(TrapError::Hypervisor(format!(
+            "EL1 descriptor transaction {:?} could not roll back: {refusal:?}",
+            pending.txn.id
+        ))),
+    }
+}
+
+/// Settle every guest-lane grant receipt for the MM this boundary mutates.
+fn settle_guest_frame_grants<E: ThreadedEngine>(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    engine: &mut E,
+    mutation: &carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
+) -> Result<(), TrapError> {
+    let Some(slots) = carrick_el1_abi::descriptor_txn_slots_host() else {
+        return Ok(());
+    };
+    let mm_key = mutation.host_alias_permit().mm().raw();
+    GUEST_GRANT_LEDGER.settle_ready(slots, mm_key, |pending, receipt| {
+        settle_guest_frame_grant(
+            pending,
+            &receipt,
+            |txn, receipt| engine.settle_el1_descriptor_receipt(txn, receipt),
+            |pending, _resident| {
+                let permit = mutation.host_alias_permit();
+                let plan = dispatcher
+                    .resident_frame_grant_plan(&permit, pending.fault_va, pending.requested_len)
+                    .filter(|plan| (plan.start(), plan.len(), plan.prot()) == pending.plan)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "EL1 published grant {:?} but its first-touch plan changed",
+                            pending.txn.id
+                        ))
+                    })?;
+                dispatcher.commit_resident_frame_grant(plan);
+                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                    let _ = table.publish(pending.residency);
+                }
+                Ok(())
+            },
+        )
+    })?;
+    Ok(())
+}
+
+/// Whether a guest descriptor transaction for `mm_key` is in flight over
+/// `address`: the fault predates EL1's publication and must retry, never
+/// take a host first-touch path that would race the guest's edit.
+pub(super) fn guest_descriptor_edit_in_flight(
+    slots: Option<&carrick_el1_abi::DescriptorTxnSlots>,
+    mm_key: u64,
+    address: u64,
+) -> bool {
+    slots.is_some_and(|slots| slots.pending_covering(mm_key, address))
+}
+
 /// Resolve a fault whose read-only outer classification placed it inside a
 /// first-touch or grow-down extent. This entry point cannot be called without
 /// structural mutation authority and is kept separate from ordinary signal
@@ -448,6 +685,15 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     let ring_tid = tid.raw();
     let mm_key = mutation.host_alias_permit().mm().raw();
     reconcile_guest_frame_commits(dispatcher, engine, mutation);
+    settle_guest_frame_grants(dispatcher, engine, mutation)?;
+    if guest_descriptor_edit_in_flight(
+        carrick_el1_abi::descriptor_txn_slots_host(),
+        mm_key,
+        address,
+    ) {
+        cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
+        return Ok(true);
+    }
     if !el1_frame_grants_enabled() {
         cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
     }
@@ -557,6 +803,9 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     return Ok(true);
                 };
                 let fault_page = plan.fault_page();
+                let plan_shape = (plan.start(), plan.len(), plan.prot());
+                select_guest_descriptor_lane(engine, GuestDescriptorLanePrecondition::current());
+                let deferred_to_guest = std::cell::Cell::new(false);
                 let residency_identity = carrick_el1_abi::FrameGrantResidencyIdentity {
                     mm_key: request.mm_key,
                     semantic_base: service.semantic_base,
@@ -595,20 +844,42 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             El1FrameGrantPublished::OnHost => Ok::<bool, TrapError>(true),
                             El1FrameGrantPublished::Unsupported
                             | El1FrameGrantPublished::Refused(_) => Ok(false),
-                            // The guest-owned lane needs the descriptor
-                            // transaction slot in the shared EL1 region
-                            // (`carrick-el1-abi`) and receipt settlement
-                            // before residency commit. Until that transport
-                            // exists no MM selects the lane; if one did, the
-                            // grant is withdrawn and refused, never
-                            // published by the host.
+                            // Guest-owned lane: EL1 publishes. The mailbox
+                            // slot is released now; residency is committed
+                            // only when the verified receipt settles, and a
+                            // fault in the span retries until then.
                             El1FrameGrantPublished::Submit(txn) => {
-                                engine.abandon_el1_descriptor_txn(&txn)?;
-                                Ok(false)
+                                let pending = PendingGuestGrant {
+                                    txn,
+                                    fault_va: address,
+                                    requested_len: request.requested_len,
+                                    plan: plan_shape,
+                                    residency: residency_identity,
+                                };
+                                let submitted = match (
+                                    carrick_el1_abi::descriptor_txn_slots_host(),
+                                    engine.mailbox_slot(),
+                                ) {
+                                    (Some(slots), Some(slot)) => {
+                                        GUEST_GRANT_LEDGER.submit(slots, slot, pending)
+                                    }
+                                    _ => false,
+                                };
+                                if submitted {
+                                    deferred_to_guest.set(true);
+                                    Ok(true)
+                                } else {
+                                    engine.abandon_el1_descriptor_txn(&txn)?;
+                                    Ok(false)
+                                }
                             }
                         }
                     },
                     || {
+                        if deferred_to_guest.get() {
+                            // Committed by `settle_guest_frame_grants`.
+                            return;
+                        }
                         dispatcher.commit_resident_frame_grant(plan);
                         // A full journal is safe: prepared leaves still use
                         // the existing host first-touch path. Publish only
@@ -1981,5 +2252,386 @@ mod first_touch_access_tests {
                 .is_some()
         );
         crate::probes::hvpatch_first_touch_refused(0x4000_1000, 3, 2, &error);
+    }
+}
+
+#[cfg(test)]
+mod guest_descriptor_lane_tests {
+    use super::*;
+    use carrick_aarch64::engine::Stage1Authority;
+    use carrick_el1_abi::{DescriptorTxnSlots, FrameGrantResidencyIdentity};
+    use carrick_mem::memory::{
+        AARCH64_LINUX_PAGE_TABLE_LAYOUT, LINUX_HVPATCH_GLOBAL_FRAME_BASE, LINUX_MMAP_BASE,
+        LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE, stage1_hvpatch_page_tables,
+    };
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, CallerInvalidatesAsid, DescriptorApplied, DescriptorOp, DescriptorOutcome,
+        DescriptorReceipt, DescriptorRefusal, InlineJournal, PageSpan, PrimaryTableWords,
+        apply_submitted_descriptor_txn,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, GuestPermissionEdit, HostArenaResolver, LiveDescriptorOwner,
+        PageTableManager, SubstrateGpa,
+    };
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+
+    struct BufferResolver {
+        buf: parking_lot::Mutex<Vec<u8>>,
+    }
+
+    unsafe impl HostArenaResolver for BufferResolver {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            (base == LINUX_PAGE_TABLES_BASE).then(|| self.buf.lock().as_mut_ptr())
+        }
+        fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+            (base == LINUX_PAGE_TABLES_BASE).then(|| self.buf.lock().as_ptr())
+        }
+    }
+
+    const MM: u64 = 41;
+    const VA: u64 = LINUX_MMAP_BASE + 0x80_0000;
+    const IPA: u64 = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+
+    fn nz(value: u64) -> NonZeroU64 {
+        NonZeroU64::new(value).unwrap()
+    }
+
+    /// A live MM on the guest-owned lane, selected in-test.
+    fn guest_lane() -> (Stage1Authority, Arc<BufferResolver>) {
+        let mut manager = PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        manager.set_prot_none(VA, 0x20_0000, None).unwrap();
+        let mut bytes = manager.as_bytes().to_vec();
+        bytes.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let resolver = Arc::new(BufferResolver {
+            buf: parking_lot::Mutex::new(bytes),
+        });
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        unsafe {
+            authority.bind_live_backing(
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+            );
+        }
+        authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        (authority, resolver)
+    }
+
+    /// EL1's side: claim the submission in `slot` and execute it.
+    fn el1_apply(
+        resolver: &BufferResolver,
+        slots: &DescriptorTxnSlots,
+        slot: usize,
+    ) -> Option<DescriptorReceipt> {
+        let mut buf = resolver.buf.lock();
+        let maintenance = CallerInvalidatesAsid;
+        let words = unsafe {
+            PrimaryTableWords::new(
+                buf.as_mut_ptr().cast(),
+                LINUX_PAGE_TABLES_BASE,
+                LINUX_PAGE_TABLES_SIZE as usize,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        apply_submitted_descriptor_txn(
+            slots.slot(slot)?,
+            MM,
+            &words,
+            SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+            &mut InlineJournal::new(),
+        )
+    }
+
+    fn residency() -> FrameGrantResidencyIdentity {
+        FrameGrantResidencyIdentity {
+            mm_key: MM,
+            semantic_base: VA,
+            physical_ipa: IPA,
+            len: 4 * 4096,
+            mapping_id: 2,
+            frame_id: 1,
+            owner_generation: 3,
+            inventory_revision: 4,
+        }
+    }
+
+    fn grant_op(fault: u64) -> DescriptorOp {
+        DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: VA,
+                ipa: IPA,
+                len: 4 * 4096,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(fault, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(1),
+                mapping_id: nz(2),
+                owner_generation: nz(3),
+                inventory_revision: nz(4),
+            },
+        }
+    }
+
+    fn settle_with(
+        authority: &Stage1Authority,
+        commits: &mut Vec<(PendingGuestGrant, PageSpan)>,
+    ) -> impl FnMut(PendingGuestGrant, DescriptorReceipt) -> Result<GuestGrantSettlement, TrapError>
+    {
+        move |pending, receipt| {
+            settle_guest_frame_grant(
+                pending,
+                &receipt,
+                |txn, receipt| {
+                    authority
+                        .settle_guest_descriptor_receipt(txn, receipt)
+                        .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+                },
+                |pending, resident| {
+                    commits.push((*pending, resident));
+                    Ok(())
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn the_lane_stays_unselected_until_every_writer_is_converted() {
+        let current = GuestDescriptorLanePrecondition::current();
+        assert!(!current.admits());
+        assert!(!current.host_copyout && !current.fork_parent_arming && !current.backend_writers);
+        let all = GuestDescriptorLanePrecondition {
+            slots_placed: true,
+            frame_grants: true,
+            host_copyout: true,
+            fork_parent_arming: true,
+            backend_writers: true,
+        };
+        assert!(all.admits());
+        for missing in 0..5 {
+            let mut partial = all;
+            match missing {
+                0 => partial.slots_placed = false,
+                1 => partial.frame_grants = false,
+                2 => partial.host_copyout = false,
+                3 => partial.fork_parent_arming = false,
+                _ => partial.backend_writers = false,
+            }
+            assert!(!partial.admits(), "missing writer {missing}");
+        }
+    }
+
+    #[test]
+    fn guest_grant_retries_until_its_receipt_then_commits_exact_residency_once() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let fault = VA + 2 * 4096;
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(fault))
+            .unwrap();
+        let pending = PendingGuestGrant {
+            txn,
+            fault_va: fault,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: residency(),
+        };
+        let untouched = resolver.buf.lock().clone();
+        assert!(ledger.submit(&slots, 4, pending));
+        assert!(!ledger.submit(&slots, 4, pending), "one grant per slot");
+        assert_eq!(*resolver.buf.lock(), untouched, "the host stored nothing");
+
+        // Until EL1 publishes, a fault in the span retries on the host.
+        assert!(guest_descriptor_edit_in_flight(
+            Some(&slots),
+            MM,
+            VA + 0x3abc
+        ));
+        assert!(!guest_descriptor_edit_in_flight(Some(&slots), MM + 1, VA));
+        assert!(!guest_descriptor_edit_in_flight(
+            Some(&slots),
+            MM,
+            VA + 4 * 4096
+        ));
+        assert!(!guest_descriptor_edit_in_flight(None, MM, VA));
+        let mut commits = Vec::new();
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+                .unwrap(),
+            0
+        );
+        assert!(commits.is_empty(), "no residency before the receipt");
+
+        let receipt = el1_apply(&resolver, &slots, 4).expect("EL1 claims its MM's work");
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        assert!(!guest_descriptor_edit_in_flight(Some(&slots), MM, fault));
+        // Another MM's boundary never settles this MM's receipt.
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM + 1, settle_with(&authority, &mut commits))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+                .unwrap(),
+            1
+        );
+        assert_eq!(commits, vec![(pending, PageSpan::new(fault, 4096))]);
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(fault)),
+            Some(Some(IPA + 2 * 4096))
+        );
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(VA)),
+            Some(None),
+            "the rest of the grant stays prepared"
+        );
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+                .unwrap(),
+            0,
+            "a receipt settles exactly once"
+        );
+        assert!(ledger.submit(&slots, 4, pending), "the slot is free again");
+    }
+
+    #[test]
+    fn refused_or_indeterminate_guest_grants_never_commit_residency() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        let pending = PendingGuestGrant {
+            txn,
+            fault_va: VA,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: residency(),
+        };
+        assert!(ledger.submit(&slots, 0, pending));
+        el1_apply(&resolver, &slots, 0).unwrap();
+        let mut commits = Vec::new();
+        ledger
+            .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+            .unwrap();
+        commits.clear();
+
+        // Planned against one graph, executed against a changed one: EL1
+        // refuses whole and nothing is committed.
+        let protect = authority
+            .prepare_guest_descriptor_txn(
+                nz(MM),
+                DescriptorOp::Protect(GuestPermissionEdit {
+                    va: VA,
+                    len: 4 * 4096,
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                }),
+            )
+            .unwrap();
+        let retire = authority
+            .prepare_guest_descriptor_txn(nz(MM), DescriptorOp::Retire(PageSpan::new(VA, 4096)))
+            .unwrap();
+        assert!(ledger.submit(
+            &slots,
+            1,
+            PendingGuestGrant {
+                txn: retire,
+                ..pending
+            }
+        ));
+        el1_apply(&resolver, &slots, 1).unwrap();
+        ledger
+            .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+            .unwrap();
+        assert!(ledger.submit(
+            &slots,
+            2,
+            PendingGuestGrant {
+                txn: protect,
+                ..pending
+            }
+        ));
+        let refused = el1_apply(&resolver, &slots, 2).unwrap();
+        assert_eq!(
+            refused.outcome,
+            DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+        );
+        let mut outcomes = Vec::new();
+        ledger
+            .settle_ready(&slots, MM, |pending, receipt| {
+                let outcome = settle_guest_frame_grant(
+                    pending,
+                    &receipt,
+                    |txn, receipt| {
+                        authority
+                            .settle_guest_descriptor_receipt(txn, receipt)
+                            .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+                    },
+                    |_, _| panic!("a refused transaction must not commit"),
+                );
+                if let Ok(settled) = outcome {
+                    outcomes.push(settled);
+                }
+                Ok::<_, TrapError>(GuestGrantSettlement::Refused(DescriptorRefusal::Contended))
+            })
+            .unwrap();
+        assert!(outcomes.contains(&GuestGrantSettlement::Refused(
+            DescriptorRefusal::NotPrivateAnonymous
+        )));
+
+        // An indeterminate rollback fails stopped.
+        let indeterminate = DescriptorReceipt {
+            id: txn.id,
+            digest: txn.digest(),
+            outcome: DescriptorOutcome::Indeterminate(DescriptorRefusal::Contended),
+        };
+        assert!(
+            settle_guest_frame_grant(
+                pending,
+                &indeterminate,
+                |_, _| panic!("never verified"),
+                |_, _| panic!("never committed"),
+            )
+            .is_err()
+        );
+        // An applied receipt that does not authenticate fails stopped too.
+        let forged = DescriptorReceipt {
+            id: txn.id,
+            digest: txn.digest() ^ 1,
+            outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                pages: 4,
+                resident: PageSpan::new(VA, 4096),
+                tables_linked: 0,
+                live_stores: 1,
+                flush_required: true,
+            }),
+        };
+        assert!(
+            settle_guest_frame_grant(
+                pending,
+                &forged,
+                |txn, receipt| {
+                    authority
+                        .settle_guest_descriptor_receipt(txn, receipt)
+                        .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+                },
+                |_, _| panic!("never committed"),
+            )
+            .is_err()
+        );
     }
 }
