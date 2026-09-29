@@ -38,7 +38,7 @@ At refresh, the implementation baseline on local `main` and local
 remote-tracking `origin/main` is `a70b40466`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
 Batch 3 is on `integ/batch3`, unlanded. Its current implementation correction
-is `3981c0366`; the signed scheduler regression source is `0542e2d2f`
+is `99c8cd5ac`; the broader signed EL1 regression source is `40a707ba0`
 (subsequent receipt-only commits may follow). All twelve active
 batch/memory/IPC/sigsuspend worktrees inventoried below were clean at the
 initial refresh inspection; only batch 3 has been advanced in this goal.
@@ -88,7 +88,7 @@ do not overwrite it with that branch's pre-refresh controller.
 
 | Worktree / branch | Head | Disposition |
 |---|---|---|
-| `wt-batch3` / `integ/batch3` | `0542e2d2f` signed source | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
+| `wt-batch3` / `integ/batch3` | `40a707ba0` signed source | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
 | `wt-cp2-descr` / `work/cp2-el1-descriptor-owner` | `c555f5dd1` | Review candidate; 9 signed filters and first-touch slopes 0.004–0.009 are handoff claims |
 | `wt-cp2-cow` / `work/cp2-hvf-cow-adapters` | `d581dd099` | Ancestry-confirmed in descriptor branch; do not merge it a second time |
 | `wt-cp2-return` / `work/cp2-elastic-return` | `8f268dee4` | Review candidate; scoped grant/return accounting and signed green are handoff claims |
@@ -145,6 +145,16 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   signed `el1_sched` tests at `0542e2d2f` passed, with negative entitlement
   control and zero scoped leftovers. This is regression evidence; signed
   deterministic interleaving and WorkObservation bindings remain open.
+- [x] Preserve identity at the earlier core publication boundary (`99c8cd5ac`):
+  three red-first callback/returned-batch/executor-take witnesses. Core 53,
+  EL1 host-test 74, kernel/semantics 2,459, serial-host 109 and runtime 630
+  passed (existing ignores unchanged). At `40a707ba0`, all 49 selected signed
+  EL1 executions across nine executables passed, with negative control and
+  zero scoped leftovers. Clippy and lint passed. These are regression receipts,
+  not historical attribution or deterministic signed-interleaving closure.
+- [ ] Complete the producer lifetime audit: RecordRef preserves identity but
+  does not grant exclusive record-field access; inspect post-Host publication
+  writes, cancellation and scheduler handback wakes.
 - [ ] Reduce Python's `SnapshotRestoreFailed`: record 1/incarnation 35925 was
   `Parked { seq: 17965 }` during host materialization; subsequent MM cleanup
   aborted. Compare against main before calling it a batch regression.
