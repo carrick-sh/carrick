@@ -561,7 +561,7 @@ impl DentryCache {
                 // OLD name to the kept object, and the new name could mint a
                 // second `DentryId` for the same inode. So `entries` and
                 // `path_to_dir_id` are dropped in full here, with no
-                // exception for kept dirs; only ROOT's fixed "/"/"" mapping
+                // exception for kept dirs; only ROOT's fixed "/"/"" entry
                 // survives (ROOT's path can never change).
                 entries.clear();
                 self.inodes.write().clear();
@@ -1568,8 +1568,8 @@ impl DentryCache {
                 // If this id was still parked in `orphaned_dirs` (kept
                 // across a foreign bump but never rediscovered by name
                 // before its pin dropped and it aged out here), drop that
-                // mapping too so a later coincidental (dev, ino) match
-                // never finds a dangling id.
+                // record too so a later coincidental (dev, ino) match never
+                // finds a dangling id.
                 self.orphaned_dirs
                     .write()
                     .remove(&InodeIdentity::new(dir.dev, dir.ino));
