@@ -743,7 +743,7 @@ pub struct KernelDebugSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_absent: Option<bool>,
     /// What is WRONG with this graph, projected from a
-    /// [`SnapshotFinding`](super::super::snapshot::SnapshotFinding) capture
+    /// [`SnapshotFinding`] capture
     /// instead of the served strict path. Empty for an ordinary coherent
     /// snapshot; non-empty means the runtime already knew this graph violates
     /// an invariant and is reporting it rather than refusing the whole
