@@ -323,6 +323,172 @@ where
     )
 }
 
+/// Result of draining one MM's host descriptor submissions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// Nothing was submitted for the MM.
+    Clean,
+    /// This many submissions were applied (each answered with a receipt).
+    Drained(u32),
+    /// Submissions remain and this vCPU may not edit the MM now: the MM is
+    /// unpublished, or a host pause closed its gate without delegating.
+    Blocked,
+}
+
+/// Apply every submission for `mm_key` on the live graph `ttbr0` names.
+///
+/// With the MM's gate open, the exact editor is claimed first, waiting out
+/// another EL1 editor (a bounded critical section: EL1 editors never block
+/// on anything). `host_custody` is set only by the host-driven drain call:
+/// the host holds this MM's pause, has excluded every EL1 editor, and
+/// delegates the edit to this vCPU, so a closed gate is its custody rather
+/// than a refusal.
+pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
+    spaces: &AddressSpaces,
+    slots: &carrick_el1_abi::DescriptorTxnSlots,
+    mm_key: u64,
+    ttbr0: u64,
+    owner: NonZeroU64,
+    applier: &mut X,
+    host_custody: bool,
+) -> DrainOutcome {
+    if mm_key == 0 || slots.submitted_for(mm_key).next().is_none() {
+        return DrainOutcome::Clean;
+    }
+    let Some(index) = spaces.find(mm_key) else {
+        return DrainOutcome::Blocked;
+    };
+    let apply_all = |applier: &mut X| {
+        let mut applied = 0;
+        for slot in slots.submitted_for(mm_key) {
+            if applier.apply(slot, mm_key, ttbr0).is_some() {
+                applied += 1;
+            }
+        }
+        DrainOutcome::Drained(applied)
+    };
+    loop {
+        if spaces.grant(index, mm_key).is_none() {
+            return if host_custody {
+                apply_all(applier)
+            } else {
+                DrainOutcome::Blocked
+            };
+        }
+        if let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) {
+            return apply_all(applier);
+        }
+        if slots.submitted_for(mm_key).next().is_none() {
+            // The other editor applied them.
+            return DrainOutcome::Drained(0);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn is_syscall(frame: &TrapFrame) -> bool {
+    (frame.esr >> 26) & 0x3f == 0x15
+}
+
+/// The last EL1 step before a thread of an MM returns to EL0 (a served
+/// syscall, fault or interrupt, including a thread the scheduler switched
+/// in, whose record the slot's task now names), and before a kicked
+/// interrupt leaves for the host: apply that MM's pending descriptor
+/// submissions, so no instruction of the MM runs against a descriptor edit
+/// the host already committed to (a fork-COW arm above all). When they
+/// cannot be applied here, the thread leaves through the host instead:
+/// a served syscall keeps its result (`ServedWithWork`), anything else
+/// forwards.
+pub fn drain_before_el0<X: DescriptorTxnApplier>(
+    frame: &TrapFrame,
+    action: Action,
+    current_tasks: &[CurrentTask],
+    spaces: &AddressSpaces,
+    slots: &carrick_el1_abi::DescriptorTxnSlots,
+    applier: &mut X,
+) -> Action {
+    let to_el0 = matches!(action, Action::Served | Action::ServedWithWork);
+    let kicked = action == Action::Forward && frame.esr == 0;
+    if !(to_el0 || kicked) {
+        return action;
+    }
+    let Some(task) = current_tasks.get(frame.slot as usize) else {
+        return action;
+    };
+    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    if mm_key == 0 || slots.submitted_for(mm_key).next().is_none() {
+        return action;
+    }
+    let (Some(owner), Some(index)) = (NonZeroU64::new(frame.slot + 1), spaces.find(mm_key)) else {
+        return action;
+    };
+    let outcome = match spaces.grant(index, mm_key) {
+        Some(grant) => {
+            drain_mm_descriptor_txns(spaces, slots, mm_key, grant.ttbr0, owner, applier, false)
+        }
+        None => DrainOutcome::Blocked,
+    };
+    match (outcome, action) {
+        (DrainOutcome::Blocked, Action::Served | Action::ServedWithWork) if is_syscall(frame) => {
+            Action::ServedWithWork
+        }
+        (DrainOutcome::Blocked, Action::Served) => Action::Forward,
+        _ => action,
+    }
+}
+
+/// EL1 side of the host-driven drain call ([`carrick_el1_abi::DESCRIPTOR_DRAIN_ESR`]).
+/// Answers in `frame.x[0]`: applied count, plus the blocked bit.
+pub fn serve_host_drain<X: DescriptorTxnApplier>(
+    frame: &mut TrapFrame,
+    spaces: &AddressSpaces,
+    slots: &carrick_el1_abi::DescriptorTxnSlots,
+    applier: &mut X,
+) {
+    let mm_key = frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM];
+    let ttbr0 = frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_TTBR0];
+    let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+        frame.x[0] = carrick_el1_abi::DESCRIPTOR_DRAIN_BLOCKED;
+        return;
+    };
+    frame.x[0] = match drain_mm_descriptor_txns(spaces, slots, mm_key, ttbr0, owner, applier, true)
+    {
+        DrainOutcome::Clean => 0,
+        DrainOutcome::Drained(applied) => u64::from(applied),
+        DrainOutcome::Blocked => carrick_el1_abi::DESCRIPTOR_DRAIN_BLOCKED,
+    };
+}
+
+/// Hardware entry of [`drain_before_el0`] (`carrick_el1_syscall`).
+#[cfg(target_os = "none")]
+pub fn drain_before_el0_hw(frame: &TrapFrame, action: Action) -> Action {
+    let current_tasks = unsafe {
+        &*(carrick_el1_abi::EL1_CURRENT_TASKS_BASE
+            as *const [CurrentTask; carrick_el1_abi::EL1_STACK_SLOTS as usize])
+    };
+    let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+    drain_before_el0(
+        frame,
+        action,
+        current_tasks,
+        &zone.spaces,
+        carrick_el1_abi::descriptor_txn_slots_guest(),
+        &mut HardwareDescriptorTxnApplier,
+    )
+}
+
+/// Hardware entry of [`serve_host_drain`] (`carrick_el1_syscall`).
+#[cfg(target_os = "none")]
+pub fn serve_host_drain_hw(frame: &mut TrapFrame) {
+    let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+    serve_host_drain(
+        frame,
+        &zone.spaces,
+        carrick_el1_abi::descriptor_txn_slots_guest(),
+        &mut HardwareDescriptorTxnApplier,
+    );
+}
+
 /// Dispatch an EL0 data abort at EL1.
 ///
 /// Increments `counters.fault_taken`; at EL1, requests host-published bulk
@@ -1259,6 +1425,280 @@ mod tests {
                 DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot)
             );
             assert!(applier.invalidated.borrow().is_empty());
+        }
+
+        /// A resident writable page at `VA` and a fork arm for it.
+        fn armable() -> (Arena, DescriptorTxn) {
+            use carrick_mmu_core::aarch64::descriptor_txn::ForkArmMode;
+            let arena = Arena::new();
+            let idx = indices(VA);
+            // Resident, writable, nG, EL1-private leaf.
+            let leaf = (IPA & 0x0000_FFFF_FFFF_F000)
+                | 0b11
+                | (1 << 10)
+                | (0b11 << 8)
+                | (0b01 << 6)
+                | (1 << 11)
+                | (1 << 53)
+                | (1 << 54)
+                | (1 << 56)
+                | (1 << 57);
+            arena.words[1536 + idx[3]].store(leaf, Ordering::Relaxed);
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(77),
+                    generation: nz(9),
+                },
+                root: SubstrateGpa(ROOT),
+                op: DescriptorOp::ForkArm {
+                    span: PageSpan::new(VA, 4096),
+                    arm: ForkArmMode {
+                        kernel_only: false,
+                        executable: false,
+                        asid_scoped: true,
+                        excluded_ipa: 0,
+                        excluded_len: 0,
+                    },
+                },
+                tables: TableGrants::NONE,
+            };
+            (arena, txn)
+        }
+
+        fn writable(arena: &Arena) -> bool {
+            carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
+                arena.leaf(VA),
+                LeafAccess::Write,
+            )
+        }
+
+        fn task(mm: u64) -> CurrentTask {
+            let task = CurrentTask::new();
+            task.zone_mm.store(mm, Ordering::Release);
+            task
+        }
+
+        fn frame(esr: u64) -> TrapFrame {
+            TrapFrame {
+                esr,
+                slot: 0,
+                ..TrapFrame::default()
+            }
+        }
+
+        const SVC: u64 = 0x15 << 26;
+
+        #[test]
+        fn a_served_syscall_drains_its_mms_arm_before_returning_to_el0() {
+            let (arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(3, &txn));
+            let spaces = published_space(77, ROOT | ASID);
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            assert!(writable(&arena));
+            assert_eq!(
+                drain_before_el0(
+                    &frame(SVC),
+                    Action::Served,
+                    &[task(77)],
+                    &spaces,
+                    &slots,
+                    &mut applier
+                ),
+                Action::Served
+            );
+            assert!(!writable(&arena), "the arm landed before EL0 resumes");
+            assert_eq!(*applier.invalidated.borrow(), vec![ROOT | ASID]);
+            assert!(slots.take_receipt(3, txn.id).is_some());
+        }
+
+        #[test]
+        fn a_kicked_sibling_cannot_resume_el0_before_the_arm_lands() {
+            // Kick: the sibling leaves for the host, arm applied on the way.
+            let (arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(0, &txn));
+            let spaces = published_space(77, ROOT | ASID);
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            assert_eq!(
+                drain_before_el0(
+                    &frame(0),
+                    Action::Forward,
+                    &[task(77)],
+                    &spaces,
+                    &slots,
+                    &mut applier
+                ),
+                Action::Forward
+            );
+            assert!(!writable(&arena));
+            // Reschedule/timer interrupt served in EL1: drained before eret.
+            let (arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(0, &txn));
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            assert_eq!(
+                drain_before_el0(
+                    &frame(0),
+                    Action::Served,
+                    &[task(77)],
+                    &spaces,
+                    &slots,
+                    &mut applier
+                ),
+                Action::Served
+            );
+            assert!(!writable(&arena));
+            // A parked thread's idle exit is not a return to EL0.
+            let (arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(0, &txn));
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            assert_eq!(
+                drain_before_el0(
+                    &frame(SVC),
+                    Action::Idle,
+                    &[task(77)],
+                    &spaces,
+                    &slots,
+                    &mut applier
+                ),
+                Action::Idle
+            );
+            assert!(writable(&arena));
+        }
+
+        #[test]
+        fn a_blocked_drain_never_returns_to_el0_unarmed() {
+            let (arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(0, &txn));
+            let closed = AddressSpaces::new();
+            closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            let tasks = [task(77)];
+            assert_eq!(
+                drain_before_el0(
+                    &frame(SVC),
+                    Action::Served,
+                    &tasks,
+                    &closed,
+                    &slots,
+                    &mut applier
+                ),
+                Action::ServedWithWork,
+                "a served syscall keeps its result and leaves through the host"
+            );
+            assert_eq!(
+                drain_before_el0(
+                    &frame(0),
+                    Action::Served,
+                    &tasks,
+                    &closed,
+                    &slots,
+                    &mut applier
+                ),
+                Action::Forward
+            );
+            let fault = (0x24 << 26) | 0x07;
+            assert_eq!(
+                drain_before_el0(
+                    &frame(fault),
+                    Action::Served,
+                    &tasks,
+                    &closed,
+                    &slots,
+                    &mut applier
+                ),
+                Action::Forward
+            );
+            assert!(writable(&arena), "nothing applied behind a closed gate");
+        }
+
+        #[test]
+        fn a_switched_in_thread_drains_only_its_own_mm() {
+            let (arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            let other = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(78),
+                    generation: nz(1),
+                },
+                ..txn
+            };
+            assert!(slots.submit(1, &other));
+            let spaces = AddressSpaces::new();
+            for (mm, root) in [(77, ROOT), (78, ROOT)] {
+                let index = spaces.publish_closed(mm, root | ASID, root | ASID).unwrap();
+                spaces.open(index);
+            }
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            // The slot's task record names the switched-in thread (MM 77).
+            assert_eq!(
+                drain_before_el0(
+                    &frame(SVC),
+                    Action::Served,
+                    &[task(77)],
+                    &spaces,
+                    &slots,
+                    &mut applier
+                ),
+                Action::Served
+            );
+            assert_eq!(
+                slots.submitted_for(78).count(),
+                1,
+                "MM 78 waits for its own thread"
+            );
+            assert!(writable(&arena));
+        }
+
+        #[test]
+        fn the_host_drain_applies_under_delegated_custody_only_for_its_mm() {
+            let (arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(5, &txn));
+            // The host holds the MM's pause: the gate is closed.
+            let closed = AddressSpaces::new();
+            closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
+            let mut applier = ArenaApplier {
+                arena: &arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            let mut call = TrapFrame {
+                esr: carrick_el1_abi::DESCRIPTOR_DRAIN_ESR,
+                slot: 5,
+                ..TrapFrame::default()
+            };
+            call.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM] = 78;
+            call.x[carrick_el1_abi::DESCRIPTOR_DRAIN_TTBR0] = ROOT | ASID;
+            serve_host_drain(&mut call, &closed, &slots, &mut applier);
+            assert_eq!(call.x[0], 0, "another MM's call applies nothing");
+            assert!(writable(&arena));
+            call.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM] = 77;
+            serve_host_drain(&mut call, &closed, &slots, &mut applier);
+            assert_eq!(call.x[0], 1);
+            assert!(!writable(&arena));
+            let receipt = slots.take_receipt(5, txn.id).unwrap();
+            assert!(txn.verify_receipt(&receipt).is_ok());
         }
     }
 }
