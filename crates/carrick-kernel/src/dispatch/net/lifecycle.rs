@@ -1750,13 +1750,26 @@ mod icmp_ping_tests {
 
     #[test]
     fn bind_zero_skips_host_occupied_ephemeral_candidate_without_leaking_lease() {
+        // The "occupied candidate" must be a port this process can prove is
+        // exclusively its own on the real host, not a hardcoded literal like
+        // the old `32768`: that value is also `EPHEMERAL_PORT_START`, the
+        // deterministic first candidate a fresh registry always tries, so
+        // any other test in this binary (including a concurrently run copy
+        // of this very test) racing its own ephemeral bind(0) for the same
+        // literal first pick can win the real host bind before this one --
+        // reproduced at ~58% under concurrent self-invocation. Let the OS
+        // assign the port instead (bind to 0, read back via getsockname; the
+        // kernel guarantees no other bind(0) can be handed the same port
+        // while this socket holds it), then seed the allocator via the
+        // test-only seam so the dispatcher's first candidate deterministically
+        // lands on that exact, genuinely-occupied port.
         let blocker = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(blocker >= 0);
         let blocker_addr = libc::sockaddr_in {
             #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
             sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
             sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: 32768u16.to_be(),
+            sin_port: 0,
             sin_addr: libc::in_addr {
                 s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
             },
@@ -1772,8 +1785,27 @@ mod icmp_ping_tests {
             },
             0
         );
+        let mut bound_blocker_addr = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
+        let mut bound_blocker_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockname(
+                    blocker,
+                    bound_blocker_addr.as_mut_ptr() as *mut libc::sockaddr,
+                    &mut bound_blocker_len,
+                )
+            },
+            0
+        );
+        let blocker_port = u16::from_be(unsafe { bound_blocker_addr.assume_init() }.sin_port);
 
         let mut dispatcher = SyscallDispatcher::new();
+        let scope = crate::network::inzone::InZoneScope::CarrierHost;
+        dispatcher
+            .network
+            .provider
+            .inzone()
+            .set_next_ephemeral_candidate_for_test(&scope, blocker_port);
         let reporter = CompatReporter::default();
         let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
         let fd = match dispatcher
@@ -1806,13 +1838,12 @@ mod icmp_ping_tests {
                 .unwrap(),
             DispatchOutcome::Returned { value: 0 }
         );
-        let scope = crate::network::inzone::InZoneScope::CarrierHost;
         assert!(
             !dispatcher
                 .network
                 .provider
                 .inzone()
-                .port_in_use(&scope, 32768),
+                .port_in_use(&scope, blocker_port),
             "failed candidate lease leaked"
         );
         memory.write_bytes(0x4020, &16u32.to_ne_bytes()).unwrap();
@@ -1831,7 +1862,7 @@ mod icmp_ping_tests {
             DispatchOutcome::Returned { value: 0 }
         );
         let bound = memory.read_bytes(0x4010, 16).unwrap();
-        assert_ne!(u16::from_be_bytes([bound[2], bound[3]]), 32768);
+        assert_ne!(u16::from_be_bytes([bound[2], bound[3]]), blocker_port);
 
         let explicit_fd = match dispatcher
             .dispatch(
@@ -1848,7 +1879,7 @@ mod icmp_ping_tests {
             DispatchOutcome::Returned { value } => value,
             other => panic!("second socket failed: {other:?}"),
         };
-        guest_addr[2..4].copy_from_slice(&32768u16.to_be_bytes());
+        guest_addr[2..4].copy_from_slice(&blocker_port.to_be_bytes());
         memory.write_bytes(0x4000, &guest_addr).unwrap();
         assert_eq!(
             dispatcher
