@@ -269,6 +269,13 @@ pub trait KernelAuditor: Send + Sync {
         AuditVerdict::Continue
     }
 
+    /// Slot evacuation released its queue locks and retained these exact
+    /// records. Deferred liveness filtering and publication have not run.
+    /// Called through the current carrier scheduler's kernel auditor chain.
+    fn zone_handbacks_captured(&self, _records: &[carrick_el1_abi::RecordRef]) -> AuditVerdict {
+        AuditVerdict::Continue
+    }
+
     fn reaped(&self, _parent: TaskKey, _child: TaskKey) -> AuditVerdict {
         AuditVerdict::Continue
     }
@@ -452,6 +459,19 @@ impl AuditorChain {
         }
         for auditor in &self.auditors {
             let verdict = auditor.child_exit_notification_captured(parent);
+            if !verdict.is_continue() {
+                return self.check_or_record(verdict);
+            }
+        }
+        AuditVerdict::Continue
+    }
+
+    pub fn zone_handbacks_captured(&self, records: &[carrick_el1_abi::RecordRef]) -> AuditVerdict {
+        if let Some(reason) = self.abort_reason() {
+            return AuditVerdict::Abort(reason);
+        }
+        for auditor in &self.auditors {
+            let verdict = auditor.zone_handbacks_captured(records);
             if !verdict.is_continue() {
                 return self.check_or_record(verdict);
             }

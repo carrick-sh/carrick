@@ -743,9 +743,19 @@ impl HvpatchRuntimeDirectory {
             carrick_vmm_hvf::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
         }));
         let scheduler = Arc::downgrade(&services.scheduler);
-        carrick_kernel::el1_zone::register_handback_publisher(Box::new(move |record| {
+        carrick_kernel::el1_zone::register_handback_publisher(Arc::new(move |event| {
             if let Some(scheduler) = scheduler.upgrade() {
-                scheduler.publish_zone_handback(record);
+                match event {
+                    carrick_kernel::el1_zone::HandbackEvent::DeferredCaptured(records) => {
+                        let _ = scheduler
+                            .kernel()
+                            .auditors()
+                            .zone_handbacks_captured(records);
+                    }
+                    carrick_kernel::el1_zone::HandbackEvent::Ready(record) => {
+                        scheduler.publish_zone_handback(record);
+                    }
+                }
             }
         }));
         // One `M` per `P` (guest CPU): see `ExecutorPoolConfig`.
