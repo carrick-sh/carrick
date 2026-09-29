@@ -38,10 +38,13 @@ At refresh, the implementation baseline on local `main` and local
 remote-tracking `origin/main` is `a70b40466`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
 Batch 3 is on `integ/batch3`, unlanded. Its current implementation correction
-is `276e05673`; its request-lifetime checkpoint has VM-free proof only.
-Two further red-first EL1 re-park witnesses at `fb265ba9b` show that a
-pending cancellation or signal can be stranded by a new park; the retained
-`repark-requests/` receipt is the next repair boundary.
+is `0e1d7c12c`; its request-lifetime checkpoint has VM-free proof only.
+Two red-first EL1 re-park witnesses at `fb265ba9b` showed that cancellation
+or signal could be stranded by a new park. Atomic OnCpuRequested admission
+now prevents that overwrite and rolls back the unpublished wait on refusal.
+Core 65, EL1 host 76, ABI 32, kernel/semantics 2,459, serial kernel 109 and
+runtime 630 passed; affected Clippy, registry, lint and contract coverage
+passed. See `repark-requests/` for exact logs and acceptance limits.
 The prior broader signed EL1 regression source is `40a707ba0`
 (subsequent receipt-only commits may follow). All twelve active
 batch/memory/IPC/sigsuspend worktrees inventoried below were clean at the

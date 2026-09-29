@@ -91,3 +91,13 @@ Affected all-target Clippy with warnings denied and the 68-contract registry
 passed. Logs are retained here. Signed guest proof remains outstanding.
 This does not close the retirement/restore lifetime audit, exact scheduler
 wakes, park-sequence wrap, WorkObservation or full task-A acceptance.
+
+Implementation: `0e1d7c12c`. Clean compiler provenance: `b6810c6e8`.
+All 595 census rows and pinned positions remained unchanged. lint-domains
+passed for the macOS subset; Linux/FreeBSD/NetBSD profiles remain pending.
+Contract-change initially identified omitted futex, deferred-lifetime and
+shared-ABI evidence registrations. Binding-only commits `ed32f941d` and
+`666f568c7` supply those mappings; the exact `afcf8676e..666f568c7` coverage
+gate and final 68-contract registry passed. Both diagnostics and final
+coverage log are retained. ABI bindings claim image identity checks only,
+not fresh signed acceptance for GIC/fault/metadata/stage-1 behavior.
