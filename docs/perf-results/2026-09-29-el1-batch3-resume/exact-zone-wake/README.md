@@ -44,3 +44,20 @@ Serial kernel passed 109 (four nested child executions); runtime passed 630
 (eight existing ignores and one nested child execution). Affected all-target
 Clippy with warnings denied passed, and registry validation passed all 68
 contracts. Fresh signed proof remains outstanding for this scheduler change.
+
+## Review follow-up
+
+Preserve the original direct-adoption ordering: reserve zone_adopt before
+prepare_zone_handback publishes readiness (that publication may notify a
+consumer), and remove the reservation if preparation declines the record.
+All three focused controls and a final full kernel/semantics run passed:
+2,462 tests in 21 binaries, one existing ignore. Final affected all-target
+Clippy passed. The earlier runtime/serial receipts precede this ordering-only
+follow-up; fresh signed validation of the final scheduler source is pending.
+
+The contract coverage checker also guessed descriptor filenames from IDs,
+missing three scheduler files. `dee7f08a1` matches the actual parsed path.
+Two red-first fixture cases prove both correct descriptor acceptance and
+rejection of unrelated suffix-lookalike files; all 11 checker tests pass.
+The first new fixture inherited another undeclared surface contract; its
+failure is retained and the final fixtures isolate the contract they test.
