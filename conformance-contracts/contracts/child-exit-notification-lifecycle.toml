@@ -9,11 +9,11 @@ structural_budgets = []
 rationale = "A child-exit notification captured before its parent exits may arrive after that parent is reaped. The delayed scheduler nudge must authenticate the exact task, thread and execution generation, without waking a successor or aborting the carrier. Durable child waitability and wait-subscription publication remain authoritative. The correction adds no polling, retry or population scan."
 
 [bindings]
-embed = "carrick-embed::el1_sched_delayed_notification_survives_parent_reap (registered candidate; signed execution and pre-fix discrimination pending)"
+embed = "carrick-embed::el1_sched_delayed_notification_survives_parent_reap (signed source 2e6e3794a; exact captured/reaped/released ordering, zero reaped wake attempts; controlled pre-fix method fails with one rejection)"
 vm_free = "carrick-runtime::vcpu_loop::wait_wake::tests::child_exit_notification_snapshot_cannot_wake_a_reaped_parent"
 
 [bindings.unresolved]
-embed_structural = "The delayed-parent fixture is registered but not yet executed signed; no structural observation is registered."
-signed_acceptance = "The deterministic captured/reaped/released fixture is implemented but has not run signed or demonstrated a pre-fix red. Historical otmpfileforkexec attribution remains separate."
+embed_structural = "The deterministic signed lifecycle fixture passes and rejects the pre-fix method; a scoped structural observation is still not registered."
+historical_attribution = "Signed producer-specific red/green is established; attribution of the original otmpfileforkexec failure to this producer remains unproven."
 docker = "The delayed host notification interleaving is internal; pinned Linux fork/exec/wait probe output remains the guest semantic control."
 observation = "The VM-free regression asserts no reaped-task auditor abort. Live notification queueing is covered by hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation. WorkObservation and deterministic work-counter bindings remain pending; empty budgets do not confer structural acceptance."
