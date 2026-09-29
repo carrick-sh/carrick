@@ -319,6 +319,9 @@ impl Reservations<'_> {
     fn state_mut(&mut self) -> &mut State {
         unsafe { (&mut *self.root.state.get()).assume_init_mut() }
     }
+    pub fn mm(&self) -> ReservationMm {
+        self.mm
+    }
     pub fn generation(&self) -> ReservationGeneration {
         ReservationGeneration::new(self.state().generation).expect("published generation")
     }
@@ -1316,9 +1319,15 @@ mod tests {
                     };
                     frame.x[8] = 222;
                     frame.x[..6].copy_from_slice(&[0x100000, 4096, 3, 0x32, u64::MAX, 0]);
+                    let current = CurrentTask::new();
+                    current.task_id.store(slot as u64 + 1, Ordering::Relaxed);
+                    current.thread_serial.store(11, Ordering::Relaxed);
+                    current.zone_mm.store(mm.raw(), Ordering::Relaxed);
                     let before = counters.served[222].load(Ordering::Relaxed);
                     let AnonymousReservationRoute::Work(mut pending) =
-                        dispatch_anonymous_with_reservations(&mut frame, &counters, &mut model)
+                        dispatch_anonymous_with_reservations(
+                            &mut frame, &counters, &current, &mut model,
+                        )
                     else {
                         panic!("expected shared decision")
                     };
@@ -1335,7 +1344,7 @@ mod tests {
                     }
                     .unwrap();
                     pending
-                        .complete(&mut frame, &counters, &mut model, receipt)
+                        .complete(&mut frame, &current, &counters, &mut model, receipt)
                         .unwrap();
                     assert_eq!(frame.x[0], 0x100000);
                     assert_eq!(counters.served[222].load(Ordering::Relaxed), before + 1);
@@ -1350,6 +1359,64 @@ mod tests {
             assert_eq!(counters.forwarded[222].load(Ordering::Relaxed), 0);
         }
     }
+    #[test]
+    fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
+        use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+        let table = table();
+        let mm = ReservationMm::new(17).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut model = table.lock(0, mm).unwrap();
+        model.finish_import().unwrap();
+        let current = CurrentTask::new();
+        current.task_id.store(1, Ordering::Relaxed);
+        current.thread_serial.store(11, Ordering::Relaxed);
+        current.zone_mm.store(mm.raw(), Ordering::Relaxed);
+        let counters = Counters::default();
+        let mut frame = TrapFrame::default();
+        frame.x[8] = 222;
+        frame.x[..6].copy_from_slice(&[0x100000, 4096, 3, 0x32, u64::MAX, 0]);
+        let AnonymousReservationRoute::Work(mut pending) =
+            dispatch_anonymous_with_reservations(&mut frame, &counters, &current, &mut model)
+        else {
+            panic!()
+        };
+        let receipt = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                pending.request(),
+                ReservationBackingReceipt {
+                    receipt: 1,
+                    granted_bytes: 4096,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        current.thread_serial.store(12, Ordering::Relaxed);
+        assert_eq!(
+            pending.complete(&mut frame, &current, &counters, &mut model, receipt),
+            Err(Refusal::Stale)
+        );
+        assert!(model.mapping(0x100000).is_none());
+        assert_eq!(counters.served[222].load(Ordering::Relaxed), 0);
+        current.thread_serial.store(11, Ordering::Relaxed);
+        frame.slot = 7; // The original thread may resume on a different vCPU.
+        pending
+            .complete(&mut frame, &current, &counters, &mut model, receipt)
+            .unwrap();
+        assert_eq!(counters.served[222].load(Ordering::Relaxed), 1);
+        let AnonymousReservationRoute::Work(mut pending) =
+            dispatch_anonymous_with_reservations(&mut frame, &counters, &current, &mut model)
+        else {
+            panic!()
+        };
+        pending
+            .refuse(&mut frame, &current, &counters, &mut model)
+            .unwrap();
+        assert_eq!(frame.x[0] as i64, -12);
+        assert_eq!(counters.served[222].load(Ordering::Relaxed), 2);
+        assert_eq!(counters.forwarded[222].load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn reservation_fragmented_edits_match_page_reference_and_reused_mm_is_stale() {
         let table = table();
