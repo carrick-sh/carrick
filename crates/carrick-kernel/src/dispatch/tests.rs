@@ -4531,7 +4531,7 @@ mod hvpatch_in_process_fork_tests {
         parent.mark_signal_pending(&parent_context, parent_tid, 15);
         parent.proc.lock().pdeathsig = 9;
         parent.proc.lock().membarrier_ready = u64::MAX;
-        parent.mem().lock().brk_current = 0x1234_0000;
+        parent.mem().lock().seed_brk_current_for_test(0x1234_0000);
 
         let (child, child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 41, 42);
 
@@ -4550,17 +4550,17 @@ mod hvpatch_in_process_fork_tests {
         assert!(child_context.thread().signal_state().pending().is_empty());
         assert_eq!(child.proc.lock().pdeathsig, 0);
         assert_eq!(child.proc.lock().membarrier_ready, 0);
-        assert_eq!(child.mem().lock().brk_current, 0x1234_0000);
+        assert_eq!(child.mem().lock().brk_current(), 0x1234_0000);
 
         child.captured_file_table().write_open_files().remove(&3);
-        child.mem().lock().brk_current = 0x5678_0000;
+        child.mem().lock().seed_brk_current_for_test(0x5678_0000);
         assert!(
             parent
                 .captured_file_table()
                 .read_open_files()
                 .contains_key(&3)
         );
-        assert_eq!(parent.mem().lock().brk_current, 0x1234_0000);
+        assert_eq!(parent.mem().lock().brk_current(), 0x1234_0000);
     }
 
     #[test]
@@ -6253,8 +6253,8 @@ mod container_policy_dispatch_tests {
             "[parent_only]".to_string(),
         );
 
-        let parent_vmas = dispatcher.mem().lock().semantic_vmas.clone();
-        let child_vmas = child_dispatcher.mem().lock().semantic_vmas.clone();
+        let parent_vmas = dispatcher.mem().lock().semantic_vmas_snapshot();
+        let child_vmas = child_dispatcher.mem().lock().semantic_vmas_snapshot();
         assert!(parent_vmas.iter().any(|v| v.path == "[parent_only]"));
         assert!(!child_vmas.iter().any(|v| v.path == "[parent_only]"));
     }
@@ -6464,7 +6464,7 @@ mod container_policy_dispatch_tests {
             let authority = dispatcher.mem();
             let mut state = authority.lock();
             mem::update_semantic_heap_pages(&mut state, heap_base, heap_base + 0x3000);
-            state.brk_current = heap_base + 0x3000;
+            state.seed_brk_current_for_test(heap_base + 0x3000);
         });
         let grown_revision = dispatcher.mem().vma_revision();
         assert!(grown_revision.raw() > initial_revision.raw());
@@ -6490,7 +6490,7 @@ mod container_policy_dispatch_tests {
             let authority = dispatcher.mem();
             let mut state = authority.lock();
             mem::update_semantic_heap_pages(&mut state, heap_base + 0x3000, heap_base + 0x1000);
-            state.brk_current = heap_base + 0x1000;
+            state.seed_brk_current_for_test(heap_base + 0x1000);
         });
         assert!(dispatcher.mem().vma_revision().raw() > grown_revision.raw());
         let shrunk = dispatcher
@@ -6521,7 +6521,7 @@ mod container_policy_dispatch_tests {
         let mut state = authority.lock();
         mem::update_semantic_heap_pages(&mut state, heap_base, heap_base + 0x1000);
         let tail = state
-            .semantic_vmas
+            .semantic_vmas_seed_for_test()
             .iter_mut()
             .find(|vma| vma.start == heap_base && vma.end == heap_base + 0x1000)
             .expect("initial heap VMA");
@@ -6533,8 +6533,8 @@ mod container_policy_dispatch_tests {
 
         mem::update_semantic_heap_pages(&mut state, heap_base + 0x1000, heap_base + 0x3000);
         let grown = state
-            .semantic_vmas
-            .iter()
+            .semantic_vmas_snapshot()
+            .into_iter()
             .find(|vma| vma.start == heap_base + 0x1000 && vma.end == heap_base + 0x3000)
             .expect("new default heap VMA");
         assert!(grown.read);
@@ -6669,7 +6669,7 @@ mod container_policy_dispatch_tests {
         dispatcher
             .mem()
             .lock()
-            .semantic_vmas
+            .semantic_vmas_seed_for_test()
             .push(mem::SemanticVma {
                 start: 0x1001,
                 end: 0x2000,
