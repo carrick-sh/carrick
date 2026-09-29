@@ -2907,6 +2907,20 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         Ok(El1FrameGrantPublished::Unsupported)
     }
 
+    /// The venue that owns this engine's live stage-1 descriptor stores.
+    fn live_descriptor_owner(&self) -> carrick_mmu_core::aarch64::LiveDescriptorOwner {
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Host
+    }
+
+    /// Select the venue that owns this engine's live stage-1 descriptor
+    /// stores. `false`: this backend has no guest-owned lane.
+    fn select_live_descriptor_owner(
+        &mut self,
+        _owner: carrick_mmu_core::aarch64::LiveDescriptorOwner,
+    ) -> bool {
+        false
+    }
+
     /// Authenticate EL1's receipt for a transaction this engine returned and
     /// return its unused table grants. Required before residency commit,
     /// inventory repoint or old-owner retirement.
