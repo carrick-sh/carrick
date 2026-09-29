@@ -3478,18 +3478,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1157 in `run_container_gate`, `std::fs::create_dir_all` accesses only the operator-selected container gate rendezvous directory.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1169 in `run_container_gate`, `std::fs::create_dir_all` accesses only the operator-selected container gate rendezvous directory.",
     "review_id": "HA-000151",
     "source": {
-      "byte_end": 43300,
-      "byte_start": 43282,
+      "byte_end": 43918,
+      "byte_start": 43900,
       "column": 5,
       "column_end": 23,
       "column_start": 5,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1157,
-      "line_end": 1157,
-      "line_start": 1157
+      "line": 1169,
+      "line_end": 1169,
+      "line_start": 1169
     }
   },
   {
@@ -3980,18 +3980,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:483 in `PostMortem::write_to_dir`, `std::fs::create_dir_all` accesses only the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:484 in `PostMortem::write_to_dir`, `std::fs::create_dir_all` accesses only the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
     "review_id": "HA-000646",
     "source": {
-      "byte_end": 20094,
-      "byte_start": 20071,
+      "byte_end": 20138,
+      "byte_start": 20115,
       "column": 9,
       "column_end": 32,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
-      "line": 483,
-      "line_end": 483,
-      "line_start": 483
+      "line": 484,
+      "line_end": 484,
+      "line_start": 484
     }
   },
   {
@@ -9471,18 +9471,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1234 in `run_container_gate`, `std::fs::write` accesses only the operator-selected container gate receipt artifact.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1246 in `run_container_gate`, `std::fs::write` accesses only the operator-selected container gate receipt artifact.",
     "review_id": "HA-000404",
     "source": {
-      "byte_end": 46852,
-      "byte_start": 46843,
+      "byte_end": 47470,
+      "byte_start": 47461,
       "column": 5,
       "column_end": 14,
       "column_start": 5,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1234,
-      "line_end": 1234,
-      "line_start": 1234
+      "line": 1246,
+      "line_end": 1246,
+      "line_start": 1246
     }
   },
   {
@@ -9816,18 +9816,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:487 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem JSON inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:488 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem JSON inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
     "review_id": "HA-000647",
     "source": {
-      "byte_end": 20305,
-      "byte_start": 20291,
+      "byte_end": 20349,
+      "byte_start": 20335,
       "column": 9,
       "column_end": 23,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
-      "line": 487,
-      "line_end": 487,
-      "line_start": 487
+      "line": 488,
+      "line_end": 488,
+      "line_start": 488
     }
   },
   {
@@ -9843,18 +9843,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:496 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:497 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
     "review_id": "HA-000687",
     "source": {
-      "byte_end": 20631,
-      "byte_start": 20617,
+      "byte_end": 20675,
+      "byte_start": 20661,
       "column": 9,
       "column_end": 23,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
-      "line": 496,
-      "line_end": 496,
-      "line_start": 496
+      "line": 497,
+      "line_end": 497,
+      "line_start": 497
     }
   },
   {
@@ -9870,18 +9870,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:505 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem high-rate event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:506 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem high-rate event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
     "review_id": "HA-000648",
     "source": {
-      "byte_end": 21000,
-      "byte_start": 20986,
+      "byte_end": 21044,
+      "byte_start": 21030,
       "column": 9,
       "column_end": 23,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
-      "line": 505,
-      "line_end": 505,
-      "line_start": 505
+      "line": 506,
+      "line_end": 506,
+      "line_start": 506
     }
   },
   {
@@ -10215,18 +10215,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1226 in `run_container_gate`, `std::process::id` accesses only the run-scoped carrier identity recorded in the container gate receipt.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1238 in `run_container_gate`, `std::process::id` accesses only the run-scoped carrier identity recorded in the container gate receipt.",
     "review_id": "HA-000429",
     "source": {
-      "byte_end": 46535,
-      "byte_start": 46519,
+      "byte_end": 47153,
+      "byte_start": 47137,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1226,
-      "line_end": 1226,
-      "line_start": 1226
+      "line": 1238,
+      "line_end": 1238,
+      "line_start": 1238
     }
   },
   {
@@ -13898,18 +13898,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1192 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1204 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
     "review_id": "HA-000574",
     "source": {
-      "byte_end": 44938,
-      "byte_start": 44918,
+      "byte_end": 45556,
+      "byte_start": 45536,
       "column": 32,
       "column_end": 52,
       "column_start": 32,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1192,
-      "line_end": 1192,
-      "line_start": 1192
+      "line": 1204,
+      "line_end": 1204,
+      "line_start": 1204
     }
   },
   {
@@ -13924,18 +13924,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1200 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1212 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
     "review_id": "HA-000575",
     "source": {
-      "byte_end": 45380,
-      "byte_start": 45360,
+      "byte_end": 45998,
+      "byte_start": 45978,
       "column": 31,
       "column_end": 51,
       "column_start": 31,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1200,
-      "line_end": 1200,
-      "line_start": 1200
+      "line": 1212,
+      "line_end": 1212,
+      "line_start": 1212
     }
   },
   {
