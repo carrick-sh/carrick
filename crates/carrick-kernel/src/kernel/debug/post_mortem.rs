@@ -382,6 +382,7 @@ impl PostMortem {
                         &forensic.snapshot,
                         &selected,
                         aux.as_deref(),
+                        &forensic.findings,
                     ))
                 }
                 Err(error) => {

@@ -258,7 +258,7 @@ fn build_response(
         Ok(snapshot) => {
             let aux = kernel.debug_aux_provider();
             let projected =
-                KernelDebugSnapshot::project_with_aux(&snapshot, &selected, aux.as_deref());
+                KernelDebugSnapshot::project_with_aux(&snapshot, &selected, aux.as_deref(), &[]);
             ServerResponse::Snapshot(Box::new(projected))
         }
         // A held authority (a wedge's MM coordinator) refuses the coherent
@@ -273,6 +273,42 @@ fn build_response(
                 error.to_string(),
                 &degraded,
             )))
+        }
+        // The strict, served projection refuses a graph that violates an
+        // invariant — right for a caller that must trust what it gets. But
+        // `carrick debug hvpatch-kernel` querying a LIVE, still-hung carrier
+        // is the opposite contract: the graph is already known to be wrong,
+        // and the violated invariant is the most valuable row in the
+        // capture. Turning it into a bare error string discarded the whole
+        // kernel graph exactly when the post-mortem needed it (a cpython
+        // process-pool hang refused this way). Forensic capture never
+        // refuses; report the violation IN the projection instead of hiding
+        // the graph behind it.
+        Err(super::super::KernelSnapshotError::InvariantViolation(message)) => {
+            match kernel.forensic_snapshot(Instant::now() + STRICT_SNAPSHOT_BUDGET) {
+                Ok(forensic) => {
+                    let aux = kernel.debug_aux_provider();
+                    let projected = KernelDebugSnapshot::project_with_aux(
+                        &forensic.snapshot,
+                        &selected,
+                        aux.as_deref(),
+                        &forensic.findings,
+                    );
+                    ServerResponse::Snapshot(Box::new(projected))
+                }
+                // The forensic path only ever fails on the same
+                // Busy/TimedOut/AuthorityUnavailable grounds as the strict
+                // one (it audits instead of refusing, so it cannot itself
+                // raise a NEW invariant violation) — a live double failure is
+                // rare enough that naming both refusals plainly is the
+                // honest answer, not a guess at which one to hide.
+                Err(forensic_error) => ServerResponse::Error {
+                    schema: KERNEL_DEBUG_RESPONSE_SCHEMA.to_owned(),
+                    error: format!(
+                        "kernel snapshot invariant violated: {message}; forensic capture also failed: {forensic_error}"
+                    ),
+                },
+            }
         }
         Err(error) => ServerResponse::Error {
             schema: KERNEL_DEBUG_RESPONSE_SCHEMA.to_owned(),
@@ -309,4 +345,108 @@ pub enum ServerResponse {
 /// the CLI agree on the default without duplicating the list.
 pub fn default_tables() -> Vec<KernelDebugTable> {
     KernelDebugTable::ALL.to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+    use crate::kernel::{Asid, MmBackend, MmBackendSnapshot, RootBootstrap, SnapshotError};
+
+    /// An `Mm` backend that reports a mapping id the frame inventory never
+    /// recorded — the same class of alias-registry/backend disagreement as
+    /// the 2026-09-07 exit wedge, where `carrick debug hvpatch-kernel`
+    /// answered only a bare invariant string and nothing else.
+    /// `validate_snapshot` still refuses this graph (right for the strict,
+    /// served path), but `forensic_snapshot`'s audit re-judges it and never
+    /// refuses, carrying the violation forward as a finding instead.
+    #[derive(Debug)]
+    struct DanglingMappingBackend;
+
+    impl MmBackend for DanglingMappingBackend {
+        fn snapshot(&self, _deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
+            let root = crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(0x1000))
+                .expect("aligned stage-1 root");
+            let asid = Asid::from_registry_allocation(
+                std::num::NonZeroU16::new(1).expect("nonzero test ASID"),
+            );
+            Ok(MmBackendSnapshot {
+                revision: 1,
+                binding: crate::kernel::MmBinding {
+                    asid,
+                    stage1_root: root,
+                    ttbr0: crate::kernel::Ttbr0::for_aarch64(asid, root),
+                },
+                vmas: Vec::new(),
+                vma_revision: None,
+                mapping_ids: vec![carrick_hal::MappingId::from_kernel_allocation(
+                    NonZeroU64::new(99).expect("mapping"),
+                )],
+                frame_inventory_revision: None,
+            })
+        }
+
+        fn revision(&self) -> u64 {
+            1
+        }
+    }
+
+    /// A live carrier whose served graph violates an invariant must not turn
+    /// into a bare refusal: `carrick debug hvpatch-kernel` is exactly the
+    /// tool reached for mid-hang, and dropping the whole kernel graph on top
+    /// of an already-known problem loses the investigation, not just the one
+    /// row (this is the named `build_response` gap: a cpython
+    /// `multiprocessing` process-pool hang carried a legitimate zombie
+    /// process-group member, and the strict `InvariantViolation` branch
+    /// answered with only an error string). The server must fall back to the
+    /// never-refusing forensic capture and report the violation IN the
+    /// projection instead of hiding the graph behind it.
+    #[test]
+    fn a_live_invariant_violation_still_serves_the_graph_with_findings() {
+        let bootstrap = RootBootstrap::with_mm_backend(
+            4345,
+            carrick_hal::ThreadId::synthetic_for_tests(4345),
+            Arc::new(DanglingMappingBackend),
+            "invariant-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("root bootstrap input");
+        let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("root kernel");
+
+        // Confirm the strict path really does refuse this graph, so the
+        // fallback below is exercised for the reason this test claims.
+        assert!(matches!(
+            kernel.snapshot(Instant::now() + STRICT_SNAPSHOT_BUDGET),
+            Err(super::super::super::KernelSnapshotError::InvariantViolation(_))
+        ));
+
+        let request = KernelDebugRequest::for_tables(None);
+        let response = build_response(&request, &kernel, Instant::now());
+        let snapshot = match response {
+            ServerResponse::Snapshot(snapshot) => *snapshot,
+            other => panic!(
+                "a violated invariant must still serve the graph, not just refuse it: {other:?}"
+            ),
+        };
+        assert_eq!(snapshot.schema, KERNEL_DEBUG_RESPONSE_SCHEMA);
+        assert!(
+            !snapshot.findings.is_empty(),
+            "the violation must be reported in the projection, never silently hidden"
+        );
+        assert!(
+            snapshot
+                .findings
+                .iter()
+                .any(|finding| finding.contains("mapping")),
+            "findings: {:?}",
+            snapshot.findings
+        );
+        assert!(
+            snapshot.tasks.as_ref().is_some_and(|tasks| tasks
+                .iter()
+                .any(|task| task.diagnostic_name.as_deref() == Some("invariant-root"))),
+            "the graph itself must remain usable alongside the finding"
+        );
+    }
 }
