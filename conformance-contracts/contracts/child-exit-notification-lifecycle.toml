@@ -20,7 +20,7 @@ kind = "exact"
 metric = "child_exit_notification_wake_attempts"
 value = 0
 layers = ["vm-free"]
-rationale = "Every delivery in the measured window follows parent reap, so no scheduler wake attempt is licensed."
+rationale = "The VM-free fixture has retired execution states before delivery, so it filters all threads before scheduler authentication. A signed thread may retain an execution generation after graph reap; the exact scheduler then rejects it as Pending."
 
 [[structural_budgets]]
 kind = "exact"
@@ -32,9 +32,23 @@ rationale = "The signed three-process fixture has two child exits and two single
 [[structural_budgets]]
 kind = "upper-bound"
 metric = "child_exit_notification_wake_attempts"
+maximum = 2
+layers = ["embed-structural"]
+rationale = "One exact-authority authentication per visited snapshot thread; Pending is a rejection without delivery, not excess scheduler work."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "child_exit_notification_wake_deliveries"
+value = 0
+layers = ["vm-free"]
+rationale = "No retired parent can receive a queued or kicked notification wake."
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "child_exit_notification_wake_deliveries"
 maximum = 1
 layers = ["embed-structural"]
-rationale = "The reaped middle parent requires zero scheduler calls. Only the root may still be live when its notification arrives; durable wait subscriptions can let it finish first."
+rationale = "Only the root can receive a queued or kicked wake; exact authority rejects the already-reaped middle parent. The signed semantic ordering and zero reaped-wake rejections remain required."
 
 [bindings]
 embed = "carrick-embed::el1_sched_delayed_notification_survives_parent_reap (signed source 2e6e3794a; exact captured/reaped/released ordering, zero reaped wake attempts; controlled pre-fix method fails with one rejection)"

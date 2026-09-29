@@ -71,7 +71,21 @@ impl HvpatchRuntimeEndpoint {
                 );
             }
             match scheduler.wake_exact(target) {
-                Ok(_) => delivered = true,
+                Ok(_disposition) => {
+                    #[cfg(feature = "conformance-metrics")]
+                    if matches!(
+                        _disposition,
+                        carrick_kernel::kernel::scheduler::WakeDisposition::Queued
+                            | carrick_kernel::kernel::scheduler::WakeDisposition::Kicked
+                    ) && let Some(scope) = &work
+                    {
+                        let _ = scope.add(
+                            carrick_observability::work_meter::WorkMetric::ChildExitNotificationWakeDeliveries,
+                            1,
+                        );
+                    }
+                    delivered = true;
+                }
                 Err(
                     carrick_kernel::kernel::scheduler::SchedulerError::Thread(
                         carrick_kernel::kernel::objects::ThreadExecutionError::InvalidTransition {
@@ -1867,12 +1881,18 @@ mod tests {
                 };
                 evaluate(contract, std::slice::from_ref(&observation)).unwrap();
                 println!("{}", serde_json::to_string(&observation).unwrap());
-                for (visits, attempts) in [(deliveries + 1, 0), (deliveries, 1)] {
+                for (visits, attempts, wakes) in [
+                    (deliveries + 1, 0, 0),
+                    (deliveries, 1, 0),
+                    (deliveries, 0, 1),
+                ] {
                     let mut excess = observation.clone();
                     let mut work = WorkSnapshot::new();
                     work.insert(WorkMetric::ChildExitNotificationThreadVisits, visits)
                         .unwrap();
                     work.insert(WorkMetric::ChildExitNotificationWakeAttempts, attempts)
+                        .unwrap();
+                    work.insert(WorkMetric::ChildExitNotificationWakeDeliveries, wakes)
                         .unwrap();
                     excess.work = Some(work);
                     assert!(

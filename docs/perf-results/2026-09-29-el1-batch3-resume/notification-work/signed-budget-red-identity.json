@@ -1,0 +1,8 @@
+{
+  "source_head": "44b2834c1",
+  "executable_path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-b2206a957bd60d90",
+  "sha256": "ee1d9c71a0aab627b00e8ebb80e97676f0cc39b85862c63478054f4dd44b6087",
+  "saved_executable": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/el1-resume-b3/notification-work-budget-red/ee1d9c71a0aab627b00e8ebb80e97676f0cc39b85862c63478054f4dd44b6087",
+  "result": "failed: authentication attempts 2 exceed mistaken bound 1",
+  "cleanup_remaining": 0
+}

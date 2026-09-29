@@ -1,0 +1,35 @@
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-observability)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-hal)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-conformance-contract)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.30s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-69b4e828d490bdcd)
+
+running 1 test
+test vcpu_loop::binding::tests::hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation ... FAILED
+
+failures:
+
+---- vcpu_loop::binding::tests::hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation stdout ----
+
+thread 'vcpu_loop::binding::tests::hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation' (34082117) panicked at crates/carrick-runtime/src/vcpu_loop/binding.rs:6025:13:
+assertion `left == right` failed
+  left: Some(0)
+ right: Some(1)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    vcpu_loop::binding::tests::hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 641 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-runtime --lib`

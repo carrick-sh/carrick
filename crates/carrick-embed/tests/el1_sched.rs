@@ -2185,12 +2185,14 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
         };
         println!("{}", serde_json::to_string(&observation).unwrap());
         evaluate(contract, std::slice::from_ref(&observation)).unwrap();
-        for (visits, attempts) in [(3, 1), (2, 2)] {
+        for (visits, attempts, wakes) in [(3, 2, 1), (2, 3, 1), (2, 2, 2)] {
             let mut excess = observation.clone();
             let mut work = WorkSnapshot::new();
             work.insert(WorkMetric::ChildExitNotificationThreadVisits, visits)
                 .unwrap();
             work.insert(WorkMetric::ChildExitNotificationWakeAttempts, attempts)
+                .unwrap();
+            work.insert(WorkMetric::ChildExitNotificationWakeDeliveries, wakes)
                 .unwrap();
             excess.work = Some(work);
             assert!(
