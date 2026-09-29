@@ -263,7 +263,21 @@ fix separates that red from this green. Whole-run counters do not establish
 unique completed syscalls or zero IPC-caused host exits. Do not retry this
 population to manufacture acceptance or build a new observation framework.
 
-**Next implementation/qualification step:** blocked close/reuse and two-live-
+**New direct blocker:** signed source `15021dfb8` runs real inherited IPC
+across forked parent/child descriptor tables. Pipe one-pair completed 128
+checked round trips with 257 parks. Pipe eight-pair hit the 60-second watchdog:
+four idle-WFI slots and parked tasks in both address spaces. The census also
+records one lost adoption and one space refusal; cause is unproven. Later
+cases did not run. Negative entitlement passed and cleanup was zero. Exact
+failed executable and raw census are preserved in the adapter's
+`processes-first-red*` receipts. No retries or product fix yet.
+
+Immediate next action is a bounded reduction of this concrete two-process
+failure using existing scheduler/IPC ownership observations. This qualifies
+as a direct dependency, unlike the stopped historical capture investigation.
+Do not label the counters a diagnosis or reopen unrelated lifecycle work.
+
+**Following implementation/qualification step:** blocked close/reuse and two-live-
 process witnesses, then mixed venue and signals/partial progress. Keep the
 forwarding/counter issue as an explicit acceptance blocker while independent
 functional migration proceeds. Any investigation must name its blocked
