@@ -314,3 +314,26 @@ for the forwarding; no root-cause or scoped zero-exit claim is made.
 
 Unrelated rustfmt churn in the standalone fixture main file was removed,
 leaving only the intended module/mode additions relative to ab5ec3e1d.
+
+## Blocking population: capability demonstrated, acceptance still open
+
+Signed source `c1c17d963`, run `el1-ipc-pairs-20260929-b`, completed all
+six pipe/eventfd populations at 1/8/64 pairs and 128 rounds. Each population
+checked payload identity and completed 128/1024/8192 round trips. Real EL1
+parks were pipe 258/2065/16514 and eventfd 258/2061/16512. The entitlement
+negative control passed and scoped cleanup was zero. Official manifest and
+raw log are retained beside this file; tested bytes were independently
+hash-checked and preserved at the path in `pairs-population-preserved.json`.
+
+This does not clear `pairs-first-red.log`: the earlier pipe-eight population
+completed its data checks but missed the served-write bound by one. No
+product fix separates these executions. The runner now collects unchanged
+counter assertions across the fixed population rather than stopping early.
+Whole-run generic counters can count park/resume entries and do not prove
+unique completed operations, scoped zero IPC host exits or timing ratios.
+Forwarding variability remains an acceptance blocker. No retry-until-green
+claim or full checkpoint acceptance is made.
+
+Next: real blocked close/reuse and two-process functional witnesses, then
+mixed host/guest operation and signals with partial progress. Keep exit
+attribution bounded and separate from independent capability development.

@@ -1,0 +1,124 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+build-embed-interceptor-probe: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/interceptor-probe-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-zone-readers: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/zone-readers-aarch64
+   Compiling carrick-embed-el1-sched v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/fixtures/embed-el1-sched)
+    Finished `release` profile [optimized] target(s) in 0.59s
+build-embed-el1-sched: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/embed-fixtures/el1-sched-aarch64
+   Compiling carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 11.44s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_embed-ac5091a89d42fbfc.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_embed-ac5091a89d42fbfc.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_embed-ac5091a89d42fbfc
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_vcpu_lifetime-16462fe60de7b299.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_vcpu_lifetime-16462fe60de7b299.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_vcpu_lifetime-16462fe60de7b299
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/fault_budget_guest-b05d4abe5fb16d7c.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/fault_budget_guest-b05d4abe5fb16d7c.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/fault_budget_guest-b05d4abe5fb16d7c
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/discard_fork_threads-40d01799be59a0ad.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/discard_fork_threads-40d01799be59a0ad.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/discard_fork_threads-40d01799be59a0ad
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/wedge_capture_ladder-c184a6d912502b10.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/wedge_capture_ladder-c184a6d912502b10.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/wedge_capture_ladder-c184a6d912502b10
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/crash_parked_thread-daaf29baf92b16c3.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/crash_parked_thread-daaf29baf92b16c3.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/crash_parked_thread-daaf29baf92b16c3
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify09_probe-8ab374e06b8cf677.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify09_probe-8ab374e06b8cf677.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify09_probe-8ab374e06b8cf677
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_ipc_routing-3355072563416c12
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/inotify_hotpath_contract-447c6fd266adf039.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/inotify_hotpath_contract-447c6fd266adf039.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/inotify_hotpath_contract-447c6fd266adf039
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/kernel_abort-201c922b6ee92d74.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/kernel_abort-201c922b6ee92d74.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/kernel_abort-201c922b6ee92d74
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/write_seek_contract-ae3942d64d36dd47.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/write_seek_contract-ae3942d64d36dd47.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/write_seek_contract-ae3942d64d36dd47
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/conformance_contracts-e010d7eaa8826e2d.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/conformance_contracts-e010d7eaa8826e2d.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/conformance_contracts-e010d7eaa8826e2d
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_files-f14f7a86ea8287c9.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_files-f14f7a86ea8287c9.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_files-f14f7a86ea8287c9
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/pt_pause_drain_pressure-e1f729ebc91cdf7d.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/pt_pause_drain_pressure-e1f729ebc91cdf7d.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/pt_pause_drain_pressure-e1f729ebc91cdf7d
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify-8d58401ad14f61d2.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify-8d58401ad14f61d2.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_inotify-8d58401ad14f61d2
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/perf_regression-c77a40a76f722eca.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/perf_regression-c77a40a76f722eca.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/perf_regression-c77a40a76f722eca
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/two_process_parallelism-266adc1a3cc33999.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/two_process_parallelism-266adc1a3cc33999.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/two_process_parallelism-266adc1a3cc33999
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_preemption-fec5a6ce0c55a5db.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_preemption-fec5a6ce0c55a5db.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_preemption-fec5a6ce0c55a5db
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_gic-08087e1d0b8bdf2e.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_gic-08087e1d0b8bdf2e.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_gic-08087e1d0b8bdf2e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/shared_buffer_futex-f5fc4aac3288eaab.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/shared_buffer_futex-f5fc4aac3288eaab.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/shared_buffer_futex-f5fc4aac3288eaab
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_kick_served_loop-9721202fdb30b811.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_kick_served_loop-9721202fdb30b811.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_kick_served_loop-9721202fdb30b811
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/guest_smoke-820ee32ef5a9e9d3.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/guest_smoke-820ee32ef5a9e9d3.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/guest_smoke-820ee32ef5a9e9d3
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/host_wait_policy-728fed50fb490be5.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/host_wait_policy-728fed50fb490be5.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/host_wait_policy-728fed50fb490be5
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_transparent-2ea7e87d7d389879.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_transparent-2ea7e87d7d389879.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_transparent-2ea7e87d7d389879
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/realtime_calibration-ab4ec1be5f00ad51.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/realtime_calibration-ab4ec1be5f00ad51.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/realtime_calibration-ab4ec1be5f00ad51
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_race-3690085b56dad18b.tmp.99283
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_race-3690085b56dad18b.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/scheduler_race-3690085b56dad18b
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e.tmp.99283: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e
+test-signed: resolved exact filter el1_ipc_pairs_blocking -> el1_ipc_pairs_blocking
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_sched-3c030f910e35df6e el1_ipc_pairs_blocking --exact --nocapture
+
+running 1 test
+test el1_ipc_pairs_blocking ... IPC pairs pipe n=1: zone=ZoneCounts { el1_parks: 258, el1_switches: 256, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 10, wfi_entries: 6, idle_exits: 4, misplaced: 0, steals: 0, service_exits: 2, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 1, host_executor_parks: 0 } forwarded=[(57, 4), (59, 2), (64, 1), (73, 1), (93, 2), (94, 1), (96, 1), (132, 10), (134, 5), (135, 12), (178, 2), (215, 5), (220, 2), (226, 5)] exit 0 signal None stdout "ipc-pairs kind=pipe pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs pipe n=1 served before=[0, 0] after=[510, 256]
+IPC pairs pipe n=8: zone=ZoneCounts { el1_parks: 2065, el1_switches: 2050, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 270, sgis: 256, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 58, wfi_entries: 22, idle_exits: 36, misplaced: 0, steals: 8, service_exits: 15, service_placements: 18, ready_placements: 0, service_adoptions: 18, exit_adoptions: 9, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 33), (59, 16), (63, 1), (64, 2), (73, 1), (93, 16), (94, 1), (96, 1), (98, 1), (132, 52), (134, 5), (135, 68), (178, 16), (215, 33), (220, 16), (222, 3), (226, 33)] exit 0 signal None stdout "ipc-pairs kind=pipe pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs pipe n=8 served before=[510, 256] after=[4590, 2304]
+IPC pairs pipe n=64: zone=ZoneCounts { el1_parks: 16514, el1_switches: 16385, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 363, wfi_entries: 131, idle_exits: 220, misplaced: 0, steals: 15, service_exits: 143, service_placements: 137, ready_placements: 0, service_adoptions: 137, exit_adoptions: 2, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 257), (59, 128), (64, 1), (73, 1), (93, 128), (94, 1), (96, 1), (98, 2), (132, 388), (134, 5), (135, 516), (178, 128), (215, 256), (220, 128), (222, 25), (226, 257)] exit 0 signal None stdout "ipc-pairs kind=pipe pairs=64 rounds=128 completed=8192\n" stderr ""
+IPC pairs pipe n=64 served before=[4590, 2304] after=[37231, 18688]
+IPC pairs eventfd n=1: zone=ZoneCounts { el1_parks: 258, el1_switches: 256, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 7, wfi_entries: 3, idle_exits: 5, misplaced: 0, steals: 0, service_exits: 2, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 2), (57, 2), (64, 1), (73, 1), (93, 2), (94, 1), (96, 1), (132, 10), (134, 5), (135, 12), (178, 2), (215, 5), (220, 2), (226, 5)] exit 0 signal None stdout "ipc-pairs kind=eventfd pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs eventfd n=1 served before=[37231, 18688] after=[37741, 18944]
+IPC pairs eventfd n=8: zone=ZoneCounts { el1_parks: 2061, el1_switches: 2047, host_parks: 2, signal_claims: 0, control_claims: 0, cross_wakes: 75, sgis: 59, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 54, wfi_entries: 27, idle_exits: 30, misplaced: 0, steals: 10, service_exits: 16, service_placements: 19, ready_placements: 1, service_adoptions: 19, exit_adoptions: 11, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 16), (57, 18), (63, 1), (64, 1), (73, 1), (93, 16), (94, 1), (96, 1), (98, 4), (132, 54), (134, 5), (135, 68), (178, 16), (215, 33), (220, 16), (222, 1), (226, 33)] exit 0 signal None stdout "ipc-pairs kind=eventfd pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs eventfd n=8 served before=[37741, 18944] after=[41817, 20992]
+IPC pairs eventfd n=64: zone=ZoneCounts { el1_parks: 16512, el1_switches: 16385, host_parks: 2, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 347, wfi_entries: 134, idle_exits: 208, misplaced: 0, steals: 10, service_exits: 139, service_placements: 137, ready_placements: 1, service_adoptions: 137, exit_adoptions: 2, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 128), (57, 129), (64, 1), (73, 1), (93, 128), (94, 1), (96, 1), (98, 3), (132, 388), (134, 5), (135, 516), (178, 128), (215, 255), (220, 128), (222, 27), (226, 257)] exit 0 signal None stdout "ipc-pairs kind=eventfd pairs=64 rounds=128 completed=8192\n" stderr ""
+IPC pairs eventfd n=64 served before=[41817, 20992] after=[74458, 37376]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 40 filtered out; finished in 0.66s
+
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.noent.99283: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/entitlement_negative-9743e1c29a1cd363.noent.99283
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+remaining carrick procs (run-id el1-ipc-pairs-20260929-b) = 0
+remaining carrick procs (run-id el1-ipc-pairs-20260929-b-cli) = 0
+test-signed: receipt target/test-results/carrick-embed-signed-artifacts.jsonl
+test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 28 signed, negative control passed)
