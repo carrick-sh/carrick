@@ -3127,122 +3127,33 @@ fn read_eventfd(
     address: u64,
     length: usize,
     state: &EventFdState,
-    semaphore: bool,
     nonblocking: bool,
     authority: WaitFdAuthority,
 ) -> DispatchOutcome {
     if length < core::mem::size_of::<LinuxEventfdValue>() {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
+        return DispatchOutcome::errno(LINUX_EINVAL);
     }
-    let counter = state.counter_ref();
-    loop {
-        let current = counter.load(std::sync::atomic::Ordering::SeqCst);
-        if current == 0 {
-            let host_fd = state.read_fd.as_ref().map(|r| r.raw()).unwrap_or(-1);
-            let owner = state.read_fd.clone();
-            return would_block_outcome(host_fd, libc::POLLIN, nonblocking, owner, authority);
-        }
-        let taken = if semaphore { 1 } else { current };
-        if counter
-            .compare_exchange(
-                current,
-                current - taken,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            continue; // raced another reader/writer — re-derive
-        }
-        if current - taken == 0 {
-            if let Some(r) = &state.read_fd {
-                let mut buf = [0u8; 16];
-                // BLOCKING-IO-OK: make_readiness_pipe creates non-blocking pipes with O_NONBLOCK.
-                let _ = unsafe { libc::read(r.raw(), buf.as_mut_ptr() as *mut _, buf.len()) };
-            }
-        }
-        let eventfd_value = LinuxEventfdValue {
-            value: if semaphore { 1 } else { current },
-        };
-        if memory
-            .write_bytes(address, eventfd_value.as_bytes())
-            .is_err()
-        {
-            // Copyout fault: put the tokens back before surfacing EFAULT.
-            counter.fetch_add(taken, std::sync::atomic::Ordering::SeqCst);
-            return DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            };
-        }
-        crate::event_ring::rec(
-            crate::event_ring::EFDREAD,
-            -1,
-            current as u32 as i32,
-            (current - taken) as u32 as i32,
-        );
-        state.wait_queue.wake_all();
-        return DispatchOutcome::returned_len_or_errno(core::mem::size_of::<LinuxEventfdValue>());
+    match state.read_with(|value| {
+        memory
+            .write_bytes(address, LinuxEventfdValue { value }.as_bytes())
+            .is_ok()
+    }) {
+        Ok(_) => DispatchOutcome::returned_len_or_errno(core::mem::size_of::<LinuxEventfdValue>()),
+        Err(LINUX_EAGAIN) => would_block_outcome(-1, libc::POLLIN, nonblocking, None, authority),
+        Err(errno) => DispatchOutcome::errno(errno),
     }
 }
 
-fn write_eventfd(this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
+fn write_eventfd(_this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
     if bytes.len() != core::mem::size_of::<LinuxEventfdValue>() {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
+        return DispatchOutcome::errno(LINUX_EINVAL);
     }
     let Ok(value) = LinuxEventfdValue::read_from_bytes(bytes) else {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
+        return DispatchOutcome::errno(LINUX_EINVAL);
     };
-    let increment = value.value;
-    if increment == u64::MAX {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
-    let counter = state.counter_ref();
-    loop {
-        let current = counter.load(std::sync::atomic::Ordering::SeqCst);
-        let next = match current.checked_add(increment) {
-            // Linux caps the counter at u64::MAX - 1; a write that would
-            // exceed it fails EAGAIN (poll's POLLOUT check mirrors this).
-            Some(next) if next < u64::MAX => next,
-            _ => {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_EAGAIN,
-                };
-            }
-        };
-        if counter
-            .compare_exchange(
-                current,
-                next,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            continue; // raced another writer/reader — re-derive
-        }
-        crate::event_ring::rec(
-            crate::event_ring::EFDWRITE,
-            -1,
-            current as u32 as i32,
-            next as u32 as i32,
-        );
-        if current == 0 && next > 0 {
-            if let Some(w) = &state.write_fd {
-                // BLOCKING-IO-OK: make_readiness_pipe creates non-blocking pipes with O_NONBLOCK.
-                let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
-            }
-            this.notify_inmem_epoll();
-        }
-        state.wait_queue.wake_all();
-        return DispatchOutcome::returned_len_or_errno(core::mem::size_of::<LinuxEventfdValue>());
+    match state.write_value(value.value) {
+        Ok(()) => DispatchOutcome::returned_len_or_errno(core::mem::size_of::<LinuxEventfdValue>()),
+        Err(errno) => DispatchOutcome::errno(errno),
     }
 }
 

@@ -788,7 +788,7 @@ impl CarrierWaitServiceInner {
                             }
                         }
                         ReadinessProbe::BlockingWrite {
-                            poll_fd,
+                            poll_fd: Some(poll_fd),
                             poll_events,
                             write,
                             completion,
@@ -1206,6 +1206,21 @@ impl CarrierWaitService {
             )
         };
         let weak = Arc::downgrade(&self.inner);
+        if let ReadinessProbe::BlockingWrite { write, .. } = &probe {
+            let queue = write.lock().wait_queue();
+            if let Some(queue) = queue {
+                let callback_weak = weak.clone();
+                let enrollment = queue.enroll_callback(move |_| {
+                    if let Some(inner) = callback_weak.upgrade() {
+                        // Resume the captured operation under its execution lease.
+                        // No guest fd lookup or write is performed by this callback.
+                        inner.publish_event(token, ContinuationEvent::Ready);
+                    }
+                });
+                self.inner
+                    .attach_subscription(token, ProducerSubscription::WaitQueue(enrollment));
+            }
+        }
         let futex_source = match &probe {
             ReadinessProbe::Futex { table, wait, .. } => Some((table.0.clone(), wait.clone())),
             ReadinessProbe::SharedWord { generation, .. } => Some((

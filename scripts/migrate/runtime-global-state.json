@@ -1795,14 +1795,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-kernel/src/eventfd_shm.rs",
-      "symbol": "SLAB",
-      "fingerprint": "9cdb5a65d0bfea293471215a440665d765252f97012fe3c69748f09b134df2fc",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static SLAB in crates/carrick-runtime/src/eventfd_shm.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-kernel/src/exec_stamps.rs",
       "symbol": "FORK_LINK_SEQUENCE",
       "fingerprint": "777a6d48c3506202086f9fc345b08be454afb46b0c0a02fd9671d56c1dcabdfa",
@@ -3351,7 +3343,7 @@
       "symbol": "SYSTEM_CHARGE_WINDOW",
       "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
       "classification": "carrier_infra",
-      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction — the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other — and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
+      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction \u2014 the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other \u2014 and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
     },
     {
       "kind": "thread_local",
@@ -3763,11 +3755,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
-      "symbol": "OWED_WAKE_DELIVERY",
-      "fingerprint": "4906ab939256b4d99e171cb767799d26c91b10dfa2c55069cce2c5dbef8720fd",
-      "classification": "carrier_infra",
-      "rationale": "Process-global, set-once delivery hook of the host IPC subscription registry: the carrier's one host authority delivers owed readiness wakes for its subscribed objects at an EL1-forced host boundary."
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "symbol": "NEXT_REGION",
+      "fingerprint": "3c7db8490488c0bd323b91a6de2d99ca3390619e18e9a327bc04d958bad88f4b",
+      "classification": "monotonic_allocator",
+      "rationale": "Allocates non-reused authority identities for kernel-owned IPC regions; no guest object state is process-global."
     }
   ]
 }

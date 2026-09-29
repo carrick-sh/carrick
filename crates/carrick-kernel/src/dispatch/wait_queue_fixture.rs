@@ -150,11 +150,6 @@ fn new_pipe() -> crate::dispatch::fd_table::PipeRef {
 
 fn pipe_reader() -> WaitQueueFixture {
     let pipe = new_pipe();
-    {
-        let mut state = pipe.state.lock();
-        state.readers = 1;
-        state.writers = 1;
-    }
     let producer_pipe = Arc::clone(&pipe);
     WaitQueueFixture {
         description: install(OpenDescription::PipeReader {
@@ -163,10 +158,7 @@ fn pipe_reader() -> WaitQueueFixture {
         }),
         interest: LinuxPollEvents::IN,
         producer: Box::new(move || {
-            let mut state = producer_pipe.state.lock();
-            state.buffer.extend(b"gap".iter().copied());
-            drop(state);
-            producer_pipe.wait_queue.wake_all();
+            assert_eq!(producer_pipe.write_bytes(b"gap"), Ok(3));
         }),
         _guards: Vec::new(),
     }
@@ -174,16 +166,8 @@ fn pipe_reader() -> WaitQueueFixture {
 
 fn pipe_writer() -> WaitQueueFixture {
     let pipe = new_pipe();
-    {
-        let mut state = pipe.state.lock();
-        state.readers = 1;
-        state.writers = 1;
-        // A full pipe is the only state in which a writer is NOT already
-        // writable, so it is the only one with a real producer edge.
-        let capacity = state.capacity;
-        assert!(capacity > 0, "pipe capacity");
-        state.buffer.extend(std::iter::repeat_n(0u8, capacity));
-    }
+    let capacity = pipe.get_capacity();
+    assert_eq!(pipe.write_bytes(&vec![0; capacity]), Ok(capacity));
     let producer_pipe = Arc::clone(&pipe);
     WaitQueueFixture {
         description: install(OpenDescription::PipeWriter {
@@ -192,10 +176,10 @@ fn pipe_writer() -> WaitQueueFixture {
         }),
         interest: LinuxPollEvents::OUT,
         producer: Box::new(move || {
-            let mut state = producer_pipe.state.lock();
-            state.buffer.clear();
-            drop(state);
-            producer_pipe.wait_queue.wake_all();
+            assert_eq!(
+                producer_pipe.read_with(capacity, |bytes| bytes.len()),
+                Ok(capacity)
+            );
         }),
         _guards: Vec::new(),
     }
@@ -208,14 +192,10 @@ fn eventfd() -> WaitQueueFixture {
         description: install(OpenDescription::EventFd {
             base: OpenDescriptionBase::new(0),
             state,
-            semaphore: false,
         }),
         interest: LinuxPollEvents::IN,
         producer: Box::new(move || {
-            producer_state
-                .counter_ref()
-                .store(1, std::sync::atomic::Ordering::SeqCst);
-            producer_state.wait_queue.wake_all();
+            producer_state.write_value(1).unwrap();
         }),
         _guards: Vec::new(),
     }

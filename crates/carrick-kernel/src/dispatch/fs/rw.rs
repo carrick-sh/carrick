@@ -989,6 +989,14 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
+            let _read_lease = if open_file.description.inspect_kind(|open| matches!(
+                open, OpenDescription::PipeReader { .. } | OpenDescription::EventFd { .. }
+            )) == Some(true) {
+                let Some(lease) = open_file.description.retain_fd_lease() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                Some(lease)
+            } else { None };
             let Some(mut open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -1121,11 +1129,9 @@ impl<'a> FsView<'a> {
                 OpenDescription::VirtualConsole { .. } => (0, Vec::new()),
                 OpenDescription::EventFd {
                     state,
-                    semaphore,
                     ..
                 } => {
                     let state = Arc::clone(state);
-                    let semaphore = *semaphore;
                     let nonblocking = LinuxOpenFlags::from_bits_truncate(
                         open_file.description.common().status_flags(),
                     )
@@ -1136,8 +1142,7 @@ impl<'a> FsView<'a> {
                         address,
                         length,
                         &state,
-                        semaphore,
-                        nonblocking,
+                            nonblocking,
                         WaitFdAuthority::logical(slot_authority),
                     ));
                 }
@@ -1615,6 +1620,9 @@ impl<'a> FsView<'a> {
                     let pipe = Arc::clone(pipe);
                     let flags = open_file.description.common().status_flags();
                     drop(open);
+                    let Some(_read_lease) = open_file.description.retain_fd_lease() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
                     let mut total = 0i64;
                     for iov in &iovecs {
                         let len = usize::try_from(iov.iov_len)
@@ -2873,7 +2881,16 @@ impl<'a> FsView<'a> {
                             return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
                         }
                         OpenDescription::EventFd { state, .. } => {
-                            return Ok(write_eventfd(this, bytes, state));
+                            let outcome = write_eventfd(this, bytes, state);
+                            if !nonblocking && matches!(outcome, DispatchOutcome::Errno { errno: LINUX_EAGAIN }) {
+                                let Ok(value) = LinuxEventfdValue::read_from_bytes(bytes) else {
+                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                };
+                                return Ok(DispatchOutcome::BlockingWrite(BlockingWrite::eventfd(
+                                    Arc::clone(state), io_lease, value.value, tid,
+                                )));
+                            }
+                            return Ok(outcome);
                         }
                         OpenDescription::PipeWriter { pipe, .. } => {
                             let pipe = Arc::clone(pipe);
@@ -3965,6 +3982,8 @@ impl<'a> FsView<'a> {
                                         crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
                                             write.with_writev_tail(tail, total)
                                         }
+                                        // Eventfd owns one scalar operation, not a byte stream.
+                                        crate::dispatch::outcome::BlockingWriteTarget::EventFd(_) => write,
                                     };
                                     return Ok(DispatchOutcome::BlockingWrite(write));
                                 }
@@ -3980,6 +3999,7 @@ impl<'a> FsView<'a> {
                             crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
                                 write.with_writev_tail(tail, total)
                             }
+                            crate::dispatch::outcome::BlockingWriteTarget::EventFd(_) => write,
                         };
                         return Ok(DispatchOutcome::BlockingWrite(write));
                     }

@@ -87,9 +87,11 @@ pub const IPC_OBJECTS: usize = 1024;
 pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
-/// Region magic: "CRKIPC" + ABI version 2 (v2: `IpcOperation::value`).
-pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x02");
+/// Region magic: "CRKIPC" + ABI version 3 (indexed host wake publication).
+pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x03");
 const IPC_READY: u64 = 1;
+const HOST_WAKE_WORDS: usize = IPC_OBJECTS.div_ceil(64);
+const _: () = assert!(HOST_WAKE_WORDS <= 64);
 
 /// The descriptor authority shared by host and EL1.
 pub type IpcFdCore = fd::Core<IPC_FD_TABLES, IPC_OFDS>;
@@ -126,6 +128,16 @@ impl IpcObjectHandle {
             generation: raw.generation,
         }
     }
+}
+
+/// The shared queue identity for one readiness direction of an IPC incarnation.
+pub fn object_wait_key(
+    object: IpcObjectHandle,
+    direction: pipe::WaitFor,
+) -> Option<carrick_sched_core::object_wait::ObjectWaitKey> {
+    let lane = u32::from(direction == pipe::WaitFor::Writable);
+    let index = object.index().checked_mul(2)?.checked_add(1 + lane)?;
+    carrick_sched_core::object_wait::ObjectWaitKey::new(index, u64::from(object.generation()) + 1)
 }
 
 /// Plain-data [`IpcObjectHandle`].
@@ -315,6 +327,10 @@ pub struct IpcDirectory {
     free_operations: AtomicU64,
     _reserved_ops: [u64; 7],
     operations: [IpcOperationSlot; IPC_OPERATIONS],
+    /// Two-level pending index. Publishers set object bits before summary bits;
+    /// a host boundary takes one bounded snapshot, never scans live objects.
+    host_wake_summary: AtomicU64,
+    host_wake_words: [AtomicU64; HOST_WAKE_WORDS],
 }
 
 /// Layout facts of this ABI; see [`IPC_LAYOUT_HASH`].
@@ -361,6 +377,9 @@ const LAYOUT_FACTS: &[u64] = &[
     IPC_OPERATIONS as u64,
     core::mem::size_of::<IpcOperationSlot>() as u64,
     core::mem::offset_of!(IpcDirectory, operations) as u64,
+    core::mem::offset_of!(IpcDirectory, host_wake_summary) as u64,
+    core::mem::offset_of!(IpcDirectory, host_wake_words) as u64,
+    HOST_WAKE_WORDS as u64,
     core::mem::offset_of!(IpcOperationSlot, op) as u64,
 ];
 
@@ -921,8 +940,39 @@ impl<'a> IpcRegion<'a> {
         if subs.load(Ordering::Relaxed) == 0 {
             return Err(IpcError::Corrupt);
         }
-        subs.fetch_sub(1, Ordering::AcqRel);
+        if subs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            guard.record.host_wake_owed.store(0, Ordering::Release);
+        }
         Ok(())
+    }
+
+    /// Take a bounded batch of pending object identities. Each returned handle
+    /// is only a candidate: the host must authenticate its incarnation and
+    /// consume its owed flag under the object lock before notifying anyone.
+    /// Work is proportional to pending words and bits, not the live population.
+    /// A concurrent publication either joins this batch or remains indexed for
+    /// the next boundary; repeated publications of one object coalesce.
+    pub fn drain_host_wake_candidates(&self, mut deliver: impl FnMut(IpcObjectHandle)) -> usize {
+        let mut summary = self.dir.host_wake_summary.swap(0, Ordering::AcqRel);
+        let mut visited = 0;
+        while summary != 0 {
+            let word = summary.trailing_zeros() as usize;
+            summary &= summary - 1;
+            let mut pending = self.dir.host_wake_words[word].swap(0, Ordering::AcqRel);
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                pending &= pending - 1;
+                let index = word * 64 + bit;
+                if let Some(record) = self.dir.objects.get(index) {
+                    visited += 1;
+                    deliver(IpcObjectHandle {
+                        index: index as u32,
+                        generation: record.generation.load(Ordering::Acquire) as u32,
+                    });
+                }
+            }
+        }
+        visited
     }
 
     /// Host: take (and clear) the owed-wake flag of `object`.
@@ -1224,6 +1274,13 @@ impl<'a> IpcObjectGuard<'a> {
         let host_owed = changed && r.host_subscribers.load(Ordering::Relaxed) != 0;
         if host_owed {
             r.host_wake_owed.store(1, Ordering::Release);
+            let index = self.handle.index as usize;
+            self.region.dir.host_wake_words[index / 64]
+                .fetch_or(1u64 << (index % 64), Ordering::Release);
+            self.region
+                .dir
+                .host_wake_summary
+                .fetch_or(1u64 << (index / 64), Ordering::Release);
         }
         IpcWake {
             object: self.handle,

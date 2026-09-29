@@ -861,28 +861,36 @@ impl<'a> FsView<'a> {
         );
     }
 
-    pub(in crate::dispatch) fn pipe_reader(&self, fd: i32) -> Option<(PipeRef, u64)> {
+    pub(in crate::dispatch) fn pipe_reader(
+        &self,
+        fd: i32,
+    ) -> Option<(super::pipe::PipeEndpointLease, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
-        match &*open {
-            OpenDescription::PipeReader { pipe, .. } => Some((
-                Arc::clone(pipe),
-                open_file.description.common().status_flags(),
-            )),
+        let pipe = open_file.description.inspect_kind(|open| match open {
+            OpenDescription::PipeReader { pipe, .. } => Some(Arc::clone(pipe)),
             _ => None,
-        }
+        })??;
+        let lease = open_file.description.retain_fd_lease()?;
+        Some((
+            super::pipe::PipeEndpointLease::new(pipe, lease),
+            open_file.description.common().status_flags(),
+        ))
     }
 
-    pub(in crate::dispatch) fn pipe_writer(&self, fd: i32) -> Option<(PipeRef, u64)> {
+    pub(in crate::dispatch) fn pipe_writer(
+        &self,
+        fd: i32,
+    ) -> Option<(super::pipe::PipeEndpointLease, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
-        match &*open {
-            OpenDescription::PipeWriter { pipe, .. } => Some((
-                Arc::clone(pipe),
-                open_file.description.common().status_flags(),
-            )),
+        let pipe = open_file.description.inspect_kind(|open| match open {
+            OpenDescription::PipeWriter { pipe, .. } => Some(Arc::clone(pipe)),
             _ => None,
-        }
+        })??;
+        let lease = open_file.description.retain_fd_lease()?;
+        Some((
+            super::pipe::PipeEndpointLease::new(pipe, lease),
+            open_file.description.common().status_flags(),
+        ))
     }
 
     pub(in crate::dispatch) fn fd_is_pipe_writer(&self, fd: i32) -> Result<bool, LinuxErrno> {
@@ -955,7 +963,7 @@ impl<'a> FsView<'a> {
         let open = open_file.description.inspect()?;
         match &*open {
             OpenDescription::PipeWriter { pipe, .. } => {
-                if pipe.state.lock().readers == 0 {
+                if pipe.snapshot().readers == 0 {
                     Some(LINUX_EPIPE)
                 } else {
                     None

@@ -1,0 +1,29 @@
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1_abi-77e02c509d45e0eb)
+
+running 21 tests
+test ipc::tests::el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags ... ok
+test ipc::tests::el1_ipc_blocked_write_resumes_from_its_continuation_without_replay ... ok
+test ipc::tests::el1_ipc_contended_object_lock_refuses_before_effects ... ok
+test ipc::tests::el1_ipc_eventfd_counter_semaphore_overflow_and_fault_in_place ... ok
+test ipc::tests::el1_ipc_fd_reuse_during_blocked_read_keeps_the_endpoint ... ok
+test ipc::tests::el1_ipc_host_notification_is_owed_only_to_subscribers ... ok
+test ipc::tests::el1_ipc_host_wake_index_coalesces_without_scanning_live_objects ... ok
+test ipc::tests::el1_ipc_layout_is_frozen_and_fits_one_metadata_extent ... ok
+test ipc::tests::el1_ipc_live_pipe_storage_replacement_preserves_both_venues ... ok
+test ipc::tests::el1_ipc_live_pipe_storage_replacement_refuses_overlap_and_bounds ... ok
+test ipc::tests::el1_ipc_operation_tokens_own_their_record_and_reject_stale_copies ... ok
+test ipc::tests::el1_ipc_pipe_roundtrip_eof_and_epipe_across_venues ... ok
+test ipc::tests::el1_ipc_region_attach_authenticates_the_header ... ok
+test ipc::tests::el1_ipc_stale_object_generations_are_rejected ... ok
+test ipc::tests::el1_ipc_steady_state_transfers_scale_linearly_without_allocation ... ok
+test ipc::tests::el1_ipc_storage_refusals_roll_back_and_free_records_keep_storage ... ok
+test ipc::tests::el1_ipc_two_processes_with_overlapping_user_vas_complete_their_own_reads ... ok
+test ipc_tables::tests::el1_ipc_table_map_bounds_probes_and_refuses_when_full ... ok
+test ipc_tables::tests::el1_ipc_table_map_publishes_replaces_and_withdraws ... ok
+test ipc_tables::tests::el1_ipc_table_map_readers_never_see_torn_entries ... ok
+test ipc_tables::tests::el1_ipc_window_attach_fails_closed_until_published ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+

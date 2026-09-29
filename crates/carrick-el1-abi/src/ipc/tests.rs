@@ -458,7 +458,13 @@ fn el1_ipc_host_notification_is_owed_only_to_subscribers() {
     assert!(wake.host_owed);
     assert!(fx.region.take_host_wake(object));
     assert!(!fx.region.take_host_wake(object), "delivered once");
+    let (_, wake) = el1_io(&fx, t, w, Some(b"pending"), &mut []).unwrap();
+    assert!(wake.host_owed);
     fx.region.unsubscribe_host(object, &Spin).unwrap();
+    assert!(
+        !fx.region.take_host_wake(object),
+        "last subscriber cancels an undelivered wake"
+    );
     assert_eq!(
         fx.region.unsubscribe_host(object, &Spin),
         Err(IpcError::Corrupt)
@@ -829,4 +835,56 @@ fn el1_ipc_live_pipe_storage_replacement_refuses_overlap_and_bounds() {
         assert_eq!(invalid, before);
         assert_eq!(guard.storage(), old);
     }
+}
+
+#[test]
+fn el1_ipc_host_wake_index_coalesces_without_scanning_live_objects() {
+    let fx = fixture(1 << 20);
+    let objects: Vec<_> = (0..128)
+        .map(|_| {
+            fx.region
+                .create_eventfd(0, EventMode::Counter, &Spin)
+                .unwrap()
+        })
+        .collect();
+    let object = objects[73];
+    fx.region.subscribe_host(object, &Spin).unwrap();
+    for _ in 0..8 {
+        let mut guard = fx.region.lock(object, &Spin).unwrap();
+        let step = guard.eventfd().unwrap().try_write(1);
+        assert!(guard.publish(step.wake).host_owed);
+    }
+    let mut delivered = Vec::new();
+    let visits = fx
+        .region
+        .drain_host_wake_candidates(|candidate| delivered.push(candidate));
+    assert_eq!(visits, 1, "one indexed candidate despite 128 live objects");
+    assert_eq!(delivered, [object]);
+    assert!(fx.region.take_host_wake(object));
+    assert_eq!(
+        fx.region
+            .drain_host_wake_candidates(|_| panic!("duplicate candidate")),
+        0
+    );
+    // Publication during delivery stays indexed for the next bounded batch.
+    let mut guard = fx.region.lock(object, &Spin).unwrap();
+    let step = guard.eventfd().unwrap().try_write(1);
+    guard.publish(step.wake);
+    drop(guard);
+    assert_eq!(
+        fx.region.drain_host_wake_candidates(|candidate| {
+            assert!(fx.region.take_host_wake(candidate));
+            let mut guard = fx.region.lock(candidate, &Spin).unwrap();
+            let step = guard.eventfd().unwrap().try_write(1);
+            guard.publish(step.wake);
+        }),
+        1
+    );
+    assert_eq!(
+        fx.region.drain_host_wake_candidates(|candidate| {
+            assert_eq!(candidate, object);
+            assert!(fx.region.take_host_wake(candidate));
+        }),
+        1
+    );
 }

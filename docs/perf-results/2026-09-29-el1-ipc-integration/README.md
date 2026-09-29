@@ -1,0 +1,71 @@
+# IPC development integration (unaccepted)
+
+Join adapter b0313df83 with host 77b6f40a1. The merge is development work,
+not checkpoint acceptance or a merge to main. The adapter alone and joined
+runtime compile checks passed. The existing host blocking-eventfd witness
+initially failed with EAGAIN when an owned continuation was required; that red is retained below.
+Initial joined IPC tests completed: 53 passed, one ignored and the same blocking-eventfd continuation test failed. No other failure was reported. Generated compiler capture remains the
+prior adapter snapshot and must be refreshed at stable source qualification.
+
+Current controller: ../wt-batch3/docs/superpowers/plans/2026-09-26-el1-completion.md
+in the sibling worktree (user-requested priority reset). Finish owned blocking
+operations and descriptor lifecycle, then qualify the five signed IPC tests.
+Lifecycle historical failures and full final acceptance remain open.
+
+## Runtime backing integration
+
+Source inspection found `host_window_backing` still returned `None`, preventing
+the existing runtime registration path from exposing the shared IPC authority
+to EL1. It now returns the same kernel-owned `Arc<HostIpc>` through the backing
+trait. The focused `serial_host_el1_ipc_runtime_backing_retains_the_kernel_authority`
+test failed at backing admission before the fix and passed afterward (1/1).
+It checks pointer/extent identity, access to the existing eventfd after dropping
+the dispatcher/kernel references, and final release of the retained owner.
+Logs: `backing-red.log`, `backing-green.log`. This is a VM-free ownership proof,
+not signed mapping or checkpoint acceptance. The blocking-eventfd correction is described below; descriptor publication and
+owed-host-wake integration remain open.
+
+## Host-originated blocking eventfd write
+
+The retained baseline `joined-tests.log` has EAGAIN instead of an owned wait.
+The correction uses the existing BlockingWrite continuation with a captured
+scalar and functional FileDescriptionFdLease; its transfer still calls the
+shared eventfd core. Object waits subscribe to the existing WaitQueue, do not
+contribute host pollfds, and probe once after enrollment to close the gap.
+Ready events resume the owned write instead of resolving the numeric fd or
+rereading guest memory. A still-blocked resumption returns the same owned
+operation. The single-task runner bridges that queue to its existing waiter;
+the production carrier releases executor capacity via CarrierWaitService.
+
+The original retained-value witness now passes. Added fd-reuse and pre-enrollment
+capacity-drain coverage also passed in the 57-pass IPC suite (one pre-existing
+ignored test). The continuation regression suite passed 90/90; runtime check
+and workspace formatting check passed. Exact logs accompany this file. The final 57-pass IPC run additionally asserts that the wait does not enter the reactor's host-fd
+population. These are development checks, not signed checkpoint acceptance.
+
+Next: publish descriptor tables through create/fork/unshare/destroy and descriptor
+mutation, wire owed host wakes, integrate the fixture branch, then run the five
+signed guest IPC witnesses. These checks were captured before the development integration commit.
+
+## Guest-to-host wake delivery
+
+The unregistered process-global wake callback was a no-op. A red kernel test
+observed zero callbacks after an EL1-style shared-object publication and host
+boundary. The runtime now passes its exact Kernel; that kernel drains its own
+IPC pending index and authenticates/consumes owed flags under object locks.
+The obsolete global hook and its inventory row are removed.
+
+ABI v3 adds a two-level atomic pending bitmap. Publication sets the object bit
+before its summary bit; a bounded host batch visits only indexed candidates.
+Repeated writes coalesce. A publication during delivery remains indexed for a
+later batch. Layout hash includes the new fields; stale layouts fail closed.
+The ABI suite passes 21/21, including one candidate for eight writes among 128
+live objects. The final kernel IPC suite passes 58 with one pre-existing ignored
+test, including kernel isolation, exactly-once delivery, retirement/reuse and
+preservation of a successor notification. Formatting and ABI/kernel/runtime Clippy pass. Logs: wake-red.log,
+wake-abi.log, wake-kernel-final.log. Signed guest execution remains unqualified.
+
+Descriptor tables are still unpublished: FileTable has no shared descriptor
+binding. Next integration must connect its admission, mutation, fork/unshare,
+CLOEXEC and destruction to the shared core before publishing IpcTableMap entries;
+a one-time snapshot would leave a competing stale namespace and is insufficient.

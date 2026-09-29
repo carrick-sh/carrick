@@ -1,8 +1,9 @@
+use crate::el1_zone::HostLockWait;
 use carrick_abi::*;
+use carrick_el1_abi::ipc::{IpcBacking, IpcObjectGuard, IpcObjectHandle, pipe as core_pipe};
 use carrick_guest_mem::CurrentMmMemory;
-use parking_lot::{Condvar, Mutex};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use super::*;
@@ -19,39 +20,68 @@ pub(crate) fn next_pipe_id() -> u64 {
     NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct PipeState {
-    pub(crate) buffer: VecDeque<u8>,
+/// A readiness snapshot, never mutable pipe storage.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PipeSnapshot {
+    pub(crate) unread: usize,
     pub(crate) capacity: usize,
     pub(crate) readers: usize,
     pub(crate) writers: usize,
-    pub(crate) pipe_id: u64,
+    pub(crate) writable: bool,
 }
 
-/// One in-memory guest pipe.
-///
-/// The two host readiness pipes (`read_pipe_ready`, `write_pipe_ready`) are the
-/// level-triggered signals a host `poll`/`kqueue` waits on when a guest blocks
-/// in `read`/`write` or registers the pipe with a readiness poller. They are
-/// created LAZILY on the first such wait: a plain `pipe()` + copy + `close`
-/// never needs them, and creating them eagerly cost every guest `pipe()` two
-/// host `pipe(2)`s, four `F_DUPFD_CLOEXEC` relocations and eight `fcntl`s —
-/// `ltp-pipe06` (524k pipes to `EMFILE`) ran ~29x Docker on that alone.
-/// Creation is serialised under `state`, so a thread that holds the state
-/// lock must use the `*_locked` accessors; the unlocked ones take the lock.
-#[derive(Debug)]
+/// Host binding of one shared PipeRecord. Bytes, endpoint counts and capacity
+/// live exclusively in the IPC region. Unpublished endpoint holds are consumed
+/// by the first descriptions; failure before publication releases them in Drop.
 pub struct PipeInner {
-    pub(crate) state: Mutex<PipeState>,
-    pub(crate) changed: Condvar,
-    pub(crate) capacity_cell: Arc<AtomicI64>,
-    read_pipe_ready: OnceLock<Option<(HostFdRef, HostFdRef)>>,
-    write_pipe_ready: OnceLock<Option<(HostFdRef, HostFdRef)>>,
-    read_notified: std::sync::atomic::AtomicBool,
-    write_notified: std::sync::atomic::AtomicBool,
+    owner: Arc<crate::el1_ipc::HostIpc>,
+    object: IpcObjectHandle,
+    pipe_id: u64,
+    initial: Mutex<[Option<core_pipe::End>; 2]>,
+    #[cfg(test)]
+    fixture: [Option<core_pipe::End>; 2],
+    resize: Mutex<()>,
+    readiness: Arc<Mutex<(bool, bool)>>,
+    read_pipe_ready: Arc<OnceLock<Option<(HostFdRef, HostFdRef)>>>,
+    write_pipe_ready: Arc<OnceLock<Option<(HostFdRef, HostFdRef)>>>,
+    readiness_publisher: Arc<dyn Fn() + Send + Sync>,
     pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 
+impl std::fmt::Debug for PipeInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipeInner")
+            .field("object", &self.object)
+            .field("pipe_id", &self.pipe_id)
+            .finish_non_exhaustive()
+    }
+}
+
 pub type PipeRef = Arc<PipeInner>;
+
+/// Functional endpoint ownership for a captured splice/tee/vmsplice operand.
+/// The shared object cannot retire while the operation uses its captured bytes.
+pub(crate) struct PipeEndpointLease {
+    pipe: PipeRef,
+    _description: crate::kernel::objects::FileDescriptionFdLease,
+}
+impl PipeEndpointLease {
+    pub(crate) fn new(
+        pipe: PipeRef,
+        description: crate::kernel::objects::FileDescriptionFdLease,
+    ) -> Self {
+        Self {
+            pipe,
+            _description: description,
+        }
+    }
+}
+impl std::ops::Deref for PipeEndpointLease {
+    type Target = PipeRef;
+    fn deref(&self) -> &Self::Target {
+        &self.pipe
+    }
+}
 
 /// Exact publication authority captured before a write parks. It avoids
 /// resolving a numeric guest fd after close or reuse.
@@ -151,32 +181,229 @@ impl PipeWriteEndpointLease {
     }
 }
 
-pub(crate) fn pipe_writer_is_writable(state: &PipeState) -> bool {
-    state.capacity.saturating_sub(state.buffer.len()) >= PIPE_BUF
+pub(crate) fn pipe_writer_is_writable(state: &PipeSnapshot) -> bool {
+    state.writable
+}
+
+fn object_error(error: core_pipe::Error) -> LinuxErrno {
+    match error {
+        core_pipe::Error::WouldBlock(_) => LINUX_EAGAIN,
+        core_pipe::Error::BrokenPipe => LINUX_EPIPE,
+        core_pipe::Error::Fault => LINUX_EFAULT,
+        core_pipe::Error::Busy => LINUX_EBUSY,
+        core_pipe::Error::Permission => LINUX_EPERM,
+        core_pipe::Error::Storage => LINUX_ENOMEM,
+        core_pipe::Error::Invalid => LINUX_EINVAL,
+        _ => carrick_fatal::carrick_fatal!("ipc::pipe", "invalid shared pipe state"),
+    }
 }
 
 impl PipeInner {
+    pub(crate) fn create(
+        owner: Arc<crate::el1_ipc::HostIpc>,
+        pipe_id: u64,
+        capacity: usize,
+    ) -> Result<Self, crate::el1_ipc::AdmissionError> {
+        let object = owner.create_pipe(capacity)?;
+        let wait_queue = owner.wait_queue(object);
+        let readiness = Arc::new(Mutex::new((false, false)));
+        let read_pipe_ready = Arc::new(OnceLock::new());
+        let write_pipe_ready = Arc::new(OnceLock::new());
+        let readiness_primer: Arc<dyn Fn() + Send + Sync> = {
+            let owner = Arc::clone(&owner);
+            let state = Arc::clone(&readiness);
+            let read = Arc::clone(&read_pipe_ready);
+            let write = Arc::clone(&write_pipe_ready);
+            Arc::new(move || {
+                Self::publish_readiness(&owner, object, &state, &read, &write);
+            })
+        };
+        let readiness_publisher: Arc<dyn Fn() + Send + Sync> = {
+            let prime = Arc::clone(&readiness_primer);
+            let queue = Arc::clone(&wait_queue);
+            Arc::new(move || {
+                prime();
+                queue.wake_all();
+            })
+        };
+        owner.register_host_waker(object, &readiness_publisher, &readiness_primer);
+        Ok(Self {
+            owner,
+            object,
+            pipe_id,
+            initial: Mutex::new([Some(core_pipe::End::Reader), Some(core_pipe::End::Writer)]),
+            #[cfg(test)]
+            fixture: [None, None],
+            resize: Mutex::new(()),
+            readiness,
+            read_pipe_ready,
+            write_pipe_ready,
+            readiness_publisher,
+            wait_queue,
+        })
+    }
+    #[cfg(test)]
     pub(crate) fn new(pipe_id: u64, capacity: usize) -> Self {
-        let capacity = capacity.clamp(PIPE_BUF, MAX_PIPE_CAPACITY);
-        // The buffer grows on first write; a never-written pipe owns no heap.
-        Self {
-            state: Mutex::new(PipeState {
-                buffer: VecDeque::new(),
-                capacity,
-                readers: 0,
-                writers: 0,
-                pipe_id,
-            }),
-            changed: Condvar::new(),
-            capacity_cell: Arc::new(AtomicI64::new(capacity as i64)),
-            read_pipe_ready: OnceLock::new(),
-            write_pipe_ready: OnceLock::new(),
-            read_notified: std::sync::atomic::AtomicBool::new(false),
-            write_notified: std::sync::atomic::AtomicBool::new(false),
-            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+        Self::create(
+            Arc::new(crate::el1_ipc::HostIpc::new(1 << 23).unwrap()),
+            pipe_id,
+            capacity,
+        )
+        .unwrap()
+    }
+    #[cfg(test)]
+    pub(crate) fn new_connected(pipe_id: u64, capacity: usize) -> Self {
+        let mut pipe = Self::new(pipe_id, capacity);
+        pipe.fixture = std::mem::take(pipe.initial.get_mut());
+        pipe
+    }
+    #[cfg(test)]
+    pub(crate) fn retire_fixture_endpoint(&mut self, end: core_pipe::End) {
+        let index = usize::from(end == core_pipe::End::Writer);
+        if let Some(end) = self.fixture[index].take() {
+            self.release_endpoint(end);
         }
     }
+    #[cfg(test)]
+    pub(crate) fn is_retired(&self) -> bool {
+        self.owner
+            .region()
+            .lock(self.object, &HostLockWait)
+            .is_err()
+    }
+    #[cfg(test)]
+    pub(crate) fn guest_write_for_test(&self, bytes: &[u8]) {
+        let mut guard = self.lock();
+        let step = guard.pipe().unwrap().try_write(bytes);
+        assert_eq!(step.result, Ok(bytes.len()));
+        guard.publish(step.wake);
+    }
+    #[cfg(test)]
+    pub(crate) fn ipc_object(&self) -> IpcObjectHandle {
+        self.object
+    }
+    fn lock(&self) -> IpcObjectGuard<'_> {
+        self.owner
+            .region()
+            .lock(self.object, &HostLockWait)
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::pipe", "stale live pipe binding")
+            })
+    }
+    fn snapshot_locked(guard: &mut IpcObjectGuard<'_>) -> PipeSnapshot {
+        let pipe = guard
+            .pipe()
+            .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"));
+        PipeSnapshot {
+            unread: pipe.unread_bytes(),
+            capacity: pipe.capacity(),
+            readers: pipe.references(core_pipe::End::Reader),
+            writers: pipe.references(core_pipe::End::Writer),
+            writable: pipe.readiness(core_pipe::End::Writer).writable,
+        }
+    }
+    pub(crate) fn snapshot(&self) -> PipeSnapshot {
+        Self::snapshot_locked(&mut self.lock())
+    }
+    pub(crate) fn pipe_id(&self) -> u64 {
+        self.pipe_id
+    }
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        // Epoll can retain an observation after the last functional endpoint
+        // closes. Authenticate the incarnation without retaining it or reading
+        // the successor's bytes after this directory slot is reused.
+        match self.owner.region().lock(self.object, &HostLockWait) {
+            Ok(mut guard) => Self::snapshot_locked(&mut guard).unread,
+            Err(carrick_el1_abi::ipc::IpcError::Stale) => 0,
+            Err(_) => carrick_fatal::carrick_fatal!("ipc::pipe", "invalid observation"),
+        }
+    }
+    pub(crate) fn get_capacity(&self) -> usize {
+        self.snapshot().capacity
+    }
 
+    fn finish<T>(
+        &self,
+        mut guard: IpcObjectGuard<'_>,
+        step: core_pipe::Step<T>,
+    ) -> Result<T, LinuxErrno> {
+        let wake = guard.publish(step.wake);
+        let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+        delivery.collect(wake);
+        drop(guard);
+        delivery.deliver();
+        if wake.host_owed {
+            self.owner.service_host_wake(self.object);
+        }
+        step.result.map_err(object_error)
+    }
+    pub(crate) fn write_bytes(&self, bytes: &[u8]) -> Result<usize, LinuxErrno> {
+        let mut guard = self.lock();
+        let step = guard
+            .pipe()
+            .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"))
+            .try_write(bytes);
+        self.finish(guard, step)
+    }
+    pub(crate) fn read_with(
+        &self,
+        count: usize,
+        copy: impl FnMut(&[u8]) -> usize,
+    ) -> Result<usize, LinuxErrno> {
+        let mut guard = self.lock();
+        let step = guard
+            .pipe()
+            .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"))
+            .read_with(count, copy);
+        self.finish(guard, step)
+    }
+    pub(crate) fn retain_endpoint(&self, end: core_pipe::End) {
+        let index = usize::from(end == core_pipe::End::Writer);
+        if self.initial.lock()[index].take().is_some() {
+            return;
+        }
+        self.lock()
+            .pipe()
+            .and_then(|mut pipe| {
+                pipe.retain(end)
+                    .map_err(carrick_el1_abi::ipc::IpcError::Object)
+            })
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::pipe", "retaining a closed endpoint")
+            });
+    }
+    pub(crate) fn release_endpoint(&self, end: core_pipe::End) {
+        let released = self
+            .owner
+            .release(
+                IpcBacking::Pipe {
+                    object: self.object,
+                    end,
+                }
+                .encode(),
+            )
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::pipe", "releasing a closed endpoint")
+            });
+        if let carrick_el1_abi::ipc::IpcReleased::Object { wake, .. } = released {
+            if wake.host_owed {
+                (self.readiness_publisher)();
+            }
+        }
+    }
+    pub(crate) fn set_capacity(&self, capacity: usize) -> Result<usize, LinuxErrno> {
+        let _resize = self.resize.lock();
+        self.owner
+            .resize_pipe(self.object, capacity, MAX_PIPE_CAPACITY)
+            .map_err(|error| match error {
+                crate::el1_ipc::AdmissionError::Shared(carrick_el1_abi::ipc::IpcError::Object(
+                    error,
+                )) => object_error(error),
+                _ => LINUX_ENOMEM,
+            })?;
+        self.owner.service_host_wake(self.object);
+        Ok(self.get_capacity())
+    }
     #[cfg(test)]
     pub(crate) fn readiness_pipes_initialized(&self) -> (bool, bool) {
         (
@@ -184,139 +411,104 @@ impl PipeInner {
             self.write_pipe_ready.get().is_some(),
         )
     }
-
-    #[cfg(test)]
-    pub(crate) fn new_connected(pipe_id: u64, capacity: usize) -> Self {
-        let pipe = Self::new(pipe_id, capacity);
-        {
-            let mut state = pipe.state.lock();
-            state.readers = 1;
-            state.writers = 1;
-            pipe.update_readiness_locked(&state);
-        }
-        pipe
-    }
-
-    pub(crate) fn update_readiness_locked(&self, state: &PipeState) {
-        let read_ready = !state.buffer.is_empty() || state.writers == 0;
-        if let Some((r, w)) = self.read_pipe_ready.get().and_then(Option::as_ref) {
-            if read_ready {
-                if !self.read_notified.swap(true, Ordering::SeqCst) {
-                    let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
-                }
-            } else if self.read_notified.swap(false, Ordering::SeqCst) {
-                let mut buf = [0u8; 32];
-                let _ = unsafe { libc::read(r.raw(), buf.as_mut_ptr() as *mut _, buf.len()) };
+    fn prime_channel(
+        channel: &OnceLock<Option<(HostFdRef, HostFdRef)>>,
+        notified: &mut bool,
+        ready: bool,
+    ) {
+        if let Some((r, w)) = channel.get().and_then(Option::as_ref) {
+            if ready && !*notified {
+                let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr().cast(), 1) };
+            } else if !ready && *notified {
+                let mut bytes = [0u8; 32];
+                let _ = unsafe { libc::read(r.raw(), bytes.as_mut_ptr().cast(), bytes.len()) };
             }
+            *notified = ready;
         }
-
-        let write_ready = state.readers == 0 || pipe_writer_is_writable(state);
-        if let Some((r, w)) = self.write_pipe_ready.get().and_then(Option::as_ref) {
-            if write_ready {
-                if !self.write_notified.swap(true, Ordering::SeqCst) {
-                    let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
-                }
-            } else if self.write_notified.swap(false, Ordering::SeqCst) {
-                let mut buf = [0u8; 32];
-                let _ = unsafe { libc::read(r.raw(), buf.as_mut_ptr() as *mut _, buf.len()) };
-            }
-        }
-
-        self.wait_queue.wake_all();
     }
-
-    /// The host fd a waiter polls (`POLLIN`) for "this pipe is readable",
-    /// creating the readiness pipe on first use. `None` only when the host
-    /// could not allocate the fds (the caller reports `EMFILE`).
+    pub(crate) fn update_readiness(&self) {
+        Self::publish_readiness(
+            &self.owner,
+            self.object,
+            &self.readiness,
+            &self.read_pipe_ready,
+            &self.write_pipe_ready,
+        );
+    }
+    fn publish_readiness(
+        owner: &crate::el1_ipc::HostIpc,
+        object: IpcObjectHandle,
+        readiness: &Mutex<(bool, bool)>,
+        read: &OnceLock<Option<(HostFdRef, HostFdRef)>>,
+        write: &OnceLock<Option<(HostFdRef, HostFdRef)>>,
+    ) {
+        if read.get().is_none() && write.get().is_none() {
+            return;
+        }
+        let mut notified = readiness.lock();
+        let region = owner.region();
+        let snapshot = region
+            .lock(object, &HostLockWait)
+            .ok()
+            .map(|mut guard| Self::snapshot_locked(&mut guard));
+        let read_ready = snapshot.is_none_or(|s| s.unread != 0 || s.writers == 0);
+        let write_ready = snapshot.is_none_or(|s| s.readers == 0 || s.writable);
+        Self::prime_channel(read, &mut notified.0, read_ready);
+        Self::prime_channel(write, &mut notified.1, write_ready);
+    }
+    fn poll_fd(&self, channel: &OnceLock<Option<(HostFdRef, HostFdRef)>>) -> Option<HostFdRef> {
+        let subscription = self.owner.subscribe_host(self.object).ok()?;
+        let needs_prime = channel.get().is_none()
+            || self
+                .owner
+                .region()
+                .lock(self.object, &HostLockWait)
+                .ok()
+                .is_none_or(|guard| guard.host_subscribers() == 1);
+        let ready = channel.get_or_init(make_readiness_pipe);
+        if needs_prime {
+            self.update_readiness();
+        }
+        ready
+            .as_ref()
+            .map(|(r, _)| r.clone().with_ipc_subscription(subscription))
+    }
     pub(crate) fn read_poll_fd(&self) -> Option<HostFdRef> {
-        if let Some(ready) = self.read_pipe_ready.get() {
-            return ready.as_ref().map(|(r, _)| r.clone());
-        }
-        let state = self.state.lock();
-        self.read_poll_fd_locked(&state)
+        self.poll_fd(&self.read_pipe_ready)
     }
-
-    /// Observe the read readiness fd without materializing it. Lifecycle
-    /// cleanup uses this because an untouched pipe has no host registration
-    /// to remove.
-    pub(crate) fn initialized_read_poll_fd(&self) -> Option<HostFdRef> {
-        self.read_pipe_ready
-            .get()
-            .and_then(Option::as_ref)
-            .map(|(r, _)| r.clone())
-    }
-
-    /// [`Self::read_poll_fd`] for a caller that already holds `state`.
-    pub(crate) fn read_poll_fd_locked(&self, state: &PipeState) -> Option<HostFdRef> {
-        if self.read_pipe_ready.get().is_none() {
-            // Initialisation always runs under `state`, so a `get()` miss under
-            // the lock means this thread is the one that creates it; the level
-            // is primed from the current state before anyone can poll it.
-            self.read_pipe_ready.get_or_init(make_readiness_pipe);
-            self.update_readiness_locked(state);
-        }
-        self.read_pipe_ready
-            .get()
-            .and_then(Option::as_ref)
-            .map(|(r, _)| r.clone())
-    }
-
-    /// The host fd a waiter polls (`POLLIN`) for "this pipe is writable" —
-    /// the level protocol keeps one byte queued while the pipe has room —
-    /// creating the readiness pipe on first use.
     pub(crate) fn write_poll_fd(&self) -> Option<HostFdRef> {
-        if let Some(ready) = self.write_pipe_ready.get() {
-            return ready.as_ref().map(|(r, _)| r.clone());
-        }
-        let state = self.state.lock();
-        self.write_poll_fd_locked(&state)
+        self.poll_fd(&self.write_pipe_ready)
     }
-
-    /// Observe the write readiness fd without materializing it.
+    pub(crate) fn initialized_read_poll_fd(&self) -> Option<HostFdRef> {
+        self.read_pipe_ready.get().and_then(|_| self.read_poll_fd())
+    }
     pub(crate) fn initialized_write_poll_fd(&self) -> Option<HostFdRef> {
         self.write_pipe_ready
             .get()
-            .and_then(Option::as_ref)
-            .map(|(r, _)| r.clone())
+            .and_then(|_| self.write_poll_fd())
     }
-
-    /// [`Self::write_poll_fd`] for a caller that already holds `state`.
-    pub(crate) fn write_poll_fd_locked(&self, state: &PipeState) -> Option<HostFdRef> {
-        if self.write_pipe_ready.get().is_none() {
-            self.write_pipe_ready.get_or_init(make_readiness_pipe);
-            self.update_readiness_locked(state);
+}
+impl Drop for PipeInner {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        for end in self.fixture.iter_mut().filter_map(Option::take) {
+            let _ = self.owner.release(
+                IpcBacking::Pipe {
+                    object: self.object,
+                    end,
+                }
+                .encode(),
+            );
         }
-        self.write_pipe_ready
-            .get()
-            .and_then(Option::as_ref)
-            .map(|(r, _)| r.clone())
-    }
-
-    pub(crate) fn pipe_id(&self) -> u64 {
-        self.state.lock().pipe_id
-    }
-
-    pub(crate) fn buffered_bytes(&self) -> usize {
-        self.state.lock().buffer.len()
-    }
-
-    pub(crate) fn set_capacity(&self, new_capacity: usize) -> Result<usize, LinuxErrno> {
-        let mut state = self.state.lock();
-        if state.buffer.len() > new_capacity {
-            return Err(LINUX_EBUSY);
+        for end in self.initial.get_mut().iter_mut().filter_map(Option::take) {
+            let _ = self.owner.release(
+                IpcBacking::Pipe {
+                    object: self.object,
+                    end,
+                }
+                .encode(),
+            );
         }
-        state.capacity = new_capacity;
-        self.capacity_cell
-            .store(new_capacity as i64, Ordering::Release);
-        self.update_readiness_locked(&state);
-        drop(state);
-        self.changed.notify_all();
-        Ok(new_capacity)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn get_capacity(&self) -> usize {
-        self.state.lock().capacity
     }
 }
 
@@ -333,38 +525,26 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
         return DispatchOutcome::Returned { value: 0 };
     }
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
-    let mut state = pipe.state.lock();
-    if !state.buffer.is_empty() {
-        let read_len = state.buffer.len().min(length);
-        let bytes: Vec<u8> = state.buffer.drain(..read_len).collect();
-        pipe.update_readiness_locked(&state);
-        drop(state);
-        pipe.changed.notify_all();
-        if memory.write_bytes(address, &bytes).is_err() {
-            return DispatchOutcome::errno(LINUX_EFAULT);
+    let mut offset = 0usize;
+    let result = pipe.read_with(length, |bytes| {
+        if memory.write_bytes(address + offset as u64, bytes).is_err() {
+            return 0;
         }
-        return DispatchOutcome::returned_len_or_errno(read_len);
-    }
-    if state.writers == 0 {
-        // EOF: all writers closed and buffer empty
-        return DispatchOutcome::Returned { value: 0 };
-    }
-    if nonblocking {
-        DispatchOutcome::errno(LINUX_EAGAIN)
-    } else {
-        wait_for_pipe_readable_locked(pipe, &state, authority)
+        offset += bytes.len();
+        bytes.len()
+    });
+    match result {
+        Ok(count) => DispatchOutcome::returned_len_or_errno(count),
+        Err(LINUX_EAGAIN) if !nonblocking => wait_for_pipe_readable(pipe, authority),
+        Err(errno) => DispatchOutcome::errno(errno),
     }
 }
 
-/// Park until `pipe` has bytes (or loses its last writer): the one blocking
-/// read wait every in-memory pipe consumer shares — `read(2)`, `splice(2)`
-/// and `vmsplice(2)` out of a pipe.
-fn wait_for_pipe_readable_locked(
+pub(crate) fn wait_for_pipe_readable(
     pipe: &PipeRef,
-    state: &PipeState,
     authority: super::WaitFdAuthority,
 ) -> DispatchOutcome {
-    if let Some(host_fd) = pipe.read_poll_fd_locked(state) {
+    if let Some(host_fd) = pipe.read_poll_fd() {
         DispatchOutcome::WaitOnFds {
             fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
             timeout: None,
@@ -378,16 +558,6 @@ fn wait_for_pipe_readable_locked(
     }
 }
 
-/// Park a blocking splice/vmsplice reader on an empty pipe that still has
-/// writers (see [`take_pipe_bytes`]).
-pub(crate) fn wait_for_pipe_readable(
-    pipe: &PipeRef,
-    authority: super::WaitFdAuthority,
-) -> DispatchOutcome {
-    let state = pipe.state.lock();
-    wait_for_pipe_readable_locked(pipe, &state, authority)
-}
-
 #[allow(dead_code)]
 pub(crate) fn read_pipe_bytes(
     buf: &mut [u8],
@@ -395,71 +565,77 @@ pub(crate) fn read_pipe_bytes(
     _status_flags: u64,
     _tid: crate::thread::ThreadId,
 ) -> Result<usize, LinuxErrno> {
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    let length = buf.len();
-    let mut state = pipe.state.lock();
-    if !state.buffer.is_empty() {
-        let read_len = state.buffer.len().min(length);
-        for (dest, src) in buf[..read_len]
-            .iter_mut()
-            .zip(state.buffer.drain(..read_len))
-        {
-            *dest = src;
-        }
-        pipe.update_readiness_locked(&state);
-        drop(state);
-        pipe.changed.notify_all();
-        return Ok(read_len);
-    }
-    if state.writers == 0 {
-        // EOF
-        return Ok(0);
-    }
-    Err(LINUX_EAGAIN)
+    let mut offset = 0;
+    pipe.read_with(buf.len(), |bytes| {
+        buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+        offset += bytes.len();
+        bytes.len()
+    })
 }
 
-/// What draining an in-memory pipe for `splice`/`vmsplice` found. An empty
-/// pipe is NOT a zero-byte transfer: with writers alive it is a wait (or
-/// EAGAIN), and only with no writer left is it EOF. Collapsing the two into
-/// an empty `Vec` made `splice(pipe -> file)` return 0 whenever the reader
-/// outran the writer, so LTP splice02 ended its copy loop early under load.
-#[derive(Debug, PartialEq, Eq)]
-pub enum PipeDrain {
-    Bytes(Vec<u8>),
+/// A splice read holds the source object until its delivered prefix commits.
+/// A failed destination never removes bytes or needs a second pushback store.
+pub struct PipeRead<'a> {
+    pipe: &'a PipeInner,
+    guard: IpcObjectGuard<'a>,
+    bytes: Vec<u8>,
+}
+impl std::ops::Deref for PipeRead<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+impl PipeRead<'_> {
+    pub(crate) fn commit(mut self, count: usize) {
+        let step = self
+            .guard
+            .pipe()
+            .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"))
+            .consume(count);
+        self.pipe
+            .finish(self.guard, step)
+            .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "invalid read commit"));
+    }
+}
+pub enum PipeDrain<'a> {
+    Bytes(PipeRead<'a>),
     Eof,
     WouldBlock,
 }
 
-pub(crate) fn take_pipe_bytes(pipe: &PipeRef, length: usize) -> PipeDrain {
-    let mut state = pipe.state.lock();
-    if state.buffer.is_empty() {
-        if state.writers == 0 {
-            return PipeDrain::Eof;
+pub(crate) fn take_pipe_bytes(pipe: &PipeRef, length: usize) -> PipeDrain<'_> {
+    // Bound admission work by observed source bytes, including the empty case.
+    let snapshot = pipe.snapshot();
+    if snapshot.unread == 0 {
+        return if snapshot.writers == 0 {
+            PipeDrain::Eof
+        } else {
+            PipeDrain::WouldBlock
+        };
+    }
+    // Staging allocation precedes the shared object lock. Another reader can
+    // consume this snapshot; peek rechecks the same authoritative record.
+    let mut bytes = vec![0; length.min(snapshot.unread)];
+    let mut guard = pipe.lock();
+    let mut copied = 0;
+    let result = guard
+        .pipe()
+        .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"))
+        .peek_with(bytes.len(), |chunk| {
+            bytes[copied..copied + chunk.len()].copy_from_slice(chunk);
+            copied += chunk.len();
+            chunk.len()
+        });
+    match result {
+        Ok(0) => PipeDrain::Eof,
+        Ok(count) => {
+            bytes.truncate(count);
+            PipeDrain::Bytes(PipeRead { pipe, guard, bytes })
         }
-        return PipeDrain::WouldBlock;
+        Err(core_pipe::Error::WouldBlock(_)) => PipeDrain::WouldBlock,
+        Err(_) => carrick_fatal::carrick_fatal!("ipc::pipe", "invalid shared read"),
     }
-
-    let read_len = state.buffer.len().min(length);
-    let bytes = state.buffer.drain(..read_len).collect();
-    pipe.update_readiness_locked(&state);
-    drop(state);
-    pipe.changed.notify_all();
-    PipeDrain::Bytes(bytes)
-}
-
-pub(crate) fn restore_pipe_bytes(pipe: &PipeRef, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    let mut state = pipe.state.lock();
-    for byte in bytes.iter().rev() {
-        state.buffer.push_front(*byte);
-    }
-    pipe.update_readiness_locked(&state);
-    drop(state);
-    pipe.changed.notify_all();
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -472,72 +648,87 @@ pub enum InMemoryTeeOutcome {
     Transferred(usize),
 }
 
-fn pipe_double_lock<'a>(
-    p1: &'a PipeInner,
-    p2: &'a PipeInner,
-) -> (
-    parking_lot::MutexGuard<'a, PipeState>,
-    parking_lot::MutexGuard<'a, PipeState>,
-) {
-    let ptr1 = p1 as *const PipeInner as usize;
-    let ptr2 = p2 as *const PipeInner as usize;
-    if ptr1 < ptr2 {
-        let g1 = p1.state.lock();
-        let g2 = p2.state.lock();
-        (g1, g2)
-    } else {
-        let g2 = p2.state.lock();
-        let g1 = p1.state.lock();
-        (g1, g2)
-    }
-}
-
 pub(crate) fn tee_in_memory_pipes(
-    in_pipe: &PipeRef,
-    out_pipe: &PipeRef,
+    source: &PipeRef,
+    dest: &PipeRef,
     count: usize,
 ) -> InMemoryTeeOutcome {
-    if Arc::ptr_eq(in_pipe, out_pipe) || in_pipe.pipe_id() == out_pipe.pipe_id() {
+    transfer_in_memory_pipes(source, dest, count, false)
+}
+
+pub(crate) fn transfer_in_memory_pipes(
+    source: &PipeRef,
+    dest: &PipeRef,
+    count: usize,
+    consume: bool,
+) -> InMemoryTeeOutcome {
+    if Arc::ptr_eq(source, dest) {
         return InMemoryTeeOutcome::SamePipe;
     }
     if count == 0 {
         return InMemoryTeeOutcome::Transferred(0);
     }
-    let (in_state, mut out_state) = pipe_double_lock(in_pipe, out_pipe);
-
-    // Linux link_pipe checks destination readers first; broken destination pipe
-    // takes precedence over empty source or full destination.
-    if out_state.readers == 0 {
+    // One stable order for every host operation touching two pipe objects.
+    let (mut src, mut dst) = if Arc::as_ptr(source) < Arc::as_ptr(dest) {
+        let src = source.lock();
+        (src, dest.lock())
+    } else {
+        let dst = dest.lock();
+        (source.lock(), dst)
+    };
+    if PipeInner::snapshot_locked(&mut dst).readers == 0 {
         return InMemoryTeeOutcome::BrokenPipe;
     }
-
-    if in_state.buffer.is_empty() {
-        if in_state.writers == 0 {
-            return InMemoryTeeOutcome::Eof;
-        }
-        return InMemoryTeeOutcome::SourceWouldBlock;
-    }
-
-    let dest_room = out_state.capacity.saturating_sub(out_state.buffer.len());
-    if dest_room == 0 {
-        return InMemoryTeeOutcome::DestWouldBlock;
-    }
-
-    let copy_len = count.min(in_state.buffer.len()).min(dest_room);
-    let (s1, s2) = in_state.buffer.as_slices();
-    if copy_len <= s1.len() {
-        out_state.buffer.extend(&s1[..copy_len]);
+    let mut wakes = core_pipe::WakeSet::default();
+    let mut copied = 0;
+    let result = src
+        .pipe()
+        .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong source kind"))
+        .peek_with(count, |chunk| {
+            let mut pipe = dst.pipe().unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::pipe", "wrong destination kind")
+            });
+            let room = pipe.capacity().saturating_sub(pipe.unread_bytes());
+            if room == 0 {
+                return 0;
+            }
+            let step = pipe.try_write(&chunk[..chunk.len().min(room)]);
+            wakes.readers |= step.wake.readers;
+            wakes.writers |= step.wake.writers;
+            let written = step.result.unwrap_or(0);
+            copied += written;
+            written
+        });
+    let source_wake = if consume && copied > 0 {
+        src.pipe()
+            .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong source kind"))
+            .consume(copied)
+            .wake
     } else {
-        out_state.buffer.extend(s1);
-        out_state.buffer.extend(&s2[..copy_len - s1.len()]);
+        core_pipe::WakeSet::default()
+    };
+    let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+    let source_wake = src.publish(source_wake);
+    let dest_wake = dst.publish(wakes);
+    delivery.collect(source_wake);
+    delivery.collect(dest_wake);
+    drop(src);
+    drop(dst);
+    delivery.deliver();
+    if copied > 0 {
+        if dest_wake.host_owed {
+            dest.owner.service_host_wake(dest.object);
+        }
+        if source_wake.host_owed {
+            source.owner.service_host_wake(source.object);
+        }
+        return InMemoryTeeOutcome::Transferred(copied);
     }
-    out_pipe.update_readiness_locked(&out_state);
-
-    drop(in_state);
-    drop(out_state);
-    out_pipe.changed.notify_all();
-
-    InMemoryTeeOutcome::Transferred(copy_len)
+    match result {
+        Ok(0) => InMemoryTeeOutcome::Eof,
+        Err(core_pipe::Error::WouldBlock(_)) => InMemoryTeeOutcome::SourceWouldBlock,
+        _ => InMemoryTeeOutcome::DestWouldBlock,
+    }
 }
 
 /// Exact operation authority admitted before the pipe state lock. A parked
@@ -567,39 +758,29 @@ pub(crate) fn write_pipe<I: Fn() -> bool>(
         return DispatchOutcome::Returned { value: 0 };
     }
 
-    let mut state = pipe.state.lock();
-    if state.readers == 0 {
-        return DispatchOutcome::errno(LINUX_EPIPE);
-    }
-
-    let available = state.capacity.saturating_sub(state.buffer.len());
-    // Writes <= PIPE_BUF are atomic. Larger writes with no room also wait
-    // before their first byte rather than occupying an executor in a retry loop.
-    if available == 0 || (bytes.len() <= PIPE_BUF && available < bytes.len()) {
-        if nonblocking {
-            return DispatchOutcome::errno(LINUX_EAGAIN);
+    let written = match pipe.write_bytes(bytes) {
+        Ok(written) => written,
+        Err(LINUX_EAGAIN) => {
+            if nonblocking {
+                return DispatchOutcome::errno(LINUX_EAGAIN);
+            }
+            if (operation.is_interrupted)() {
+                return DispatchOutcome::errno(LINUX_EINTR);
+            }
+            let Some(host_fd) = pipe.write_poll_fd() else {
+                return DispatchOutcome::errno(LINUX_EMFILE);
+            };
+            return DispatchOutcome::WaitOnFds {
+                fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, operation.authority),
+                timeout: None,
+                sig_mask: carrick_abi::WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd {
+                    on_timeout: LINUX_EAGAIN.guest_retval(),
+                },
+            };
         }
-        if (operation.is_interrupted)() {
-            return DispatchOutcome::errno(LINUX_EINTR);
-        }
-        let Some(host_fd) = pipe.write_poll_fd_locked(&state) else {
-            return DispatchOutcome::errno(LINUX_EMFILE);
-        };
-        return DispatchOutcome::WaitOnFds {
-            fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, operation.authority),
-            timeout: None,
-            sig_mask: carrick_abi::WaitSigMask::NONE,
-            completion: FdWaitCompletion::Fd {
-                on_timeout: LINUX_EAGAIN.guest_retval(),
-            },
-        };
-    }
-
-    let written = bytes.len().min(available);
-    state.buffer.extend(&bytes[..written]);
-    pipe.update_readiness_locked(&state);
-    drop(state);
-    pipe.changed.notify_all();
+        Err(errno) => return DispatchOutcome::errno(errno),
+    };
 
     if written == bytes.len() || nonblocking || (operation.is_interrupted)() {
         return DispatchOutcome::returned_len_or_errno(written);
@@ -639,14 +820,16 @@ impl<'a> FsView<'a> {
             let fd_flags = linux_fd_flags_from_open_flags(flags);
 
             let pipe_id = next_pipe_id();
-            let pipe = Arc::new(PipeInner::new(pipe_id, DEFAULT_PIPE_CAPACITY));
+            let owner = cx.kernel.kernel().ipc().map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?;
+            let pipe = Arc::new(PipeInner::create(owner, pipe_id, DEFAULT_PIPE_CAPACITY)
+                .map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?);
 
             let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock)
                 .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
-            read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+            read_base.set_shared_pipe(Arc::clone(&pipe));
             let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock)
                 .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
-            write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+            write_base.set_shared_pipe(Arc::clone(&pipe));
 
             let read_open = OpenFile::from_open_description_with_status_flags(
                 Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
@@ -692,6 +875,67 @@ impl<'a> FsView<'a> {
 mod tests {
     use super::*;
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
+
+    #[test]
+    fn serial_host_el1_ipc_pipe_proxy_subscription_ends_with_lease() {
+        let pipe = PipeInner::new_connected(next_pipe_id(), DEFAULT_PIPE_CAPACITY);
+        let subscribers = || pipe.lock().host_subscribers();
+        assert_eq!(subscribers(), 0);
+        let lease = pipe.read_poll_fd().unwrap();
+        assert_eq!(subscribers(), 1);
+        drop(lease);
+        assert_eq!(
+            subscribers(),
+            0,
+            "cached proxy is not a live host subscriber"
+        );
+        let mut guard = pipe.lock();
+        let step = guard.pipe().unwrap().try_write(b"guest");
+        assert!(!guard.publish(step.wake).host_owed);
+        drop(guard);
+        let resumed = pipe.read_poll_fd().unwrap();
+        let mut ready = libc::pollfd {
+            fd: resumed.raw(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut ready, 1, 0) },
+            1,
+            "a new subscriber samples changes made during the unsubscribed interval"
+        );
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_pipe_guest_write_host_read_and_reverse() {
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let pipe = Arc::new(PipeInner::create(Arc::clone(&owner), 1, 65536).unwrap());
+        let region = owner.region();
+        let mut guest = region
+            .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
+            .unwrap();
+        assert_eq!(guest.pipe().unwrap().try_write(b"guest").result, Ok(5));
+        drop(guest);
+        let mut bytes = [0; 5];
+        assert_eq!(
+            read_pipe_bytes(
+                &mut bytes,
+                &pipe,
+                0,
+                crate::thread::ThreadId::synthetic_for_tests(1)
+            ),
+            Ok(5)
+        );
+        assert_eq!(&bytes, b"guest");
+        assert_eq!(pipe.write_bytes(b"host"), Ok(4));
+        let mut guest = region
+            .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
+            .unwrap();
+        assert_eq!(guest.pipe().unwrap().try_read(&mut bytes).result, Ok(4));
+        assert_eq!(&bytes[..4], b"host");
+        assert_eq!(guest.host_subscribers(), 0);
+        assert_eq!(pipe.readiness_pipes_initialized(), (false, false));
+    }
 
     fn write_pipe_for_test(
         bytes: &[u8],
@@ -826,11 +1070,13 @@ mod tests {
 
     #[test]
     fn in_memory_pipe_broken_pipe_and_eof() {
-        let pipe = Arc::new(PipeInner::new_connected(3, 4096));
+        let mut pipe = Arc::new(PipeInner::new_connected(3, 4096));
         let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         // Close all readers
-        pipe.state.lock().readers = 0;
+        Arc::get_mut(&mut pipe)
+            .unwrap()
+            .retire_fixture_endpoint(core_pipe::End::Reader);
         let out = write_pipe_for_test(
             b"test",
             &pipe,
@@ -842,8 +1088,10 @@ mod tests {
         assert_eq!(out, DispatchOutcome::errno(LINUX_EPIPE));
 
         // Restore reader, close all writers
-        pipe.state.lock().readers = 1;
-        pipe.state.lock().writers = 0;
+        let mut pipe = Arc::new(PipeInner::new_connected(6, 4096));
+        Arc::get_mut(&mut pipe)
+            .unwrap()
+            .retire_fixture_endpoint(core_pipe::End::Writer);
         let mut buf = [0u8; 10];
         let n = read_pipe_bytes(&mut buf, &pipe, 0, tid).expect("read");
         assert_eq!(n, 0); // EOF
@@ -936,7 +1184,6 @@ mod tests {
         let pipe = Arc::new(PipeInner::new(14, PIPE_BUF));
         // The reader end is live independently of the writer description
         // constructed below.
-        pipe.state.lock().readers = 1;
         let description = Arc::new(
             crate::kernel::FileDescription::concrete_with_status_flags(
                 Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
@@ -974,7 +1221,7 @@ mod tests {
         // not observe EOF before the staged suffix lands.
         description.release_fd_ref();
         assert_eq!(description.fd_ref_count(), 1);
-        assert_eq!(pipe.state.lock().writers, 1);
+        assert_eq!(pipe.snapshot().writers, 1);
 
         let mut first = vec![0; PIPE_BUF];
         assert_eq!(
@@ -998,13 +1245,12 @@ mod tests {
         }
         drop(blocked);
         assert_eq!(description.fd_ref_count(), 0);
-        assert_eq!(pipe.state.lock().writers, 0);
+        assert_eq!(pipe.snapshot().writers, 0);
     }
 
     #[test]
     fn aggregate_fault_truncates_staged_current_suffix_at_copy_boundary() {
         let pipe = Arc::new(PipeInner::new(16, PIPE_BUF));
-        pipe.state.lock().readers = 1;
         let description = Arc::new(
             crate::kernel::FileDescription::concrete_with_status_flags(
                 Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
@@ -1072,7 +1318,6 @@ mod tests {
     #[test]
     fn aggregate_blocking_write_excludes_unadmitted_later_vectors() {
         let pipe = Arc::new(PipeInner::new(15, PIPE_BUF));
-        pipe.state.lock().readers = 1;
         let description = Arc::new(
             crate::kernel::FileDescription::concrete_with_status_flags(
                 Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {

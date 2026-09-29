@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 1 test
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity ... FAILED
+
+failures:
+
+---- dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity stdout ----
+
+thread 'dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity' (34210465) panicked at crates/carrick-kernel/src/dispatch/tests.rs:79:9:
+blocking eventfd write must yield an owned continuation: Errno { errno: LinuxErrno(11) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2312 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

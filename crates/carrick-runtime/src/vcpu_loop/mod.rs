@@ -1493,7 +1493,9 @@ where
             // host waiter it could not signal from EL1.
             carrick_kernel::el1_inotify::deliver_owed_wakes();
             // An EL1 pipe/eventfd change may owe host subscribers a wake.
-            carrick_kernel::kernel::continuation::ipc::deliver_owed_host_wakes();
+            carrick_kernel::kernel::continuation::ipc::deliver_owed_host_wakes(
+                kernel_context.kernel(),
+            );
             CENSUS_EL1_BOUNDARY.with(|flag| flag.set(true));
         }
 
