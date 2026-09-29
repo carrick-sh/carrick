@@ -31,20 +31,51 @@ pub use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
 /// descriptor-table locks for (the zone's host lock policy).
 pub use crate::el1_zone::HostLockWait as HostIpcWait;
 
-/// How the host wakes an object's waiters after a state change it made (the
-/// guest venue notifies under the object lock; the host uses its own
-/// placement boundary). Called with no IPC lock held.
-pub trait IpcHostWake {
+/// Host services for one completion owner: authenticate its mapping, retire
+/// host tokens, and deliver object wakes. Callbacks run with no IPC lock held.
+pub trait IpcHostServices {
+    fn validate_region(&self, region: &IpcRegion<'_>) -> Result<(), IpcError>;
+    fn release_host(&self, token: carrick_el1_abi::ipc::HostResourceToken) -> Result<(), IpcError>;
     fn wake(&self, object: IpcObjectHandle, lanes: WakeSet);
 }
 
-/// The production host wake: the scheduler's host placement for object
+/// The production completion owner and scheduler's host placement for object
 /// queues (`notify_object_host`), never impersonating a running guest slot.
 /// Placed waiters run in the guest (their slot rescheduled when owed);
 /// waiters no slot admits are handed to their host continuations.
-pub struct ZoneHostWake;
+pub struct ZoneHostServices {
+    owner: std::sync::Arc<crate::el1_ipc::HostIpc>,
+}
 
-impl IpcHostWake for ZoneHostWake {
+impl ZoneHostServices {
+    pub fn new(kernel: &crate::kernel::Kernel) -> Result<Self, IpcError> {
+        Ok(Self {
+            owner: kernel.existing_ipc().ok_or(IpcError::Stale)?,
+        })
+    }
+
+    /// Completion may retire a cancelled task whose context no longer resolves.
+    /// The dispatcher still retains its kernel's resource owner.
+    pub fn for_dispatcher(
+        dispatcher: &crate::dispatch::SyscallDispatcher,
+    ) -> Result<Self, IpcError> {
+        Self::new(dispatcher.kernel_binding.read().kernel())
+    }
+}
+
+impl IpcHostServices for ZoneHostServices {
+    fn validate_region(&self, region: &IpcRegion<'_>) -> Result<(), IpcError> {
+        if region.same_mapping(&self.owner.region()) {
+            Ok(())
+        } else {
+            Err(IpcError::BadRegion)
+        }
+    }
+    fn release_host(&self, token: carrick_el1_abi::ipc::HostResourceToken) -> Result<(), IpcError> {
+        self.owner
+            .release(carrick_el1_abi::ipc::IpcBacking::Host(token).encode())
+            .map(|_| ())
+    }
     fn wake(&self, object: IpcObjectHandle, lanes: WakeSet) {
         let Some(zone) = crate::el1_zone::zone() else {
             return;
@@ -92,6 +123,28 @@ pub fn host_window_backing(
 ) -> Option<std::sync::Arc<dyn carrick_el1_abi::IpcWindowBacking>> {
     let owner = dispatcher.kernel_binding.read().kernel().ipc().ok()?;
     Some(owner)
+}
+
+/// Bind the current production file table before returning to the guest.
+/// Missing windows and bounded admission refusals retain host service. Never
+/// publish a different kernel's descriptor IDs into the carrier's mapping.
+pub fn publish_file_table(context: &crate::kernel::KernelContext) {
+    let Some(map) = carrick_el1_abi::ipc_table_map_host() else {
+        return;
+    };
+    if !map.window_published() {
+        return;
+    }
+    let Some(region) = host_region() else {
+        return;
+    };
+    let Some(owner) = context.kernel().existing_ipc() else {
+        return;
+    };
+    if !region.same_mapping(&owner.region()) {
+        return;
+    }
+    let _ = context.resources().files().publish_ipc(owner, map);
 }
 
 /// Deliver guest-produced IPC readiness at this kernel's host boundary.
@@ -190,23 +243,27 @@ pub fn interrupted(op: &IpcOperation, cause: IpcCause) -> IpcHostOutcome {
 pub fn finish(
     region: &IpcRegion<'_>,
     token: IpcOpToken,
-    wake: &impl IpcHostWake,
+    wake: &impl IpcHostServices,
 ) -> Result<IpcOperation, IpcError> {
+    wake.validate_region(region)?;
     let op = region.finish_operation(token)?;
     if op.pin.authority != 0 {
         let fd = region.fd(HostIpcWait);
-        if let Some(description) = fd.unpin(OfdPin::from_raw(op.pin)).map_err(IpcError::Fd)?
-            && let IpcReleased::Object { wake: w, freed } =
-                region.release_backing(description.backing, &HostIpcWait)?
-            && !freed
-        {
-            wake.wake(
-                w.object,
-                WakeSet {
-                    readers: w.readers,
-                    writers: w.writers,
-                },
-            );
+        if let Some(description) = fd.unpin(OfdPin::from_raw(op.pin)).map_err(IpcError::Fd)? {
+            match region.release_backing(description.backing, &HostIpcWait)? {
+                IpcReleased::Object {
+                    wake: w,
+                    freed: false,
+                } => wake.wake(
+                    w.object,
+                    WakeSet {
+                        readers: w.readers,
+                        writers: w.writers,
+                    },
+                ),
+                IpcReleased::Host(token) => wake.release_host(token)?,
+                IpcReleased::Object { freed: true, .. } => {}
+            }
         }
     }
     Ok(op)
@@ -217,7 +274,7 @@ pub fn interrupt(
     region: &IpcRegion<'_>,
     token: IpcOpToken,
     cause: IpcCause,
-    wake: &impl IpcHostWake,
+    wake: &impl IpcHostServices,
 ) -> Result<IpcHostOutcome, IpcError> {
     let op = finish(region, token, wake)?;
     Ok(interrupted(&op, cause))
@@ -304,8 +361,9 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     mm: IpcMmKey,
     memory: &mut M,
     signal: Option<IpcCause>,
-    wake: &impl IpcHostWake,
+    wake: &impl IpcHostServices,
 ) -> Result<IpcHostOutcome, IpcError> {
+    wake.validate_region(region)?;
     let mut op = region.operation(&token)?;
     match op.handback {
         IpcHandback::Sigpipe => {

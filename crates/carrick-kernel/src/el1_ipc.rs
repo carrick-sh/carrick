@@ -185,6 +185,10 @@ enum HostDescriptionState {
 }
 
 impl HostDescriptionFlags {
+    pub(crate) fn belongs_to(&self, owner: &std::sync::Arc<HostIpc>) -> bool {
+        std::sync::Arc::ptr_eq(&self.owner, owner)
+    }
+
     pub(crate) const MUTABLE_MASK: u64 =
         carrick_abi::LINUX_O_APPEND | carrick_abi::LINUX_O_NONBLOCK | carrick_abi::LINUX_O_ASYNC;
 

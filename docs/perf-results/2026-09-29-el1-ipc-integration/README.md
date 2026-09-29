@@ -191,3 +191,51 @@ Final kernel IPC filter: 67 passed, one pre-existing ignored.
 HostTable is not yet attached to kernel FileTable. Table publication and the live
 namespace mutation/lifecycle wiring remain open. These are development checks,
 not signed guest execution or checkpoint acceptance.
+
+
+## Live FileTable publication and host-token retirement
+
+Production FileTable now owns a shared HostTable binding. Initial publication
+includes all real slots and implicit stdio; insert/remove/mutable-slot guards
+update only touched slots, and descriptor storage grows geometrically. Bare
+stdio close/CLOEXEC changes update the same projection while explicit slots
+retain priority. Fork and exec tables admit their own complete namespace on
+first use. Functional retirement withdraws and destroys shared table identity,
+even if diagnostic FileTable Arcs survive. Admission failure withdraws the
+entire namespace and retains host service, without a full-table retry on every
+syscall. An independent fork/exec namespace can attempt admission again.
+
+Runtime boot and syscall entry publish the current table only into a mapped
+IPC window owned by the same Kernel. The first red FileTable witness refused
+publication (NoMemory). The implementation now passes mutation, guest-pin,
+stdio, growth, fork/exec, teardown and storage-refusal checks. A real dispatcher
+creates an eventfd whose shared guest view reads both its initial value and a
+later host write; close removes the slot and retires the object. Final focused
+serial IPC filter: 29 passed. These are VM-free observations, not guest execution.
+
+Host-backed descriptions have one forwarding OFD pin tied to functional
+lifetime. A real completion witness found that final Host tokens were ignored
+by IPC handback completion: its release count was zero rather than one.
+Completion now validates the exact Kernel mapping before effects and releases
+the owning Kernel's token once. A second Kernel with the same numeric token is
+rejected before consuming the operation. Cancellation uses the retained
+Kernel owner without requiring the cancelled task's context to resolve.
+Prior focused completion checks: 88 passed; IPC 69 passed, one existing ignore;
+affected Clippy and formatting passed.
+
+The first broader kernel regression had 2,197 pass, one existing ignore and one
+failure in status_flags_are_one_value_owned_by_description_common. It expected
+F_SETFL to erase eventfd O_RDWR. The retained flags-oracle.log proves O_RDWR=2
+is present with NONBLOCK=2048; expectations now preserve that access mode when
+mutable status flags are set or cleared. The failed output remains retained.
+
+A new signed el1_ipc_live_routing test performs 1,024 pipe and eventfd round
+trips, checks bytes/values and reads actual EL1 served/forwarded counters. It
+makes only a whole-run routing claim; it does not fabricate parked operations,
+claim a scoped zero-exit window, or replace the five full vertical witnesses.
+Signed execution, full CI, inventory reconciliation and promotion are pending.
+
+Final development regression: just test-kernel passed (2,198 kernel tests,
+one existing ignore, then all kernel-semantics suites); serial host tests
+passed 138/138. No guest execution was concurrent. Affected ABI/kernel/runtime/
+embed Clippy passed before the final test-only O_RDWR expectation correction.

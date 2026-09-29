@@ -31,6 +31,17 @@ impl HostTable {
         self.id
     }
 
+    /// Admit the exact FileSlot description, including host-only forwarding
+    /// records. Callers must already retain the slot's functional reference.
+    pub fn replace_slot(
+        &self,
+        target: fd::Fd,
+        slot: &crate::kernel::FileSlot,
+    ) -> Result<(), AdmissionError> {
+        let description = slot.description.ipc_description(&self.owner)?;
+        self.replace(target, &description, slot.close_on_exec())
+    }
+
     /// Caller serializes host admission; growing storage preserves identity.
     pub fn ensure_capacity(&mut self, capacity: usize) -> Result<(), AdmissionError> {
         if capacity > self.capacity {
