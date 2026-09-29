@@ -104,6 +104,15 @@ pub struct ObjectWakeReport {
     pub deferred: u32,
 }
 
+/// Host notification receipt. Every claimed waiter is either queued through
+/// the host placement boundary or transferred to the caller for handback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostObjectWakeReport {
+    pub visited: u32,
+    pub queued: u32,
+    pub handed: u32,
+}
+
 #[repr(C)]
 pub(super) struct ObjectQueue {
     lock: AtomicU32,
@@ -146,6 +155,58 @@ impl ObjectWaitGuard<'_> {
             key: self.key,
             epoch: self.queue().epoch.load(Ordering::Relaxed),
         }
+    }
+
+    /// Host-side readiness publication, under object state and this queue.
+    /// Uses the same host placement transaction as host futex wakes, without
+    /// pretending the caller is a running guest slot. A waiter resumes its
+    /// saved operation; readiness never completes a syscall with zero bytes.
+    ///
+    /// Callbacks only collect ownership/effects into preallocated storage.
+    /// Release this guard and object state before handback or reschedule
+    /// delivery. If no guest slot admits a waiter, `handed` owns its exact
+    /// detached record and pending operation, which must be resumed or settled.
+    pub fn notify_object_host(
+        &self,
+        handed: &mut impl FnMut(RecordId),
+        placed: &mut impl FnMut(HostPlacement),
+    ) -> Result<HostObjectWakeReport, ObjectWaitError> {
+        let epoch = self.queue().epoch.load(Ordering::Relaxed);
+        let next_epoch = epoch.checked_add(1).ok_or(ObjectWaitError::Exhausted)?;
+        self.queue().epoch.store(next_epoch, Ordering::Relaxed);
+        let mut report = HostObjectWakeReport::default();
+        let mut cursor = self.queue().head.load(Ordering::Relaxed);
+        while let Some(record) = RecordId::from_raw(cursor) {
+            let rec = self.zone.record(record);
+            cursor = rec.object.next.load(Ordering::Relaxed);
+            report.visited += 1;
+            let from @ Claim::Parked { seq } = rec.claim() else {
+                continue;
+            };
+            match self.zone.place_in_guest(record, from, None, |rec| {
+                self.unlink(record);
+                self.zone.mark_woken(rec, 0);
+            }) {
+                Placement::Placed(placement) => {
+                    report.queued += 1;
+                    placed(placement);
+                }
+                Placement::NoSlot => {
+                    if rec.cas(from, Claim::Host { seq }) {
+                        self.unlink(record);
+                        self.zone.mark_woken(rec, 0);
+                        self.zone
+                            .counters
+                            .host_wakes
+                            .fetch_add(1, Ordering::Relaxed);
+                        report.handed += 1;
+                        handed(record);
+                    }
+                }
+                Placement::Lost => {}
+            }
+        }
+        Ok(report)
     }
 
     /// Enroll and publish one owned record atomically with respect to object
@@ -363,5 +424,179 @@ impl ZoneTables {
             }
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+    use std::{boxed::Box, sync::Barrier, vec::Vec};
+
+    const SLOT: SlotId = SlotId::new(3);
+    const MM: u64 = 7;
+
+    fn fixture(running: bool) -> Box<ZoneTables> {
+        let zone = unsafe {
+            // SAFETY: the shared zone ABI's empty state is all-zero.
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>());
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr.cast::<ZoneTables>())
+        };
+        if running {
+            zone.publish_slot(SLOT, MM, None, 0);
+            assert!(zone.occupancy.replace(ExecutionSlot::zone(SLOT), 0, MM));
+            zone.enter_guest(SLOT);
+        }
+        zone.bind_object_wait(key(1), &SpinForever).unwrap();
+        zone.bind_object_wait(key(2), &SpinForever).unwrap();
+        zone
+    }
+
+    fn key(index: u32) -> ObjectWaitKey {
+        ObjectWaitKey::new(index, 1).unwrap()
+    }
+
+    fn allocate(zone: &ZoneTables, tid: u64) -> RecordId {
+        zone.alloc_record(ThreadIdentity {
+            tid,
+            serial: tid,
+            mm: MM,
+            file_table: 99,
+            generation: 1,
+            affinity: 0,
+        })
+        .unwrap()
+    }
+
+    fn park(zone: &ZoneTables, index: u32, tid: u64) -> RecordId {
+        let record = allocate(zone, tid);
+        let guard = zone.object_wait(key(index), &SpinForever).unwrap();
+        guard
+            .park(
+                guard.snapshot(),
+                record,
+                OperationToken::new(tid, 1).unwrap(),
+            )
+            .unwrap();
+        record
+    }
+
+    fn notify(zone: &ZoneTables, index: u32) -> (HostObjectWakeReport, Vec<RecordId>) {
+        let mut handed = Vec::with_capacity(64);
+        let guard = zone.object_wait(key(index), &SpinForever).unwrap();
+        let report = guard
+            .notify_object_host(&mut |r| handed.push(r), &mut |_| {})
+            .unwrap();
+        (report, handed)
+    }
+
+    #[test]
+    fn el1_ipc_wait_host_wake_scales_and_preserves_operation() {
+        for n in [1, 8, 64] {
+            let zone = fixture(true);
+            for tid in 1..=128 {
+                park(&zone, 2, tid);
+            }
+            for tid in 129..129 + n {
+                park(&zone, 1, tid);
+            }
+            let (report, handed) = notify(&zone, 1);
+            assert_eq!(report.visited, n as u32);
+            assert_eq!(report.queued, n as u32);
+            assert_eq!(report.handed, 0);
+            assert!(handed.is_empty());
+            assert_eq!(
+                zone.counters
+                    .host_service_placements
+                    .load(Ordering::Relaxed),
+                0
+            );
+            for _ in 0..n {
+                let switched = zone.switch_in_full(SLOT).unwrap();
+                assert_eq!(switched.result, None);
+                let rec = zone.record(switched.record);
+                // SAFETY: the test owns the switched-in context.
+                assert_eq!(
+                    unsafe { rec.take_object_operation() }.unwrap().index(),
+                    rec.identity().tid
+                );
+                zone.release_current(SLOT, switched.record);
+            }
+            assert_eq!(notify(&zone, 1).0.visited, 0);
+        }
+    }
+
+    #[test]
+    fn el1_ipc_wait_host_wake_closes_concurrent_enroll_gap() {
+        let zone = fixture(true);
+        let snapshot = zone.object_wait(key(1), &SpinForever).unwrap().snapshot();
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                notify(&zone, 1);
+                barrier.wait();
+            });
+            barrier.wait();
+            let record = allocate(&zone, 1);
+            let guard = zone.object_wait(key(1), &SpinForever).unwrap();
+            let (error, operation) = guard
+                .park(snapshot, record, OperationToken::new(1, 1).unwrap())
+                .unwrap_err();
+            assert_eq!(error, ObjectWaitError::Changed);
+            guard.park(guard.snapshot(), record, operation).unwrap();
+        });
+        assert_eq!(notify(&zone, 1).0.queued, 1);
+    }
+
+    #[test]
+    fn el1_ipc_wait_host_wake_races_signal_control_once() {
+        for kind in [Handback::Signal, Handback::Control, Handback::Cancelled] {
+            let zone = fixture(true);
+            let records: Vec<_> = (1..=64).map(|tid| park(&zone, 1, tid)).collect();
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    notify(&zone, 1);
+                });
+                barrier.wait();
+                for record in records {
+                    assert_eq!(
+                        zone.claim_for_host(zone.record_ref(record), None, kind, &SpinForever),
+                        HostClaim::Claimed
+                    );
+                    let rec = zone.record(record);
+                    assert_eq!(rec.handback(), Some(kind));
+                    // SAFETY: host claim detached all wait and run registrations.
+                    unsafe {
+                        assert_eq!(
+                            rec.take_object_operation().unwrap().index(),
+                            rec.identity().tid
+                        );
+                        assert!(rec.take_object_operation().is_none());
+                    }
+                    zone.free_record(record);
+                }
+            });
+            assert_eq!(notify(&zone, 1).0.visited, 0);
+            assert_eq!(zone.slot(SLOT).queued(), 0);
+        }
+    }
+
+    #[test]
+    fn el1_ipc_wait_host_wake_without_slot_hands_back_exact_operation() {
+        let zone = fixture(false);
+        let record = park(&zone, 1, 1);
+        let (report, handed) = notify(&zone, 1);
+        assert_eq!(report.handed, 1);
+        assert_eq!(report.queued, 0);
+        assert_eq!(handed, [record]);
+        let rec = zone.record(record);
+        assert!(matches!(rec.claim(), Claim::Host { .. }));
+        assert_eq!(rec.handback(), Some(Handback::Resumed));
+        // SAFETY: the caller owns the detached host handback.
+        assert!(unsafe { rec.take_object_operation() }.is_some());
+        assert_eq!(notify(&zone, 1).0.visited, 0);
     }
 }
