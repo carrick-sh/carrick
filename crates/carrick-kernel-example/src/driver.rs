@@ -186,12 +186,7 @@ pub(crate) fn drive(
 ) -> Result<InternalCompletion, ExampleError> {
     let deadline = Instant::now() + WAIT_BOUND;
     loop {
-        let is_live = task.context.exact_thread_is_live()
-            && task
-                .process
-                .kernel_graph()
-                .task_is_live(task.process.task_id());
-        if !is_live {
+        if !task.is_live() {
             return Ok(InternalCompletion::Cancelled(
                 CancellationCause::ProcessExit,
             ));
@@ -199,12 +194,22 @@ pub(crate) fn drive(
         // Capture the current resource generation at each syscall boundary.
         // set*id and close_range may replace immutable thread resources while
         // preserving the task/thread identity; a creation-time snapshot is stale.
+        //
+        // A sibling's `exit_group` can retire the whole task-group from the
+        // kernel registry between the liveness check above and this lookup,
+        // so `context_for_linux_tid` returning an error here can mean "the
+        // process is gone", not just "this thread is gone" — re-check with
+        // the same combined `is_live()` used everywhere else on this path
+        // (not `exact_thread_is_live()` alone, which can still read
+        // stale-true for a beat after the task-group's registry entry is
+        // removed) so this race resolves to a graceful cancellation instead
+        // of propagating a raw `UnknownTask` kernel error.
         let fresh = match task
             .process
             .context_for_linux_tid(task.context.thread().key().tid)
         {
             Ok(context) => context,
-            Err(_) if !task.context.exact_thread_is_live() => {
+            Err(_) if !task.is_live() => {
                 return Ok(InternalCompletion::Cancelled(
                     CancellationCause::ProcessExit,
                 ));
@@ -221,12 +226,7 @@ pub(crate) fn drive(
 
         let (mut outcome, request) = {
             let disp = task.dispatcher.lock();
-            if !task.context.exact_thread_is_live()
-                || !task
-                    .process
-                    .kernel_graph()
-                    .task_is_live(task.process.task_id())
-            {
+            if !task.is_live() {
                 return Ok(InternalCompletion::Cancelled(
                     CancellationCause::ProcessExit,
                 ));
@@ -270,12 +270,7 @@ pub(crate) fn drive(
         loop {
             match outcome {
                 DispatchOutcome::Returned { value } => {
-                    let is_live = task.context.exact_thread_is_live()
-                        && task
-                            .process
-                            .kernel_graph()
-                            .task_is_live(task.process.task_id());
-                    if !is_live {
+                    if !task.is_live() {
                         return Ok(InternalCompletion::Cancelled(
                             CancellationCause::ProcessExit,
                         ));
@@ -287,12 +282,7 @@ pub(crate) fn drive(
                     return Ok(InternalCompletion::Returned(value));
                 }
                 DispatchOutcome::Errno { errno } => {
-                    let is_live = task.context.exact_thread_is_live()
-                        && task
-                            .process
-                            .kernel_graph()
-                            .task_is_live(task.process.task_id());
-                    if !is_live {
+                    if !task.is_live() {
                         return Ok(InternalCompletion::Cancelled(
                             CancellationCause::ProcessExit,
                         ));
@@ -417,12 +407,7 @@ pub(crate) fn drive(
                     // continuation, and return without parking for WAIT_BOUND.
                     {
                         let disp = task.dispatcher.lock();
-                        let is_live = task.context.exact_thread_is_live()
-                            && task
-                                .process
-                                .kernel_graph()
-                                .task_is_live(task.process.task_id());
-                        if !is_live {
+                        if !task.is_live() {
                             drop(disp);
                             let _ = continuation.cancel(CancellationCause::ProcessExit);
                             return Ok(InternalCompletion::Cancelled(
@@ -467,12 +452,7 @@ pub(crate) fn drive(
                         }
                     };
 
-                    let is_live = task.context.exact_thread_is_live()
-                        && task
-                            .process
-                            .kernel_graph()
-                            .task_is_live(task.process.task_id());
-                    if !is_live {
+                    if !task.is_live() {
                         let _ = continuation.cancel(CancellationCause::ProcessExit);
                         return Ok(InternalCompletion::Cancelled(
                             CancellationCause::ProcessExit,

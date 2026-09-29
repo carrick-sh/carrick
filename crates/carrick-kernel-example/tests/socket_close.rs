@@ -7,7 +7,8 @@
 use carrick_abi::syscall::nr;
 use carrick_abi::{CanonicalNr, LINUX_AF_INET, LINUX_EPOLLIN, LINUX_EPOLLRDHUP, LINUX_SOCK_STREAM};
 use carrick_kernel_example::{
-    Expect, Operand, ScriptedBackend, Step, Syscall, await_parked, last_child, slot, sys,
+    Expect, Operand, ScriptedBackend, Step, Syscall, alloc_buffer, await_parked, last_child, slot,
+    sys,
 };
 
 pub const LINUX_SHUT_RD: i32 = 0;
@@ -47,22 +48,6 @@ fn sockaddr_in_bytes(port: u16) -> Vec<u8> {
     addr
 }
 
-fn bind(fd: impl Into<Operand>, port: u16) -> Syscall {
-    let addr = sockaddr_in_bytes(port);
-    call(
-        "bind",
-        nr::BIND,
-        [
-            fd.into(),
-            Operand::Bytes(addr),
-            16.into(),
-            0.into(),
-            0.into(),
-            0.into(),
-        ],
-    )
-}
-
 fn listen(fd: impl Into<Operand>, backlog: i32) -> Syscall {
     call(
         "listen",
@@ -78,14 +63,14 @@ fn listen(fd: impl Into<Operand>, backlog: i32) -> Syscall {
     )
 }
 
-fn connect(fd: impl Into<Operand>, port: u16) -> Syscall {
-    let addr = sockaddr_in_bytes(port);
+/// `bind` to the sockaddr held in `addr_slot`'s buffer.
+fn bind_addr(fd: impl Into<Operand>, addr_slot: usize) -> Syscall {
     call(
-        "connect",
-        nr::CONNECT,
+        "bind",
+        nr::BIND,
         [
             fd.into(),
-            Operand::Bytes(addr),
+            slot(addr_slot),
             16.into(),
             0.into(),
             0.into(),
@@ -93,6 +78,58 @@ fn connect(fd: impl Into<Operand>, port: u16) -> Syscall {
         ],
     )
 }
+
+/// `connect` to the sockaddr held in `addr_slot`'s buffer.
+fn connect_addr(fd: impl Into<Operand>, addr_slot: usize) -> Syscall {
+    call(
+        "connect",
+        nr::CONNECT,
+        [
+            fd.into(),
+            slot(addr_slot),
+            16.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+/// `getsockname`, writing the resolved sockaddr back into `addr_slot`'s buffer
+/// (the same address `bind_addr`/`connect_addr` read from) in place.
+fn getsockname_addr(fd: impl Into<Operand>, addr_slot: usize) -> Syscall {
+    call(
+        "getsockname",
+        nr::GETSOCKNAME,
+        [
+            fd.into(),
+            slot(addr_slot),
+            Operand::InOut(16u32.to_ne_bytes().to_vec()),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
+// Every test below binds its listener with this pattern:
+//   alloc_buffer(ADDR_SLOT, sockaddr_in_bytes(0)),        // port 0 = OS picks one
+//   Step::Sys(bind_addr(slot(LISTENER), ADDR_SLOT).ret(0)),
+//   Step::Sys(getsockname_addr(slot(LISTENER), ADDR_SLOT).ret(0)),  // resolves the port
+//   ...
+//   Step::Sys(connect_addr(slot(CLIENT), ADDR_SLOT).ret(0)),
+//
+// This suite dials real loopback TCP sockets. A literal port number (this
+// file previously hardcoded 32768-32774, the low end of the Linux ephemeral
+// range) collides under concurrent runs of this suite on the same host --
+// e.g. two worktree gates or CI jobs running at once, which is routine for
+// this project -- and the resulting EADDRINUSE is not a semantic bug in
+// carrick's socket emulation, it is a resource-hygiene defect in the test.
+// Asking the OS for an ephemeral port removes the whole collision class
+// deterministically, rather than retrying or widening a timeout. Slot 20 is
+// otherwise unused by any test in this file and holds the shared sockaddr
+// buffer that `bind_addr`/`getsockname_addr`/`connect_addr` all read/write.
+const ADDR_SLOT: usize = 20;
 
 fn accept(fd: impl Into<Operand>) -> Syscall {
     call(
@@ -116,14 +153,16 @@ fn tcp_local_shut_rd_wakes_epoll_with_epollrdhup() {
                 .save_out_i32(0, 1, 5),
         ),
         Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(0)),
-        Step::Sys(bind(slot(0), 32770).ret(0)),
+        alloc_buffer(ADDR_SLOT, sockaddr_in_bytes(0)),
+        Step::Sys(bind_addr(slot(0), ADDR_SLOT).ret(0)),
+        Step::Sys(getsockname_addr(slot(0), ADDR_SLOT).ret(0)),
         Step::Sys(listen(slot(0), 1).ret(0)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
             Step::Sys(sys::close(slot(0)).ret(0)),
             Step::Sys(sys::close(slot(5)).ret(0)),
             Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(1)),
-            Step::Sys(connect(slot(1), 32770).ret(0)),
+            Step::Sys(connect_addr(slot(1), ADDR_SLOT).ret(0)),
             // Keep child peer live until parent finishes assertions
             Step::Sys(sys::read(slot(4), 1).ret(1)),
             Step::Sys(sys::close(slot(1)).ret(0)),
@@ -184,14 +223,16 @@ fn tcp_local_shut_rd_with_in_and_rdhup_interest() {
                 .save_out_i32(0, 1, 5),
         ),
         Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(0)),
-        Step::Sys(bind(slot(0), 32771).ret(0)),
+        alloc_buffer(ADDR_SLOT, sockaddr_in_bytes(0)),
+        Step::Sys(bind_addr(slot(0), ADDR_SLOT).ret(0)),
+        Step::Sys(getsockname_addr(slot(0), ADDR_SLOT).ret(0)),
         Step::Sys(listen(slot(0), 1).ret(0)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
             Step::Sys(sys::close(slot(0)).ret(0)),
             Step::Sys(sys::close(slot(5)).ret(0)),
             Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(1)),
-            Step::Sys(connect(slot(1), 32771).ret(0)),
+            Step::Sys(connect_addr(slot(1), ADDR_SLOT).ret(0)),
             Step::Sys(sys::read(slot(4), 1).ret(1)),
             Step::Sys(sys::close(slot(1)).ret(0)),
             Step::Sys(sys::close(slot(4)).ret(0)),
@@ -261,14 +302,16 @@ fn tcp_local_shut_rdwr_wakes_epoll_with_epollrdhup() {
                 .save_out_i32(0, 1, 5),
         ),
         Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(0)),
-        Step::Sys(bind(slot(0), 32772).ret(0)),
+        alloc_buffer(ADDR_SLOT, sockaddr_in_bytes(0)),
+        Step::Sys(bind_addr(slot(0), ADDR_SLOT).ret(0)),
+        Step::Sys(getsockname_addr(slot(0), ADDR_SLOT).ret(0)),
         Step::Sys(listen(slot(0), 1).ret(0)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
             Step::Sys(sys::close(slot(0)).ret(0)),
             Step::Sys(sys::close(slot(5)).ret(0)),
             Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(1)),
-            Step::Sys(connect(slot(1), 32772).ret(0)),
+            Step::Sys(connect_addr(slot(1), ADDR_SLOT).ret(0)),
             Step::Sys(sys::read(slot(4), 1).ret(1)),
             Step::Sys(sys::close(slot(1)).ret(0)),
             Step::Sys(sys::close(slot(4)).ret(0)),
@@ -327,14 +370,16 @@ fn tcp_local_shut_wr_negative_control_no_rdhup() {
                 .save_out_i32(0, 1, 5),
         ),
         Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(0)),
-        Step::Sys(bind(slot(0), 32773).ret(0)),
+        alloc_buffer(ADDR_SLOT, sockaddr_in_bytes(0)),
+        Step::Sys(bind_addr(slot(0), ADDR_SLOT).ret(0)),
+        Step::Sys(getsockname_addr(slot(0), ADDR_SLOT).ret(0)),
         Step::Sys(listen(slot(0), 1).ret(0)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
             Step::Sys(sys::close(slot(0)).ret(0)),
             Step::Sys(sys::close(slot(5)).ret(0)),
             Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(1)),
-            Step::Sys(connect(slot(1), 32773).ret(0)),
+            Step::Sys(connect_addr(slot(1), ADDR_SLOT).ret(0)),
             Step::Sys(sys::read(slot(4), 1).ret(1)),
             Step::Sys(sys::close(slot(1)).ret(0)),
             Step::Sys(sys::close(slot(4)).ret(0)),
@@ -382,14 +427,16 @@ fn tcp_local_shut_rd_dup_alias_lifecycle() {
                 .save_out_i32(0, 1, 5),
         ),
         Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(0)),
-        Step::Sys(bind(slot(0), 32774).ret(0)),
+        alloc_buffer(ADDR_SLOT, sockaddr_in_bytes(0)),
+        Step::Sys(bind_addr(slot(0), ADDR_SLOT).ret(0)),
+        Step::Sys(getsockname_addr(slot(0), ADDR_SLOT).ret(0)),
         Step::Sys(listen(slot(0), 1).ret(0)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
             Step::Sys(sys::close(slot(0)).ret(0)),
             Step::Sys(sys::close(slot(5)).ret(0)),
             Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(1)),
-            Step::Sys(connect(slot(1), 32774).ret(0)),
+            Step::Sys(connect_addr(slot(1), ADDR_SLOT).ret(0)),
             Step::Sys(sys::read(slot(4), 1).ret(1)),
             Step::Sys(sys::close(slot(1)).ret(0)),
             Step::Sys(sys::close(slot(4)).ret(0)),
@@ -491,13 +538,15 @@ fn tcp_peer_close_wakes_epoll_with_epollrdhup() {
     // When stream peer closes its write end (or whole socket), EPOLLRDHUP is delivered.
     let script = vec![
         Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(0)),
-        Step::Sys(bind(slot(0), 32768).ret(0)),
+        alloc_buffer(ADDR_SLOT, sockaddr_in_bytes(0)),
+        Step::Sys(bind_addr(slot(0), ADDR_SLOT).ret(0)),
+        Step::Sys(getsockname_addr(slot(0), ADDR_SLOT).ret(0)),
         Step::Sys(listen(slot(0), 1).ret(0)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
             Step::Sys(sys::close(slot(0)).ret(0)),
             Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(1)),
-            Step::Sys(connect(slot(1), 32768).ret(0)),
+            Step::Sys(connect_addr(slot(1), ADDR_SLOT).ret(0)),
             await_parked(1, "epoll_pwait"),
             Step::Sys(sys::close(slot(1)).ret(0)),
             Step::Sys(sys::exit_group(0)),
@@ -553,14 +602,16 @@ fn tcp_peer_shut_wr_live_peer_handshake() {
                 .save_out_i32(0, 1, 5),
         ),
         Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(0)),
-        Step::Sys(bind(slot(0), 32769).ret(0)),
+        alloc_buffer(ADDR_SLOT, sockaddr_in_bytes(0)),
+        Step::Sys(bind_addr(slot(0), ADDR_SLOT).ret(0)),
+        Step::Sys(getsockname_addr(slot(0), ADDR_SLOT).ret(0)),
         Step::Sys(listen(slot(0), 1).ret(0)),
         Step::Sys(sys::fork()),
         Step::ChildMarker(vec![
             Step::Sys(sys::close(slot(0)).ret(0)),
             Step::Sys(sys::close(slot(5)).ret(0)), // Close control pipe write end
             Step::Sys(socket(LINUX_AF_INET, LINUX_SOCK_STREAM, 0).save(1)),
-            Step::Sys(connect(slot(1), 32769).ret(0)),
+            Step::Sys(connect_addr(slot(1), ADDR_SLOT).ret(0)),
             await_parked(1, "epoll_pwait"),
             // Child shuts down write side (sends FIN)
             Step::Sys(sys::shutdown(slot(1), LINUX_SHUT_WR).ret(0)),
