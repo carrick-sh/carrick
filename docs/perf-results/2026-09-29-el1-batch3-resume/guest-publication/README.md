@@ -20,3 +20,9 @@ Clippy with warnings denied passed. Kernel command exited 0. No signed
 execution claim is made for this changed source: the prior 49-execution
 receipt at 40a707ba0 is historical. Signed promotion and full batch gates
 remain required after completing the transfer protocol.
+
+Implementation commit: `a9da3196d`; clean provenance refresh: `68a25b09d`.
+All 595 authority rows and positions were unchanged. `just lint-domains`
+exited 0 at the refreshed source; its compiler authority result explicitly
+covers the macOS subset, with Linux/FreeBSD/NetBSD profiles still pending.
+Exact contract-change coverage from `26874b0b2` passed.
