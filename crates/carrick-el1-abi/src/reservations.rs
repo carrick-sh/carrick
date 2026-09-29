@@ -7,6 +7,10 @@
 //! Refusal leaves the old reservation visible; a failed descriptor rollback
 //! must fail stopped, never manufacture a refusal/completion.
 
+/// Shared reservation bootstrap region, before T2's descriptor transaction slots.
+pub const EL1_RESERVATIONS_OFFSET: u64 = crate::EL1_COUNTERS_OFFSET + 0x2_0000;
+pub const EL1_RESERVATIONS_END: u64 = crate::EL1_COUNTERS_OFFSET + 0x8_0000;
+
 macro_rules! identity {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]

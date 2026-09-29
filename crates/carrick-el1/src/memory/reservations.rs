@@ -9,10 +9,10 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const ROOTS: usize = carrick_sched_core::spaces::ADDRESS_SPACES;
-const NODES: usize = 4096;
+const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
-pub const RESERVATIONS_OFFSET: usize = EL1_COUNTERS_OFFSET as usize + 0x20000;
+pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
 const VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +164,8 @@ const LAYOUT_HASH: u64 = {
 
 const _: () = assert!(core::mem::size_of::<Counters>() <= 0x20000);
 const _: () = assert!(
-    RESERVATIONS_OFFSET + core::mem::size_of::<SharedReservations>() <= EL1_STACKS_OFFSET as usize
+    RESERVATIONS_OFFSET + core::mem::size_of::<SharedReservations>()
+        <= EL1_RESERVATIONS_END as usize
 );
 
 /// Holds one MM's metadata authority. Drop releases it; never carry this guard
