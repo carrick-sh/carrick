@@ -107,6 +107,9 @@ pub const BUNDLED_HVPATCH_FRAME_COW_D: &str =
 /// Complete low-rate HVPatch carrier user-stack aggregation.
 pub const BUNDLED_HVPATCH_CARRIER_CPU_LOW_RATE_D: &str =
     include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-low-rate.d");
+/// Complete HVPatch carrier CPU attribution decomposition.
+pub const BUNDLED_HVPATCH_CARRIER_CPU_ATTRIBUTION_D: &str =
+    include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-attribution.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
 pub const BUNDLED_NATIVE_SHAPE_D: &str =
     include_str!("../../../scripts/dtrace/native-shape-census.d");
