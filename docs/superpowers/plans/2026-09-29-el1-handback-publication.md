@@ -133,3 +133,15 @@ Backend load and wait_for_materialized can call materialize_zone, which still
 checks live+Host before copying context. Service records are distinct from
 ZoneWait records; settle_vacated only re-places Service records. Audit those
 ownership classes separately before adding or claiming a universal read lease.
+
+
+## Re-park request boundary (red at fb265ba9b)
+
+The actual EL1 wait_word path can erase an admitted OnCpu host request:
+B parks after the request and is no longer current or queued at host exit.
+Two live-thread witnesses fail for cancellation and signal, retained in
+`docs/perf-results/2026-09-29-el1-batch3-resume/repark-requests/`.
+The next change must atomically arbitrate park admission against the host
+request and audit all OnCpu transitions; see that receipt for the proposed
+claim-protocol correction and required controls. The existing tagged request
+fix remains useful but does not close request lifetime across re-park.

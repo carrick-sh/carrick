@@ -1,0 +1,29 @@
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-el1)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-a61e50e98fe13e35)
+
+running 2 tests
+test substrate::sched::tests::cancelled_on_cpu_thread_is_not_stranded_by_repark ... FAILED
+test substrate::sched::tests::signal_requested_on_cpu_is_not_lost_by_repark ... FAILED
+
+failures:
+
+---- substrate::sched::tests::cancelled_on_cpu_thread_is_not_stranded_by_repark stdout ----
+
+thread 'substrate::sched::tests::cancelled_on_cpu_thread_is_not_stranded_by_repark' (33407516) panicked at crates/carrick-el1/src/substrate/../sched/tests.rs:287:9:
+cancelled re-park must retire
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- substrate::sched::tests::signal_requested_on_cpu_is_not_lost_by_repark stdout ----
+
+thread 'substrate::sched::tests::signal_requested_on_cpu_is_not_lost_by_repark' (33407517) panicked at crates/carrick-el1/src/substrate/../sched/tests.rs:290:9:
+host request must survive re-park, got Parked { seq: 2 }
+
+
+failures:
+    substrate::sched::tests::cancelled_on_cpu_thread_is_not_stranded_by_repark
+    substrate::sched::tests::signal_requested_on_cpu_is_not_lost_by_repark
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 74 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1 --lib`
