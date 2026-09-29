@@ -423,7 +423,10 @@ pub(super) struct GuestDescriptorLanePrecondition {
     pub(super) frame_grants: bool,
     /// Host syscall copyout into prepared pages (`commit_prepared_host_write`).
     pub(super) host_copyout: bool,
-    /// Fork parent COW arming (`build_process_spec`).
+    /// Fork parent COW arming (`build_process_spec`). The engine builds the
+    /// arm as EL1 transactions, but the fork lifecycle does not yet submit
+    /// them (`take_guest_fork_arm_txns`) and EL1 does not yet drain an MM's
+    /// submissions before any of its threads resumes EL0.
     pub(super) fork_parent_arming: bool,
     /// Backend COW, sparse/foreign materialization and exec publication.
     pub(super) backend_writers: bool,
@@ -452,7 +455,8 @@ impl GuestDescriptorLanePrecondition {
 }
 
 /// Select the guest-owned lane for `engine`'s MM when the precondition
-/// admits it. Never demotes a guest-owned MM.
+/// admits it. Called where an engine binds an MM (initial runner and exec);
+/// fork children inherit their parent's lane. Never demotes a guest-owned MM.
 pub(super) fn select_guest_descriptor_lane<E: ThreadedEngine>(
     engine: &mut E,
     precondition: GuestDescriptorLanePrecondition,
@@ -524,6 +528,36 @@ impl GuestGrantLedger {
         true
     }
 
+    /// Release every slot and ledger entry of an MM that is retiring (final
+    /// teardown or exec replacement). An unclaimed submission is withdrawn,
+    /// and a published receipt is consumed: the MM's tables and grants retire
+    /// with it, so nothing is settled or committed. A submission EL1 is
+    /// still applying stays until its receipt, which a later call releases.
+    /// Returns the entries released.
+    pub(super) fn withdraw_mm(
+        &self,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+        mm_key: u64,
+    ) -> usize {
+        let mut released = 0;
+        for (slot, entry) in self.pending.iter().enumerate() {
+            let mut entry = entry.lock();
+            let Some(pending) = *entry else {
+                continue;
+            };
+            if pending.txn.id.mm_key.get() != mm_key {
+                continue;
+            }
+            if slots.withdraw(slot, pending.txn.id)
+                || slots.take_receipt(slot, pending.txn.id).is_some()
+            {
+                *entry = None;
+                released += 1;
+            }
+        }
+        released
+    }
+
     /// Settle every receipt EL1 has published for `mm_key`, in slot order.
     /// Returns how many were settled.
     pub(super) fn settle_ready<Err>(
@@ -561,6 +595,15 @@ impl GuestGrantLedger {
 
 /// Carrier-wide ledger for the shared EL1 descriptor transaction slots.
 static GUEST_GRANT_LEDGER: GuestGrantLedger = GuestGrantLedger::new();
+
+/// Release a retiring MM's descriptor transaction slots and ledger entries,
+/// at final-MM teardown and at exec replacement, beside its residency
+/// records. A slot left SUBMITTED would refuse every later grant on that
+/// vCPU slot, whichever MM it next runs.
+pub(super) fn withdraw_guest_descriptor_work(mm_key: u64) -> usize {
+    carrick_el1_abi::descriptor_txn_slots_host()
+        .map_or(0, |slots| GUEST_GRANT_LEDGER.withdraw_mm(slots, mm_key))
+}
 
 /// Authenticate one guest grant receipt, then commit exactly its resident
 /// span. Residency is never committed before EL1's publication is proven,
@@ -804,7 +847,6 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 };
                 let fault_page = plan.fault_page();
                 let plan_shape = (plan.start(), plan.len(), plan.prot());
-                select_guest_descriptor_lane(engine, GuestDescriptorLanePrecondition::current());
                 let deferred_to_guest = std::cell::Cell::new(false);
                 let residency_identity = carrick_el1_abi::FrameGrantResidencyIdentity {
                     mm_key: request.mm_key,
@@ -2633,5 +2675,94 @@ mod guest_descriptor_lane_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_retiring_mm_releases_exactly_its_slots_and_ledger_entries() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let pending_for = |txn| PendingGuestGrant {
+            txn,
+            fault_va: VA,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: residency(),
+        };
+        // Slot 0: applied, receipt unsettled. Slot 1: submitted, unclaimed.
+        let applied = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        assert!(ledger.submit(&slots, 0, pending_for(applied)));
+        el1_apply(&resolver, &slots, 0).unwrap();
+        let unclaimed = authority
+            .prepare_guest_descriptor_txn(
+                nz(MM),
+                DescriptorOp::Retire(PageSpan::new(VA + 4096, 4096)),
+            )
+            .unwrap();
+        assert!(ledger.submit(&slots, 1, pending_for(unclaimed)));
+        // Another MM's pending work on slot 2 is untouched.
+        let other_lane = guest_lane().0;
+        let other = other_lane
+            .prepare_guest_descriptor_txn(nz(MM + 1), grant_op(VA))
+            .unwrap();
+        assert!(ledger.submit(
+            &slots,
+            2,
+            PendingGuestGrant {
+                txn: other,
+                ..pending_for(other)
+            }
+        ));
+
+        assert_eq!(ledger.withdraw_mm(&slots, MM), 2);
+        assert!(!guest_descriptor_edit_in_flight(
+            Some(&slots),
+            MM,
+            VA + 4096
+        ));
+        let mut commits = Vec::new();
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+                .unwrap(),
+            0
+        );
+        assert!(commits.is_empty(), "a retired MM commits no residency");
+        // Both slots serve the next MM that runs on them.
+        assert!(ledger.submit(&slots, 0, pending_for(unclaimed)));
+        assert!(ledger.withdraw_mm(&slots, MM) == 1);
+        assert!(guest_descriptor_edit_in_flight(Some(&slots), MM + 1, VA));
+        assert_eq!(ledger.withdraw_mm(&slots, MM + 1), 1);
+    }
+
+    /// Lane selection sits where an engine binds an MM, and a retiring MM
+    /// releases its descriptor work beside its residency records, at final
+    /// teardown and at exec replacement.
+    #[test]
+    fn mm_bind_and_retirement_sites_select_and_withdraw_the_guest_lane() {
+        let binding = include_str!("binding.rs");
+        let exec = include_str!("exec.rs");
+        for (source, bind, retire) in [
+            (
+                binding,
+                "engine.bind_task_snapshot_identity(mm.raw(), asid_generation);",
+                "table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);",
+            ),
+            (
+                exec,
+                "engine.bind_task_snapshot_identity(committed_mm.raw(), committed_asid_generation);",
+                "table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);",
+            ),
+        ] {
+            let after_bind = source.split(bind).nth(1).expect("MM bind site");
+            let next = &after_bind[..after_bind.len().min(400)];
+            assert!(next.contains("select_guest_descriptor_lane("));
+            assert!(next.contains("GuestDescriptorLanePrecondition::current()"));
+            let after_retire = source.split(retire).nth(1).expect("retirement site");
+            let next = &after_retire[..after_retire.len().min(200)];
+            assert!(next.contains("withdraw_guest_descriptor_work("));
+        }
     }
 }

@@ -242,8 +242,15 @@ impl Stage1Authority {
     /// image. The child shares this authority's image pool, so its image
     /// returns to the parent's pool when the child retires.
     pub fn child_with_manager(&self, manager: PageTableManager) -> Self {
-        let image_pool = Arc::clone(&self.inner.lock().image_pool);
-        Self::with_pool(Some(manager), image_pool)
+        let (image_pool, live_owner) = {
+            let inner = self.inner.lock();
+            (Arc::clone(&inner.image_pool), inner.live_owner)
+        };
+        let child = Self::with_pool(Some(manager), image_pool);
+        // The child's image was built and published offline; once live, it
+        // belongs to the same lane as its parent.
+        child.select_live_descriptor_owner(live_owner);
+        child
     }
 
     /// The image recycle pool shared across this authority's process tree.
@@ -2501,5 +2508,26 @@ mod tests {
             host_lane.prepare_guest_descriptor_txn(nz(9), op),
             Err(GuestTxnPrepareError::NotGuestOwned)
         );
+    }
+
+    #[test]
+    fn fork_children_inherit_their_parents_live_descriptor_lane() {
+        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
+        let host_child = parent.child_with_manager(test_manager());
+        assert_eq!(
+            host_child.live_descriptor_owner(),
+            LiveDescriptorOwner::Host
+        );
+        parent.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        let guest_child = parent.child_with_manager(test_manager());
+        assert_eq!(
+            guest_child.live_descriptor_owner(),
+            LiveDescriptorOwner::Guest
+        );
+        assert_eq!(
+            guest_child.with_manager(PageTableManager::live_descriptor_owner),
+            Some(LiveDescriptorOwner::Guest)
+        );
+        assert!(!guest_child.shares_exact_authority(&parent));
     }
 }
