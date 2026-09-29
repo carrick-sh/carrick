@@ -155,13 +155,12 @@ impl El1FrameGrantLedger {
             )));
         }
         let key = (base, length);
-        // This ledger only feeds allocator statistics. Some host return paths
-        // (process teardown, host-side munmap of an EL1 grant) release the
-        // extent without `mark_return`; a re-grant of the same extent is then
-        // counted as reuse rather than aborting the carrier.
-        if !self.active.insert(key) {
-            self.returned.insert(key);
+        if self.active.contains(&key) {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 frame regrant precedes exact return: base=0x{base:x} length=0x{length:x}"
+            )));
         }
+        self.active.insert(key);
         self.stats.grants_succeeded = self.stats.grants_succeeded.saturating_add(1);
         self.stats.bytes_granted = self.stats.bytes_granted.saturating_add(length);
         if self.returned.contains(&key) {
@@ -184,6 +183,206 @@ impl El1FrameGrantLedger {
 mod allocator_stats_tests {
     use super::*;
     use crate::trap::frame_inventory_backend_tests::global_frame_allocator_test_lock;
+
+    fn grant_owned(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+    ) -> (u64, std::sync::Arc<GlobalFrameHostOwner>) {
+        let length = CowArmedRanges::COMPOUND_SIZE;
+        let mut lease = GlobalFrameStage2Lease::reserve(length, length).unwrap();
+        let (base, length) = lease.key();
+        // The callback supplied by the test is the entire stage-2 backend.
+        lease.mark_mapped();
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            length as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .unwrap();
+        register_global_frame_host_owner_in(custody, lease, host, 3).unwrap();
+        mark_el1_frame_grant_in(custody, base, length).unwrap();
+        let owner = std::sync::Arc::clone(
+            custody
+                .global_frame_host_owners
+                .lock()
+                .get(&(base, length))
+                .unwrap()
+                .owner(),
+        );
+        (base, owner)
+    }
+
+    #[test]
+    fn el1_lifecycle_pins_failed_unmap_and_reuse_at_three_scales() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        for scale in [1, 8, 64] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let before = snapshot_el1_frame_grant_stats();
+            let length = CowArmedRanges::COMPOUND_SIZE;
+            let mut grants = Vec::new();
+            let mut unmaps = 0;
+            for _ in 0..scale {
+                let (base, owner) = grant_owned(&custody);
+                let pin = owner.pin().unwrap();
+                let result = retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    base,
+                    length,
+                    owner.generation(),
+                    &mut |_, _| {
+                        unmaps += 1;
+                        Ok(())
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+                ));
+                grants.push((base, owner, pin));
+            }
+            assert_eq!(unmaps, 0);
+            assert_eq!(
+                snapshot_el1_frame_grant_stats().bytes_returned,
+                before.bytes_returned
+            );
+            let mut retained = Vec::new();
+            for (base, owner, pin) in grants {
+                drop(pin);
+                let failed = retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    base,
+                    length,
+                    owner.generation(),
+                    &mut |_, _| {
+                        unmaps += 1;
+                        Err(CarrierStage2BackendError::HvReturn(1))
+                    },
+                );
+                assert!(matches!(
+                    failed,
+                    GlobalFrameRetirementOutcome::RetryPending { .. }
+                ));
+                retained.push((base, owner));
+            }
+            assert_eq!(
+                snapshot_el1_frame_grant_stats().bytes_returned,
+                before.bytes_returned
+            );
+            assert_eq!(
+                custody.global_frame_host_owners.lock().len(),
+                scale as usize
+            );
+            for (base, owner) in retained {
+                let retired = retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    base,
+                    length,
+                    owner.generation(),
+                    &mut |_, _| {
+                        unmaps += 1;
+                        Ok(())
+                    },
+                );
+                assert!(retired.is_retired());
+                let released = snapshot_el1_frame_grant_stats();
+                // Duplicate finalization of this exact owner must not count twice.
+                assert!(finalize_global_frame_owner_record(&custody, &owner).is_err());
+                assert_eq!(snapshot_el1_frame_grant_stats(), released);
+                let weak_backing = std::sync::Arc::downgrade(&owner.mapping);
+                assert!(
+                    weak_backing.upgrade().is_some(),
+                    "IPA return is not host backing drop"
+                );
+                drop(owner);
+                assert!(weak_backing.upgrade().is_none());
+            }
+            let after = snapshot_el1_frame_grant_stats();
+            assert_eq!(after.bytes_returned - before.bytes_returned, scale * length);
+            assert_eq!(after.returns_completed - before.returns_completed, scale);
+            assert_eq!(unmaps, 2 * scale);
+            assert!(custody.global_frame_host_owners.lock().is_empty());
+            for _ in 0..scale {
+                let (base, owner) = grant_owned(&custody);
+                assert!(
+                    retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        base,
+                        length,
+                        owner.generation(),
+                        &mut |_, _| Ok(()),
+                    )
+                    .is_retired()
+                );
+            }
+            let reused = snapshot_el1_frame_grant_stats();
+            assert_eq!(reused.reused_grants - after.reused_grants, scale);
+            assert_eq!(
+                reused.bytes_returned - before.bytes_returned,
+                2 * scale * length
+            );
+        }
+    }
+
+    #[test]
+    fn el1_lifecycle_pooled_returns_retain_host_storage_at_three_scales() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        for scale in [1, 8, 64] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let pool = std::sync::Arc::new(
+                crate::frame_pool::PreMappedFramePool::new_test_fixture(scale),
+            );
+            let before = snapshot_el1_frame_grant_stats();
+            let mut owners = Vec::new();
+            for _ in 0..scale {
+                let handle = pool.allocate_compound().unwrap();
+                let key = (handle.ipa(), handle.len() as u64);
+                register_pooled_global_frame_host_owner_in(&custody, handle, 3).unwrap();
+                mark_el1_frame_grant_in(&custody, key.0, key.1).unwrap();
+                let owner = std::sync::Arc::clone(
+                    custody
+                        .global_frame_host_owners
+                        .lock()
+                        .get(&key)
+                        .unwrap()
+                        .owner(),
+                );
+                assert!(
+                    retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        key.0,
+                        key.1,
+                        owner.generation(),
+                        &mut |_, _| panic!("pool must retain its stage-2 map"),
+                    )
+                    .is_retired()
+                );
+                owners.push(owner);
+            }
+            assert_eq!(
+                pool.allocated_count(),
+                scale,
+                "owner projections still retain pool handles"
+            );
+            drop(owners);
+            assert_eq!(pool.allocated_count(), 0);
+            assert_eq!(
+                pool.pool_size(),
+                scale * CowArmedRanges::COMPOUND_SIZE as usize
+            );
+            let after = snapshot_el1_frame_grant_stats();
+            assert_eq!(
+                after.returns_completed - before.returns_completed,
+                scale as u64
+            );
+            let handles: Vec<_> = (0..scale)
+                .map(|_| pool.allocate_compound().unwrap())
+                .collect();
+            assert!(handles.iter().all(|handle| unsafe {
+                std::slice::from_raw_parts(handle.as_ptr(), handle.len())
+                    .iter()
+                    .all(|byte| *byte == 0)
+            }));
+            drop(handles);
+        }
+    }
 
     #[test]
     fn el1_lifecycle_regrant_requires_a_return_receipt_at_three_scales() {
@@ -324,16 +523,36 @@ pub(crate) fn mark_el1_frame_grant_in(
     base: u64,
     length: u64,
 ) -> Result<(), TrapError> {
-    if global_frame_host_owner_identity_in(custody, base, length).is_none() {
-        return Err(TrapError::Hypervisor(format!(
-            "EL1 frame grant has no exact live host owner: base=0x{base:x} length=0x{length:x}"
-        )));
+    // Serialize receipt publication with exact owner retirement. A standalone
+    // identity lookup followed by ledger insertion can publish a grant after
+    // its owner has already returned the IPA.
+    let owners = custody.global_frame_host_owners.lock();
+    let owner = owners
+        .get(&(base, length))
+        .and_then(GlobalFrameOwnerEntry::live_owner)
+        .ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "EL1 frame grant has no exact live host owner: base=0x{base:x} length=0x{length:x}"
+            ))
+        })?;
+    let mut receipt = owner.mapping.el1_grant.lock();
+    if receipt.is_some() {
+        return Err(TrapError::Hypervisor(
+            "EL1 owner already has a grant receipt".to_owned(),
+        ));
     }
-    el1_frame_grant_ledger().lock().mark_grant(base, length)
+    el1_frame_grant_ledger().lock().mark_grant(base, length)?;
+    *receipt = Some(El1FrameGrantReceipt { base, length });
+    Ok(())
 }
 
-fn mark_el1_frame_grant_return(base: u64, length: u64) {
-    el1_frame_grant_ledger().lock().mark_return(base, length);
+/// Owned by the physical mapping across VM replay and shared-MM retention.
+/// Taking this receipt after terminal release prevents an old owner from
+/// recording a return against a successor at the same IPA.
+#[derive(Debug)]
+struct El1FrameGrantReceipt {
+    base: u64,
+    length: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -599,6 +818,7 @@ pub(crate) struct GlobalFrameSharedMapping {
     pub(crate) code_content: super::code_content::CodeContent,
     backing: GlobalFrameBacking,
     logical_pin_count: parking_lot::Mutex<u64>,
+    el1_grant: parking_lot::Mutex<Option<El1FrameGrantReceipt>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -623,6 +843,7 @@ impl GlobalFrameSharedMapping {
             code_content: super::code_content::CodeContent::new(mapping.len()),
             backing: GlobalFrameBacking::Owned(mapping),
             logical_pin_count: parking_lot::Mutex::new(0),
+            el1_grant: parking_lot::Mutex::new(None),
         }
     }
 
@@ -631,6 +852,7 @@ impl GlobalFrameSharedMapping {
             code_content: super::code_content::CodeContent::new(handle.len()),
             backing: GlobalFrameBacking::Pooled(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
+            el1_grant: parking_lot::Mutex::new(None),
         }
     }
 
@@ -639,6 +861,7 @@ impl GlobalFrameSharedMapping {
             code_content: super::code_content::CodeContent::new(handle.len()),
             backing: GlobalFrameBacking::PooledRoot(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
+            el1_grant: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1889,7 +2112,17 @@ pub(crate) fn finalize_global_frame_owner_record_using(
     owner: &GlobalFrameHostOwner,
     release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
-    finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa)
+    let mut receipt = owner.mapping.el1_grant.lock();
+    // Keep return publication indivisible from IPA reuse, including reuse by
+    // a different custody. Backend unmap has already completed at this point.
+    let mut ledger = receipt.as_ref().map(|_| el1_frame_grant_ledger().lock());
+    finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa)?;
+    if let Some(receipt) = receipt.take() {
+        if let Some(ledger) = ledger.as_mut() {
+            ledger.mark_return(receipt.base, receipt.length);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2773,7 +3006,6 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                 .pending_global_frame_directory_retries
                 .lock()
                 .complete(((ipa, length), generation));
-            mark_el1_frame_grant_return(ipa, length);
         }
         _ => {}
     }
