@@ -2041,6 +2041,7 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
         reaped: bool,
         timed_out: bool,
         markers: usize,
+        reaped_wake_rejections: usize,
         events: Vec<&'static str>,
     }
     #[derive(Default)]
@@ -2070,6 +2071,20 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
                 .unwrap();
             state.timed_out |= timeout.timed_out() && !state.reaped;
             state.events.push("released");
+            AuditVerdict::Continue
+        }
+
+        fn wake_rejected(
+            &self,
+            target: TaskKey,
+            reason: carrick_kernel::observe::WakeRejectionReason,
+        ) -> AuditVerdict {
+            let mut state = self.state.lock().unwrap();
+            if state.target == Some(target)
+                && reason == carrick_kernel::observe::WakeRejectionReason::Reaped
+            {
+                state.reaped_wake_rejections += 1;
+            }
             AuditVerdict::Continue
         }
 
@@ -2130,6 +2145,10 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
     );
     assert_eq!(state.markers, 1);
     assert_eq!(state.events, ["captured", "reaped", "released"]);
+    assert_eq!(
+        state.reaped_wake_rejections, 0,
+        "delayed notification used reaped wake authority"
+    );
     println!(
         "el1 delayed notification ordering={:?} markers={}",
         state.events, state.markers
