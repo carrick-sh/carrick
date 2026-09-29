@@ -1343,6 +1343,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.deferred-handback-identity",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
@@ -1403,6 +1404,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.deferred-handback-identity",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",

@@ -559,10 +559,10 @@ pub fn step_away_from_slot(slot: SlotId, driver: u64) {
     if zone.step_away(
         slot,
         driver,
-        &mut |record| records.push(record),
+        &mut |record| records.push(zone.record_ref(record)),
         &mut |placement| placements.push(placement),
     ) {
-        settle_vacated(zone, Some(slot), records, placements);
+        settle_vacated(zone, Some(slot), records, placements, &mut publish_handback);
     }
 }
 
@@ -591,41 +591,177 @@ pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<S
     if zone.leave_slot(
         slot,
         driver,
-        &mut |record| records.push(record),
+        &mut |record| records.push(zone.record_ref(record)),
         &mut |placement| placements.push(placement),
     ) {
-        settle_vacated(zone, now, records, placements);
+        settle_vacated(zone, now, records, placements, &mut publish_handback);
     }
 }
 
 /// Deliver what vacating a slot placed, and place or hand back what it took:
-/// a service thread no live slot takes waits on `fallback`, if any.
+/// a service thread no live slot takes waits on `fallback`, if any. Preserve
+/// the incarnation captured at evacuation: another host claimant can retire
+/// and reuse the record before this deferred publication runs.
 fn settle_vacated(
     zone: &ZoneTables,
     fallback: Option<SlotId>,
-    records: Vec<RecordId>,
+    records: Vec<RecordRef>,
     placements: Vec<carrick_el1_abi::HostPlacement>,
+    publish: &mut impl FnMut(RecordRef),
 ) {
     for placement in placements {
         deliver_placement(Some(placement));
     }
     for record in records {
-        if zone.record(record).handback() == Some(Handback::Service) {
+        let Some(rec) = zone.live(record) else {
+            continue;
+        };
+        if rec.handback() == Some(Handback::Service) {
             // A service record stands for its thread's held host row, which
             // only the scheduler sees: placing it from host ownership is
             // invisible to any claimant.
-            if deliver_placement(zone.place_from_host(record)) {
+            if deliver_placement(zone.place_from_host(record.id)) {
                 continue;
             }
-            if fallback.is_some_and(|fallback| zone.requeue_on(fallback, record)) {
+            if fallback.is_some_and(|fallback| zone.requeue_on(fallback, record.id)) {
                 continue;
             }
             // No slot runs an executor that could take it (every one is
             // stopped in a host call, say): its thread's held row goes to a
             // host run queue (`Scheduler::publish_zone_handback`).
-            publish_handback(zone.record_ref(record));
+            publish(record);
         } else {
-            publish_handback(zone.record_ref(record));
+            publish(record);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use carrick_el1_abi::{Claim, ThreadIdentity};
+
+    fn heap_zone() -> Box<ZoneTables> {
+        let layout = std::alloc::Layout::new::<ZoneTables>();
+        // SAFETY: all-zero is the valid empty zone state. Box owns this
+        // aligned allocation and releases it after the test.
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        }
+    }
+
+    fn identity(tid: u64) -> ThreadIdentity {
+        ThreadIdentity {
+            tid,
+            serial: tid,
+            mm: 7,
+            file_table: 1,
+            generation: 1,
+            affinity: 0,
+        }
+    }
+
+    /// Contract kernel.el1.deferred-handback-identity. The slot evacuation
+    /// and its publication are separate phases: a control claimant can retire
+    /// a host-owned record in between. Publication owes the original thread
+    /// only, never a new waiter that reused the record number.
+    #[test]
+    fn deferred_slot_handback_does_not_wake_a_reused_record() {
+        for count in [1, 8, 32] {
+            let zone = heap_zone();
+            let slot = SlotId::new(3);
+            zone.drive(slot, 7);
+            let mut original = Vec::new();
+            for tid in 1..=count {
+                let record = zone.alloc_record(identity(tid)).unwrap();
+                let seq = zone.next_seq(record);
+                zone.publish_park(record, seq);
+                assert_eq!(
+                    zone.claim_for_host(
+                        zone.record_ref(record),
+                        Some(seq),
+                        Handback::Woken,
+                        &HostLockWait,
+                    ),
+                    HostClaim::Claimed,
+                );
+                original.push(zone.record_ref(record));
+                assert!(zone.requeue_on(slot, record));
+            }
+            let mut records = Vec::new();
+            let mut placements = Vec::new();
+            assert!(zone.leave_slot(
+                slot,
+                7,
+                &mut |record| records.push(zone.record_ref(record)),
+                &mut |placement| placements.push(placement),
+            ));
+            assert_eq!(records.len(), count as usize);
+            assert!(placements.is_empty());
+
+            // The other owner completes each original host continuation,
+            // frees its record, and a new thread parks in the same slot.
+            let mut replacements = Vec::new();
+            for old in original {
+                assert!(matches!(
+                    zone.live(old).unwrap().claim(),
+                    Claim::Host { .. }
+                ));
+                assert_eq!(
+                    zone.claim_for_host(old, None, Handback::Cancelled, &HostLockWait),
+                    HostClaim::AlreadyHost,
+                );
+                zone.free_record(old.id);
+                let record = zone
+                    .alloc_record(identity(100 + u64::from(old.id.raw())))
+                    .unwrap();
+                assert_eq!(record, old.id);
+                assert_ne!(zone.record_ref(record), old);
+                let seq = zone.next_seq(record);
+                zone.publish_park(record, seq);
+                replacements.push((record, seq));
+            }
+            let mut published = Vec::new();
+            settle_vacated(&zone, None, records, placements, &mut |record| {
+                published.push(record);
+            });
+            assert!(
+                published.is_empty(),
+                "delayed handback targeted replacement: {published:?}"
+            );
+            for (record, seq) in replacements {
+                assert_eq!(zone.record(record).claim(), Claim::Parked { seq });
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_slot_handback_preserves_live_records() {
+        let zone = heap_zone();
+        let slot = SlotId::new(3);
+        zone.drive(slot, 7);
+        let record = zone.alloc_host_runnable(identity(1)).unwrap();
+        let expected = zone.record_ref(record);
+        assert!(zone.requeue_on(slot, record));
+        let mut records = Vec::new();
+        let mut placements = Vec::new();
+        assert!(zone.leave_slot(
+            slot,
+            7,
+            &mut |record| records.push(zone.record_ref(record)),
+            &mut |placement| placements.push(placement),
+        ));
+        let mut published = Vec::new();
+        settle_vacated(&zone, None, records, placements, &mut |record| {
+            published.push(record);
+        });
+        assert_eq!(published, [expected]);
+        assert!(matches!(
+            zone.live(expected).unwrap().claim(),
+            Claim::Host { .. }
+        ));
     }
 }
