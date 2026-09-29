@@ -1,0 +1,22 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.70s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 1 test
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_guest_writer_pin_delays_eof_after_host_close ... FAILED
+
+failures:
+
+---- dispatch::fs::pipe::tests::serial_host_el1_ipc_guest_writer_pin_delays_eof_after_host_close stdout ----
+
+thread 'dispatch::fs::pipe::tests::serial_host_el1_ipc_guest_writer_pin_delays_eof_after_host_close' (34273267) panicked at crates/carrick-kernel/src/dispatch/fs/pipe.rs:895:14:
+pipe writer must install its shared description: StalePin
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::fs::pipe::tests::serial_host_el1_ipc_guest_writer_pin_delays_eof_after_host_close
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2325 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

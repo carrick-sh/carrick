@@ -564,7 +564,7 @@ impl HostIpc {
         Ok(token)
     }
     /// Final-description release, after leaving the descriptor table lock.
-    /// The caller delivers the returned object wake after leaving object locks.
+    /// Delivers guest and host wakes after leaving object locks.
     pub fn release(&self, backing: fd::BackingToken) -> Result<IpcReleased, IpcError> {
         let released = self.region().release_backing(backing, &HostLockWait)?;
         if let IpcReleased::Object { wake, freed: false } = released {
@@ -574,6 +574,9 @@ impl HostIpc {
                 delivery.collect(wake);
                 drop(guard);
                 delivery.deliver();
+            }
+            if wake.host_owed {
+                self.service_host_wake(wake.object);
             }
         }
         if let IpcReleased::Host(token) = released {
