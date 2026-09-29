@@ -3301,7 +3301,7 @@
       "kind": "thread_local",
       "file": "crates/carrick-kernel/src/dispatch/resources.rs",
       "symbol": "CAPTURED_RESOURCES",
-      "fingerprint": "7ecab6ee6e0726c019f74800ac1f03a578f1dc599d2fc9a78dacac320db5aed1",
+      "fingerprint": "c8ffe1fcbc0332b22e033140e70d796222c3d1a4884f2e43eb66cb6f6e1ec992",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell CAPTURED_RESOURCES in crates/carrick-runtime/src/dispatch/resources.rs maintaining per-host-thread execution state for the carrier."
     },
@@ -3603,16 +3603,16 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-kernel/src/dispatch/mem/metadata_budget_tests.rs",
-      "symbol": "allocation_meter::ALLOCATOR",
+      "file": "crates/carrick-kernel/src/dispatch/allocation_meter.rs",
+      "symbol": "ALLOCATOR",
       "fingerprint": "d4c9d80202765523c1138ceb045009150abc1fa333ebf119f3328aebba0ab748",
       "classification": "test_only",
-      "rationale": "Test-only counting allocator ALLOCATOR used by the mmap/munmap/brk metadata budget tests to measure host-heap bytes per call; compiled under cfg(test) only."
+      "rationale": "Test-only counting allocator ALLOCATOR shared by the kernel budget tests to measure host-heap bytes per call; compiled under cfg(test) only."
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-kernel/src/dispatch/mem/metadata_budget_tests.rs",
-      "symbol": "allocation_meter::BYTES",
+      "file": "crates/carrick-kernel/src/dispatch/allocation_meter.rs",
+      "symbol": "BYTES",
       "fingerprint": "1979ac4a51ecee9d3c94d37d8386815313eafbb8eb78938ef944a88407cd3f15",
       "classification": "test_only",
       "rationale": "Test-only per-thread byte counter for the mmap/munmap/brk metadata budget tests; compiled under cfg(test) only."
@@ -3651,11 +3651,19 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-kernel/src/dispatch/mem/metadata_budget_tests.rs",
-      "symbol": "allocation_meter::CALLS",
+      "file": "crates/carrick-kernel/src/dispatch/allocation_meter.rs",
+      "symbol": "CALLS",
       "fingerprint": "fcbb46529d9f212a87507c71261580ad1302f22c6ec60daf7632cd08076b1903",
       "classification": "test_only",
       "rationale": "Test-only per-thread allocation call counter for the mmap/munmap/brk and openat metadata budget tests; compiled under cfg(test) only."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/dispatch/budget_meter.rs",
+      "symbol": "ACTIVE_SNAPSHOT",
+      "fingerprint": "1faab0a15ffbb8eb9c943c397466388efd804d15d5fccef68b6bacb9f63897e0",
+      "classification": "test_only",
+      "rationale": "Test-only per-thread budget snapshot for the forwarded read/write/close budget tests; the module is compiled under cfg(test) only."
     },
     {
       "kind": "thread_local",
