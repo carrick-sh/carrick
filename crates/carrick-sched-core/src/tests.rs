@@ -1491,3 +1491,308 @@ fn read_parked_context_reports_not_parked_for_an_unmatched_identity() {
     };
     assert!(matches!(no_longer_parked, ParkedContextRead::NotParked));
 }
+
+mod ipc_wait {
+    use super::*;
+    use crate::object_wait::*;
+
+    fn key(index: u32, generation: u64) -> ObjectWaitKey {
+        ObjectWaitKey::new(index, generation).unwrap()
+    }
+
+    fn token(index: u64) -> OperationToken {
+        OperationToken::new(index, 9).unwrap()
+    }
+
+    fn object_park(zone: &ZoneTables, key: ObjectWaitKey, tid: u64) -> RecordId {
+        let guard = zone.object_wait(key, &HostWait).unwrap();
+        let record = zone.alloc_record(identity(tid)).unwrap();
+        // SAFETY: newly allocated context, not yet published.
+        unsafe {
+            let ctx = zone.record(record).ctx_mut();
+            ctx.x[0] = 0xfeed;
+            ctx.pc = 0x8000;
+        }
+        guard.park(guard.snapshot(), record, token(tid)).unwrap();
+        record
+    }
+
+    fn notify(zone: &ZoneTables, key: ObjectWaitKey) -> (ObjectWakeReport, WakeEffects) {
+        let guard = zone.object_wait(key, &HostWait).unwrap();
+        let mut effects = WakeEffects::default();
+        let report = guard.notify_object(SLOT, &mut effects).unwrap();
+        (report, effects)
+    }
+
+    #[test]
+    fn el1_ipc_wait_recheck_preserves_pending_result() {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let key = key(1, 1);
+        zone.bind_object_wait(key, &HostWait).unwrap();
+        let record = object_park(&zone, key, 17);
+        assert_eq!(notify(&zone, key).0.queued, 1);
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert_eq!(
+            switched.result, None,
+            "readiness is not a completed zero-byte read"
+        );
+        assert_eq!(zone.record(record).handback(), Some(Handback::Resumed));
+        // SAFETY: switched record is exclusively owned here.
+        unsafe {
+            assert_eq!(zone.record(record).ctx_mut().x[0], 0xfeed);
+            assert_eq!(zone.record(record).take_object_operation(), Some(token(17)));
+            assert_eq!(zone.record(record).take_object_operation(), None);
+        }
+    }
+
+    #[test]
+    fn el1_ipc_wait_check_enroll_park_race() {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let key = key(1, 1);
+        zone.bind_object_wait(key, &HostWait).unwrap();
+        let snapshot = zone.object_wait(key, &HostWait).unwrap().snapshot();
+        // Readiness changes after the predicate check, before enrollment;
+        // notification has no waiters but must invalidate the observation.
+        assert_eq!(notify(&zone, key).0.visited, 0);
+        let record = zone.alloc_record(identity(1)).unwrap();
+        let guard = zone.object_wait(key, &HostWait).unwrap();
+        let (error, operation) = guard.park(snapshot, record, token(1)).unwrap_err();
+        assert_eq!(error, ObjectWaitError::Changed);
+        assert!(!zone.record(record).has_object_operation());
+        guard.park(guard.snapshot(), record, operation).unwrap();
+        drop(guard);
+        assert_eq!(notify(&zone, key).0.queued, 1);
+    }
+
+    #[test]
+    fn el1_ipc_wait_object_and_record_reuse_reject_stale_identity() {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let old = key(1, 7);
+        let new = key(1, 8);
+        zone.bind_object_wait(old, &HostWait).unwrap();
+        let record = object_park(&zone, old, 1);
+        let stale = zone.record_ref(record);
+        assert_eq!(
+            zone.bind_object_wait(new, &HostWait),
+            Err(ObjectWaitError::Occupied)
+        );
+        assert_eq!(
+            zone.claim_for_host(stale, None, Handback::Cancelled, &HostWait),
+            HostClaim::Claimed
+        );
+        zone.free_record(record);
+        assert!(
+            zone.live(stale).is_some(),
+            "cannot recycle a pinned operation"
+        );
+        // SAFETY: host owns the claimed and unlinked record.
+        assert_eq!(
+            unsafe { zone.record(record).take_object_operation() },
+            Some(token(1))
+        );
+        zone.free_record(record);
+        assert!(zone.live(stale).is_none());
+        zone.bind_object_wait(new, &HostWait).unwrap();
+        assert!(matches!(
+            zone.object_wait(old, &HostWait),
+            Err(ObjectWaitError::Stale)
+        ));
+        assert_eq!(
+            zone.bind_object_wait(old, &HostWait),
+            Err(ObjectWaitError::Stale)
+        );
+        let replacement = object_park(&zone, new, 2);
+        assert_eq!(
+            zone.claim_for_host(stale, None, Handback::Control, &HostWait),
+            HostClaim::Stale
+        );
+        assert!(matches!(
+            zone.record(replacement).claim(),
+            Claim::Parked { .. }
+        ));
+    }
+
+    #[test]
+    fn el1_ipc_wait_wake_signal_control_have_one_owner() {
+        for kind in [Handback::Signal, Handback::Control, Handback::Cancelled] {
+            for host_first in [true, false] {
+                let zone = zone();
+                host_publish(&zone, SLOT, MM, None, 0);
+                zone.enter_guest(SLOT);
+                let key = key(1, 1);
+                zone.bind_object_wait(key, &HostWait).unwrap();
+                let record = object_park(&zone, key, 1);
+                if !host_first {
+                    assert_eq!(notify(&zone, key).0.queued, 1);
+                }
+                assert_eq!(
+                    zone.claim_for_host(zone.record_ref(record), None, kind, &HostWait),
+                    HostClaim::Claimed
+                );
+                assert_eq!(notify(&zone, key).0.queued, 0);
+                assert_eq!(zone.record(record).handback(), Some(kind));
+                assert!(zone.switch_in_full(SLOT).is_none());
+                // SAFETY: host owns it; both wait/run queues detached it.
+                unsafe {
+                    assert_eq!(zone.record(record).take_object_operation(), Some(token(1)));
+                    assert_eq!(zone.record(record).take_object_operation(), None);
+                }
+                zone.free_record(record);
+            }
+        }
+    }
+
+    #[test]
+    fn el1_ipc_wait_scales_with_affected_waiters_not_population() {
+        for n in [1, 8, 64] {
+            let zone = zone();
+            host_publish(&zone, SLOT, MM, None, 0);
+            zone.enter_guest(SLOT);
+            let affected = key(1, 1);
+            let unrelated = key(2, 1);
+            zone.bind_object_wait(affected, &HostWait).unwrap();
+            zone.bind_object_wait(unrelated, &HostWait).unwrap();
+            for tid in 1..=128 {
+                object_park(&zone, unrelated, tid);
+            }
+            for tid in 129..129 + n {
+                object_park(&zone, affected, tid);
+            }
+            let (report, effects) = notify(&zone, affected);
+            assert_eq!(
+                report,
+                ObjectWakeReport {
+                    visited: n as u32,
+                    queued: n as u32,
+                    deferred: 0
+                }
+            );
+            assert!(effects.queued_own);
+            assert!(!effects.misplaced);
+            assert_eq!(
+                zone.slot(SLOT).queued(),
+                n as usize,
+                "one execution slot serves all waiters"
+            );
+            assert_eq!(
+                zone.counters
+                    .host_service_placements
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(zone.counters.host_wakes.load(Ordering::Relaxed), 0);
+            for _ in 0..n {
+                let switched = zone.switch_in_full(SLOT).unwrap();
+                assert_eq!(switched.result, None);
+                let rec = zone.record(switched.record);
+                // SAFETY: this slot owns this OnCpu record.
+                assert!(unsafe { rec.take_object_operation() }.is_some());
+                zone.release_current(SLOT, switched.record);
+            }
+            assert_eq!(notify(&zone, affected).0.visited, 0);
+        }
+    }
+
+    #[test]
+    fn el1_ipc_wait_concurrent_notify_and_control_detach_once() {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let key = key(1, 1);
+        zone.bind_object_wait(key, &HostWait).unwrap();
+        let records: Vec<_> = (1..=64).map(|tid| object_park(&zone, key, tid)).collect();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                notify(&zone, key);
+            });
+            barrier.wait();
+            for record in &records {
+                assert_eq!(
+                    zone.claim_for_host(
+                        zone.record_ref(*record),
+                        None,
+                        Handback::Control,
+                        &HostWait
+                    ),
+                    HostClaim::Claimed
+                );
+                // SAFETY: control claimed and detached this exact record.
+                let operation = unsafe { zone.record(*record).take_object_operation() }.unwrap();
+                assert_eq!(operation.index(), zone.record(*record).identity().tid);
+                zone.free_record(*record);
+            }
+        });
+        assert_eq!(notify(&zone, key).0.visited, 0);
+        assert_eq!(zone.slot(SLOT).queued(), 0);
+    }
+
+    #[test]
+    fn el1_ipc_wait_never_aliases_a_private_futex() {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let key = key(MM as u32, 0x1000);
+        zone.bind_object_wait(key, &HostWait).unwrap();
+        let object = object_park(&zone, key, 1);
+        let futex = park(&zone, 2, 0x1000);
+        assert_eq!(
+            wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap(),
+            [futex]
+        );
+        assert!(matches!(zone.record(object).claim(), Claim::Parked { .. }));
+        assert_eq!(notify(&zone, key).0.queued, 1);
+        assert_eq!(zone.record(futex).handback(), Some(Handback::Woken));
+        assert_eq!(zone.record(object).handback(), Some(Handback::Resumed));
+    }
+    #[test]
+    fn el1_ipc_wait_interruption_requires_adapter_settlement() {
+        for kind in [Handback::Signal, Handback::Control] {
+            let zone = zone();
+            host_publish(&zone, SLOT, MM, None, 0);
+            zone.enter_guest(SLOT);
+            let key = key(1, 1);
+            zone.bind_object_wait(key, &HostWait).unwrap();
+            let record = object_park(&zone, key, 1);
+            assert_eq!(
+                zone.claim_for_host(zone.record_ref(record), None, kind, &HostWait),
+                HostClaim::Claimed
+            );
+            assert!(
+                zone.record(record).needs_host(),
+                "pending interruption must not become a zero-byte completion"
+            );
+        }
+    }
+
+    #[test]
+    fn el1_ipc_wait_cancelled_pin_reaches_adapter_before_recycling() {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let key = key(1, 1);
+        zone.bind_object_wait(key, &HostWait).unwrap();
+        let record = object_park(&zone, key, 1);
+        notify(&zone, key);
+        zone.record(record).request_cancel();
+        assert_eq!(zone.sweep_cancelled(SLOT), 0);
+        assert!(zone.head_needs_host(SLOT));
+        assert!(zone.switch_in_full(SLOT).is_none());
+        let mut taken = Vec::new();
+        assert_eq!(zone.take_host_wanted(SLOT, &mut |r| taken.push(r)), 1);
+        assert_eq!(taken, [record]);
+        assert_eq!(zone.record(record).handback(), Some(Handback::Cancelled));
+        // SAFETY: host took the detached record.
+        assert!(unsafe { zone.record(record).take_object_operation() }.is_some());
+        zone.free_record(record);
+        assert_eq!(zone.record(record).claim(), Claim::Free);
+    }
+}
