@@ -1,0 +1,126 @@
+[main (root-commit) c71eba3] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main de5ee3f] modify guest file
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+.[main (root-commit) d43abdf] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 8febcfb] modify guest and binding
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+.[main (root-commit) d43abdf] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 263d1ac] rename guest file byte-identical
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+ rename crates/carrick-kernel/src/dispatch/{futex.rs => futex_renamed.rs} (100%)
+.[main (root-commit) d43abdf] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 48571fe] rename and edit guest file
+ 2 files changed, 1 insertion(+), 1 deletion(-)
+ delete mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex_renamed.rs
+.[main (root-commit) d43abdf] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 427e9c4] add unclassified file
+ 1 file changed, 1 insertion(+)
+ create mode 100644 crates/unclassified/new_file.rs
+.[main (root-commit) d43abdf] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main b9b63cc] modify with glob exemption
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+ create mode 100644 docs/conformance-exemptions/exemption.toml
+.[main (root-commit) d43abdf] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main bbb2d04] modify with bad exemption revisions
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+ create mode 100644 docs/conformance-exemptions/exemption.toml
+.[main (root-commit) f5d54dd] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 32ca891] modify with bad rationale
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+ create mode 100644 docs/conformance-exemptions/exemption.toml
+.[main (root-commit) f5d54dd] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 3fb8e48] modify guest file
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main e087913] modify guest with valid exemption
+ Date: Tue Sep 29 10:27:25 2026 -0700
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+ create mode 100644 docs/conformance-exemptions/exemption.toml
+[main dc5b1b0] update exemption with exact head sha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main 37e004d] final exemption head
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main 6bd7241] final exemption head
+ Date: Tue Sep 29 10:27:25 2026 -0700
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main 6bd7241] final exemption head
+ Date: Tue Sep 29 10:27:25 2026 -0700
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+.[main (root-commit) f5d54dd] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 304810e] update declared contract
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+ rename conformance-contracts/contracts/{futex-contention.toml => reviewed-contract.toml} (97%)
+F[main (root-commit) f5d54dd] initial commit
+ 4 files changed, 663 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 1f51102] unrelated lookalike
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+ create mode 100644 docs/contention.toml
+.
+======================================================================
+FAIL: test_descriptor_with_unrelated_filename_is_evidence (scripts.tests.test_check_contract_change.CheckContractChangeTest.test_descriptor_with_unrelated_filename_is_evidence)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/scripts/tests/test_check_contract_change.py", line 71, in test_descriptor_with_unrelated_filename_is_evidence
+    self.assertEqual(result.returncode, 0, msg=result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : error: uncovered guest surface: crates/carrick-kernel/src/dispatch/futex.rs (contract: kernel.futex.requeue) requires contract/test evidence
+
+
+----------------------------------------------------------------------
+Ran 11 tests in 2.050s
+
+FAILED (failures=1)

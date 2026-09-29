@@ -1,0 +1,5 @@
+python3 scripts/conformance/check-contract-change.py --root . --base 55cb799a3 --head HEAD
+error: uncovered guest surface: crates/carrick-kernel/src/kernel/scheduler.rs (contract: kernel.scheduler.runnable-progress) requires contract/test evidence
+error: uncovered guest surface: crates/carrick-kernel/src/kernel/scheduler.rs (contract: kernel.scheduler.preemption-lifecycle) requires contract/test evidence
+error: uncovered guest surface: crates/carrick-kernel/src/kernel/scheduler.rs (contract: kernel.scheduler.preemption-cost) requires contract/test evidence
+error: recipe `check-contract-change` failed on line 936 with exit code 1
