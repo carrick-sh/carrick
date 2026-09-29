@@ -192,14 +192,10 @@ fn eventfd() -> WaitQueueFixture {
         description: install(OpenDescription::EventFd {
             base: OpenDescriptionBase::new(0),
             state,
-            semaphore: false,
         }),
         interest: LinuxPollEvents::IN,
         producer: Box::new(move || {
-            producer_state
-                .counter_ref()
-                .store(1, std::sync::atomic::Ordering::SeqCst);
-            producer_state.wait_queue.wake_all();
+            producer_state.write_value(1).unwrap();
         }),
         _guards: Vec::new(),
     }

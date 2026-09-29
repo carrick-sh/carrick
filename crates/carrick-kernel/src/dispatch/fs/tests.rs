@@ -6369,6 +6369,41 @@ fn vmsplice_in_memory_pipe_writer_full_blocking_parks_on_write_readiness_pollin(
     assert_ne!(poll_fd_struct.revents & libc::POLLIN, 0);
 }
 
+#[test]
+fn serial_host_el1_ipc_splice_endpoint_survives_final_slot_close() {
+    let pair = TestPipePair::new(65536, 65536);
+    pair.fill_in(b"retained");
+    let (endpoint, _) = pair
+        .dispatcher
+        .fs_view()
+        .pipe_reader(pair.in_read_fd)
+        .unwrap();
+    pair.dispatcher
+        .close_fd_for_internal_rollback(pair.in_read_fd);
+    pair.dispatcher
+        .close_fd_for_internal_rollback(pair.in_write_fd);
+    assert!(
+        !pair.in_pipe.is_retired(),
+        "captured transfer retains its exact endpoint"
+    );
+    let mut bytes = [0; 8];
+    assert_eq!(
+        pipe::read_pipe_bytes(
+            &mut bytes,
+            &endpoint,
+            0,
+            crate::thread::ThreadId::synthetic_for_tests(1)
+        ),
+        Ok(8)
+    );
+    assert_eq!(&bytes, b"retained");
+    drop(endpoint);
+    assert!(
+        pair.in_pipe.is_retired(),
+        "observation alone does not retain the endpoint"
+    );
+}
+
 struct TestPipePair {
     dispatcher: SyscallDispatcher,
     in_pipe: PipeRef,
