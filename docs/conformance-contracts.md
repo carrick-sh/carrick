@@ -172,6 +172,19 @@ HEAD, SHA-256, CDHash, LC_UUID, hypervisor entitlement, `__dof_carrick`, and
 run-ID-scoped cleanup. A focused contract proves only its named family; it does
 not close the frozen suite or ecosystem denominator.
 
+## Executor empty host queue
+
+`kernel.executor.empty-host-steal` covers an executor seeking host-runnable
+work while runnable tasks are held by the in-guest scheduler. Linux blocking
+and wakeup semantics remain the authority: a guest wait releases executor
+capacity, and a wake must make the exact runnable generation claimable without
+waiting for another guest task. The VM-free structural binding is
+`zone_only_steal_has_zero_host_cpu_scan_visits` in `scheduler.rs`, at 1, 8 and
+32 guest CPUs. Its budget is exactly zero host CPU queue visits per empty
+steal attempt, even when a zone-held row contributes to lifecycle drain.
+Host-runnable rows must remain stealable. Signed execution, same-image Docker
+timing, and full promotion remain open for the integration director.
+
 ## Futex example
 
 `kernel.futex.contention` is the first vertical contract. Its VM-free binding

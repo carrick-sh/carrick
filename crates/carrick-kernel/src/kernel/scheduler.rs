@@ -1060,6 +1060,11 @@ pub(crate) struct RunQueueInner {
     /// makes an unchanged census mean exactly "no claim boundary crossed".
     claim_boundaries: AtomicU64,
     total_queued: AtomicUsize,
+    /// Claimable rows on host CPU queues. `total_queued` also includes
+    /// zone-held rows, which no host executor can find by stealing.
+    host_queued: AtomicUsize,
+    #[cfg(test)]
+    steal_scan_visits: AtomicUsize,
     active_authorities: AtomicUsize,
     close_epoch: AtomicU64,
     /// Carrier-wide exact-key dedup, sharded so a wake never contends with an
@@ -1448,6 +1453,7 @@ impl RunQueueInner {
             drop(shard);
             local.rows.push_back(row);
             cpu.depth.store(local.rows.len(), Ordering::Release);
+            self.host_queued.fetch_add(1, Ordering::SeqCst);
             self.total_queued.fetch_add(1, Ordering::SeqCst);
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
             local.waiters > 0
@@ -1516,6 +1522,7 @@ impl RunQueueInner {
             drop(shard);
             local.rows.push_back(publishable);
             cpu.depth.store(local.rows.len(), Ordering::Release);
+            self.host_queued.fetch_add(1, Ordering::SeqCst);
             self.total_queued.fetch_add(1, Ordering::SeqCst);
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
             local.waiters > 0
@@ -1621,6 +1628,7 @@ impl RunQueueInner {
             let mut local = cpu.state.lock();
             local.rows.push_back(row);
             cpu.depth.store(local.rows.len(), Ordering::Release);
+            self.host_queued.fetch_add(1, Ordering::SeqCst);
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
         }
         cpu.idle_condvar.notify_one();
@@ -1747,12 +1755,19 @@ impl RunQueueInner {
         self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
         self.shard(key).lock().queued.remove(&key);
         cpu.depth.store(local.rows.len(), Ordering::Release);
+        self.host_queued.fetch_sub(1, Ordering::SeqCst);
         self.total_queued.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// `findrunnable`'s steal: an idle CPU takes work from the longest queue,
     /// honouring the stolen task's affinity mask.
     fn try_steal(&self, stealer: GuestCpuId) -> Option<QueueRow> {
+        // Zone-held rows count towards lifecycle drain but cannot appear on a
+        // host CPU queue. This also avoids allocating/sorting a victim list
+        // twice on every empty executor handoff.
+        if self.host_queued.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
         if self.policy.inspects_queues()
             && let Some(row) = self.policy_steal(stealer)
         {
@@ -1762,7 +1777,11 @@ impl RunQueueInner {
             .cpus
             .iter()
             .enumerate()
-            .filter(|(index, cpu)| *index != stealer.as_usize() && cpu.queue_len() > 0)
+            .filter(|(index, cpu)| {
+                #[cfg(test)]
+                self.steal_scan_visits.fetch_add(1, Ordering::Relaxed);
+                *index != stealer.as_usize() && cpu.queue_len() > 0
+            })
             .map(|(index, cpu)| (index, cpu.queue_len()))
             .collect();
         victims.sort_by_key(|(_, depth)| std::cmp::Reverse(*depth));
@@ -2379,6 +2398,9 @@ impl RunQueue {
                 claimed: AtomicUsize::new(0),
                 claim_boundaries: AtomicU64::new(0),
                 total_queued: AtomicUsize::new(0),
+                host_queued: AtomicUsize::new(0),
+                #[cfg(test)]
+                steal_scan_visits: AtomicUsize::new(0),
                 active_authorities: AtomicUsize::new(0),
                 close_epoch: AtomicU64::new(0),
                 keys,
@@ -2423,6 +2445,7 @@ impl RunQueue {
                 RunQueueInner::retire_gates(&mut shard, key);
             }
             cpu.depth.store(local.rows.len(), Ordering::Release);
+            self.inner.host_queued.fetch_sub(1, Ordering::SeqCst);
             self.inner.total_queued.fetch_sub(1, Ordering::SeqCst);
             drop(local);
             self.inner.settle_close_if_closing();
@@ -7652,6 +7675,44 @@ mod tests {
             kernel,
             Arc::new(GuestCpuPolicy::new(cpus)),
         ))
+    }
+
+    /// Contract `kernel.executor.empty-host-steal`: a zone-held runnable row
+    /// cannot be stolen from a host CPU queue. Repeated empty handoffs must
+    /// visit no CPU queues, independent of the guest CPU count.
+    #[test]
+    fn zone_only_steal_has_zero_host_cpu_scan_visits() {
+        for cpus in [1, 8, 32] {
+            let (kernel, root) = bootstrap(20_000 + cpus as i32);
+            publish(&root, 20_000 + cpus as u64);
+            let scheduler = scheduler_with_cpus(kernel, cpus);
+            let inner = &scheduler.queue.inner;
+            let key = QueueKey {
+                thread: root.thread().key(),
+                generation: root.thread().execution_state().generation().unwrap(),
+            };
+            {
+                let mut shard = inner.shard(key).lock();
+                shard.queued.insert(key);
+                shard.zone_held.insert(
+                    key,
+                    super::QueueRow {
+                        key,
+                        thread: Arc::clone(root.thread()),
+                        closing_authorized: false,
+                    },
+                );
+            }
+            inner.total_queued.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..16 {
+                assert!(inner.try_steal(GuestCpuId::new(0)).is_none());
+            }
+            assert_eq!(
+                inner.steal_scan_visits.load(Ordering::Relaxed),
+                0,
+                "{cpus} guest CPUs: a zone-only handoff scanned host queues"
+            );
+        }
     }
 
     /// One bound executor per guest CPU, so every CPU is online and placement
