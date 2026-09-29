@@ -475,6 +475,9 @@ mod tests {
             },
             carrick_abi::LINUX_O_RDONLY,
         );
+        // This test models an already subscribed host observer. A fresh
+        // observer instead samples the object when acquiring its proxy lease.
+        let _readiness_lease = pipe.read_poll_fd().unwrap();
         let request = pollin(&[fd]);
         assert!(
             matches!(

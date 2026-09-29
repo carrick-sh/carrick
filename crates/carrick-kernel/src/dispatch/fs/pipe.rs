@@ -33,7 +33,6 @@ pub(crate) struct PipeSnapshot {
 /// Host binding of one shared PipeRecord. Bytes, endpoint counts and capacity
 /// live exclusively in the IPC region. Unpublished endpoint holds are consumed
 /// by the first descriptions; failure before publication releases them in Drop.
-#[derive(Debug)]
 pub struct PipeInner {
     owner: Arc<crate::el1_ipc::HostIpc>,
     object: IpcObjectHandle,
@@ -42,13 +41,47 @@ pub struct PipeInner {
     #[cfg(test)]
     fixture: [Option<core_pipe::End>; 2],
     resize: Mutex<()>,
-    readiness: Mutex<(bool, bool)>,
-    read_pipe_ready: OnceLock<Option<(HostFdRef, HostFdRef)>>,
-    write_pipe_ready: OnceLock<Option<(HostFdRef, HostFdRef)>>,
+    readiness: Arc<Mutex<(bool, bool)>>,
+    read_pipe_ready: Arc<OnceLock<Option<(HostFdRef, HostFdRef)>>>,
+    write_pipe_ready: Arc<OnceLock<Option<(HostFdRef, HostFdRef)>>>,
+    readiness_publisher: Arc<dyn Fn() + Send + Sync>,
     pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 
+impl std::fmt::Debug for PipeInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipeInner")
+            .field("object", &self.object)
+            .field("pipe_id", &self.pipe_id)
+            .finish_non_exhaustive()
+    }
+}
+
 pub type PipeRef = Arc<PipeInner>;
+
+/// Functional endpoint ownership for a captured splice/tee/vmsplice operand.
+/// The shared object cannot retire while the operation uses its captured bytes.
+pub(crate) struct PipeEndpointLease {
+    pipe: PipeRef,
+    _description: crate::kernel::objects::FileDescriptionFdLease,
+}
+impl PipeEndpointLease {
+    pub(crate) fn new(
+        pipe: PipeRef,
+        description: crate::kernel::objects::FileDescriptionFdLease,
+    ) -> Self {
+        Self {
+            pipe,
+            _description: description,
+        }
+    }
+}
+impl std::ops::Deref for PipeEndpointLease {
+    type Target = PipeRef;
+    fn deref(&self) -> &Self::Target {
+        &self.pipe
+    }
+}
 
 /// Exact publication authority captured before a write parks. It avoids
 /// resolving a numeric guest fd after close or reuse.
@@ -173,6 +206,27 @@ impl PipeInner {
     ) -> Result<Self, crate::el1_ipc::AdmissionError> {
         let object = owner.create_pipe(capacity)?;
         let wait_queue = owner.wait_queue(object);
+        let readiness = Arc::new(Mutex::new((false, false)));
+        let read_pipe_ready = Arc::new(OnceLock::new());
+        let write_pipe_ready = Arc::new(OnceLock::new());
+        let readiness_primer: Arc<dyn Fn() + Send + Sync> = {
+            let owner = Arc::clone(&owner);
+            let state = Arc::clone(&readiness);
+            let read = Arc::clone(&read_pipe_ready);
+            let write = Arc::clone(&write_pipe_ready);
+            Arc::new(move || {
+                Self::publish_readiness(&owner, object, &state, &read, &write);
+            })
+        };
+        let readiness_publisher: Arc<dyn Fn() + Send + Sync> = {
+            let prime = Arc::clone(&readiness_primer);
+            let queue = Arc::clone(&wait_queue);
+            Arc::new(move || {
+                prime();
+                queue.wake_all();
+            })
+        };
+        owner.register_host_waker(object, &readiness_publisher, &readiness_primer);
         Ok(Self {
             owner,
             object,
@@ -181,9 +235,10 @@ impl PipeInner {
             #[cfg(test)]
             fixture: [None, None],
             resize: Mutex::new(()),
-            readiness: Mutex::new((false, false)),
-            read_pipe_ready: OnceLock::new(),
-            write_pipe_ready: OnceLock::new(),
+            readiness,
+            read_pipe_ready,
+            write_pipe_ready,
+            readiness_publisher,
             wait_queue,
         })
     }
@@ -278,8 +333,7 @@ impl PipeInner {
         drop(guard);
         delivery.deliver();
         if wake.host_owed {
-            self.update_readiness();
-            self.wait_queue.wake_all();
+            self.owner.service_host_wake(self.object);
         }
         step.result.map_err(object_error)
     }
@@ -319,7 +373,8 @@ impl PipeInner {
             });
     }
     pub(crate) fn release_endpoint(&self, end: core_pipe::End) {
-        self.owner
+        let released = self
+            .owner
             .release(
                 IpcBacking::Pipe {
                     object: self.object,
@@ -330,8 +385,11 @@ impl PipeInner {
             .unwrap_or_else(|_| {
                 carrick_fatal::carrick_fatal!("ipc::pipe", "releasing a closed endpoint")
             });
-        self.update_readiness();
-        self.wait_queue.wake_all();
+        if let carrick_el1_abi::ipc::IpcReleased::Object { wake, .. } = released {
+            if wake.host_owed {
+                (self.readiness_publisher)();
+            }
+        }
     }
     pub(crate) fn set_capacity(&self, capacity: usize) -> Result<usize, LinuxErrno> {
         let _resize = self.resize.lock();
@@ -343,8 +401,7 @@ impl PipeInner {
                 )) => object_error(error),
                 _ => LINUX_ENOMEM,
             })?;
-        self.update_readiness();
-        self.wait_queue.wake_all();
+        self.owner.service_host_wake(self.object);
         Ok(self.get_capacity())
     }
     #[cfg(test)]
@@ -370,35 +427,51 @@ impl PipeInner {
         }
     }
     pub(crate) fn update_readiness(&self) {
-        if self.read_pipe_ready.get().is_none() && self.write_pipe_ready.get().is_none() {
+        Self::publish_readiness(
+            &self.owner,
+            self.object,
+            &self.readiness,
+            &self.read_pipe_ready,
+            &self.write_pipe_ready,
+        );
+    }
+    fn publish_readiness(
+        owner: &crate::el1_ipc::HostIpc,
+        object: IpcObjectHandle,
+        readiness: &Mutex<(bool, bool)>,
+        read: &OnceLock<Option<(HostFdRef, HostFdRef)>>,
+        write: &OnceLock<Option<(HostFdRef, HostFdRef)>>,
+    ) {
+        if read.get().is_none() && write.get().is_none() {
             return;
         }
-        let mut notified = self.readiness.lock();
-        let region = self.owner.region();
+        let mut notified = readiness.lock();
+        let region = owner.region();
         let snapshot = region
-            .lock(self.object, &HostLockWait)
+            .lock(object, &HostLockWait)
             .ok()
             .map(|mut guard| Self::snapshot_locked(&mut guard));
-        region.take_host_wake(self.object);
         let read_ready = snapshot.is_none_or(|s| s.unread != 0 || s.writers == 0);
         let write_ready = snapshot.is_none_or(|s| s.readers == 0 || s.writable);
-        Self::prime_channel(&self.read_pipe_ready, &mut notified.0, read_ready);
-        Self::prime_channel(&self.write_pipe_ready, &mut notified.1, write_ready);
+        Self::prime_channel(read, &mut notified.0, read_ready);
+        Self::prime_channel(write, &mut notified.1, write_ready);
     }
     fn poll_fd(&self, channel: &OnceLock<Option<(HostFdRef, HostFdRef)>>) -> Option<HostFdRef> {
-        if let Some(ready) = channel.get() {
-            return ready.as_ref().map(|(r, _)| r.clone());
-        }
-        let ready = channel.get_or_init(|| {
-            let ready = make_readiness_pipe()?;
-            self.owner
+        let subscription = self.owner.subscribe_host(self.object).ok()?;
+        let needs_prime = channel.get().is_none()
+            || self
+                .owner
                 .region()
-                .subscribe_host(self.object, &HostLockWait)
-                .ok()?;
-            Some(ready)
-        });
-        self.update_readiness();
-        ready.as_ref().map(|(r, _)| r.clone())
+                .lock(self.object, &HostLockWait)
+                .ok()
+                .is_none_or(|guard| guard.host_subscribers() == 1);
+        let ready = channel.get_or_init(make_readiness_pipe);
+        if needs_prime {
+            self.update_readiness();
+        }
+        ready
+            .as_ref()
+            .map(|(r, _)| r.clone().with_ipc_subscription(subscription))
     }
     pub(crate) fn read_poll_fd(&self) -> Option<HostFdRef> {
         self.poll_fd(&self.read_pipe_ready)
@@ -407,16 +480,12 @@ impl PipeInner {
         self.poll_fd(&self.write_pipe_ready)
     }
     pub(crate) fn initialized_read_poll_fd(&self) -> Option<HostFdRef> {
-        self.read_pipe_ready
-            .get()
-            .and_then(Option::as_ref)
-            .map(|(r, _)| r.clone())
+        self.read_pipe_ready.get().and_then(|_| self.read_poll_fd())
     }
     pub(crate) fn initialized_write_poll_fd(&self) -> Option<HostFdRef> {
         self.write_pipe_ready
             .get()
-            .and_then(Option::as_ref)
-            .map(|(r, _)| r.clone())
+            .and_then(|_| self.write_poll_fd())
     }
 }
 impl Drop for PipeInner {
@@ -536,8 +605,18 @@ pub enum PipeDrain<'a> {
 }
 
 pub(crate) fn take_pipe_bytes(pipe: &PipeRef, length: usize) -> PipeDrain<'_> {
-    // Staging allocation precedes the shared object lock.
-    let mut bytes = vec![0; length.min(MAX_PIPE_CAPACITY)];
+    // Bound admission work by observed source bytes, including the empty case.
+    let snapshot = pipe.snapshot();
+    if snapshot.unread == 0 {
+        return if snapshot.writers == 0 {
+            PipeDrain::Eof
+        } else {
+            PipeDrain::WouldBlock
+        };
+    }
+    // Staging allocation precedes the shared object lock. Another reader can
+    // consume this snapshot; peek rechecks the same authoritative record.
+    let mut bytes = vec![0; length.min(snapshot.unread)];
     let mut guard = pipe.lock();
     let mut copied = 0;
     let result = guard
@@ -638,12 +717,10 @@ pub(crate) fn transfer_in_memory_pipes(
     delivery.deliver();
     if copied > 0 {
         if dest_wake.host_owed {
-            dest.update_readiness();
-            dest.wait_queue.wake_all();
+            dest.owner.service_host_wake(dest.object);
         }
         if source_wake.host_owed {
-            source.update_readiness();
-            source.wait_queue.wake_all();
+            source.owner.service_host_wake(source.object);
         }
         return InMemoryTeeOutcome::Transferred(copied);
     }
@@ -798,6 +875,36 @@ impl<'a> FsView<'a> {
 mod tests {
     use super::*;
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
+
+    #[test]
+    fn serial_host_el1_ipc_pipe_proxy_subscription_ends_with_lease() {
+        let pipe = PipeInner::new_connected(next_pipe_id(), DEFAULT_PIPE_CAPACITY);
+        let subscribers = || pipe.lock().host_subscribers();
+        assert_eq!(subscribers(), 0);
+        let lease = pipe.read_poll_fd().unwrap();
+        assert_eq!(subscribers(), 1);
+        drop(lease);
+        assert_eq!(
+            subscribers(),
+            0,
+            "cached proxy is not a live host subscriber"
+        );
+        let mut guard = pipe.lock();
+        let step = guard.pipe().unwrap().try_write(b"guest");
+        assert!(!guard.publish(step.wake).host_owed);
+        drop(guard);
+        let resumed = pipe.read_poll_fd().unwrap();
+        let mut ready = libc::pollfd {
+            fd: resumed.raw(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut ready, 1, 0) },
+            1,
+            "a new subscriber samples changes made during the unsubscribed interval"
+        );
+    }
 
     #[test]
     fn serial_host_el1_ipc_pipe_guest_write_host_read_and_reverse() {

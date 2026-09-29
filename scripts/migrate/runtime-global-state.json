@@ -1795,14 +1795,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-kernel/src/eventfd_shm.rs",
-      "symbol": "SLAB",
-      "fingerprint": "9cdb5a65d0bfea293471215a440665d765252f97012fe3c69748f09b134df2fc",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static SLAB in crates/carrick-runtime/src/eventfd_shm.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-kernel/src/exec_stamps.rs",
       "symbol": "FORK_LINK_SEQUENCE",
       "fingerprint": "777a6d48c3506202086f9fc345b08be454afb46b0c0a02fd9671d56c1dcabdfa",

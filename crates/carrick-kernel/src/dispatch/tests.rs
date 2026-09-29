@@ -49,7 +49,7 @@ mod overlay_dispatch_tests {
         OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(counter)),
-                semaphore: false,
+
                 base: OpenDescriptionBase::new(0),
             })),
             crate::linux_abi::LINUX_O_RDWR,
@@ -383,7 +383,7 @@ mod overlay_dispatch_tests {
             OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::EventFd {
                     state: Arc::new(EventFdState::new(2)),
-                    semaphore: false,
+
                     base: OpenDescriptionBase::new(0),
                 })),
                 crate::linux_abi::LINUX_O_RDWR,
@@ -546,7 +546,7 @@ mod overlay_dispatch_tests {
         let description = kernel_file_description(
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(1)),
-                semaphore: false,
+
                 base: OpenDescriptionBase::new(0),
             })),
             crate::linux_abi::LINUX_O_RDWR,
@@ -5481,7 +5481,7 @@ mod tests {
             let eventfd = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::EventFd {
                     state: Arc::new(EventFdState::new(1)),
-                    semaphore: false,
+
                     base: OpenDescriptionBase::new(0),
                 })),
                 crate::linux_abi::LINUX_O_RDWR,
@@ -8045,8 +8045,10 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
         .expect("write file")
         .description();
 
-    let read_poll_fd = pipe.read_poll_fd().expect("read poll fd").raw();
-    let write_poll_fd = pipe.write_poll_fd().expect("write poll fd").raw();
+    let read_poll_lease = pipe.read_poll_fd().expect("read poll fd");
+    let read_poll_fd = read_poll_lease.raw();
+    let write_poll_lease = pipe.write_poll_fd().expect("write poll fd");
+    let write_poll_fd = write_poll_lease.raw();
 
     // 1. Initial installation activates exactly one reader/writer endpoint and readiness state.
     assert_eq!(read_description.common().fd_refs(), 1);
@@ -8601,7 +8603,7 @@ mod scm_rights_tests {
         let state = Arc::new(EventFdState::new(0));
         let desc = Arc::new(RwLock::new(OpenDescription::EventFd {
             state,
-            semaphore: false,
+
             base: OpenDescriptionBase::new(0),
         }));
         let common = Arc::new(crate::kernel::DescriptionCommon::new(0));

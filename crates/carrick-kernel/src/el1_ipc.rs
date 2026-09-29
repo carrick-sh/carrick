@@ -131,7 +131,7 @@ struct HostResources {
 }
 
 #[derive(Debug)]
-struct HostSubscription {
+pub(crate) struct HostSubscription {
     owner: std::sync::Arc<HostIpc>,
     object: IpcObjectHandle,
 }
@@ -146,6 +146,18 @@ impl Drop for HostSubscription {
     }
 }
 
+enum HostWakeTarget {
+    Queue(std::sync::Weak<crate::kernel::WaitQueue>),
+    Publisher {
+        wake: std::sync::Weak<dyn Fn() + Send + Sync>,
+        prime: std::sync::Weak<dyn Fn() + Send + Sync>,
+    },
+}
+struct HostWakeEntry {
+    object: IpcObjectHandle,
+    target: HostWakeTarget,
+}
+
 /// One kernel's IPC authority and all memory needed by both venues.
 /// Runtime mappings must retain an `Arc<HostIpc>` for their entire lifetime.
 /// The pool reserves virtual address space; anonymous pages are committed by
@@ -155,6 +167,7 @@ pub struct HostIpc {
     bytes: Mapping,
     pool: Mutex<Pool>,
     resources: Mutex<HostResources>,
+    host_wakes: Mutex<Vec<Option<HostWakeEntry>>>,
 }
 impl std::fmt::Debug for HostIpc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -174,6 +187,11 @@ impl HostIpc {
             directory: Mapping::new(std::mem::size_of::<IpcDirectory>())?,
             bytes: Mapping::new(pool_bytes)?,
             pool: Mutex::new(Pool::new(pool_bytes)),
+            host_wakes: Mutex::new(
+                (0..carrick_el1_abi::ipc::IPC_OBJECTS)
+                    .map(|_| None)
+                    .collect(),
+            ),
             resources: Mutex::new(HostResources {
                 next: 1,
                 live: BTreeMap::new(),
@@ -200,13 +218,94 @@ impl HostIpc {
         object: IpcObjectHandle,
     ) -> std::sync::Arc<crate::kernel::WaitQueue> {
         let owner = std::sync::Arc::clone(self);
-        std::sync::Arc::new(crate::kernel::WaitQueue::with_subscription(move || {
-            owner.region().subscribe_host(object, &HostLockWait).ok()?;
-            Some(Box::new(HostSubscription {
-                owner: std::sync::Arc::clone(&owner),
-                object,
-            }))
+        let queue = std::sync::Arc::new(crate::kernel::WaitQueue::with_subscription(move || {
+            let subscription = owner.subscribe_host(object).ok()?;
+            // Enrollment closes the gap after the dispatch readiness check.
+            // Prime any proxy from the object after subscription publication,
+            // before the reactor starts waiting on its level-triggered fd.
+            let publisher = {
+                let wakes = owner.host_wakes.lock();
+                wakes
+                    .get(object.index() as usize)
+                    .and_then(Option::as_ref)
+                    .filter(|entry| entry.object == object)
+                    .and_then(|entry| match &entry.target {
+                        HostWakeTarget::Publisher { prime, .. } => prime.upgrade(),
+                        HostWakeTarget::Queue(_) => None,
+                    })
+            };
+            if let Some(publisher) = publisher {
+                publisher();
+            }
+            Some(Box::new(subscription))
+        }));
+        self.host_wakes.lock()[object.index() as usize] = Some(HostWakeEntry {
+            object,
+            target: HostWakeTarget::Queue(std::sync::Arc::downgrade(&queue)),
+        });
+        queue
+    }
+    pub(crate) fn subscribe_host(
+        self: &std::sync::Arc<Self>,
+        object: IpcObjectHandle,
+    ) -> Result<std::sync::Arc<HostSubscription>, IpcError> {
+        self.region().subscribe_host(object, &HostLockWait)?;
+        Ok(std::sync::Arc::new(HostSubscription {
+            owner: std::sync::Arc::clone(self),
+            object,
         }))
+    }
+    pub(crate) fn register_host_waker(
+        &self,
+        object: IpcObjectHandle,
+        publisher: &std::sync::Arc<dyn Fn() + Send + Sync>,
+        primer: &std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.host_wakes.lock()[object.index() as usize] = Some(HostWakeEntry {
+            object,
+            target: HostWakeTarget::Publisher {
+                wake: std::sync::Arc::downgrade(publisher),
+                prime: std::sync::Arc::downgrade(primer),
+            },
+        });
+    }
+    /// Deliver guest-produced readiness work by exact object incarnation.
+    /// Runtime calls this after returning from EL1; it never scans the pool.
+    pub fn service_host_wake(&self, object: IpcObjectHandle) -> bool {
+        // Authenticate and consume under the object lock: a recycled slot
+        // cannot lose its successor's wake between generation check and swap.
+        let region = self.region();
+        let Ok(guard) = region.lock(object, &HostLockWait) else {
+            return false;
+        };
+        let owed = region.take_host_wake(object);
+        drop(guard);
+        if !owed {
+            return false;
+        }
+        let (queue, publisher) = {
+            let wakes = self.host_wakes.lock();
+            let Some(entry) = wakes
+                .get(object.index() as usize)
+                .and_then(Option::as_ref)
+                .filter(|entry| entry.object == object)
+            else {
+                return false;
+            };
+            match &entry.target {
+                HostWakeTarget::Queue(queue) => (queue.upgrade(), None),
+                HostWakeTarget::Publisher { wake, .. } => (None, wake.upgrade()),
+            }
+        };
+        if let Some(queue) = queue {
+            queue.wake_all();
+            return true;
+        }
+        if let Some(publisher) = publisher {
+            publisher();
+            return true;
+        }
+        false
     }
 
     pub fn directory_ptr(&self) -> *mut IpcDirectory {

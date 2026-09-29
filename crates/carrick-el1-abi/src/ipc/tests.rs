@@ -458,7 +458,13 @@ fn el1_ipc_host_notification_is_owed_only_to_subscribers() {
     assert!(wake.host_owed);
     assert!(fx.region.take_host_wake(object));
     assert!(!fx.region.take_host_wake(object), "delivered once");
+    let (_, wake) = el1_io(&fx, t, w, Some(b"pending"), &mut []).unwrap();
+    assert!(wake.host_owed);
     fx.region.unsubscribe_host(object, &Spin).unwrap();
+    assert!(
+        !fx.region.take_host_wake(object),
+        "last subscriber cancels an undelivered wake"
+    );
     assert_eq!(
         fx.region.unsubscribe_host(object, &Spin),
         Err(IpcError::Corrupt)

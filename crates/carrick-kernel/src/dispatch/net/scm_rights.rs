@@ -220,7 +220,7 @@ mod tests {
         OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(0)),
-                semaphore: false,
+
                 base: OpenDescriptionBase::new(0),
             })),
             crate::linux_abi::LINUX_O_RDWR,

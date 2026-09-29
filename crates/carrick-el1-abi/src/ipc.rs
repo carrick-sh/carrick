@@ -869,7 +869,9 @@ impl<'a> IpcRegion<'a> {
         if subs.load(Ordering::Relaxed) == 0 {
             return Err(IpcError::Corrupt);
         }
-        subs.fetch_sub(1, Ordering::AcqRel);
+        if subs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            guard.record.host_wake_owed.store(0, Ordering::Release);
+        }
         Ok(())
     }
 

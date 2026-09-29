@@ -675,10 +675,7 @@ impl<'a> NetView<'a> {
                     Some(fd) => readiness(fd.raw()),
                     None => described(),
                 },
-                OpenDescription::EventFd { state, .. } => match state.read_fd.as_ref() {
-                    Some(fd) => readiness(fd.raw()),
-                    None => described(),
-                },
+                OpenDescription::EventFd { .. } => described(),
                 OpenDescription::Epoll { kqueue, .. } => readiness(kqueue.poll_fd()),
                 OpenDescription::Pidfd { kqueue, .. } => direct(kqueue.poll_fd()),
                 // An in-zone instance's host fd is a wake source only: EL1
@@ -731,7 +728,7 @@ impl<'a> NetView<'a> {
                 pipe.initialized_write_poll_fd()
             }
             .map(|fd| fd.view()),
-            OpenDescription::EventFd { state, .. } => state.read_fd.as_ref().map(|fd| fd.view()),
+            OpenDescription::EventFd { .. } => None,
             // A pidfd is read-ready when its process exits; the backing
             // multiplexer's poll fd (the kqueue fd on macOS, the
             // pidfd-bearing epoll fd on Linux) is what poll/epoll watch.
@@ -1422,7 +1419,6 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 base: OpenDescriptionBase::new(0),
                 state: Arc::new(crate::dispatch::EventFdState::new(1)),
-                semaphore: false,
             })),
             0,
             0,
@@ -1952,7 +1948,6 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 base: OpenDescriptionBase::new(0),
                 state: Arc::new(crate::dispatch::EventFdState::new(1)),
-                semaphore: false,
             })),
             LINUX_O_RDWR,
             0,
@@ -2757,8 +2752,13 @@ impl<'a> NetView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let description = OpenDescription::EventFd {
-                state: Arc::new(EventFdState::new(initial_value)),
-                semaphore: efd_flags.contains(LinuxEfdFlags::SEMAPHORE),
+                state: Arc::new(EventFdState::create(
+                    cx.kernel.kernel().ipc().map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?,
+                    initial_value as u32,
+                    if efd_flags.contains(LinuxEfdFlags::SEMAPHORE) {
+                        carrick_el1_abi::ipc::pipe::EventMode::Semaphore
+                    } else { carrick_el1_abi::ipc::pipe::EventMode::Counter },
+                ).map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?),
                 // EFD_NONBLOCK == O_NONBLOCK, so the isolated bit IS the
                 // status-flag word the base expects.
                 base: OpenDescriptionBase::new((efd_flags & LinuxEfdFlags::NONBLOCK).bits()),
