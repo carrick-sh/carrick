@@ -272,8 +272,18 @@ cases did not run. Negative entitlement passed and cleanup was zero. Exact
 failed executable and raw census are preserved in the adapter's
 `processes-first-red*` receipts. No retries or product fix yet.
 
-Immediate next action is a bounded reduction of this concrete two-process
-failure using existing scheduler/IPC ownership observations. This qualifies
+**Follow-up `8c9617950`:** deterministic test proves an unplaceable object
+wake had no runnable owner. Reusing the existing misplaced handback queue
+fixes that gap: 62 scheduler-core and 14 focused EL1 IPC tests plus affected
+Clippy pass. Unchanged signed execution now completes pipe 1/8/64 and
+eventfd 1/8, but eventfd64 still hits the watchdog with two worker records
+parked alongside the two waiting leaders. Full test remains red; completed
+cases also retain served-write bound failures. Negative entitlement and
+cleanup pass. Exact executable/census preserved in adapter
+`processes-wake-fix*`; do not claim full liveness or zero-exit closure.
+
+Immediate next action is existing kernel post-mortem/event-ring capture of
+the remaining eventfd64 workers to identify exact wait ownership. This qualifies
 as a direct dependency, unlike the stopped historical capture investigation.
 Do not label the counters a diagnosis or reopen unrelated lifecycle work.
 
