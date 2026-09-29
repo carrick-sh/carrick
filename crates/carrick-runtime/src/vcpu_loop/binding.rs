@@ -5355,6 +5355,19 @@ where
         // the owning carrier mappings: every failure below can drop them.
         let authority = match (&mut engine as &mut dyn std::any::Any).downcast_mut::<HvfEngine>() {
             Some(engine) => {
+                // Root preparation has rebound the dispatcher to the carrier's
+                // authoritative Kernel. The earlier image-loader dispatcher
+                // owns only a temporary bootstrap graph and must not supply
+                // the window mapped for these tasks.
+                if let Some(backing) =
+                    carrick_kernel::kernel::continuation::ipc::host_window_backing(
+                        &kernel.dispatcher,
+                    )
+                    && let Err(error) = carrick_vmm_hvf::register_ipc_window_backing(backing)
+                {
+                    prepared.fail_exact();
+                    return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
+                }
                 match carrick_vmm_hvf::hvf_aarch64_engine::persistent_executor_factory_authority(
                     engine,
                 ) {
@@ -5381,6 +5394,7 @@ where
             &context,
             authority.fd_ceiling_publisher(),
         );
+        carrick_kernel::kernel::continuation::ipc::publish_file_table(&context);
 
         let boxed: Box<dyn std::any::Any> = Box::new(engine);
         let hvf_engine = match boxed.downcast::<HvfEngine>() {
