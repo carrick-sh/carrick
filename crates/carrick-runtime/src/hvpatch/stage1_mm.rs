@@ -1010,6 +1010,9 @@ impl Stage1MmRetirement {
     /// entry is freed.
     pub(crate) fn retire_address_space(&self) {
         let space = self.space.lock().take();
+        if let Some(space) = space.as_ref() {
+            space.retire_reservations();
+        }
         drop(space);
     }
 

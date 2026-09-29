@@ -128,6 +128,7 @@ impl ReservationCompletion {
     /// - backing/inventory grant and return agree with `backing`;
     /// - all descriptor edits, invalidation and required zero-fill completed;
     /// - no observer can see a later descriptor edit before T1's commit.
+    ///
     /// Never call this after partial failure or with a mere host syscall result.
     pub unsafe fn after_descriptor_and_backing_commit(
         request: ReservationRequest,

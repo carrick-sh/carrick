@@ -61,6 +61,7 @@ pub(super) use brk::update_semantic_heap_pages;
 pub(crate) mod madvise;
 pub(crate) mod vma;
 pub use self::vma::*;
+pub mod el1_reservations;
 pub mod fault;
 pub(crate) use self::fault::*;
 pub(crate) use madvise::MadviseCoveredSegment;
