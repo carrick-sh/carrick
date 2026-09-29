@@ -156,6 +156,33 @@ pub const DESCRIPTOR_TXN_LAYOUT_FACTS: [u64; 6] = [
     core::mem::offset_of!(DescriptorTxnSlots, slots) as u64,
 ];
 
+/// `TrapFrame::esr` of a host-driven descriptor drain call: EC 0x3F is
+/// architecturally unallocated, so no exception taken from EL0 carries it.
+/// The host runs `carrick_el1_syscall` on a vCPU whose TTBR0 is the MM's
+/// root, with a frame naming that MM, and EL1 applies every submission for
+/// the MM before returning to the maintenance `hvc #1`.
+pub const DESCRIPTOR_DRAIN_ESR: u64 = 0x3F << 26;
+
+/// Drain frame words: `x[1]` = MM key, `x[2]` = the vCPU's full TTBR0 (root
+/// and ASID) the host read and authenticated. EL1 answers in `x[0]`.
+pub const DESCRIPTOR_DRAIN_MM: usize = 1;
+pub const DESCRIPTOR_DRAIN_TTBR0: usize = 2;
+/// `x[0]` answer bits: the low 32 bits count applied submissions; this bit
+/// reports submissions EL1 could not apply (another EL1 editor holds the MM).
+pub const DESCRIPTOR_DRAIN_BLOCKED: u64 = 1 << 32;
+
+/// Offset in the EL1 region of the drain frame for vCPU `slot`: below the
+/// vector's own trap frame at the top of that slot's EL1 stack, 16-aligned,
+/// leaving the rest of the stack for the call.
+#[must_use]
+pub fn descriptor_drain_frame_offset(slot: usize) -> Option<u64> {
+    if slot >= EL1_STACK_SLOTS as usize {
+        return None;
+    }
+    let top = crate::EL1_STACKS_OFFSET + (slot as u64 + 1) * crate::EL1_STACK_SIZE;
+    Some((top - 0x120 - 0x200) & !0xF)
+}
+
 /// Host view of every descriptor transaction slot, if an EL1 region is
 /// installed.
 pub fn descriptor_txn_slots_host() -> Option<&'static DescriptorTxnSlots> {
