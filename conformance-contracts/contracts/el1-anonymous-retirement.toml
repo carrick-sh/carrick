@@ -7,9 +7,11 @@ guest_surfaces = [
   "fault:first-touch",
   "kernel:stage1-mmu",
   "kernel:frame-inventory",
+  "syscall:exit_group",
   "vmm:hvf",
 ]
 semantic_authority = [
+  "man 2 fork / man 2 _exit: one process exiting must not invalidate another process mapping of inherited backing",
   "man 2 mmap: a fresh MAP_PRIVATE | MAP_ANONYMOUS mapping is zero-filled even when it reuses a previously unmapped virtual range",
   "man 2 munmap: references to pages in the unmapped range are invalid and the mapping may be replaced by a later mmap",
   "Hypervisor.framework hv_vm_unmap: retired stage-2 backing is removed before its IPA is returned for reuse",
@@ -20,9 +22,10 @@ rationale = "EL1 increment 2 mapping-retirement checkpoint. Each run repeatedly 
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-mmu-core::aarch64::tests::owned_host_image_reuse_clears_live_descriptors_written_by_an_el1_editor; carrick-kernel::dispatch::mem::tests::lazy_fixed_anonymous_replacement_rearms_first_touch_after_retirement; carrick-vmm-hvf::trap::global_frame::allocator_stats_tests::el1_grant_stats_count_owned_and_pooled_return_and_reuse"
+vm_free = "carrick-vmm-hvf::trap::frame_inventory::tests::process_retirement_does_not_combine_counts_from_different_populations (one deterministic sibling publication/retirement attempt, no stale RetireFrame); carrick-mmu-core::aarch64::tests::owned_host_image_reuse_clears_live_descriptors_written_by_an_el1_editor; carrick-kernel::dispatch::mem::tests::lazy_fixed_anonymous_replacement_rearms_first_touch_after_retirement; carrick-vmm-hvf::trap::global_frame::allocator_stats_tests::el1_grant_stats_count_owned_and_pooled_return_and_reuse"
 embed = "carrick-embed::el1_sched::el1_anonymous_mapping_retirement_returns_and_reuses_frames"
 docker = "native-arm64 same-source mapping-retirement fixture at 256, 1024 and 4096 pages; docs/perf-results/2026-09-27-el1-anonymous-retirement"
 
 [bindings.unresolved]
+terminal_retirement = "The deterministic backend test covers a stale kernel-count/backend-count interleaving. It does not establish that this interleaving caused conf-20571-c00, nor replace signed Go20 acceptance, two-MM execution, full CI, or runtime-ratio evidence."
 production = "This checkpoint proves exact retirement, zeroed reuse and bounded bulk work through the existing mmap-family service boundary. Permission-denial coverage and migration of mmap-family syscall ownership into EL1 remain later increments."
