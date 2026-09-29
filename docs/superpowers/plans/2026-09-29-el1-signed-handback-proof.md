@@ -45,3 +45,13 @@ observations with excess-work rejection; preserve exact bytes and cleanup.
 The existing notification test is the gate/receipt pattern. It is not the
 fixture itself, since its held object is a process snapshot rather than an
 EL1 record. No speculative production ownership fix is proposed by this brief.
+
+## Initial feasibility result
+
+The first signed two-process workload (200 rounds) on `497096b2f` completed
+but captured zero records, so the feasibility test failed. Preserve that
+result; do not expand iterations or retry. The hook's VM-free boundary tests
+pass, including slot/publisher lock release. Real guest triggering remains
+unproven. Next establish a queued sibling before the owning executor enters
+a real host wait and vacates its slot; a scheduler publisher hook, synthetic
+record or timer-dependent lucky queue population cannot substitute.
