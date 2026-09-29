@@ -423,24 +423,26 @@ pub(super) struct GuestDescriptorLanePrecondition {
     pub(super) frame_grants: bool,
     /// Host syscall copyout into prepared pages (`commit_prepared_host_write`).
     pub(super) host_copyout: bool,
-    /// Fork parent COW arming (`build_process_spec`). The engine builds the
-    /// arm as EL1 transactions, but the fork lifecycle does not yet submit
-    /// them (`take_guest_fork_arm_txns`) and EL1 does not yet drain an MM's
-    /// submissions before any of its threads resumes EL0.
+    /// Fork parent COW arming (`build_process_spec`): built as EL1
+    /// transactions, applied synchronously on the forking vCPU through the
+    /// host-driven drain call and settled before the fork commits
+    /// (`apply_guest_fork_arm`); EL1 drains an MM's submissions before any of
+    /// its threads returns to EL0.
     pub(super) fork_parent_arming: bool,
     /// Backend COW, sparse/foreign materialization and exec publication.
     pub(super) backend_writers: bool,
 }
 
 impl GuestDescriptorLanePrecondition {
-    /// The writer census of this build. Copyout, fork arming and the backend
-    /// writers are not converted, so no MM may select the lane yet.
+    /// The writer census of this build. Host copyout (pending the kernel's
+    /// deferred first-touch commit) and the backend writers are not
+    /// converted, so no MM may select the lane yet.
     pub(super) fn current() -> Self {
         Self {
             slots_placed: carrick_el1_abi::descriptor_txn_slots_host().is_some(),
             frame_grants: true,
             host_copyout: false,
-            fork_parent_arming: false,
+            fork_parent_arming: true,
             backend_writers: false,
         }
     }
@@ -499,6 +501,8 @@ pub(super) enum GuestGrantSettlement {
 pub(super) struct GuestGrantLedger {
     pending:
         [parking_lot::Mutex<Option<PendingGuestGrant>>; carrick_el1_abi::EL1_STACK_SLOTS as usize],
+    /// Occupied entries, so a boundary with nothing pending skips the scan.
+    occupied: std::sync::atomic::AtomicUsize,
 }
 
 impl GuestGrantLedger {
@@ -506,6 +510,7 @@ impl GuestGrantLedger {
         Self {
             pending: [const { parking_lot::const_mutex(None) };
                 carrick_el1_abi::EL1_STACK_SLOTS as usize],
+            occupied: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -525,7 +530,21 @@ impl GuestGrantLedger {
             return false;
         }
         *entry = Some(pending);
+        self.occupied
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         true
+    }
+
+    /// Whether any guest grant is pending anywhere in the carrier.
+    pub(super) fn is_occupied(&self) -> bool {
+        self.occupied.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    fn release(&self, entry: &mut Option<PendingGuestGrant>) {
+        if entry.take().is_some() {
+            self.occupied
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     /// Release every slot and ledger entry of an MM that is retiring (final
@@ -551,7 +570,7 @@ impl GuestGrantLedger {
             if slots.withdraw(slot, pending.txn.id)
                 || slots.take_receipt(slot, pending.txn.id).is_some()
             {
-                *entry = None;
+                self.release(&mut entry);
                 released += 1;
             }
         }
@@ -577,7 +596,7 @@ impl GuestGrantLedger {
                     Some(pending) if pending.txn.id.mm_key.get() == mm_key => {
                         let receipt = slots.take_receipt(slot, pending.txn.id);
                         if receipt.is_some() {
-                            *entry = None;
+                            self.release(&mut entry);
                         }
                         receipt.map(|receipt| (pending, receipt))
                     }
@@ -644,7 +663,7 @@ pub(super) fn settle_guest_frame_grant(
 }
 
 /// Settle every guest-lane grant receipt for the MM this boundary mutates.
-fn settle_guest_frame_grants<E: ThreadedEngine>(
+pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
     dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
     engine: &mut E,
     mutation: &carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
@@ -678,6 +697,162 @@ fn settle_guest_frame_grants<E: ThreadedEngine>(
         )
     })?;
     Ok(())
+}
+
+/// Whether a forwarded-syscall boundary must settle guest grants before it
+/// services the syscall, so `mincore` and every other reader of residency
+/// sees what EL1 already published. Cheap when nothing is pending.
+pub(super) fn guest_grants_awaiting_settlement() -> bool {
+    GUEST_GRANT_LEDGER.is_occupied()
+}
+
+/// The venue a synchronous guest descriptor drain runs on: the exact vCPU
+/// (slot, TTBR0) of the MM, the host-driven EL1 call, and receipt settlement.
+pub(super) trait GuestDrainVenue {
+    fn slot(&self) -> Option<usize>;
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError>;
+    /// Run the EL1 drain call with `frame` on this vCPU; return the frame
+    /// EL1 answered.
+    fn drain_call(
+        &mut self,
+        frame: carrick_el1_abi::TrapFrame,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError>;
+    fn settle(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
+}
+
+/// The production venue: the engine's own vCPU and the shared EL1 region.
+pub(super) struct EngineDrainVenue<'a, E>(pub(super) &'a mut E);
+
+impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
+    fn slot(&self) -> Option<usize> {
+        self.0.mailbox_slot()
+    }
+
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+        self.0.live_ttbr0()
+    }
+
+    fn drain_call(
+        &mut self,
+        frame: carrick_el1_abi::TrapFrame,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        let unavailable = |what: &str| TrapError::Hypervisor(format!("guest drain call: {what}"));
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(unavailable("no EL1 region"));
+        }
+        let offset = carrick_el1_abi::descriptor_drain_frame_offset(frame.slot as usize)
+            .ok_or_else(|| unavailable("slot out of range"))?;
+        // SAFETY: the EL1 region owner keeps the mapping alive while it is
+        // installed; the header is its first 32 bytes.
+        let header = carrick_el1_abi::ImageHeader::read_from_prefix(unsafe {
+            std::slice::from_raw_parts(
+                region as *const u8,
+                std::mem::size_of::<carrick_el1_abi::ImageHeader>(),
+            )
+        })
+        .ok_or_else(|| unavailable("no EL1 image header"))?;
+        let host_frame = (region + offset as usize) as *mut carrick_el1_abi::TrapFrame;
+        // SAFETY: the offset lies in this vCPU slot's own EL1 stack, below the
+        // vector's trap frame, 16-aligned; this host thread owns the vCPU.
+        unsafe { host_frame.write_volatile(frame) };
+        self.0.run_el1_service_call(
+            carrick_el1_abi::EL1_REGION_BASE + header.entry_offset,
+            carrick_el1_abi::EL1_REGION_BASE + offset,
+        )?;
+        // SAFETY: as above; EL1 answered in place before `hvc #1`.
+        Ok(unsafe { host_frame.read_volatile() })
+    }
+
+    fn settle(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        self.0.settle_el1_descriptor_receipt(txn, receipt)
+    }
+}
+
+/// Apply `txns` for one MM synchronously, in order, on the venue's vCPU while
+/// the host holds that MM: each is submitted into a free slot, EL1 applies it
+/// through the host-driven drain call under the host's delegated custody, and
+/// its exact receipt is settled before the next one is submitted. Any
+/// refusal, blocked drain or unauthenticated receipt is an error; the caller
+/// decides whether that is fatal.
+pub(super) fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
+    venue: &mut V,
+    slots: &carrick_el1_abi::DescriptorTxnSlots,
+    txns: &[carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn],
+) -> Result<Vec<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt>, TrapError> {
+    let fail = |what: String| TrapError::Hypervisor(format!("guest descriptor drain: {what}"));
+    let own = venue
+        .slot()
+        .ok_or_else(|| fail("vCPU has no slot".to_owned()))?;
+    let mut verified = Vec::with_capacity(txns.len());
+    for txn in txns {
+        let ttbr0 = venue.live_ttbr0()?;
+        if ttbr0 & 0x0000_FFFF_FFFF_F000 != txn.root.raw() {
+            return Err(fail(format!(
+                "vCPU TTBR0 0x{ttbr0:x} is not the transaction root 0x{:x}",
+                txn.root.raw()
+            )));
+        }
+        let used = (0..slots.as_slice().len())
+            .map(|offset| (own + offset) % slots.as_slice().len())
+            .find(|&slot| slots.submit(slot, txn))
+            .ok_or_else(|| fail("every descriptor slot is busy".to_owned()))?;
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: carrick_el1_abi::DESCRIPTOR_DRAIN_ESR,
+            slot: own as u64,
+            ..carrick_el1_abi::TrapFrame::default()
+        };
+        frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM] = txn.id.mm_key.get();
+        frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_TTBR0] = ttbr0;
+        let answered = match venue.drain_call(frame) {
+            Ok(answered) => answered,
+            Err(error) => {
+                let _ = slots.withdraw(used, txn.id);
+                return Err(error);
+            }
+        };
+        if answered.x[0] & carrick_el1_abi::DESCRIPTOR_DRAIN_BLOCKED != 0 {
+            let _ = slots.withdraw(used, txn.id);
+            return Err(fail("EL1 could not claim the MM".to_owned()));
+        }
+        let receipt = slots
+            .take_receipt(used, txn.id)
+            .ok_or_else(|| fail(format!("no receipt for {:?}", txn.id)))?;
+        verified.push(venue.settle(txn, &receipt)?);
+    }
+    Ok(verified)
+}
+
+/// Fork parent arm on the guest-owned lane: applied synchronously on the
+/// forking vCPU before the fork commits and before any parent thread can run
+/// again. A failure here leaves the parent's frames shared with a child that
+/// may already exist, so it fails stopped.
+pub(super) fn apply_guest_fork_arm<E: ThreadedEngine>(
+    engine: &mut E,
+    txns: Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>,
+) {
+    let Some(slots) = carrick_el1_abi::descriptor_txn_slots_host() else {
+        carrick_fatal::carrick_fatal!(
+            "hvpatch::guest_fork_arm",
+            "guest fork arm has no descriptor transaction slots"
+        );
+    };
+    if let Err(error) = apply_guest_descriptor_txns_now(&mut EngineDrainVenue(engine), slots, &txns)
+    {
+        carrick_fatal::carrick_fatal!(
+            "hvpatch::guest_fork_arm",
+            "guest fork parent arm failed: {error}"
+        );
+    }
 }
 
 /// Whether a guest descriptor transaction for `mm_key` is in flight over
@@ -2446,7 +2621,8 @@ mod guest_descriptor_lane_tests {
     fn the_lane_stays_unselected_until_every_writer_is_converted() {
         let current = GuestDescriptorLanePrecondition::current();
         assert!(!current.admits());
-        assert!(!current.host_copyout && !current.fork_parent_arming && !current.backend_writers);
+        assert!(current.frame_grants && current.fork_parent_arming);
+        assert!(!current.host_copyout && !current.backend_writers);
         let all = GuestDescriptorLanePrecondition {
             slots_placed: true,
             frame_grants: true,
@@ -2764,5 +2940,224 @@ mod guest_descriptor_lane_tests {
             let next = &after_retire[..after_retire.len().min(200)];
             assert!(next.contains("withdraw_guest_descriptor_work("));
         }
+    }
+
+    /// EL1 as the drain call sees it: apply every submission for the MM in
+    /// the frame, from any slot, and answer the count.
+    struct FakeVenue<'a> {
+        resolver: &'a BufferResolver,
+        slots: &'a DescriptorTxnSlots,
+        authority: &'a Stage1Authority,
+        ttbr0: u64,
+        block: bool,
+        max_in_flight: usize,
+    }
+
+    impl GuestDrainVenue for FakeVenue<'_> {
+        fn slot(&self) -> Option<usize> {
+            Some(9)
+        }
+        fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+            Ok(self.ttbr0)
+        }
+        fn drain_call(
+            &mut self,
+            mut frame: carrick_el1_abi::TrapFrame,
+        ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+            assert_eq!(frame.esr, carrick_el1_abi::DESCRIPTOR_DRAIN_ESR);
+            assert_eq!(frame.slot, 9, "the frame is the calling vCPU's");
+            let mm = frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM];
+            let in_flight = self.slots.submitted_for(mm).count();
+            self.max_in_flight = self.max_in_flight.max(in_flight);
+            if self.block {
+                frame.x[0] = carrick_el1_abi::DESCRIPTOR_DRAIN_BLOCKED;
+                return Ok(frame);
+            }
+            let mut applied = 0;
+            let indexes: Vec<usize> = (0..self.slots.as_slice().len())
+                .filter(|&i| self.slots.slot(i).unwrap().submitted_for(mm))
+                .collect();
+            for index in indexes {
+                el1_apply_mm(self.resolver, self.slots, index, mm).unwrap();
+                applied += 1;
+            }
+            frame.x[0] = applied;
+            Ok(frame)
+        }
+        fn settle(
+            &mut self,
+            txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+            receipt: &DescriptorReceipt,
+        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+        {
+            self.authority
+                .settle_guest_descriptor_receipt(txn, receipt)
+                .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+        }
+    }
+
+    fn el1_apply_mm(
+        resolver: &BufferResolver,
+        slots: &DescriptorTxnSlots,
+        slot: usize,
+        mm: u64,
+    ) -> Option<DescriptorReceipt> {
+        let mut buf = resolver.buf.lock();
+        let maintenance = CallerInvalidatesAsid;
+        let words = unsafe {
+            PrimaryTableWords::new(
+                buf.as_mut_ptr().cast(),
+                LINUX_PAGE_TABLES_BASE,
+                LINUX_PAGE_TABLES_SIZE as usize,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        apply_submitted_descriptor_txn(
+            slots.slot(slot)?,
+            mm,
+            &words,
+            SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+            &mut InlineJournal::new(),
+        )
+    }
+
+    fn resident_grant(authority: &Stage1Authority, resolver: &BufferResolver) {
+        let slots = DescriptorTxnSlots::new();
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), {
+                let DescriptorOp::Prepare {
+                    publication,
+                    backing,
+                    ..
+                } = grant_op(VA)
+                else {
+                    unreachable!()
+                };
+                DescriptorOp::Prepare {
+                    publication,
+                    resident: PageSpan::new(VA, 4 * 4096),
+                    backing,
+                }
+            })
+            .unwrap();
+        assert!(slots.submit(0, &txn));
+        el1_apply(resolver, &slots, 0).unwrap();
+        let receipt = slots.take_receipt(0, txn.id).unwrap();
+        authority
+            .settle_guest_descriptor_receipt(&txn, &receipt)
+            .unwrap();
+    }
+
+    fn writable(authority: &Stage1Authority, va: u64) -> bool {
+        authority
+            .with_manager(|manager| {
+                carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
+                    carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(va)),
+                    carrick_mmu_core::aarch64::LeafAccess::Write,
+                )
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn the_fork_arm_lands_in_order_and_settles_before_the_fork_commits() {
+        let (authority, resolver) = guest_lane();
+        resident_grant(&authority, &resolver);
+        assert!(writable(&authority, VA) && writable(&authority, VA + 3 * 4096));
+        let arm: Vec<_> = [(VA, 2 * 4096), (VA + 3 * 4096, 4096)]
+            .into_iter()
+            .map(|(va, len)| {
+                let op = authority
+                    .with_manager(|manager| manager.fork_arm_op(va, len, false, false))
+                    .unwrap();
+                authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap()
+            })
+            .collect();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let mut venue = FakeVenue {
+            resolver: &resolver,
+            slots: &slots,
+            authority: &authority,
+            ttbr0: LINUX_PAGE_TABLES_BASE | (7 << 48),
+            block: false,
+            max_in_flight: 0,
+        };
+        let receipts = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            venue.max_in_flight, 1,
+            "one submission at a time, settled in order"
+        );
+        assert!(!writable(&authority, VA));
+        assert!(!writable(&authority, VA + 4096));
+        assert!(writable(&authority, VA + 2 * 4096), "outside the arm");
+        assert!(!writable(&authority, VA + 3 * 4096));
+        assert!(slots.as_slice().iter().all(|slot| slot.state() == 0));
+    }
+
+    #[test]
+    fn a_fork_arm_on_the_wrong_vcpu_or_blocked_is_an_error_and_leaves_no_slot() {
+        let (authority, resolver) = guest_lane();
+        resident_grant(&authority, &resolver);
+        let op = authority
+            .with_manager(|manager| manager.fork_arm_op(VA, 4096, false, false))
+            .unwrap();
+        let arm = [authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap()];
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let mut venue = FakeVenue {
+            resolver: &resolver,
+            slots: &slots,
+            authority: &authority,
+            ttbr0: (LINUX_PAGE_TABLES_BASE + 0x1000) | (7 << 48),
+            block: false,
+            max_in_flight: 0,
+        };
+        assert!(apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).is_err());
+        assert!(
+            writable(&authority, VA),
+            "another root's vCPU applies nothing"
+        );
+        venue.ttbr0 = LINUX_PAGE_TABLES_BASE | (7 << 48);
+        venue.block = true;
+        assert!(apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).is_err());
+        assert!(writable(&authority, VA));
+        assert!(
+            slots.as_slice().iter().all(|slot| slot.state() == 0),
+            "a failed drain withdraws its submission"
+        );
+    }
+
+    /// The fork commits only after its guest arm is applied, and a
+    /// forwarded syscall settles published grants before it is serviced.
+    #[test]
+    fn fork_commit_and_syscall_entry_order_guest_descriptor_work() {
+        let lifecycle = include_str!("lifecycle.rs");
+        let commit = lifecycle
+            .split("fn commit_parent(&mut self, memory: &mut E)")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("commit_parent");
+        let take = commit
+            .find("take_guest_fork_arm_txns()")
+            .expect("arm taken");
+        let apply = commit.find("apply_guest_fork_arm(").expect("arm applied");
+        let commit_fork = commit
+            .find("commit_process_fork()")
+            .expect("fork committed");
+        assert!(take < apply && apply < commit_fork);
+        let module = include_str!("mod.rs");
+        let service = module
+            .split("fn service_threaded_syscall_for_executor(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("syscall service");
+        let settle = service
+            .find("settle_guest_frame_grants(")
+            .expect("settlement at syscall entry");
+        let dispatch = service
+            .find("service_threaded_syscall_for_executor_inner(")
+            .expect("dispatch");
+        assert!(settle < dispatch);
     }
 }

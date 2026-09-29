@@ -398,6 +398,12 @@ where
     }
 
     fn commit_parent(&mut self, memory: &mut E) -> Result<(), RuntimeError> {
+        // Guest-owned lane: the parent's fork-COW arm lands in EL1, in order
+        // and settled, before the fork commits and any parent thread resumes.
+        let arm = memory.take_guest_fork_arm_txns();
+        if !arm.is_empty() {
+            super::signal::apply_guest_fork_arm(memory, arm);
+        }
         memory.commit_process_fork().map_err(RuntimeError::Trap)
     }
 
