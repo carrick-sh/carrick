@@ -1,11 +1,11 @@
 {
   "schema": 1,
   "counts": {
-    "inspect_misc": 162,
+    "inspect_misc": 161,
     "lifecycle": 39,
     "create_install": 72,
     "slot_description_mutation": 21,
-    "read_attempt": 18,
+    "read_attempt": 17,
     "write_attempt": 22,
     "stream_transfer": 11,
     "mapping_ring": 11,
@@ -650,28 +650,6 @@
       "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fanotify_emit_for_fd",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 866,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.inspect()?;",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "pipe_reader",
-      "migration_family": "read_attempt"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs",
-      "line": 878,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.inspect()?;",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "pipe_writer",
       "migration_family": "inspect_misc"
     },
     {
