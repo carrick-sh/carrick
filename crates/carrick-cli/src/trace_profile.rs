@@ -238,6 +238,7 @@ impl V2ProfileAuthority {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TraceProfileKind {
     HvpatchCarrierCpuLowRate,
+    HvpatchCarrierCpuAttribution,
     HvpatchInotify09Population,
     HvpatchFrameCow,
     HvpatchExecRuntimeStages,
@@ -251,6 +252,7 @@ impl TraceProfileKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::HvpatchCarrierCpuLowRate => "hvpatch-carrier-cpu-low-rate",
+            Self::HvpatchCarrierCpuAttribution => "hvpatch-carrier-cpu-attribution",
             Self::HvpatchInotify09Population => "hvpatch-inotify09-population",
             Self::HvpatchFrameCow => "hvpatch-frame-cow",
             Self::HvpatchExecRuntimeStages => "hvpatch-exec-runtime-stages",
@@ -269,6 +271,9 @@ impl TraceProfileKind {
     pub(crate) const fn capture_bound_placeholder(self) -> Option<&'static str> {
         match self {
             Self::NativeAmplification => Some(AMP1_BOUND_PLACEHOLDER),
+            Self::HvpatchCarrierCpuAttribution => {
+                Some(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
+            }
             Self::HvpatchCarrierCpuLowRate
             | Self::HvpatchInotify09Population
             | Self::HvpatchFrameCow
@@ -284,6 +289,9 @@ impl TraceProfileKind {
         match self {
             Self::HvpatchCarrierCpuLowRate => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_LOW_RATE_D
+            }
+            Self::HvpatchCarrierCpuAttribution => {
+                carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_ATTRIBUTION_D
             }
             Self::HvpatchInotify09Population => {
                 crate::hvpatch_inotify_population_profile::BUNDLED_PROGRAM
@@ -311,6 +319,7 @@ impl TraceProfileKind {
     fn parse_protocol(value: &str) -> Result<Self> {
         match value {
             "hvpatch-carrier-cpu-low-rate" => Ok(Self::HvpatchCarrierCpuLowRate),
+            "hvpatch-carrier-cpu-attribution" => Ok(Self::HvpatchCarrierCpuAttribution),
             "hvpatch-inotify09-population" => Ok(Self::HvpatchInotify09Population),
             "hvpatch-frame-cow" => Ok(Self::HvpatchFrameCow),
             "hvpatch-exec-runtime-stages" => Ok(Self::HvpatchExecRuntimeStages),
@@ -432,6 +441,42 @@ mod tests {
         );
     }
 
+    /// `hvpatch-carrier-cpu-attribution` must declare a capture bound so
+    /// `carrick trace -p hvpatch-carrier-cpu-attribution --profile-bound-seconds`
+    /// can raise its shipped 90 s default for long workloads (e.g. `go build`)
+    /// instead of failing with "does not declare a capture bound".
+    #[test]
+    fn hvpatch_carrier_cpu_attribution_declares_a_capture_bound() {
+        let template = carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_ATTRIBUTION_D;
+        assert_eq!(
+            TraceProfileKind::HvpatchCarrierCpuAttribution.capture_bound_placeholder(),
+            Some(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
+        );
+        assert_eq!(
+            template
+                .matches(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
+                .count(),
+            1,
+            "the bundled template must contain exactly one capture-bound placeholder"
+        );
+        assert!(
+            template.contains("bound_limit_s = (uint64_t)90;"),
+            "the unrendered template must stay a legal D program with its 90 s default"
+        );
+
+        let rendered = render_profile_capture_bound(
+            TraceProfileKind::HvpatchCarrierCpuAttribution,
+            template,
+            1800,
+        )
+        .expect("render a bound for a long workload like go build");
+        assert!(rendered.contains("bound_limit_s = (uint64_t)1800;"));
+        assert!(
+            !rendered.contains(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
+        );
+        assert!(rendered.contains("bound_limit_s = (uint64_t)90;"));
+    }
+
     #[test]
     fn capture_bound_refuses_a_template_without_exactly_one_slot() {
         for template in [
@@ -487,6 +532,10 @@ mod tests {
             (
                 TraceProfileKind::HvpatchCarrierCpuLowRate,
                 "hvpatch-carrier-cpu-low-rate",
+            ),
+            (
+                TraceProfileKind::HvpatchCarrierCpuAttribution,
+                "hvpatch-carrier-cpu-attribution",
             ),
             (TraceProfileKind::HvpatchFrameCow, "hvpatch-frame-cow"),
             (

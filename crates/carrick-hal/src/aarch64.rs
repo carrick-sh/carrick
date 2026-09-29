@@ -137,6 +137,48 @@ impl ExecLevel {
     }
 }
 
+/// The `svc #0` opcode HvPatch's syscall islands reissue.
+const AARCH64_SVC_ZERO: u32 = 0xd400_0001;
+const AARCH64_B_OPCODE: u32 = 0x1400_0000;
+const AARCH64_B_OPCODE_MASK: u32 = 0xfc00_0000;
+
+/// Recover an HvPatch syscall island's original `svc #0` instruction address
+/// (NOT `+4` — see below) from its return-branch address.
+///
+/// HvPatch's direct-execution pivot replaces a guest `svc #0` with a branch
+/// to a per-site island: the island itself re-issues `svc #0` (so the trap
+/// the host takes is architecturally identical) followed by an
+/// unconditional `B` back to `original_svc_addr + 4`. A thread the host or
+/// the in-guest scheduler parks mid-syscall therefore has its saved PC
+/// addressing the ISLAND's return-branch instruction, not guest `.text` — an
+/// address that exists in no ELF program header and that no Linux-visible
+/// consumer (a core file's `NT_PRSTATUS.pc`, `ptrace`, a signal frame) may
+/// ever see published as-is.
+///
+/// `resume_pc` is the return-branch instruction's own address; `svc` and
+/// `return_branch` are the 32-bit words the caller already read from
+/// `resume_pc - 4` and `resume_pc` (the two instructions every island begins
+/// with). Returns `None` when the bytes do not match that exact shape — a
+/// live EL0 PC that is not, in fact, inside an island — so every caller
+/// falls back to the untranslated `resume_pc` rather than publishing a wrong
+/// guess.
+///
+/// This returns the SVC INSTRUCTION'S OWN address, not `+4`: a caller that
+/// wants a symbol to look up (a wait diagnostic) uses it directly, one that
+/// wants the Linux-visible resume PC of a thread blocked in that syscall
+/// (a core file, `ptrace`) adds 4 itself — two different, legitimate
+/// meanings from the one address this decodes.
+pub fn decode_hvpatch_island_origin(resume_pc: u64, svc: u32, return_branch: u32) -> Option<u64> {
+    if svc != AARCH64_SVC_ZERO || return_branch & AARCH64_B_OPCODE_MASK != AARCH64_B_OPCODE {
+        return None;
+    }
+    let imm26 = i64::from(return_branch & 0x03ff_ffff);
+    let signed_imm26 = (imm26 << 38) >> 38;
+    let target = i128::from(resume_pc).checked_add(i128::from(signed_imm26) * 4)?;
+    let origin = target.checked_sub(4)?;
+    u64::try_from(origin).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +228,72 @@ mod tests {
         assert!(ExecLevel::from_pstate(0x3c0).is_guest());
         assert_eq!(ExecLevel::from_pstate(0x3c5), ExecLevel::Kernel); // EL1h
         assert!(!ExecLevel::from_pstate(0x3c5).is_guest());
+    }
+
+    /// `B <target>` at address `from`, exactly as HvPatch's island writer
+    /// encodes the return branch.
+    fn encode_b(from: u64, target: u64) -> u32 {
+        let delta = (target as i64) - (from as i64);
+        assert_eq!(delta % 4, 0, "branch target must be word-aligned");
+        let imm26 = ((delta / 4) as u32) & 0x03ff_ffff;
+        AARCH64_B_OPCODE | imm26
+    }
+
+    #[test]
+    fn decodes_an_islands_return_branch_back_to_the_original_svc() {
+        // A real island shape: guest svc at 0x210270 (so Linux-visible resume
+        // pc is 0x210274), island placed well outside the guest's own image
+        // at 0x234000, whose return branch (at 0x234004) targets 0x210274 --
+        // exactly the fixture layout that produced the reported bug.
+        const ORIGINAL_SVC: u64 = 0x210270;
+        const ISLAND_RETURN_BRANCH: u64 = 0x234004;
+        let return_branch = encode_b(ISLAND_RETURN_BRANCH, ORIGINAL_SVC + 4);
+
+        let origin =
+            decode_hvpatch_island_origin(ISLAND_RETURN_BRANCH, AARCH64_SVC_ZERO, return_branch)
+                .expect("island shape must decode");
+        assert_eq!(
+            origin, ORIGINAL_SVC,
+            "decode returns the svc's own address, not +4"
+        );
+        assert_eq!(
+            origin + 4,
+            ORIGINAL_SVC + 4,
+            "a caller wanting the Linux-visible resume pc adds 4 itself"
+        );
+    }
+
+    #[test]
+    fn refuses_bytes_that_are_not_an_island() {
+        // The word before a live, untranslated EL0 pc is ordinary guest code,
+        // essentially never `svc #0` followed by a `B`; a caller must fall
+        // back to the untranslated pc rather than publish a wrong guess.
+        assert_eq!(
+            decode_hvpatch_island_origin(
+                0x210274,
+                0x9100_0fe0, /* add x0, sp, #0 */
+                0x1400_0002
+            ),
+            None,
+            "the preceding word must be exactly svc #0"
+        );
+        assert_eq!(
+            decode_hvpatch_island_origin(0x210274, AARCH64_SVC_ZERO, 0xd503_201f /* nop */),
+            None,
+            "the following word must decode as a B instruction"
+        );
+    }
+
+    #[test]
+    fn round_trips_across_a_negative_branch_offset() {
+        // The island can sit either side of the guest image; a return branch
+        // to a LOWER address must decode identically to a higher one.
+        const ORIGINAL_SVC: u64 = 0x400000;
+        const ISLAND_RETURN_BRANCH: u64 = 0x100004;
+        let return_branch = encode_b(ISLAND_RETURN_BRANCH, ORIGINAL_SVC + 4);
+        assert_eq!(
+            decode_hvpatch_island_origin(ISLAND_RETURN_BRANCH, AARCH64_SVC_ZERO, return_branch),
+            Some(ORIGINAL_SVC)
+        );
     }
 }

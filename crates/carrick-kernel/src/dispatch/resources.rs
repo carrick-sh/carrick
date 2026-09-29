@@ -13,10 +13,11 @@ pub(super) struct CapturedResources {
     file_lease: Option<crate::kernel::objects::FileTableFunctionalLease>,
     files_finished: bool,
     io_rearm: Option<super::net::IoRearm>,
-    credentials: Arc<crate::kernel::Credentials>,
-    fs_context: Arc<crate::kernel::FsContext>,
-    files: Arc<crate::kernel::FileTable>,
-    mm: Arc<crate::kernel::Mm>,
+    resources: Arc<crate::kernel::ThreadResources>,
+    /// A table published by unshare/close_range inside this exact scope.
+    /// Ordinary dispatch reads the already captured ThreadResources table.
+    files_override: Option<Arc<crate::kernel::FileTable>>,
+    shared: Arc<crate::kernel::TaskShared>,
     /// The task whose resource limits apply to this operation.
     ///
     /// Captured here for the same reason the credentials are: enforcement sites
@@ -33,20 +34,19 @@ impl CapturedResources {
             file_lease: None,
             files_finished: false,
             io_rearm: None,
-            credentials: context.resources().credentials(),
-            fs_context: context.resources().fs_context(),
-            files: context.resources().files(),
-            mm: context.shared().mm(),
+            resources: Arc::clone(context.resources()),
+            files_override: None,
+            shared: Arc::clone(context.shared()),
             task: Arc::clone(context.task()),
         }
     }
 
     pub(super) fn credentials(&self) -> Arc<crate::kernel::Credentials> {
-        Arc::clone(&self.credentials)
+        self.resources.credentials()
     }
 
     pub(super) fn fs_context(&self) -> Arc<crate::kernel::FsContext> {
-        Arc::clone(&self.fs_context)
+        self.resources.fs_context()
     }
 
     pub(super) fn files(&self) -> Arc<crate::kernel::FileTable> {
@@ -56,11 +56,17 @@ impl CapturedResources {
                 "file authority used after owned host operation boundary"
             );
         }
-        Arc::clone(&self.files)
+        Arc::clone(self.files_ref())
+    }
+
+    fn files_ref(&self) -> &Arc<crate::kernel::FileTable> {
+        self.files_override
+            .as_ref()
+            .unwrap_or_else(|| self.resources.files_ref())
     }
 
     pub(super) fn mm(&self) -> Arc<crate::kernel::Mm> {
-        Arc::clone(&self.mm)
+        self.shared.mm()
     }
 
     pub(super) fn task(&self) -> crate::kernel::TaskRef {
@@ -263,11 +269,11 @@ fn with_resource_scope<R>(
 ) -> R {
     resources.file_lease = Some(
         resources
-            .files
+            .files_ref()
             .acquire_functional_lease()
             .unwrap_or_else(|| {
                 tracing::error!(
-                    file_table = ?resources.files.id(),
+                    file_table = ?resources.files_ref().id(),
                     "captured operation reached a draining FileTable generation"
                 );
                 carrick_fatal!(
@@ -388,7 +394,7 @@ pub(crate) fn update_captured_file_table(new_files: &Arc<crate::kernel::FileTabl
         let mut stack = stack.borrow_mut();
         if let Some(resources) = stack.last_mut() {
             resources.file_lease = None;
-            resources.files = Arc::clone(new_files);
+            resources.files_override = Some(Arc::clone(new_files));
             resources.file_lease =
                 Some(new_files.acquire_functional_lease().unwrap_or_else(|| {
                     carrick_fatal!(
@@ -459,6 +465,43 @@ pub(super) fn mm() -> Option<Arc<crate::kernel::Mm>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_scope_retains_bundles_without_cloning_each_resource() {
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let credentials = context.resources().credentials();
+        let fs_context = context.resources().fs_context();
+        let files = context.resources().files();
+        let mm = context.shared().mm();
+        let credentials_before = Arc::strong_count(&credentials);
+        let fs_before = Arc::strong_count(&fs_context);
+        let files_before = Arc::strong_count(&files);
+        let mm_before = Arc::strong_count(&mm);
+        let resources_before = Arc::strong_count(context.resources());
+        let shared_before = Arc::strong_count(context.shared());
+        let task_before = Arc::strong_count(context.task());
+
+        // The three retained Arcs are the exact captured resource bundle,
+        // shared MM bundle and task. The file table is borrowed from that
+        // bundle for its lease; a warm syscall clones no bundle member.
+        for scale in [1, 8, 32, 128] {
+            for _ in 0..scale {
+                with_captured_resources(&context, || {
+                    assert_eq!(Arc::strong_count(&credentials), credentials_before);
+                    assert_eq!(Arc::strong_count(&fs_context), fs_before);
+                    assert_eq!(Arc::strong_count(&mm), mm_before);
+                    assert_eq!(Arc::strong_count(&files), files_before);
+                    assert_eq!(Arc::strong_count(context.resources()), resources_before + 1);
+                    assert_eq!(Arc::strong_count(context.shared()), shared_before + 1);
+                    assert_eq!(Arc::strong_count(context.task()), task_before + 1);
+                    assert!(Arc::ptr_eq(&super::credentials().unwrap(), &credentials));
+                    assert!(Arc::ptr_eq(&super::fs_context().unwrap(), &fs_context));
+                    assert!(Arc::ptr_eq(&super::mm().unwrap(), &mm));
+                });
+            }
+        }
+    }
 
     #[test]
     fn retained_scope_cannot_hide_a_nested_exact_context() {

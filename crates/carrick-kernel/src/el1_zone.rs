@@ -276,6 +276,84 @@ pub fn thread_key_of(record: RecordRef) -> Option<crate::kernel::ThreadKey> {
     crate::kernel::ThreadKey::from_zone_identity(tid, serial)
 }
 
+/// Outcome of [`read_quiesced_parked_registers`].
+///
+/// Cold, rare (crash capture only): boxing `Found` would add an allocation
+/// for every call solely to shrink the two empty variants.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum QuiescedParkedRegisters {
+    /// `key` has no live EL1-parked record right now: it is running, is
+    /// host-owned, or its record is gone. The caller's own crash-capture
+    /// safe-point protocol owns the answer instead.
+    NotParked,
+    /// The exact architectural state EL1 saved for `key`, converted to the
+    /// core-dump register-file shape.
+    Found(carrick_hal::Aarch64CoreRegisters),
+    /// A record matched `key`'s identity but changed while it was being
+    /// read: refuse to attribute those bytes to `key` rather than publish an
+    /// unauthenticated register file.
+    Unauthenticated,
+}
+
+/// Read `key`'s EL1 save area for address space `mm`, converted to the
+/// host's crash-capture register-file shape, if EL1 currently holds it
+/// parked (queued on a futex wait queue or a vCPU run queue).
+///
+/// A thread parked in a syscall resumes directly at EL0 with no host trap
+/// pending, exactly as the runtime's zone-residency loader (`materialize_zone`,
+/// `carrick-runtime`) overlays it to run: there is no separate "live vCPU
+/// state" for a thread EL1 is not currently running, so the same
+/// `pc`/`pstate` pair fills every raw/live/resume field of the result,
+/// mirroring that loader's field assignments.
+///
+/// # Safety
+///
+/// The caller must have already authenticated that no vCPU of address space
+/// `mm` can be executing guest code right now (every one of its vCPUs
+/// force-exited to the host and its execution-lease set drained) — the
+/// crash-capture quiesce barrier does exactly this before it ever polls a
+/// register-file quorum. See [`ZoneTables::read_parked_context`] for why that
+/// authentication is what makes this read race-free.
+pub unsafe fn read_quiesced_parked_registers(
+    mm: u64,
+    key: crate::kernel::ThreadKey,
+) -> QuiescedParkedRegisters {
+    // `zone()`, not the raw `zone_tables()`: a carrier with the futex zone or
+    // guest scheduling hatched off never parks a thread in EL1 in the first
+    // place, so its (still-mapped) records must not be consulted as if they
+    // could be authoritative.
+    let Some(zone) = zone() else {
+        return QuiescedParkedRegisters::NotParked;
+    };
+    let Ok(tid) = u64::try_from(key.tid.raw()) else {
+        return QuiescedParkedRegisters::NotParked;
+    };
+    // SAFETY: forwarded by the caller (see the doc comment above).
+    match unsafe { zone.read_parked_context(mm, tid, key.serial.raw()) } {
+        carrick_el1_abi::ParkedContextRead::NotParked => QuiescedParkedRegisters::NotParked,
+        carrick_el1_abi::ParkedContextRead::Unauthenticated => {
+            QuiescedParkedRegisters::Unauthenticated
+        }
+        carrick_el1_abi::ParkedContextRead::Found(ctx) => {
+            QuiescedParkedRegisters::Found(carrick_hal::Aarch64CoreRegisters {
+                gprs: ctx.x,
+                sp_el0: ctx.sp_el0,
+                resume_pc: ctx.pc,
+                resume_pstate: ctx.pstate,
+                pc: ctx.pc,
+                pstate: ctx.pstate,
+                elr_el1: ctx.pc,
+                spsr_el1: ctx.pstate,
+                tpidr_el0: ctx.tpidr_el0,
+                vregs: ctx.v,
+                fpsr: ctx.fpsr as u32,
+                fpcr: ctx.fpcr as u32,
+            })
+        }
+    }
+}
+
 /// Force `slot`'s vCPU out of the guest WITHOUT host work: a host placement
 /// owes it a reschedule SGI (`ZoneTables::take_resched`), which its run loop
 /// raises before the vCPU runs on.
