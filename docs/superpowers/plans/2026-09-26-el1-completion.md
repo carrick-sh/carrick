@@ -103,8 +103,12 @@ the signed rebuild pass. The corrected CLI (SHA `ec12ac299cd4c7200fb8befe663da28
 passes all 20 fixed Go rows against the verified native ARM64 oracle, with
 no retries, diffs or leftover guests. This closes that candidate population;
 the original failure stays preserved. Prior EL1/probe receipts do not transfer
-to this executable. Signed regression qualification and remaining lifecycle
-proofs still block batch acceptance. See `retirement-acceptance/`.
+to this executable. See `retirement-acceptance/`. The corrected source now
+passes 50 unique signed EL1 executions across nine hash-verified, preserved
+executables, with negative entitlement and zero scoped leftovers. This includes
+the parked-thread crash-register witness. See `retirement-signed-el1/`.
+Remaining lifecycle/structural proofs and full batch qualification still block
+acceptance; the next implementation target is notification work observation.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake

@@ -1,0 +1,182 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-interceptor-probe: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/embed-fixtures/interceptor-probe-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-zone-readers: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/embed-fixtures/zone-readers-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-el1-sched: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/embed-fixtures/el1-sched-aarch64
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 18s
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/write_seek_contract-655aefdea1874a90.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/write_seek_contract-655aefdea1874a90
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/inotify_hotpath_contract-b6e66637595bd8ed.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/inotify_hotpath_contract-b6e66637595bd8ed
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/crash_parked_thread-ac4b8d7e5234f849.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/crash_parked_thread-ac4b8d7e5234f849
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_kick_served_loop-515d037f012f44fb.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_kick_served_loop-515d037f012f44fb
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/wedge_capture_ladder-901bc0106cd0e8dd.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/wedge_capture_ladder-901bc0106cd0e8dd
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/fault_budget_guest-d7108058cd078309.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/fault_budget_guest-d7108058cd078309
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_files-1e6a92366579cf6c.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_files-1e6a92366579cf6c
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/discard_fork_threads-ede4836bafd3d408.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/discard_fork_threads-ede4836bafd3d408
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-5c0e433fa1c09ea5.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-5c0e433fa1c09ea5
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/shared_buffer_futex-692fbc5fdd19b57b.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/shared_buffer_futex-692fbc5fdd19b57b
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/host_wait_policy-f53fc18f775ffe51.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/host_wait_policy-f53fc18f775ffe51
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify-bce76854a0c94a41.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify-bce76854a0c94a41
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/pt_pause_drain_pressure-8c901bf0cbbb2367.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/pt_pause_drain_pressure-8c901bf0cbbb2367
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_gic-16f015d9c1504abe.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_gic-16f015d9c1504abe
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/realtime_calibration-17c355e0310708c2.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/realtime_calibration-17c355e0310708c2
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/perf_regression-28b7174fbae1d3a3.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/perf_regression-28b7174fbae1d3a3
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/kernel_abort-d1ac0df7510c64fb.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/kernel_abort-d1ac0df7510c64fb
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/two_process_parallelism-4f3c6fc63376028d.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/two_process_parallelism-4f3c6fc63376028d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify09_probe-e2247aca698e3431.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify09_probe-e2247aca698e3431
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/entitlement_negative-2ea3128a996608c8.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/entitlement_negative-2ea3128a996608c8
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/scheduler_preemption-a848ab6a40a27c3a.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/scheduler_preemption-a848ab6a40a27c3a
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/scheduler_race-6158a0c72347df12.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/scheduler_race-6158a0c72347df12
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_transparent-9f1543913016aba2.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_transparent-9f1543913016aba2
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/conformance_contracts-7718e7bd813cbef7.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/conformance_contracts-7718e7bd813cbef7
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/guest_smoke-42224af0716988ce.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/guest_smoke-42224af0716988ce
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_vcpu_lifetime-2567fb3a3dc40a15.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_vcpu_lifetime-2567fb3a3dc40a15
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/carrick_embed-46b7704b908cc13f.tmp.38526: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/carrick_embed-46b7704b908cc13f
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/crash_parked_thread-ac4b8d7e5234f849 el1_
+
+running 1 test
+test crash_core_attributes_the_el1_parked_sibling_registers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_kick_served_loop-515d037f012f44fb el1_
+
+running 2 tests
+test el1_served_burst_surfaces_kicks_under_oversubscription ... ok
+test el1_served_loop_surfaces_kicks ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 121.73s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_files-1e6a92366579cf6c el1_
+
+running 13 tests
+test el1_files_blocking_survives_task_reschedule ... ok
+test el1_files_contract ... ok
+test el1_files_cross_process_readers_contract ... ok
+test el1_files_exit_group_stress ... ok
+test el1_files_inode_exclusivity_two_processes ... ok
+test el1_files_kick_delivery_spin_loop ... ok
+test el1_files_kick_delivery_spin_loop_signal ... ok
+test el1_files_memfd_never_delegated_and_seals_hold ... ok
+test el1_files_path_mutation_contract ... ok
+test el1_files_recall_on_teardown ... ok
+test el1_files_shared_inode_contract ... ok
+test el1_files_signal_stress ... ok
+test el1_zone_entry_at_open_contract ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.39s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-5c0e433fa1c09ea5 el1_
+
+running 23 tests
+test el1_anonymous_mapping_retirement_returns_and_reuses_frames ... ok
+test el1_anonymous_permission_transitions_stay_in_guest ... ok
+test el1_fork_cow_resolves_in_guest ... ok
+test el1_memory_fault_entry_preserves_context ... ok
+test el1_memory_first_touch_stays_in_guest ... ok
+test el1_metadata_allocator_concurrent_growth ... ok
+test el1_metadata_allocator_grows_and_returns_extents ... ok
+test el1_metadata_allocator_host_wait_requires_unmasked_irq ... ok
+test el1_sched_cross_vcpu_handoff_has_no_host_exits ... ok
+test el1_sched_delayed_notification_survives_parent_reap ... ok
+test el1_sched_exec_from_a_sibling_with_parked_threads ... ok
+test el1_sched_exit_group_with_parked_threads ... ok
+test el1_sched_futex_handoff_has_no_host_exits ... ok
+test el1_sched_host_blocked_read_resumes_by_guest_scheduling ... ok
+test el1_sched_host_woken_thread_preempts_a_compute_loop ... ok
+test el1_sched_idle_carrier_costs_no_host_cpu ... ok
+test el1_sched_mm_occupancy_two_processes ... ok
+test el1_sched_preemption_reaches_compute_loops ... ok
+test el1_sched_pstate_seen_by_the_guest_is_unchanged ... ok
+test el1_sched_signal_reaches_a_parked_thread ... ok
+test el1_sched_signal_reaches_a_wfi_parked_vcpu ... ok
+test el1_sched_timed_wait_times_out_in_guest ... ok
+test el1_sched_two_processes_share_vcpus ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 27.07s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify-bce76854a0c94a41 el1_
+
+running 4 tests
+test el1_inotify09_contract ... ok
+test el1_inotify_contract ... ok
+test el1_inotify_queue_shape ... ok
+test el1_inotify_recall_on_dir_watch ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.49s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_gic-16f015d9c1504abe el1_
+
+running 2 tests
+test el1_gic_el0_id_view_hides_the_gic ... ok
+test el1_gic_vtimer_reaches_el1_without_host_exits ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_inotify09_probe-e2247aca698e3431 el1_
+
+running 2 tests
+test el1_inotify09_probe ... ok
+test el1_inotify_loop_bench ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.83s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_transparent-9f1543913016aba2 el1_
+
+running 2 tests
+test el1_transparent_fork_exec_shared_backing ... ok
+test el1_transparent_smoke ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_vcpu_lifetime-2567fb3a3dc40a15 el1_
+
+running 1 test
+test el1_vcpus_live_for_the_vm_lifetime_across_a_second_root ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/entitlement_negative-2ea3128a996608c8.noent.38526: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/entitlement_negative-2ea3128a996608c8.noent.38526
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+remaining carrick procs (run-id el1-retirement-acceptance-a49b7e6bf) = 0
+remaining carrick procs (run-id el1-retirement-acceptance-a49b7e6bf-cli) = 0
+test-signed: receipt target/test-results/carrick-embed-signed-artifacts.jsonl
+test-signed: OK (carrick-embed: 9 invoked signed executable(s) passed, 27 signed, negative control passed)
