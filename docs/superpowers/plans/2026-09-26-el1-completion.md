@@ -273,7 +273,13 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   The new graph-scoped counters have red/green VM-free observations at 1/8/32
   deliveries: one retained thread visit per delivery, zero scheduler attempts
   after reap, plus a live-parent positive control and excess-work rejections.
-  Signed whole-fixture work assertions are implemented but not yet qualified.
+  The first signed observation exposed an incorrect budget assumption:
+  exact scheduler authentication can reject a retained generation after reap.
+  It reported two visits/two attempts, with semantic ordering preserved.
+  Counters now distinguish attempts from actual Queued/Kicked deliveries;
+  the corrected signed bound is one authentication per thread and at most one
+  delivered wake for the whole fixture. A live-parent delivery counter control
+  was separately red-first. Corrected signed qualification is pending.
   See `notification-work/`; no total scheduler work or timing claim is made.
 - [ ] Accept and integrate locally only when all blockers/gates close.
 

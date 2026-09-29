@@ -1,0 +1,26 @@
+Executable=/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-b2206a957bd60d90
+Identifier=el1_sched-b2206a957bd60d90.tmp.43072
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=59645 flags=0x2(adhoc) hashes=1853+7 location=embedded
+VersionPlatform=1
+VersionMin=720896
+VersionSDK=786432
+Hash type=sha256 size=32
+CandidateCDHash sha256=72763b12afee6ebee5903dc4b2e2b571f98899f1
+CandidateCDHashFull sha256=72763b12afee6ebee5903dc4b2e2b571f98899f196b48630d71ac11c49f4900e
+Hash choices=sha256
+CMSDigest=72763b12afee6ebee5903dc4b2e2b571f98899f196b48630d71ac11c49f4900e
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=20824064
+Executable Segment flags=0x1
+Page size=16384
+CDHash=72763b12afee6ebee5903dc4b2e2b571f98899f1
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+warning: Specifying ':' in the path is deprecated and will not work in a future release
+Total signatures=1
+Chosen signature=1

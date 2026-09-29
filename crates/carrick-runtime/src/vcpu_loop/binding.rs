@@ -6022,6 +6022,10 @@ mod tests {
                 work.get(WorkMetric::ChildExitNotificationWakeAttempts),
                 Some(1)
             );
+            assert_eq!(
+                work.get(WorkMetric::ChildExitNotificationWakeDeliveries),
+                Some(1)
+            );
         }
         assert_eq!(scheduler.queued_len(), 1);
         assert_eq!(

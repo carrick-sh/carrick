@@ -107,10 +107,12 @@ pub enum WorkMetric {
     ChildExitNotificationThreadVisits,
     /// Calls to the exact scheduler wake authority from that delivery path.
     ChildExitNotificationWakeAttempts,
+    /// Notification wake calls that actually queued or kicked the target.
+    ChildExitNotificationWakeDeliveries,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 50;
+    pub const COUNT: usize = 51;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -162,6 +164,7 @@ impl WorkMetric {
         Self::AllocatorCapacityBytes,
         Self::ChildExitNotificationThreadVisits,
         Self::ChildExitNotificationWakeAttempts,
+        Self::ChildExitNotificationWakeDeliveries,
     ];
 }
 
