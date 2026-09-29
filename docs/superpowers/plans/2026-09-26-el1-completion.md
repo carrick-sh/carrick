@@ -108,7 +108,10 @@ passes 50 unique signed EL1 executions across nine hash-verified, preserved
 executables, with negative entitlement and zero scoped leftovers. This includes
 the parked-thread crash-register witness. See `retirement-signed-el1/`.
 Remaining lifecycle/structural proofs and full batch qualification still block
-acceptance; the next implementation target is notification work observation.
+acceptance. The notification structural binding now passes on source
+`9ba825eac` with two visits, two authentications and one delivered wake,
+complete counters, negative controls and verified cleanup. Its exact tested
+bytes are preserved; this is not full-tree acceptance.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake
@@ -268,8 +271,8 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   delivery ordering. Source `2e6e3794a` passes with zero reaped wake attempts;
   the same fixture with the retained pre-fix method fails at one attempt.
   This is producer proof, not attribution of the original otmp failure.
-- [ ] Close the notification contract's scoped structural observation gap;
-  run the complete batch gate below on the final candidate.
+- [x] Close the notification contract's scoped structural observation gap.
+  Full candidate gates remain separate and open below.
   The new graph-scoped counters have red/green VM-free observations at 1/8/32
   deliveries: one retained thread visit per delivery, zero scheduler attempts
   after reap, plus a live-parent positive control and excess-work rejections.
@@ -279,7 +282,9 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   Counters now distinguish attempts from actual Queued/Kicked deliveries;
   the corrected signed bound is one authentication per thread and at most one
   delivered wake for the whole fixture. A live-parent delivery counter control
-  was separately red-first. Corrected signed qualification is pending.
+  was separately red-first. Corrected signed qualification passes on `9ba825eac`: two visits, two
+  authentications, one delivered wake, complete observations, negative controls
+  and zero scoped leftovers. Exact tested bytes and manifest are preserved.
   See `notification-work/`; no total scheduler work or timing claim is made.
 - [ ] Accept and integrate locally only when all blockers/gates close.
 
