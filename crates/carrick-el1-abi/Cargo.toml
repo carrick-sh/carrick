@@ -9,4 +9,5 @@ workspace = true
 
 [dependencies]
 carrick-inotify-core = { path = "../carrick-inotify-core" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
