@@ -7,8 +7,12 @@ use carrick_el1_abi::{
     METADATA_GRANT_ERR_NOT_FOUND, METADATA_GRANT_OP_ALLOC, METADATA_GRANT_OP_FREE,
     METADATA_GRANT_SUCCESS,
 };
+use carrick_el1_abi::{
+    MetadataExtent, MetadataExtentResolver, MetadataResolutionError, PinnedMetadataExtent,
+};
 use carrick_hal::TrapError;
 use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const MAX_DYNAMIC_EXTENT_SLOTS: usize = 128;
@@ -26,12 +30,50 @@ pub struct MetadataGrantStats {
 
 #[derive(Debug)]
 struct GrantedSlotRecord {
-    backing: OwnedHostMapping,
+    backing: Arc<OwnedHostMapping>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     identity: crate::trap::CarrierStage2RecordIdentity,
     num_slots: usize,
     token: u64,
     generation: u64,
+}
+
+/// A pin retains the exact mapping even after VM teardown removes its grant
+/// record. Ordinary grant return is refused before stage-2 unmap while pinned.
+pub struct HostMetadataExtentPin {
+    extent: MetadataExtent,
+    backing: Arc<OwnedHostMapping>,
+}
+
+// SAFETY: the Arc owns the mapped bytes. Normal return checks outstanding pins;
+// VM destruction can remove stage-2 mappings but cannot destroy this host owner.
+unsafe impl PinnedMetadataExtent for HostMetadataExtentPin {
+    fn extent(&self) -> MetadataExtent {
+        self.extent
+    }
+    fn host_base(&self) -> core::ptr::NonNull<u8> {
+        core::ptr::NonNull::new(self.backing.as_ptr()).expect("owned mapping")
+    }
+}
+
+/// Bound to the custody object and exact live generation that issued grants.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct HostMetadataExtentResolver<'a> {
+    pub(crate) custody: &'a crate::trap::CarrierVmCustody,
+    pub(crate) generation: crate::trap::CarrierVmGeneration,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetadataExtentResolver for HostMetadataExtentResolver<'_> {
+    type Pin = HostMetadataExtentPin;
+    fn pin(&self, extent: MetadataExtent) -> Result<Self::Pin, MetadataResolutionError> {
+        if !request_has_live_vm(self.custody, Some(self.generation)) {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        metadata_aperture(self.custody)
+            .lock()
+            .pin_extent(extent, self.generation.0)
+    }
 }
 
 // Backing ownership moves only under its carrier aperture lock; access is synchronized by
@@ -52,6 +94,35 @@ impl HostApertureState {
         }
     }
 
+    fn pin_extent(
+        &self,
+        extent: MetadataExtent,
+        generation: u64,
+    ) -> Result<HostMetadataExtentPin, MetadataResolutionError> {
+        let offset = extent
+            .base()
+            .checked_sub(EL1_DYNAMIC_METADATA_BASE)
+            .filter(|offset| offset.is_multiple_of(EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64))
+            .ok_or(MetadataResolutionError::InvalidExtent)?;
+        let slot = usize::try_from(offset / EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64)
+            .map_err(|_| MetadataResolutionError::InvalidExtent)?;
+        let record = self
+            .slots
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(MetadataResolutionError::StaleOwner)?;
+        if record.generation != generation || record.token != extent.token() {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        if record.backing.len() as u64 != extent.len() {
+            return Err(MetadataResolutionError::InvalidExtent);
+        }
+        Ok(HostMetadataExtentPin {
+            extent,
+            backing: Arc::clone(&record.backing),
+        })
+    }
+
     fn return_extent_using(
         &mut self,
         slot: usize,
@@ -66,6 +137,9 @@ impl HostApertureState {
         if record.backing.len() != size || record.token != token || record.generation != generation
         {
             return METADATA_GRANT_ERR_INVALID;
+        }
+        if Arc::strong_count(&record.backing) != 1 {
+            return METADATA_GRANT_ERR_DENIED;
         }
         if !unmap(record) {
             return METADATA_GRANT_ERR_DENIED;
@@ -357,7 +431,7 @@ fn service_metadata_operation(
             }
         };
         state.slots[slot_idx] = Some(GrantedSlotRecord {
-            backing,
+            backing: Arc::new(backing),
             identity,
             num_slots,
             token,
@@ -507,6 +581,53 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn metadata_extent_pin_authenticates_owner_and_blocks_return() {
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let size = EL1_DYNAMIC_METADATA_EXTENT_SIZE;
+        let backing = allocate_metadata_backing(size).unwrap();
+        let mut state = HostApertureState::new();
+        state.reserve_slots(0, 1);
+        state.slots[0] = Some(GrantedSlotRecord {
+            identity: test_record(&custody, generation, &backing, 19),
+            backing: Arc::new(backing),
+            num_slots: 1,
+            token: 19,
+            generation: generation.0,
+        });
+        let extent = MetadataExtent::new(EL1_DYNAMIC_METADATA_BASE, size as u64, 19).unwrap();
+        for wrong in [
+            MetadataExtent::new(extent.base(), extent.len(), 20).unwrap(),
+            MetadataExtent::new(extent.base(), extent.len() / 2, 19).unwrap(),
+            MetadataExtent::new(extent.base() + 4096, extent.len(), 19).unwrap(),
+        ] {
+            assert!(state.pin_extent(wrong, generation.0).is_err());
+        }
+        assert!(state.pin_extent(extent, generation.0 + 1).is_err());
+        let pin = state.pin_extent(extent, generation.0).unwrap();
+        unsafe { pin.host_base().as_ptr().write(0x5a) };
+        let mut unmapped = false;
+        assert_eq!(
+            state.return_extent_using(0, size, 19, generation.0, |_| {
+                unmapped = true;
+                true
+            }),
+            METADATA_GRANT_ERR_DENIED,
+            "live metadata pin must exclude return"
+        );
+        assert!(!unmapped);
+        assert_eq!(unsafe { pin.host_base().as_ptr().read() }, 0x5a);
+        drop(pin);
+        assert_eq!(
+            state.return_extent_using(0, size, 19, generation.0, |_| true),
+            METADATA_GRANT_SUCCESS
+        );
+        assert!(state.pin_extent(extent, generation.0).is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn metadata_publication_has_an_exact_stage2_record() {
         let custody = crate::trap::CarrierVmCustody::new();
         let generation = custody.begin_create().expect("create");
@@ -570,7 +691,7 @@ mod tests {
             assert_eq!(aperture.find_and_reserve_slots(1), Some(0));
             aperture.slots[0] = Some(GrantedSlotRecord {
                 identity: test_record(&custody, first, &backing, 91),
-                backing,
+                backing: Arc::new(backing),
                 num_slots: 1,
                 token: 91,
                 generation: first.0,
@@ -634,7 +755,7 @@ mod tests {
         unsafe { ptr.write(0xa5) };
         state.slots[slot] = Some(GrantedSlotRecord {
             identity: test_record(&custody, generation, &backing, 7),
-            backing,
+            backing: Arc::new(backing),
             num_slots: 2,
             token: 7,
             generation: 1,

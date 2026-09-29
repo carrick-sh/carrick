@@ -16,6 +16,9 @@
 
 #![no_std]
 
+mod metadata_extent;
+pub use metadata_extent::*;
+
 mod reservations;
 pub use reservations::*;
 

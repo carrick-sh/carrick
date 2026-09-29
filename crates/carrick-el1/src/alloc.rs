@@ -950,6 +950,33 @@ impl MetadataStorage {
         None
     }
 
+    /// Allocate using the existing allocator/mailbox policy and report the
+    /// complete enclosing extent. Token zero names bootstrap storage; dynamic
+    /// grants retain the host-issued nonzero token. The caller still owns the
+    /// allocation and must return it through `deallocate`, never return the
+    /// enclosing extent directly. Call outside reservation and descriptor locks.
+    pub fn allocate_with_extent(&self, layout: Layout) -> Option<(*mut u8, ExtentGrantReceipt)> {
+        let ptr = self.allocate(layout)?;
+        let irq = disable_irq_save();
+        let core = self.lock.lock();
+        // SAFETY: allocate just returned this live payload to this caller; it
+        // has not escaped and cannot have been deallocated. Header lookup is
+        // constant work regardless of the number of extents or allocations.
+        let index = unsafe { (*(ptr.sub(HEADER_SIZE).cast::<BlockHeader>())).extent_idx as usize };
+        let extent = &core.extents[index];
+        let receipt = ExtentGrantReceipt {
+            base_va: extent.base_va,
+            size: extent.size,
+            token: match extent.kind {
+                ExtentKind::Bootstrap => 0,
+                ExtentKind::Dynamic { token } => token,
+            },
+        };
+        core::mem::drop(core);
+        restore_irq(irq);
+        Some((ptr, receipt))
+    }
+
     pub fn deallocate(&self, ptr: *mut u8, layout: Layout) {
         let align = layout.align().max(16);
         let guard = disable_irq_save();
@@ -1219,6 +1246,41 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_receipt_identifies_exact_extent_without_transferring_ownership() {
+        let mut backing = vec![0u8; 64 * 1024];
+        let storage = MetadataStorage::new();
+        storage
+            .lock
+            .lock()
+            .admit_extent(
+                backing.as_mut_ptr() as u64,
+                backing.len(),
+                ExtentKind::Dynamic { token: 71 },
+            )
+            .unwrap();
+        let layout = Layout::from_size_align(4096, 4096).unwrap();
+        let (ptr, receipt) = storage.allocate_with_extent(layout).unwrap();
+        assert_eq!(
+            receipt,
+            ExtentGrantReceipt {
+                base_va: backing.as_mut_ptr() as u64,
+                size: backing.len(),
+                token: 71
+            }
+        );
+        assert!(
+            ptr as u64 >= receipt.base_va
+                && ptr as u64 + layout.size() as u64 <= receipt.base_va + receipt.size as u64
+        );
+        assert_eq!(storage.lock.lock().extents[0].live_allocations, 1);
+        storage.deallocate(ptr, layout);
+        assert_eq!(
+            storage.lock.lock().extents[0].state,
+            ExtentState::PendingReturn
+        );
+    }
 
     #[test]
     fn test_arbitrary_alignments_and_memory_writes() {
