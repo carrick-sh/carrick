@@ -838,6 +838,9 @@ impl<'a> MemView<'a> {
             );
         };
         let (read, write, execute) = prot_to_proc_perms(commit.prot);
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            table.retire_overlapping(authority.mm_id.raw(), commit.start, commit.len);
+        }
         let mut mem = authority.mem.lock();
 
         // Remove only the replaced range from every classification. This is
@@ -1279,6 +1282,9 @@ impl<'a> MemView<'a> {
     /// alias too and must retire the same VMA/residency/lock/fault/bus/seal/memfd
     /// state before it removes the attachment and decrements `nattch`.
     pub(crate) fn remove_mapping_metadata(&self, start: u64, len: u64) {
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            table.retire_overlapping(self.mm_authority().mm_id.raw(), start, len);
+        }
         remove_mapping_metadata_locked(&mut self.mem().lock(), start, len);
         self.captured_mm()
             .replace_io_uring_mappings(start, len, None);

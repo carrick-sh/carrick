@@ -1359,12 +1359,8 @@ fn el1_memory_first_touch_stays_in_guest() {
              exits_diff={} slope={exit_slope:.4} exits/page",
             exits1 as i64 - exits0 as i64,
         );
-        // WEAKENED 2026-09-27 (owner-approved): was < 0.125. First touch now
-        // publishes and commits one page per grant (bulk backing kept) so mincore,
-        // sparse cores and DONTNEED stay Linux-correct; restore the bound when the
-        // AF-clear bulk publication (work/af-batching) lands.
         assert!(
-            exit_slope < 2.5,
+            exit_slope < 0.125,
             "first-touch host-exit slope across scale {p0} -> {p1} was {exit_slope:.4} exits/page \
              (both processes count, added={added_pages}); contract ceiling is <0.125 exits per added page"
         );
@@ -1455,10 +1451,9 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
             "el1-sched mapping-retirement slope {p0}->{p1} pages rounds={ROUNDS}: exits_diff={} slope={exit_slope:.4} exits/page/round",
             exits1 as i64 - exits0 as i64,
         );
-        // WEAKENED 2026-09-27 (owner-approved): was < 0.125; see the served_munmap note.
         assert!(
-            exit_slope < 2.5,
-            "mapping-retirement host-exit slope {exit_slope:.4} exceeds <2.5 exits per added page per round"
+            exit_slope < 0.125,
+            "mapping-retirement host-exit slope {exit_slope:.4} exceeds <0.125 exits per added page per round"
         );
     }
 }
@@ -1588,11 +1583,9 @@ fn el1_anonymous_permission_transitions_stay_in_guest() {
             pair[1].pages,
             pair[1].exits as i64 - pair[0].exits as i64,
         );
-        // WEAKENED 2026-09-27 (owner-approved): was < 0.125. Per-page first-touch
-        // publication; restore when work/af-batching lands.
         assert!(
-            slope < 2.5,
-            "permission-transition host-exit slope {slope:.4} exceeds <2.5 exits per added page per round"
+            slope < 0.125,
+            "permission-transition host-exit slope {slope:.4} exceeds <0.125 exits per added page per round"
         );
     }
 
