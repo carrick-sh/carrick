@@ -1,0 +1,15 @@
+(lldb) process attach --pid 8177
+Process 8177 stopped
+* thread #1, name = 'main', queue = 'com.apple.main-thread', stop reason = signal SIGSTOP
+       frame #0: 0x000000018a8bab9c libsystem_kernel.dylib`semaphore_wait_trap + 8
+libsystem_kernel.dylib`semaphore_wait_trap:
+->  0x18a8bab9c <+8>: ret    
+
+libsystem_kernel.dylib`semaphore_wait_signal_trap:
+    0x18a8baba0 <+0>: mov    x16, #-0x25               ; =-37 
+    0x18a8baba4 <+4>: svc    #0x80
+    0x18a8baba8 <+8>: ret    
+Target 0: (el1_sched-3c030f910e35df6e) stopped.
+Executable binary set to "/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/el1-ipc-processes-red-8c9617950/el1_sched-3c030f910e35df6e".
+Architecture set to: arm64-apple-macosx-.
+(lldb) image lookup -r -s IPC_WINDOW_HOST
