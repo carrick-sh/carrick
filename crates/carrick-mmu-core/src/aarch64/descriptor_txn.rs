@@ -926,6 +926,13 @@ impl DescriptorTxnSlot {
             .is_ok()
     }
 
+    /// EL1: a submission for `mm_key` is waiting to be claimed.
+    #[must_use]
+    pub fn submitted_for(&self, mm_key: u64) -> bool {
+        self.state.load(Ordering::Acquire) == DESCRIPTOR_TXN_SUBMITTED
+            && self.mm_key.load(Ordering::Relaxed) == mm_key
+    }
+
     /// Either venue: an in-flight transaction for `mm_key` covers `va`.
     #[must_use]
     pub fn pending_covering(&self, mm_key: u64, va: u64) -> bool {
