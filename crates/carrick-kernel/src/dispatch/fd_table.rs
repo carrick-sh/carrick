@@ -3835,6 +3835,21 @@ mod tests {
     const SYS_READ: u64 = 63;
     const SYS_FTRUNCATE: u64 = 46;
 
+    /// kernel.el1.ipc-host-coherence: object admission alone must not
+    /// subscribe a host poller or allocate its readiness transport. Both an
+    /// empty and an initially readable guest-only eventfd have this budget.
+    #[test]
+    fn serial_host_el1_ipc_guest_only_eventfd_has_no_host_readiness() {
+        for initial in [0, 1] {
+            let state = EventFdState::new(initial);
+            assert_eq!(state.counter_value(), initial);
+            assert!(
+                state.read_fd.is_none() && state.write_fd.is_none(),
+                "eventfd admission allocated host readiness without a subscriber (initial={initial})"
+            );
+        }
+    }
+
     #[test]
     fn owned_inode_identity_survives_path_replacement_and_aliasing() {
         use std::os::fd::IntoRawFd;
