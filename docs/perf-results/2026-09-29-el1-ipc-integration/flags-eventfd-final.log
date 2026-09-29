@@ -1,0 +1,17 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.14s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 9 tests
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_description_refusal_rolls_back_object ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_mixed_subscriber_wakes_once ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_guest_only_eventfd_has_no_host_readiness ... ok
+test dispatch::net::epoll_ops::nested_epoll_readiness_tests::threaded_eventfd_nested_epoll_wake ... ok
+test dispatch::overlay_dispatch_tests::eventfd_write_records_the_host_readiness_transition ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_closes_enrollment_gap ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_survives_fd_reuse ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 2320 filtered out; finished in 0.07s
+

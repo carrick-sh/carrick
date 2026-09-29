@@ -1,0 +1,4 @@
+machine=aarch64
+eventfd_getfl=2050
+rdwr=2
+nonblock=2048

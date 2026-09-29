@@ -445,6 +445,17 @@ impl PipeInner {
             .install(table, fd, false)
     }
 
+    pub(crate) fn endpoint_status_flags(
+        &self,
+        end: core_pipe::End,
+    ) -> Option<Arc<crate::el1_ipc::HostDescriptionFlags>> {
+        self.endpoints[usize::from(end == core_pipe::End::Writer)]
+            .lock()
+            .description
+            .as_ref()
+            .map(crate::el1_ipc::HostDescription::flags)
+    }
+
     pub(crate) fn retain_endpoint(&self, end: core_pipe::End) {
         let mut endpoint = self.endpoints[usize::from(end == core_pipe::End::Writer)].lock();
         if endpoint.description.is_none() {
@@ -938,6 +949,58 @@ impl<'a> FsView<'a> {
 mod tests {
     use super::*;
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
+
+    #[test]
+    fn serial_host_el1_ipc_pipe_flags_are_shared_per_endpoint() {
+        use carrick_el1_abi::ipc::fd;
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let pipe = Arc::new(PipeInner::create(Arc::clone(&owner), 1, 65536).unwrap());
+        let reader = crate::dispatch::fd_table::kernel_file_description(
+            Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
+                base: OpenDescriptionBase::new(LINUX_O_RDONLY | LINUX_O_NONBLOCK),
+                pipe: Arc::clone(&pipe),
+            })),
+            LINUX_O_RDONLY | LINUX_O_NONBLOCK,
+        );
+        let writer = crate::dispatch::fd_table::kernel_file_description(
+            Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
+                base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+                pipe: Arc::clone(&pipe),
+            })),
+            LINUX_O_WRONLY,
+        );
+        let table = owner.create_table(64, 4).unwrap();
+        pipe.install_endpoint_for_test(core_pipe::End::Reader, table, fd::Fd(0))
+            .unwrap();
+        pipe.install_endpoint_for_test(core_pipe::End::Writer, table, fd::Fd(1))
+            .unwrap();
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        assert!(authority.getfl(table, fd::Fd(0)).unwrap().1.nonblock);
+        assert!(!authority.getfl(table, fd::Fd(1)).unwrap().1.nonblock);
+        authority
+            .setfl(table, fd::Fd(0), fd::StatusFlags::default())
+            .unwrap();
+        writer
+            .common()
+            .set_status_flags(LINUX_O_WRONLY | LINUX_O_NONBLOCK);
+        assert_eq!(reader.common().status_flags(), LINUX_O_RDONLY);
+        assert_eq!(
+            writer.common().status_flags(),
+            LINUX_O_WRONLY | LINUX_O_NONBLOCK
+        );
+        assert!(authority.getfl(table, fd::Fd(1)).unwrap().1.nonblock);
+        assert_eq!(
+            authority.getfl(table, fd::Fd(1)).unwrap().0,
+            fd::AccessMode::WriteOnly
+        );
+        assert!(authority.close(table, fd::Fd(0)).unwrap().is_none());
+        assert!(authority.close(table, fd::Fd(1)).unwrap().is_none());
+        let extent = authority
+            .destroy_table(table, |_| panic!("empty table"))
+            .unwrap();
+        owner.reclaim_descriptors(extent);
+    }
 
     #[test]
     fn serial_host_el1_ipc_pipe_second_description_refusal_rolls_back() {

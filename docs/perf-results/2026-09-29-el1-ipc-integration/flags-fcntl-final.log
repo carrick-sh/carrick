@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 6 tests
+test dispatch::fs::tests::fcntl_f_created_query_semantics ... ok
+test dispatch::fs::tests::fcntl_pipe_host_pipe_accounting_and_set_capacity ... ok
+test dispatch::fs::tests::fcntl_pipe_set_capacity_preserves_authority_fatal_without_direct_fallback ... ok
+test dispatch::fs::tests::fcntl_pipe_set_capacity_routes_through_canonical_authority ... ok
+test dispatch::fs::tests::fcntl_pipe_set_capacity_semantic_errors ... ok
+test dispatch::hvpatch_in_process_fork_tests::fcntl_pipe_set_capacity_works_on_successor_table_after_close_range_unshare ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 2323 filtered out; finished in 0.00s
+
