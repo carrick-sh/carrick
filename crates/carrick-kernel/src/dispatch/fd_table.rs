@@ -2970,6 +2970,18 @@ impl crate::kernel::FileDescription {
         self.inspect()?.open_path().map(str::to_owned)
     }
 
+    /// Only copy a second path when a description names a different object
+    /// from the fd spelling (for example, an open through a symlink).
+    pub(in crate::dispatch) fn distinct_open_path_snapshot(
+        &self,
+        recorded: &str,
+    ) -> Option<String> {
+        self.inspect()?
+            .open_path()
+            .filter(|description| *description != recorded)
+            .map(str::to_owned)
+    }
+
     pub(in crate::dispatch) fn pidfd_watch(&self) -> PidfdWatchAccess {
         let Some(open) = self.inspect() else {
             return PidfdWatchAccess::Closed;

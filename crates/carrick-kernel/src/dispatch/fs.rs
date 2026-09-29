@@ -1191,11 +1191,11 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn record_fd_open_path(&self, fd: i32, path: String) {
-        // The description's own path goes through the inspect authority
-        // (`open_path_snapshot`); no raw table or description guard here.
+        // The description's own path goes through the inspect authority;
+        // only a name distinct from the recorded spelling needs another copy.
         let description_path = self
             .open_file(fd)
-            .and_then(|open_file| open_file.description().open_path_snapshot());
+            .and_then(|open_file| open_file.description().distinct_open_path_snapshot(&path));
         self.captured_file_table()
             .write_fd_open_paths()
             .insert_with_description_path(fd, path, description_path);
