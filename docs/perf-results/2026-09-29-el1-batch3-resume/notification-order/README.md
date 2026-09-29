@@ -42,7 +42,7 @@ matched after execution. This is one selected execution, not the full EL1 suite.
 Compile check, the existing VM-free notification regression, affected
 all-target Clippy, registry and contract coverage passed during fixture
 development. check2.log covers the final rejection-count addition. Broader regression results below cover the final auditor event; clean
-compiler inventory/domain gates remain pending. Other deferred-record signed interleavings,
+compiler inventory/domain gates are recorded below. Other deferred-record signed interleavings,
 structural notification observations, historical attribution and full batch
 acceptance remain open.
 
@@ -55,3 +55,9 @@ with eight existing ignores. Affected kernel/runtime/embed all-target Clippy
 passed. Logs are final-kernel, final-serial, final-runtime and final-clippy.
 The contract registry also passed (final-registry). These are source regressions;
 they do not enlarge the signed fixture's one-test execution population.
+
+Clean compiler reconciliation on `3fb63f608` retained all 595 rows and their
+positions; only the source stamp changed (commit `852fedd48`). Final
+`just lint-domains` and contract coverage `257de53e0..852fedd48` passed.
+Logs are final-reconcile, final-lint and final-coverage. The compiler census
+is the macOS subset only; Linux/FreeBSD/NetBSD profiles remain unqualified.
