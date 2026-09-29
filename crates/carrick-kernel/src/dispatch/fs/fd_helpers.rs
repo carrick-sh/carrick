@@ -955,7 +955,7 @@ impl<'a> FsView<'a> {
         let open = open_file.description.inspect()?;
         match &*open {
             OpenDescription::PipeWriter { pipe, .. } => {
-                if pipe.state.lock().readers == 0 {
+                if pipe.snapshot().readers == 0 {
                     Some(LINUX_EPIPE)
                 } else {
                     None

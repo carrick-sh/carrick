@@ -130,6 +130,22 @@ struct HostResources {
     live: BTreeMap<u64, Box<dyn Send + Sync>>,
 }
 
+#[derive(Debug)]
+struct HostSubscription {
+    owner: std::sync::Arc<HostIpc>,
+    object: IpcObjectHandle,
+}
+impl Drop for HostSubscription {
+    fn drop(&mut self) {
+        // A final close can retire the object before its observation enrollments.
+        // Generation authentication prevents touching a recycled incarnation.
+        let _ = self
+            .owner
+            .region()
+            .unsubscribe_host(self.object, &HostLockWait);
+    }
+}
+
 /// One kernel's IPC authority and all memory needed by both venues.
 /// Runtime mappings must retain an `Arc<HostIpc>` for their entire lifetime.
 /// The pool reserves virtual address space; anonymous pages are committed by
@@ -179,6 +195,20 @@ impl HostIpc {
         }
         Ok(owner)
     }
+    pub(crate) fn wait_queue(
+        self: &std::sync::Arc<Self>,
+        object: IpcObjectHandle,
+    ) -> std::sync::Arc<crate::kernel::WaitQueue> {
+        let owner = std::sync::Arc::clone(self);
+        std::sync::Arc::new(crate::kernel::WaitQueue::with_subscription(move || {
+            owner.region().subscribe_host(object, &HostLockWait).ok()?;
+            Some(Box::new(HostSubscription {
+                owner: std::sync::Arc::clone(&owner),
+                object,
+            }))
+        }))
+    }
+
     pub fn directory_ptr(&self) -> *mut IpcDirectory {
         self.directory.ptr.as_ptr().cast()
     }
@@ -199,6 +229,21 @@ impl HostIpc {
             .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("IPC", "corrupt owned IPC region"))
     }
 
+    fn bind_waits(&self, object: IpcObjectHandle) {
+        if let Some(zone) = crate::el1_zone::zone() {
+            for direction in [pipe::WaitFor::Readable, pipe::WaitFor::Writable] {
+                if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, direction) {
+                    zone.bind_object_wait(key, &HostLockWait)
+                        .unwrap_or_else(|_| {
+                            carrick_fatal::carrick_fatal!(
+                                "ipc::admission",
+                                "object wait generation collision"
+                            )
+                        });
+                }
+            }
+        }
+    }
     fn provision_pipe(
         &self,
         ring_bytes: u64,
@@ -216,7 +261,10 @@ impl HostIpc {
         let region = self.region();
         let mut storage = None;
         match region.create_pipe(capacity, &mut storage, &HostLockWait) {
-            Ok(object) => return Ok(object),
+            Ok(object) => {
+                self.bind_waits(object);
+                return Ok(object);
+            }
             Err(IpcError::NeedsStorage { ring_bytes, pages }) => {
                 storage = Some(self.provision_pipe(ring_bytes, pages)?);
             }
@@ -227,16 +275,53 @@ impl HostIpc {
         if let Some(retired_or_unused) = storage {
             self.pool.lock().release(retired_or_unused.offset);
         }
-        result.map_err(Into::into)
+        let object = result?;
+        self.bind_waits(object);
+        Ok(object)
     }
     pub fn create_eventfd(
         &self,
         initial: u32,
         mode: pipe::EventMode,
     ) -> Result<IpcObjectHandle, AdmissionError> {
-        self.region()
-            .create_eventfd(initial, mode, &HostLockWait)
-            .map_err(Into::into)
+        let object = self.region().create_eventfd(initial, mode, &HostLockWait)?;
+        self.bind_waits(object);
+        Ok(object)
+    }
+
+    pub(crate) fn resize_pipe(
+        &self,
+        object: IpcObjectHandle,
+        requested: usize,
+        limit: usize,
+    ) -> Result<usize, AdmissionError> {
+        let region = self.region();
+        let current = region.lock(object, &HostLockWait)?.pipe()?.capacity();
+        let rounded = pipe::Pipe::rounded_capacity(4096, requested).map_err(IpcError::Object)?;
+        if rounded > current && rounded > limit {
+            return Err(IpcError::Object(pipe::Error::Permission).into());
+        }
+        let mut replacement = if rounded > current {
+            Some(self.provision_pipe(rounded as u64, (rounded / 4096) as u64)?)
+        } else {
+            None
+        };
+        let result = (|| {
+            let mut guard = region.lock(object, &HostLockWait)?;
+            if let Some(storage) = &mut replacement {
+                guard.replace_pipe_storage(storage)?;
+            }
+            let step = guard.pipe()?.set_capacity(requested, limit);
+            let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+            delivery.collect(guard.publish(step.wake));
+            drop(guard);
+            delivery.deliver();
+            step.result.map_err(IpcError::Object)
+        })();
+        if let Some(storage) = replacement {
+            self.pool.lock().release(storage.offset);
+        }
+        result.map_err(Into::into)
     }
     fn provision_descriptors(&self, capacity: usize) -> Result<fd::Extent, AdmissionError> {
         if capacity == 0 || capacity > i32::MAX as usize {
@@ -299,6 +384,15 @@ impl HostIpc {
     /// The caller delivers the returned object wake after leaving object locks.
     pub fn release(&self, backing: fd::BackingToken) -> Result<IpcReleased, IpcError> {
         let released = self.region().release_backing(backing, &HostLockWait)?;
+        if let IpcReleased::Object { wake, freed: false } = released {
+            let region = self.region();
+            if let Ok(guard) = region.lock(wake.object, &HostLockWait) {
+                let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+                delivery.collect(wake);
+                drop(guard);
+                delivery.deliver();
+            }
+        }
         if let IpcReleased::Host(token) = released {
             let resource = self
                 .resources
@@ -316,6 +410,37 @@ impl HostIpc {
 mod tests {
     use super::*;
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
+
+    #[test]
+    fn serial_host_el1_ipc_host_subscription_lifetime_is_exact() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let object = owner.create_eventfd(0, pipe::EventMode::Counter).unwrap();
+        let queue = owner.wait_queue(object);
+        let wait = crate::kernel::WaitSet::new();
+        let region = owner.region();
+        let count = || {
+            region
+                .lock(object, &HostLockWait)
+                .unwrap()
+                .host_subscribers()
+        };
+        assert_eq!(count(), 0);
+        let first = queue.enroll(&wait);
+        let callback = queue.enroll_callback(|_| {});
+        assert_eq!(count(), 2);
+        drop(first);
+        assert_eq!(count(), 1);
+        drop(callback);
+        assert_eq!(count(), 0);
+        let mut guard = region.lock(object, &HostLockWait).unwrap();
+        let step = guard.eventfd().unwrap().try_write(1);
+        assert!(!guard.publish(step.wake).host_owed);
+        drop(guard);
+        assert!(!region.take_host_wake(object));
+        owner
+            .release(IpcBacking::EventFd { object }.encode())
+            .unwrap();
+    }
 
     #[test]
     fn serial_host_el1_ipc_pool_reuses_released_storage() {

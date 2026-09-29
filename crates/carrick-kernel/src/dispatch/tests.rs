@@ -7963,9 +7963,9 @@ fn closing_unpolled_pipe_does_not_materialize_readiness_fds() {
     let dispatcher = SyscallDispatcher::new();
     let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(41, 65536));
     let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
-    read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    read_base.set_shared_pipe(Arc::clone(&pipe));
     let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
-    write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    write_base.set_shared_pipe(Arc::clone(&pipe));
     let read_file = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::PipeReader {
             base: read_base,
@@ -8011,9 +8011,9 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     let parent = SyscallDispatcher::new();
     let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(42, 65536));
     let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
-    read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    read_base.set_shared_pipe(Arc::clone(&pipe));
     let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
-    write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    write_base.set_shared_pipe(Arc::clone(&pipe));
 
     let read_desc = Arc::new(RwLock::new(OpenDescription::PipeReader {
         base: read_base,
@@ -8052,7 +8052,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     assert_eq!(read_description.common().fd_refs(), 1);
     assert_eq!(write_description.common().fd_refs(), 1);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(state.readers, 1);
         assert_eq!(state.writers, 1);
     }
@@ -8076,7 +8076,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     assert_eq!(read_description.common().fd_refs(), 2);
     assert_eq!(write_description.common().fd_refs(), 2);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(
             state.readers, 1,
             "fork copy must not increment backing reader endpoint count"
@@ -8096,7 +8096,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     parent.close_fd_for_internal_rollback(write_fd);
     assert_eq!(write_description.common().fd_refs(), 1);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(
             state.writers, 1,
             "intermediate close must retain backing writer count"
@@ -8116,7 +8116,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     child.close_fd_for_internal_rollback(write_fd);
     assert_eq!(write_description.common().fd_refs(), 0);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(
             state.writers, 0,
             "final release must decrement backing writer count to 0"
@@ -8135,7 +8135,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     parent.close_fd_for_internal_rollback(read_fd);
     assert_eq!(read_description.common().fd_refs(), 1);
     {
-        let state = pipe.state.lock();
+        let state = pipe.snapshot();
         assert_eq!(
             state.readers, 1,
             "intermediate close must retain backing reader count"
@@ -8151,11 +8151,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     child.close_fd_for_internal_rollback(read_fd);
     assert_eq!(read_description.common().fd_refs(), 0);
     {
-        let state = pipe.state.lock();
-        assert_eq!(
-            state.readers, 0,
-            "final release must decrement backing reader count to 0"
-        );
+        assert!(pipe.is_retired(), "final release retires the shared incarnation");
         assert!(
             matches!(&*read_desc.read(), OpenDescription::Closed { .. }),
             "final release must transition reader OpenDescription to Closed"

@@ -2058,7 +2058,7 @@ mod netlink_readiness_tests {
         {
             let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(50, 65536));
             let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
-            read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+            read_base.set_shared_pipe(Arc::clone(&pipe));
             fixtures.push(OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::PipeReader {
                     base: read_base,
@@ -2073,7 +2073,7 @@ mod netlink_readiness_tests {
         {
             let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(51, 65536));
             let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
-            write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+            write_base.set_shared_pipe(Arc::clone(&pipe));
             fixtures.push(OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::PipeWriter {
                     base: write_base,

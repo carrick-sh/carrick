@@ -3351,7 +3351,7 @@
       "symbol": "SYSTEM_CHARGE_WINDOW",
       "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
       "classification": "carrier_infra",
-      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction — the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other — and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
+      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction \u2014 the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other \u2014 and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
     },
     {
       "kind": "thread_local",
@@ -3744,6 +3744,14 @@
       "fingerprint": "b45f2e0792f4c7c840555bdf52882bf567b1f7f35998d77b3e2084e080d8479d",
       "classification": "test_only",
       "rationale": "Test-only mutex serializing crash-capture unit tests that install a synthetic EL1 region (record_el1_region_host_ptr, el1_zone::enable) to prove the crash quorum reads a parked thread's authoritative EL1 save area; absent from production builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "symbol": "NEXT_REGION",
+      "fingerprint": "3c7db8490488c0bd323b91a6de2d99ca3390619e18e9a327bc04d958bad88f4b",
+      "classification": "monotonic_allocator",
+      "rationale": "Allocates non-reused authority identities for kernel-owned IPC regions; no guest object state is process-global."
     }
   ]
 }

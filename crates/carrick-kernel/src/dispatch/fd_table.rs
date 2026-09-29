@@ -385,6 +385,7 @@ pub(crate) struct OpenDescriptionBase {
     /// test_subprocess.test_pipesizes sets on the write end, reads on the read
     /// ends). `pipe2` hands the same `Arc` to both ends; `None` everywhere else.
     pipe_capacity_shared: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    shared_pipe: Option<PipeRef>,
     /// Guest-intended SO_REUSEADDR / SO_REUSEPORT, tracked so getsockopt reports
     /// what the guest set — NOT the host SO_REUSEPORT carrick silently turns on
     /// to emulate Linux UDP wildcard-rebind from SO_REUSEADDR. (audit M4)
@@ -477,6 +478,7 @@ impl OpenDescriptionBase {
             send_timeout: None,
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
             pipe_capacity_shared: None,
+            shared_pipe: None,
             inzone_listener: None,
             inzone_cleanup: None,
         }
@@ -506,6 +508,7 @@ impl OpenDescriptionBase {
     }
 
     /// Route pipe capacity through a cell shared with the pipe's other end.
+    #[cfg(test)]
     pub(super) fn set_pipe_capacity_cell(
         &mut self,
         cell: std::sync::Arc<std::sync::atomic::AtomicI64>,
@@ -513,7 +516,14 @@ impl OpenDescriptionBase {
         self.pipe_capacity_shared = Some(cell);
     }
 
+    pub(super) fn set_shared_pipe(&mut self, pipe: PipeRef) {
+        self.shared_pipe = Some(pipe);
+    }
+
     pub(super) fn pipe_capacity(&self) -> i64 {
+        if let Some(pipe) = &self.shared_pipe {
+            return pipe.get_capacity() as i64;
+        }
         match &self.pipe_capacity_shared {
             Some(cell) => cell.load(std::sync::atomic::Ordering::Relaxed),
             None => self.pipe_capacity,
@@ -2654,9 +2664,9 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::PerfEvent { .. } => LinuxEpollEvents::empty(),
             OpenDescription::FsContext { .. } => LinuxEpollEvents::empty(),
             OpenDescription::PipeReader { pipe, .. } => {
-                let state = pipe.state.lock();
+                let state = pipe.snapshot();
                 let mut ready = LinuxEpollEvents::empty();
-                if !state.buffer.is_empty() {
+                if state.unread != 0 {
                     ready |= LinuxEpollEvents::IN;
                 }
                 if state.writers == 0 {
@@ -2665,7 +2675,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let state = pipe.state.lock();
+                let state = pipe.snapshot();
                 let mut ready = LinuxEpollEvents::empty();
                 if state.readers == 0 {
                     ready |= LinuxEpollEvents::ERR;
@@ -2870,35 +2880,22 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         let description = self.read();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
-                let mut state = pipe.state.lock();
-                state.readers = state.readers.saturating_add(1);
-                pipe.update_readiness_locked(&state);
+                pipe.retain_endpoint(carrick_el1_abi::ipc::pipe::End::Reader)
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let mut state = pipe.state.lock();
-                state.writers = state.writers.saturating_add(1);
-                pipe.update_readiness_locked(&state);
+                pipe.retain_endpoint(carrick_el1_abi::ipc::pipe::End::Writer)
             }
             _ => {}
         }
     }
-
     fn on_last_fd_ref(&self) {
         let description = self.read();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
-                let mut state = pipe.state.lock();
-                state.readers = state.readers.saturating_sub(1);
-                pipe.update_readiness_locked(&state);
-                drop(state);
-                pipe.changed.notify_all();
+                pipe.release_endpoint(carrick_el1_abi::ipc::pipe::End::Reader)
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let mut state = pipe.state.lock();
-                state.writers = state.writers.saturating_sub(1);
-                pipe.update_readiness_locked(&state);
-                drop(state);
-                pipe.changed.notify_all();
+                pipe.release_endpoint(carrick_el1_abi::ipc::pipe::End::Writer)
             }
             _ => {}
         }
@@ -3011,8 +3008,8 @@ impl crate::kernel::FileDescription {
         let OpenDescription::PipeReader { pipe, .. } = &*open else {
             return false;
         };
-        let state = pipe.state.lock();
-        state.buffer.is_empty() && state.writers != 0
+        let state = pipe.snapshot();
+        state.unread == 0 && state.writers != 0
     }
 
     pub(in crate::dispatch) fn host_socket_authority(
@@ -3699,13 +3696,13 @@ impl InMemoryPipeTestFixture {
     pub(crate) fn new(pipe_id: u64, capacity: usize) -> Self {
         let pipe = Arc::new(super::fs::pipe::PipeInner::new_connected(pipe_id, capacity));
         let mut read_base = OpenDescriptionBase::new(0);
-        read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        read_base.set_shared_pipe(Arc::clone(&pipe));
         let read_desc = OpenDescription::PipeReader {
             base: read_base,
             pipe: Arc::clone(&pipe),
         };
         let mut write_base = OpenDescriptionBase::new(0);
-        write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        write_base.set_shared_pipe(Arc::clone(&pipe));
         let write_desc = OpenDescription::PipeWriter {
             base: write_base,
             pipe: Arc::clone(&pipe),
@@ -3748,8 +3745,7 @@ impl InMemoryPipeTestFixture {
     }
 
     pub(crate) fn enqueue_bytes(&self, bytes: &[u8]) {
-        let mut state = self.pipe.state.lock();
-        state.buffer.extend(bytes);
+        assert_eq!(self.pipe.write_bytes(bytes), Ok(bytes.len()));
     }
 }
 

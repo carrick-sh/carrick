@@ -128,6 +128,16 @@ impl IpcObjectHandle {
     }
 }
 
+/// The shared queue identity for one readiness direction of an IPC incarnation.
+pub fn object_wait_key(
+    object: IpcObjectHandle,
+    direction: pipe::WaitFor,
+) -> Option<carrick_sched_core::object_wait::ObjectWaitKey> {
+    let lane = u32::from(direction == pipe::WaitFor::Writable);
+    let index = object.index().checked_mul(2)?.checked_add(1 + lane)?;
+    carrick_sched_core::object_wait::ObjectWaitKey::new(index, u64::from(object.generation()) + 1)
+}
+
 /// Plain-data [`IpcObjectHandle`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
