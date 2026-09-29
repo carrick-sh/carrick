@@ -959,6 +959,10 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     pub fn setfl(&self, table: TableId, fd: Fd, flags: StatusFlags) -> Result<(), Error> {
         let (_guard, t) = self.lock(table)?;
         let ofd = self.ofd(t.entry(fd)?.ofd);
+        Self::set_ofd_flags(ofd, flags)
+    }
+
+    fn set_ofd_flags(ofd: &OfdRecord, flags: StatusFlags) -> Result<(), Error> {
         let requested = encode_mode(AccessMode::ReadOnly, flags) & MODE_MUTABLE;
         let mut current = ofd.mode.load(Ordering::Acquire);
         loop {
@@ -1273,6 +1277,66 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     pub fn pinned(&self, pin: &OfdPin) -> Result<Description, Error> {
         self.check_pin(pin)?;
         Ok(self.snapshot(pin.key.index))
+    }
+
+    /// Admit a description before installing a numeric descriptor. The pin
+    /// owns its backing until installation or rollback; no scratch fd table
+    /// or second description is needed for host admission and SCM_RIGHTS.
+    pub fn create_pinned(&self, description: Description) -> Result<OfdPin, Error> {
+        let authority = self.identity()?;
+        let index = self.alloc_ofd(description)?;
+        let ofd = self.ofd(index);
+        // Newly allocated and unpublished: exchange the initial descriptor
+        // hold for the caller's pin before exposing the OFD identity.
+        ofd.holds.store(PIN, Ordering::Release);
+        Ok(OfdPin {
+            authority,
+            key: OfdKey {
+                index,
+                generation: ofd.generation.load(Ordering::Acquire),
+            },
+        })
+    }
+
+    /// Install the SAME pinned description at an empty exact descriptor slot.
+    /// Refuse occupied slots without replacement or mutation. The caller owns
+    /// the target-table admission (including any external fd reservation).
+    pub fn install_pin(
+        &self,
+        table: TableId,
+        target: Fd,
+        pin: &OfdPin,
+        cloexec: bool,
+    ) -> Result<(), Error> {
+        self.check_pin(pin)?;
+        let (_guard, t) = self.lock(table)?;
+        if target.0 < 0 || target.0 as usize >= t.limit {
+            return Err(Error::BadFd);
+        }
+        if target.0 as usize >= t.storage.capacity() {
+            return Err(Error::NeedsBacking {
+                descriptors: target.0 as usize + 1,
+            });
+        }
+        if t.storage.get(target.0 as usize).is_some() {
+            return Err(Error::TooManyFiles);
+        }
+        self.retain(pin.key.index, REF)?;
+        t.storage.set(
+            target.0 as usize,
+            Some(Entry {
+                ofd: pin.key.index,
+                cloexec,
+            }),
+        );
+        Ok(())
+    }
+
+    /// F_SETFL-class mutation through an owned description, independent of
+    /// numeric fd reuse. Uses the same immutable/mutable mask as `setfl`.
+    pub fn set_pinned_flags(&self, pin: &OfdPin, flags: StatusFlags) -> Result<(), Error> {
+        self.check_pin(pin)?;
+        Self::set_ofd_flags(self.ofd(pin.key.index), flags)
     }
 
     /// Release a pin. Returns the description exactly when this was its final
