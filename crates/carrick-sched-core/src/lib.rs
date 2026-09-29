@@ -2481,6 +2481,12 @@ impl ZoneTables {
         let guard = self.slot_lock(victim, &BoundedSpin(EL1_SLOT_LOCK_SPINS))?;
         let s = self.slot(victim);
         let cpu = self.slot(thief).cpu.load(Ordering::Relaxed);
+        // A victim in the guest reaches its own run queue (it polls it, or
+        // owes a reschedule), so work only its executor can serve stays
+        // there. A stopped victim's executor is on the host and may not
+        // return to this vCPU (a spare, a blocking host call): what waits
+        // on it is stranded unless an idle vCPU takes it.
+        let victim_stopped = !s.state().in_guest();
         let mut cursor = s.head.load(Ordering::Acquire);
         while cursor != NIL {
             let record = RecordId(cursor);
@@ -2492,10 +2498,10 @@ impl ZoneTables {
             if owner != victim
                 || rec.home().is_some()
                 || rec.is_cancelled()
-                // Keep work with the victim if the thief would need its
-                // executor, whether for service or a foreign address space.
-                // Moving it to the idle thief would only create a host exit.
-                || self.needs_executor(thief, rec)
+                // Keep work with a victim in the guest if the thief would
+                // need its executor, whether for service or a foreign
+                // address space: moving it would only create a host exit.
+                || (!victim_stopped && self.needs_executor(thief, rec))
                 || !rec.allows_cpu(cpu)
             {
                 continue;
@@ -2517,6 +2523,15 @@ impl ZoneTables {
             self.remove_locked(&guard, record);
             drop(guard);
             self.counters.el1_steals.fetch_add(1, Ordering::Relaxed);
+            // Rescued from a stopped slot, it needs the thief's executor:
+            // queue it on the thief, whose idle loop then leaves for the
+            // host with it at its head.
+            if self.needs_executor(thief, rec) {
+                if let Some(own) = self.slot_lock(thief, &SpinForever) {
+                    self.push_locked(&own, record, None);
+                }
+                return None;
+            }
             if !rec.cas(
                 Claim::Queued { slot: thief, seq },
                 Claim::OnCpu { slot: thief, seq },
