@@ -62,8 +62,10 @@ negative controls and cleanup passed. See `notification-order/` for both
 artifacts, the controlled source patch and the initially non-discriminating
 fixture result. This closes this producer's signed interleaving gap only; the
 49-execution receipt above predates the new audit event and is not full-tree
-acceptance for this source. Clean compiler gates and broad regressions remain
-pending for the audit event.
+acceptance for this source. Broad regressions after the audit event passed:
+kernel/semantics 2,462 (one existing ignore), serial kernel 110, runtime 630
+(eight existing ignores) and affected Clippy. Clean compiler gates remain
+pending.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake
