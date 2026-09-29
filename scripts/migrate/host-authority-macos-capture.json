@@ -10581,15 +10581,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 41124,
-        "byte_start": 41099,
+        "byte_end": 41187,
+        "byte_start": 41162,
         "column": 22,
         "column_end": 47,
         "column_start": 22,
         "file": "crates/carrick-kernel/src/kernel/continuation/wait_service.rs",
-        "line": 1069,
-        "line_end": 1069,
-        "line_start": 1069
+        "line": 1071,
+        "line_end": 1071,
+        "line_start": 1071
       }
     },
     {
@@ -11937,9 +11937,9 @@
       }
     }
   ],
-  "rows_sha256": "b017cdc0df25a2a060495a3c76058cc5b4ac8be75329edaa63af216240545b8f",
+  "rows_sha256": "7e2a92705a410410c6d3cf36ce4116d4aea71eff0caaf8aaed3361b9bb101071",
   "schema": 1,
-  "source_head": "a9da3196d457e56ac1c5465315c9412b53c75bd9",
+  "source_head": "8c0ad1d34261ffdffd0695d8abbdfded182374b1",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
