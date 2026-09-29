@@ -7,7 +7,7 @@
 
 **Updated:** 2026-09-29, from local Git state, source inspection and retained
 receipts. After requesting the refresh, the user explicitly said "Set the
-goal and go." The end-to-end goal is active; execution is in task A below.
+goal and go." The end-to-end goal is active; execution now prioritizes task C under the user-requested reset below; A remains unaccepted.
 
 **Goal:** Complete the accepted AArch64/macOS EL1 migration,
 with one authoritative owner and one semantic implementation per object,
@@ -189,11 +189,37 @@ and saving recoverable state. Never sweep shared probe/build storage.
 
 ## Execution order and review focus
 
-The next authorized implementation proposal is **A**, followed by **B**, **C**,
-then **D**. This preserves the handoff's bounded overlap between memory and IPC;
-C does not mean checkpoint 3 is complete before memory closes. Later stages
-remain part of the denominator but get bounded briefs from live source when
-reached, rather than speculative interfaces now.
+**Priority reset, explicitly requested by the user on 2026-09-29:** stop the
+expanding deferred-capture investigation and resume work on guest capabilities.
+Task A remains an acceptance blocker, but unresolved historical attribution
+and additional race fixtures are not dependencies of every development edit.
+Do not mark A accepted or merge its unqualified candidate to main.
+
+The immediate development frontier is **C: the pipe/eventfd vertical**. Review
+and compile the existing adapter/host/fixture integration, complete the actual
+blocking continuation and descriptor-lifetime gaps, then turn the five named
+signed witnesses green with nonzero guest parks and the required exit/work
+bounds. Reuse existing implementations. Establish any concrete prerequisite
+from source before pulling it in; do not require all of B or A by assumption.
+A development integration is explicitly unaccepted until its applicable gates
+pass. A newly reproduced lifecycle failure on this path is a direct blocker
+and receives a bounded reduction; the old failure is not silently dismissed.
+
+Then join **B and D** into the memory ownership milestone: reviewed descriptor,
+COW and elastic-return foundations, reservation authority and production
+routing, copyout/backend writers, and finally host pause removal. Keep all E
+ownership stages and final conformance/cost acceptance in scope; x86 stays
+deferred. This changes development order, not completion requirements.
+
+Progress is measured by guest capability and removed host ownership, not
+commits, receipt count or added hooks. Work on one vertical at a time. Before
+adding infrastructure, identify the acceptance test it directly enables and
+why the existing mechanisms cannot do so. After two failed fixture designs or
+a work session without new discriminating evidence, reassess the dependency
+and choose another independent high-impact action; preserve the open blocker.
+Batch inventory/full-CI/artifact promotion at stable integration boundaries.
+Use focused checks during development; never reuse old receipts as proof of
+a new artifact. Do not add a second audit or hook merely to validate the first.
 
 Review focus across every slice: exact task/MM/record generation after reuse;
 two live processes with overlapping VAs and independent identity; partial I/O
@@ -203,7 +229,9 @@ must provide those witnesses where applicable.
 
 ### A. Close batch-3 lifecycle blockers
 
-Next bounded proof: [signed deferred handback ordering](2026-09-29-el1-signed-handback-proof.md).
+Deferred investigation: [signed deferred handback ordering](2026-09-29-el1-signed-handback-proof.md).
+Resume only for an explicit acceptance dependency or a concrete failure in the
+active vertical; do not keep adding trigger experiments as the main work.
 The capture hook is implemented with VM-free red/green and lock-release
 controls. Its first signed two-process trigger failed with zero captures
 on `497096b2f`; retain that fixture failure and establish actual queued-record
@@ -326,6 +354,7 @@ Protect/Retire/CowRepoint/ForkArm machinery is not full production ownership.
 
 ### C. Complete the pipe/eventfd vertical
 
+**Current implementation priority after the user-requested reset.**
 Consumes reviewed adapter, host and fixture branches; produces live in-guest
 pipe/eventfd service with exact descriptor/operation lifetime. Checkpoint 3
 still includes the broader work in E.
