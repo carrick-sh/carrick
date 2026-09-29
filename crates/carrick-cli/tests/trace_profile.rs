@@ -44,6 +44,17 @@ fn carrier_low_rate_program_sha256() -> String {
     )
 }
 
+const HVP_CARRIER_CPU_ATTR_PROGRAM: &str =
+    include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-attribution.d");
+
+fn carrier_cpu_attr_program_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(HVP_CARRIER_CPU_ATTR_PROGRAM.as_bytes())
+    )
+}
+
 fn amp1_stream() -> String {
     AMP1_FIXTURE
         .replace("@PROGRAM_SHA256@", &amp1_program_sha256())
@@ -133,6 +144,144 @@ fn hvpatch_carrier_low_rate_requires_a_retained_raw_capture() {
             "trace",
             "--profile",
             "hvpatch-carrier-cpu-low-rate",
+            "--",
+            "run-elf",
+            "/tmp/fixture",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("requires --trace-out"));
+}
+
+fn carrier_cpu_attr_stream() -> String {
+    [
+        &format!(
+            "HVPCARRIERATTR|header|program_sha256={}",
+            carrier_cpu_attr_program_sha256()
+        ),
+        "HVPCARRIERATTR|image|host_pid=4242|text_base=0x104664000|slide=0x4664000",
+        "HVPCARRIERATTR|summary|status=ok|root_exited=1|bounded=0|errors=0|saw_sample=1",
+        "HVPCARRIERATTR|sample-population|count=13",
+        "HVPCARRIERATTR|section=user-stacks",
+        "              carrick`hv_vcpu_run+0x10",
+        "              2",
+        "",
+        "              carrick`carrick_kernel::dispatch::fs::sys_openat+0x20",
+        "              2",
+        "",
+        "              carrick`carrick_kernel::dispatch::mem::handle_guest_page_fault+0x10",
+        "              2",
+        "",
+        "              carrick`carrick_kernel::dispatch::mem::handle_cow_fault+0x10",
+        "              2",
+        "",
+        "              carrick`carrick_kernel::dispatch::mem::handle_frame_grant+0x10",
+        "              1",
+        "",
+        "              carrick`carrick_kernel::dispatch::mem::stage2_alias_map+0x10",
+        "              1",
+        "",
+        "              carrick`carrick_kernel::dispatch::mailbox::handle_el1_mailbox+0x10",
+        "              1",
+        "",
+        "              carrick`carrick_runtime::executor::schedule+0x10",
+        "              1",
+        "",
+        "              libsystem_kernel.dylib`__psynch_cvwait+0x8",
+        "              1",
+        "",
+    ]
+    .join("\n")
+}
+
+fn validate_carrier_cpu_attr(contents: &str, extra_args: &[&str]) -> assert_cmd::assert::Assert {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
+    let mut command = cli();
+    command
+        .arg("__hvpatch-carrier-cpu-attribution-validate")
+        .arg("--input")
+        .arg(file.path())
+        .args(extra_args);
+    command.assert()
+}
+
+#[test]
+fn hvpatch_carrier_cpu_attribution_accepts_only_a_closed_complete_stack_population() {
+    validate_carrier_cpu_attr(&carrier_cpu_attr_stream(), &[])
+        .success()
+        .stdout(contains("HVPCARRIERATTR_VALID samples=13"));
+
+    for corrupt in [
+        carrier_cpu_attr_stream().replace("root_exited=1", "root_exited=0"),
+        carrier_cpu_attr_stream().replace("bounded=0", "bounded=1"),
+        carrier_cpu_attr_stream().replace("errors=0", "errors=1"),
+        carrier_cpu_attr_stream().replace("saw_sample=1", "saw_sample=0"),
+        carrier_cpu_attr_stream().replace(&carrier_cpu_attr_program_sha256(), &"00".repeat(32)),
+        carrier_cpu_attr_stream()
+            .replace("sample-population|count=13", "sample-population|count=12"),
+        carrier_cpu_attr_stream().replace("              2\n", ""),
+    ] {
+        validate_carrier_cpu_attr(&corrupt, &[]).failure();
+    }
+
+    validate_carrier_cpu_attr(&carrier_cpu_attr_stream(), &["--aggregation-drops", "1"])
+        .failure()
+        .stderr(contains("not lossless"));
+}
+
+#[test]
+fn hvpatch_carrier_cpu_attribution_fails_closed_on_100_percent_other() {
+    let p_sha = carrier_cpu_attr_program_sha256();
+    let stream = [
+        &format!("HVPCARRIERATTR|header|program_sha256={p_sha}"),
+        "HVPCARRIERATTR|image|host_pid=4242|text_base=0x104664000|slide=0x4664000",
+        "HVPCARRIERATTR|summary|status=ok|root_exited=1|bounded=0|errors=0|saw_sample=1",
+        "HVPCARRIERATTR|sample-population|count=10",
+        "HVPCARRIERATTR|section=usdt-metrics",
+        "HVPCARRIERATTR|section=user-stacks",
+        "              0xdeadbeef",
+        "              10",
+        "",
+    ]
+    .join("\n");
+
+    validate_carrier_cpu_attr(&stream, &[])
+        .failure()
+        .stderr(contains("attribution failed closed"));
+}
+
+#[test]
+fn hvpatch_carrier_cpu_attribution_accepts_real_captured_python_trace() {
+    let trace_path = std::path::Path::new("target/cpa-python.trace");
+    if !trace_path.exists() {
+        return;
+    }
+    let mut command = cli();
+    command
+        .arg("__hvpatch-carrier-cpu-attribution-validate")
+        .arg("--input")
+        .arg(trace_path);
+    command
+        .assert()
+        .success()
+        .stdout(contains("HVPCARRIERATTR_VALID samples=1601"));
+}
+
+#[test]
+fn hvpatch_carrier_cpu_attribution_requires_a_retained_raw_capture() {
+    assert_eq!(
+        HVP_CARRIER_CPU_ATTR_PROGRAM
+            .matches("/* CARRICK_HVPCARRIERCPUATTR_PROGRAM_SHA256 */")
+            .count(),
+        1,
+        "the Rust launcher must render exactly one immutable-template digest slot"
+    );
+    cli()
+        .args([
+            "trace",
+            "--profile",
+            "hvpatch-carrier-cpu-attribution",
             "--",
             "run-elf",
             "/tmp/fixture",
