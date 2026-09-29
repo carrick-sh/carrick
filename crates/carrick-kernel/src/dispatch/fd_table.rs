@@ -171,7 +171,7 @@ pub(crate) struct EventFdState {
     owner: Arc<crate::el1_ipc::HostIpc>,
     object: carrick_el1_abi::ipc::IpcObjectHandle,
     lifetime: Mutex<Option<EventFdObject>>,
-    pub(super) wait_queue: Arc<crate::kernel::WaitQueue>,
+    pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 impl EventFdState {
     pub(super) fn create(
@@ -234,7 +234,7 @@ impl EventFdState {
             _ => carrick_fatal!("ipc::eventfd", "invalid eventfd operation"),
         })
     }
-    pub(super) fn read_with(&self, copy: impl FnOnce(u64) -> bool) -> Result<u64, LinuxErrno> {
+    pub(crate) fn read_with(&self, copy: impl FnOnce(u64) -> bool) -> Result<u64, LinuxErrno> {
         let region = self.owner.region();
         let mut guard = region
             .lock(self.object, &crate::el1_zone::HostLockWait)
@@ -253,7 +253,7 @@ impl EventFdState {
         }
         self.finish(guard, step)
     }
-    pub(super) fn write_value(&self, value: u64) -> Result<(), LinuxErrno> {
+    pub(crate) fn write_value(&self, value: u64) -> Result<(), LinuxErrno> {
         let region = self.owner.region();
         let mut guard = region
             .lock(self.object, &crate::el1_zone::HostLockWait)
