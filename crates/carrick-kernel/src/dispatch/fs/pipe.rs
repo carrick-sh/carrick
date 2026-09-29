@@ -254,7 +254,7 @@ impl PipeInner {
     #[cfg(test)]
     pub(crate) fn new_connected(pipe_id: u64, capacity: usize) -> Self {
         let mut pipe = Self::new(pipe_id, capacity);
-        pipe.fixture = std::mem::replace(pipe.initial.get_mut(), [None, None]);
+        pipe.fixture = std::mem::take(pipe.initial.get_mut());
         pipe
     }
     #[cfg(test)]

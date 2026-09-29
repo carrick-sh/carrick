@@ -6429,7 +6429,7 @@ impl TestPipePair {
         let make_pair = |pipe: &PipeRef, r_flags, w_flags| {
             let desc = |flags, is_reader| {
                 let mut base = OpenDescriptionBase::new(flags);
-                base.set_shared_pipe(Arc::clone(&pipe));
+                base.set_shared_pipe(Arc::clone(pipe));
                 let d = if is_reader {
                     OpenDescription::PipeReader {
                         base,
