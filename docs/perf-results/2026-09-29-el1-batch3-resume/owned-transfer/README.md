@@ -47,3 +47,9 @@ scheduler handback wake targeting. Do not infer those are safe from the new
 producer token. No historical Python/otmp attribution, WorkObservation
 binding, fresh signed gate, complete batch acceptance or performance closure
 is claimed. The earlier signed receipt at 40a707ba0 belongs to older code.
+
+Implementation: `8c0ad1d34`; provenance refresh: `c90cc8a98`. All 595
+authority identities were retained; one source position and two K1 line
+entries moved. Exact contract-change coverage passed. `just lint-domains`
+passed at the refreshed checkpoint; compiler authority remains the macOS
+subset, with Linux/FreeBSD/NetBSD profiles pending.
