@@ -13,6 +13,9 @@
 
 mod common;
 
+#[path = "../../../fixtures/embed-el1-sched/src/sample_buffer.rs"]
+mod sample_buffer;
+
 use std::time::Duration;
 
 use carrick_abi::{NsGid, NsUid};
@@ -23,6 +26,18 @@ use carrick_embed::{
 };
 
 const FIXTURE: &str = "/opt/carrick/el1-sched";
+
+#[test]
+fn measured_sample_backing_is_fixed_across_short_and_long_runs() {
+    for (short, long) in [(5_000, 55_000), (200, 1_200)] {
+        let short_samples = sample_buffer::measured_samples(short, long);
+        let long_samples = sample_buffer::measured_samples(long, long);
+        assert_eq!(short_samples.capacity(), long_samples.capacity());
+        assert!(short_samples.capacity() >= long);
+        assert!(short_samples.is_empty());
+        assert!(long_samples.is_empty());
+    }
+}
 
 fn carrier_or_fail() -> Carrier {
     for _ in 0..50 {
@@ -413,11 +428,8 @@ fn el1_sched_futex_handoff_has_no_host_exits() {
         );
         worst_exits_per_rt = worst_exits_per_rt.max(exits_per_rt);
     }
-    // WEAKENED 2026-09-27 (owner-approved): was < 0.01; measured 0.0121 at load
-    // average 16 during the EL1 correctness landing (0.0039 in the paired run).
-    // Restore once measured on a quiet host.
     assert!(
-        worst_exits_per_rt < 0.05,
+        worst_exits_per_rt < 0.01,
         "a futex handoff between two guest threads cost {worst_exits_per_rt:.3} host exits \
          per round trip; the in-guest (EL1) handoff must cost none in steady state"
     );
@@ -640,10 +652,8 @@ fn el1_sched_timed_wait_times_out_in_guest() {
         );
         worst = worst.max(exits_per_wait);
     }
-    // WEAKENED 2026-09-27 (owner-approved): was < 0.01; measured 0.010 on a loaded
-    // host during the EL1 correctness landing. Restore once rerun on a quiet host.
     assert!(
-        worst < 0.05,
+        worst < 0.01,
         "a timed futex wait cost {worst:.3} host exits; EL1 must end it on the virtual timer"
     );
 }
