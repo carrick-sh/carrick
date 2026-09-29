@@ -317,6 +317,7 @@ pub(crate) struct RetiredMmRootStage2 {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct MmAccessState {
+    pub(crate) host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     native_activation_leaf_checks: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -580,6 +581,7 @@ impl MmAccessState {
         >,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
+            host_cow_stats: crate::hvf_aarch64_engine::HostCowStats::default(),
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             native_activation_leaf_checks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -1847,6 +1849,8 @@ pub(crate) fn perform_foreign_cow_transaction(
     invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
     request: ForeignCowTransactionRequest<'_>,
 ) -> Result<CarrierForeignCowReceipt, carrick_hal::ForeignMmTransportError> {
+    require_host_cow_lane(&lease.state.page_tables_authority())
+        .map_err(|_| carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
     let ForeignCowTransactionRequest {
         invocation,
         requested,
@@ -2698,6 +2702,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         },
     });
     lease_guard.retained = committed.clone();
+    lease.state.host_cow_stats.record_host_cow_resolution();
     Ok(CarrierForeignCowReceipt {
         snapshot: committed,
         start: carrick_guest_mem::GuestVa(span.va),

@@ -926,6 +926,79 @@ fn foreign_cow_fingerprint(installed: &InstalledMm) -> (Vec<u8>, String, Vec<(u6
 }
 
 #[test]
+fn guest_owned_foreign_cow_and_sparse_replacement_refuse_without_mutation() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let child = install_mm(
+        &transport,
+        701,
+        0x9a01_1800_0000,
+        0x9b01_1800_0000,
+        *b"old!",
+    );
+    let peer = install_mm(
+        &transport,
+        702,
+        0x9a01_1900_0000,
+        0x9b01_1900_0000,
+        *b"peer",
+    );
+    let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+    child
+        .state
+        .page_tables_authority()
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let before = foreign_cow_fingerprint(&child);
+    let peer_before = foreign_cow_fingerprint(&peer);
+    let aliases_before = alias_registry().lock().ordered();
+    assert!(matches!(
+        lease.break_cow(
+            &mut invalidator,
+            &child.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
+    ));
+    assert_eq!(invalidator.calls, 0);
+
+    let mut authority = TestForeignCowAuthority::new(&child);
+    authority.allow_quiesce = true;
+    child.state.cow_runtime.write().as_mut().unwrap().authority = Arc::new(authority);
+    let identity = child.state.cow_runtime.read().as_ref().unwrap().identity;
+    let context = sparse_materialization::PublicationContext::for_local(
+        child.state.clone(),
+        Arc::clone(legacy_test_carrier_vm_custody_arc()),
+        identity,
+    )
+    .unwrap();
+    assert!(
+        sparse_materialization::publish_replacing(
+            &context,
+            TEST_VA,
+            TEST_VA + 4096,
+            SparseExtentBacking::SeededAnon { bytes: b"next" },
+            &mut || panic!("guest lane must not publish host descriptors"),
+            &mut || panic!("guest lane must not retire old backing"),
+        )
+        .is_err()
+    );
+    assert_eq!(foreign_cow_fingerprint(&child), before);
+    assert_eq!(foreign_cow_fingerprint(&peer), peer_before);
+    assert_eq!(alias_registry().lock().ordered(), aliases_before);
+    assert_eq!(child.state.host_cow_stats.host_cow_resolutions(), 0);
+    assert_eq!(peer.state.host_cow_stats.host_cow_resolutions(), 0);
+    let mut bytes = [0; 4];
+    read_installed(&transport, &child, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"old!");
+    read_installed(&transport, &peer, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"peer");
+}
+
+#[test]
 fn sparse_replacement_failure_preserves_preimage_before_retirement() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();
@@ -1024,6 +1097,7 @@ fn foreign_cow_write_keeps_the_shared_parent_owner_unchanged() {
         )
         .expect("foreign child COW");
     assert_eq!(invalidator.calls, 1);
+    assert_eq!(child.state.host_cow_stats.host_cow_resolutions(), 1);
     let old_key = child.owners.0[1];
     let mut parent_bytes = [0_u8; 4];
     copy_from_pinned_owner(
