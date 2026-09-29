@@ -8,6 +8,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+#[path = "reservations/storage.rs"]
 mod storage;
 pub use storage::ResolvedReservationNodes;
 
