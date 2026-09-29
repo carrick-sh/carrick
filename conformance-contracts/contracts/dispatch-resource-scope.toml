@@ -1,0 +1,17 @@
+schema_version = 1
+id = "kernel.dispatch.resource-scope"
+title = "Warm syscall scope retains exact resource bundles without eager member clones"
+guest_surfaces = ["kernel:syscall-dispatch", "syscall:getuid", "syscall:getppid"]
+semantic_authority = ["man 2 getuid", "man 2 getppid", "Carrick exact captured task and file-table lease contracts"]
+fixture = "unit:ordinary_scope_retains_bundles_without_cloning_each_resource"
+scale_points = [1, 8, 32, 128]
+structural_budgets = []
+rationale = "A warm ordinary syscall retains the captured ThreadResources, TaskShared and Task, borrows the original file table for its functional lease, and clones no credentials, filesystem context, MM or file-table member at scope entry. The VM-free test enforces exact strong-reference deltas and resource identity at every scale point. The functional lease remains mandatory for exec retirement and owned host waits."
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::resources::tests::ordinary_scope_retains_bundles_without_cloning_each_resource"
+
+[bindings.unresolved]
+embed_structural = "The director owns signed carrier binding and exact-artifact verification."
+docker = "The director owns paired workload timing against native arm64 Docker."
+observation = "The direct Arc strong-count budget is not yet emitted as a versioned WorkObservation; the current WorkMetric taxonomy has no resource-Arc-clone metric."
