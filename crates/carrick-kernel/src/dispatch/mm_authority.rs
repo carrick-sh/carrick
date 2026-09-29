@@ -22,6 +22,8 @@ pub use super::mm_mutation::MmTransactionGuard;
 /// MM receives an exact fork-private authority.
 pub struct DispatchMmAuthority {
     pub(crate) mm_id: crate::kernel::MmId,
+    pub(in crate::dispatch) reservation_provider:
+        Mutex<mem::el1_reservations::ReservationProviderSlot>,
     pub(crate) mem: Arc<mem::MemAuthority>,
     pub(crate) host_alias_transactions: Arc<HostAliasTransactions>,
     pub(crate) mutation_coordinator: Arc<mm_mutation::MmMutationCoordinator>,
@@ -48,6 +50,7 @@ impl DispatchMmAuthority {
     pub(in crate::dispatch) fn new(mm_id: crate::kernel::MmId) -> Self {
         Self {
             mm_id,
+            reservation_provider: Mutex::default(),
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
@@ -60,6 +63,7 @@ impl DispatchMmAuthority {
     pub(in crate::dispatch) fn fork_private(&self, mm_id: crate::kernel::MmId) -> Self {
         Self {
             mm_id,
+            reservation_provider: Mutex::new(self.reservation_provider.lock().inherited()),
             mem: self.mem.fork_private(),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
@@ -80,6 +84,7 @@ impl DispatchMmAuthority {
     pub(in crate::dispatch) fn rebind_prepared_root(&self, mm_id: crate::kernel::MmId) -> Self {
         Self {
             mm_id,
+            reservation_provider: Mutex::new(self.reservation_provider.lock().inherited()),
             mem: Arc::clone(&self.mem),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
@@ -107,6 +112,7 @@ impl DispatchMmAuthority {
         Ok((
             Self {
                 mm_id,
+                reservation_provider: Mutex::new(self.reservation_provider.lock().inherited()),
                 mem: Arc::new(forked_mem),
                 host_alias_transactions: Arc::new(HostAliasTransactions::new()),
                 mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
@@ -151,6 +157,7 @@ impl DispatchMmAuthority {
         let mm_id = crate::kernel::MmId::from_registry_allocation(std::num::NonZeroU64::MIN);
         Self {
             mm_id,
+            reservation_provider: Mutex::default(),
             mem: Arc::new(mem::MemAuthority::with_revision(
                 mem::MemState::new(),
                 revision,
@@ -463,6 +470,7 @@ impl MmExecutorParticipation {
         ttbr0: u64,
         ttbr1: u64,
     ) -> Option<crate::kernel::AddressSpacePublication> {
+        self.authority.seal_reservation_provider();
         let (brk_current, mmap_next) = {
             let state = self.authority.mem.lock();
             (state.brk_current(), state.mmap_next)
@@ -1360,5 +1368,84 @@ mod mm_transaction_tests {
             2,
             "exactly two MmTransactionGuard construction sites: begin_transaction and terminal_process_transaction"
         );
+    }
+}
+
+#[cfg(test)]
+mod reservation_provider_tests {
+    use super::*;
+    use crate::dispatch::mem::el1_reservations::{
+        HostReservationProvider, PreparedHostReservations,
+    };
+    use carrick_el1::memory::reservations::Refusal;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Provider(Arc<AtomicUsize>);
+    impl HostReservationProvider for Provider {
+        fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(Refusal::MetadataRequired)
+        }
+    }
+    fn mm(raw: u64) -> crate::kernel::MmId {
+        crate::kernel::MmId::from_registry_allocation(std::num::NonZeroU64::new(raw).unwrap())
+    }
+
+    #[test]
+    fn reservation_provider_installation_is_exact_once_and_prepublication() {
+        let authority = DispatchMmAuthority::new(mm(41));
+        assert!(matches!(
+            authority.prepare_el1_reservations(),
+            Err(Refusal::ForeignMapping)
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            authority.install_reservation_provider(Arc::new(Provider(calls.clone()))),
+            Ok(())
+        );
+        assert_eq!(
+            authority.install_reservation_provider(Arc::new(Provider(calls.clone()))),
+            Err(Refusal::Collision)
+        );
+        assert!(matches!(
+            authority.prepare_el1_reservations(),
+            Err(Refusal::MetadataRequired)
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let late = DispatchMmAuthority::new(mm(42));
+        late.seal_reservation_provider();
+        assert_eq!(
+            late.install_reservation_provider(Arc::new(Provider(calls))),
+            Err(Refusal::Stale)
+        );
+    }
+
+    #[test]
+    fn reservation_provider_survives_fork_rebind_and_exec_staging_without_copying_roots() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let parent = Arc::new(DispatchMmAuthority::new(mm(51)));
+        parent
+            .install_reservation_provider(Arc::new(Provider(calls.clone())))
+            .unwrap();
+        parent.seal_reservation_provider();
+        let child = parent.fork_private(mm(52));
+        let rebound = parent.rebind_prepared_root(mm(53));
+        let binding = DispatchMmBinding::new(Arc::clone(&parent));
+        let staged = binding.stage_private_exec(mm(54));
+        for authority in [&*parent, &child, &rebound, &*staged.staged] {
+            assert!(matches!(
+                authority.prepare_el1_reservations(),
+                Err(Refusal::MetadataRequired)
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        drop(staged);
+        assert!(Arc::ptr_eq(&binding.current.load_full(), &parent));
+        assert_eq!(binding.current.load().mm_id, mm(51));
+        assert!(matches!(
+            parent.prepare_el1_reservations(),
+            Err(Refusal::MetadataRequired)
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
     }
 }
