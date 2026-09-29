@@ -171,6 +171,9 @@ where
             }
         }
     }));
+    // Stopped, closed or dead, this executor comes back to no vCPU: nothing
+    // may wait on the slot it drove.
+    backend::leave_driven_zone_slot();
     let mut retired = false;
     let mut failure = match lifecycle {
         Ok(Ok(())) => None,
@@ -1489,9 +1492,11 @@ fn next_runnable<F: PersistentExecutor>(
     zone.sweep_cancelled(slot);
     carrick_kernel::el1_zone::hand_back_wanted(slot);
     if registration.is_spare() {
-        // A spare may park on the host for a guest CPU to be lent to it:
-        // nothing may wait on its stopped vCPU meanwhile.
-        carrick_kernel::el1_zone::retire_slot(slot);
+        // No guest CPU runs this vCPU: nothing queued on it is this
+        // executor's to claim now. It parks on the run queue until it
+        // borrows a CPU, and gives up its slot before it sleeps
+        // (`ExecutorKick::parking_spare`), so nothing waits there for it.
+        return Ok(scheduler.try_take(registration)?);
     }
     if let Some(record) = zone.take_service_head(slot) {
         if zone.record(record).handback() != Some(carrick_el1_abi::Handback::Service) {

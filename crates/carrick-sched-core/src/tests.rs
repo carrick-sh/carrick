@@ -23,6 +23,8 @@ impl LockWait for HostWait {
 /// its published slot state and, as the host's occupancy authority does,
 /// the slot's occupancy word.
 fn host_publish(zone: &ZoneTables, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
+    // The executor that loads it drives the slot (one executor per slot).
+    zone.drive(slot, u64::from(slot.raw()) + 1);
     zone.publish_slot(slot, mm, cpu, affinity);
     let here = ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
@@ -1206,7 +1208,7 @@ fn only_the_executor_still_driving_a_slot_vacates_it() {
     let zone = zone();
     enter(&zone, OTHER, 1);
     enter(&zone, SLOT, 0);
-    zone.set_driver(SLOT, 7);
+    zone.drive(SLOT, 7);
     let service = service_record(&zone, 5);
     zone.leave_guest(SLOT, &HostWait);
     zone.leave_guest(OTHER, &HostWait);
@@ -1217,7 +1219,7 @@ fn only_the_executor_still_driving_a_slot_vacates_it() {
     let mut taken = Vec::new();
     let mut placed = Vec::new();
     // Another executor drives the slot now: nothing happens.
-    zone.set_driver(SLOT, 9);
+    zone.drive(SLOT, 9);
     assert!(!zone.leave_slot(SLOT, 7, &mut |r| taken.push(r), &mut |p| placed.push(p)));
     assert_eq!(zone.runnable_head(SLOT), Some(service));
     // The executor still driving it leaves: the queue goes, the slot is
@@ -1226,6 +1228,67 @@ fn only_the_executor_still_driving_a_slot_vacates_it() {
     assert_eq!(taken, [service]);
     assert_eq!(zone.runnable_head(SLOT), None);
     assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(OTHER));
+}
+
+/// Contract kernel.el1.slot-liveness: a slot takes work that needs an
+/// executor only while an executor that comes back to it drives it.
+/// Publishing a slot or entering its vCPU says nothing about who comes back
+/// (the host publishes as it loads, EL1 state follows the vCPU): only a drive
+/// makes a slot live.
+#[test]
+fn only_a_drive_makes_a_slot_live() {
+    let zone = zone();
+    assert!(zone.reset_slot(SLOT));
+    zone.publish_slot(SLOT, MM, Some(0), 0);
+    zone.enter_guest(SLOT);
+    zone.leave_guest(SLOT, &HostWait);
+    assert!(!zone.slot(SLOT).is_live());
+    let service = service_record(&zone, 5);
+    assert_eq!(
+        zone.place_from_host(service),
+        None,
+        "nobody drives the slot"
+    );
+    zone.drive(SLOT, 7);
+    assert!(zone.slot(SLOT).is_live());
+    assert_eq!(zone.slot(SLOT).driver(), Some(7));
+    assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(SLOT));
+}
+
+/// Contract kernel.el1.slot-liveness: an executor that steps away for a
+/// blocking host wait keeps its slot but takes no new work there until it
+/// steps back; a service thread nobody else takes may wait for it. Only the
+/// executor driving the slot steps away or back: a stale executor whose
+/// slot another executor drove and left must not make it live again.
+#[test]
+fn only_its_driver_steps_away_from_and_back_to_a_slot() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    zone.drive(SLOT, 7);
+    zone.leave_guest(SLOT, &HostWait);
+    let mut taken = Vec::new();
+    let mut placed = Vec::new();
+    assert!(!zone.step_away(SLOT, 9, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert!(zone.slot(SLOT).is_live());
+    assert!(zone.step_away(SLOT, 7, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert!(!zone.slot(SLOT).is_live());
+    assert_eq!(zone.slot(SLOT).driver(), Some(7), "away, not gone");
+    let service = service_record(&zone, 5);
+    assert_eq!(zone.place_from_host(service), None);
+    assert!(zone.requeue_on(SLOT, service), "it waits for its driver");
+    zone.step_back(SLOT, 9);
+    assert!(!zone.slot(SLOT).is_live());
+    zone.step_back(SLOT, 7);
+    assert!(zone.slot(SLOT).is_live());
+    assert_eq!(zone.take_service_head(SLOT), Some(service));
+
+    // Another executor drives the slot, then leaves it: the first one's
+    // late return finds nothing to come back to.
+    zone.drive(SLOT, 9);
+    assert!(zone.leave_slot(SLOT, 9, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    zone.step_back(SLOT, 7);
+    assert!(!zone.slot(SLOT).is_live());
+    assert_eq!(zone.slot(SLOT).driver(), None);
 }
 
 /// Contract `kernel.el1.address-space-switch`: the Dekker pair between EL1
