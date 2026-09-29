@@ -189,6 +189,56 @@ and saving recoverable state. Never sweep shared probe/build storage.
 
 ## Execution order and review focus
 
+### Immediate deliverable and drift check
+
+The next deliverable is a real signed pipe/eventfd round trip through EL1,
+with production FileTable publication and observed guest execution. The
+existing helper/core tests are prerequisites, not this deliverable. No new
+checkpoint has been accepted by the IPC development commits.
+
+Execute these steps in order:
+1. Connect HostTable to the real FileTable: complete initial namespace,
+   implicit stdio, incremental mutation, fork/exec and functional retirement.
+   A partially published namespace is invalid because missing slots become
+   guest EBADF rather than host forwarding. Reuse the existing shared core.
+2. Run one honest signed end-to-end pipe/eventfd witness using actual
+   execution observations. Repair the existing fixture's fabricated reports;
+   do not build a new diagnostic framework. This first witness demonstrates
+   routing only, not acceptance of the vertical.
+3. Expand to the five required lifetime, wake, mixed-venue, round-trip and
+   signal/partial-progress witnesses, then qualify the stable integration.
+4. Continue B+D memory ownership, followed by E and final ARM64 acceptance.
+
+At each progress interval report whether production routing advanced, a
+directly blocking defect was eliminated, or only supporting work occurred.
+Two consecutive supporting-only intervals require an explicit dependency
+review and course correction; passing helper tests alone do not reset this
+counter. Historical lifecycle investigations stay off this development path
+unless a concrete failure or acceptance dependency requires them. Preserve
+their unresolved acceptance status. No repeated full-suite runs on unchanged
+code and no infrastructure expansion without a named blocked execution step.
+
+Latest development observation: adapter commit `5cc3b64a6` connects HostTable
+to production FileTable publication and mutation/retirement. Boot and syscall
+entry attempt admission only into the exact Kernel's mapped IPC window.
+Initial namespace admission is complete; incremental updates touch changed
+slots and grow geometrically. Refused admission withdraws the whole projection
+and forwards that table, without rescanning it on every syscall. Fork/exec
+namespaces independently admit their complete snapshot.
+
+The red-first table witness, fork/exec/refusal checks and real dispatcher
+eventfd/shared-view check pass. `just test-kernel` passes (2,198 kernel tests,
+one existing ignore, then semantics suites); serial host 138/138; affected
+Clippy passes. A stale eventfd test expected F_SETFL to erase O_RDWR; corrected
+against retained native-Linux evidence, with its failed run preserved. Exact-
+owner host-token retirement also fixes the reproduced handback leak.
+
+The first honest signed routing witness is now building/running on source
+`5cc3b64a6`, run ID `el1-ipc-routing-20260929-a`. It checks 1,024 pipe and
+1,024 eventfd round trips and reads real whole-run served/forwarded counters.
+No signed result, scoped zero-exit budget, park/wake proof or checkpoint
+acceptance is claimed yet. Main remains unchanged; x86 remains deferred.
+
 **Priority reset, explicitly requested by the user on 2026-09-29:** stop the
 expanding deferred-capture investigation and resume work on guest capabilities.
 Task A remains an acceptance blocker, but unresolved historical attribution
