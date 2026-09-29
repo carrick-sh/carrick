@@ -3517,6 +3517,11 @@ impl SyscallDispatcher {
     }
 
     #[inline]
+    pub(in crate::dispatch) fn detach_open_file_from_epolls(&self, fd: i32, open_file: &OpenFile) {
+        self.net_view().detach_open_file_from_epolls(fd, open_file);
+    }
+
+    #[inline]
     pub(in crate::dispatch) fn host_socket_lookup(
         &self,
         fd: i32,

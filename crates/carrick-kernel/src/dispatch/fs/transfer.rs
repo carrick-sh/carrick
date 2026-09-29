@@ -359,15 +359,16 @@ impl<'a> FsView<'a> {
         let Some(file) = self.open_file(guest_fd) else {
             return;
         };
-        if file.description.fd_ref_count() == 1
-            && !file
-                .description
-                .common()
-                .splice_pushback()
-                .lock()
-                .is_empty()
+        Self::discard_splice_pushback_for_description(&file.description);
+    }
+
+    pub(in crate::dispatch) fn discard_splice_pushback_for_description(
+        description: &crate::kernel::FileDescription,
+    ) {
+        if description.fd_ref_count() == 1
+            && !description.common().splice_pushback().lock().is_empty()
         {
-            file.description.clear_splice_pushback();
+            description.clear_splice_pushback();
         }
     }
 

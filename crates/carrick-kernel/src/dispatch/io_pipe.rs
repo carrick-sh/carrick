@@ -15,10 +15,46 @@ use super::fd_table::{HostFdRef, HostWriteKind};
 use super::fs;
 use super::outcome::{BlockingWrite, DispatchOutcome, FdWaitCompletion};
 use super::wait_authority::{WaitFdAuthority, WaitFds};
+use crate::kernel::objects::FileSlotAuthority;
 use carrick_vfs::errno::HostSyscallResult as _;
 
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
 const SMALL_HOST_READ_BUF: usize = 8192;
+
+/// Deferred readiness authority for a host pipe operation.
+///
+/// Avoids allocating heap buffers for `WaitFdAuthority` during routine,
+/// non-blocking forwarded reads and writes by retaining only the scalar
+/// `FileSlotAuthority` until an operation actually returns `EAGAIN` / `EINTR`.
+#[derive(Clone, Debug)]
+pub(crate) enum HostPipeAuthority {
+    Full(WaitFdAuthority),
+    Slot(FileSlotAuthority),
+}
+
+impl HostPipeAuthority {
+    #[inline]
+    pub(crate) fn into_wait_authority(self) -> WaitFdAuthority {
+        match self {
+            Self::Full(auth) => auth,
+            Self::Slot(slot) => WaitFdAuthority::logical(slot),
+        }
+    }
+}
+
+impl From<WaitFdAuthority> for HostPipeAuthority {
+    #[inline]
+    fn from(auth: WaitFdAuthority) -> Self {
+        Self::Full(auth)
+    }
+}
+
+impl From<FileSlotAuthority> for HostPipeAuthority {
+    #[inline]
+    fn from(slot: FileSlotAuthority) -> Self {
+        Self::Slot(slot)
+    }
+}
 
 /// Runner for host I/O operations that can block and need to release
 /// guest CPU (P) and MM participation via host-wait handoff.
@@ -33,7 +69,7 @@ pub(crate) struct HostPipeReadTarget<'a> {
     pub host_fd: i32,
     pub host_fd_owner: Option<HostFdRef>,
     pub nonblocking: bool,
-    pub authority: WaitFdAuthority,
+    pub authority: HostPipeAuthority,
     pub socket_flow: Option<&'a Arc<crate::kernel::UnixFlow>>,
     pub is_stream: bool,
     pub offset: Option<i64>,
@@ -45,13 +81,13 @@ impl<'a> HostPipeReadTarget<'a> {
         host_fd: i32,
         host_fd_owner: Option<HostFdRef>,
         nonblocking: bool,
-        authority: WaitFdAuthority,
+        authority: impl Into<HostPipeAuthority>,
     ) -> Self {
         Self {
             host_fd,
             host_fd_owner,
             nonblocking,
-            authority,
+            authority: authority.into(),
             socket_flow: None,
             is_stream: false,
             offset: None,
@@ -108,6 +144,8 @@ pub(crate) fn read_host_pipe_into(
     // or adoption sites; EAGAIN becomes WaitOnFds for blocking guest fds.
     let mut n = 0isize;
     let read_fn = |buf: &mut [u8]| -> isize {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_host_read();
         if let Some(flow) = socket_flow {
             let mut ledger = flow.lock_ledger();
             let n = unsafe {
@@ -166,7 +204,7 @@ pub(crate) fn read_host_pipe_into(
                 libc::POLLIN,
                 nonblocking,
                 host_fd_owner,
-                authority,
+                authority.into_wait_authority(),
             ));
         }
         return Ok(DispatchOutcome::Errno { errno: e });
@@ -246,6 +284,83 @@ pub(crate) fn read_host_pipe_at(
     read_host_pipe(memory, guest_addr, length, target.with_offset(offset))
 }
 
+fn read_host_pipe_direct(
+    buf: &mut [u8],
+    target: HostPipeReadTarget<'_>,
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
+    let HostPipeReadTarget {
+        host_fd,
+        host_fd_owner,
+        nonblocking,
+        authority,
+        socket_flow,
+        is_stream,
+        offset,
+        host_wait,
+    } = target;
+    let mut n = 0isize;
+    let read_fn = |buf: &mut [u8]| -> isize {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_host_read();
+        if let Some(flow) = socket_flow {
+            let mut ledger = flow.lock_ledger();
+            let n = unsafe {
+                match offset {
+                    Some(off) => libc::pread(
+                        host_fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        off as libc::off_t,
+                    ),
+                    None => libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()),
+                }
+            };
+            if n > 0 {
+                if is_stream {
+                    ledger.consume_stream(n as usize);
+                } else {
+                    ledger.consume_dgram();
+                }
+            }
+            drop(ledger);
+            n
+        } else {
+            unsafe {
+                match offset {
+                    Some(off) => libc::pread(
+                        host_fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        off as libc::off_t,
+                    ),
+                    None => libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()),
+                }
+            }
+        }
+    };
+    if let Some(hw) = host_wait {
+        hw.run_with_host_wait(&mut || {
+            n = read_fn(buf);
+        })?;
+    } else {
+        n = read_fn(buf);
+    }
+    crate::probes::host_pipe_io(host_fd, 0, n as i64);
+    if let Err(e) = n.host_syscall_errno() {
+        if e == LINUX_EAGAIN || e == LINUX_EINTR {
+            return Ok(would_block_outcome(
+                host_fd,
+                libc::POLLIN,
+                nonblocking,
+                host_fd_owner,
+                authority.into_wait_authority(),
+            ));
+        }
+        return Ok(DispatchOutcome::Errno { errno: e });
+    }
+    Ok(DispatchOutcome::returned_isize_or_errno(n))
+}
+
 pub(crate) fn read_host_pipe(
     memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
@@ -258,7 +373,19 @@ pub(crate) fn read_host_pipe(
     // Clamp to Linux's MAX_RW_COUNT before staging a host buffer; a huge guest
     // count would otherwise be a one-syscall OOM-abort of the runtime.
     let length = length.min(MAX_RW_COUNT);
-    if length <= SMALL_HOST_READ_BUF {
+    if let Some(host_ptr) = memory.host_ptr_for_write(guest_addr, length) {
+        let range = [carrick_guest_mem::HostWriteRange {
+            guest: carrick_guest_mem::GuestVa(guest_addr),
+            len: length,
+            host: carrick_guest_mem::HostVa(host_ptr as usize),
+        }];
+        let _host_write = match carrick_guest_mem::HostWriteGuard::new(memory, &range) {
+            Ok(g) => g,
+            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+        };
+        let buf = unsafe { std::slice::from_raw_parts_mut(host_ptr, length) };
+        read_host_pipe_direct(buf, target)
+    } else if length <= SMALL_HOST_READ_BUF {
         let mut buf = [0u8; SMALL_HOST_READ_BUF];
         read_host_pipe_into(memory, guest_addr, &mut buf[..length], target)
     } else {
@@ -281,7 +408,7 @@ pub struct HostPipeWriteTarget<'a> {
     pub(crate) pipe_state: Option<(i64, usize)>,
     pub(crate) tid: crate::thread::ThreadId,
     pub(crate) sigpipe_on_epipe: bool,
-    pub(crate) authority: WaitFdAuthority,
+    pub(crate) authority: HostPipeAuthority,
     /// The carrier's host-signal bridge: a pending unblocked signal ends a
     /// partially completed blocking write with the bytes so far.
     pub(crate) host_signal: &'a dyn carrick_hal::HostSignalBridge,
@@ -300,7 +427,7 @@ impl<'a> HostPipeWriteTarget<'a> {
         nonblocking: bool,
         write_kind: HostWriteKind,
         tid: crate::thread::ThreadId,
-        authority: WaitFdAuthority,
+        authority: impl Into<HostPipeAuthority>,
         host_signal: &'a dyn carrick_hal::HostSignalBridge,
     ) -> Self {
         Self {
@@ -311,7 +438,7 @@ impl<'a> HostPipeWriteTarget<'a> {
             pipe_state: None,
             tid,
             sigpipe_on_epipe: false,
-            authority,
+            authority: authority.into(),
             host_signal,
             socket_flow: None,
             socket_cred: None,
@@ -601,7 +728,7 @@ fn write_host_pipe_payload(
                         libc::POLLOUT,
                         nonblocking,
                         host_fd_owner.clone(),
-                        authority.clone(),
+                        authority.clone().into_wait_authority(),
                     ));
                 }
                 if nonblocking && offset == 0 && len <= 4096 && len > room {
@@ -610,7 +737,7 @@ fn write_host_pipe_payload(
                         libc::POLLOUT,
                         nonblocking,
                         host_fd_owner.clone(),
-                        authority.clone(),
+                        authority.clone().into_wait_authority(),
                     ));
                 }
                 len = len.min(room);
@@ -618,6 +745,8 @@ fn write_host_pipe_payload(
             // BLOCKING-IO-OK: host_fd was adopted O_NONBLOCK; EAGAIN routes to
             // the lockless wait path below.
             let write_fn = || -> isize {
+                #[cfg(test)]
+                crate::dispatch::budget_meter::record_host_write();
                 if let (Some(flow), Some(cred)) = (&socket_flow, socket_cred) {
                     let mut ledger = flow.lock_ledger();
                     let n = unsafe {
@@ -720,7 +849,7 @@ fn write_host_pipe_payload(
                     libc::POLLOUT,
                     nonblocking,
                     host_fd_owner.clone(),
-                    authority.clone(),
+                    authority.clone().into_wait_authority(),
                 ));
             }
             // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
@@ -766,7 +895,7 @@ fn write_host_pipe_payload(
                     libc::POLLOUT,
                     nonblocking,
                     host_fd_owner.clone(),
-                    authority.clone(),
+                    authority.clone().into_wait_authority(),
                 ));
             }
             return Ok(DispatchOutcome::Errno { errno: e });

@@ -179,6 +179,7 @@ pub(crate) struct FsState {
     /// same-process create/delete/rename cases exercised by LTP by piggybacking
     /// on the existing dispatch-layer mutation hooks.
     pub(in crate::dispatch) dnotify_registry: parking_lot::Mutex<Vec<DnotifyRegistration>>,
+    pub(in crate::dispatch) dnotify_active: std::sync::atomic::AtomicBool,
 
     /// Fork-coherent cache of `resolve_at_path` results (guest AT_FDCWD
     /// absolute path -> canonical host-side path). Under `--fs host` a resolve
@@ -660,6 +661,7 @@ impl FsState {
             inotify_registry: crate::inotify::InotifyRegistry::default(),
             fanotify_registry: crate::fanotify::FanotifyRegistry::default(),
             dnotify_registry: parking_lot::Mutex::new(Vec::new()),
+            dnotify_active: std::sync::atomic::AtomicBool::new(false),
             resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
@@ -680,6 +682,10 @@ impl FsState {
             // Arc clone: the SAME table, not a copy. See the field docs.
             fanotify_registry: self.fanotify_registry.clone(),
             dnotify_registry: parking_lot::Mutex::new(self.dnotify_registry.lock().clone()),
+            dnotify_active: std::sync::atomic::AtomicBool::new(
+                self.dnotify_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
             resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),

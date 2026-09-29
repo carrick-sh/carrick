@@ -18,92 +18,13 @@
 
 use super::tests::{CountingMmapMemory, returned};
 use super::*;
-use crate::memory::LINUX_MMAP_BASE;
+use crate::dispatch::allocation_meter;
 
-pub(crate) mod allocation_meter {
-    use std::{
-        alloc::{GlobalAlloc, Layout, System},
-        cell::Cell,
-    };
-
-    thread_local! {
-        static BYTES: Cell<Option<u64>> = const { Cell::new(None) };
-        static CALLS: Cell<Option<u64>> = const { Cell::new(None) };
-    }
-
-    struct CountingAllocator;
-
-    #[global_allocator]
-    static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-    fn record(bytes: usize) {
-        let _ = BYTES.try_with(|count| {
-            if let Some(total) = count.get() {
-                count.set(Some(total.saturating_add(bytes as u64)));
-            }
-        });
-        let _ = CALLS.try_with(|count| {
-            if let Some(total) = count.get() {
-                count.set(Some(total.saturating_add(1)));
-            }
-        });
-    }
-
-    // SAFETY: every call is forwarded unchanged to `System`; the const TLS
-    // counter allocates nothing and observes only the current thread.
-    unsafe impl GlobalAlloc for CountingAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
-            unsafe { System.alloc_zeroed(layout) }
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            record(new_size);
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct AllocationStats {
-        pub bytes: u64,
-        pub calls: u64,
-    }
-
-    /// Host-heap allocations and bytes requested by this thread while `run` executes.
-    pub(crate) fn measure_stats<T>(run: impl FnOnce() -> T) -> (T, AllocationStats) {
-        BYTES.with(|count| count.set(Some(0)));
-        CALLS.with(|count| count.set(Some(0)));
-        let value = run();
-        let bytes = BYTES.with(|count| count.replace(None)).unwrap_or(0);
-        let calls = CALLS.with(|count| count.replace(None)).unwrap_or(0);
-        (value, AllocationStats { bytes, calls })
-    }
-
-    /// Host-heap bytes requested by this thread while `run` executes.
-    pub(super) fn measure<T>(run: impl FnOnce() -> T) -> (T, u64) {
-        let (val, stats) = measure_stats(run);
-        (val, stats.bytes)
-    }
-
-    /// Host-heap bytes and allocation calls requested by this thread while `run` executes.
-    pub(super) fn measure_with_count<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
-        let (value, stats) = measure_stats(run);
-        (value, stats.bytes, stats.calls)
-    }
-}
-
+/// Host-heap bytes and allocation calls requested by this thread while `run` executes.
 pub(crate) fn measure_host_heap<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
     allocation_meter::measure_with_count(run)
 }
+use crate::memory::LINUX_MMAP_BASE;
 
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
