@@ -393,3 +393,22 @@ The graph has no eventfd counter or saved IPC operation payloads. These
 observations do not distinguish missed wake, consumed operation or replay.
 Next is a bounded LLDB capture of those existing values on the authoritative
 carrier, not new counters, repeated acceptance attempts or another framework.
+
+## Inherited-table lifetime demonstrated; mixed venue finds eventfd vector gap
+
+Signed source4a7d705bc/runel1-ipc-lifetime-20260929-a passes: parent
+replaces a pipe reader slot with eventfd42; child retains inherited pipe
+identity through128 checked roundtrips, final writer close yields EOF,
+child exit0. Real EL1 parks257. Negative entitlement and cleanup pass.
+Exact manifest and hash-verified preserved bytes in lifetime-* receipts.
+This is not deterministic close of an already blocked shared-table fd.
+
+Source50b2a6dc1 adds mixed scalar/vector I/O. Pipe passes128 roundtrips
+with128 host readv and128 writev,127 EL1 parks. Eventfd fails on its first
+writev; whole signed test RED. Negative entitlement and cleanup pass.
+Native aarch64 Docker on the recorded arm64 image accepts writev8/readv8
+and returns42. Carrick readv source explicitly rejects EventFd with EINVAL.
+Next: red-first VM-free eventfd vector coverage, oracle multi-iovec/fault
+semantics, then connect vector calls to existing shared object semantics.
+No new semantic implementation, host FD or weakened bounds. Existing
+multi-pair liveness remains open and separate.
