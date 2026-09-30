@@ -2722,6 +2722,7 @@ fn el1_fork_cow_resolves_in_guest() {
     for pages in SCALES {
         let grants_before = carrick_embed::el1_frame_grant_stats();
         let cow_before = carrick_embed::host_cow_snapshot();
+        let pool_before = el1_cow_pool_counters();
         let faults_before = read_el1_counters().map_or(0, |c| {
             c.fault_taken.load(std::sync::atomic::Ordering::Relaxed)
         });
@@ -2742,6 +2743,18 @@ fn el1_fork_cow_resolves_in_guest() {
             cow.guest_lane_refused,
             cow.guest_lane_refused_reasons,
             cow.guest_lane_deferred
+        );
+        // Guest EL1 COW: resolved in EL1, declined to the host by reason,
+        // and what the host provisioned and settled for it.
+        let pool_after = el1_cow_pool_counters();
+        println!(
+            "el1-sched fork-cow pages={pages} el1_cow_resolved={} \
+             el1_cow_declined[unclassified,pool_empty,editor_busy,refused]={:?} \
+             guest_cow_provisioned={} guest_cow_settled={}",
+            pool_after.0.saturating_sub(pool_before.0),
+            core::array::from_fn::<u64, 4, _>(|i| pool_after.1[i].saturating_sub(pool_before.1[i])),
+            cow.guest_cow_provisioned,
+            cow.guest_cow_settled,
         );
         let grants_after = carrick_embed::el1_frame_grant_stats();
         let faults_after = read_el1_counters().map_or(0, |c| {
@@ -2810,6 +2823,14 @@ fn el1_fork_cow_resolves_in_guest() {
             "fork-cow host-exit slope {exit_slope:.4} exceeds ceiling <0.125 exits per added page"
         );
     }
+}
+
+/// The carrier pool's guest COW counters: (resolved, declined by reason).
+fn el1_cow_pool_counters() -> (u64, [u64; carrick_el1_abi::COW_DECLINE_REASONS]) {
+    carrick_el1_abi::cow_grant_pool_host()
+        .map_or((0, [0; carrick_el1_abi::COW_DECLINE_REASONS]), |pool| {
+            (pool.resolved(), pool.declined())
+        })
 }
 
 /// Contract `kernel.el1.anonymous-reservations`: anonymous `mmap` (including
