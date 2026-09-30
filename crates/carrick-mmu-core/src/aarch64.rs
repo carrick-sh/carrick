@@ -1161,6 +1161,118 @@ pub(crate) fn pt_terminal_edit(
     Some(new_desc)
 }
 
+/// One range rule that the host editor ([`PageTableManager::apply_rule`]) and
+/// guest EL1 descriptor transactions ([`descriptor_txn::DescriptorOp::Terminal`])
+/// both apply per covering terminal, so the two venues share one semantic
+/// definition of every host-originated protection, retirement and tag edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRule {
+    /// The [`PtOp`] terminal rule, composed per terminal as:
+    /// `reset_retired` (a new mapping at a reused VA drops the predecessor's
+    /// EL1-private retired leaf; a live private leaf there is refused), then
+    /// `op` (none: leave the terminal as reset), then `deny_host_buffers` (a
+    /// formerly resident EL1-private leaf that `op` invalidated records
+    /// kernel-only AP so host buffer access is denied), then `fork_arm`
+    /// (re-arm fork COW, recording write intent).
+    Pt {
+        op: Option<PtOp>,
+        reset_retired: bool,
+        deny_host_buffers: bool,
+        fork_arm: bool,
+    },
+    /// Remove EL1-private authority from prepared (invalid) file BUS-tail
+    /// leaves. A resident or malformed private leaf is refused.
+    BusFault,
+}
+
+impl TerminalRule {
+    /// The plain [`PtOp`] rule with no composition.
+    #[must_use]
+    pub const fn pt(op: PtOp) -> Self {
+        Self::Pt {
+            op: Some(op),
+            reset_retired: false,
+            deny_host_buffers: false,
+            fork_arm: false,
+        }
+    }
+}
+
+/// A terminal a [`TerminalRule`] refuses to edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRefusal {
+    /// A new mapping would reuse a VA still holding a live private leaf.
+    Occupied,
+    /// A BUS tail over a resident private leaf.
+    Resident,
+    /// An EL1-private tag set with no valid encoding.
+    Malformed,
+}
+
+/// Apply `rule` to one covering terminal. `Ok(None)`: the terminal already
+/// satisfies the rule and its whole span is skipped without a split.
+pub(crate) fn terminal_rule_edit(
+    asid_scoped_leaves: bool,
+    rule: TerminalRule,
+    desc: u64,
+    level: usize,
+    block_start: u64,
+) -> Result<Option<u64>, TerminalRefusal> {
+    match rule {
+        TerminalRule::BusFault => match el1_private_leaf_state(desc) {
+            El1PrivateLeafState::Resident => Err(TerminalRefusal::Resident),
+            El1PrivateLeafState::Malformed => Err(TerminalRefusal::Malformed),
+            El1PrivateLeafState::Prepared => Ok(Some(
+                desc & !(SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | SW_EL1_MAY_EXEC),
+            )),
+            El1PrivateLeafState::Unowned | El1PrivateLeafState::Retired => Ok(None),
+        },
+        TerminalRule::Pt {
+            op,
+            reset_retired,
+            deny_host_buffers,
+            fork_arm,
+        } => {
+            let mut current = desc;
+            if reset_retired {
+                match el1_private_leaf_state(current) {
+                    El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident => {
+                        return Err(TerminalRefusal::Occupied);
+                    }
+                    El1PrivateLeafState::Malformed => return Err(TerminalRefusal::Malformed),
+                    El1PrivateLeafState::Retired => current = 0,
+                    El1PrivateLeafState::Unowned => {}
+                }
+            }
+            let was_resident = el1_private_leaf_state(current) == El1PrivateLeafState::Resident;
+            if let Some(edited) = op.and_then(|op| {
+                pt_terminal_edit(asid_scoped_leaves, op, current, level, block_start)
+            }) {
+                current = edited;
+            }
+            if deny_host_buffers
+                && was_resident
+                && el1_private_leaf_state(current) == El1PrivateLeafState::Prepared
+                && current & AP_MASK != AP_PRIV_RO
+            {
+                current = (current & !AP_MASK) | AP_PRIV_RO;
+            }
+            if fork_arm
+                && let Some(armed) = pt_terminal_edit(
+                    asid_scoped_leaves,
+                    PtOp::ForkReadOnly,
+                    current,
+                    level,
+                    block_start,
+                )
+            {
+                current = armed;
+            }
+            Ok((current != desc).then_some(current))
+        }
+    }
+}
+
 /// The outcome of an edit applied to a page-table range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PageTableApplyOutcome {
@@ -4321,6 +4433,22 @@ impl PageTableManager {
         va: u64,
         len: usize,
         op: PtOp,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        self.apply_rule(va, len, TerminalRule::pt(op), source)
+    }
+
+    /// Apply `rule` to every covering terminal of `[va, va+len)`: skip a
+    /// terminal that already satisfies it, edit a covered one in place and
+    /// split one the range bisects. Guest EL1 descriptor transactions apply
+    /// the same [`terminal_rule_edit`]. A refused terminal fails the edit
+    /// (the host editor keeps no journal; callers that need atomicity
+    /// validate first, as `clear_retired_for_new_mapping` does).
+    pub fn apply_rule(
+        &mut self,
+        va: u64,
+        len: usize,
+        rule: TerminalRule,
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
         let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
@@ -4334,7 +4462,9 @@ impl PageTableManager {
             let block_start = cur & mask;
             let block_end = block_start + span;
             let desc = self.read_desc(off)?;
-            let edited = pt_terminal_edit(self.asid_scoped_leaves, op, desc, level, block_start);
+            let edited =
+                terminal_rule_edit(self.asid_scoped_leaves, rule, desc, level, block_start)
+                    .map_err(|_| PageTableError::BadAddress)?;
             if edited.is_none() {
                 // The covering block is ALREADY at the target — skip its whole
                 // span with no split (this is what keeps RW-on-already-RW, and a
@@ -4379,7 +4509,14 @@ impl PageTableManager {
         }
         // Reclaim any sub-table the edit left fully uniform (single-vCPU only;
         // see try_coalesce). Walk one VA per 2 MiB block touched.
-        if changed && !self.multi_vcpu && self.offline_private_image {
+        let coalesces = matches!(
+            rule,
+            TerminalRule::Pt {
+                reset_retired: false,
+                ..
+            }
+        );
+        if coalesces && changed && !self.multi_vcpu && self.offline_private_image {
             let mut block = va & !((1 << 21) - 1);
             while block < end {
                 let idx = indices(block);
@@ -4458,31 +4595,21 @@ impl PageTableManager {
                 .checked_add(span)
                 .ok_or(PageTableError::BadAddress)?;
         }
-        let mut changed = false;
-        current = va;
-        while current < end {
-            let (location, level) = self.leaf_offset(current, false, None)?;
-            let descriptor = self.read_desc(location)?;
-            let (span, mask) = Self::level_span(level);
-            let block_start = current & mask;
-            let block_end = block_start
-                .checked_add(span)
-                .ok_or(PageTableError::BadAddress)?;
-            // Only EL1-private retired leaves carry predecessor permission
-            // authority; other retired leaves keep their retained output for
-            // same-VA reuse and file-mapping fault classification.
-            if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Retired {
-                if block_start < va || block_end > end {
-                    self.split_block(location, level, source.as_deref_mut())?;
-                    changed = true;
-                    continue;
-                }
-                self.write_desc(location, 0)?;
-                changed = true;
-            }
-            current = block_end;
-        }
-        Ok(PageTableApplyOutcome::new(changed, false))
+        // Validated above, so the shared rule refuses nothing here: only
+        // EL1-private retired leaves change (other retired leaves keep their
+        // retained output for same-VA reuse and file-fault classification).
+        let outcome = self.apply_rule(
+            va,
+            len,
+            TerminalRule::Pt {
+                op: None,
+                reset_retired: true,
+                deny_host_buffers: false,
+                fork_arm: false,
+            },
+            source.as_deref_mut(),
+        )?;
+        Ok(PageTableApplyOutcome::new(outcome.changed, false))
     }
 
     /// Drop one invalid output which is retired or which the fork child did
@@ -4517,45 +4644,18 @@ impl PageTableManager {
         &mut self,
         va: u64,
         len: usize,
-        mut source: Option<&mut dyn TableArenaSource>,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        let end = va
-            .checked_add(len as u64)
-            .ok_or(PageTableError::BadAddress)?;
-        if len == 0 || !va.is_multiple_of(PT_PAGE) || !len.is_multiple_of(PT_PAGE as usize) {
+        if len == 0
+            || !va.is_multiple_of(PT_PAGE)
+            || !len.is_multiple_of(PT_PAGE as usize)
+            || va.checked_add(len as u64).is_none()
+        {
             return Err(PageTableError::BadAddress);
         }
-        let mut current = va;
-        let mut changed = false;
-        while current < end {
-            let (location, level) = self.leaf_offset(current, false, None)?;
-            let descriptor = self.read_desc(location)?;
-            let (span, mask) = Self::level_span(level);
-            let block_start = current & mask;
-            let block_end = block_start
-                .checked_add(span)
-                .ok_or(PageTableError::BadAddress)?;
-            match el1_private_leaf_state(descriptor) {
-                El1PrivateLeafState::Resident | El1PrivateLeafState::Malformed => {
-                    return Err(PageTableError::BadAddress);
-                }
-                El1PrivateLeafState::Prepared => {
-                    if block_start < va || block_end > end {
-                        self.split_block(location, level, source.as_deref_mut())?;
-                        changed = true;
-                        continue;
-                    }
-                    self.write_desc(
-                        location,
-                        descriptor & !(SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | SW_EL1_MAY_EXEC),
-                    )?;
-                    changed = true;
-                }
-                El1PrivateLeafState::Unowned | El1PrivateLeafState::Retired => {}
-            }
-            current = block_end;
-        }
-        Ok(PageTableApplyOutcome::new(changed, false))
+        let outcome = self.apply_rule(va, len, TerminalRule::BusFault, source)?;
+        // Prepared leaves are invalid: removing their tags needs no flush.
+        Ok(PageTableApplyOutcome::new(outcome.changed, false))
     }
 
     /// Host-forwarded `mprotect(PROT_NONE)` over EL1-private leaves. The
@@ -4570,47 +4670,21 @@ impl PageTableManager {
         len: usize,
         source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        let end = va
-            .checked_add(len as u64)
-            .ok_or(PageTableError::BadAddress)?;
         // Only leaves the guest could observe (VALID, EL1-private) are marked:
         // stale invalid leaves under a fresh PROT_NONE reservation stay as they
         // are, and publication rebuilds them when the range is granted again.
-        let mut resident = Vec::new();
-        let mut current = va & !(PT_PAGE - 1);
-        while current < end {
-            let (location, level) = self.leaf_offset(current, false, None)?;
-            let (span, mask) = Self::level_span(level);
-            let descriptor = self.read_desc(location)?;
-            let run_start = (current & mask).max(va & !(PT_PAGE - 1));
-            let run_end = (current & mask)
-                .checked_add(span)
-                .ok_or(PageTableError::BadAddress)?;
-            if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Resident
-                && (level == 3 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE)
-            {
-                resident.push((run_start, run_end.min(end)));
-            }
-            current = run_end;
-        }
-        let outcome = self.set_prot_none(va, len, source)?;
-        for (start, stop) in resident {
-            let mut page = start;
-            while page < stop {
-                let (location, level) = self.leaf_offset(page, false, None)?;
-                let (span, mask) = Self::level_span(level);
-                let descriptor = self.read_desc(location)?;
-                if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Prepared
-                    && descriptor & AP_MASK != AP_PRIV_RO
-                {
-                    self.write_desc(location, (descriptor & !AP_MASK) | AP_PRIV_RO)?;
-                }
-                page = (page & mask)
-                    .checked_add(span)
-                    .ok_or(PageTableError::BadAddress)?;
-            }
-        }
-        Ok(outcome)
+        self.reclaim_pending = true;
+        self.apply_rule(
+            va,
+            len,
+            TerminalRule::Pt {
+                op: Some(PtOp::Invalidate),
+                reset_retired: false,
+                deny_host_buffers: true,
+                fork_arm: false,
+            },
+            source,
+        )
     }
 
     /// `munmap`: invalidate `[va, va+len)` (the freed range faults until
