@@ -2908,6 +2908,35 @@ pub fn publish_zone_identity(slot: usize, zone_mm: u64, thread_serial: u64) {
     current_task.zone_mm.store(zone_mm, Ordering::Release);
 }
 
+/// For a wedge post-mortem: every slot's task record with its boundary
+/// flags. `pending_host_work` or `served_with_work` still set on a slot that
+/// waits in the guest is host work EL1 announced and no host boundary took:
+/// EL1 announces an owed host IPC wake solely through these flags.
+pub fn write_current_task_census(out: &mut impl core::fmt::Write) -> core::fmt::Result {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return Ok(());
+    }
+    for slot in 0..EL1_STACK_SLOTS as usize {
+        let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+        // SAFETY: the record lives in the EL1 region; only atomics are touched.
+        let task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+        let tid = task.task_id.load(Ordering::Acquire);
+        let pending = task.pending_host_work.load(Ordering::Acquire);
+        let served = task.served_with_work.load(Ordering::Acquire);
+        if tid == 0 && pending == 0 && served == 0 {
+            continue;
+        }
+        writeln!(
+            out,
+            "el1 task slot {slot}: tid={tid} serial={} mm={} pending_host_work={pending} served_with_work={served}",
+            task.thread_serial.load(Ordering::Acquire),
+            task.zone_mm.load(Ordering::Acquire),
+        )?;
+    }
+    Ok(())
+}
+
 /// Read the task record of `slot` (what EL1 last published as running): the
 /// task id and thread serial.
 pub fn current_task_snapshot(slot: usize) -> Option<(El1TaskId, u64)> {
