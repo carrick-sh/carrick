@@ -6279,3 +6279,132 @@ fn continuation_publish_ready_racing_child_reap_is_dropped_without_abort() {
         *recorder.rejections.lock()
     );
 }
+
+/// A blocking `read(2)` on an empty eventfd parks as a continuation on the
+/// object's own wait queue (the eventfd has no host readiness descriptor). A
+/// producer `write(2)` that lands either after enrollment or in the window
+/// between the reader's dispatch and its enrollment must wake it, and the
+/// redispatched read must return the counter.
+fn blocking_eventfd_read_wakes_with(write_before_enroll: bool) {
+    use carrick_guest_mem::GuestMemory;
+    let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let kernel = Arc::clone(context.kernel());
+    let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 4096]);
+    let reporter = crate::compat::CompatReporter::default();
+    fn returned(outcome: DispatchOutcome) -> i64 {
+        match outcome {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("fixture syscall: {other:?}"),
+        }
+    }
+    let efd = returned(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(19, SyscallArgs([0; 6])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+    );
+    let read = SyscallRequest::new(63, SyscallArgs([efd as u64, 0x4000, 8, 0, 0, 0]));
+    let outcome = dispatcher
+        .dispatch(&context, read, &mut memory, &reporter)
+        .unwrap();
+    assert!(
+        matches!(&outcome, DispatchOutcome::WaitOnFds { .. }),
+        "empty blocking eventfd read must park: {outcome:?}"
+    );
+    let generation = publish(&context, 0x985);
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("eventfd read continuation");
+    let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+
+    let write = |dispatcher: &mut crate::dispatch::SyscallDispatcher,
+                 memory: &mut crate::dispatch::LinearMemory| {
+        memory.write_bytes(0x4100, &5u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(64, SyscallArgs([efd as u64, 0x4100, 8, 0, 0, 0])),
+                        memory,
+                        &reporter,
+                    )
+                    .unwrap()
+            ),
+            8
+        );
+    };
+    if write_before_enroll {
+        write(&mut dispatcher, &mut memory);
+    }
+    let mut registration = service.prepare_registration(&continuation);
+    service.enroll(&mut registration).expect("enroll");
+    let token = registration.wake_token();
+    continuation
+        .attach_registration(registration)
+        .expect("attach");
+    if !write_before_enroll {
+        write(&mut dispatcher, &mut memory);
+    }
+
+    struct ThreadWake(std::thread::Thread);
+    impl std::task::Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(service.event(token));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let event = loop {
+        if let Poll::Ready(event) = future.as_mut().poll(&mut cx) {
+            break Some(event);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break None;
+        }
+        std::thread::park_timeout(remaining);
+    };
+    let Some(event) = event else {
+        let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+        panic!(
+            "blocking eventfd read lost the producer wake (write_before_enroll={write_before_enroll})"
+        );
+    };
+    let event = event.expect("eventfd read wake");
+    assert_eq!(event, ContinuationEvent::Ready);
+    assert_eq!(
+        continuation.resume(event, &context).unwrap().completion,
+        ContinuationCompletion::Redispatch
+    );
+    assert_eq!(
+        returned(
+            dispatcher
+                .dispatch(&context, read, &mut memory, &reporter)
+                .unwrap()
+        ),
+        8
+    );
+    let value = memory.read_bytes(0x4000, 8).unwrap();
+    assert_eq!(u64::from_le_bytes(value.try_into().unwrap()), 5);
+}
+
+#[test]
+fn blocking_eventfd_read_wakes_on_producer_write_after_enroll() {
+    blocking_eventfd_read_wakes_with(false);
+}
+
+#[test]
+fn blocking_eventfd_read_wakes_on_producer_write_before_enroll() {
+    blocking_eventfd_read_wakes_with(true);
+}
