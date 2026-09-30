@@ -13,7 +13,7 @@ writer closure, rollback-path review or signed ownership acceptance.
 | Backend `publish_private_repoint` | Metadata only; verifies completed mapping |
 | `prepare_el1_frame_grant` replacement branch | Guarded: old alias/owner retirement needs descriptor completion ordering |
 | `materialize_retired_reuse` | Guarded host descriptor publication and rollback; next backing-reuse conversion |
-| `sparse_materialization::publish_replacing` | Guarded host replacement and rollback |
+| `sparse_materialization::publish_replacing` | Local caller connected to Deferred MapAlias with verified completion before retirement callback; model caller red/green in sparse-caller.md. Foreign path remains guarded |
 | `perform_foreign_cow_transaction` | Guarded foreign-MM descriptor publication; needs exact foreign-MM driving/completion authority |
 | Engine `mark_bus_fault`, `protect_range`, `restore_shared_identity` | Host edit funnel still used; convert current permission/tag/alias semantics |
 | Engine `discard_private_anonymous`, `unmap_range`, `unmap_alias_range` | Host edit funnel still used; retain discard/retirement/backing completion ordering |
@@ -21,8 +21,9 @@ writer closure, rollback-path review or signed ownership acceptance.
 | Engine `publish_el1_frame_grant`, fork arming in `build_process_spec` | Guest routes exist; audit all host branches and rollback paths before census closure |
 | Engine `configure_process_asid`, `prepare_core_snapshot`, exec rebuild and offline image installation | Classify offline construction separately; convert any remaining live writes and preserve exact-root publication |
 
-Next implement replacement-grant/retired/sparse publication using the same
-transaction machinery. Keep unknown/partial completion fail-closed. Do not add a
+Next obtain bounded signed integration evidence through the existing service,
+then group remaining replacement/retirement, protection/unmap and foreign/exec
+conversions using the same transaction machinery. Keep unknown/partial completion fail-closed. Do not add a
 second copy transport, weaken admission or start unrelated IPC captures.
 
 After all live writer and rollback routes are accounted for, activate the full

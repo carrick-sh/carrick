@@ -554,7 +554,7 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
     let inventory = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let authority =
         std::sync::Arc::new(super::super::task_only_carrier_directory_tests::TestCowAuthority);
-    let result = GuestCowPreparedBacking::prepare(
+    let result = GuestPreparedBacking::prepare(
         custody.clone(),
         authority,
         inventory.clone(),

@@ -767,6 +767,7 @@ impl MmAccessState {
 /// Exact-MM local publication permit. Only this constructor acquires exclusion;
 /// callers cannot substitute an arbitrary FrameCowQuiesce implementation.
 pub(super) struct PublicationContext<'a> {
+    mm_key: std::num::NonZeroU64,
     state: std::sync::Arc<MmAccessState>,
     custody: std::sync::Arc<CarrierVmCustody>,
     authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
@@ -799,6 +800,8 @@ impl<'a> PublicationContext<'a> {
             return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
         }
         Ok(Self {
+            mm_key: std::num::NonZeroU64::new(requested.mm.raw_for_probe())
+                .ok_or(carrick_hal::ForeignMmTransportError::MissingBinding)?,
             state,
             custody,
             authority: binding.authority,
@@ -878,6 +881,8 @@ impl<'a> PublicationContext<'a> {
             }
         }
         Ok(Self {
+            mm_key: std::num::NonZeroU64::new(identity.mm)
+                .ok_or_else(|| TrapError::Hypervisor("zero sparse MM".to_owned()))?,
             state,
             custody,
             authority: binding.authority,
@@ -919,7 +924,19 @@ pub(super) fn publish_replacing(
     flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     retire_previous: &mut dyn FnMut(),
 ) -> Result<PublishedSparseExtent, TrapError> {
-    require_host_cow_lane(&context.state.page_tables_authority())?;
+    let guest_lane = context
+        .state
+        .page_tables_authority()
+        .live_descriptor_owner()
+        == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
+    if context.foreign.is_some() {
+        require_host_cow_lane(&context.state.page_tables_authority())?;
+    }
+    if guest_lane && !flush_stage1.guest_publication_available() {
+        return Err(TrapError::Hypervisor(
+            "guest sparse publication requires its driving vCPU".to_owned(),
+        ));
+    }
     #[cfg(debug_assertions)]
     const PAGE_SIZE: u64 = 4096;
     #[cfg(debug_assertions)]
@@ -956,12 +973,14 @@ pub(super) fn publish_replacing(
     } = prepare(std::sync::Arc::clone(&context.custody), start, end, backing)?;
     const TWO_MIB: u64 = 2 * 1024 * 1024;
 
-    let inventory_mapping = {
-        let mut inventory = context.state.frame_inventory.ledger.lock();
-        HvfVmState::stage_mapping_in(
-            &context.custody,
-            &mut inventory,
-            &mut reservation,
+    let (inventory_mapping, foreign_receipt) = if guest_lane {
+        use carrick_mmu_core::aarch64::descriptor_txn::{AliasAccess, DescriptorOp, PageSpan};
+        let mut prepared = super::cow_engine::GuestPreparedBacking::prepare_owned(
+            context.custody.clone(),
+            context.authority.clone(),
+            context.state.frame_inventory.ledger.clone(),
+            reservation,
+            context.mm_key,
             InventoryMappingStage {
                 gpa: physical_ipa,
                 length: physical_len,
@@ -978,20 +997,86 @@ pub(super) fn publish_replacing(
                     generation: owner_generation,
                 },
             },
-        )?
-    };
-    let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
-    // A fresh local extent replaces only invalid descriptors: the walker
-    // caches nothing for them, so the publication needs ordering (sync before
-    // commit) but no stage-1 TLB maintenance. Any transaction that overwrote a
-    // live VALID descriptor, and every foreign publication, keeps the flush.
-    let mut replaced_valid_descriptor = true;
-    // Journal this transaction's descriptor pre-images rather than
-    // cloning the whole 1.75 MiB table region (see `begin_undo`).
-    let publication = {
-        let page_tables_authority = context.state.page_tables_authority();
-        let has_source = page_tables_authority.has_source();
-        page_tables_authority
+            owner_rollback,
+        )?;
+        let backing = prepared.backing()?;
+        let tables = context.state.page_tables_authority();
+        let mut current = start;
+        while current < end {
+            let count = (end - current).min(TWO_MIB);
+            let op = DescriptorOp::MapAlias {
+                access: AliasAccess::Deferred,
+                span: PageSpan::new(current, count),
+                target_ipa: carrick_mmu_core::aarch64::SubstrateGpa(
+                    semantic_ipa + (current - start),
+                ),
+                backing,
+            };
+            let txn = match tables.prepare_guest_descriptor_txn(context.mm_key, op) {
+                Ok(txn) => txn,
+                Err(error) if current == start => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "prepare guest sparse publication: {error:?}"
+                    )));
+                }
+                Err(error) => carrick_fatal!(
+                    "hvpatch::sparse_materialization",
+                    "partially published guest sparse extent: {error:?}"
+                ),
+            };
+            let receipt = flush_stage1.publish(&txn).unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::sparse_materialization",
+                    "guest sparse publication lacks verified completion: {error}"
+                );
+            });
+            if *receipt.txn() != txn {
+                carrick_fatal!(
+                    "hvpatch::sparse_materialization",
+                    "guest sparse receipt names another transaction"
+                );
+            }
+            current += count;
+        }
+        prepared.commit();
+        (prepared.extent, None)
+    } else {
+        let inventory_mapping = {
+            let mut inventory = context.state.frame_inventory.ledger.lock();
+            HvfVmState::stage_mapping_in(
+                &context.custody,
+                &mut inventory,
+                &mut reservation,
+                InventoryMappingStage {
+                    gpa: physical_ipa,
+                    length: physical_len,
+                    permissions: carrick_hal::MemPerms {
+                        read: true,
+                        write: !page_granular_arm,
+                        exec: true,
+                    },
+                    backing: inventory_backing,
+                    inherited_frame: None,
+                    stage2_lease: Some((physical_ipa, physical_len)),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: physical_host as usize,
+                        generation: owner_generation,
+                    },
+                },
+            )?
+        };
+        let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
+        // A fresh local extent replaces only invalid descriptors: the walker
+        // caches nothing for them, so the publication needs ordering (sync before
+        // commit) but no stage-1 TLB maintenance. Any transaction that overwrote a
+        // live VALID descriptor, and every foreign publication, keeps the flush.
+        let mut replaced_valid_descriptor = true;
+        // Journal this transaction's descriptor pre-images rather than
+        // cloning the whole 1.75 MiB table region (see `begin_undo`).
+        let publication = {
+            let page_tables_authority = context.state.page_tables_authority();
+            let has_source = page_tables_authority.has_source();
+            page_tables_authority
             .edit(
                 || {
                     Err(TrapError::Hypervisor(
@@ -1113,101 +1198,101 @@ pub(super) fn publish_replacing(
                     Ok(())
                 },
             )
-    };
-    if let Err(error) = publication {
-        let rollback = context.state.page_tables_authority().edit(
-            || {
-                Err(TrapError::Hypervisor(
-                    "rollback page tables disappeared".to_owned(),
-                ))
-            },
-            |editor| {
-                let resolver = context
-                    .state
-                    .pinned_stage1_arenas(&context.custody, editor.base())?;
-                // The owned resolver drops its pins before retirement. Exact-MM
-                // exclusion remains held through descriptor restore and TLBI.
-                unsafe {
-                    editor.rollback_undo_retiring(
-                        resolver,
-                        |e| match e {
-                            carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
-                                TrapError::MetadataAllocation
-                            }
-                            other => TrapError::Hypervisor(format!(
-                                "failed to rollback stage1 undo: {other:?}"
-                            )),
-                        },
-                        |popped| {
-                            flush_stage1.flush()?;
-                            let journal = extension_regions
-                                .iter()
-                                .filter_map(|region| {
-                                    region.structural_owner.as_ref().map(|owner| {
-                                        (owner.physical_ipa, std::sync::Arc::clone(owner))
+        };
+        if let Err(error) = publication {
+            let rollback = context.state.page_tables_authority().edit(
+                || {
+                    Err(TrapError::Hypervisor(
+                        "rollback page tables disappeared".to_owned(),
+                    ))
+                },
+                |editor| {
+                    let resolver = context
+                        .state
+                        .pinned_stage1_arenas(&context.custody, editor.base())?;
+                    // The owned resolver drops its pins before retirement. Exact-MM
+                    // exclusion remains held through descriptor restore and TLBI.
+                    unsafe {
+                        editor.rollback_undo_retiring(
+                            resolver,
+                            |e| match e {
+                                carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
+                                    TrapError::MetadataAllocation
+                                }
+                                other => TrapError::Hypervisor(format!(
+                                    "failed to rollback stage1 undo: {other:?}"
+                                )),
+                            },
+                            |popped| {
+                                flush_stage1.flush()?;
+                                let journal = extension_regions
+                                    .iter()
+                                    .filter_map(|region| {
+                                        region.structural_owner.as_ref().map(|owner| {
+                                            (owner.physical_ipa, std::sync::Arc::clone(owner))
+                                        })
                                     })
-                                })
-                                .collect();
-                            context.state.retire_rolled_back_arenas(
-                                &context.custody,
-                                popped,
-                                &journal,
-                                &mut unmap_global_frame_stage2_record,
-                                &mut release_retired_stage2_ipa,
-                            )?;
-                            Ok::<(), TrapError>(())
-                        },
-                    )?;
-                }
-                Ok::<(), TrapError>(())
+                                    .collect();
+                                context.state.retire_rolled_back_arenas(
+                                    &context.custody,
+                                    popped,
+                                    &journal,
+                                    &mut unmap_global_frame_stage2_record,
+                                    &mut release_retired_stage2_ipa,
+                                )?;
+                                Ok::<(), TrapError>(())
+                            },
+                        )?;
+                    }
+                    Ok::<(), TrapError>(())
+                },
+            );
+            if let Err(rollback_error) = rollback {
+                carrick_fatal!(
+                    "hvpatch::sparse_materialization_rollback",
+                    "sparse page-table rollback failed after publication failure: start=0x{start:x} end=0x{end:x} error={rollback_error}"
+                );
+            }
+            HvfVmState::rollback_unpublished_mappings(
+                &mut context.state.frame_inventory.ledger.lock(),
+                &[inventory_entry],
+            )?;
+            return Err(error);
+        }
+        // Publication succeeded: the journalled pre-images are no longer needed.
+        let _ = context.state.page_tables_authority().edit(
+            || Err(()),
+            |editor| {
+                editor.commit_undo();
+                Ok::<(), ()>(())
             },
         );
-        if let Err(rollback_error) = rollback {
+        if (replaced_valid_descriptor || context.foreign.is_some())
+            && let Err(error) = flush_stage1.flush()
+        {
             carrick_fatal!(
-                "hvpatch::sparse_materialization_rollback",
-                "sparse page-table rollback failed after publication failure: start=0x{start:x} end=0x{end:x} error={rollback_error}"
+                "hvpatch::sparse_materialization_tlbi",
+                "sparse page-table stage-1 TLBI failed after publication: start=0x{start:x} end=0x{end:x} error={error}"
             );
         }
-        HvfVmState::rollback_unpublished_mappings(
-            &mut context.state.frame_inventory.ledger.lock(),
-            &[inventory_entry],
-        )?;
-        return Err(error);
-    }
-    // Publication succeeded: the journalled pre-images are no longer needed.
-    let _ = context.state.page_tables_authority().edit(
-        || Err(()),
-        |editor| {
-            editor.commit_undo();
-            Ok::<(), ()>(())
-        },
-    );
-    if (replaced_valid_descriptor || context.foreign.is_some())
-        && let Err(error) = flush_stage1.flush()
-    {
-        carrick_fatal!(
-            "hvpatch::sparse_materialization_tlbi",
-            "sparse page-table stage-1 TLBI failed after publication: start=0x{start:x} end=0x{end:x} error={error}"
-        );
-    }
-    let commit = reservation.commit(());
-    let foreign_receipt = if let Some(requested) = &context.foreign {
-        let mut mapping_ids = requested.mapping_ids.clone();
-        for event in commit.batch().events() {
-            match *event {
-                carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
-                    mapping_ids.retain(|id| *id != mapping)
+        let commit = reservation.commit(());
+        let foreign_receipt = if let Some(requested) = &context.foreign {
+            let mut mapping_ids = requested.mapping_ids.clone();
+            for event in commit.batch().events() {
+                match *event {
+                    carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
+                        mapping_ids.retain(|id| *id != mapping)
+                    }
+                    carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
+                        mapping_ids.push(mapping)
+                    }
+                    _ => {}
                 }
-                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
-                    mapping_ids.push(mapping)
-                }
-                _ => {}
             }
-        }
-        mapping_ids.sort_unstable();
-        mapping_ids.dedup();
-        let challenge = commit.receipt_challenge();
-        let (receipt, kernel_proof, generation) = context
+            mapping_ids.sort_unstable();
+            mapping_ids.dedup();
+            let challenge = commit.receipt_challenge();
+            let (receipt, kernel_proof, generation) = context
             .authority
             .apply_foreign_cow(
                 commit,
@@ -1236,7 +1321,7 @@ pub(super) fn publish_replacing(
                     "kernel foreign-MM inventory application failed: start=0x{start:x} end=0x{end:x} error={error}"
                 );
             });
-        if generation.raw_for_probe() != owner_generation
+            if generation.raw_for_probe() != owner_generation
             || !challenge.authenticate_apply(
                 &receipt,
                 std::num::NonZeroU64::new(requested.mm.raw_for_probe()).unwrap_or_else(|| {
@@ -1256,31 +1341,33 @@ pub(super) fn publish_replacing(
                 inventory_mapping.frame
             );
         }
-        let mut snapshot = requested.clone();
-        snapshot.mapping_ids = mapping_ids;
-        snapshot.frame_inventory_revision =
-            carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(receipt.revision());
-        Some(CarrierForeignCowReceipt {
-            snapshot,
-            start: carrick_guest_mem::GuestVa(start),
-            len: semantic_len,
-            mapping: inventory_mapping.mapping,
-            frame: inventory_mapping.frame,
-            physical_base: carrick_guest_mem::Gpa(physical_ipa),
-            physical_len,
-            owner_generation: generation,
-            kernel_proof,
-        })
-    } else {
-        if let Err(error) = context.authority.apply(commit) {
-            carrick_fatal!(
-                "hvpatch::sparse_materialization_inventory",
-                "local kernel frame-inventory application failed after sparse publication: start=0x{start:x} end=0x{end:x} error={error}"
-            );
-        }
-        None
+            let mut snapshot = requested.clone();
+            snapshot.mapping_ids = mapping_ids;
+            snapshot.frame_inventory_revision =
+                carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(receipt.revision());
+            Some(CarrierForeignCowReceipt {
+                snapshot,
+                start: carrick_guest_mem::GuestVa(start),
+                len: semantic_len,
+                mapping: inventory_mapping.mapping,
+                frame: inventory_mapping.frame,
+                physical_base: carrick_guest_mem::Gpa(physical_ipa),
+                physical_len,
+                owner_generation: generation,
+                kernel_proof,
+            })
+        } else {
+            if let Err(error) = context.authority.apply(commit) {
+                carrick_fatal!(
+                    "hvpatch::sparse_materialization_inventory",
+                    "local kernel frame-inventory application failed after sparse publication: start=0x{start:x} end=0x{end:x} error={error}"
+                );
+            }
+            None
+        };
+        owner_rollback.commit();
+        (inventory_mapping, foreign_receipt)
     };
-    owner_rollback.commit();
 
     match context.authority.mapping_is_live(
         inventory_mapping.mapping,

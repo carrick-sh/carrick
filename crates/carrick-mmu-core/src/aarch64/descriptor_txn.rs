@@ -86,7 +86,7 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 5;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 6;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
@@ -203,10 +203,11 @@ pub enum DescriptorOp {
         new_ipa: SubstrateGpa,
         backing: BackingIdentity,
     },
-    /// Map already-populated backing with the user RWX alias permissions.
+    /// Map already-populated backing with explicit alias access.
     /// Unlike CowRepoint, this never copies bytes. The host retains exact-MM
     /// exclusion and authenticated backing until the verified receipt.
     MapAlias {
+        access: AliasAccess,
         span: PageSpan,
         target_ipa: SubstrateGpa,
         backing: BackingIdentity,
@@ -218,6 +219,35 @@ pub enum DescriptorOp {
     /// range edges split. `arm` carries the image construction mode and the
     /// IPA window no valid output may name.
     ForkArm { span: PageSpan, arm: ForkArmMode },
+}
+
+/// Permissions of a populated alias. Deferred backing retains its output
+/// while remaining invalid and read-only until the later protection commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AliasAccess {
+    Deferred,
+    User { writable: bool, executable: bool },
+}
+impl AliasAccess {
+    fn wire(self) -> u64 {
+        match self {
+            Self::Deferred => 0,
+            Self::User {
+                writable,
+                executable,
+            } => 1 | (u64::from(writable) << 1) | (u64::from(executable) << 2),
+        }
+    }
+    fn from_wire(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Deferred),
+            1 | 3 | 5 | 7 => Some(Self::User {
+                writable: raw & 2 != 0,
+                executable: raw & 4 != 0,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Access authority for an exact COW span. Tagged private leaves record their
@@ -377,8 +407,11 @@ impl DescriptorOp {
                 ..
             } => [va, old_ipa.raw(), new_ipa.raw(), len, access.wire(), 0],
             Self::MapAlias {
-                span, target_ipa, ..
-            } => [span.va, span.len, target_ipa.raw(), 0, 0, 0],
+                access,
+                span,
+                target_ipa,
+                ..
+            } => [span.va, span.len, target_ipa.raw(), access.wire(), 0, 0],
             Self::ForkArm { span, arm } => [
                 span.va,
                 span.len,
@@ -436,6 +469,7 @@ impl DescriptorOp {
                 backing: backing?,
             }),
             Self::KIND_MAP_ALIAS => Some(Self::MapAlias {
+                access: AliasAccess::from_wire(payload[3])?,
                 span: PageSpan::new(payload[0], payload[1]),
                 target_ipa: SubstrateGpa(payload[2]),
                 backing: backing?,
@@ -1679,13 +1713,30 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
         let state = el1_private_leaf_state(descriptor);
         match self.op {
             DescriptorOp::MapAlias {
-                span, target_ipa, ..
+                access,
+                span,
+                target_ipa,
+                ..
             } => {
                 let output = target_ipa.raw() + (base - span.va);
                 let flags = if level == 3 {
                     USER_PAGE_FLAGS
                 } else {
                     super::USER_BLOCK_FLAGS
+                };
+                let flags = match access {
+                    AliasAccess::Deferred => (flags & !AP_MASK & !VALID) | AP_RO,
+                    AliasAccess::User {
+                        writable,
+                        executable,
+                    } => {
+                        let flags = if writable {
+                            flags
+                        } else {
+                            (flags & !AP_MASK) | AP_RO
+                        };
+                        if executable { flags } else { flags | UXN }
+                    }
                 };
                 Ok(output | flags | NON_GLOBAL)
             }
@@ -2302,6 +2353,16 @@ mod tests {
     fn every_operation_round_trips_through_the_slot_wire_encoding() {
         let ops = [
             DescriptorOp::MapAlias {
+                access: AliasAccess::Deferred,
+                span: PageSpan::new(0x5000, 2 * PT_PAGE),
+                target_ipa: SubstrateGpa(0x7000),
+                backing: backing(90),
+            },
+            DescriptorOp::MapAlias {
+                access: AliasAccess::User {
+                    writable: true,
+                    executable: true,
+                },
                 span: PageSpan::new(0x5000, 2 * PT_PAGE),
                 target_ipa: SubstrateGpa(0x7000),
                 backing: backing(90),
@@ -3296,6 +3357,72 @@ mod tests {
         }
 
         #[test]
+        fn alias_user_permissions_match_requested_access() {
+            for writable in [false, true] {
+                for executable in [false, true] {
+                    let words = fixture(3);
+                    applied(run(
+                        &words,
+                        DescriptorOp::MapAlias {
+                            access: AliasAccess::User {
+                                writable,
+                                executable,
+                            },
+                            span: PageSpan::new(VA, PT_PAGE),
+                            target_ipa: SubstrateGpa(IPA),
+                            backing: backing(90),
+                        },
+                        &TableGrants::NONE,
+                    ));
+                    let leaf = words.get(leaf_pa(VA));
+                    assert!(terminal_descriptor_permits_el0(leaf, LeafAccess::Read));
+                    assert_eq!(
+                        terminal_descriptor_permits_el0(leaf, LeafAccess::Write),
+                        writable
+                    );
+                    assert_eq!(
+                        terminal_descriptor_permits_el0(leaf, LeafAccess::Execute),
+                        executable
+                    );
+                    assert_eq!(leaf & PA_MASK_4KIB, IPA);
+                    assert_ne!(leaf & NON_GLOBAL, 0);
+                }
+            }
+        }
+
+        #[test]
+        fn deferred_alias_retains_backing_without_granting_access() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(4, PageSpan::new(VA, 4 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            let destination = IPA + 0x8000;
+            applied(run(
+                &words,
+                DescriptorOp::MapAlias {
+                    access: AliasAccess::Deferred,
+                    span: PageSpan::new(VA, 4 * PT_PAGE),
+                    target_ipa: SubstrateGpa(destination),
+                    backing: backing(90),
+                },
+                &TableGrants::NONE,
+            ));
+            for index in 0..4 {
+                let leaf = words.get(leaf_pa(VA + index * PT_PAGE));
+                assert_eq!(
+                    leaf,
+                    (destination + index * PT_PAGE)
+                        | ((USER_PAGE_FLAGS & !AP_MASK & !VALID) | AP_RO | NON_GLOBAL)
+                );
+                assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Read));
+                assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Write));
+                assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Execute));
+            }
+        }
+
+        #[test]
         fn map_alias_replaces_outputs_without_private_tags_and_rolls_back() {
             let destination = IPA + 0x8000;
             for failure in core::iter::once(None).chain((0..8).map(Some)) {
@@ -3312,6 +3439,10 @@ mod tests {
                 let result = run(
                     &words,
                     DescriptorOp::MapAlias {
+                        access: AliasAccess::User {
+                            writable: true,
+                            executable: true,
+                        },
                         span: PageSpan::new(VA, 4 * PT_PAGE),
                         target_ipa: SubstrateGpa(destination),
                         backing: backing(90),
@@ -3367,6 +3498,10 @@ mod tests {
             let created = applied(run(
                 &empty,
                 DescriptorOp::MapAlias {
+                    access: AliasAccess::User {
+                        writable: true,
+                        executable: true,
+                    },
                     span: PageSpan::new(VA, 4 * PT_PAGE),
                     target_ipa: SubstrateGpa(IPA),
                     backing: backing(90),
@@ -3388,6 +3523,10 @@ mod tests {
                 let result = applied(run(
                     &words,
                     DescriptorOp::MapAlias {
+                        access: AliasAccess::User {
+                            writable: true,
+                            executable: true,
+                        },
                         span: PageSpan::new(VA, 0x200000),
                         target_ipa: SubstrateGpa(target),
                         backing: backing(90),

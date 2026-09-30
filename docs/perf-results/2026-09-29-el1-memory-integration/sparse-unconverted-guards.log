@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-435a2ef3804478cb)
+
+running 1 test
+test trap::foreign_mm::tests::guest_owned_foreign_cow_and_sparse_replacement_refuse_without_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 618 filtered out; finished in 0.04s
+

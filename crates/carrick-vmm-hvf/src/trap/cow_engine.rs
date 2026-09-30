@@ -59,28 +59,39 @@ fn require_published_repoint(
         .ok_or_else(refusal)?
 }
 
-/// A new replacement is published in the kernel inventory before EL1 may
-/// copy it, while the old mapping remains live. Only the final descriptor
-/// receipt allows this provisional grant to survive the COW transaction.
-struct GuestCowPreparedBacking {
+/// Publish a replacement in the kernel inventory while old mappings remain
+/// live. Only verified EL1 descriptor completion allows the provisional grant
+/// to survive; prepublication failure rolls back kernel, backend and owner.
+pub(super) struct GuestPreparedBacking {
     authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
     inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
-    extent: InventoryExtent,
+    pub(super) extent: InventoryExtent,
     receipt: carrick_hal::FrameInventoryApplyReceipt,
     owner: Option<GlobalFrameOwnerRollback>,
     armed: bool,
 }
-impl GuestCowPreparedBacking {
+impl GuestPreparedBacking {
     fn prepare(
+        custody: std::sync::Arc<CarrierVmCustody>,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        reservation: carrick_hal::FrameInventoryReservation,
+        mm: std::num::NonZeroU64,
+        stage: InventoryMappingStage,
+    ) -> Result<Self, TrapError> {
+        let mut owner = GlobalFrameOwnerRollback::new(custody.clone());
+        owner.record((stage.gpa, stage.length));
+        Self::prepare_owned(custody, authority, inventory, reservation, mm, stage, owner)
+    }
+    pub(super) fn prepare_owned(
         custody: std::sync::Arc<CarrierVmCustody>,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
         mut reservation: carrick_hal::FrameInventoryReservation,
         mm: std::num::NonZeroU64,
         stage: InventoryMappingStage,
+        owner: GlobalFrameOwnerRollback,
     ) -> Result<Self, TrapError> {
-        let mut owner = GlobalFrameOwnerRollback::new(custody.clone());
-        owner.record((stage.gpa, stage.length));
         let length = carrick_hal::FrameLength::from_mapping_extent(
             std::num::NonZeroU64::new(stage.length)
                 .ok_or_else(|| TrapError::Hypervisor("empty COW backing".to_owned()))?,
@@ -128,7 +139,7 @@ impl GuestCowPreparedBacking {
         }
         Ok(prepared)
     }
-    fn backing(
+    pub(super) fn backing(
         &self,
     ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity, TrapError> {
         let nonzero = |value| {
@@ -142,14 +153,14 @@ impl GuestCowPreparedBacking {
             inventory_revision: nonzero(self.receipt.revision())?,
         })
     }
-    fn commit(&mut self) {
+    pub(super) fn commit(&mut self) {
         self.armed = false;
         if let Some(owner) = self.owner.take() {
             owner.commit();
         }
     }
 }
-impl Drop for GuestCowPreparedBacking {
+impl Drop for GuestPreparedBacking {
     fn drop(&mut self) {
         if self.armed {
             self.authority
@@ -585,6 +596,10 @@ impl HvfVmState {
                 // capacity, independently of a file mapping's total length.
                 let count = (region.end - current).min(2 * 1024 * 1024);
                 let op = DescriptorOp::MapAlias {
+                    access: carrick_mmu_core::aarch64::descriptor_txn::AliasAccess::User {
+                        writable: true,
+                        executable: true,
+                    },
                     span: PageSpan::new(va + (current - target_ipa), count),
                     target_ipa: SubstrateGpa(current),
                     backing: region.backing,
@@ -3040,7 +3055,7 @@ impl HvfTaskState {
             extent.backing
         });
         let mut guest_backing = if let Some(reservation) = guest_reservation {
-            Some(GuestCowPreparedBacking::prepare(
+            Some(GuestPreparedBacking::prepare(
                 custody.clone(),
                 authority.clone(),
                 self.frame_inventory.ledger.clone(),

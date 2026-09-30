@@ -520,6 +520,49 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
         )
     }
 
+    fn apply_frame_grant(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        gpa: Gpa,
+        length: carrick_hal::FrameLength,
+    ) -> Result<
+        (
+            carrick_hal::FrameInventoryApplyReceipt,
+            carrick_hal::ForeignOwnerGeneration,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let generation =
+            NonZeroU64::new(global_frame_host_owner_generation(gpa.raw(), length.raw()))
+                .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
+                .ok_or_else(|| std::io::Error::other("test frame grant has no live owner"))?;
+        let receipt = self.apply_with_receipt(commit)?;
+        assert!(receipt.authorizes(mapping, frame));
+        Ok((receipt, generation))
+    }
+
+    fn rollback_frame_grant(
+        &self,
+        receipt: &carrick_hal::FrameInventoryApplyReceipt,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (mapping, frame, _, _) = self
+            .published
+            .lock()
+            .take()
+            .ok_or_else(|| std::io::Error::other("no test grant to roll back"))?;
+        assert!(receipt.authorizes(mapping, frame));
+        let mut live = self.live.write();
+        assert_eq!(receipt.mm(), live.mm);
+        live.mapping_ids.retain(|id| *id != mapping);
+        live.frame_inventory_revision =
+            carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+                live.frame_inventory_revision.raw_for_probe() + 1,
+            );
+        Ok(())
+    }
+
     fn apply_foreign_cow(
         &self,
         commit: carrick_hal::FrameInventoryCommit<()>,
@@ -996,6 +1039,250 @@ fn guest_owned_foreign_cow_and_sparse_replacement_refuse_without_mutation() {
     assert_eq!(&bytes, b"old!");
     read_installed(&transport, &peer, &mut bytes).unwrap();
     assert_eq!(&bytes, b"peer");
+}
+
+#[test]
+fn guest_sparse_publication_executes_before_retirement_and_preserves_old_owner() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorTxn, InlineJournal, PrimaryTableWords, TableMaintenance,
+        VerifiedDescriptorReceipt, execute_descriptor_txn,
+    };
+    use std::cell::Cell;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut installed = install_mm(
+        &transport,
+        703,
+        0x9a01_1a00_0000,
+        0x9b01_1a00_0000,
+        *b"old!",
+    );
+    let (_authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+    let mut authority = TestForeignCowAuthority::new(&installed);
+    authority.allow_quiesce = true;
+    let authority = Arc::new(authority);
+    installed
+        .state
+        .cow_runtime
+        .write()
+        .as_mut()
+        .unwrap()
+        .authority = authority.clone();
+    let identity = installed
+        .state
+        .cow_runtime
+        .read()
+        .as_ref()
+        .unwrap()
+        .identity;
+    let context = sparse_materialization::PublicationContext::for_local(
+        installed.state.clone(),
+        Arc::clone(legacy_test_carrier_vm_custody_arc()),
+        identity,
+    )
+    .unwrap();
+    let tables = installed.state.page_tables_authority();
+    tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let root_key = installed.owners.0[0];
+    let old_key = installed.owners.0[1];
+    let root_host = global_frame_host_owner_identity(root_key.0, root_key.1)
+        .unwrap()
+        .0;
+    let old_owner = global_frame_host_owner_identity(old_key.0, old_key.1).unwrap();
+    let completed = Cell::new(false);
+    let retired = Cell::new(false);
+    struct Maintenance(Cell<usize>);
+    impl TableMaintenance for Maintenance {
+        fn publish_barrier(&self) {}
+        fn invalidate_range(&self, _va: u64, _len: u64) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    struct Service<'a> {
+        tables: carrick_aarch64::Stage1Authority,
+        authority: Arc<TestForeignCowAuthority>,
+        root: (u64, u64),
+        host: usize,
+        completed: &'a Cell<bool>,
+        retired: &'a Cell<bool>,
+        maintenance: Maintenance,
+    }
+    impl carrick_aarch64::vmm::Stage1Services for Service<'_> {
+        fn flush(&mut self) -> Result<(), TrapError> {
+            panic!("guest publication must not use host edit/flush")
+        }
+        fn guest_publication_available(&self) -> bool {
+            true
+        }
+        fn publish(&mut self, txn: &DescriptorTxn) -> Result<VerifiedDescriptorReceipt, TrapError> {
+            assert!(!self.retired.get());
+            assert!(
+                self.authority.published.lock().is_some(),
+                "grant inventory must precede descriptors"
+            );
+            // Execute the real neutral journal, not a fabricated success receipt.
+            let words = unsafe {
+                PrimaryTableWords::new(
+                    self.host as *mut _,
+                    self.root.0,
+                    self.root.1 as usize,
+                    &self.maintenance,
+                )
+            }
+            .unwrap();
+            let receipt = execute_descriptor_txn(
+                &words,
+                carrick_mmu_core::aarch64::SubstrateGpa(self.root.0),
+                txn,
+                &mut InlineJournal::new(),
+            );
+            let verified = self
+                .tables
+                .settle_guest_descriptor_receipt(txn, &receipt)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("model guest receipt: {error:?}"))
+                })?;
+            self.completed.set(true);
+            Ok(verified)
+        }
+    }
+    let mut service = Service {
+        tables: tables.clone(),
+        authority,
+        root: root_key,
+        host: root_host,
+        completed: &completed,
+        retired: &retired,
+        maintenance: Maintenance(Cell::new(0)),
+    };
+    let published = sparse_materialization::publish_replacing(
+        &context,
+        TEST_VA,
+        TEST_VA + 4096,
+        SparseExtentBacking::SeededAnon { bytes: b"next" },
+        &mut service,
+        &mut || {
+            assert!(
+                completed.get(),
+                "retirement must follow verified descriptor completion"
+            );
+            assert_eq!(
+                global_frame_host_owner_identity(old_key.0, old_key.1),
+                Some(old_owner)
+            );
+            retired.set(true);
+        },
+    )
+    .expect("guest sparse caller publishes with host writes prohibited");
+    installed.owners.0.push((
+        published.region.physical_ipa,
+        published.region.physical_size as u64,
+    ));
+    assert!(completed.get() && retired.get());
+    assert!(service.maintenance.0.get() > 0);
+    assert_eq!(
+        tables.with_manager(|manager| manager.translate(TEST_VA)),
+        Some(None)
+    );
+    assert_eq!(
+        tables.with_manager(|manager| manager.translate_retained_output(TEST_VA)),
+        Some(Some(published.region.ipa))
+    );
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(published.region.host_addr, 4) },
+        b"next"
+    );
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(old_owner.0 as *const u8, 4) },
+        b"old!"
+    );
+    assert_eq!(installed.state.host_cow_stats.host_cow_resolutions(), 0);
+}
+
+#[test]
+fn guest_sparse_plan_refusal_returns_grant_without_retiring_predecessor() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        704,
+        0x9a01_1b00_0000,
+        0x9b01_1b00_0000,
+        *b"kept",
+    );
+    let (_authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+    let mut authority = TestForeignCowAuthority::new(&installed);
+    authority.allow_quiesce = true;
+    let authority = Arc::new(authority);
+    installed
+        .state
+        .cow_runtime
+        .write()
+        .as_mut()
+        .unwrap()
+        .authority = authority.clone();
+    let identity = installed
+        .state
+        .cow_runtime
+        .read()
+        .as_ref()
+        .unwrap()
+        .identity;
+    let context = sparse_materialization::PublicationContext::for_local(
+        installed.state.clone(),
+        Arc::clone(legacy_test_carrier_vm_custody_arc()),
+        identity,
+    )
+    .unwrap();
+    installed
+        .state
+        .page_tables_authority()
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let before = foreign_cow_fingerprint(&installed);
+    let aliases = alias_registry().lock().ordered();
+    let mappings = installed.live.0.read().mapping_ids.clone();
+    struct NoPublication;
+    impl carrick_aarch64::vmm::Stage1Services for NoPublication {
+        fn flush(&mut self) -> Result<(), TrapError> {
+            panic!("no host publication")
+        }
+        fn guest_publication_available(&self) -> bool {
+            true
+        }
+        fn publish(
+            &mut self,
+            _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+        {
+            panic!("an invalid semantic span must refuse before submission")
+        }
+    }
+    // Backing can be allocated, but this semantic range is outside TTBR0.
+    let start = 1_u64 << 48;
+    let error = sparse_materialization::publish_replacing(
+        &context,
+        start,
+        start + 4096,
+        SparseExtentBacking::SeededAnon { bytes: b"next" },
+        &mut NoPublication,
+        &mut || panic!("refused publication must not retire old backing"),
+    )
+    .err()
+    .expect("invalid descriptor plan refuses");
+    assert!(
+        error
+            .to_string()
+            .contains("prepare guest sparse publication"),
+        "{error}"
+    );
+    assert_eq!(foreign_cow_fingerprint(&installed), before);
+    assert_eq!(alias_registry().lock().ordered(), aliases);
+    assert_eq!(installed.live.0.read().mapping_ids, mappings);
+    assert!(authority.published.lock().is_none());
 }
 
 #[test]
