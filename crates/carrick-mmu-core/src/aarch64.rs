@@ -2192,6 +2192,7 @@ impl PageTableManager {
         }
         from_free += reserved;
         let bump_needed = (count - reserved) as u64;
+        self.skip_occupied_primary_candidates(bump_needed)?;
         let arena = &self.arenas[0];
         let bump_end = arena
             .next_free
@@ -4246,6 +4247,57 @@ impl PageTableManager {
         Ok(None)
     }
 
+    /// The bump cursor of the live primary arena, re-established before
+    /// `pages` pages are carved from it. A guest editor can grow the same
+    /// live primary arena between host edits. Usually the cached cursor
+    /// still points at pristine zero pages, so checking exactly the
+    /// candidates is the whole cost. If any candidate is occupied,
+    /// reconstruct the high-water mark once from the authoritative live
+    /// image; never hand a guest-linked table page out again, whether to the
+    /// host editor ([`Self::alloc_table`]) or as an EL1 table grant
+    /// ([`Self::reserve_primary_table_grants`]).
+    fn skip_occupied_primary_candidates(&mut self, pages: u64) -> Result<(), PageTableError> {
+        let arena = &self.arenas[0];
+        let Some(candidate_end) = pages
+            .checked_mul(PT_PAGE)
+            .and_then(|len| arena.next_free.checked_add(len))
+        else {
+            return Ok(());
+        };
+        if pages == 0 || !arena.is_live() || candidate_end > arena.capacity as u64 {
+            return Ok(());
+        }
+        let resolver = self
+            .resolver
+            .as_ref()
+            .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+        let host = resolver
+            .host_const_ptr_for_range(arena.base, candidate_end as usize)
+            .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+        // SAFETY: the resolver maps `[base, candidate_end)` of the arena.
+        let candidates = unsafe {
+            core::slice::from_raw_parts(
+                host.add(arena.next_free as usize),
+                (candidate_end - arena.next_free) as usize,
+            )
+        };
+        const ZERO_PAGE: [u8; PT_PAGE as usize] = [0; PT_PAGE as usize];
+        if candidates
+            .chunks_exact(PT_PAGE as usize)
+            .all(|page| page == ZERO_PAGE)
+        {
+            return Ok(());
+        }
+        let host = resolver
+            .host_const_ptr_for_range(arena.base, arena.capacity)
+            .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+        // SAFETY: the resolver maps the whole primary arena.
+        let image = unsafe { core::slice::from_raw_parts(host, arena.capacity) };
+        let discovered = discover_next_free_spare(image);
+        self.arenas[0].next_free = self.arenas[0].next_free.max(discovered);
+        Ok(())
+    }
+
     /// Carve a zeroed table page: reuse a coalesced one if available, else bump
     /// the spare tail of the primary arena or an extension arena, or allocate a
     /// new extension arena from the attached source.
@@ -4266,37 +4318,7 @@ impl PageTableManager {
             debug_assert_eq!(popped, Some(pa));
             return Ok(pa);
         }
-        // A guest editor can grow the same live primary arena between host
-        // edits. Usually the cached cursor still points at a pristine zero
-        // page, so the fixed one-page check is the whole cost. If that exact
-        // candidate is occupied, reconstruct the high-water mark once from the
-        // authoritative live image before bump allocation; never hand a
-        // guest-linked table page out again.
-        if self.arenas[0].is_live()
-            && self.arenas[0].next_free + PT_PAGE <= self.arenas[0].capacity as u64
-        {
-            let arena = &self.arenas[0];
-            let resolver = self
-                .resolver
-                .as_ref()
-                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
-            let candidate_end = (arena.next_free + PT_PAGE) as usize;
-            let host = resolver
-                .host_const_ptr_for_range(arena.base, candidate_end)
-                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
-            let candidate = unsafe {
-                core::slice::from_raw_parts(host.add(arena.next_free as usize), PT_PAGE as usize)
-            };
-            const ZERO_PAGE: [u8; PT_PAGE as usize] = [0; PT_PAGE as usize];
-            if candidate != ZERO_PAGE {
-                let host = resolver
-                    .host_const_ptr_for_range(arena.base, arena.capacity)
-                    .ok_or(PageTableError::UnresolvedArena(arena.base))?;
-                let image = unsafe { core::slice::from_raw_parts(host, arena.capacity) };
-                let discovered = discover_next_free_spare(image);
-                self.arenas[0].next_free = self.arenas[0].next_free.max(discovered);
-            }
-        }
+        self.skip_occupied_primary_candidates(1)?;
         if self.arenas[0].next_free + PT_PAGE <= self.arenas[0].capacity as u64 {
             let off = self.arenas[0].next_free;
             let needed = (off + PT_PAGE) as usize;
@@ -11308,6 +11330,29 @@ mod tests {
         );
         assert_eq!(mgr.free_tables, free_before);
         assert_eq!(mgr.arenas[0].next_free, cursor_before);
+    }
+
+    /// A guest editor can link a table page past the host's cached cursor
+    /// (the live arena grew under another image of this MM). A grant must
+    /// never name that page: two parents linking one table make two VA
+    /// ranges alias the same leaves. The grant path shares the host
+    /// allocator's occupied-candidate check.
+    #[test]
+    fn primary_table_grants_skip_a_guest_linked_page_past_the_cursor() {
+        let (mut mgr, resolver) = create_live_fixture();
+        let cursor = mgr.arenas[0].next_free;
+        // EL1 filled the second candidate page (a linked L3 table).
+        let occupied = cursor + PT_PAGE;
+        resolver.write_word(LINUX_PAGE_TABLES_BASE, occupied as usize + 8, VALID);
+        let grants = mgr.reserve_primary_table_grants(3).expect("three pages");
+        for &page in grants.as_slice() {
+            assert!(
+                page > LINUX_PAGE_TABLES_BASE + occupied,
+                "grant 0x{page:x} at or below the guest-linked page 0x{:x}",
+                LINUX_PAGE_TABLES_BASE + occupied
+            );
+        }
+        assert_eq!(mgr.arenas[0].next_free, occupied + 4 * PT_PAGE);
     }
 
     #[derive(Default)]
