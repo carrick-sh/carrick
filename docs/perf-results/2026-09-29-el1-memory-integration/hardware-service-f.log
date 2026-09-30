@@ -1,0 +1,44 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vmm-hvf)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1.73s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_kernel_memory_probe-a60c81ce2eb96b58.tmp.60675
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_kernel_memory_probe-a60c81ce2eb96b58.tmp.60675: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_kernel_memory_probe-a60c81ce2eb96b58
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_vmm_hvf-c0477cba4ddb34be.tmp.60675
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_vmm_hvf-c0477cba4ddb34be.tmp.60675: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_vmm_hvf-c0477cba4ddb34be
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_compute_baseline_probe-a17590e8cf591173.tmp.60675
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_compute_baseline_probe-a17590e8cf591173.tmp.60675: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_compute_baseline_probe-a17590e8cf591173
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_fork_probe-6bc4feecf48abe83.tmp.60675
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_fork_probe-6bc4feecf48abe83.tmp.60675: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_fork_probe-6bc4feecf48abe83
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_svc_tax_probe-288f096eee3918d4.tmp.60675
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_svc_tax_probe-288f096eee3918d4.tmp.60675: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_svc_tax_probe-288f096eee3918d4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_info_load_probe-543b886b403c3c3b.tmp.60675
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_info_load_probe-543b886b403c3c3b.tmp.60675: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_info_load_probe-543b886b403c3c3b
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_bl_exit_free_probe-60b5d379d0b971c8.tmp.60675
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_bl_exit_free_probe-60b5d379d0b971c8.tmp.60675: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/hvf_bl_exit_free_probe-60b5d379d0b971c8
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_descriptor_service-e396d5c65d2d8882.tmp.60675: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_descriptor_service-e396d5c65d2d8882
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/el1_descriptor_service-e396d5c65d2d8882 serial_host_el1_descriptor_service --ignored --nocapture
+
+running 1 test
+test serial_host_el1_descriptor_service_executes_and_settles ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_vmm_hvf-c0477cba4ddb34be.noent.60675: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/target/release/deps/carrick_vmm_hvf-c0477cba4ddb34be.noent.60675
+
+running 1 test
+test trap::stage2_backend::unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 618 filtered out; finished in 0.00s
+
+remaining carrick procs (run-id el1-descriptor-service-20260929-f) = 0
+remaining carrick procs (run-id el1-descriptor-service-20260929-f-cli) = 0
+test-signed: receipt target/test-results/carrick-vmm-hvf-signed-artifacts.jsonl
+test-signed: OK (carrick-vmm-hvf: 1 invoked signed executable(s) passed, 8 signed, negative control passed)
