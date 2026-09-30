@@ -7,7 +7,7 @@
 
 **Updated:** 2026-09-29, from local Git state, source inspection and retained
 receipts. After requesting the refresh, the user explicitly said "Set the
-goal and go." The end-to-end goal is active; execution now prioritizes task C under the user-requested reset below; A remains unaccepted.
+goal and go." The end-to-end goal is active; execution now advances B+D memory ownership after the bounded C coherence slice below; A and full C remain unaccepted.
 
 **Goal:** Complete the accepted AArch64/macOS EL1 migration,
 with one authoritative owner and one semantic implementation per object,
@@ -328,7 +328,7 @@ Task A remains an acceptance blocker, but unresolved historical attribution
 and additional race fixtures are not dependencies of every development edit.
 Do not mark A accepted or merge its unqualified candidate to main.
 
-The immediate development frontier is **C: the pipe/eventfd vertical**. Review
+The initial development frontier after the reset was **C: the pipe/eventfd vertical**. Review
 and compile the existing adapter/host/fixture integration, complete the actual
 blocking continuation and descriptor-lifetime gaps, then turn the five named
 signed witnesses green with nonzero guest parks and the required exit/work
@@ -359,6 +359,30 @@ two live processes with overlapping VAs and independent identity; partial I/O
 and SA_RESTART during exec/exit; rollback under allocation/publication refusal;
 coherence with host file mutations and shared aliases. Each owning task below
 must provide those witnesses where applicable.
+
+### Current frontier after bounded IPC coherence delivery
+
+Source `6970e3e` fixes vector eventfd operations through the existing shared
+counter and owned write continuation. Native ARM64 shape/fault oracles,
+red-first split read, 32 focused IPC tests and affected Clippy pass. Signed
+`el1-ipc-vector-20260929-a` completes 128 checked mixed-venue roundtrips each
+for pipe/eventfd, with 127/128 EL1 parks. Negative entitlement and zero-leftover
+cleanup pass. Exact tested bytes and manifest are retained in adapter
+`docs/perf-results/2026-09-29-el1-ipc-integration/vector-*`.
+
+**Next implementation: B+D memory ownership.** Review and join descriptor/COW
+`c555f5dd1` and elastic return `8f268dee4` on the development integration;
+check their shared layout and run the focused memory regression net. Then
+review reservation candidate `f2efa3716` and wire authoritative reservation
+routing and remaining writers. All three worktrees were clean at this reset.
+Host pause removal remains last. Avoid a new diagnostic framework or another
+broad IPC capture before a specific new hypothesis provides a decisive test.
+
+C remains unaccepted: multi-process liveness and served-operation bounds,
+blocked shared-table close/reuse, signals/restart/partial progress, scoped
+zero-IPC-exit proof and full qualification remain required. A remains an
+acceptance blocker. Advancing independent memory work defers these blockers;
+it does not resolve or waive them. Keep one implementation vertical active.
 
 ### A. Close batch-3 lifecycle blockers
 
@@ -465,8 +489,10 @@ and 100 passing probe diagnostics do not erase the original reds.
 
 ### B. Integrate reviewed memory foundations
 
-Consumes A's accepted base; produces one reviewed descriptor/return foundation
-without claiming the still-disabled guest descriptor lane is active.
+Development may proceed on the current unaccepted integration base; A's
+acceptance is required for final landing, not independent memory development.
+Produces one reviewed descriptor/return foundation without claiming the
+still-disabled guest descriptor lane is active.
 
 - [ ] Review descriptor + elastic-return diffs and branch-local receipts;
   preserve exact MM/frame/IPA/owner domains and rollback receipts.
