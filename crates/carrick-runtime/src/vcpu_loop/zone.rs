@@ -217,9 +217,11 @@ where
                 // Another thread is on the vCPU. Take it off with its live
                 // state; this executor claims it next. This job's thread,
                 // which EL1 parked, settles below.
-                let served_with_work =
-                    carrick_kernel::el1_delegation::take_served_with_work(slot.raw().into());
-                carrick_kernel::el1_delegation::clear_pending_host_work(slot.raw().into());
+                // Delivers what the served call owed (inotify, IPC).
+                let served_with_work = carrick_kernel::el1_delegation::settle_el1_boundary_for(
+                    slot.raw().into(),
+                    &self.kernel.dispatcher,
+                );
                 let state = engine.snapshot_guest_state_for_publication()?;
                 let ctx = zone_ctx_from_state(
                     &state,
@@ -231,9 +233,6 @@ where
                     },
                 )?;
                 engine.discard_terminal_syscall_continuation()?;
-                if served_with_work {
-                    carrick_kernel::el1_inotify::deliver_owed_wakes();
-                }
                 // SAFETY: `current` is OnCpu on this slot and the vCPU is
                 // stopped: this executor is its only owner until the
                 // handback below.
@@ -260,7 +259,10 @@ where
                 // The vCPU left EL1 with no thread on it (the idle exit)
                 // with this job's thread parked or preempted: host work, or
                 // a queued thread that needs this executor.
-                carrick_kernel::el1_delegation::clear_pending_host_work(slot.raw().into());
+                let _ = carrick_kernel::el1_delegation::settle_el1_boundary_for(
+                    slot.raw().into(),
+                    &self.kernel.dispatcher,
+                );
                 engine.snapshot_guest_state_for_publication()?
             }
         };
