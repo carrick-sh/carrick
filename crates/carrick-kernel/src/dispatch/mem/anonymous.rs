@@ -455,7 +455,20 @@ impl MemState {
     /// memory (only carrick's hidden backing rows may enclose it).
     pub(in crate::dispatch) fn proc_regions(&self) -> Option<Vec<ProcMapsEntry>> {
         let host = || {
-            let mut regions = self.address_space_regions.clone();
+            // The hidden mmap arena, shared aperture and private overlay are
+            // carrick's backing reservations, not Linux VMAs: they are `rwx`
+            // and span the whole window, so rendering them beside the
+            // guest's own rows misreports its protections and adds rows.
+            // The heap backing row stays: `[heap]` is clamped to `brk`.
+            let mut regions = self.address_space_regions.clone().map(|rows| {
+                rows.into_iter()
+                    .filter(|row| {
+                        !super::boot_region_is_hidden_mmap_backing(row, self.layout)
+                            && !super::boot_region_is_hidden_shared_aperture(row)
+                            && !super::boot_region_is_hidden_private_overlay(row)
+                    })
+                    .collect::<Vec<_>>()
+            });
             if !self.dynamic_maps.is_empty() {
                 regions
                     .get_or_insert_with(Vec::new)

@@ -7021,3 +7021,61 @@ fn clock_stub_protection_adjacent_ranges_remain_mutable() {
         );
     }
 }
+
+/// `/proc/self/maps` on the host-setup lane must describe only what the
+/// guest mapped. Carrick's hidden mmap-arena reservation is `rwx`, spans the
+/// whole arena and is labelled `[carrick-mmap]`; Linux has no such VMA, and
+/// rendering it beside the guest's own rows made a private `rw-p` anonymous
+/// mapping read back as `rwxp` with a path and extra rows
+/// (`el1_delegated_root_concurrent_vma_ops`).
+#[test]
+fn proc_regions_hides_the_mmap_arena_reservation_on_the_host_setup_lane() {
+    let mut mem = MemState::new();
+    let layout = mem.layout;
+    let row = |start: u64, end: u64, write: bool, execute: bool| ProcMapsEntry {
+        start,
+        end,
+        read: true,
+        write,
+        execute,
+        sharing: carrick_vfs::ProcMapSharing::Private,
+        path: String::new(),
+    };
+    mem.address_space_regions = Some(vec![
+        row(0x1_0000_0000, 0x1_0001_0000, false, true),
+        row(
+            layout.mmap_base,
+            layout.mmap_base + layout.mmap_size,
+            true,
+            true,
+        ),
+    ]);
+    let guest = row(
+        layout.mmap_base + 0x5000,
+        layout.mmap_base + 0x15000,
+        true,
+        false,
+    );
+    mem.dynamic_maps.push(guest.clone());
+
+    let regions = mem.proc_regions().expect("regions");
+    let in_arena: Vec<_> = regions
+        .iter()
+        .filter(|r| r.start >= layout.mmap_base && r.start < layout.mmap_base + layout.mmap_size)
+        .collect();
+    assert_eq!(
+        in_arena.len(),
+        1,
+        "only the guest's own row may appear in the arena: {in_arena:x?}"
+    );
+    assert_eq!(
+        (
+            in_arena[0].start,
+            in_arena[0].end,
+            in_arena[0].write,
+            in_arena[0].execute
+        ),
+        (guest.start, guest.end, true, false)
+    );
+    assert!(regions.iter().any(|r| r.start == 0x1_0000_0000));
+}
