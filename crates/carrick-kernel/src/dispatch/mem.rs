@@ -177,10 +177,9 @@ impl MemAuthority {
     }
 
     pub(super) fn with_revision(state: MemState, revision: crate::kernel::VmaRevision) -> Self {
-        let revision = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision.raw()));
         Self {
-            state: settled::SettledMem::new(state, std::sync::Arc::clone(&revision)),
-            revision,
+            state: settled::SettledMem::new(state),
+            revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision.raw())),
         }
     }
 

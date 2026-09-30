@@ -28,17 +28,15 @@ pub(super) struct SettledMem {
     state: Mutex<MemState>,
     /// The MM id that keys this MM's address-space entry; 0 until bound.
     key: AtomicU64,
-    revision: std::sync::Arc<AtomicU64>,
     #[cfg(test)]
     test_spaces: TestSpaces,
 }
 
 impl SettledMem {
-    pub(super) fn new(state: MemState, revision: std::sync::Arc<AtomicU64>) -> Self {
+    pub(super) fn new(state: MemState) -> Self {
         Self {
             state: Mutex::new(state),
             key: AtomicU64::new(0),
-            revision,
             #[cfg(test)]
             test_spaces: Mutex::new(None),
         }
@@ -93,11 +91,16 @@ impl SettledMem {
         let Some(spaces) = spaces else {
             return;
         };
-        let applied = spaces.drain_vma_journal(key, |edit| state.apply_journaled_edit(edit));
-        if applied != 0 {
-            // The rows changed: observers keyed on the VMA revision see it.
-            self.revision.fetch_add(1, Ordering::Release);
-        }
+        // Deliberately NO `VmaRevision` bump. The revision is published only
+        // by the host-alias dispatch protocol (`HostAliasDispatchAdmission`
+        // advances it at the end of a dispatch, under the phase lock that
+        // foreign-MM snapshot consumers wait on). A settle runs inside any
+        // reader's lock at an arbitrary time, so a bump here would change the
+        // revision under a foreign COW publication that validated its
+        // snapshot against it and fail that operation (the parent's
+        // concurrent mprotects answered ENOMEM under fork load). EL1's served
+        // edits were outside the revision before the journal and stay so.
+        spaces.drain_vma_journal(key, |edit| state.apply_journaled_edit(edit));
     }
 }
 
@@ -266,6 +269,19 @@ mod tests {
     }
 
     #[test]
+    fn settling_the_journal_never_advances_the_vma_revision() {
+        let (authority, spaces) = mm();
+        let before = authority.vma_revision();
+        el1_serves(&spaces, 1, R);
+        assert_eq!(rows(&authority).len(), 3, "the edit was applied");
+        assert_eq!(
+            authority.vma_revision(),
+            before,
+            "the revision is published only by the host-alias dispatch protocol"
+        );
+    }
+
+    #[test]
     fn an_unbound_mm_ignores_the_journal() {
         let (authority, spaces) = mm();
         authority.state.bind(0);
@@ -275,5 +291,84 @@ mod tests {
             vec![(BASE, BASE + PAGES * PAGE, true, true)]
         );
         assert_eq!(spaces.pending_vma_edits(KEY), 1);
+    }
+
+    /// The `el1_sched_mm_occupancy_two_processes` shape without a VM: eight
+    /// writers each narrow and restore their own pages through EL1's
+    /// journal (falling back to the host commit when it is full), while the
+    /// host validates that every range stays covered (Linux: mprotect of a
+    /// mapped range never answers ENOMEM) and forks the MM concurrently.
+    #[test]
+    fn concurrent_edits_a_full_journal_and_forks_never_uncover_a_range() {
+        use crate::dispatch::mem::guest_vma_covers_locked;
+        const WRITERS: u64 = 8;
+        let (authority, spaces) = mm();
+        let authority = Arc::new(authority);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for writer in 0..WRITERS {
+            let (authority, spaces) = (Arc::clone(&authority), Arc::clone(&spaces));
+            threads.push(std::thread::spawn(move || {
+                // One page each: `PAGES` == `WRITERS`.
+                for round in 0..400u64 {
+                    let prot = if round % 2 == 0 { R } else { RW };
+                    let index = spaces.find(KEY).unwrap();
+                    let owner = NonZeroU64::new(writer + 1).unwrap();
+                    let editor = spaces
+                        .try_begin_edit_bounded(index, KEY, owner, u32::MAX)
+                        .unwrap();
+                    let (start, end) = (BASE + writer * PAGE, BASE + (writer + 1) * PAGE);
+                    if editor.journal_has_room() {
+                        editor.journal_protect(start, end, prot).unwrap();
+                    } else {
+                        drop(editor);
+                        // ReturnWithWork: the host commits the same edit.
+                        authority.lock().set_mapping_prot(
+                            start,
+                            end,
+                            LinuxProtFlags::from_bits_truncate(u64::from(prot)),
+                        );
+                    }
+                }
+            }));
+        }
+        let validator = {
+            let (authority, stop) = (Arc::clone(&authority), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut checks = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    let guard = authority.lock();
+                    assert!(
+                        guard_covers(&guard, BASE, PAGES * PAGE),
+                        "a mapped range read as a hole after {checks} checks"
+                    );
+                    drop(guard);
+                    checks += 1;
+                }
+            })
+        };
+        let forker = {
+            let (authority, stop) = (Arc::clone(&authority), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let child = authority.fork_private();
+                    assert!(guard_covers(&child.lock(), BASE, PAGES * PAGE));
+                }
+            })
+        };
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        validator.join().unwrap();
+        forker.join().unwrap();
+        // 400 rounds: the last edit of each writer restored RW.
+        assert_eq!(
+            rows(&authority),
+            vec![(BASE, BASE + PAGES * PAGE, true, true)]
+        );
+        fn guard_covers(state: &MemState, start: u64, len: u64) -> bool {
+            guest_vma_covers_locked(state, start, len)
+        }
     }
 }
