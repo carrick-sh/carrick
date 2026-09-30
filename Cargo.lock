@@ -770,6 +770,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-mem",

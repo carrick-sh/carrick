@@ -31,6 +31,7 @@ pub struct ResidentFaultRange {
 /// at or below" lookup exact.
 #[derive(Clone, Default)]
 pub struct FirstTouchArming {
+    revision: u64,
     /// `start -> (end, prot)`, non-overlapping, ordered by `start`.
     extents: std::collections::BTreeMap<u64, FirstTouchArm>,
 }
@@ -42,6 +43,10 @@ struct FirstTouchArm {
 }
 
 impl FirstTouchArming {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Arm `range` for first-touch observation at `prot`, replacing whatever
     /// armed the pages it covers.
     pub(crate) fn arm(&mut self, range: carrick_vfs::GuestMemoryRange, prot: LinuxProtFlags) {
@@ -101,6 +106,12 @@ impl FirstTouchArming {
     /// outside it. This is the commit path for one page, so it must not touch
     /// entries the range does not overlap.
     pub(crate) fn disarm(&mut self, range: carrick_vfs::GuestMemoryRange) {
+        self.revision = self.revision.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "dispatch::first_touch_revision",
+                "first-touch arming revision exhausted"
+            )
+        });
         let (start, end) = (range.start().raw(), range.end().raw());
         // The one entry that may begin BEFORE `range` and still cover it.
         if let Some((&head_start, &head)) = self.extents.range(..start).next_back()

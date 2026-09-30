@@ -43,3 +43,25 @@ test callers. Their existence does not prove production guest COW. Next is
 reservation authority integration followed by actual copyout/backend routing,
 scoped T6 observation and signed memory evidence. Do not flip admission bits
 or remove the host pause before these writers are converted.
+
+## Carrier reservation provider connection
+
+Join reservation candidate f2efa3716 onto 8fc9513fd and connect its provider
+to the persistent factory before worker admission. CarrierMetadataAccess
+retains the existing PersistentCarrierMappings and exact VM generation;
+dynamic extent resolution uses the existing exact-token resolver. Runtime
+prepared views retain mapping pins, cache unchanged storage generations, and
+lock the exact MM through the owned region's ZoneTables, not global pointers.
+
+The new lifetime witness failed on absent access and passes after connection;
+it retains mapping ownership across dropping the factory reference and rejects
+access after exact custody retirement. Its initial host-only fixture required
+an unmapped fixed lease to avoid invoking a real HVF unmap during cleanup.
+The corrected semantic red and green are retained.
+
+Checks: 27 kernel reservation-filter tests, 114 EL1 and 56 ABI tests, lifetime
+witness and affected runtime Clippy pass. This does not activate anonymous
+policy: legacy MemState admission still refuses a second anonymous owner.
+The signed first-touch regression is next. The reservation branch's earlier
+active-target fixture race, full source review, inventory reconciliation and
+full acceptance remain open.

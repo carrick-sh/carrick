@@ -2746,6 +2746,28 @@
       "rationale": "Shared object wake claims must be unique and fit the fixed record population; duplicate delivery or an invalid ownership transition is a scheduler invariant failure.",
       "sink": "fatal",
       "domain": "ipc::wake"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "function": "retire_reservation_root",
+      "ordinal_in_function": 1,
+      "fingerprint": "6baa265f6424a7f7fd48ebe83ca313a89272e01117175bd8158a65fc71b2f87b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_occupancy",
+      "rationale": "Final-MM settlement follows admission closure and occupant drain; a surviving reservation guard or pending descriptor/backing receipt means completion ownership was lost. Reusing the root would expose a stale reservation generation or free metadata still owned by an unfinished transaction. Ordinary proposal refusal is handled before settlement.",
+      "sink": "fatal",
+      "domain": "kernel::mm_occupancy"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "function": "FirstTouchArming::disarm",
+      "ordinal_in_function": 1,
+      "fingerprint": "a5c161535dca538c353b88badcbb4256e4db1f85799f0e9703a9e4c1ccd9621b",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::first_touch_revision",
+      "rationale": "Exhausting the exact arming revision must stop publication rather than reuse a generation and authenticate an obsolete descriptor receipt.",
+      "sink": "fatal",
+      "domain": "dispatch::first_touch_revision"
     }
   ]
 }

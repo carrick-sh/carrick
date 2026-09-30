@@ -2377,6 +2377,14 @@ pub(crate) struct PersistentExecutorSpec {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PersistentExecutorSpec {
+    pub(crate) fn reservation_metadata_access(
+        &self,
+    ) -> Option<crate::metadata_grant::CarrierMetadataAccess> {
+        crate::metadata_grant::CarrierMetadataAccess::new(std::sync::Arc::clone(
+            &self.carrier_mappings,
+        ))
+    }
+
     pub(crate) fn fd_ceiling_publisher(
         &self,
     ) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {

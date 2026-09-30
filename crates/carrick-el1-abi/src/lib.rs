@@ -22,6 +22,11 @@
 
 mod descriptor_txn;
 pub use descriptor_txn::*;
+mod metadata_extent;
+pub use metadata_extent::*;
+
+mod reservations;
+pub use reservations::*;
 
 use core::cell::UnsafeCell;
 
@@ -325,6 +330,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_REGION_BASE,
         EL1_REGION_SIZE,
         EL1_COUNTERS_OFFSET,
+        EL1_RESERVATIONS_OFFSET,
+        EL1_RESERVATIONS_END,
         EL1_STACKS_OFFSET,
         EL1_STACK_SIZE,
         EL1_CURRENT_TASKS_OFFSET,
