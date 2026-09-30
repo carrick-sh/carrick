@@ -19,6 +19,8 @@ fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
 
 #[test]
 fn guest_lane_refuses_host_cow_before_copy_or_publication() {
+    // `materialize_retired_reuse` publishes through EL1 on the guest lane;
+    // `foreign_mm::tests::guest_retained_reuse_*` pin that contract.
     // Converted writers publish through EL1 and must refuse a missing
     // driving vCPU before any allocation or inventory staging.
     let source = include_str!("../cow_engine.rs");

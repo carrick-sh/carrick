@@ -776,73 +776,6 @@ impl HvfVmState {
         reg.activate()
     }
 
-    /// Whether the frame backing `ipa` is referenced by MORE than one extent in
-    /// the shared backend registry — i.e., some other mm (a fork parent or
-    /// child) still lives on it. The registry `Arc` is shared across every
-    /// engine in the carrier and its counts drive retirement, so it is the
-    /// authority for "shared", where the per-engine armed-set is only a
-    /// derived (and known-omissive) approximation.
-    /// Whether this mm may write DIRECTLY through the frame its retained
-    /// stage-1 output names. Two ways to lose that right:
-    ///
-    /// - This mm's inventory holds NO extent covering the IPA at all: the leaf
-    ///   is stale — it survived a retirement/replacement of the mapping it
-    ///   belonged to — and whatever lives behind that IPA now belongs to
-    ///   someone else. The forkserver worker's scrub had exactly this shape
-    ///   (606 own extents, none covering the retained IPA) and its Direct
-    ///   write zeroed the SERVER's live interned-dict granule.
-    /// - An extent exists but the backend registry counts more than one
-    ///   reference on its frame: a fork peer still lives on it, and a direct
-    ///   write would be visible through the other mm.
-    ///
-    /// In both cases the maintenance write must MATERIALIZE a private zeroed
-    /// replacement instead. The registry `Arc` is shared carrier-wide and its
-    /// counts drive retirement, so it is the authority; the per-engine
-    /// armed-set is a derived, known-omissive approximation
-    /// (`mtforkcorrupt`).
-    pub(crate) fn retained_output_lacks_exclusive_claim(&self, ipa: u64) -> bool {
-        // Only REUSABLE global-frame IPAs carry claims at all. Boot and
-        // identity regions (the heap, the low arena's fixed backing, page
-        // tables) are per-mm by construction and never enter the extent map;
-        // treating their absence as a lost claim routed every brk-heap scrub
-        // into materialization and broke `ltp-brk02`/`ltp-tgkill01` outright.
-        if !is_reusable_global_frame_extent(ipa, 1) {
-            return false;
-        }
-        let inventory = self.frame_inventory.lock();
-        let extent = inventory.extent_containing(ipa).map(|(_, extent)| *extent);
-        let Some(extent) = extent else {
-            return true;
-        };
-        // DELIBERATE sharing is not a lost claim. A `SharedAnon`/`SharedFile`
-        // backing is MAP_SHARED semantics: every mapper must keep seeing the
-        // same bytes, and materializing a private replacement under it breaks
-        // exactly what the guest asked for (measured: multiprocessing's
-        // Barrier hung when a shared semaphore page was privatized here).
-        // Only a PRIVATE backing observed by more than one mm is fork-COW
-        // sharing that a maintenance write must not write through.
-        //
-        // A private FILE VIEW never carries an exclusive claim: its host
-        // bytes are the file's page cache, so a direct maintenance write
-        // would either fail (the view is `PROT_READ`) or, worse, be the file.
-        // The maintenance write must materialize the page privately, exactly
-        // like a guest write to a clean page.
-        match extent.backing {
-            InventoryBackingIdentity::PrivateFileView(_) => return true,
-            InventoryBackingIdentity::Private(_) => {}
-            InventoryBackingIdentity::SharedAnon(_)
-            | InventoryBackingIdentity::SharedFile { .. } => return false,
-        }
-        inventory
-            .frames
-            .lock()
-            .references
-            .get(&extent.frame)
-            .copied()
-            .unwrap_or(0)
-            > 1
-    }
-
     pub(crate) const DEFAULT_FAULT_WINDOW_BYTES: u64 = 64 * 1024;
 
     pub(crate) fn fault_window_bytes() -> u64 {
@@ -1658,6 +1591,76 @@ impl HvfVmState {
         }
         Ok(end)
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfTaskState {
+    /// Whether the frame backing `ipa` is referenced by MORE than one extent in
+    /// the shared backend registry — i.e., some other mm (a fork parent or
+    /// child) still lives on it. The registry `Arc` is shared across every
+    /// engine in the carrier and its counts drive retirement, so it is the
+    /// authority for "shared", where the per-engine armed-set is only a
+    /// derived (and known-omissive) approximation.
+    /// Whether this mm may write DIRECTLY through the frame its retained
+    /// stage-1 output names. Two ways to lose that right:
+    ///
+    /// - This mm's inventory holds NO extent covering the IPA at all: the leaf
+    ///   is stale — it survived a retirement/replacement of the mapping it
+    ///   belonged to — and whatever lives behind that IPA now belongs to
+    ///   someone else. The forkserver worker's scrub had exactly this shape
+    ///   (606 own extents, none covering the retained IPA) and its Direct
+    ///   write zeroed the SERVER's live interned-dict granule.
+    /// - An extent exists but the backend registry counts more than one
+    ///   reference on its frame: a fork peer still lives on it, and a direct
+    ///   write would be visible through the other mm.
+    ///
+    /// In both cases the maintenance write must MATERIALIZE a private zeroed
+    /// replacement instead. The registry `Arc` is shared carrier-wide and its
+    /// counts drive retirement, so it is the authority; the per-engine
+    /// armed-set is a derived, known-omissive approximation
+    /// (`mtforkcorrupt`).
+    pub(crate) fn retained_output_lacks_exclusive_claim(&self, ipa: u64) -> bool {
+        // Only REUSABLE global-frame IPAs carry claims at all. Boot and
+        // identity regions (the heap, the low arena's fixed backing, page
+        // tables) are per-mm by construction and never enter the extent map;
+        // treating their absence as a lost claim routed every brk-heap scrub
+        // into materialization and broke `ltp-brk02`/`ltp-tgkill01` outright.
+        if !is_reusable_global_frame_extent(ipa, 1) {
+            return false;
+        }
+        let inventory = self.frame_inventory.lock();
+        let extent = inventory.extent_containing(ipa).map(|(_, extent)| *extent);
+        let Some(extent) = extent else {
+            return true;
+        };
+        // DELIBERATE sharing is not a lost claim. A `SharedAnon`/`SharedFile`
+        // backing is MAP_SHARED semantics: every mapper must keep seeing the
+        // same bytes, and materializing a private replacement under it breaks
+        // exactly what the guest asked for (measured: multiprocessing's
+        // Barrier hung when a shared semaphore page was privatized here).
+        // Only a PRIVATE backing observed by more than one mm is fork-COW
+        // sharing that a maintenance write must not write through.
+        //
+        // A private FILE VIEW never carries an exclusive claim: its host
+        // bytes are the file's page cache, so a direct maintenance write
+        // would either fail (the view is `PROT_READ`) or, worse, be the file.
+        // The maintenance write must materialize the page privately, exactly
+        // like a guest write to a clean page.
+        match extent.backing {
+            InventoryBackingIdentity::PrivateFileView(_) => return true,
+            InventoryBackingIdentity::Private(_) => {}
+            InventoryBackingIdentity::SharedAnon(_)
+            | InventoryBackingIdentity::SharedFile { .. } => return false,
+        }
+        inventory
+            .frames
+            .lock()
+            .references
+            .get(&extent.frame)
+            .copied()
+            .unwrap_or(0)
+            > 1
+    }
 
     /// Void every pending deferred-COW receipt naming `[va, va+len)`.
     ///
@@ -1744,6 +1747,7 @@ impl HvfVmState {
     /// `protect_range` publication authenticates the deferred PTE receipts.
     pub(crate) fn materialize_retired_reuse(
         &mut self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         va: u64,
         requested_end: u64,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
@@ -1867,7 +1871,8 @@ impl HvfVmState {
             TrapError::Hypervisor("HVPatch retained reuse offset underflow".to_owned())
         })?;
         let page_table_host = self
-            .mapping_for_range(
+            .mapping_for_range_in(
+                custody,
                 crate::memory::LINUX_PAGE_TABLES_BASE,
                 carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
             )
@@ -1879,7 +1884,7 @@ impl HvfVmState {
         let mut reservation = authority.reserve(1, 1, 2).map_err(|error| {
             TrapError::Hypervisor(format!("reserve HVPatch retained reuse inventory: {error}"))
         })?;
-        let backing = Self::private_backing_identity();
+        let backing = HvfVmState::private_backing_identity();
         let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             CowArmedRanges::COMPOUND_SIZE as usize,
             crate::host_mapping::HostMappingKind::FrameCow,
@@ -1911,14 +1916,13 @@ impl HvfVmState {
             )));
         }
         new_lease.mark_mapped();
-        let custody = self.carrier_vm_custody();
         let owner_generation = register_global_frame_host_owner_in(
-            &custody,
+            custody,
             new_lease,
             new_host,
             u64::from(stage2_perms),
         )?;
-        let mut owner_rollback = GlobalFrameOwnerRollback::new(custody);
+        let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(custody));
         owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
 
         let retained_stage = || InventoryMappingStage {
@@ -1945,7 +1949,7 @@ impl HvfVmState {
             // Kernel grant, backend ledger and stage-2 owner roll back on drop
             // until EL1's verified completion lets the replacement survive.
             let mut prepared = GuestPreparedBacking::prepare_owned(
-                self.carrier_vm_custody(),
+                std::sync::Arc::clone(custody),
                 authority.clone(),
                 self.frame_inventory.ledger.clone(),
                 reservation,
@@ -1987,7 +1991,7 @@ impl HvfVmState {
         } else {
             let inventory_mapping = {
                 let mut inventory = self.frame_inventory.lock();
-                Self::stage_mapping_in(
+                HvfVmState::stage_mapping_in(
                     self.custody(),
                     &mut inventory,
                     &mut reservation,
@@ -2019,7 +2023,7 @@ impl HvfVmState {
                                     "begin undo HVPatch retained reuse leaves: {other:?}"
                                 )),
                             })?;
-                            Self::refresh_stage1_exclusivity(editor.manager);
+                            HvfVmState::refresh_stage1_exclusivity(editor.manager);
                             editor
                                 .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
                                 .map_err(|error| {
@@ -2096,7 +2100,7 @@ impl HvfVmState {
                         "retained reuse rollback TLBI failed: {flush_error}"
                     );
                 }
-                Self::rollback_unpublished_mappings(
+                HvfVmState::rollback_unpublished_mappings(
                     &mut self.frame_inventory.lock(),
                     &[inventory_entry],
                 )?;
@@ -4196,9 +4200,11 @@ impl HvfVmState {
             }
             match route {
                 FrameCowWriteRoute::MaterializeRetired => {
-                    if let Some(materialized_end) =
-                        self.materialize_retired_reuse(current, end, flush_stage1)?
-                    {
+                    if let Some(materialized_end) = {
+                        let custody = self.carrier_vm_custody();
+                        self.task
+                            .materialize_retired_reuse(&custody, current, end, flush_stage1)?
+                    } {
                         current = materialized_end;
                     }
                     // The materializer rechecks after acquiring quiesce. If a
