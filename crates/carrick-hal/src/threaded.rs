@@ -2690,9 +2690,11 @@ pub struct El1FrameGrantPublication {
     pub ready: El1FrameGrantReady,
 }
 
-/// Exactly what one successful `prepare_el1_frame_grant` published for a
-/// grant whose leaves were then never exposed (refused, rolled back, or never
-/// submitted): the semantic span and the backend identity it returned.
+/// Exactly what one successful `prepare_el1_frame_grant` published: the
+/// semantic span and the backend identity it returned. It names the grant to
+/// its completion (`complete_el1_frame_grant`, after EL1's verified receipt)
+/// or to its rollback (leaves never exposed: refused, rolled back, or never
+/// submitted).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct El1FrameGrantRollback {
     pub mm_key: u64,
@@ -3038,6 +3040,18 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         &mut self,
         _grant: El1FrameGrantRollback,
     ) -> Result<bool, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend prepared no EL1 frame grant".to_owned(),
+        ))
+    }
+
+    /// Finish what `prepare_el1_frame_grant` deferred for a guest-lane grant
+    /// once EL1's receipt for it has verified: a grant that replaces a
+    /// private predecessor retires that old owner and registers its own
+    /// alias only now, never before the guest's leaves exist. Called before
+    /// residency is committed. A fresh grant has nothing deferred. The
+    /// caller holds the MM's mutation authority.
+    fn complete_el1_frame_grant(&mut self, _grant: El1FrameGrantRollback) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "backend prepared no EL1 frame grant".to_owned(),
         ))

@@ -693,28 +693,192 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
     assert!(!ScopedStage2MapTestStub::is_mapped(gpa, length as usize));
 }
 
+fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantReplacement {
+    use super::*;
+    let ready = carrick_hal::El1FrameGrantReady {
+        physical_ipa: 0x80_0000_0000 + base,
+        frame_id: 5,
+        mapping_id: 6,
+        owner_generation: generation,
+        inventory_revision: 8,
+    };
+    PendingEl1GrantReplacement {
+        grant: carrick_hal::threaded::El1FrameGrantRollback {
+            mm_key: 41,
+            semantic_base: base,
+            len: 0x4000,
+            ready,
+        },
+        predecessor_leases: std::collections::BTreeSet::from([(0x90_0000_0000, 0x4000)]),
+        alias: AliasBacking {
+            start: base,
+            ipa: ready.physical_ipa,
+            host_addr: 0x1000,
+            size: 0x4000,
+            physical_ipa: ready.physical_ipa,
+            physical_host_addr: 0x1000,
+            physical_size: 0x4000,
+            perms: 7,
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: alias_ownership_scope(
+                GuestMappingSharing::Private,
+                None,
+                ContainerRootToken::ROOT,
+            ),
+            inventory_backing: HvfVmState::private_backing_identity(),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        },
+    }
+}
+
+/// A guest-lane replacement is named to its completion or rollback by its
+/// exact incarnation, and one span never holds two pending replacements.
 #[test]
-fn guest_lane_declines_frame_grant_replacement_before_any_transition() {
-    // The replacement branch retires a predecessor; on the guest lane that
-    // must go through `publish_replacing` (retirement after the verified
-    // receipt), so the bulk grant declines before beginning a transition.
-    let source = include_str!("../cow_engine.rs");
-    let body = source
-        .split_once("fn prepare_el1_frame_grant(")
-        .unwrap()
+fn pending_el1_grant_replacements_match_only_the_exact_grant() {
+    use super::*;
+    let mut ledger = PendingEl1GrantReplacements::default();
+    let first = replacement(0x10_0000, 3);
+    assert!(ledger.insert(first.clone()));
+    assert!(ledger.overlaps(0x10_3000, 0x1000));
+    assert!(!ledger.overlaps(0x10_4000, 0x1000));
+    assert!(!ledger.overlaps(0x0f_c000, 0x4000));
+    assert!(
+        !ledger.insert(replacement(0x10_2000, 9)),
+        "an overlapping replacement is refused"
+    );
+    // Same span, another owner incarnation: not this grant.
+    assert_eq!(ledger.take(&replacement(0x10_0000, 4).grant), None);
+    assert!(ledger.insert(replacement(0x20_0000, 3)));
+    assert_eq!(ledger.take(&first.grant), Some(first.clone()));
+    assert_eq!(ledger.take(&first.grant), None, "taken exactly once");
+    assert!(!ledger.overlaps(0x10_0000, 0x4000));
+    assert!(ledger.take(&replacement(0x20_0000, 3).grant).is_some());
+}
+
+fn fn_body<'a>(source: &'a str, entry: &str) -> &'a str {
+    source
+        .split_once(entry)
+        .unwrap_or_else(|| panic!("{entry}"))
         .1
         .split("\n    pub(crate) fn ")
         .next()
-        .unwrap();
-    let decline = body
-        .find("LiveDescriptorOwner::Guest")
-        .expect("guest lane declines replacement");
-    let transition = body
-        .find("begin_pristine_materialization(")
-        .expect("pristine transition");
-    assert!(decline < transition);
-    let fresh_only = &body[decline..];
-    assert!(fresh_only[..200].contains("return Ok(None)"));
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap()
+}
+
+fn in_order(body: &str, needles: &[&str]) {
+    let mut at = 0;
+    for needle in needles {
+        let found = body[at..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+        at += found + needle.len();
+    }
+}
+
+/// The guest lane publishes a replacement grant instead of declining it,
+/// but retires nothing before EL1's receipt: the grant's alias is held back
+/// in the MM's ledger (never registered beside its predecessor), and only
+/// the host lane folds the retirement into the grant's commit.
+#[test]
+fn guest_lane_replacement_grant_defers_retirement_and_registration() {
+    let source = include_str!("../cow_engine.rs");
+    let prepare = fn_body(source, "fn prepare_el1_frame_grant(");
+    assert!(
+        !prepare.contains("require_host_cow_lane("),
+        "the guest lane no longer refuses a replacement"
+    );
+    in_order(
+        prepare,
+        &[
+            "Some(planned) if guest_lane => (None, Some(planned.planned_leases))",
+            "Some(planned) => (Some(planned), None)",
+            "publish_frame_grant(",
+            "if let Some(retirement) = retirement.take()",
+            "commit_preapplied_process_alias_retirement(",
+            "None => register_shared_alias(published.alias)",
+            "self.el1_grant_replacements.lock().insert(pending)",
+            "transition.commit()",
+        ],
+    );
+    assert_eq!(
+        prepare.matches("register_shared_alias(").count(),
+        1,
+        "a replacement's alias is registered only at completion"
+    );
+}
+
+/// Completion retires the predecessor only after re-preparing it against
+/// the live inventory and proving the planned leases, then registers the
+/// grant, under one frame-registry hold the retirement never takes itself.
+/// Rollback of a pending replacement retires only the grant's own
+/// unregistered publication: never the span's registered predecessor.
+#[test]
+fn replacement_completion_and_rollback_touch_the_right_owner() {
+    let source = include_str!("../cow_engine.rs");
+    let complete = fn_body(source, "fn complete_el1_frame_grant(");
+    in_order(
+        complete,
+        &[
+            "el1_grant_replacements.lock().take(&grant)",
+            "prepare_process_alias_retirement(",
+            "retirement.planned_leases != pending.predecessor_leases",
+            "FrameRegistryGuard::acquire(",
+            "commit_process_alias_retirement(",
+            "&registry)",
+            "register_shared_alias(pending.alias)",
+            "drop(registry)",
+        ],
+    );
+    let rollback = fn_body(source, "fn roll_back_el1_frame_grant(");
+    let (pending, fresh) = rollback
+        .split_once("let aliases = alias_registry()")
+        .expect("fresh-grant rollback follows the pending branch");
+    in_order(
+        pending,
+        &[
+            "el1_grant_replacements.lock().take(&grant)",
+            "retire_unregistered_el1_frame_grant(",
+            "restore_pristine(",
+            "return Ok(true)",
+        ],
+    );
+    for predecessor_writer in [
+        "unregister_process_alias(",
+        "commit_process_alias_retirement(",
+    ] {
+        assert!(
+            !pending.contains(predecessor_writer),
+            "{predecessor_writer}"
+        );
+    }
+    assert!(fresh.contains("is_exactly_el1_frame_grant("));
+    let retire = fn_body(source, "fn retire_unregistered_el1_frame_grant(");
+    in_order(
+        retire,
+        &[
+            "reserve_process_alias_retirement(",
+            "commit_process_alias_retirement_inner(",
+            "AliasRetirementRows::NeverRegistered",
+        ],
+    );
+    assert!(!retire.contains("FrameRegistryGuard::acquire("));
+    let inner = fn_body(source, "fn commit_process_alias_retirement_inner(");
+    in_order(
+        inner,
+        &[
+            "let registered = rows == AliasRetirementRows::Registered;",
+            "if registered {",
+            "supersede_cow_receipts(",
+            "let actual_leases = if registered {",
+            "unregister_alias(",
+        ],
+    );
 }
 
 /// A refused grant's rollback retires only the exact alias its preparation
@@ -792,6 +956,12 @@ fn el1_frame_grant_rollback_retires_through_the_unmap_path_then_restores_pristin
         .split("\n    pub(crate) fn ")
         .next()
         .unwrap();
+    // A pending guest-lane replacement is rolled back first, through its
+    // own branch (`replacement_completion_and_rollback_touch_the_right_owner`).
+    let body = body
+        .split_once("let aliases = alias_registry()")
+        .expect("fresh-grant rollback")
+        .1;
     let guard = body
         .find("is_exactly_el1_frame_grant(")
         .expect("exact identity guard");
