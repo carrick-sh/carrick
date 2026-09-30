@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn serial_host_el1_ipc_file_table_fork_exec_and_refusal() {
         let ids = ObjectIdRegistry::new();
-        let owner = Arc::new(HostIpc::new(16384).unwrap());
+        let owner = Arc::new(HostIpc::new(1 << 16).unwrap());
         let map = map();
         let parent = FileTable::new(ids.file_table_id().unwrap());
         let description = Arc::new(FileDescription::regular(ids.file_description_id().unwrap()));

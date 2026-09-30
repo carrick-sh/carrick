@@ -259,6 +259,14 @@ impl Extent {
 /// [`Error::BadBacking`]). Allocation of extents happens outside this
 /// authority, never under a table lock.
 ///
+/// Lifetime rule (lock-free lookups): an extent's memory must stay mapped,
+/// and be accessed only as `DescriptorSlot`/`AtomicU64` words by every
+/// party, for as long as the core lives, including after the extent is
+/// retired (`grow_table`, `destroy_table`). A lookup may still read a
+/// retired extent's words before `seq` rejects them, so the venue may reuse
+/// that memory only as another extent (type-stable reclamation), never as
+/// anything written non-atomically.
+///
 /// The venue also holds the open-file-description records: `ofd(index)`
 /// resolves record `index` for every index below the core's published
 /// count ([`Core::ofd_count`], grown by [`Authority::publish_ofds`]). The

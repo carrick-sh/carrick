@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_el1_abi::ipc::{
     HostResourceToken, IPC_DIRECTORY_BYTES, IPC_MAX_OBJECTS, IPC_MAX_OFDS, IPC_OBJECT_SEGMENT,
-    IPC_OFD_SEGMENT, IPC_PIPE_PAGE_SIZE, IPC_POOL_ALIGN, IPC_STOCK_RING_BYTES, IpcDirectory,
-    IpcError, IpcObjectHandle, IpcPipeStorage, IpcRegion, IpcReleased, descriptor_extent_bytes, fd,
-    pipe,
+    IPC_OFD_SEGMENT, IPC_PIPE_PAGE_SIZE, IPC_POOL_ALIGN, IPC_POOL_AREAS, IPC_STOCK_RING_BYTES,
+    IpcDirectory, IpcError, IpcObjectHandle, IpcPipeStorage, IpcRegion, IpcReleased,
+    descriptor_extent_bytes, fd, ipc_descriptor_area, ipc_ring_area, pipe,
 };
 use parking_lot::Mutex;
 
@@ -111,17 +111,19 @@ impl Drop for Mapping {
     }
 }
 
-/// Buddy allocator for admission only. At most log2(pool pages) split/merge
-/// steps; transfer paths never enter it. Allocated offsets authenticate frees.
+/// Buddy allocator for admission only, over one area of the pool: `bytes`
+/// (a power of two) starting at `base` (a multiple of `bytes`). At most
+/// log2(area pages) split/merge steps; transfer paths never enter it.
+/// Allocated offsets authenticate frees.
 struct Pool {
     free: Vec<BTreeSet<u64>>,
     allocated: BTreeMap<u64, usize>,
 }
 impl Pool {
-    fn new(bytes: usize) -> Self {
+    fn new(base: u64, bytes: usize) -> Self {
         let order = (bytes / IPC_POOL_ALIGN as usize).ilog2() as usize;
         let mut free = vec![BTreeSet::new(); order + 1];
-        free[order].insert(0);
+        free[order].insert(base);
         Self {
             free,
             allocated: BTreeMap::new(),
@@ -376,7 +378,14 @@ impl Drop for HostDescription {
 pub struct HostIpc {
     directory: Mapping,
     bytes: Mapping,
-    pool: Mutex<Pool>,
+    /// The pool's two type-stable areas ([`ipc_ring_area`],
+    /// [`ipc_descriptor_area`]), each allocated only for its own kind: a
+    /// descriptor extent retired while a lock-free EL1 or host lookup still
+    /// reads it is only ever reused as another extent (atomic words), never
+    /// as ring bytes, and the mapping lives as long as this owner (every
+    /// view borrows it; the carrier retains the owner while it maps it).
+    rings: Mutex<Pool>,
+    descriptors: Mutex<Pool>,
     resources: Mutex<HostResources>,
     /// Host wake targets by object index, sized to the highest index used.
     host_wakes: Mutex<Vec<Option<HostWakeEntry>>>,
@@ -421,7 +430,8 @@ impl HostIpc {
     /// the ABI's reservation). The directory reserves address space for every
     /// store's full span; pages are committed only as segments are published.
     pub fn with_limits(pool_bytes: usize, limits: IpcLimits) -> Result<Self, AdmissionError> {
-        if pool_bytes < IPC_POOL_ALIGN as usize || !pool_bytes.is_power_of_two() {
+        if pool_bytes < (IPC_POOL_AREAS * IPC_POOL_ALIGN) as usize || !pool_bytes.is_power_of_two()
+        {
             return Err(AdmissionError::NoMemory);
         }
         let limits = IpcLimits {
@@ -431,7 +441,14 @@ impl HostIpc {
         let owner = Self {
             directory: Mapping::new(IPC_DIRECTORY_BYTES)?,
             bytes: Mapping::new(pool_bytes)?,
-            pool: Mutex::new(Pool::new(pool_bytes)),
+            rings: Mutex::new(Pool::new(
+                ipc_ring_area(pool_bytes as u64).start,
+                pool_bytes / IPC_POOL_AREAS as usize,
+            )),
+            descriptors: Mutex::new(Pool::new(
+                ipc_descriptor_area(pool_bytes as u64).start,
+                pool_bytes / IPC_POOL_AREAS as usize,
+            )),
             host_wakes: Mutex::new(Vec::new()),
             resources: Mutex::new(HostResources {
                 next: 1,
@@ -683,7 +700,7 @@ impl HostIpc {
             ring_bytes,
             pages,
         };
-        storage.offset = self.pool.lock().allocate(storage.footprint())?;
+        storage.offset = self.rings.lock().allocate(storage.footprint())?;
         Ok(storage)
     }
     /// A new pipe costs its object record only: its ring is provided at its
@@ -695,7 +712,7 @@ impl HostIpc {
             self.with_object(|region| region.create_pipe(capacity, &mut retired, &HostLockWait));
         // A reused record's too-small ring, detached after the object lock.
         if let Some(retired) = retired {
-            self.pool.lock().release(retired.offset);
+            self.rings.lock().release(retired.offset);
         }
         let object = object?;
         self.bind_waits(object);
@@ -721,7 +738,7 @@ impl HostIpc {
             return;
         };
         if let Err(ring) = region.stock_ring(ring) {
-            self.pool.lock().release(ring.offset);
+            self.rings.lock().release(ring.offset);
         }
     }
 
@@ -757,7 +774,7 @@ impl HostIpc {
                 .lock(object, &HostLockWait)
                 .and_then(|mut guard| guard.provide_pipe_storage(&mut storage));
             if storage != IpcPipeStorage::default() {
-                self.pool.lock().release(storage.offset);
+                self.rings.lock().release(storage.offset);
             }
             match installed {
                 Ok(_) => return Ok(()),
@@ -817,7 +834,7 @@ impl HostIpc {
             })();
             let without_ring = replacement.is_none();
             if let Some(storage) = replacement {
-                self.pool.lock().release(storage.offset);
+                self.rings.lock().release(storage.offset);
             }
             match result {
                 // A first write gave the pipe its ring (for the old capacity)
@@ -832,7 +849,7 @@ impl HostIpc {
             return Err(AdmissionError::NoMemory);
         }
         let token = self
-            .pool
+            .descriptors
             .lock()
             .allocate(descriptor_extent_bytes(capacity))?;
         Ok(fd::Extent {
@@ -896,7 +913,7 @@ impl HostIpc {
     }
     /// Reclaim only an extent returned by this region's destroy/grow operation.
     pub(crate) fn reclaim_descriptors(&self, extent: fd::Extent) {
-        self.pool.lock().release(extent.token);
+        self.descriptors.lock().release(extent.token);
     }
     pub fn retain_host_resource(
         &self,
@@ -1071,9 +1088,9 @@ mod tests {
                 Err(IpcError::Stale)
             ));
         }
-        // 2048 pipes ran in a pool of eight 128 KiB blocks: the freed
+        // 2048 pipes ran in a ring area of four 128 KiB blocks: the freed
         // record's ring and the stock are reused, never one ring per pipe.
-        assert!(owner.pool.lock().allocated.len() <= 8);
+        assert!(owner.rings.lock().allocated.len() <= 4);
     }
 
     #[test]
@@ -1101,7 +1118,7 @@ mod tests {
             .unwrap();
         owner.release(desc.backing).unwrap();
         owner.reclaim_descriptors(extent);
-        assert!(owner.pool.lock().allocated.is_empty());
+        assert!(owner.descriptors.lock().allocated.is_empty());
     }
 
     /// Creating a pipe takes no pool storage (Linux allocates pipe pages on
@@ -1109,13 +1126,13 @@ mod tests {
     /// nothing allocated and the pipe intact.
     #[test]
     fn serial_host_el1_ipc_pool_refusal_has_no_partial_admission() {
-        let owner = HostIpc::new(4096).unwrap();
+        let owner = HostIpc::new(8192).unwrap();
         let pipe = owner.create_pipe(65536).unwrap();
         assert_eq!(
             owner.ensure_pipe_storage(pipe),
             Err(AdmissionError::NoMemory)
         );
-        assert!(owner.pool.lock().allocated.is_empty());
+        assert!(owner.rings.lock().allocated.is_empty());
         let region = owner.region();
         let mut guard = region.lock(pipe, &HostLockWait).unwrap();
         assert!(!guard.pipe().unwrap().is_backed());
@@ -1139,11 +1156,11 @@ mod tests {
     #[test]
     fn serial_host_el1_ipc_rings_are_provided_at_first_write() {
         use carrick_el1_abi::ipc::IPC_RING_STOCK;
-        let owner = HostIpc::new(1 << 27).unwrap();
+        let owner = HostIpc::new(1 << 28).unwrap();
         let pipes: Vec<_> = (0..4096)
             .map(|_| owner.create_pipe(65536).unwrap())
             .collect();
-        let allocated = || owner.pool.lock().allocated.len();
+        let allocated = || owner.rings.lock().allocated.len();
         assert_eq!(allocated(), IPC_RING_STOCK, "idle pipes: the stock only");
         let first = pipes[4000];
         owner.ensure_pipe_storage(first).unwrap();
@@ -1186,7 +1203,7 @@ mod tests {
             let mut guard = region.lock(*object, &HostLockWait).unwrap();
             assert_eq!(guard.provide_ring_from_stock(), Ok(true));
         }
-        assert_eq!(owner.pool.lock().allocated.len(), 128, "one ring per pipe");
+        assert_eq!(owner.rings.lock().allocated.len(), 128, "one ring per pipe");
         for object in pipes {
             for end in [pipe::End::Reader, pipe::End::Writer] {
                 owner

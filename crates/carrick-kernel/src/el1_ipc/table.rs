@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn serial_host_el1_ipc_owned_tables_reclaim_extent_and_identity_capacity() {
-        let owner = Arc::new(HostIpc::new(16384).unwrap());
+        let owner = Arc::new(HostIpc::new(1 << 16).unwrap());
         for _ in 0..carrick_el1_abi::ipc::IPC_FD_TABLES + 1 {
             let mut parent = HostTable::create(Arc::clone(&owner), 64, 4).unwrap();
             let child = parent.fork().unwrap();
@@ -206,11 +206,11 @@ mod tests {
             // The three live tables own distinct extents. In particular,
             // successful fork must not reclaim its consumed (zeroed) token,
             // because pool offset zero may still belong to the parent.
-            assert_eq!(owner.pool.lock().allocated.len(), 3);
+            assert_eq!(owner.descriptors.lock().allocated.len(), 3);
             parent.ensure_capacity(64).unwrap();
-            assert_eq!(owner.pool.lock().allocated.len(), 3);
+            assert_eq!(owner.descriptors.lock().allocated.len(), 3);
             drop((parent, child, third));
-            assert!(owner.pool.lock().allocated.is_empty());
+            assert!(owner.descriptors.lock().allocated.is_empty());
         }
     }
 

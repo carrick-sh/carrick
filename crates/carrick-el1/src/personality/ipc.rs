@@ -869,7 +869,9 @@ mod tests {
     // ---- the world: region (host-initialized), zone, one slot, task A ----
     struct World {
         region: &'static IpcRegion<'static>,
+        /// Next free byte of the pool's ring area and descriptor area.
         next: Cell<u64>,
+        next_descriptor: Cell<u64>,
         zone: Box<ZoneTables>,
         task: CurrentTask,
         cpu: FakeCpu,
@@ -898,7 +900,7 @@ mod tests {
             )
             .cast::<IpcDirectory>()
         };
-        let pool_len = 16 << 20;
+        let pool_len = 32 << 20;
         let pool =
             unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
         let region = unsafe {
@@ -940,6 +942,9 @@ mod tests {
         cpu.sgis.reserve(4096);
         cpu.asid_invalidations.reserve(4096);
         World {
+            next_descriptor: Cell::new(
+                carrick_el1_abi::ipc::ipc_descriptor_area(pool_len as u64).start,
+            ),
             region: Box::leak(Box::new(region)),
             next: Cell::new(0),
             zone,
@@ -954,20 +959,28 @@ mod tests {
     }
 
     impl World {
+        /// Ring-area bytes.
         fn bump(&self, bytes: u64) -> u64 {
             let at = self.next.get();
             self.next.set((at + bytes).next_multiple_of(IPC_POOL_ALIGN));
             at
+        }
+        /// A descriptor extent of `capacity` slots, in the descriptor area.
+        fn descriptor_extent(&self, capacity: usize) -> Extent {
+            let at = self.next_descriptor.get();
+            self.next_descriptor
+                .set((at + descriptor_extent_bytes(capacity)).next_multiple_of(IPC_POOL_ALIGN));
+            Extent {
+                token: at,
+                capacity: capacity as u64,
+            }
         }
         fn host(&self) -> carrick_el1_abi::ipc::IpcFdAuthority<'static, HostWait> {
             self.region.fd(HostWait)
         }
         /// The host venue's table for thread `tid` (a new process).
         fn table(&self, tid: u64) -> TableId {
-            let extent = Extent {
-                token: self.bump(descriptor_extent_bytes(64)),
-                capacity: 64,
-            };
+            let extent = self.descriptor_extent(64);
             let t = self.host().create_table(1024, &mut { extent }).unwrap();
             self.map
                 .publish(file_table_of(tid, self.a_tid), t.to_raw())
@@ -975,10 +988,7 @@ mod tests {
             t
         }
         fn fork_table(&self, parent: TableId, tid: u64) -> TableId {
-            let mut extent = Extent {
-                token: self.bump(descriptor_extent_bytes(64)),
-                capacity: 64,
-            };
+            let mut extent = self.descriptor_extent(64);
             let t = self.host().fork(parent, &mut extent).unwrap();
             self.map
                 .publish(file_table_of(tid, self.a_tid), t.to_raw())

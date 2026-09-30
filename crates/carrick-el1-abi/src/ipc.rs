@@ -522,6 +522,7 @@ const LAYOUT_FACTS: &[u64] = &[
     HOST_WAKE_LEAF_WORDS as u64,
     core::mem::offset_of!(IpcOperationSlot, op) as u64,
     IPC_RING_STOCK as u64,
+    IPC_POOL_AREAS,
     IPC_STOCK_RING_BYTES,
     core::mem::size_of::<RingStockSlot>() as u64,
     core::mem::offset_of!(IpcDirectory, ring_stock) as u64,
@@ -901,13 +902,30 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Pool bytes `[offset, offset+len)`, authenticated against the pool.
-    fn pool_range(&self, offset: u64, len: u64, align: u64) -> Option<*mut u8> {
+    fn pool_range(
+        &self,
+        area: core::ops::Range<u64>,
+        offset: u64,
+        len: u64,
+        align: u64,
+    ) -> Option<*mut u8> {
         let end = offset.checked_add(len)?;
-        if !offset.is_multiple_of(align) || end > self.pool_len {
+        if !offset.is_multiple_of(align) || offset < area.start || end > area.end {
             return None;
         }
         // SAFETY: in bounds of the pool mapping.
         Some(unsafe { self.pool.add(offset as usize) })
+    }
+
+    /// Pipe-ring bytes `[offset, offset+len)`, inside the ring area.
+    fn ring_range(&self, offset: u64, len: u64) -> Option<*mut u8> {
+        self.pool_range(ipc_ring_area(self.pool_len), offset, len, IPC_POOL_ALIGN)
+    }
+
+    /// Descriptor-extent words `[offset, offset+len)`, inside the
+    /// descriptor area.
+    fn descriptor_range(&self, offset: u64, len: u64) -> Option<*mut u8> {
+        self.pool_range(ipc_descriptor_area(self.pool_len), offset, len, 64)
     }
 
     /// A published object record; `None` past the published count.
@@ -952,9 +970,7 @@ impl<'a> IpcRegion<'a> {
     pub fn stock_ring(&self, ring: IpcPipeStorage) -> Result<(), IpcPipeStorage> {
         if ring.ring_bytes != IPC_STOCK_RING_BYTES
             || !ring.fits(IPC_STOCK_RING_BYTES as usize)
-            || self
-                .pool_range(ring.offset, ring.footprint(), IPC_POOL_ALIGN)
-                .is_none()
+            || self.ring_range(ring.offset, ring.footprint()).is_none()
         {
             return Err(ring);
         }
@@ -1514,9 +1530,15 @@ impl SlotBacking for IpcRegion<'_> {
         let words = bitmap_words(capacity);
         let slot_bytes = (capacity as u64).checked_mul(8)?;
         let total = slot_bytes.checked_add((words as u64).checked_mul(8)?)?;
-        let base = self.pool_range(extent.token, total, 64)?;
-        // SAFETY: authenticated in-bounds, 64-byte aligned pool range of
-        // atomics; the fd core accesses it only under the table's lock.
+        let base = self.descriptor_range(extent.token, total)?;
+        // SAFETY: an authenticated, 64-byte aligned range of the pool's
+        // descriptor area. That area is type-stable: every word in it is
+        // only ever accessed as an `AtomicU64` (slots, bitmaps), by every
+        // venue, for the pool mapping's whole lifetime, whichever extent
+        // currently owns it. So a lock-free lookup that resolved an extent
+        // retired and reused meanwhile only makes atomic loads of atomics
+        // that are written atomically, and rejects what it read via the
+        // table's `seq`.
         unsafe {
             Some((
                 core::slice::from_raw_parts(base as *const DescriptorSlot, capacity),
@@ -1528,6 +1550,23 @@ impl SlotBacking for IpcRegion<'_> {
         }
     }
 }
+
+/// The pool's pipe-ring area: its lower half. Ring bytes are plain memory
+/// (copied under the object lock); they never overlap the descriptor area.
+pub const fn ipc_ring_area(pool_len: u64) -> core::ops::Range<u64> {
+    0..pool_len / IPC_POOL_AREAS
+}
+
+/// The pool's descriptor-extent area: its upper half. It is type-stable:
+/// its words are only ever descriptor slots and free-slot bitmap words,
+/// accessed as `AtomicU64` by every venue, so a retired extent's memory can
+/// be reused for another extent while a lock-free lookup still reads it.
+pub const fn ipc_descriptor_area(pool_len: u64) -> core::ops::Range<u64> {
+    pool_len / IPC_POOL_AREAS..pool_len
+}
+
+/// The pool is split into this many equal areas (rings, then descriptors).
+pub const IPC_POOL_AREAS: u64 = 2;
 
 /// Pool bytes a descriptor extent of `capacity` slots occupies.
 pub const fn descriptor_extent_bytes(capacity: usize) -> u64 {
@@ -1603,10 +1642,7 @@ impl<'a> IpcObjectGuard<'a> {
     }
     fn set_storage(&mut self, s: IpcPipeStorage) -> Result<(), IpcError> {
         if s != IpcPipeStorage::default()
-            && self
-                .region
-                .pool_range(s.offset, s.footprint(), IPC_POOL_ALIGN)
-                .is_none()
+            && self.region.ring_range(s.offset, s.footprint()).is_none()
         {
             return Err(IpcError::BadStorage);
         }
@@ -1629,7 +1665,7 @@ impl<'a> IpcObjectGuard<'a> {
         }
         let base = self
             .region
-            .pool_range(s.offset, s.footprint(), IPC_POOL_ALIGN)
+            .ring_range(s.offset, s.footprint())
             .filter(|_| s.ring_bytes != 0)
             .ok_or(IpcError::BadStorage)?;
         // SAFETY: the object lock is held (exclusive state access); the
@@ -1734,7 +1770,7 @@ impl<'a> IpcObjectGuard<'a> {
         }
         let base = self
             .region
-            .pool_range(new.offset, footprint, IPC_POOL_ALIGN)
+            .ring_range(new.offset, footprint)
             .ok_or(IpcError::BadStorage)?;
         // SAFETY: checked pool bounds, page alignment and disjointness from
         // this object's live extent. As for creation, the host allocator owns
