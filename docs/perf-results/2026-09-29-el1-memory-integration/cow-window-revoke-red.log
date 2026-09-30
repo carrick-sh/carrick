@@ -1,0 +1,41 @@
+   Compiling carrick-mmu-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mmu-core)
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+warning: unreachable statement
+  --> crates/carrick-mmu-core/src/aarch64/descriptor_txn/copy_window.rs:72:5
+   |
+71 |       return Ok(result);
+   |       ----------------- any code following this expression is unreachable
+72 | /     if !restore(words, base, &edits) {
+73 | |         return Err(DescriptorOutcome::Indeterminate(DescriptorRefusal::Contended));
+74 | |     }
+   | |_____^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+warning: `carrick-mmu-core` (lib) generated 1 warning
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+warning: `carrick-mmu-core` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.06s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-795688a8226b9d93)
+
+running 1 test
+test aarch64::descriptor_txn::copy_window::tests::cow_copy_aliases_are_scoped_kernel_only_and_removed_before_completion ... FAILED
+
+failures:
+
+---- aarch64::descriptor_txn::copy_window::tests::cow_copy_aliases_are_scoped_kernel_only_and_removed_before_completion stdout ----
+
+thread 'aarch64::descriptor_txn::copy_window::tests::cow_copy_aliases_are_scoped_kernel_only_and_removed_before_completion' (34631050) panicked at crates/carrick-mmu-core/src/aarch64/descriptor_txn/copy_window.rs:134:9:
+assertion `left == right` failed
+  left: 27021597764259715
+ right: 65538
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    aarch64::descriptor_txn::copy_window::tests::cow_copy_aliases_are_scoped_kernel_only_and_removed_before_completion
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 154 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

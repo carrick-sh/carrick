@@ -1,0 +1,14 @@
+    Checking carrick-mmu-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mmu-core)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+    Checking bitflags v2.11.1
+    Checking serde v1.0.228
+    Checking zerocopy v0.8.48
+    Checking thiserror v2.0.20
+    Checking scroll v0.13.0
+    Checking goblin v0.10.5
+    Checking carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+    Checking carrick-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-abi)
+    Checking carrick-guest-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-guest-mem)
+    Checking carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.11s

@@ -70,6 +70,8 @@
 //! before retiring the old owner; a receipt proves what EL1 wrote, not that the
 //! host's inventory has not since moved.
 
+pub mod copy_window;
+
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
