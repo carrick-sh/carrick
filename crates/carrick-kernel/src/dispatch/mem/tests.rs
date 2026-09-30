@@ -1452,7 +1452,7 @@ fn moving_shared_mremap_fails_before_private_copy_or_metadata_mutation() {
         "shared-code".into(),
     );
 
-    let mmap_next_before = dispatcher.mem().lock().mmap_next;
+    let mmap_next_before = dispatcher.mem().lock().arena_for_test().mmap_next;
     let outcome = threaded_memory_call(
         &dispatcher,
         &mut memory,
@@ -1464,7 +1464,10 @@ fn moving_shared_mremap_fails_before_private_copy_or_metadata_mutation() {
         ),
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
-    assert_eq!(dispatcher.mem().lock().mmap_next, mmap_next_before);
+    assert_eq!(
+        dispatcher.mem().lock().arena_for_test().mmap_next,
+        mmap_next_before
+    );
     assert!(
         memory
             .protections
@@ -1531,7 +1534,7 @@ fn mixed_rx_and_r_mremap_source_is_rejected_without_broadening_permissions() {
         DispatchOutcome::Returned { value: 0 }
     );
     let maps_before = dispatcher.mem().lock().dynamic_maps.clone();
-    let mmap_next_before = dispatcher.mem().lock().mmap_next;
+    let mmap_next_before = dispatcher.mem().lock().arena_for_test().mmap_next;
 
     let outcome = threaded_memory_call(
         &dispatcher,
@@ -1552,7 +1555,10 @@ fn mixed_rx_and_r_mremap_source_is_rejected_without_broadening_permissions() {
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
     assert_eq!(dispatcher.mem().lock().dynamic_maps, maps_before);
-    assert_eq!(dispatcher.mem().lock().mmap_next, mmap_next_before);
+    assert_eq!(
+        dispatcher.mem().lock().arena_for_test().mmap_next,
+        mmap_next_before
+    );
 }
 
 #[test]
@@ -1570,7 +1576,7 @@ fn mremap_shrink_unmap_failure_keeps_source_metadata_and_allocator() {
         ProcMapSharing::Private,
         "source".into(),
     );
-    dispatcher.mem().lock().mmap_next = source + 2 * LINUX_PAGE_SIZE;
+    dispatcher.mem().lock().arena_for_test().mmap_next = source + 2 * LINUX_PAGE_SIZE;
     let mut memory =
         DeferredSetterFailureMemory::new(source, (2 * LINUX_PAGE_SIZE) as usize).fail_unmaps(1);
     let maps_before = dispatcher.mem().lock().dynamic_maps.clone();
@@ -1587,7 +1593,7 @@ fn mremap_shrink_unmap_failure_keeps_source_metadata_and_allocator() {
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
     assert_eq!(dispatcher.mem().lock().dynamic_maps, maps_before);
     assert_eq!(
-        dispatcher.mem().lock().mmap_next,
+        dispatcher.mem().lock().arena_for_test().mmap_next,
         source + 2 * LINUX_PAGE_SIZE
     );
 }
@@ -4171,7 +4177,11 @@ fn next_mmap_address_reuses_freed_arena_region() {
     {
         let mem_authority_117 = dispatcher.mem();
         let mut mem = mem_authority_117.lock();
-        free_regions_insert(&mut mem.free_regions, freed, 2 * LINUX_PAGE_SIZE);
+        free_regions_insert(
+            &mut mem.arena_for_test().free_regions,
+            freed,
+            2 * LINUX_PAGE_SIZE,
+        );
     }
 
     let first = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any);
@@ -4180,7 +4190,14 @@ fn next_mmap_address_reuses_freed_arena_region() {
     let second = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any);
     assert_eq!(second, Some((freed + LINUX_PAGE_SIZE, true)));
 
-    assert!(dispatcher.mem().lock().free_regions.is_empty());
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .arena_for_test()
+            .free_regions
+            .is_empty()
+    );
 }
 
 /// A page-cache view of a file needs `address ≡ offset (mod host page)`,
@@ -4217,7 +4234,7 @@ fn next_mmap_address_honours_file_offset_congruence() {
     assert_eq!(address, LINUX_MMAP_BASE + residue);
     assert!(!reused);
     assert_eq!(
-        dispatcher.mem().lock().free_regions,
+        dispatcher.mem().lock().arena_for_test().free_regions,
         vec![(LINUX_MMAP_BASE, residue)],
         "the skipped congruence prefix is parked, not stranded"
     );
@@ -4230,7 +4247,7 @@ fn next_mmap_address_honours_file_offset_congruence() {
     {
         let mem_authority = dispatcher.mem();
         let mut mem = mem_authority.lock();
-        free_regions_insert(&mut mem.free_regions, hole, hole_len);
+        free_regions_insert(&mut mem.arena_for_test().free_regions, hole, hole_len);
     }
     let (address, reused) = dispatcher
         .next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, congruence)
@@ -4238,7 +4255,7 @@ fn next_mmap_address_honours_file_offset_congruence() {
     assert_eq!(address, hole + residue);
     assert!(reused);
     assert_eq!(
-        dispatcher.mem().lock().free_regions,
+        dispatcher.mem().lock().arena_for_test().free_regions,
         vec![
             (hole, residue),
             (
@@ -4254,7 +4271,7 @@ fn next_mmap_address_honours_file_offset_congruence() {
     {
         let mem_authority = dispatcher.mem();
         let mut mem = mem_authority.lock();
-        free_regions_insert(&mut mem.free_regions, hole, residue);
+        free_regions_insert(&mut mem.arena_for_test().free_regions, hole, residue);
     }
     let (address, reused) = dispatcher
         .next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, congruence)
@@ -4290,7 +4307,7 @@ fn a_prot_none_reserve_does_not_raise_the_writable_watermark() {
 
     // Rewind the cursor the way `munmap` of the top region does, then take
     // the same span again. Nothing could have written it, so no scrub.
-    dispatcher.mem().lock().mmap_next = reserve.0;
+    dispatcher.mem().lock().arena_for_test().mmap_next = reserve.0;
     let again = dispatcher
         .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any)
         .expect("re-allocate");
@@ -4324,7 +4341,7 @@ fn a_writable_mapping_raises_the_watermark_and_forces_a_later_scrub() {
         "a writable hand-out must move the watermark past its end"
     );
 
-    dispatcher.mem().lock().mmap_next = writable.0;
+    dispatcher.mem().lock().arena_for_test().mmap_next = writable.0;
     let again = dispatcher
         .next_mmap_address(
             0,
@@ -4349,20 +4366,24 @@ fn reset_memory_state_on_execve_resets_arenas_and_preserves_auxv_snapshot() {
         let mem_authority_118 = dispatcher.mem();
         let mut mem = mem_authority_118.lock();
         mem.seed_brk_current_for_test(LINUX_HEAP_BASE + 0x21000);
-        mem.mmap_next = LINUX_MMAP_BASE + 0x8000;
+        mem.arena_for_test().mmap_next = LINUX_MMAP_BASE + 0x8000;
         mem.mmap_writable_high = LINUX_MMAP_BASE + 0x9000;
-        free_regions_insert(&mut mem.free_regions, LINUX_MMAP_BASE + 0x1000, 0x1000);
+        free_regions_insert(
+            &mut mem.arena_for_test().free_regions,
+            LINUX_MMAP_BASE + 0x1000,
+            0x1000,
+        );
     }
 
     dispatcher.reset_memory_state_on_execve();
 
     {
         let mem_authority_119 = dispatcher.mem();
-        let mem = mem_authority_119.lock();
+        let mut mem = mem_authority_119.lock();
         assert_eq!(mem.program_break(), LINUX_HEAP_BASE);
-        assert_eq!(mem.mmap_next, LINUX_MMAP_BASE);
+        assert_eq!(mem.arena_for_test().mmap_next, LINUX_MMAP_BASE);
         assert_eq!(mem.mmap_writable_high, LINUX_MMAP_BASE);
-        assert!(mem.free_regions.is_empty());
+        assert!(mem.arena_for_test().free_regions.is_empty());
         assert_eq!(mem.linux_auxv_image, vec![1, 2, 3, 4]);
     }
     assert_eq!(
@@ -4424,7 +4445,11 @@ fn reused_private_anonymous_mmap_zeroes_backing_without_zero_write() {
     {
         let mem_authority_120 = dispatcher.mem();
         let mut mem = mem_authority_120.lock();
-        free_regions_insert(&mut mem.free_regions, LINUX_MMAP_BASE, LINUX_PAGE_SIZE);
+        free_regions_insert(
+            &mut mem.arena_for_test().free_regions,
+            LINUX_MMAP_BASE,
+            LINUX_PAGE_SIZE,
+        );
     }
     let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
     memory.bytes.fill(0x5a);
@@ -4861,10 +4886,10 @@ fn shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily() {
 fn every_mmap_refusal_names_itself() {
     const SOURCE: &str = include_str!("mmap.rs");
     let start = SOURCE
-        .find("fn mmap(this, cx, requested: GuestPtr,")
+        .find("fn mmap_served(this, cx, requested: GuestPtr,")
         .expect("mmap handler header");
     let end = SOURCE
-        .find("fn munmap(this, cx, address: GuestPtr,")
+        .find("fn munmap_served(this, cx, address: GuestPtr,")
         .expect("munmap handler header");
     let body = &SOURCE[start..end];
     assert!(
@@ -5157,12 +5182,12 @@ fn mmap_refuses_growth_past_rlimit_as_with_enomem() {
         .expect("mmap dispatch");
     assert_eq!(returned(first), LINUX_MMAP_BASE as i64);
 
-    let cursor = dispatcher.mem().lock().mmap_next;
+    let cursor = dispatcher.mem().lock().arena_for_test().mmap_next;
     let second = dispatcher
         .dispatch(&context, map(LINUX_PAGE_SIZE), &mut memory, &reporter)
         .expect("mmap dispatch");
     assert_eq!(second, DispatchOutcome::errno(LINUX_ENOMEM));
-    assert_eq!(dispatcher.mem().lock().mmap_next, cursor);
+    assert_eq!(dispatcher.mem().lock().arena_for_test().mmap_next, cursor);
 }
 
 /// When `RLIMIT_AS` and `RLIMIT_DATA` are infinite (carrick defaults),

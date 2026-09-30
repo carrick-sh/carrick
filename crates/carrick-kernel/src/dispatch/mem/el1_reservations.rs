@@ -10,12 +10,14 @@
 //! before publishing the grant receipt. A generation mismatch is refusal, never
 //! permission to replay the Linux syscall or revive an old mapping.
 //!
-//! Production admission currently fails closed with `ForeignMapping`: the
-//! legacy MemState authority still serves mmap/munmap/mprotect/brk/mremap,
-//! madvise, fault planning, mincore, proc maps, fork and exec/exit. None of those
-//! MMs may seal a shared root until those paths relinquish their anonymous
-//! facts. The snapshot importer below is a host-only conformance fixture, not
-//! a second production authority or an activation mechanism.
+//! Production admission currently fails closed with `ForeignMapping`. Once a
+//! root is admitted (today only by the conformance fixture), brk, mmap, munmap,
+//! mprotect placement and the anonymous-private rows have one owner, the root
+//! (`anonymous::AnonymousAuthority`); mremap and attribute-changing madvise
+//! are host-served over demoted rows, and fault planning, mincore and exec/exit
+//! still read host residency state. The snapshot importer below
+//! is a host-only conformance fixture, not a second production authority or an
+//! activation mechanism.
 
 use super::*;
 #[cfg(test)]
@@ -194,51 +196,64 @@ impl MemView<'_> {
 }
 
 impl MemView<'_> {
-    /// S1a conformance fixture: seal this MM's published root as the owner of
-    /// its program break. The root imports the host break, the current limits
-    /// and the host-owned charges; `MemState` then keeps no break of its own.
-    /// Production admission still refuses (`admit_host_snapshot`): the other
-    /// anonymous facts have not relinquished their host writer yet.
+    /// Conformance fixture: seal this MM's published root as the one owner of
+    /// its anonymous memory. Every host row is imported: plain private
+    /// anonymous rows inside the heap/arena layout as EL1-editable nodes that
+    /// then leave `MemState`, everything else as opaque placement obstacles
+    /// the host keeps. Production admission still refuses
+    /// (`admit_host_snapshot`).
     #[cfg(test)]
-    pub(in crate::dispatch) fn delegate_break_for_test(&self) -> Result<(), Refusal> {
-        let root = self.mm_authority().delegated_break()?;
+    pub(in crate::dispatch) fn delegate_anonymous_for_test(&self) -> Result<(), Refusal> {
+        use super::anonymous::{opaque_flags, root_owned_row};
+        use carrick_el1_abi::ReservationNodeFlags;
+        let root = self.mm_authority().delegated_root()?;
         let (address_limit, data_limit) = self
             .address_space_limits_apply(true)
             .unwrap_or((u64::MAX, u64::MAX));
         let authority = self.mem();
         let mut mem = authority.lock();
-        let brk::BreakAuthority::HostSetup(host_break) = *mem.break_authority() else {
+        let Some(host_break) = mem.host_arena().map(|arena| arena.brk) else {
             return Err(Refusal::Stale);
         };
-        let (external_address_bytes, external_data_bytes) = host_owned_charges(&mem);
-        let heap = mem
-            .layout
-            .heap_base
-            .checked_add(mem.layout.heap_size)
-            .and_then(|end| ReservationRange::new(mem.layout.heap_base, end))
-            .ok_or(Refusal::Invalid)?;
-        let heap_rows: Vec<_> = mem
+        let mut owned = Vec::new();
+        let rows: Vec<_> = mem
             .semantic_vmas
             .iter()
-            .filter(|vma| heap.start() <= vma.start && vma.end <= heap.end())
-            .map(|vma| (vma.start, vma.end, eligible(vma, &mem)))
-            .collect();
+            .map(|vma| {
+                let range = ReservationRange::new(vma.start, vma.end).ok_or(Refusal::Invalid)?;
+                let bits = u64::from(vma.read)
+                    | (u64::from(vma.write) << 1)
+                    | (u64::from(vma.execute) << 2);
+                let prot = ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?;
+                let flags = if root_owned_row(vma, &mem) {
+                    owned.push((vma.start, vma.end));
+                    ReservationNodeFlags::ANONYMOUS_PRIVATE
+                } else {
+                    opaque_flags(vma, &mem)
+                };
+                Ok((range, prot, flags))
+            })
+            .collect::<Result<_, Refusal>>()?;
         root.with_root_for_import(|model| {
             let mut layout = model.layout();
             layout.brk = host_break;
             layout.address_limit = address_limit;
             layout.data_limit = data_limit;
-            layout.external_address_bytes = external_address_bytes;
-            layout.external_data_bytes = external_data_bytes;
+            layout.external_address_bytes = 0;
+            layout.external_data_bytes = 0;
             model.configure_import(layout)?;
-            for (start, end, anonymous) in heap_rows {
-                let range = ReservationRange::new(start, end).ok_or(Refusal::Invalid)?;
-                model.import(range, ReservationProtection::READ_WRITE, anonymous)?;
+            for (range, prot, flags) in rows {
+                model.import_with(range, prot, flags)?;
             }
             model.finish_import()
         })?;
-        *mem.break_authority_mut() = brk::BreakAuthority::Delegated(root);
-        Ok(())
+        // The root now owns these rows; the host keeps no second copy.
+        for (start, end) in owned {
+            mem.semantic_vmas.remove_range(start, end);
+            trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, end - start);
+        }
+        mem.delegate_anonymous(root.clone());
+        self.with_charged_root(&mem, &root, |_| Ok(()))
     }
 }
 
@@ -655,5 +670,5 @@ pub use projection::{NonAnonymousVmas, ReservationProcMaps};
 
 #[path = "el1_reservations/provider.rs"]
 mod provider;
-pub(in crate::dispatch) use provider::{DelegatedBreak, ReservationProviderSlot};
+pub(in crate::dispatch) use provider::{DelegatedRoot, ReservationProviderSlot};
 pub use provider::{HostReservationProvider, PreparedHostReservations, PreparedReservationSession};

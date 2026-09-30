@@ -61,6 +61,7 @@ pub(super) use brk::update_semantic_heap_pages;
 pub(crate) mod madvise;
 pub(crate) mod vma;
 pub use self::vma::*;
+pub(crate) mod anonymous;
 pub mod el1_reservations;
 mod host_first_touch;
 pub use host_first_touch::{HostFirstTouchDescriptorReceipt, HostFirstTouchIntent};
@@ -236,10 +237,11 @@ impl MemAuthority {
     > {
         let state = self.state.lock();
         let revision = self.vma_revision();
-        let mut forked = state.clone();
+        // The child is a different MM in host setup: a delegated parent's
+        // root rows and break become its values, never its root.
+        let mut forked = state.fork_materialized();
         forked.deferred_anonymous = std::sync::Arc::new(state.deferred_anonymous.fork_private());
-        forked.brk = state.brk.fork_private();
-        let projection = Self::derive_fork_projection(&state)?;
+        let projection = Self::derive_fork_projection(&forked)?;
 
         for (start, len) in projection.omitted_ranges {
             remove_mapping_metadata_locked(&mut forked, start, len);
@@ -278,7 +280,10 @@ impl MemAuthority {
     > {
         let state = self.state.lock();
         let revision = self.vma_revision();
-        let projection = Self::derive_fork_projection(&state)?;
+        let projection = match state.delegated_root() {
+            None => Self::derive_fork_projection(&state)?,
+            Some(_) => Self::derive_fork_projection(&state.fork_materialized())?,
+        };
         Ok((
             revision,
             std::sync::Arc::from(projection.ranges.into_boxed_slice()),
@@ -288,9 +293,8 @@ impl MemAuthority {
     pub(super) fn fork_private(&self) -> std::sync::Arc<Self> {
         let state = self.state.lock();
         let revision = self.vma_revision();
-        let mut forked = state.clone();
+        let mut forked = state.fork_materialized();
         forked.deferred_anonymous = std::sync::Arc::new(state.deferred_anonymous.fork_private());
-        forked.brk = state.brk.fork_private();
         std::sync::Arc::new(Self::with_revision(forked, revision))
     }
 
@@ -335,17 +339,19 @@ impl MemAuthority {
 pub struct MemState {
     pub(super) deferred_anonymous: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
     pub layout: MemoryLayout,
-    /// Canonical semantic VMAs owned by this address space.
+    /// Host-owned semantic VMAs of this address space: every row in host
+    /// setup; once delegated, only the rows the root holds as opaque nodes
+    /// (the root owns the anonymous ones). Whole-MM readers use
+    /// [`MemState::observed_vmas`].
     semantic_vmas: VmaMap,
-    /// The single owner of the program break (`brk`/`sbrk`): this state while
-    /// the MM is in host setup, the shared EL1 reservation root once the MM's
-    /// break is delegated. Read it only through [`MemState::program_break`].
-    brk: brk::BreakAuthority,
-    /// Bump cursor for the anonymous mmap arena.
-    pub mmap_next: u64,
+    /// The single owner of the program break, the anonymous arena placement
+    /// and the anonymous-private rows: this state in host setup, the shared
+    /// EL1 reservation root once delegated. See [`anonymous`].
+    anonymous: anonymous::AnonymousAuthority,
     /// MONOTONIC high-water of the arena: the highest address the guest could
     /// EVER have stored a non-zero byte into. `munmap` NEVER lowers it (unlike
-    /// `mmap_next`).
+    /// the host-setup `mmap_next`). A backing fact, not a placement one: it
+    /// stays with the host in both venues.
     ///
     /// The bump path assumes `[mmap_next, ...)` is pristine (lazily zero-filled
     /// guest RAM), so it skips the zero-fill that reused `free_regions` get. That
@@ -384,11 +390,6 @@ pub struct MemState {
     /// here and repoints the VA's stage-1 leaf to it (so stores stay private),
     /// without any post-vCPU `hv_vm_map`. Per-process (fork snapshots it).
     pub overlay: crate::shared_aperture::SharedAperture,
-    /// Freed in-arena anonymous/private ranges available for reuse, kept sorted
-    /// by start and coalesced. Reclaiming `munmap`'d space so a churning guest
-    /// doesn't exhaust the bump arena. NOT used for MAP_FIXED or shared-file
-    /// maps (those have their own lifecycles).
-    pub free_regions: Vec<(u64, u64)>,
     /// Snapshot of the guest's `AddressSpace` regions, captured at boot
     /// via `SyscallDispatcher::set_address_space_regions`. When present,
     /// `/proc/self/maps` is rendered from this list (with the heap end
@@ -508,15 +509,13 @@ impl MemState {
         Self {
             layout,
             semantic_vmas: VmaMap::new(),
-            brk: brk::BreakAuthority::HostSetup(layout.heap_base),
-            mmap_next: layout.mmap_base,
+            anonymous: anonymous::AnonymousAuthority::HostSetup(anonymous::HostArena::new(layout)),
             mmap_writable_high: layout.mmap_base,
             shared: crate::shared_aperture::SharedAperture::new(),
             overlay: crate::shared_aperture::SharedAperture::with_window(
                 crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
                 crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
             ),
-            free_regions: Vec::new(),
             address_space_regions: None,
             dynamic_maps: Vec::new(),
             host_alias_backed_ranges: Vec::new(),
@@ -552,33 +551,19 @@ impl MemState {
         self.linux_auxv_image = linux_auxv_image;
     }
 
-    /// Owned observation of the current host authority. Shared-root admission
-    /// remains refused until the internal mutation paths relinquish these facts.
+    /// Owned observation of every VMA row of this MM (host rows plus, once
+    /// delegated, the root's anonymous rows).
     pub(super) fn semantic_vmas_snapshot(&self) -> Vec<SemanticVma> {
-        self.semantic_vmas.as_slice().to_vec()
+        self.observed_vmas().as_slice().to_vec()
     }
 
     pub(super) fn seed_semantic_vmas(&mut self, vmas: VmaMap) {
         self.semantic_vmas = vmas;
     }
 
-    /// The program break as answered by its single owner. A delegated break
-    /// is read from the exact admitted root; this state holds no copy.
-    pub(super) fn program_break(&self) -> u64 {
-        self.brk.observe()
-    }
-
-    pub(super) fn break_authority(&self) -> &brk::BreakAuthority {
-        &self.brk
-    }
-
-    pub(super) fn break_authority_mut(&mut self) -> &mut brk::BreakAuthority {
-        &mut self.brk
-    }
-
     #[cfg(test)]
     pub(super) fn seed_brk_current_for_test(&mut self, value: u64) {
-        self.brk = brk::BreakAuthority::HostSetup(value);
+        self.arena_for_test().brk = value;
     }
 
     #[cfg(test)]
@@ -994,6 +979,7 @@ pub(super) fn guest_vma_overlaps_locked(mem: &MemState, start: u64, len: u64) ->
         return true;
     };
     dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
+        || mem.root_anonymous_overlaps(start, len)
         || mem
             .growdown_ranges
             .iter()
@@ -1202,8 +1188,12 @@ impl<'a> MemView<'a> {
         };
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
+        // A delegated root's anonymous nodes carry no policy: the edited
+        // range becomes host-owned, then its rows are mirrored back.
+        mem.demote_root_rows(start, end);
         mem.semantic_vmas
             .update_policy(start, end, copy_update, child_update, dump_update);
+        mem.mirror_host_rows(start, end);
     }
 
     /// Whether `[start, start + len)` is fully covered by VMAs whose contents
@@ -1214,7 +1204,7 @@ impl<'a> MemView<'a> {
         };
         self.mem()
             .lock()
-            .semantic_vmas
+            .observed_vmas()
             .overlapping(start, end)
             .all(|vma| vma.dump_policy == carrick_abi::VmaDumpPolicy::Omit)
     }
@@ -1257,7 +1247,10 @@ impl<'a> MemView<'a> {
     }
 
     fn dynamic_mapping_overlaps(&self, start: u64, len: u64) -> bool {
-        dynamic_mapping_overlaps_sorted(&self.mem().lock().dynamic_maps, start, len)
+        let authority = self.mem();
+        let mem = authority.lock();
+        dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
+            || mem.root_anonymous_overlaps(start, len)
     }
 
     /// Whether `[start, start + len)` overlaps a Linux-visible guest VMA.
@@ -1339,7 +1332,7 @@ impl<'a> MemView<'a> {
         let mem_authority_5 = self.mem();
         let mem = mem_authority_5.lock();
         let fork_semantics =
-            MremapForkSemantics::capture(&mem.semantic_vmas, start, len).ok_or(LINUX_EFAULT)?;
+            MremapForkSemantics::capture(&mem.observed_vmas(), start, len).ok_or(LINUX_EFAULT)?;
         let private_file = mem
             .private_file_maps
             .iter()
@@ -1451,6 +1444,11 @@ impl<'a> MemView<'a> {
         let Some(end) = start.checked_add(len) else {
             return;
         };
+        // A pending root `mprotect` owns this range: the host holds no row
+        // for it, and the completion publishes the protection.
+        if mem.venue_owns(start, end) {
+            return;
+        }
         update_proc_map_prot(&mut mem.dynamic_maps, start, len, prot);
         mem.semantic_vmas.update_prot(
             start,
@@ -1476,6 +1474,7 @@ impl<'a> MemView<'a> {
             visible.sort_by_key(|region| region.start);
             *regions = visible;
         }
+        mem.mirror_host_rows(start, end);
     }
 
     /// Reset memory-accounting state that Linux destroys across `execve(2)`.
@@ -1492,6 +1491,11 @@ impl<'a> MemView<'a> {
         });
     }
 
+    /// Where a new mapping goes, and whether its backing may hold a prior
+    /// mapping's bytes. `root_eligible`: a plain private anonymous mapping a
+    /// delegated root can own itself (its proposal is then this syscall's
+    /// host venue); every other mapping on a delegated MM is host-served and
+    /// placed by the root around its nodes.
     pub(in crate::dispatch) fn next_mmap_address(
         &self,
         requested: u64,
@@ -1499,7 +1503,24 @@ impl<'a> MemView<'a> {
         prot: u64,
         flags: u64,
         congruence: MmapGrantCongruence,
-    ) -> Option<(u64, bool)> {
+        root_eligible: bool,
+    ) -> Result<Option<(u64, bool)>, DispatchError> {
+        {
+            let authority = self.mem();
+            let mut mem = authority.lock();
+            if let Some(root) = mem.delegated_root().cloned() {
+                return self.next_delegated_address(
+                    &mut mem,
+                    root,
+                    requested,
+                    length,
+                    prot,
+                    flags,
+                    congruence,
+                    root_eligible,
+                );
+            }
+        }
         let granted = self.next_mmap_address_inner(requested, length, prot, flags, congruence);
         // Grant audit: CARRICK_MMAP_GRANT_DEBUG=1 logs any non-FIXED grant that
         // overlaps a LIVE dynamic mapping, with the allocator state and caller.
@@ -1521,10 +1542,9 @@ impl<'a> MemView<'a> {
             if !overlaps.is_empty() {
                 eprintln!(
                     "[GRANTDBG pid={}] non-fixed grant {address:#x}+{length:#x} OVERLAPS live {overlaps:x?}\n  \
-                     mmap_next={:#x} free_regions={:x?}\n{}",
+                     arena={:x?}\n{}",
                     self.identity_pid(),
-                    mem.mmap_next,
-                    mem.free_regions,
+                    mem.host_arena(),
                     std::backtrace::Backtrace::force_capture(),
                 );
             }
@@ -1546,17 +1566,17 @@ impl<'a> MemView<'a> {
                     .collect();
                 eprintln!(
                     "[GRANTDBG pid={}] grant {address:#x}+{length:#x} covers debug VA; dynamic_maps near: \
-                     {near:x?}\n  mmap_next={:#x} free_regions={:x?}\n{}",
+                     {near:x?}\n  arena={:x?}\n{}",
                     self.identity_pid(),
-                    mem.mmap_next,
-                    mem.free_regions,
+                    mem.host_arena(),
                     std::backtrace::Backtrace::force_capture(),
                 );
             }
         }
-        granted
+        Ok(granted)
     }
 
+    /// Host-setup placement: the arena cursor and free list.
     fn next_mmap_address_inner(
         &self,
         requested: u64,
@@ -1596,6 +1616,7 @@ impl<'a> MemView<'a> {
                 if prot & LINUX_PROT_WRITE != 0 {
                     mem.mmap_writable_high = mem.mmap_writable_high.max(end);
                 }
+                let arena = mem.host_arena_mut()?;
                 // A `MAP_FIXED` inside the arena ALLOCATES arena VA, so both
                 // hand-out paths have to be told. Neither was: the free list
                 // could still be holding this range, and the bump cursor stayed
@@ -1603,19 +1624,19 @@ impl<'a> MemView<'a> {
                 // address out a second time and scrubbing the live mapping to
                 // zero. See `lower_mmap_next` for the full mechanism and the
                 // one-second reducer.
-                free_regions_remove_range(&mut mem.free_regions, requested, length);
-                if end > mem.mmap_next {
+                free_regions_remove_range(&mut arena.free_regions, requested, length);
+                if end > arena.mmap_next {
                     // Skipping ahead would strand `[mmap_next, requested)`
                     // forever, so hand it to the free list rather than lose it.
-                    let gap_start = mem.mmap_next;
+                    let gap_start = arena.mmap_next;
                     if requested > gap_start {
                         free_regions_insert(
-                            &mut mem.free_regions,
+                            &mut arena.free_regions,
                             gap_start,
                             requested - gap_start,
                         );
                     }
-                    mem.mmap_next = end;
+                    arena.mmap_next = end;
                 }
             }
             return Some((requested, false));
@@ -1629,8 +1650,9 @@ impl<'a> MemView<'a> {
                 let mem_authority_11 = self.mem();
                 let mut mem = mem_authority_11.lock();
                 let end = requested.checked_add(length)?;
-                if requested >= mem.mmap_next {
-                    mem.mmap_next = end;
+                let mmap_next = mem.host_arena()?.mmap_next;
+                if requested >= mmap_next {
+                    mem.host_arena_mut()?.mmap_next = end;
                     // `reused` (forces a zero-fill) iff this bump landed on memory
                     // the guest already dirtied below the monotonic dirty high-
                     // water (mmap_next was lowered by a prior munmap). Above the
@@ -1662,9 +1684,11 @@ impl<'a> MemView<'a> {
 
         let mut mem = mem_authority_12.lock();
         if length <= layout.mmap_size {
+            let writable_high = mem.mmap_writable_high;
+            let arena = mem.host_arena_mut()?;
             // First free region with a congruent fit. The slack before a congruent
             // start and the remainder after the grant both stay on the free list.
-            let fit = mem
+            let fit = arena
                 .free_regions
                 .iter()
                 .enumerate()
@@ -1675,16 +1699,16 @@ impl<'a> MemView<'a> {
                     (end <= region_end).then_some((pos, s, start, end, region_end))
                 });
             if let Some((pos, s, start, end, region_end)) = fit {
-                mem.free_regions.remove(pos);
+                arena.free_regions.remove(pos);
                 if start > s {
-                    free_regions_insert(&mut mem.free_regions, s, start - s);
+                    free_regions_insert(&mut arena.free_regions, s, start - s);
                 }
                 if end < region_end {
-                    free_regions_insert(&mut mem.free_regions, end, region_end - end);
+                    free_regions_insert(&mut arena.free_regions, end, region_end - end);
                 }
                 return Some((start, true));
             }
-            if let Some(cursor) = align_up_u64(mem.mmap_next, page_size)
+            if let Some(cursor) = align_up_u64(arena.mmap_next, page_size)
                 && let Some(address) = congruence.first_at_or_after(cursor)
                 && range_within(address, length, layout.mmap_base, layout.mmap_size)
                 && let Some(end) = address.checked_add(length)
@@ -1692,13 +1716,13 @@ impl<'a> MemView<'a> {
                 // A congruent bump skipped `[cursor, address)`; park it for reuse
                 // rather than stranding it.
                 if address > cursor {
-                    free_regions_insert(&mut mem.free_regions, cursor, address - cursor);
+                    free_regions_insert(&mut arena.free_regions, cursor, address - cursor);
                 }
-                mem.mmap_next = end;
+                arena.mmap_next = end;
                 // Same dirty-high-water discipline as the hint path: a bump allocation
                 // that dips below the high-water (because munmap lowered mmap_next over
                 // already-touched pages) must be zeroed, not returned with stale bytes.
-                let stale = address < mem.mmap_writable_high;
+                let stale = address < writable_high;
                 if writable {
                     mem.mmap_writable_high = mem.mmap_writable_high.max(end);
                 }
@@ -2000,11 +2024,10 @@ impl<'a> MemView<'a> {
         mark_range_unmapped(memory, address, len_usize);
         let mem_authority_39 = self.mem();
         let mut mem = mem_authority_39.lock();
-        if address.checked_add(len) == Some(mem.mmap_next) {
-            let mem = &mut *mem;
-            lower_mmap_next(&mut mem.mmap_next, &mut mem.free_regions, address);
-        } else {
-            free_regions_insert(&mut mem.free_regions, address, len);
+        // A delegated root never admitted this range: its placement proposal
+        // is refused with the failed syscall, and there is no cursor to lower.
+        if let Some(arena) = mem.host_arena_mut() {
+            arena.release(address, len);
         }
         Ok(())
     }
@@ -2243,7 +2266,8 @@ impl SyscallDispatcher {
         congruence: MmapGrantCongruence,
     ) -> Option<(u64, bool)> {
         self.mem_view()
-            .next_mmap_address(requested, length, prot, flags, congruence)
+            .next_mmap_address(requested, length, prot, flags, congruence, false)
+            .expect("host-setup placement has no root to refuse")
     }
 
     #[cfg(test)]
@@ -2523,6 +2547,10 @@ pub(super) fn mmap_request_uses_alias(
 #[cfg(test)]
 #[path = "mem/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mem/delegated_tests.rs"]
+pub(in crate::dispatch) mod delegated_tests;
 
 #[cfg(test)]
 #[path = "mem/metadata_budget_tests.rs"]

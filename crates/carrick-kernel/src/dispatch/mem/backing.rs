@@ -46,7 +46,10 @@ fn dynamic_maps_share_canonical_vma(
     })
 }
 
-fn insert_dynamic_map_coalescing(mem: &mut MemState, entry: ProcMapsEntry) {
+pub(in crate::dispatch::mem) fn insert_dynamic_map_coalescing(
+    mem: &mut MemState,
+    entry: ProcMapsEntry,
+) {
     let maps = &mut mem.dynamic_maps;
     let mut idx = maps.partition_point(|map| map.start < entry.start);
     maps.insert(idx, entry);
@@ -582,6 +585,9 @@ pub(crate) fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len
     locked_ranges_remove(&mut mem.read_only_shared_file_maps, remove);
     locked_ranges_remove(&mut mem.host_alias_backed_ranges, remove);
     locked_ranges_remove(&mut mem.alias_vma_ranges, remove);
+    // A delegated root follows the host rows (a pending root `munmap` owns
+    // its own range instead).
+    mem.mirror_host_rows(start, start.saturating_add(len));
 }
 
 impl MemState {
@@ -970,8 +976,12 @@ impl<'a> MemView<'a> {
             }
             semantic.into_vec()
         };
-        mem.semantic_vmas.insert_many_replacing(semantic);
-        insert_dynamic_map_coalescing(&mut mem, entry);
+        // A pending root proposal owns this range: the host records no row.
+        if !mem.venue_owns(commit.start, end) {
+            mem.semantic_vmas.insert_many_replacing(semantic);
+            insert_dynamic_map_coalescing(&mut mem, entry);
+        }
+        mem.mirror_host_rows(commit.start, end);
     }
 
     /// Snapshot one MAP_PRIVATE file payload into anonymous materialization
@@ -1429,18 +1439,20 @@ impl<'a> MemView<'a> {
             }
             semantic
         });
-        if let Some(end) = start.checked_add(len) {
-            mem.semantic_vmas.remove_range(start, end);
+        mem.semantic_vmas.remove_range(start, end);
+        if mem.venue_owns(start, end) {
+            // A pending root proposal owns this range: the root, not this
+            // state, records the mapping when the proposal completes.
+            trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
+            return;
         }
         mem.semantic_vmas.insert_many_replacing(semantic);
 
-        if !dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len) {
-            insert_dynamic_map_coalescing(&mut mem, entry);
-            return;
+        if dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len) {
+            trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
         }
-
-        trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
         insert_dynamic_map_coalescing(&mut mem, entry);
+        mem.mirror_host_rows(start, end);
     }
 
     pub(crate) fn record_remapped_dynamic_mapping(
