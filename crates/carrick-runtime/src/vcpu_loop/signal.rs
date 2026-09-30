@@ -657,6 +657,13 @@ pub(super) trait GuestGrantBackend {
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
     ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
+    /// Finish what the backend deferred until EL1's verified receipt: a
+    /// grant replacing a private predecessor retires that old owner and
+    /// registers its own alias only now.
+    fn complete(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<(), TrapError>;
     /// Undo what the backend published for a grant EL1 never exposed.
     fn roll_back(
         &mut self,
@@ -677,6 +684,13 @@ impl<E: ThreadedEngine> GuestGrantBackend for EngineGrantBackend<'_, E> {
         self.0.settle_el1_descriptor_receipt(txn, receipt)
     }
 
+    fn complete(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<(), TrapError> {
+        self.0.complete_el1_frame_grant(grant)
+    }
+
     fn roll_back(
         &mut self,
         grant: carrick_hal::threaded::El1FrameGrantRollback,
@@ -685,11 +699,14 @@ impl<E: ThreadedEngine> GuestGrantBackend for EngineGrantBackend<'_, E> {
     }
 }
 
-/// Authenticate one guest grant receipt, then commit exactly its resident
-/// span. Residency is never committed before EL1's publication is proven,
-/// and an unauthenticated or indeterminate receipt fails stopped. A refused
-/// or rolled-back grant exposed no leaf, so what the backend published for
-/// it before submission is rolled back.
+/// Authenticate one guest grant receipt, then complete the backend's
+/// deferred publication and commit exactly its resident span. Residency is
+/// never committed before EL1's publication is proven, and an
+/// unauthenticated or indeterminate receipt fails stopped. A grant that
+/// replaces a private predecessor retires that old owner only here, after
+/// the verified receipt and before residency. A refused or rolled-back grant
+/// exposed no leaf, so its predecessor is left exactly as it was and what
+/// the backend published for the grant before submission is rolled back.
 pub(super) fn settle_guest_frame_grant(
     pending: PendingGuestGrant,
     receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
@@ -703,6 +720,7 @@ pub(super) fn settle_guest_frame_grant(
     match receipt.outcome {
         DescriptorOutcome::Applied(_) => {
             let verified = backend.verify(&pending.txn, receipt)?;
+            backend.complete(pending.rollback())?;
             commit(&pending, verified.resident())?;
             Ok(GuestGrantSettlement::Committed(verified.resident()))
         }
@@ -2547,6 +2565,7 @@ mod guest_descriptor_lane_tests {
     struct AuthorityBackend<'a> {
         authority: &'a Stage1Authority,
         rolled_back: Vec<carrick_hal::threaded::El1FrameGrantRollback>,
+        completed: Vec<carrick_hal::threaded::El1FrameGrantRollback>,
     }
 
     impl<'a> AuthorityBackend<'a> {
@@ -2554,6 +2573,7 @@ mod guest_descriptor_lane_tests {
             Self {
                 authority,
                 rolled_back: Vec::new(),
+                completed: Vec::new(),
             }
         }
     }
@@ -2568,6 +2588,14 @@ mod guest_descriptor_lane_tests {
             self.authority
                 .settle_guest_descriptor_receipt(txn, receipt)
                 .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+        }
+
+        fn complete(
+            &mut self,
+            grant: carrick_hal::threaded::El1FrameGrantRollback,
+        ) -> Result<(), TrapError> {
+            self.completed.push(grant);
+            Ok(())
         }
 
         fn roll_back(
@@ -2836,6 +2864,13 @@ mod guest_descriptor_lane_tests {
             panic!("never verified")
         }
 
+        fn complete(
+            &mut self,
+            _grant: carrick_hal::threaded::El1FrameGrantRollback,
+        ) -> Result<(), TrapError> {
+            panic!("never completed")
+        }
+
         fn roll_back(
             &mut self,
             _grant: carrick_hal::threaded::El1FrameGrantRollback,
@@ -2884,6 +2919,7 @@ mod guest_descriptor_lane_tests {
                 vec![pending.rollback()],
                 "{outcome:?} left the grant's backing registered"
             );
+            assert!(backend.completed.is_empty(), "{outcome:?} completed");
         }
         let rollback = pending.rollback();
         assert_eq!(
@@ -2901,6 +2937,258 @@ mod guest_descriptor_lane_tests {
             Ok(GuestGrantSettlement::Committed(_))
         ));
         assert!(backend.rolled_back.is_empty());
+        assert_eq!(backend.completed, vec![pending.rollback()]);
+    }
+
+    /// What a settlement asked of the backend, and when residency was
+    /// committed, in order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GrantEvent {
+        Verified,
+        Completed(carrick_hal::threaded::El1FrameGrantRollback),
+        RolledBack(carrick_hal::threaded::El1FrameGrantRollback),
+        Committed,
+    }
+
+    struct RecordingBackend<'a> {
+        authority: &'a Stage1Authority,
+        log: &'a std::cell::RefCell<Vec<GrantEvent>>,
+    }
+
+    impl GuestGrantBackend for RecordingBackend<'_> {
+        fn verify(
+            &mut self,
+            txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+            receipt: &DescriptorReceipt,
+        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+        {
+            let verified = self
+                .authority
+                .settle_guest_descriptor_receipt(txn, receipt)
+                .map_err(|error| TrapError::Hypervisor(format!("{error:?}")));
+            if verified.is_ok() {
+                self.log.borrow_mut().push(GrantEvent::Verified);
+            }
+            verified
+        }
+
+        fn complete(
+            &mut self,
+            grant: carrick_hal::threaded::El1FrameGrantRollback,
+        ) -> Result<(), TrapError> {
+            self.log.borrow_mut().push(GrantEvent::Completed(grant));
+            Ok(())
+        }
+
+        fn roll_back(
+            &mut self,
+            grant: carrick_hal::threaded::El1FrameGrantRollback,
+        ) -> Result<bool, TrapError> {
+            self.log.borrow_mut().push(GrantEvent::RolledBack(grant));
+            Ok(true)
+        }
+    }
+
+    const NEXT_IPA: u64 = IPA + 0x20_0000;
+
+    /// A grant over the span of a retired predecessor, with its own backing.
+    fn replacement_op(fault: u64) -> DescriptorOp {
+        DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: VA,
+                ipa: NEXT_IPA,
+                len: 4 * 4096,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(fault, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(5),
+                mapping_id: nz(6),
+                owner_generation: nz(7),
+                inventory_revision: nz(8),
+            },
+        }
+    }
+
+    fn replacement_pending(
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        fault: u64,
+    ) -> PendingGuestGrant {
+        PendingGuestGrant {
+            txn,
+            fault_va: fault,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: FrameGrantResidencyIdentity {
+                physical_ipa: NEXT_IPA,
+                mapping_id: 6,
+                frame_id: 5,
+                owner_generation: 7,
+                inventory_revision: 8,
+                ..residency()
+            },
+        }
+    }
+
+    /// Publish a first grant through EL1 and then retire its span the way a
+    /// discard or unmap does on this lane: the leaves keep their outputs as
+    /// retired leases for the host's reconciliation, while the backend still
+    /// names the old owner until something replaces it.
+    fn retired_predecessor(
+        authority: &Stage1Authority,
+        resolver: &BufferResolver,
+        slots: &DescriptorTxnSlots,
+    ) {
+        for op in [
+            grant_op(VA),
+            DescriptorOp::Retire(PageSpan::new(VA, 4 * 4096)),
+        ] {
+            let txn = authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap();
+            assert!(slots.submit(7, &txn));
+            let receipt = el1_apply(resolver, slots, 7).unwrap();
+            assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+            authority
+                .settle_guest_descriptor_receipt(&txn, &receipt)
+                .unwrap();
+            let _ = slots.take_receipt(7, txn.id);
+        }
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(VA)),
+            Some(None)
+        );
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate_retained_output(VA)),
+            Some(Some(IPA)),
+            "the predecessor's retired lease is still named by its leaves"
+        );
+    }
+
+    /// A grant that replaces a private predecessor is published by EL1 over
+    /// the predecessor's retired leaves. The backend may retire the old owner
+    /// and register the new grant only once EL1's receipt verifies, and
+    /// before the host commits residency for it.
+    #[test]
+    fn a_replacement_grant_completes_its_backend_only_after_the_verified_receipt() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        retired_predecessor(&authority, &resolver, &slots);
+
+        let fault = VA + 4096;
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), replacement_op(fault))
+            .expect("a retired predecessor admits the replacement grant");
+        let pending = replacement_pending(txn, fault);
+        assert!(ledger.submit(&slots, 3, pending));
+        let log = std::cell::RefCell::new(Vec::new());
+        let mut settle = |pending: PendingGuestGrant, receipt: DescriptorReceipt| {
+            settle_guest_frame_grant(
+                pending,
+                &receipt,
+                &mut RecordingBackend {
+                    authority: &authority,
+                    log: &log,
+                },
+                |_, resident| {
+                    assert_eq!(resident, PageSpan::new(fault, 4096));
+                    log.borrow_mut().push(GrantEvent::Committed);
+                    Ok(())
+                },
+            )
+        };
+        assert_eq!(ledger.settle_ready(&slots, MM, &mut settle).unwrap(), 0);
+        assert!(
+            log.borrow().is_empty(),
+            "the old owner stays until EL1 publishes the replacement"
+        );
+
+        let receipt = el1_apply(&resolver, &slots, 3).unwrap();
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        assert_eq!(ledger.settle_ready(&slots, MM, &mut settle).unwrap(), 1);
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                GrantEvent::Verified,
+                GrantEvent::Completed(pending.rollback()),
+                GrantEvent::Committed,
+            ],
+            "retire the predecessor after the verified receipt, before residency"
+        );
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(fault)),
+            Some(Some(NEXT_IPA + 4096))
+        );
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate_retained_output(VA)),
+            Some(Some(NEXT_IPA)),
+            "the rest of the span is prepared on the replacement's backing"
+        );
+    }
+
+    /// EL1 refuses a replacement whose span another publication took first.
+    /// The backend never completes it (the predecessor stays exactly as it
+    /// was) and rolls back only the new grant's own publication, once.
+    #[test]
+    fn a_refused_replacement_grant_leaves_its_predecessor_and_rolls_back_once() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        retired_predecessor(&authority, &resolver, &slots);
+
+        let fault = VA + 4096;
+        let replacement = authority
+            .prepare_guest_descriptor_txn(nz(MM), replacement_op(fault))
+            .unwrap();
+        let pending = replacement_pending(replacement, fault);
+        assert!(ledger.submit(&slots, 3, pending));
+        // A competing publication over the same span executes first.
+        let competing = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        assert!(slots.submit(5, &competing));
+        let taken = el1_apply(&resolver, &slots, 5).unwrap();
+        assert!(matches!(taken.outcome, DescriptorOutcome::Applied(_)));
+        authority
+            .settle_guest_descriptor_receipt(&competing, &taken)
+            .unwrap();
+
+        let refused = el1_apply(&resolver, &slots, 3).unwrap();
+        assert!(
+            matches!(
+                refused.outcome,
+                DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_)
+            ),
+            "{:?}",
+            refused.outcome
+        );
+        let log = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, |pending, receipt| {
+                    settle_guest_frame_grant(
+                        pending,
+                        &receipt,
+                        &mut RecordingBackend {
+                            authority: &authority,
+                            log: &log,
+                        },
+                        |_, _| panic!("a refused replacement never commits residency"),
+                    )
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            *log.borrow(),
+            vec![GrantEvent::RolledBack(pending.rollback())],
+            "no predecessor retirement for a grant EL1 never exposed"
+        );
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(VA)),
+            Some(Some(IPA)),
+            "the competing publication is untouched"
+        );
     }
 
     #[test]

@@ -928,6 +928,17 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
+    /// Finish what [`Self::prepare_el1_frame_grant`] deferred until EL1's
+    /// verified receipt: retire a replaced predecessor, register the grant.
+    fn complete_el1_frame_grant(
+        &mut self,
+        _grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend prepared no EL1 frame grant".to_owned(),
+        ))
+    }
+
     /// Refresh fork-private process state after the child frame inventory and
     /// exact MM/COW authority are live, but before the child enters guest code.
     fn refresh_fork_process_state(
