@@ -2375,6 +2375,19 @@ pub struct Aarch64CoreRegisters {
     pub fpcr: u32,
 }
 
+/// Exact logical inventory row and its containing physical host-owner extent.
+/// These differ after a mapping is fragmented; neither domain substitutes for
+/// the other. The caller retains a physical-owner pin through publication.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameBackingAuthentication {
+    pub mapping: crate::MappingId,
+    pub frame: crate::FrameId,
+    pub gpa: carrick_guest_mem::Gpa,
+    pub length: crate::FrameLength,
+    pub owner_gpa: carrick_guest_mem::Gpa,
+    pub owner_length: crate::FrameLength,
+}
+
 /// Runtime authority used by a backend when a private stage-1 write fault (or
 /// a kernel copy-to-user into the same page) must publish one new physical
 /// frame. The backend owns physical allocation/mapping; the runtime owns the
@@ -2480,10 +2493,7 @@ pub trait FrameCowAuthority: Send + Sync {
     /// and independently retained physical owner at the returned revision.
     fn authenticate_frame_backing(
         &self,
-        _mapping: crate::MappingId,
-        _frame: crate::FrameId,
-        _gpa: carrick_guest_mem::Gpa,
-        _length: crate::FrameLength,
+        _request: FrameBackingAuthentication,
     ) -> Result<
         (
             std::num::NonZeroU64,
