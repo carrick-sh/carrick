@@ -620,11 +620,18 @@ impl GuestGrantLedger {
 /// Carrier-wide ledger for the shared EL1 descriptor transaction slots.
 static GUEST_GRANT_LEDGER: GuestGrantLedger = GuestGrantLedger::new();
 
-/// Release a retiring MM's descriptor transaction slots and ledger entries,
-/// at final-MM teardown and at exec replacement, beside its residency
-/// records. A slot left SUBMITTED would refuse every later grant on that
-/// vCPU slot, whichever MM it next runs.
+/// Release a retiring MM's descriptor transaction slots, ledger entries and
+/// frame-grant mailbox work, at final-MM teardown and at exec replacement,
+/// beside its residency records. A slot left SUBMITTED, or a mailbox left
+/// holding the MM's request or refusal, would refuse every later grant on
+/// that vCPU slot, whichever MM it next runs. Returns the descriptor entries
+/// released.
 pub(super) fn withdraw_guest_descriptor_work(mm_key: u64) -> usize {
+    for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
+        if let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot) {
+            let _ = mailbox.withdraw_mm(mm_key);
+        }
+    }
     carrick_el1_abi::descriptor_txn_slots_host()
         .map_or(0, |slots| GUEST_GRANT_LEDGER.withdraw_mm(slots, mm_key))
 }

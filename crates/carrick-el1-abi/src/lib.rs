@@ -1274,6 +1274,43 @@ impl FrameGrantMailbox {
     pub fn has_guest_work(&self) -> bool {
         self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_IDLE
     }
+
+    /// Host, at an MM's final teardown or exec replacement: release an
+    /// unclaimed request or an unconsumed refusal that belongs to `mm_key`.
+    /// No thread of that MM will fault again to claim it, and a busy mailbox
+    /// refuses every later request on this vCPU slot, whichever MM it next
+    /// runs. The slot passes through HOST_WORKING so the owner is rechecked
+    /// after the transition (excluding reuse ABA); another MM's work is
+    /// restored unchanged, and a request a host boundary is serving is left
+    /// to that boundary. Returns whether this call released the slot.
+    pub fn withdraw_mm(&self, mm_key: u64) -> bool {
+        for held in [FRAME_GRANT_MAILBOX_REQUESTED, FRAME_GRANT_MAILBOX_RESPONSE] {
+            if self.mm_key.load(Ordering::Relaxed) != mm_key
+                || self
+                    .state
+                    .compare_exchange(
+                        held,
+                        FRAME_GRANT_MAILBOX_HOST_WORKING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+            let released = self.mm_key.load(Ordering::Relaxed) == mm_key;
+            self.state.store(
+                if released {
+                    FRAME_GRANT_MAILBOX_IDLE
+                } else {
+                    held
+                },
+                Ordering::Release,
+            );
+            return released;
+        }
+        false
+    }
 }
 
 impl Default for FrameGrantMailbox {
@@ -4148,6 +4185,47 @@ mod tests {
         assert_eq!(mailboxes.slot(3).unwrap().claim_request(), Some(first));
         assert_eq!(mailboxes.slot(7).unwrap().claim_request(), Some(second));
         assert!(mailboxes.slot(EL1_STACK_SLOTS as usize).is_none());
+    }
+
+    /// A retiring MM leaves no request or refusal behind: its threads will
+    /// never fault again to claim them, and a mailbox left busy refuses every
+    /// later request on that vCPU slot, whichever MM it next runs.
+    #[test]
+    fn a_retiring_mm_withdraws_exactly_its_own_mailbox_work() {
+        let request = |mm_key, request_generation| FrameGrantRequest {
+            mm_key,
+            request_generation,
+            fault_va: 0x4000_3000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        };
+        let refused = FrameGrantMailbox::new();
+        assert!(refused.try_publish_request(request(71, 1)));
+        assert!(refused.claim_request().is_some());
+        assert!(refused.publish_refusal(FRAME_GRANT_ERR_DENIED));
+        let requested = FrameGrantMailbox::new();
+        assert!(requested.try_publish_request(request(71, 2)));
+        let other = FrameGrantMailbox::new();
+        assert!(other.try_publish_request(request(72, 3)));
+        assert!(other.claim_request().is_some());
+        assert!(other.publish_refusal(FRAME_GRANT_ERR_DENIED));
+        let working = FrameGrantMailbox::new();
+        assert!(working.try_publish_request(request(71, 4)));
+        assert!(working.claim_request().is_some());
+
+        for mailbox in [&refused, &requested, &other, &working] {
+            let _ = mailbox.withdraw_mm(71);
+        }
+        assert!(!refused.has_guest_work(), "a retired MM's refusal stayed");
+        assert!(!requested.has_guest_work(), "a retired MM's request stayed");
+        assert!(other.has_guest_work(), "another MM's refusal was withdrawn");
+        assert!(other.claim_response(72, 3).is_some());
+        assert!(
+            working.has_guest_work(),
+            "a request the host is serving belongs to that boundary"
+        );
+        assert!(refused.try_publish_request(request(73, 5)));
+        assert!(requested.try_publish_request(request(73, 6)));
     }
 
     #[test]
