@@ -31,7 +31,7 @@
 //! `/proc/<pid>/maps` of a delegated MM is the root's anonymous projection
 //! merged once with the host rows, which never describe root-owned memory.
 
-use super::el1_reservations::DelegatedRoot;
+use super::el1_reservations::{DelegatedRoot, ForkSeed};
 use super::*;
 use carrick_el1::memory::reservations::{Decision, Mapping, Placement, Refusal, Reservations};
 use carrick_el1_abi::{
@@ -46,9 +46,8 @@ use std::borrow::Cow;
 #[derive(Clone)]
 pub(in crate::dispatch) enum AnonymousAuthority {
     HostSetup(HostArena),
-    /// Constructed only by root admission, which production still refuses
-    /// (the conformance fixture seals it).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Constructed only by root admission
+    /// (`SyscallDispatcher::admit_el1_reservations`).
     Delegated(DelegatedAnonymous),
 }
 
@@ -64,6 +63,9 @@ pub(in crate::dispatch) struct HostArena {
     /// doesn't exhaust the bump arena. NOT used for MAP_FIXED or shared-file
     /// maps (those have their own lifecycles).
     pub(in crate::dispatch) free_regions: Vec<(u64, u64)>,
+    /// A fork child's host-setup twin: the parent root generation its rows
+    /// were materialized from. Only that fork's commit may admit its root.
+    pub(in crate::dispatch) fork_seed: Option<ForkSeed>,
 }
 
 impl HostArena {
@@ -72,6 +74,7 @@ impl HostArena {
             brk: layout.heap_base,
             mmap_next: layout.mmap_base,
             free_regions: Vec::new(),
+            fork_seed: None,
         }
     }
 
@@ -95,7 +98,6 @@ pub(in crate::dispatch) struct DelegatedAnonymous {
 }
 
 impl DelegatedAnonymous {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::dispatch) fn new(root: DelegatedRoot) -> Self {
         Self { root, venue: None }
     }
@@ -204,7 +206,6 @@ fn in_layout(start: u64, end: u64, layout: MemoryLayout) -> bool {
 /// Whether the root owns this host row as an EL1-editable anonymous node:
 /// private anonymous memory inside the heap/arena layout (its fork/dump
 /// attributes ride the node, see [`carried_flags`]).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::dispatch) fn root_owned_row(vma: &SemanticVma, mem: &MemState) -> bool {
     vma.provenance.is_private_anonymous()
         && !vma.droppable
@@ -216,7 +217,6 @@ pub(in crate::dispatch) fn root_owned_row(vma: &SemanticVma, mem: &MemState) -> 
 }
 
 /// The fork/dump attributes a row's policies name, as root node flags.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::dispatch) fn carried_flags(vma: &SemanticVma) -> ReservationNodeFlags {
     let mut flags = ReservationNodeFlags::EMPTY;
     if vma.fork_policy.copy == carrick_abi::VmaForkCopyPolicy::Omit {
@@ -315,7 +315,7 @@ fn union_of(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 /// The charges of every Linux-visible mapping the host projects, to be
 /// reduced by what the root holds. Computed before the root guard is taken:
 /// the projection itself may read the root.
-struct HostCharges {
+pub(in crate::dispatch) struct HostCharges {
     address: Vec<(u64, u64)>,
     data: Vec<(u64, u64)>,
 }
@@ -328,10 +328,27 @@ impl HostCharges {
         }
     }
 
+    /// The charges of a host-setup MM about to be admitted, under the
+    /// delegated policy (the heap is root nodes, never a host template).
+    /// The rows the root is about to own are still host rows here; every
+    /// one becomes a root node, so [`Self::beyond`] never charges it.
+    pub(in crate::dispatch) fn at_admission(mem: &MemState) -> Self {
+        Self {
+            address: host_vma_summaries(mem, false)
+                .iter()
+                .map(|vma| (vma.start.raw(), vma.end.raw()))
+                .collect(),
+            data: host_data_ranges(mem),
+        }
+    }
+
     /// Charges outside the root's committed nodes: nothing the root holds
     /// (anonymous or opaque) is charged twice. One range-charge descent per
     /// host row: O(host rows x log root nodes), never a walk of the root.
-    fn beyond(self, model: &mut Reservations<'_>) -> Result<(u64, u64), Refusal> {
+    pub(in crate::dispatch) fn beyond(
+        self,
+        model: &mut Reservations<'_>,
+    ) -> Result<(u64, u64), Refusal> {
         Ok((
             uncovered_bytes(self.address, model)?,
             uncovered_bytes(self.data, model)?,
@@ -366,11 +383,55 @@ impl MemState {
         }
     }
 
-    /// Seal the admitted root as the owner (conformance fixture only: the
-    /// production admission still refuses).
-    #[cfg(test)]
-    pub(in crate::dispatch) fn delegate_anonymous(&mut self, root: DelegatedRoot) {
-        self.anonymous = AnonymousAuthority::Delegated(DelegatedAnonymous::new(root));
+    /// Hand this host-setup MM's anonymous facts to its just-admitted
+    /// `root`, which holds every `owned` range as an anonymous node: their
+    /// host rows leave, their residency facts name the root incarnations and
+    /// their locks become root attributes. The one tail of every admission.
+    pub(in crate::dispatch) fn seal_delegated(
+        &mut self,
+        root: &DelegatedRoot,
+        owned: &[(u64, u64)],
+    ) {
+        // The root now owns these rows; the host keeps no second copy.
+        for &(start, end) in owned {
+            self.semantic_vmas.remove_range(start, end);
+            trim_dynamic_maps_for_range(&mut self.dynamic_maps, start, end - start);
+            // A visible boot region is a host row too (hidden backing rows
+            // are carrick's own and never trimmed).
+            trim_live_boot_regions_for_range(self, start, end - start);
+        }
+        self.anonymous = AnonymousAuthority::Delegated(DelegatedAnonymous::new(root.clone()));
+        // Host residency facts now describe the incarnations just admitted
+        // (a fork child's inherited facts already name them).
+        for &(start, end) in owned {
+            for piece in self.root_first_touch_pieces(start, end) {
+                self.resident
+                    .hand_over(piece.range, super::ResidencyOwner::Host, piece.owner());
+            }
+        }
+        // Locks become root attributes (`set_locked` routes each piece to
+        // its owner; a fork child's root already carries them).
+        for &(start, end) in owned {
+            let locked: Vec<_> = self
+                .locked_ranges
+                .iter()
+                .filter_map(|range| {
+                    guest_range(range.start().raw().max(start), range.end().raw().min(end))
+                })
+                .collect();
+            for range in locked {
+                super::locked_ranges_remove(&mut self.locked_ranges, range);
+                self.set_locked(range, true);
+            }
+        }
+    }
+
+    /// Whether this MM's current host syscall holds a venue open on its root.
+    pub(in crate::dispatch) fn host_venue_open(&self) -> bool {
+        matches!(
+            &self.anonymous,
+            AnonymousAuthority::Delegated(delegated) if delegated.venue.is_some()
+        )
     }
 
     #[cfg(test)]
@@ -976,20 +1037,32 @@ impl MemState {
         }
     }
 
-    /// The state a fork child starts from: its own MM in host setup. A
-    /// delegated parent's root rows, break and arena occupancy become the
-    /// child's values; the child never names the parent's root.
+    /// The state a fork child starts from, before its own root is published.
+    /// A host-setup parent's child is its clone. A delegated parent's child
+    /// is its host-setup twin: the parent root's rows, break and arena
+    /// occupancy as host facts (the fork projection is derived from them),
+    /// stamped with the parent root generation they came from. The fork
+    /// commit then seeds the child's root from exactly that generation
+    /// (`El1AdmissionOrigin::ForkCommit`), so the child stays delegated; the
+    /// child never names the parent's root.
     pub(in crate::dispatch) fn fork_materialized(&self) -> MemState {
         let mut forked = self.clone();
         let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
+            // A twin's clone is no fork twin of its own.
+            if let Some(arena) = forked.host_arena_mut() {
+                arena.fork_seed = None;
+            }
             return forked;
         };
         let layout = self.layout;
         let brk = self.program_break();
         let mut mappings = Vec::new();
-        delegated
+        let generation = delegated
             .root
-            .with_root(|model| model.observe_mappings(&mut |mapping| mappings.push(mapping)))
+            .with_root(|model| {
+                model.observe_mappings(&mut |mapping| mappings.push(mapping))?;
+                Ok(model.generation())
+            })
             .unwrap_or_else(|refusal| broken_root("a fork observation", refusal));
         let arena_start = layout.mmap_base;
         let arena_end = arena_start.saturating_add(layout.mmap_size);
@@ -1020,11 +1093,22 @@ impl MemState {
                 mmap_next = mmap_next.max(end);
             }
         }
+        // Captured before the twin leaves the root: the residency facts the
+        // child inherits name the parent's (and the seeded root's)
+        // incarnations; in host setup they answer as host facts.
+        let pieces = self.root_first_touch_pieces(arena_start, arena_end);
         forked.anonymous = AnonymousAuthority::HostSetup(HostArena {
             brk,
             mmap_next,
             free_regions,
+            fork_seed: Some(ForkSeed {
+                parent: delegated.root.mm(),
+                generation,
+            }),
         });
+        for piece in &pieces {
+            forked.adopt_root_first_touch(piece);
+        }
         forked
     }
 
