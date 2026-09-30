@@ -1273,6 +1273,58 @@ pub(crate) fn terminal_rule_edit(
     }
 }
 
+/// Whether a sub-table whose entries are descriptors at `level` may be
+/// reclaimed at all: only L3 tables (under an L2 entry) and L2 tables (under
+/// an L1 entry). L1 tables under the L0 root are never freed. The host
+/// reclaim walk ([`PageTableManager::unmap_aliased`]) and the guest
+/// executor's reclaiming Terminal op share this definition.
+pub(crate) const fn sub_table_level_reclaimable(level: usize) -> bool {
+    matches!(level, 2 | 3)
+}
+
+/// Whether the table page `pa` lies in the runtime spare tail of the primary
+/// arena whose first byte is `primary_base`: never one of the boot tables
+/// (null guard, kernel hole, Rosetta alias), which must never be freed.
+/// Callers bound the other end: the host by its bump cursor, EL1 by the
+/// arena it can reach.
+pub(crate) fn primary_spare_table(primary_base: u64, pa: u64) -> bool {
+    pa.is_multiple_of(PT_PAGE)
+        && pa
+            .checked_sub(primary_base)
+            .is_some_and(|offset| offset >= SPARE_START_OFFSET)
+}
+
+/// Whether one entry of a sub-table at `level`, covering `entry_va`, records
+/// nothing a rebuild could not reproduce, so freeing its table (and zeroing
+/// the parent entry) loses no information. A table is reclaimable exactly
+/// when it is spare and every one of its 512 entries satisfies this.
+///
+/// "VALID clear" is NOT that test. An invalid leaf that retains a
+/// non-identity output is the normal shape of every armed-but-untouched
+/// sparse-arena page, of every `PROT_NONE`/`MADV_DONTNEED` page whose frame
+/// the mm still owns, and of every pending materialization receipt: the next
+/// protection commit republishes exactly that output in place. Freeing such
+/// a table and re-splitting the emptied parent later handed those pages
+/// fabricated outputs (`cpython-concurrent_futures`' fork child validator:
+/// "stage-1 VA 0x6008405000 resolves to IPA 0x5000, expected
+/// 0x9c19205000"; the parent had been reading and writing IPA 0x5000
+/// silently).
+///
+/// Reclaimable entries are: empty (no output), identity (a rebuild yields
+/// the same address), or RETIRED by `munmap` (the lease is gone; the
+/// retained address is only a reuse signal). The host editor and the guest
+/// executor share this one definition.
+pub(crate) fn reclaimable_entry(desc: u64, level: usize, entry_va: u64) -> bool {
+    if desc & VALID != 0 {
+        return false;
+    }
+    if !PageTableManager::records_output(desc, level) || desc & SW_RETIRED != 0 {
+        return true;
+    }
+    let (_, mask) = PageTableManager::level_span(level);
+    desc & mask == entry_va & mask
+}
+
 /// The outcome of an edit applied to a page-table range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PageTableApplyOutcome {
@@ -2179,6 +2231,18 @@ impl PageTableManager {
         let root = SubstrateGpa(self.base());
         let plan = descriptor_txn::plan_descriptor_op(&words, root, op)
             .map_err(GuestTxnPrepareError::Refused)?;
+        // A reclaiming edit may return no more tables than planned (the plan
+        // never exceeds the budget); the receipt is checked against this
+        // narrowed budget.
+        let op = match op {
+            descriptor_txn::DescriptorOp::Terminal { span, mut edit } => {
+                edit.reclaim_budget = edit
+                    .reclaim_budget
+                    .min(u8::try_from(plan.reclaimed_tables).unwrap_or(u8::MAX));
+                descriptor_txn::DescriptorOp::Terminal { span, edit }
+            }
+            other => other,
+        };
         let tables = self
             .reserve_primary_table_grants(plan.table_grants)
             .map_err(GuestTxnPrepareError::Manager)?;
@@ -2230,14 +2294,39 @@ impl PageTableManager {
                 asid_scoped: self.asid_scoped_leaves,
                 excluded_ipa: self.layout.excluded_ipa_start,
                 excluded_len: self.layout.excluded_ipa_len,
+                reclaim_budget: 0,
             },
         }
     }
 
+    /// The guest descriptor operation for [`Self::unmap_aliased`] on this
+    /// image: munmap retirement followed by reclaim of every spare sub-table
+    /// it empties. [`Self::prepare_guest_descriptor_txn`] narrows the reclaim
+    /// budget to its plan; a span that would empty more than
+    /// [`descriptor_txn::MAX_RECLAIMED_TABLES`] tables is refused there with
+    /// [`descriptor_txn::DescriptorRefusal::ReclaimCapacity`] and must be
+    /// submitted in pieces.
+    pub fn unmap_aliased_op(&self, va: u64, len: u64) -> descriptor_txn::DescriptorOp {
+        descriptor_txn::DescriptorOp::Terminal {
+            span: descriptor_txn::PageSpan::new(va, len),
+            edit: descriptor_txn::TerminalEdit::unmap_reclaiming(
+                self.asid_scoped_leaves,
+                self.layout.excluded_ipa_start,
+                self.layout.excluded_ipa_len,
+            ),
+        }
+    }
+
     /// Authenticate EL1's receipt for `txn` and return the table grants it
-    /// did not link. Grants of a refused or rolled-back transaction all
-    /// return; after an unauthenticated or indeterminate receipt they stay
-    /// reserved, because their linkage is unknown.
+    /// did not consume and the emptied tables it unlinked. Grants of a
+    /// refused or rolled-back transaction all return; after an
+    /// unauthenticated or indeterminate receipt they stay reserved, because
+    /// their linkage is unknown.
+    ///
+    /// Reclaimed tables return exactly once: each must be a table page this
+    /// allocator issued from the primary arena's spare tail and does not
+    /// already hold free. Otherwise the receipt is inconsistent with the
+    /// allocator and nothing is returned.
     pub fn settle_guest_descriptor_receipt(
         &mut self,
         txn: &descriptor_txn::DescriptorTxn,
@@ -2246,8 +2335,33 @@ impl PageTableManager {
         use descriptor_txn::{DescriptorOutcome, ReceiptError};
         match txn.verify_receipt(receipt) {
             Ok(verified) => {
-                self.release_table_grants(verified.unused_table_grants())
+                let reclaimed = verified.reclaimed_tables();
+                // Verification bounded them below by the root's spare tail;
+                // the allocator bounds them above by what it issued.
+                let issued_end = self
+                    .arenas
+                    .first()
+                    .filter(|arena| arena.base == txn.root.raw())
+                    .map_or(0, |primary| primary.base + primary.next_free);
+                if reclaimed
+                    .iter()
+                    .any(|&pa| pa >= issued_end || self.free_tables.contains(&pa))
+                {
+                    return Err(GuestTxnSettleError::Receipt(
+                        ReceiptError::InconsistentReceipt,
+                    ));
+                }
+                let unused = verified.unused_table_grants();
+                self.free_tables
+                    .try_reserve(unused.len() + reclaimed.len())
+                    .map_err(|_| {
+                        GuestTxnSettleError::Manager(PageTableError::MetadataAllocation)
+                    })?;
+                self.release_table_grants(unused)
                     .map_err(GuestTxnSettleError::Manager)?;
+                // Verification proved them distinct and disjoint from the
+                // unused grants; the check above, from the free list.
+                self.free_tables.extend_from_slice(reclaimed);
                 Ok(verified)
             }
             Err(
@@ -2767,7 +2881,7 @@ impl PageTableManager {
             return false;
         }
         let primary = &self.arenas[0];
-        if pa >= primary.base + SPARE_START_OFFSET && pa < primary.base + primary.next_free {
+        if primary_spare_table(primary.base, pa) && pa < primary.base + primary.next_free {
             return true;
         }
         for arena in &self.arenas[1..] {
@@ -4941,38 +5055,15 @@ impl PageTableManager {
 
     /// Whether the table at `table_loc`, whose entries are terminal
     /// descriptors at `level` covering `[table_va, table_va + 512 * span)`,
-    /// records nothing a rebuild could not reproduce — so freeing it (and
-    /// zeroing the parent entry) loses no information.
-    ///
-    /// "All entries VALID-clear" is NOT that test. An invalid leaf that
-    /// retains a non-identity output is the normal shape of every
-    /// armed-but-untouched sparse-arena page, of every `PROT_NONE`/
-    /// `MADV_DONTNEED` page whose frame the mm still owns, and of every
-    /// pending materialization receipt: the next protection commit
-    /// republishes exactly that output in place. Freeing such a table and
-    /// re-splitting the emptied parent later handed those pages fabricated
-    /// outputs (`cpython-concurrent_futures`' fork child validator: "stage-1
-    /// VA 0x6008405000 resolves to IPA 0x5000, expected 0x9c19205000"; the
-    /// parent had been reading and writing IPA 0x5000 silently).
-    ///
-    /// Reclaimable entries are: empty (no output), identity (a rebuild yields
-    /// the same address), or RETIRED by `munmap` (the lease is gone; the
-    /// retained address is only a reuse signal).
+    /// records nothing a rebuild could not reproduce: every entry satisfies
+    /// the shared [`reclaimable_entry`] (see there for why "VALID clear" is
+    /// not the test).
     fn table_reclaimable(&self, table_loc: TableLocation, table_va: u64, level: usize) -> bool {
-        let (span, mask) = Self::level_span(level);
+        debug_assert!(sub_table_level_reclaimable(level));
+        let (span, _) = Self::level_span(level);
         (0..512usize).all(|i| {
-            let desc = match self.read_desc(table_loc.entry(i)) {
-                Ok(d) => d,
-                Err(_) => return false,
-            };
-            if desc & VALID != 0 {
-                return false;
-            }
-            if !Self::records_output(desc, level) || desc & SW_RETIRED != 0 {
-                return true;
-            }
-            let entry_va = table_va + (i as u64) * span;
-            desc & mask == entry_va & mask
+            self.read_desc(table_loc.entry(i))
+                .is_ok_and(|desc| reclaimable_entry(desc, level, table_va + (i as u64) * span))
         })
     }
 
@@ -11652,5 +11743,363 @@ mod tests {
                 Err(PageTableError::BadAddress)
             );
         }
+    }
+
+    /// The host alias teardown (`unmap_aliased`: retire, then reclaim every
+    /// spare sub-table left reclaimable) and the guest executor's reclaiming
+    /// `Terminal{Retire}` produce the same terminal descriptor and the same
+    /// walk for every page, and return the same set of tables to the pool:
+    /// a freed L3, a partially unmapped alias that frees nothing, a split
+    /// 2 MiB alias block that keeps its new table, two L3 tables plus the L2
+    /// they emptied, and an invalid identity block whose split table is
+    /// dropped again at once.
+    #[test]
+    fn guest_unmap_aliased_matches_the_host_editor_and_frees_the_same_tables() {
+        use core::sync::atomic::AtomicU64;
+        use descriptor_txn::{
+            CallerInvalidatesAsid, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId,
+            InlineJournal, PrimaryTableWords, execute_descriptor_txn,
+        };
+        const TWO_MIB: u64 = 1 << 21;
+        const ONE_GIB: u64 = 1 << 30;
+        let g = LINUX_HIGH_VA_THRESHOLD;
+        let g2 = g + ONE_GIB;
+        let ipa = LINUX_ALIAS_IPA_BASE;
+        let mut image = hvpatch_manager();
+        image
+            .map_aliased(g + TWO_MIB, ipa, PT_PAGE, true, None)
+            .unwrap();
+        image
+            .map_aliased(g + 2 * TWO_MIB, ipa + 0x10_0000, 2 * PT_PAGE, true, None)
+            .unwrap();
+        // Keeps G's L2 table live.
+        image
+            .map_aliased(g + 3 * TWO_MIB, ipa + 0x20_0000, PT_PAGE, true, None)
+            .unwrap();
+        image
+            .map_aliased(g + 4 * TWO_MIB, ipa + 0x40_0000, TWO_MIB, false, None)
+            .unwrap();
+        image
+            .map_aliased(g2, ipa + 0x60_0000, PT_PAGE, true, None)
+            .unwrap();
+        image
+            .map_aliased(g2 + 4 * TWO_MIB, ipa + 0x70_0000, PT_PAGE, true, None)
+            .unwrap();
+        let ident_va = g + 8 * TWO_MIB;
+        let l2_table = image.debug_walk(g + TWO_MIB)[1] & PA_MASK_TABLE;
+        image
+            .write_desc_for_test(
+                l2_table + indices(ident_va)[2] as u64 * 8,
+                (ident_va & PA_MASK_2MIB) | (USER_BLOCK_FLAGS & !VALID) | NON_GLOBAL,
+            )
+            .unwrap();
+        image.declare_live_hardware_image();
+        let unmaps = [
+            (g + TWO_MIB, PT_PAGE),
+            (g + 2 * TWO_MIB, PT_PAGE),
+            (g + 4 * TWO_MIB + 8 * PT_PAGE, 2 * PT_PAGE),
+            (g2, 5 * TWO_MIB),
+            (ident_va + PT_PAGE, 2 * PT_PAGE),
+        ];
+
+        let original = image.snapshot_image().unwrap();
+        let mut host = image.snapshot_image().unwrap();
+        host.declare_live_hardware_image();
+        host.set_multi_vcpu(false);
+        let sorted = |mut v: Vec<u64>| {
+            v.sort_unstable();
+            v
+        };
+        // The host pool after each unmap.
+        let mut host_pools = Vec::new();
+        for &(va, len) in &unmaps {
+            host.unmap_aliased(va, len as usize, None).unwrap();
+            host_pools.push((sorted(host.free_tables.clone()), host.pool_stats()));
+        }
+
+        let mut guest = image;
+        let base = guest.base();
+        let mut bytes = guest.as_bytes().to_vec();
+        bytes.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let words: Vec<AtomicU64> = bytes
+            .chunks_exact(8)
+            .map(|w| AtomicU64::new(u64::from_le_bytes(w.try_into().unwrap())))
+            .collect();
+        let maintenance = CallerInvalidatesAsid;
+        let live = unsafe {
+            PrimaryTableWords::new(
+                words.as_ptr().cast_mut(),
+                base,
+                words.len() * 8,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        let mut guest_reclaimed = Vec::new();
+        let expected_reclaims = [1, 0, 0, 3, 1];
+        for (generation, &(va, len)) in unmaps.iter().enumerate() {
+            let DescriptorOp::Terminal { span, mut edit } = guest.unmap_aliased_op(va, len) else {
+                unreachable!()
+            };
+            let op = DescriptorOp::Terminal { span, edit };
+            let plan = descriptor_txn::plan_descriptor_op(&live, SubstrateGpa(base), op).unwrap();
+            edit.reclaim_budget = plan.reclaimed_tables as u8;
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: core::num::NonZeroU64::new(9).unwrap(),
+                    generation: core::num::NonZeroU64::new(generation as u64 + 1).unwrap(),
+                },
+                root: SubstrateGpa(base),
+                op: DescriptorOp::Terminal { span, edit },
+                tables: guest
+                    .reserve_primary_table_grants(plan.table_grants)
+                    .unwrap(),
+            };
+            let receipt =
+                execute_descriptor_txn(&live, SubstrateGpa(base), &txn, &mut InlineJournal::new());
+            assert!(
+                matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
+                "unmap {va:#x}: {receipt:?}"
+            );
+            let verified = guest
+                .settle_guest_descriptor_receipt(&txn, &receipt)
+                .expect("authentic receipt");
+            // Not vacuous: G's first L3; nothing for a partial unmap or a
+            // split block; G2's two L3s and their L2; the dropped split of
+            // the identity block.
+            assert_eq!(
+                verified.reclaimed_tables().len(),
+                expected_reclaims[generation],
+                "unmap {va:#x}"
+            );
+            guest_reclaimed.extend_from_slice(verified.reclaimed_tables());
+            // The same tables came back: after every unmap the free pools
+            // (and bump cursors) agree.
+            assert_eq!(
+                (sorted(guest.free_tables.clone()), guest.pool_stats()),
+                host_pools[generation],
+                "unmap {va:#x}"
+            );
+        }
+        assert!(!guest_reclaimed.contains(&l2_table), "G's L2 stays live");
+        assert!(guest_reclaimed.contains(&(original.debug_walk(g2)[1] & PA_MASK_TABLE)));
+
+        let guest_bytes: Vec<u8> = words
+            .iter()
+            .flat_map(|w| w.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes())
+            .collect();
+        let mut probes: Vec<u64> = Vec::new();
+        for &(va, len) in &unmaps {
+            let mut page = va.saturating_sub(2 * PT_PAGE);
+            while page < va + len + 2 * PT_PAGE {
+                probes.push(page);
+                page += PT_PAGE;
+            }
+        }
+        probes.extend([
+            g + 3 * TWO_MIB,
+            g2 + 3 * TWO_MIB,
+            ident_va + TWO_MIB - PT_PAGE,
+        ]);
+        for page in probes {
+            let host_walk = host.debug_walk(page);
+            let guest_walk = walk_descriptors(&guest_bytes, base, page);
+            assert_eq!(
+                host_walk, guest_walk,
+                "page {page:#x}: host {host_walk:x?} guest {guest_walk:x?}"
+            );
+        }
+        assert_eq!(host.debug_walk(g2)[1], 0, "G2's L2 table was unlinked");
+        assert_eq!(host.debug_walk(g + TWO_MIB)[2], 0, "G's first L3 unlinked");
+        assert!(host.is_valid(g + 3 * TWO_MIB) && host.is_valid(g + 2 * TWO_MIB + PT_PAGE));
+    }
+
+    /// On the guest-owned live lane an alias munmap is one EL1 transaction:
+    /// the host plans and narrows the reclaim budget, EL1 unlinks under
+    /// break-before-make, the freed table crosses the slot in the receipt,
+    /// and settlement returns it exactly once so the host reissues it.
+    #[test]
+    fn guest_alias_unmap_returns_the_freed_table_to_the_host_allocator() {
+        use descriptor_txn::{DescriptorOutcome, DescriptorTxnId, DescriptorTxnSlot};
+        const TWO_MIB: u64 = 1 << 21;
+        let (mut mgr, resolver) = create_live_fixture();
+        let g = LINUX_HIGH_VA_THRESHOLD;
+        mgr.begin_undo().unwrap();
+        mgr.map_aliased(g + TWO_MIB, LINUX_ALIAS_IPA_BASE, PT_PAGE, true, None)
+            .unwrap();
+        mgr.map_aliased(
+            g + 2 * TWO_MIB,
+            LINUX_ALIAS_IPA_BASE + 0x10_0000,
+            PT_PAGE,
+            true,
+            None,
+        )
+        .unwrap();
+        unsafe { mgr.sync_to_host(&*resolver).unwrap() };
+        mgr.commit_undo();
+        mgr.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        let l3 = mgr.debug_walk(g + TWO_MIB)[2] & PA_MASK_TABLE;
+
+        let id = DescriptorTxnId {
+            mm_key: core::num::NonZeroU64::new(41).unwrap(),
+            generation: core::num::NonZeroU64::new(1).unwrap(),
+        };
+        let before = live_arena_bytes(&resolver);
+        let txn = mgr
+            .prepare_guest_descriptor_txn(id, mgr.unmap_aliased_op(g + TWO_MIB, PT_PAGE))
+            .expect("plan");
+        assert_eq!(
+            live_arena_bytes(&resolver),
+            before,
+            "planning stores nothing"
+        );
+        assert_eq!(txn.op.reclaim_budget(), 1, "narrowed to the plan");
+        assert!(txn.tables.is_empty());
+
+        let slot = DescriptorTxnSlot::new();
+        assert!(slot.submit(&txn));
+        let maintenance = RecordingMaintenance::default();
+        let receipt = guest_apply(&resolver, &slot, 41, &maintenance).expect("claimed");
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        assert!(
+            maintenance
+                .invalidations
+                .borrow()
+                .contains(&(g + TWO_MIB, TWO_MIB)),
+            "the unlinked entry's whole span is invalidated before the receipt"
+        );
+        let host_receipt = slot.take_receipt(id).unwrap();
+        let free_before = mgr.free_tables.len();
+        let verified = mgr
+            .settle_guest_descriptor_receipt(&txn, &host_receipt)
+            .expect("authentic receipt");
+        assert_eq!(verified.reclaimed_tables(), &[l3]);
+        assert_eq!(mgr.free_tables.len(), free_before + 1);
+        assert_eq!(mgr.translate(g + TWO_MIB), None);
+        assert_eq!(mgr.debug_walk(g + TWO_MIB)[2], 0);
+        assert_eq!(
+            mgr.translate(g + 2 * TWO_MIB),
+            Some(LINUX_ALIAS_IPA_BASE + 0x10_0000),
+            "the sibling alias keeps its table"
+        );
+        // Settling the same receipt again would free the page twice.
+        assert_eq!(
+            mgr.settle_guest_descriptor_receipt(&txn, &host_receipt),
+            Err(GuestTxnSettleError::Receipt(
+                descriptor_txn::ReceiptError::InconsistentReceipt
+            ))
+        );
+        assert_eq!(mgr.free_tables.len(), free_before + 1);
+        // The next grant reissues the reclaimed page.
+        let grants = mgr.reserve_primary_table_grants(1).unwrap();
+        assert_eq!(grants.as_slice(), &[l3]);
+    }
+
+    /// Receipts naming tables the host allocator never issued, or already
+    /// holds free, are refused whole: nothing returns to the pool.
+    #[test]
+    fn guest_reclaim_settlement_refuses_tables_the_allocator_does_not_own() {
+        use core::sync::atomic::AtomicU64;
+        use descriptor_txn::{
+            CallerInvalidatesAsid, DescriptorApplied, DescriptorOutcome, DescriptorReceipt,
+            DescriptorTxn, DescriptorTxnId, InlineJournal, PrimaryTableWords, ReceiptError,
+            ReclaimedTables, execute_descriptor_txn,
+        };
+        const TWO_MIB: u64 = 1 << 21;
+        let g = LINUX_HIGH_VA_THRESHOLD;
+        let mut image = hvpatch_manager();
+        image
+            .map_aliased(g + TWO_MIB, LINUX_ALIAS_IPA_BASE, PT_PAGE, true, None)
+            .unwrap();
+        image
+            .map_aliased(
+                g + 2 * TWO_MIB,
+                LINUX_ALIAS_IPA_BASE + 0x10_0000,
+                PT_PAGE,
+                true,
+                None,
+            )
+            .unwrap();
+        image.declare_live_hardware_image();
+        let l3 = image.debug_walk(g + TWO_MIB)[2] & PA_MASK_TABLE;
+        let base = image.base();
+        let mut bytes = image.as_bytes().to_vec();
+        bytes.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let words: Vec<AtomicU64> = bytes
+            .chunks_exact(8)
+            .map(|w| AtomicU64::new(u64::from_le_bytes(w.try_into().unwrap())))
+            .collect();
+        let maintenance = CallerInvalidatesAsid;
+        let live = unsafe {
+            PrimaryTableWords::new(
+                words.as_ptr().cast_mut(),
+                base,
+                words.len() * 8,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        let descriptor_txn::DescriptorOp::Terminal { span, mut edit } =
+            image.unmap_aliased_op(g + TWO_MIB, PT_PAGE)
+        else {
+            unreachable!()
+        };
+        edit.reclaim_budget = 2;
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: core::num::NonZeroU64::new(3).unwrap(),
+                generation: core::num::NonZeroU64::new(1).unwrap(),
+            },
+            root: SubstrateGpa(base),
+            op: descriptor_txn::DescriptorOp::Terminal { span, edit },
+            tables: descriptor_txn::TableGrants::NONE,
+        };
+        let receipt =
+            execute_descriptor_txn(&live, SubstrateGpa(base), &txn, &mut InlineJournal::new());
+        let DescriptorOutcome::Applied(genuine) = receipt.outcome else {
+            panic!("{receipt:?}");
+        };
+        assert_eq!(genuine.reclaimed.as_slice(), &[l3]);
+        let forged = |pages: &[u64]| DescriptorReceipt {
+            outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                reclaimed: ReclaimedTables::from_pages(pages).unwrap(),
+                ..genuine
+            }),
+            ..receipt
+        };
+        let primary_end = base + image.arenas[0].capacity as u64;
+        let never_issued = base + image.arenas[0].next_free;
+        let already_free = {
+            let spare = image.alloc_table_for_test().unwrap();
+            image.release_table_grants(&[spare]).unwrap();
+            spare
+        };
+        for pages in [
+            // Spare-tail pages the bump cursor never issued.
+            &[never_issued][..],
+            &[primary_end - PT_PAGE],
+            // A page the allocator already holds free.
+            &[l3, already_free],
+            // Duplicates and boot tables fail verification itself.
+            &[l3, l3],
+            &[base + PT_PAGE],
+        ] {
+            let free_before = image.free_tables.clone();
+            let next_before = image.arenas[0].next_free;
+            assert_eq!(
+                image.settle_guest_descriptor_receipt(&txn, &forged(pages)),
+                Err(GuestTxnSettleError::Receipt(
+                    ReceiptError::InconsistentReceipt
+                )),
+                "{pages:x?}"
+            );
+            assert_eq!(image.free_tables, free_before, "{pages:x?}");
+            assert_eq!(image.arenas[0].next_free, next_before);
+        }
+        let verified = image
+            .settle_guest_descriptor_receipt(&txn, &receipt)
+            .expect("the genuine receipt settles");
+        assert_eq!(verified.reclaimed_tables(), &[l3]);
+        assert_eq!(image.free_tables.iter().filter(|&&pa| pa == l3).count(), 1);
     }
 }

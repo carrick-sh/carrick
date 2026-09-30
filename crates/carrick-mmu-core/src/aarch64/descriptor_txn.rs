@@ -44,6 +44,11 @@
 //! ([`DescriptorRefusal::TablesExhausted`],
 //! [`DescriptorRefusal::TableOutsidePrimary`]). The receipt reports how many
 //! grants were linked; the host returns the unused suffix to its allocator.
+//! The reverse direction is bounded the same way: an alias munmap
+//! ([`TerminalEdit::unmap_reclaiming`]) unlinks the spare sub-tables its
+//! retirement empties, by the host editor's own reclaim predicate, and names
+//! at most [`MAX_RECLAIMED_TABLES`] of them in the receipt; the host returns
+//! them to its allocator exactly once, from a verified receipt.
 //!
 //! # Atomicity and rollback
 //!
@@ -86,13 +91,21 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 7;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 8;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
 /// 2 MiB boundary; one coarse-block split per span end needs at most two
 /// more pages per level below 1 GiB.
 pub const MAX_TABLE_GRANTS: usize = 8;
+
+/// Maximum emptied table pages one reclaiming [`DescriptorOp::Terminal`]
+/// may unlink and return in its receipt, symmetric with the grants a
+/// transaction may carry. A span that would empty more is refused whole at
+/// plan time ([`DescriptorRefusal::ReclaimCapacity`]) and the host splits
+/// it; splitting preserves the result because an L2 table is judged after
+/// every in-range L3 decision below it, in either venue.
+pub const MAX_RECLAIMED_TABLES: usize = MAX_TABLE_GRANTS;
 
 /// Highest translated TTBR0 VA plus one (48-bit, 4 KiB granule, 4 levels).
 const VA_LIMIT: u64 = 1 << 48;
@@ -299,6 +312,18 @@ pub struct TerminalEdit {
     /// IPA window no valid output may name (the in-kernel GIC).
     pub excluded_ipa: u64,
     pub excluded_len: u64,
+    /// After the rule, unlink every spare L3/L2 sub-table in the span that
+    /// the rule left reclaimable (the shared `reclaimable_entry`
+    /// predicate, exactly `PageTableManager::unmap_aliased`'s reclaim), up to
+    /// this many tables; 0 disables reclaim. Only the plain munmap
+    /// retirement rule may reclaim. EL1 unlinks each table under
+    /// break-before-make in the same journal as the rule and names the freed
+    /// pages in [`DescriptorApplied::reclaimed`]; the host returns them to its
+    /// allocator only from a verified receipt, i.e. after EL1's
+    /// inner-shareable ASID invalidation completed. That invalidation is what
+    /// the host editor's single-vCPU gate stands in for (it has no all-vCPU
+    /// TLBI), so the guest lane needs no such gate.
+    pub reclaim_budget: u8,
 }
 
 impl TerminalEdit {
@@ -323,7 +348,30 @@ impl TerminalEdit {
             asid_scoped,
             excluded_ipa,
             excluded_len,
+            reclaim_budget: 0,
         }
+    }
+
+    /// `munmap` of an alias (`PageTableManager::unmap_aliased`): retire the
+    /// range, then reclaim the sub-tables it emptied. The host narrows the
+    /// budget to its plan before submission.
+    #[must_use]
+    pub const fn unmap_reclaiming(asid_scoped: bool, excluded_ipa: u64, excluded_len: u64) -> Self {
+        Self {
+            rule: super::TerminalRule::pt(super::PtOp::Retire),
+            asid_scoped,
+            excluded_ipa,
+            excluded_len,
+            reclaim_budget: MAX_RECLAIMED_TABLES as u8,
+        }
+    }
+
+    /// Whether this edit's reclaim request is well formed: within the
+    /// receipt bound, and only after plain munmap retirement.
+    fn reclaim_well_formed(self) -> bool {
+        self.reclaim_budget == 0
+            || (usize::from(self.reclaim_budget) <= MAX_RECLAIMED_TABLES
+                && self.rule == super::TerminalRule::pt(super::PtOp::Retire))
     }
 
     fn excludes(self, output: u64, len: u64) -> bool {
@@ -344,7 +392,8 @@ impl TerminalEdit {
     const DENY_HOST_BUFFERS: u64 = 1 << 5;
     const FORK_ARM: u64 = 1 << 6;
     const ASID_SCOPED: u64 = 1 << 7;
-    const KNOWN: u64 = 0xff;
+    const RECLAIM_SHIFT: u32 = 8;
+    const KNOWN: u64 = 0xffff;
 
     fn wire(self) -> u64 {
         use super::{PtOp, TerminalRule};
@@ -354,6 +403,7 @@ impl TerminalEdit {
             0
         };
         let flag = |on: bool, bit: u64| if on { bit } else { 0 };
+        let scoped = scoped | (u64::from(self.reclaim_budget) << Self::RECLAIM_SHIFT);
         match self.rule {
             TerminalRule::BusFault => Self::RULE_BUS_FAULT | scoped,
             TerminalRule::Pt {
@@ -385,6 +435,7 @@ impl TerminalEdit {
         if word & !Self::KNOWN != 0 {
             return None;
         }
+        let reclaim_budget = (word >> Self::RECLAIM_SHIFT) as u8;
         let exec = word & Self::EXEC != 0;
         let flags = word & (Self::RESET_RETIRED | Self::DENY_HOST_BUFFERS | Self::FORK_ARM);
         let op = match word & 0b111 {
@@ -400,12 +451,14 @@ impl TerminalEdit {
                 if exec || flags != 0 {
                     return None;
                 }
-                return Some(Self {
+                let edit = Self {
                     rule: TerminalRule::BusFault,
                     asid_scoped: word & Self::ASID_SCOPED != 0,
                     excluded_ipa,
                     excluded_len,
-                });
+                    reclaim_budget,
+                };
+                return edit.reclaim_well_formed().then_some(edit);
             }
         };
         // Only ops with an execute choice may carry the execute bit.
@@ -416,7 +469,7 @@ impl TerminalEdit {
         if exec && !has_exec {
             return None;
         }
-        Some(Self {
+        let edit = Self {
             rule: TerminalRule::Pt {
                 op,
                 reset_retired: word & Self::RESET_RETIRED != 0,
@@ -426,7 +479,9 @@ impl TerminalEdit {
             asid_scoped: word & Self::ASID_SCOPED != 0,
             excluded_ipa,
             excluded_len,
-        })
+            reclaim_budget,
+        };
+        edit.reclaim_well_formed().then_some(edit)
     }
 }
 
@@ -461,6 +516,15 @@ impl DescriptorOp {
             | Self::CowRepoint { backing, .. }
             | Self::MapAlias { backing, .. } => Some(backing),
             _ => None,
+        }
+    }
+
+    /// Emptied tables this operation may unlink and return (0: none).
+    #[must_use]
+    pub fn reclaim_budget(&self) -> usize {
+        match *self {
+            Self::Terminal { edit, .. } => usize::from(edit.reclaim_budget),
+            _ => 0,
         }
     }
 
@@ -650,6 +714,62 @@ impl TableGrants {
     }
 }
 
+/// Table pages a reclaiming [`DescriptorOp::Terminal`] unlinked from the
+/// live graph (or consumed from its grants and never linked), in unlink
+/// order. EL1 reports them; the host returns them to its allocator only
+/// after [`DescriptorTxn::verify_receipt`] checked them against the
+/// submission and `PageTableManager::settle_guest_descriptor_receipt`
+/// checked them against its own arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimedTables {
+    len: u8,
+    pages: [u64; MAX_RECLAIMED_TABLES],
+}
+
+impl ReclaimedTables {
+    pub const NONE: Self = Self {
+        len: 0,
+        pages: [0; MAX_RECLAIMED_TABLES],
+    };
+
+    /// The raw list, as EL1 reported it; `None` over the bound. Contents are
+    /// validated by receipt verification, never here.
+    #[must_use]
+    pub fn from_pages(pages: &[u64]) -> Option<Self> {
+        let mut tables = Self::NONE;
+        for &pa in pages {
+            if !tables.push(pa) {
+                return None;
+            }
+        }
+        Some(tables)
+    }
+
+    fn push(&mut self, pa: u64) -> bool {
+        let Some(slot) = self.pages.get_mut(usize::from(self.len)) else {
+            return false;
+        };
+        *slot = pa;
+        self.len += 1;
+        true
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u64] {
+        &self.pages[..usize::from(self.len)]
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// One authenticated live descriptor transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DescriptorTxn {
@@ -717,6 +837,7 @@ impl DescriptorTxn {
         if usize::from(applied.tables_linked) > self.tables.len()
             || applied.resident != expected_resident
             || applied.pages != self.op.span().len / PT_PAGE
+            || !self.reclaimed_consistent(&applied)
         {
             return Err(ReceiptError::InconsistentReceipt);
         }
@@ -724,6 +845,24 @@ impl DescriptorTxn {
             txn: *self,
             applied,
         })
+    }
+}
+
+impl DescriptorTxn {
+    /// A receipt's reclaimed list may name only distinct table pages in the
+    /// spare tail of this transaction's primary arena (never the root or a
+    /// boot table), no more than the submission's budget, and none of the
+    /// grants the host already takes back as unused.
+    fn reclaimed_consistent(&self, applied: &DescriptorApplied) -> bool {
+        let reclaimed = applied.reclaimed.as_slice();
+        let unused = self.tables.unused_after(usize::from(applied.tables_linked));
+        reclaimed.len() <= self.op.reclaim_budget()
+            && reclaimed.iter().enumerate().all(|(index, &pa)| {
+                pa & !PA_MASK_4KIB == 0
+                    && super::primary_spare_table(self.root.raw(), pa)
+                    && !reclaimed[..index].contains(&pa)
+                    && !unused.contains(&pa)
+            })
     }
 }
 
@@ -752,6 +891,9 @@ pub enum DescriptorRefusal {
     BadEncoding = 19,
     WrongMm = 20,
     ExcludedOutput = 21,
+    /// A reclaiming edit would empty more tables than its budget (or than
+    /// one receipt carries): the host must split the span.
+    ReclaimCapacity = 22,
 }
 
 impl DescriptorRefusal {
@@ -779,6 +921,7 @@ impl DescriptorRefusal {
             19 => Self::BadEncoding,
             20 => Self::WrongMm,
             21 => Self::ExcludedOutput,
+            22 => Self::ReclaimCapacity,
             _ => return None,
         })
     }
@@ -792,8 +935,13 @@ pub struct DescriptorApplied {
     /// Exact pages that are resident because of this operation: the
     /// `resident` sub-span of a prepare, the span of a publish, else empty.
     pub resident: PageSpan,
-    /// Prefix of [`TableGrants`] now linked into the live graph.
+    /// Prefix of [`TableGrants`] EL1 consumed. A consumed grant is linked
+    /// into the live graph unless a reclaiming edit dropped it again, in
+    /// which case it is also named in `reclaimed`.
     pub tables_linked: u8,
+    /// Table pages this operation unlinked (or consumed and dropped), which
+    /// the host must return to its allocator exactly once.
+    pub reclaimed: ReclaimedTables,
     /// Live descriptor words replaced (journaled compare-exchanges).
     pub live_stores: u32,
     /// Whether the caller must invalidate the MM's ASID before reuse.
@@ -869,6 +1017,13 @@ impl VerifiedDescriptorReceipt {
     #[must_use]
     pub fn resident(&self) -> PageSpan {
         self.applied.resident
+    }
+
+    /// Emptied tables EL1 unlinked (after its break-before-make
+    /// invalidation completed), which the host must return to its allocator.
+    #[must_use]
+    pub fn reclaimed_tables(&self) -> &[u64] {
+        self.applied.reclaimed.as_slice()
     }
 
     /// Table grants the host must return to its allocator.
@@ -1094,6 +1249,8 @@ pub struct DescriptorTxnSlot {
     receipt_tables_linked: AtomicU64,
     receipt_live_stores: AtomicU64,
     receipt_flush: AtomicU64,
+    receipt_reclaimed_len: AtomicU64,
+    receipt_reclaimed: [AtomicU64; MAX_RECLAIMED_TABLES],
 }
 
 impl Default for DescriptorTxnSlot {
@@ -1124,6 +1281,8 @@ impl DescriptorTxnSlot {
             receipt_tables_linked: AtomicU64::new(0),
             receipt_live_stores: AtomicU64::new(0),
             receipt_flush: AtomicU64::new(0),
+            receipt_reclaimed_len: AtomicU64::new(0),
+            receipt_reclaimed: [const { AtomicU64::new(0) }; MAX_RECLAIMED_TABLES],
         }
     }
 
@@ -1309,6 +1468,7 @@ impl DescriptorTxnSlot {
             pages: 0,
             resident: PageSpan::EMPTY,
             tables_linked: 0,
+            reclaimed: ReclaimedTables::NONE,
             live_stores: 0,
             flush_required: !matches!(receipt.outcome, DescriptorOutcome::Refused(_)),
         });
@@ -1323,6 +1483,19 @@ impl DescriptorTxnSlot {
             .store(u64::from(applied.live_stores), Ordering::Relaxed);
         self.receipt_flush
             .store(u64::from(applied.flush_required), Ordering::Relaxed);
+        self.receipt_reclaimed_len
+            .store(applied.reclaimed.len() as u64, Ordering::Relaxed);
+        for (index, word) in self.receipt_reclaimed.iter().enumerate() {
+            word.store(
+                applied
+                    .reclaimed
+                    .as_slice()
+                    .get(index)
+                    .copied()
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+        }
         self.state.store(DESCRIPTOR_TXN_RECEIPT, Ordering::Release);
     }
 
@@ -1350,19 +1523,31 @@ impl DescriptorTxnSlot {
                 .and_then(DescriptorRefusal::from_code)
                 .unwrap_or(DescriptorRefusal::BadEncoding)
         };
+        let reclaimed = || {
+            let len = usize::try_from(self.receipt_reclaimed_len.load(Ordering::Relaxed)).ok()?;
+            let words: [u64; MAX_RECLAIMED_TABLES] =
+                core::array::from_fn(|i| self.receipt_reclaimed[i].load(Ordering::Relaxed));
+            ReclaimedTables::from_pages(words.get(..len)?)
+        };
         let outcome = match self.receipt_outcome.load(Ordering::Relaxed) {
-            OUTCOME_APPLIED => DescriptorOutcome::Applied(DescriptorApplied {
-                pages: self.receipt_pages.load(Ordering::Relaxed),
-                resident: PageSpan::new(
-                    self.receipt_resident_va.load(Ordering::Relaxed),
-                    self.receipt_resident_len.load(Ordering::Relaxed),
-                ),
-                tables_linked: u8::try_from(self.receipt_tables_linked.load(Ordering::Relaxed))
-                    .unwrap_or(u8::MAX),
-                live_stores: u32::try_from(self.receipt_live_stores.load(Ordering::Relaxed))
-                    .unwrap_or(u32::MAX),
-                flush_required: self.receipt_flush.load(Ordering::Relaxed) != 0,
-            }),
+            // An applied receipt whose freed-table list does not decode
+            // leaves the linkage unknown: indeterminate, never applied.
+            OUTCOME_APPLIED => match reclaimed() {
+                Some(reclaimed) => DescriptorOutcome::Applied(DescriptorApplied {
+                    pages: self.receipt_pages.load(Ordering::Relaxed),
+                    resident: PageSpan::new(
+                        self.receipt_resident_va.load(Ordering::Relaxed),
+                        self.receipt_resident_len.load(Ordering::Relaxed),
+                    ),
+                    tables_linked: u8::try_from(self.receipt_tables_linked.load(Ordering::Relaxed))
+                        .unwrap_or(u8::MAX),
+                    reclaimed,
+                    live_stores: u32::try_from(self.receipt_live_stores.load(Ordering::Relaxed))
+                        .unwrap_or(u32::MAX),
+                    flush_required: self.receipt_flush.load(Ordering::Relaxed) != 0,
+                }),
+                None => DescriptorOutcome::Indeterminate(DescriptorRefusal::BadEncoding),
+            },
             OUTCOME_REFUSED => DescriptorOutcome::Refused(refusal()),
             OUTCOME_ROLLED_BACK => DescriptorOutcome::RolledBack(refusal()),
             _ => DescriptorOutcome::Indeterminate(refusal()),
@@ -1577,41 +1762,120 @@ struct Executor<'a, W: ?Sized, J: ?Sized> {
     grants_used: usize,
     journal: &'a mut J,
     planned_live_stores: usize,
+    /// Primary arena base (the root): bounds which tables are spare.
+    root: u64,
+    /// Emptied tables this operation may unlink; 0 disables reclaim.
+    reclaim_budget: usize,
+    /// Tables unlinked so far (counted while planning, named while applying).
+    reclaimed_count: usize,
+    reclaimed: ReclaimedTables,
 }
 
 impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_, W, J> {
+    /// Visit the in-range entries of a live table. Returns whether the table
+    /// is now reclaimable: a reclaiming op, a reclaimable level, a spare page,
+    /// and every entry reclaimable by the shared predicate, judged on the
+    /// value each in-range entry holds after this op and on the untouched
+    /// value of every other entry.
     fn visit_live_table(
         &mut self,
         table_pa: u64,
         level: usize,
         table_base: u64,
-    ) -> Result<(), DescriptorRefusal> {
+    ) -> Result<bool, DescriptorRefusal> {
         let span = entry_span(level);
         let coverage_end = table_base.saturating_add(span.saturating_mul(512));
         let lo = self.start.max(table_base);
         let hi = self.end.min(coverage_end);
         if lo >= hi {
-            return Ok(());
+            return Ok(false);
         }
-        for index in (lo - table_base) / span..=(hi - 1 - table_base) / span {
+        let (first, last) = ((lo - table_base) / span, (hi - 1 - table_base) / span);
+        let mut reclaimable = self.reclaim_budget != 0
+            && super::sub_table_level_reclaimable(level)
+            && super::primary_spare_table(self.root, table_pa);
+        for index in first..=last {
             let pa = table_pa + index * 8;
             let descriptor = self.words.load(pa)?;
-            self.visit_entry(level, Loc::Live(pa), descriptor, table_base + index * span)?;
+            let entry_va = table_base + index * span;
+            let after = self.visit_entry(level, Loc::Live(pa), descriptor, entry_va)?;
+            reclaimable = reclaimable && super::reclaimable_entry(after, level, entry_va);
+        }
+        if !reclaimable {
+            return Ok(false);
+        }
+        for index in (0..first).chain(last + 1..512) {
+            let descriptor = self.words.load(table_pa + index * 8)?;
+            if !super::reclaimable_entry(descriptor, level, table_base + index * span) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Record one reclaimed table page (unknown while planning a grant).
+    fn note_reclaimed(&mut self, table: Option<u64>) -> Result<(), DescriptorRefusal> {
+        self.reclaimed_count += 1;
+        if self.reclaimed_count > self.reclaim_budget {
+            return Err(DescriptorRefusal::ReclaimCapacity);
+        }
+        if self.apply
+            && !self
+                .reclaimed
+                .push(table.ok_or(DescriptorRefusal::Malformed)?)
+        {
+            return Err(DescriptorRefusal::ReclaimCapacity);
         }
         Ok(())
     }
 
+    /// Replace the entry at `loc` that links (or would link) a reclaimed
+    /// table with an empty entry. Breaking a valid link is break-before-make
+    /// without a make: the invalidation of the entry's whole span completes
+    /// before the page can be reported free, so no walker on any PE can still
+    /// reach it when the host reissues it. Undoing the store relinks the
+    /// unchanged table, an invalid-to-valid transition that needs no
+    /// invalidation.
+    fn unlink(
+        &mut self,
+        loc: Loc,
+        descriptor: u64,
+        base: u64,
+        level: usize,
+        table: Option<u64>,
+    ) -> Result<(), DescriptorRefusal> {
+        self.note_reclaimed(table)?;
+        if descriptor == 0 {
+            return Ok(());
+        }
+        self.store(loc, descriptor, 0, None)?;
+        if self.apply && matches!(loc, Loc::Live(_)) && descriptor & VALID != 0 {
+            self.words.publish_barrier();
+            self.words.invalidate_range(base, entry_span(level));
+        }
+        Ok(())
+    }
+
+    /// Visit one entry and return the descriptor it holds after this op.
     fn visit_entry(
         &mut self,
         level: usize,
         loc: Loc,
         descriptor: u64,
         base: u64,
-    ) -> Result<(), DescriptorRefusal> {
+    ) -> Result<u64, DescriptorRefusal> {
         let span = entry_span(level);
         if is_table(descriptor, level) {
             return match loc {
-                Loc::Live(_) => self.visit_live_table(descriptor & PA_MASK_TABLE, level + 1, base),
+                Loc::Live(_) => {
+                    let child = descriptor & PA_MASK_TABLE;
+                    if self.visit_live_table(child, level + 1, base)? {
+                        self.unlink(loc, descriptor, base, level, Some(child))?;
+                        Ok(0)
+                    } else {
+                        Ok(descriptor)
+                    }
+                }
                 Loc::Fresh(_) => Err(DescriptorRefusal::Malformed),
             };
         }
@@ -1625,7 +1889,7 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                         super::TerminalRefusal::Malformed => DescriptorRefusal::Malformed,
                     })?
             else {
-                return Ok(());
+                return Ok(descriptor);
             };
             if level == 0 {
                 return Err(DescriptorRefusal::Malformed);
@@ -1639,7 +1903,7 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
             if armed != descriptor {
                 self.store(loc, descriptor, armed, None)?;
             }
-            return Ok(());
+            return Ok(armed);
         }
         if level == 0 {
             if descriptor != 0 {
@@ -1672,7 +1936,7 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                     self.store(loc, descriptor, updated, None)?;
                 }
             }
-            return Ok(());
+            return Ok(updated);
         }
         self.descend(level, loc, descriptor, base)
     }
@@ -1695,14 +1959,17 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
     }
 
     /// Replace a coarse or empty entry by a granted table, filled while
-    /// unlinked, edited, then linked child-before-parent.
+    /// unlinked, edited, then linked child-before-parent. Returns the
+    /// entry's new descriptor. A reclaiming op whose edit leaves the new
+    /// table reclaimable drops it instead of linking it, exactly as the host
+    /// editor's split followed by its reclaim frees it.
     fn descend(
         &mut self,
         level: usize,
         loc: Loc,
         descriptor: u64,
         base: u64,
-    ) -> Result<(), DescriptorRefusal> {
+    ) -> Result<u64, DescriptorRefusal> {
         let valid = descriptor & VALID != 0;
         let empty = !valid && descriptor & output_mask(level) == 0;
         if level > 0 && !valid && descriptor & (TYPE_TABLE_OR_PAGE & !VALID) != 0 {
@@ -1733,21 +2000,38 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
         let child_span = entry_span(level + 1);
         let lo = self.start.max(base);
         let hi = self.end.min(base + entry_span(level));
-        for index in (lo - base) / child_span..=(hi - 1 - base) / child_span {
-            let child = if level == 0 {
+        let child_at = |index: u64| {
+            if level == 0 {
                 0
             } else {
                 expand(descriptor, level, index)
-            };
+            }
+        };
+        let (first, last) = ((lo - base) / child_span, (hi - 1 - base) / child_span);
+        let mut reclaimable =
+            self.reclaim_budget != 0 && super::sub_table_level_reclaimable(level + 1);
+        for index in first..=last {
             let child_loc = Loc::Fresh(grant.map(|table| table + index * 8));
-            self.visit_entry(level + 1, child_loc, child, base + index * child_span)?;
+            let child_va = base + index * child_span;
+            let after = self.visit_entry(level + 1, child_loc, child_at(index), child_va)?;
+            reclaimable = reclaimable && super::reclaimable_entry(after, level + 1, child_va);
+        }
+        if reclaimable
+            && (0..first).chain(last + 1..512).all(|index| {
+                super::reclaimable_entry(child_at(index), level + 1, base + index * child_span)
+            })
+        {
+            // Every granted page is primary spare (checked before the first
+            // store), so the dropped grant returns like an unlinked table.
+            self.unlink(loc, descriptor, base, level, grant)?;
+            return Ok(0);
         }
         let table_descriptor = grant.map_or(TYPE_TABLE_OR_PAGE, |table| {
             (table & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE
         });
         let span = entry_span(level);
         match loc {
-            Loc::Fresh(_) => self.store(loc, descriptor, table_descriptor, None),
+            Loc::Fresh(_) => self.store(loc, descriptor, table_descriptor, None)?,
             Loc::Live(_) => {
                 if self.apply {
                     self.words.publish_barrier();
@@ -1759,12 +2043,13 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                     if self.apply {
                         self.words.invalidate_range(base, span);
                     }
-                    self.store(loc, 0, table_descriptor, Some((base, span)))
+                    self.store(loc, 0, table_descriptor, Some((base, span)))?;
                 } else {
-                    self.store(loc, descriptor, table_descriptor, Some((base, span)))
+                    self.store(loc, descriptor, table_descriptor, Some((base, span)))?;
                 }
             }
         }
+        Ok(table_descriptor)
     }
 
     fn take_grant(&mut self) -> Result<Option<u64>, DescriptorRefusal> {
@@ -2045,6 +2330,9 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
         }
         DescriptorOp::Protect(_) | DescriptorOp::Retire(_) => true,
         DescriptorOp::Terminal { edit, .. } => {
+            if !edit.reclaim_well_formed() {
+                return Err(DescriptorRefusal::BadEncoding);
+            }
             edit.excluded_ipa.checked_add(edit.excluded_len).is_some()
         }
         DescriptorOp::CowRepoint {
@@ -2098,6 +2386,9 @@ pub struct DescriptorPlan {
     pub table_grants: usize,
     /// Journaled live descriptor stores.
     pub live_stores: usize,
+    /// Emptied tables a reclaiming operation will unlink (and grants it will
+    /// consume and drop), at most its budget.
+    pub reclaimed_tables: usize,
 }
 
 fn plan_validated<W>(
@@ -2121,11 +2412,16 @@ where
         grants_used: 0,
         journal: &mut no_journal,
         planned_live_stores: 0,
+        root,
+        reclaim_budget: op.reclaim_budget(),
+        reclaimed_count: 0,
+        reclaimed: ReclaimedTables::NONE,
     };
     plan.visit_live_table(root, 0, 0)?;
     Ok(DescriptorPlan {
         table_grants: plan.grants_used,
         live_stores: plan.planned_live_stores,
+        reclaimed_tables: plan.reclaimed_count,
     })
 }
 
@@ -2178,7 +2474,13 @@ where
         return DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot);
     }
     for &grant in tables.as_slice() {
-        if grant == root || words.load(grant).is_err() || words.load(grant + PT_PAGE - 8).is_err() {
+        if grant == root
+            || words.load(grant).is_err()
+            || words.load(grant + PT_PAGE - 8).is_err()
+            // A reclaiming op may drop a grant it split into, and reports it
+            // freed: every grant must then be a primary spare table page.
+            || (op.reclaim_budget() != 0 && !super::primary_spare_table(root, grant))
+        {
             return DescriptorOutcome::Refused(DescriptorRefusal::BadTableGrant);
         }
     }
@@ -2205,11 +2507,16 @@ where
         grants_used: 0,
         journal: &mut *journal,
         planned_live_stores: 0,
+        root,
+        reclaim_budget: op.reclaim_budget(),
+        reclaimed_count: 0,
+        reclaimed: ReclaimedTables::NONE,
     };
     let result = apply.visit_live_table(root, 0, 0);
     let tables_linked = apply.grants_used;
+    let reclaimed = apply.reclaimed;
     match result {
-        Ok(()) => {
+        Ok(_) => {
             let stored = journal.entries().len();
             DescriptorOutcome::Applied(DescriptorApplied {
                 pages: span.len / PT_PAGE,
@@ -2219,6 +2526,7 @@ where
                     _ => PageSpan::EMPTY,
                 },
                 tables_linked: u8::try_from(tables_linked).unwrap_or(u8::MAX),
+                reclaimed,
                 live_stores: u32::try_from(stored).unwrap_or(u32::MAX),
                 flush_required: stored != 0,
             })
@@ -2439,6 +2747,7 @@ mod tests {
                 pages: txn.op.span().len / PT_PAGE,
                 resident,
                 tables_linked,
+                reclaimed: ReclaimedTables::NONE,
                 live_stores: 5,
                 flush_required: true,
             }),
@@ -2568,6 +2877,7 @@ mod tests {
                         asid_scoped,
                         excluded_ipa: 0x0800_0000,
                         excluded_len: 0x0100_0000,
+                        reclaim_budget: 0,
                     },
                 };
                 let (kind, payload) = op.encode();
@@ -2576,6 +2886,21 @@ mod tests {
                     Some(op),
                     "{rule:?}"
                 );
+            }
+        }
+        // Reclaiming munmap retirement round-trips at every budget.
+        for budget in 1..=MAX_RECLAIMED_TABLES as u8 {
+            for asid_scoped in [false, true] {
+                let mut edit =
+                    TerminalEdit::unmap_reclaiming(asid_scoped, 0x0800_0000, 0x0100_0000);
+                edit.reclaim_budget = budget;
+                let op = DescriptorOp::Terminal {
+                    span: PageSpan::new(0x5000, 3 * PT_PAGE),
+                    edit,
+                };
+                let (kind, payload) = op.encode();
+                assert_eq!(DescriptorOp::decode(kind, payload, None), Some(op));
+                assert_eq!(op.reclaim_budget(), usize::from(budget));
             }
         }
         let decode = |word| {
@@ -2587,9 +2912,17 @@ mod tests {
         };
         // Unknown bits, an execute bit on an op without one, and composition
         // flags on a BUS-tail rule are malformed, not reinterpreted.
+        let budget = |n: u64| n << TerminalEdit::RECLAIM_SHIFT;
         for word in [
-            1 << 8,
+            1 << 16,
             TerminalEdit::OP_INVALIDATE | TerminalEdit::EXEC,
+            // Reclaim only follows plain munmap retirement, within the
+            // receipt bound.
+            TerminalEdit::OP_INVALIDATE | budget(1),
+            TerminalEdit::OP_READ_WRITE | budget(1),
+            TerminalEdit::OP_RETIRE | TerminalEdit::DENY_HOST_BUFFERS | budget(1),
+            TerminalEdit::RULE_BUS_FAULT | budget(1),
+            TerminalEdit::OP_RETIRE | budget(MAX_RECLAIMED_TABLES as u64 + 1),
             TerminalEdit::OP_NONE | TerminalEdit::EXEC,
             TerminalEdit::RULE_BUS_FAULT | TerminalEdit::FORK_ARM,
             TerminalEdit::RULE_BUS_FAULT | TerminalEdit::EXEC,
@@ -2656,6 +2989,7 @@ mod tests {
             pages: 4,
             resident: PageSpan::EMPTY,
             tables_linked: 0,
+            reclaimed: ReclaimedTables::NONE,
             live_stores: 0,
             flush_required: false,
         }));
@@ -4187,6 +4521,300 @@ mod tests {
             assert_eq!(words.get(leaf_pa(VA)) & PA_MASK_4KIB, 0x009d_0000_0000);
             // Once repointed, the same grant is stale.
             assert!(copy_granted_cow_page(&words, grant, &source, &mut destination).is_err());
+        }
+
+        /// L0 root (page 0) -> boot L1 (page 1) -> spare L2 (page 9) -> two
+        /// spare L3 tables (pages 10, 11) for `VA` and `VA + 2 MiB`, each
+        /// holding one valid untagged alias page at the start of its block.
+        fn two_alias_blocks() -> TestWords {
+            let words = TestWords::new();
+            let idx = indices(VA);
+            words.set(page(0) + idx[0] as u64 * 8, table(1));
+            words.set(page(1) + idx[1] as u64 * 8, table(9));
+            for (block, l3) in [(0u64, 10u64), (1, 11)] {
+                words.set(page(9) + (idx[2] as u64 + block) * 8, table(l3));
+                words.set(
+                    page(l3),
+                    (IPA + block * PT_PAGE) | USER_PAGE_FLAGS | NON_GLOBAL,
+                );
+            }
+            words
+        }
+
+        fn unmap_reclaiming(va: u64, len: u64, budget: u8) -> DescriptorOp {
+            let mut edit = TerminalEdit::unmap_reclaiming(true, 0, 0);
+            edit.reclaim_budget = budget;
+            DescriptorOp::Terminal {
+                span: PageSpan::new(va, len),
+                edit,
+            }
+        }
+
+        #[test]
+        fn reclaiming_unmap_unlinks_emptied_tables_with_break_before_make() {
+            const TWO_MIB: u64 = 1 << 21;
+            let words = two_alias_blocks();
+            let op = unmap_reclaiming(VA, 2 * TWO_MIB, MAX_RECLAIMED_TABLES as u8);
+            let plan = plan_descriptor_op(&words, SubstrateGpa(ROOT), op).unwrap();
+            assert_eq!(plan.reclaimed_tables, 3, "two L3 tables and their L2");
+            assert_eq!(plan.table_grants, 0);
+            let result = applied(run(&words, op, &TableGrants::NONE));
+            assert_eq!(result.reclaimed.as_slice(), &[page(10), page(11), page(9)]);
+            assert_eq!(result.live_stores as usize, plan.live_stores);
+            let idx = indices(VA);
+            assert_eq!(
+                words.get(page(1) + idx[1] as u64 * 8),
+                0,
+                "L1 entry unlinked"
+            );
+            // Each unlink is broken, published, then invalidated over the
+            // whole span the entry covered, before anything later.
+            let log = words.log.borrow().clone();
+            let unlink = |entry: u64, before: u64, span_va: u64, span: u64| {
+                let at = log
+                    .iter()
+                    .position(|e| {
+                        *e == Event::Cas {
+                            pa: entry,
+                            before,
+                            after: 0,
+                        }
+                    })
+                    .expect("unlink store");
+                assert_eq!(
+                    &log[at + 1..at + 3],
+                    &[Event::Barrier, Event::Invalidate(span_va, span)]
+                );
+            };
+            unlink(page(9) + idx[2] as u64 * 8, table(10), VA, TWO_MIB);
+            unlink(
+                page(9) + (idx[2] as u64 + 1) * 8,
+                table(11),
+                VA + TWO_MIB,
+                TWO_MIB,
+            );
+            unlink(
+                page(1) + idx[1] as u64 * 8,
+                table(9),
+                VA & !((1 << 30) - 1),
+                1 << 30,
+            );
+
+            // The boot L1 is never reclaimed, and a live neighbour keeps its
+            // table: only the retired leaf changes.
+            let words = two_alias_blocks();
+            let result = applied(run(
+                &words,
+                unmap_reclaiming(VA + TWO_MIB, PT_PAGE, 4),
+                &TableGrants::NONE,
+            ));
+            assert_eq!(result.reclaimed.as_slice(), &[page(11)]);
+            assert_eq!(words.get(page(9) + idx[2] as u64 * 8), table(10));
+
+            // Without a budget the same retirement reclaims nothing.
+            let words = two_alias_blocks();
+            let result = applied(run(
+                &words,
+                unmap_reclaiming(VA, 2 * TWO_MIB, 0),
+                &TableGrants::NONE,
+            ));
+            assert!(result.reclaimed.is_empty());
+            assert_eq!(words.get(page(1) + idx[1] as u64 * 8), table(9));
+        }
+
+        #[test]
+        fn reclaim_beyond_the_budget_is_refused_before_any_store() {
+            const TWO_MIB: u64 = 1 << 21;
+            let words = two_alias_blocks();
+            let before = words.image();
+            let op = unmap_reclaiming(VA, 2 * TWO_MIB, 2);
+            assert_eq!(
+                plan_descriptor_op(&words, SubstrateGpa(ROOT), op),
+                Err(DescriptorRefusal::ReclaimCapacity)
+            );
+            assert_eq!(
+                run(&words, op, &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::ReclaimCapacity)
+            );
+            assert_eq!(words.image(), before);
+            // A budget over the receipt bound, or reclaim after any rule but
+            // plain retirement, is not an encodable edit.
+            let mut edit = TerminalEdit::unmap_reclaiming(true, 0, 0);
+            edit.reclaim_budget = MAX_RECLAIMED_TABLES as u8 + 1;
+            let over = DescriptorOp::Terminal {
+                span: PageSpan::new(VA, PT_PAGE),
+                edit,
+            };
+            edit.reclaim_budget = 1;
+            edit.rule = crate::aarch64::TerminalRule::pt(crate::aarch64::PtOp::Invalidate);
+            let invalidate = DescriptorOp::Terminal {
+                span: PageSpan::new(VA, PT_PAGE),
+                edit,
+            };
+            for op in [over, invalidate] {
+                assert_eq!(
+                    run(&words, op, &TableGrants::NONE),
+                    DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding)
+                );
+            }
+            // Grants of a reclaiming op must be primary spare pages.
+            assert_eq!(
+                run(&words, unmap_reclaiming(VA, PT_PAGE, 1), &grants(&[2])),
+                DescriptorOutcome::Refused(DescriptorRefusal::BadTableGrant)
+            );
+            assert_eq!(words.image(), before);
+        }
+
+        /// A contended store at any point of a reclaiming unmap, including
+        /// between two unlinks and at the final L2 unlink, restores every
+        /// retired leaf and every unlinked table link.
+        #[test]
+        fn contended_reclaim_restores_every_link() {
+            const TWO_MIB: u64 = 1 << 21;
+            let op = unmap_reclaiming(VA, 2 * TWO_MIB, MAX_RECLAIMED_TABLES as u8);
+            let plan = plan_descriptor_op(&two_alias_blocks(), SubstrateGpa(ROOT), op).unwrap();
+            assert_eq!(plan.live_stores, 5, "two retires and three unlinks");
+            for fail_at in 0..plan.live_stores {
+                let words = two_alias_blocks();
+                let before = words.image();
+                words.fail_cas_at.set(Some(fail_at));
+                let outcome = run(&words, op, &TableGrants::NONE);
+                assert_eq!(
+                    outcome,
+                    DescriptorOutcome::RolledBack(DescriptorRefusal::Contended),
+                    "fail at {fail_at}"
+                );
+                assert!(outcome_requires_invalidation(&outcome));
+                assert_eq!(words.image(), before, "fail at {fail_at}");
+            }
+        }
+
+        #[test]
+        fn receipts_name_only_distinct_spare_tables_within_the_budget() {
+            const TWO_MIB: u64 = 1 << 21;
+            let words = two_alias_blocks();
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(7),
+                    generation: nz(1),
+                },
+                root: SubstrateGpa(ROOT),
+                op: unmap_reclaiming(VA, 2 * TWO_MIB, 3),
+                tables: grants(&[12]),
+            };
+            let mut journal = InlineJournal::new();
+            let receipt = execute_descriptor_txn(&words, SubstrateGpa(ROOT), &txn, &mut journal);
+            let verified = txn.verify_receipt(&receipt).expect("authentic");
+            assert_eq!(verified.reclaimed_tables(), &[page(10), page(11), page(9)]);
+            assert_eq!(verified.unused_table_grants(), &[page(12)]);
+
+            let DescriptorOutcome::Applied(genuine) = receipt.outcome else {
+                panic!("{receipt:?}");
+            };
+            let forged = |pages: &[u64]| DescriptorReceipt {
+                outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                    reclaimed: ReclaimedTables::from_pages(pages).unwrap(),
+                    ..genuine
+                }),
+                ..receipt
+            };
+            for pages in [
+                // The root and boot tables are never freed.
+                &[ROOT][..],
+                &[page(1)],
+                // Outside the arena below the root, and unaligned.
+                &[ROOT - PT_PAGE],
+                &[page(10) + 8],
+                // A duplicate would free one page twice.
+                &[page(10), page(10)],
+                // More than the budget.
+                &[page(10), page(11), page(9), page(13)],
+                // An unused grant already returns as unused.
+                &[page(12)],
+            ] {
+                assert_eq!(
+                    txn.verify_receipt(&forged(pages)),
+                    Err(ReceiptError::InconsistentReceipt),
+                    "{pages:x?}"
+                );
+            }
+            // Operations without a reclaim budget return no tables.
+            let prepare = prepare_txn_at(ROOT);
+            assert!(prepare.verify_receipt(&applied_receipt(&prepare)).is_ok());
+            let mut with_reclaim = applied_receipt(&prepare);
+            if let DescriptorOutcome::Applied(ref mut applied) = with_reclaim.outcome {
+                applied.reclaimed = ReclaimedTables::from_pages(&[page(10)]).unwrap();
+            }
+            assert_eq!(
+                prepare.verify_receipt(&with_reclaim),
+                Err(ReceiptError::InconsistentReceipt)
+            );
+        }
+
+        fn prepare_txn_at(root: u64) -> DescriptorTxn {
+            DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(7),
+                    generation: nz(2),
+                },
+                root: SubstrateGpa(root),
+                op: prepare(4, PageSpan::new(VA, PT_PAGE), true),
+                tables: TableGrants::NONE,
+            }
+        }
+
+        fn applied_receipt(txn: &DescriptorTxn) -> DescriptorReceipt {
+            DescriptorReceipt {
+                id: txn.id,
+                digest: txn.digest(),
+                outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                    pages: 4,
+                    resident: PageSpan::new(VA, PT_PAGE),
+                    tables_linked: 0,
+                    reclaimed: ReclaimedTables::NONE,
+                    live_stores: 1,
+                    flush_required: true,
+                }),
+            }
+        }
+
+        #[test]
+        fn reclaimed_tables_cross_the_slot_and_an_oversized_list_is_indeterminate() {
+            const TWO_MIB: u64 = 1 << 21;
+            let words = two_alias_blocks();
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(7),
+                    generation: nz(3),
+                },
+                root: SubstrateGpa(ROOT),
+                op: unmap_reclaiming(VA, 2 * TWO_MIB, 3),
+                tables: TableGrants::NONE,
+            };
+            let slot = DescriptorTxnSlot::new();
+            assert!(slot.submit(&txn));
+            let mut journal = InlineJournal::new();
+            let published =
+                apply_submitted_descriptor_txn(&slot, 7, &words, SubstrateGpa(ROOT), &mut journal)
+                    .unwrap();
+            let taken = slot.take_receipt(txn.id).unwrap();
+            assert_eq!(taken, published);
+            assert_eq!(
+                txn.verify_receipt(&taken).unwrap().reclaimed_tables(),
+                &[page(10), page(11), page(9)]
+            );
+
+            // A receipt whose list length exceeds the bound does not decode
+            // as applied: which tables EL1 unlinked is unknown.
+            assert!(slot.submit(&txn));
+            let claimed = slot.claim_for_mm(7).unwrap();
+            let _ = claimed.complete(published.outcome);
+            slot.receipt_reclaimed_len
+                .store(MAX_RECLAIMED_TABLES as u64 + 1, Ordering::Relaxed);
+            assert_eq!(
+                slot.take_receipt(txn.id).unwrap().outcome,
+                DescriptorOutcome::Indeterminate(DescriptorRefusal::BadEncoding)
+            );
         }
     }
 }
