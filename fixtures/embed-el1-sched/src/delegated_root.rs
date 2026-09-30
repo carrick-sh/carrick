@@ -19,6 +19,7 @@
 
 use super::{poll_read_byte, poll_read_count, write_count, write_signal_byte};
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PROT_RW: libc::c_int = libc::PROT_READ | libc::PROT_WRITE;
 
@@ -79,6 +80,10 @@ const MAPS_BUFFER: usize = 1 << 19;
 struct Maps {
     buf: Vec<u8>,
     rows: Vec<Row>,
+    /// Scratch rows clipped to the fixture's own windows.
+    clip: Vec<Row>,
+    /// Scratch rows of the peer's ranges that are outside our windows.
+    foreign: Vec<Row>,
 }
 
 impl Maps {
@@ -86,6 +91,8 @@ impl Maps {
         Self {
             buf: vec![0u8; MAPS_BUFFER],
             rows: Vec::with_capacity(ROW_CAPACITY),
+            clip: Vec::with_capacity(ROW_CAPACITY),
+            foreign: Vec::with_capacity(ROW_CAPACITY),
         }
     }
 
@@ -231,18 +238,65 @@ fn first_difference(expected: &[Row], actual: &[Row]) -> String {
     "identical".to_owned()
 }
 
-/// Snapshot and compare against the modelled rows.
-fn check(maps: &mut Maps, model: &[Row], step: &str, mismatches: &mut u64) {
+/// Rows of `rows` restricted to `windows`, merged where Linux merges.
+fn clip_rows(rows: &[Row], windows: &[(usize, usize)], out: &mut Vec<Row>) {
+    out.clear();
+    for row in rows {
+        for &(start, end) in windows {
+            let (s, e) = (row.start.max(start), row.end.min(end));
+            if s < e {
+                out.push(Row {
+                    start: s,
+                    end: e,
+                    ..*row
+                });
+            }
+        }
+    }
+    normalize(out);
+}
+
+/// Snapshot `/proc/self/maps` and compare only what the fixture itself owns:
+/// the rows inside `windows` (exact start, end and permissions against
+/// `model`), and the absence of any row in the peer's private ranges `peer`
+/// that is not inside our own windows. Rows the libc, the allocator or the
+/// runtime own elsewhere are never consulted.
+fn check(
+    maps: &mut Maps,
+    windows: &[(usize, usize)],
+    model: &[Row],
+    peer: &[(usize, usize)],
+    step: &str,
+    mismatches: &mut u64,
+) {
     if !maps.snapshot() {
         *mismatches += 1;
         println!("delegated-root-vma maps unreadable at {step}");
         return;
     }
-    if maps.rows.as_slice() != model {
+    let Maps {
+        rows,
+        clip,
+        foreign,
+        ..
+    } = maps;
+    clip_rows(rows, windows, clip);
+    if clip.as_slice() != model {
         *mismatches += 1;
         println!(
             "delegated-root-vma MISMATCH at {step}: {}",
-            first_difference(model, &maps.rows)
+            first_difference(model, clip)
+        );
+    }
+    clip_rows(rows, peer, foreign);
+    for &(start, end) in windows {
+        model_unmap(foreign, start, end);
+    }
+    if !foreign.is_empty() {
+        *mismatches += 1;
+        println!(
+            "delegated-root-vma CROSS-MM rows at {step}: {:x?}",
+            foreign.as_slice()
         );
     }
 }
@@ -265,7 +319,30 @@ impl VmaOutcome {
     }
 }
 
-fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
+fn peer_windows(mail: usize, theirs: usize, ps: usize) -> [(usize, usize); 2] {
+    let a = mailbox(mail, theirs).load(Ordering::Acquire) as usize;
+    let b = mailbox(mail, theirs + 1).load(Ordering::Acquire) as usize;
+    let win = |base: usize, len: usize| {
+        if base == 0 {
+            (0, 0)
+        } else {
+            (base, base + len)
+        }
+    };
+    [win(a, 8 * ps), win(b, 4 * ps)]
+}
+
+fn mailbox(mail: usize, slot: usize) -> &'static AtomicU64 {
+    // SAFETY: `mail` is a live MAP_SHARED page made before fork; slots are
+    // in-bounds 8-byte aligned words.
+    unsafe { &*(mail as *const AtomicU64).add(slot) }
+}
+
+/// `mail` is a MAP_SHARED|MAP_ANONYMOUS page made before fork. Each role
+/// publishes the address of its current A and B there so the peer can assert
+/// that none of those private ranges ever appears in its own maps.
+fn vma_worker(child: bool, rounds: usize, shared: usize, mail: usize) -> VmaOutcome {
+    let (mine, theirs) = if child { (2, 0) } else { (0, 2) };
     let ps = page_size();
     let mid_prot = if child {
         libc::PROT_NONE
@@ -287,16 +364,19 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
         semantic_failures: 0,
     };
 
-    if !maps.snapshot() {
-        outcome.mismatches += 1;
-        return outcome;
-    }
-    let mut baseline: Vec<Row> = Vec::with_capacity(ROW_CAPACITY);
-    baseline.extend_from_slice(&maps.rows);
+    let shared_win = (shared, shared + SHARED_PAGES * ps);
+    // The fixture's own windows: the pre-fork region plus the current A and B
+    // (an unset window is empty). Nothing outside them is ever compared.
 
     for round in 0..rounds {
         model.clear();
-        model.extend_from_slice(&maps.rows);
+        model.push(Row {
+            start: shared_win.0,
+            end: shared_win.1,
+            perm: rw,
+            path: 0,
+        });
+        let mut win_b = (0usize, 0usize);
 
         // A: 8 pages; touch first and last; protect the middle two.
         let Some(a) = anon(0, 8 * ps, PROT_RW, false) else {
@@ -304,12 +384,21 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
             return outcome;
         };
         model_set(&mut model, a, a + 8 * ps, rw);
+        let win_a = (a, a + 8 * ps);
+        mailbox(mail, mine).store(a as u64, Ordering::Release);
         unsafe {
             (a as *mut u64).write_volatile(role_mark ^ round as u64);
             ((a + 7 * ps) as *mut u64).write_volatile(!role_mark ^ round as u64);
         }
         outcome.ops += 1;
-        check(&mut maps, &model, "map A", &mut outcome.mismatches);
+        check(
+            &mut maps,
+            &[shared_win, win_a, win_b],
+            &model,
+            &peer_windows(mail, theirs, ps),
+            "map A",
+            &mut outcome.mismatches,
+        );
 
         if unsafe { libc::mprotect((a + 3 * ps) as *mut libc::c_void, 2 * ps, mid_prot) } != 0 {
             outcome.semantic_failures += 1;
@@ -319,7 +408,9 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
         outcome.ops += 1;
         check(
             &mut maps,
+            &[shared_win, win_a, win_b],
             &model,
+            &peer_windows(mail, theirs, ps),
             "protect A middle",
             &mut outcome.mismatches,
         );
@@ -330,6 +421,8 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
             return outcome;
         };
         model_set(&mut model, b, b + 4 * ps, rw);
+        win_b = (b, b + 4 * ps);
+        mailbox(mail, mine + 1).store(b as u64, Ordering::Release);
         outcome.ops += 1;
         if unsafe { libc::munmap((b + ps) as *mut libc::c_void, 2 * ps) } != 0 {
             outcome.semantic_failures += 1;
@@ -337,7 +430,14 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
         }
         model_unmap(&mut model, b + ps, b + 3 * ps);
         outcome.ops += 1;
-        check(&mut maps, &model, "hole in B", &mut outcome.mismatches);
+        check(
+            &mut maps,
+            &[shared_win, win_a, win_b],
+            &model,
+            &peer_windows(mail, theirs, ps),
+            "hole in B",
+            &mut outcome.mismatches,
+        );
 
         // Tail of A.
         if unsafe { libc::munmap((a + 7 * ps) as *mut libc::c_void, ps) } != 0 {
@@ -346,7 +446,14 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
         }
         model_unmap(&mut model, a + 7 * ps, a + 8 * ps);
         outcome.ops += 1;
-        check(&mut maps, &model, "unmap A tail", &mut outcome.mismatches);
+        check(
+            &mut maps,
+            &[shared_win, win_a, win_b],
+            &model,
+            &peer_windows(mail, theirs, ps),
+            "unmap A tail",
+            &mut outcome.mismatches,
+        );
 
         // The pre-fork region, COW-shared with the peer: protect one page.
         let k = 1 + round % (SHARED_PAGES - 4);
@@ -359,7 +466,9 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
         outcome.ops += 1;
         check(
             &mut maps,
+            &[shared_win, win_a, win_b],
             &model,
+            &peer_windows(mail, theirs, ps),
             "protect shared page",
             &mut outcome.mismatches,
         );
@@ -390,12 +499,17 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
         outcome.ops += 1;
         check(
             &mut maps,
+            &[shared_win, win_a, win_b],
             &model,
+            &peer_windows(mail, theirs, ps),
             "restore shared page",
             &mut outcome.mismatches,
         );
 
-        // Unmap what is left and require the exact starting rows back.
+        // Unmap what is left and require the window to hold exactly the
+        // pre-fork region's starting row again.
+        mailbox(mail, mine).store(0, Ordering::Release);
+        mailbox(mail, mine + 1).store(0, Ordering::Release);
         if unsafe { libc::munmap(a as *mut libc::c_void, 7 * ps) } != 0
             || unsafe { libc::munmap(b as *mut libc::c_void, ps) } != 0
             || unsafe { libc::munmap((b + 3 * ps) as *mut libc::c_void, ps) } != 0
@@ -409,17 +523,12 @@ fn vma_worker(child: bool, rounds: usize, shared: usize) -> VmaOutcome {
         outcome.ops += 3;
         check(
             &mut maps,
+            &[shared_win, win_a, win_b],
             &model,
+            &peer_windows(mail, theirs, ps),
             "unmap remainder",
             &mut outcome.mismatches,
         );
-        if maps.rows != baseline {
-            outcome.mismatches += 1;
-            println!(
-                "delegated-root-vma round {round} did not return to baseline: {}",
-                first_difference(&baseline, &maps.rows)
-            );
-        }
     }
     outcome
 }
@@ -439,6 +548,22 @@ pub fn concurrent_vma(rounds: usize) -> i32 {
         let ptr = (shared + page * ps) as *mut u64;
         unsafe { ptr.write_volatile(SHARED_SEED | page as u64) };
     }
+    // SAFETY: a fresh MAP_SHARED anonymous page, zero-filled, shared by fork.
+    let mail = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            ps,
+            PROT_RW,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if mail == libc::MAP_FAILED {
+        println!("delegated-root-vma mailbox mmap failed");
+        return 1;
+    }
+    let mail = mail as usize;
     let mut ready = [0 as libc::c_int; 2];
     let mut go = [0 as libc::c_int; 2];
     let mut result = [0 as libc::c_int; 2];
@@ -467,7 +592,7 @@ pub fn concurrent_vma(rounds: usize) -> i32 {
         }
         return 1;
     }
-    let outcome = vma_worker(child, rounds, shared);
+    let outcome = vma_worker(child, rounds, shared, mail);
     let role = if child { "child" } else { "parent" };
     println!(
         "delegated-root-vma role={role} rounds={rounds} ops={} map_mismatches={} semantic_failures={} ok={}",
