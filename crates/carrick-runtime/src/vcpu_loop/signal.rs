@@ -3042,10 +3042,12 @@ mod guest_descriptor_lane_tests {
             for index in indexes {
                 if self.refuse_from.is_some_and(|from| self.answered >= from) {
                     let claimed = self.slots.slot(index).unwrap().claim_for_mm(mm).unwrap();
+                    // A refusal stored nothing, so no invalidation is owed.
                     claimed.complete(
                         carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
                             carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied,
                         ),
+                        || {},
                     );
                 } else {
                     el1_apply_mm(self.resolver, self.slots, index, mm).unwrap();
