@@ -91,7 +91,8 @@ pub use occupancy::{
     AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, Occupancy, SlotBusy,
 };
 pub use spaces::{
-    ADDRESS_SPACES, AddressSpaces, ExcludedEditor, GATE_CLOSED, SpaceEditor, SpaceGrant, SpaceIndex,
+    ADDRESS_SPACES, AddressSpaces, ExcludedEditor, GATE_CLOSED, JournalFull, SpaceEditor,
+    SpaceGrant, SpaceIndex, VMA_JOURNAL_ENTRIES, VmaEdit,
 };
 
 use core::cell::UnsafeCell;

@@ -48,10 +48,12 @@ pub struct DispatchMmAuthority {
 
 impl DispatchMmAuthority {
     pub(in crate::dispatch) fn new(mm_id: crate::kernel::MmId) -> Self {
+        let mem = Arc::new(mem::MemAuthority::new(mem::MemState::new()));
+        mem.bind_journal(mm_id);
         Self {
             mm_id,
             reservation_provider: Mutex::default(),
-            mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
+            mem,
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
@@ -61,10 +63,12 @@ impl DispatchMmAuthority {
     }
 
     pub(in crate::dispatch) fn fork_private(&self, mm_id: crate::kernel::MmId) -> Self {
+        let mem = self.mem.fork_private();
+        mem.bind_journal(mm_id);
         Self {
             mm_id,
             reservation_provider: Mutex::new(self.reservation_provider.lock().inherited()),
-            mem: self.mem.fork_private(),
+            mem,
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
@@ -82,6 +86,7 @@ impl DispatchMmAuthority {
     /// do not. Preserve the prepared VMA state, but mint every coordination
     /// object whose authority is defined by the exact committed MM.
     pub(in crate::dispatch) fn rebind_prepared_root(&self, mm_id: crate::kernel::MmId) -> Self {
+        self.mem.bind_journal(mm_id);
         Self {
             mm_id,
             reservation_provider: Mutex::new(self.reservation_provider.lock().inherited()),
@@ -109,6 +114,7 @@ impl DispatchMmAuthority {
         carrick_hal::ForkProjectionError,
     > {
         let (forked_mem, revision, ranges) = self.mem.fork_private_with_policy()?;
+        forked_mem.bind_journal(mm_id);
         Ok((
             Self {
                 mm_id,
