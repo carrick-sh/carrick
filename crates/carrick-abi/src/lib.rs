@@ -4973,6 +4973,16 @@ bitflags! {
         const ONFAULT = 0x01;
     }
 
+    /// `mremap(2)` flag bits. The wire word stays raw at the syscall seam;
+    /// `from_bits_retain` keeps unknown bits so the dispatcher's EINVAL
+    /// validation still sees them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxMremapFlags: u64 {
+        const MAYMOVE = LINUX_MREMAP_MAYMOVE;
+        const FIXED = LINUX_MREMAP_FIXED;
+        const DONTUNMAP = LINUX_MREMAP_DONTUNMAP;
+    }
+
     /// `mlockall(2)` flag bits. `MCL_ONFAULT` has a semantic precondition
     /// checked by the dispatcher: it must be paired with CURRENT and/or FUTURE.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
