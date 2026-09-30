@@ -86,7 +86,7 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 2;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 3;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
@@ -190,11 +190,12 @@ pub enum DescriptorOp {
     /// Retire prepared and resident private leaves, retaining outputs for the
     /// host's lease reconciliation.
     Retire(PageSpan),
-    /// Repoint one COW-armed resident private page from `old_ipa` to the
+    /// Repoint a COW-armed resident private span from `old_ipa` to the
     /// private copy at `new_ipa`, restoring the recorded write permission.
-    /// The copy itself must be complete before submission.
+    /// EL1 copies every page before publishing the span under one journal.
     CowRepoint {
         va: u64,
+        len: u64,
         old_ipa: SubstrateGpa,
         new_ipa: SubstrateGpa,
         backing: BackingIdentity,
@@ -255,7 +256,7 @@ impl DescriptorOp {
             Self::Prepare { publication, .. } => PageSpan::new(publication.va, publication.len),
             Self::Publish { span, .. } | Self::Retire(span) | Self::ForkArm { span, .. } => span,
             Self::Protect(edit) => PageSpan::new(edit.va, edit.len),
-            Self::CowRepoint { va, .. } => PageSpan::new(va, PT_PAGE),
+            Self::CowRepoint { va, len, .. } => PageSpan::new(va, len),
         }
     }
 
@@ -313,10 +314,11 @@ impl DescriptorOp {
             Self::Retire(span) => [span.va, span.len, 0, 0, 0, 0],
             Self::CowRepoint {
                 va,
+                len,
                 old_ipa,
                 new_ipa,
                 ..
-            } => [va, old_ipa.raw(), new_ipa.raw(), 0, 0, 0],
+            } => [va, old_ipa.raw(), new_ipa.raw(), len, 0, 0],
             Self::ForkArm { span, arm } => [
                 span.va,
                 span.len,
@@ -366,6 +368,7 @@ impl DescriptorOp {
             }
             Self::KIND_RETIRE => Some(Self::Retire(PageSpan::new(payload[0], payload[1]))),
             Self::KIND_COW_REPOINT => Some(Self::CowRepoint {
+                len: payload[3],
                 va: payload[0],
                 old_ipa: SubstrateGpa(payload[1]),
                 new_ipa: SubstrateGpa(payload[2]),
@@ -682,6 +685,7 @@ impl VerifiedDescriptorReceipt {
                 old_ipa,
                 new_ipa,
                 backing,
+                ..
             } => Some(VerifiedCowRepoint {
                 mm_key: self.txn.id.mm_key,
                 va,
@@ -1651,18 +1655,23 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 _ => Err(DescriptorRefusal::NotPrivateAnonymous),
             },
             DescriptorOp::CowRepoint {
-                old_ipa, new_ipa, ..
+                va,
+                old_ipa,
+                new_ipa,
+                ..
             } => {
                 if state != El1PrivateLeafState::Resident || !el1_cow(descriptor) {
                     return Err(DescriptorRefusal::NotCowArmed);
                 }
-                if descriptor & PA_MASK_4KIB != old_ipa.raw() {
+                if descriptor & PA_MASK_4KIB != old_ipa.raw() + (base - va) {
                     return Err(DescriptorRefusal::WrongBacking);
                 }
                 if descriptor & SW_EL1_MAY_WRITE == 0 || descriptor & AP_MASK == AP_PRIV_RO {
                     return Err(DescriptorRefusal::PermissionDenied);
                 }
-                Ok((descriptor & !PA_MASK_4KIB & !SW_EL1_COW & !AP_MASK) | new_ipa.raw() | AP_RW)
+                Ok((descriptor & !PA_MASK_4KIB & !SW_EL1_COW & !AP_MASK)
+                    | (new_ipa.raw() + (base - va))
+                    | AP_RW)
             }
             // Fork arming shares the host editor's terminal rule and is
             // applied in `visit_entry` before this per-op table.
@@ -1719,7 +1728,23 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
         }
         DescriptorOp::CowRepoint {
             old_ipa, new_ipa, ..
-        } => aligned(old_ipa.raw()) && aligned(new_ipa.raw()) && old_ipa != new_ipa,
+        } => {
+            aligned(old_ipa.raw())
+                && aligned(new_ipa.raw())
+                && old_ipa != new_ipa
+                && span.len <= 4 * PT_PAGE
+                // The hardware copies pages in order. Overlap could overwrite
+                // a source page before its turn, even with distinct starts.
+                && old_ipa.raw().abs_diff(new_ipa.raw()) >= span.len
+                && old_ipa
+                    .raw()
+                    .checked_add(span.len)
+                    .is_some_and(|end| end <= PA_MASK_4KIB + PT_PAGE)
+                && new_ipa
+                    .raw()
+                    .checked_add(span.len)
+                    .is_some_and(|end| end <= PA_MASK_4KIB + PT_PAGE)
+        }
     };
     if ok {
         Ok(())
@@ -1972,6 +1997,7 @@ impl CowCopyComplete {
     #[must_use]
     pub fn repoint_op(&self) -> DescriptorOp {
         DescriptorOp::CowRepoint {
+            len: PT_PAGE,
             va: self.grant.va,
             old_ipa: self.grant.old_ipa,
             new_ipa: self.grant.new_ipa,
@@ -2005,6 +2031,7 @@ pub fn copy_granted_cow_page<W: LiveDescriptorWords + ?Sized>(
         return Err(CowCopyError::BadWindow);
     }
     let op = DescriptorOp::CowRepoint {
+        len: PT_PAGE,
         va: grant.va,
         old_ipa: grant.old_ipa,
         new_ipa: grant.new_ipa,
@@ -2120,6 +2147,7 @@ mod tests {
             }),
             DescriptorOp::Retire(PageSpan::new(0x8000, 3 * PT_PAGE)),
             DescriptorOp::CowRepoint {
+                len: PT_PAGE,
                 va: 0x9000,
                 old_ipa: SubstrateGpa(0xa000),
                 new_ipa: SubstrateGpa(0xb000),
@@ -2272,6 +2300,7 @@ mod tests {
     fn cow_receipt_names_the_exact_repoint_for_the_backing_adapter() {
         let txn = DescriptorTxn {
             op: DescriptorOp::CowRepoint {
+                len: PT_PAGE,
                 va: 0x4000_3000,
                 old_ipa: SubstrateGpa(0x9b_0000_0000),
                 new_ipa: SubstrateGpa(0x9c_0000_0000),
@@ -3073,6 +3102,113 @@ mod tests {
         }
 
         #[test]
+        fn cow_repoint_commits_the_compound_under_one_journal() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(4, PageSpan::new(VA, 4 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            unsafe {
+                arm_existing_el1_fork_pages(
+                    words.words.as_ptr().cast_mut(),
+                    ROOT,
+                    words.words.len() * 8,
+                    VA,
+                    4 * PT_PAGE,
+                )
+            }
+            .unwrap();
+            let destination = 0x009d_0000_0000;
+            let op = DescriptorOp::CowRepoint {
+                va: VA,
+                len: 4 * PT_PAGE,
+                old_ipa: SubstrateGpa(IPA),
+                new_ipa: SubstrateGpa(destination),
+                backing: backing(80),
+            };
+            applied(run(&words, op, &TableGrants::NONE));
+            for index in 0..4 {
+                let descriptor = words.get(leaf_pa(VA + index * PT_PAGE));
+                assert_eq!(descriptor & PA_MASK_4KIB, destination + index * PT_PAGE);
+                assert!(!el1_cow(descriptor));
+            }
+        }
+
+        #[test]
+        fn cow_compound_failure_restores_every_original_leaf() {
+            for failed_store in 0..4 {
+                let words = fixture(3);
+                applied(run(
+                    &words,
+                    prepare(4, PageSpan::new(VA, 4 * PT_PAGE), true),
+                    &TableGrants::NONE,
+                ));
+                unsafe {
+                    arm_existing_el1_fork_pages(
+                        words.words.as_ptr().cast_mut(),
+                        ROOT,
+                        words.words.len() * 8,
+                        VA,
+                        4 * PT_PAGE,
+                    )
+                }
+                .unwrap();
+                let before = words.image();
+                words.forward_cas.set(0);
+                words.fail_cas_at.set(Some(failed_store));
+                let op = DescriptorOp::CowRepoint {
+                    va: VA,
+                    len: 4 * PT_PAGE,
+                    old_ipa: SubstrateGpa(IPA),
+                    new_ipa: SubstrateGpa(0x009d_0000_0000),
+                    backing: backing(80),
+                };
+                assert_eq!(
+                    run(&words, op, &TableGrants::NONE),
+                    DescriptorOutcome::RolledBack(DescriptorRefusal::Contended),
+                    "store {failed_store}",
+                );
+                assert_eq!(words.image(), before, "store {failed_store}");
+            }
+        }
+
+        #[test]
+        fn cow_compound_refuses_overlapping_copy_extents() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(4, PageSpan::new(VA, 4 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            unsafe {
+                arm_existing_el1_fork_pages(
+                    words.words.as_ptr().cast_mut(),
+                    ROOT,
+                    words.words.len() * 8,
+                    VA,
+                    4 * PT_PAGE,
+                )
+            }
+            .unwrap();
+            let before = words.image();
+            for new_ipa in [IPA - PT_PAGE, IPA + PT_PAGE] {
+                let op = DescriptorOp::CowRepoint {
+                    va: VA,
+                    len: 4 * PT_PAGE,
+                    old_ipa: SubstrateGpa(IPA),
+                    new_ipa: SubstrateGpa(new_ipa),
+                    backing: backing(80),
+                };
+                assert_eq!(
+                    run(&words, op, &TableGrants::NONE),
+                    DescriptorOutcome::Refused(DescriptorRefusal::BadRange),
+                );
+                assert_eq!(words.image(), before);
+            }
+        }
+
+        #[test]
         fn cow_repoint_installs_the_private_copy_and_restores_write() {
             let words = fixture(3);
             applied(run(
@@ -3081,6 +3217,7 @@ mod tests {
                 &TableGrants::NONE,
             ));
             let repoint = |old, new| DescriptorOp::CowRepoint {
+                len: PT_PAGE,
                 va: VA,
                 old_ipa: SubstrateGpa(old),
                 new_ipa: SubstrateGpa(new),

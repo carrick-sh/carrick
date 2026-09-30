@@ -2325,7 +2325,7 @@ impl HvfVmState {
 
     pub(crate) fn refresh_fork_process_state(
         &mut self,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
         self.task

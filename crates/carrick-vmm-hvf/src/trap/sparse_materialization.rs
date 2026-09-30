@@ -904,7 +904,7 @@ pub(super) fn publish(
     start: u64,
     end: u64,
     backing: SparseExtentBacking<'_>,
-    flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
 ) -> Result<PublishedSparseExtent, TrapError> {
     publish_replacing(context, start, end, backing, flush_stage1, &mut || {})
 }
@@ -916,7 +916,7 @@ pub(super) fn publish_replacing(
     start: u64,
     end: u64,
     backing: SparseExtentBacking<'_>,
-    flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     retire_previous: &mut dyn FnMut(),
 ) -> Result<PublishedSparseExtent, TrapError> {
     require_host_cow_lane(&context.state.page_tables_authority())?;
@@ -1139,7 +1139,7 @@ pub(super) fn publish_replacing(
                             )),
                         },
                         |popped| {
-                            flush_stage1()?;
+                            flush_stage1.flush()?;
                             let journal = extension_regions
                                 .iter()
                                 .filter_map(|region| {
@@ -1183,7 +1183,7 @@ pub(super) fn publish_replacing(
         },
     );
     if (replaced_valid_descriptor || context.foreign.is_some())
-        && let Err(error) = flush_stage1()
+        && let Err(error) = flush_stage1.flush()
     {
         carrick_fatal!(
             "hvpatch::sparse_materialization_tlbi",

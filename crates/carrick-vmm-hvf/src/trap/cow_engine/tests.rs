@@ -4,168 +4,6 @@
 
 use std::path::Path;
 
-fn guest_cow_fixture() -> (
-    carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-    crate::hvf_aarch64_engine::GuestCowBackingState,
-) {
-    use carrick_mmu_core::aarch64::SubstrateGpa;
-    use carrick_mmu_core::aarch64::descriptor_txn::*;
-    let nz = |n| std::num::NonZeroU64::new(n).unwrap();
-    let backing = |n| BackingIdentity {
-        frame_id: nz(n),
-        mapping_id: nz(n + 1),
-        owner_generation: nz(n + 2),
-        inventory_revision: nz(n + 3),
-    };
-    let current = crate::hvf_aarch64_engine::GuestCowBackingState {
-        mm_key: nz(7),
-        root: SubstrateGpa(0x8000),
-        va: carrick_guest_mem::GuestVa(0x4000),
-        old_ipa: SubstrateGpa(0x10000),
-        new_ipa: SubstrateGpa(0x20000),
-        old_backing: backing(10),
-        new_backing: backing(20),
-    };
-    (
-        DescriptorTxn {
-            id: DescriptorTxnId {
-                mm_key: current.mm_key,
-                generation: nz(1),
-            },
-            root: current.root,
-            op: DescriptorOp::CowRepoint {
-                va: current.va.raw(),
-                old_ipa: current.old_ipa,
-                new_ipa: current.new_ipa,
-                backing: current.new_backing,
-            },
-            tables: TableGrants::NONE,
-        },
-        current,
-    )
-}
-
-fn verified_cow_receipt(
-    txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-) -> carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt {
-    use carrick_mmu_core::aarch64::descriptor_txn::*;
-    txn.verify_receipt(&DescriptorReceipt {
-        id: txn.id,
-        digest: txn.digest(),
-        outcome: DescriptorOutcome::Applied(DescriptorApplied {
-            pages: 1,
-            resident: PageSpan::EMPTY,
-            tables_linked: 0,
-            live_stores: 1,
-            flush_required: true,
-        }),
-    })
-    .unwrap()
-}
-
-#[test]
-fn guest_cow_receipt_gate_rejects_stale_mm_root_generation_and_both_owners() {
-    use crate::hvf_aarch64_engine::{GuestCowBackingError, GuestCowBackingTransaction};
-    let (txn, expected) = guest_cow_fixture();
-    let verified = verified_cow_receipt(&txn);
-    let nz = |n| std::num::NonZeroU64::new(n).unwrap();
-    for changed in [
-        crate::hvf_aarch64_engine::GuestCowBackingState {
-            mm_key: nz(8),
-            ..expected
-        },
-        crate::hvf_aarch64_engine::GuestCowBackingState {
-            root: carrick_mmu_core::aarch64::SubstrateGpa(0x9000),
-            ..expected
-        },
-        crate::hvf_aarch64_engine::GuestCowBackingState {
-            old_backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
-                owner_generation: nz(99),
-                ..expected.old_backing
-            },
-            ..expected
-        },
-        crate::hvf_aarch64_engine::GuestCowBackingState {
-            new_backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
-                owner_generation: nz(99),
-                ..expected.new_backing
-            },
-            ..expected
-        },
-        crate::hvf_aarch64_engine::GuestCowBackingState {
-            new_backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
-                inventory_revision: nz(99),
-                ..expected.new_backing
-            },
-            ..expected
-        },
-    ] {
-        let mut pending = GuestCowBackingTransaction::new(txn, expected).unwrap();
-        let mut mm_repoints = [0, 0];
-        let mut retirements = 0;
-        assert_eq!(
-            pending.commit(&verified, changed, || {
-                mm_repoints[0] += 1;
-                retirements += 1;
-            }),
-            Err(GuestCowBackingError::StaleBacking)
-        );
-        assert_eq!((mm_repoints, retirements), ([0, 0], 0));
-        pending
-            .commit(&verified, expected, || {
-                mm_repoints[0] += 1;
-                retirements += 1;
-            })
-            .unwrap();
-        assert_eq!((mm_repoints, retirements), ([1, 0], 1));
-        assert_eq!(
-            pending.commit(&verified, expected, || retirements += 1),
-            Err(GuestCowBackingError::AlreadyCommitted)
-        );
-        assert_eq!(retirements, 1);
-    }
-    let mut other = txn;
-    other.id.generation = nz(2);
-    let mut pending = GuestCowBackingTransaction::new(txn, expected).unwrap();
-    assert_eq!(
-        pending.commit(&verified_cow_receipt(&other), expected, || panic!(
-            "stale receipt committed"
-        )),
-        Err(GuestCowBackingError::WrongReceipt)
-    );
-    other = txn;
-    other.id.mm_key = nz(8);
-    assert_eq!(
-        pending.commit(&verified_cow_receipt(&other), expected, || panic!(
-            "other MM committed"
-        )),
-        Err(GuestCowBackingError::WrongReceipt)
-    );
-}
-
-#[test]
-fn guest_cow_requires_an_applied_receipt_and_host_lane_is_unchanged() {
-    use carrick_mmu_core::aarch64::{LiveDescriptorOwner, descriptor_txn::*};
-    let (txn, _) = guest_cow_fixture();
-    for outcome in [
-        DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking),
-        DescriptorOutcome::RolledBack(DescriptorRefusal::Contended),
-    ] {
-        assert!(
-            txn.verify_receipt(&DescriptorReceipt {
-                id: txn.id,
-                digest: txn.digest(),
-                outcome
-            })
-            .is_err()
-        );
-    }
-    let authority = carrick_aarch64::Stage1Authority::new();
-    assert!(super::require_host_cow_lane(&authority).is_ok());
-    authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
-    assert!(super::require_host_cow_lane(&authority).is_err());
-}
-
 #[test]
 fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
     let parent = crate::hvf_aarch64_engine::HostCowStats::default();
@@ -182,11 +20,6 @@ fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
 #[test]
 fn guest_lane_refuses_host_cow_before_copy_or_publication() {
     for (source, entry, first_effect) in [
-        (
-            include_str!("../cow_engine.rs"),
-            "fn perform_frame_cow(",
-            "authority.quiesce()",
-        ),
         (
             include_str!("../cow_engine.rs"),
             "fn materialize_retired_reuse(",
@@ -659,4 +492,101 @@ fn alias_registry_queries_never_authenticate_frame_owners_under_the_lock() {
         "frame-owner authentication must run outside the alias registry lock:\n{}",
         offenders.join("\n")
     );
+}
+
+#[test]
+fn guest_cow_caller_requires_driving_vcpu_before_touching_backing() {
+    use super::*;
+    let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+    let mut task = HvfTaskState::neutral();
+    task.page_tables_authority()
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let mut flushed = false;
+    let error = task.perform_frame_cow(
+        &custody,
+        0x4000,
+        carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+        FrameCowTrigger {
+            class: carrick_observability::probes::HvpatchFrameCowTriggerClass::Stage1PermissionFault,
+            syndrome: 0,
+            far: 0x4000,
+            ttbr0: 0,
+        },
+        &mut || { flushed = true; Ok(()) },
+    ).unwrap_err();
+    assert!(error.to_string().contains("requires its driving vCPU"));
+    assert!(!flushed);
+    assert!(task.frame_inventory.ledger.lock().extents.is_empty());
+}
+
+#[test]
+fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
+    use super::*;
+    let _guard =
+        crate::trap::frame_inventory_backend_tests::global_frame_allocator_test_lock().lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+    let mut lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
+    let (gpa, length) = lease.key();
+    let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        length as usize,
+        crate::host_mapping::HostMappingKind::FrameCow,
+    )
+    .unwrap();
+    let host_addr = host.as_ptr() as usize;
+    assert_eq!(
+        unsafe { inventory_hv_vm_map(host.as_ptr().cast(), gpa, length as usize, 7) },
+        0
+    );
+    lease.mark_mapped();
+    let generation = register_global_frame_host_owner_in(&custody, lease, host, 7).unwrap();
+    let nz = |n| std::num::NonZeroU64::new(n).unwrap();
+    let reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+        carrick_hal::FrameInventoryProvenance::from_kernel_entropy([72; 32]),
+        carrick_hal::FrameInventoryBatch::prepare(
+            carrick_hal::KernelTransactionId::from_kernel_allocation(nz(1)),
+            carrick_hal::FrameEventCapacity::for_event_count(2).unwrap(),
+        )
+        .unwrap(),
+        vec![carrick_hal::FrameId::from_kernel_allocation(nz(1))],
+        vec![carrick_hal::MappingId::from_kernel_allocation(nz(1))],
+    );
+    let inventory = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+    let authority =
+        std::sync::Arc::new(super::super::task_only_carrier_directory_tests::TestCowAuthority);
+    let result = GuestCowPreparedBacking::prepare(
+        custody.clone(),
+        authority,
+        inventory.clone(),
+        reservation,
+        nz(7),
+        InventoryMappingStage {
+            gpa,
+            length,
+            permissions: carrick_hal::MemPerms {
+                read: true,
+                write: true,
+                exec: true,
+            },
+            backing: HvfVmState::private_backing_identity(),
+            inherited_frame: None,
+            stage2_lease: Some((gpa, length)),
+            stage2_owner: InventoryStage2OwnerIdentity {
+                host_addr,
+                generation,
+            },
+        },
+    );
+    assert!(matches!(result, Err(ref error) if error.to_string().contains("COW grant inventory")));
+    let inventory = inventory.lock();
+    assert!(inventory.extents.is_empty());
+    let frames = inventory.frames.lock();
+    assert!(frames.references.is_empty());
+    assert!(frames.extent_references.is_empty());
+    assert!(frames.stage2_references.is_empty());
+    assert_eq!(
+        global_frame_host_owner_identity_in(&custody, gpa, length),
+        None
+    );
+    assert!(!ScopedStage2MapTestStub::is_mapped(gpa, length as usize));
 }

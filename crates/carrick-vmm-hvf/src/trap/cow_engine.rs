@@ -20,6 +20,118 @@ pub(crate) fn require_host_cow_lane(
     Ok(())
 }
 
+/// A new replacement is published in the kernel inventory before EL1 may
+/// copy it, while the old mapping remains live. Only the final descriptor
+/// receipt allows this provisional grant to survive the COW transaction.
+struct GuestCowPreparedBacking {
+    authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+    inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    extent: InventoryExtent,
+    receipt: carrick_hal::FrameInventoryApplyReceipt,
+    owner: Option<GlobalFrameOwnerRollback>,
+    armed: bool,
+}
+impl GuestCowPreparedBacking {
+    fn prepare(
+        custody: std::sync::Arc<CarrierVmCustody>,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        mut reservation: carrick_hal::FrameInventoryReservation,
+        mm: std::num::NonZeroU64,
+        stage: InventoryMappingStage,
+    ) -> Result<Self, TrapError> {
+        let mut owner = GlobalFrameOwnerRollback::new(custody.clone());
+        owner.record((stage.gpa, stage.length));
+        let length = carrick_hal::FrameLength::from_mapping_extent(
+            std::num::NonZeroU64::new(stage.length)
+                .ok_or_else(|| TrapError::Hypervisor("empty COW backing".to_owned()))?,
+        );
+        let extent =
+            HvfVmState::stage_mapping_in(&custody, &mut inventory.lock(), &mut reservation, stage)?;
+        let commit = reservation.commit(());
+        let challenge = commit.receipt_challenge();
+        let (receipt, generation) = match authority.apply_frame_grant(
+            commit,
+            extent.mapping,
+            extent.frame,
+            carrick_guest_mem::Gpa(stage.gpa),
+            length,
+        ) {
+            Ok(applied) => applied,
+            Err(error) => {
+                HvfVmState::rollback_unpublished_mappings(
+                    &mut inventory.lock(),
+                    &[((stage.gpa, stage.length), extent)],
+                )
+                .unwrap_or_else(|rollback| {
+                    carrick_fatal!("hvpatch::cow", "COW grant rollback: {rollback}")
+                });
+                return Err(TrapError::Hypervisor(format!(
+                    "COW grant inventory: {error}"
+                )));
+            }
+        };
+        let prepared = Self {
+            authority,
+            inventory,
+            extent,
+            receipt,
+            owner: Some(owner),
+            armed: true,
+        };
+        if !challenge.authenticate_apply(&prepared.receipt, mm)
+            || !prepared.receipt.authorizes(extent.mapping, extent.frame)
+            || generation.raw_for_probe() != extent.stage2_owner.generation
+        {
+            return Err(TrapError::Hypervisor(
+                "COW grant identity mismatch".to_owned(),
+            ));
+        }
+        Ok(prepared)
+    }
+    fn backing(
+        &self,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity, TrapError> {
+        let nonzero = |value| {
+            std::num::NonZeroU64::new(value)
+                .ok_or_else(|| TrapError::Hypervisor("COW grant has a zero identity".to_owned()))
+        };
+        Ok(carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+            frame_id: nonzero(self.extent.frame.raw())?,
+            mapping_id: nonzero(self.extent.mapping.raw())?,
+            owner_generation: nonzero(self.extent.stage2_owner.generation)?,
+            inventory_revision: nonzero(self.receipt.revision())?,
+        })
+    }
+    fn commit(&mut self) {
+        self.armed = false;
+        if let Some(owner) = self.owner.take() {
+            owner.commit();
+        }
+    }
+}
+impl Drop for GuestCowPreparedBacking {
+    fn drop(&mut self) {
+        if self.armed {
+            self.authority
+                .rollback_frame_grant(&self.receipt)
+                .unwrap_or_else(|error| {
+                    carrick_fatal!("hvpatch::cow", "kernel COW grant rollback: {error}")
+                });
+            HvfVmState::rollback_unpublished_mappings(
+                &mut self.inventory.lock(),
+                &[(
+                    (self.extent.stage2_base, self.extent.stage2_length),
+                    self.extent,
+                )],
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal!("hvpatch::cow", "backend COW grant rollback: {error}")
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AliasRetirementAuthorityState {
     Pending,
@@ -534,7 +646,7 @@ impl HvfVmState {
         &mut self,
         va: u64,
         len: usize,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         let Some(started) = carrick_observability::probes::hvpatch_mapping_index_begin(
             self.mappings.live_len() as u64,
@@ -573,7 +685,7 @@ impl HvfVmState {
         &mut self,
         va: u64,
         len: usize,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
         if !self.persistent_vm_lifecycle || len == 0 {
@@ -815,7 +927,7 @@ impl HvfVmState {
         fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
         source: carrick_guest_mem::PrivateFileSource,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<bool, TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
         if !self.persistent_vm_lifecycle || len == 0 {
@@ -929,7 +1041,7 @@ impl HvfVmState {
         start: u64,
         end: u64,
         backing: SparseExtentBacking<'_>,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
         receipt_range: Option<std::ops::Range<u64>>,
     ) -> Result<u64, TrapError> {
         self.materialize_sparse_mmap_extent_inner(
@@ -1087,7 +1199,7 @@ impl HvfVmState {
         start: u64,
         end: u64,
         backing: SparseExtentBacking<'_>,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
         receipt_range: Option<std::ops::Range<u64>>,
         replacing: bool,
     ) -> Result<u64, TrapError> {
@@ -1408,7 +1520,7 @@ impl HvfVmState {
         &mut self,
         va: u64,
         requested_end: u64,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<Option<u64>, TrapError> {
         require_host_cow_lane(&self.page_tables_authority())?;
         const PAGE_SIZE: u64 = 4 * 1024;
@@ -1697,7 +1809,7 @@ impl HvfVmState {
                     Ok::<(), ()>(())
                 },
             );
-            if let Err(flush_error) = flush_stage1() {
+            if let Err(flush_error) = flush_stage1.flush() {
                 carrick_fatal!(
                     "hvpatch::mm_authority",
                     "retained reuse rollback TLBI failed: {flush_error}"
@@ -1717,7 +1829,7 @@ impl HvfVmState {
                 Ok::<(), ()>(())
             },
         );
-        if let Err(error) = flush_stage1() {
+        if let Err(error) = flush_stage1.flush() {
             carrick_fatal!(
                 "hvpatch::mm_authority",
                 "retained reuse stage-1 TLBI failed: {error}"
@@ -2231,9 +2343,15 @@ impl HvfTaskState {
         fault_va: u64,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
         trigger: FrameCowTrigger,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<bool, TrapError> {
-        require_host_cow_lane(&self.page_tables_authority())?;
+        let guest_lane = self.page_tables_authority().live_descriptor_owner()
+            == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
+        if guest_lane && !flush_stage1.guest_publication_available() {
+            return Err(TrapError::Hypervisor(
+                "guest COW requires its driving vCPU".to_owned(),
+            ));
+        }
         let identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch frame COW has no bound mm identity".to_owned())
         })?;
@@ -2298,7 +2416,7 @@ impl HvfTaskState {
                     // the current private mapping: a sibling won this COW while
                     // this vCPU was parking. Flush the losing vCPU's stale RO
                     // translation and retry the faulting instruction.
-                    flush_stage1()?;
+                    flush_stage1.flush()?;
                     return Ok(true);
                 }
                 UnarmedPermissionFaultRoute::MissingArm => {
@@ -2384,6 +2502,7 @@ impl HvfTaskState {
         })?;
         let old_host = old_source.host_addr();
         let old_physical_ipa = old_source.physical_ipa();
+        let mut old_source = Some(old_source);
         // The semantic span sits at `old_offset` WITHIN its 16 KiB compound.
         // The COW replacement must preserve that intra-compound offset: the
         // 2026-08-23 wedge2 change flattened `new_ipa`/`semantic_host` to the
@@ -2492,6 +2611,19 @@ impl HvfTaskState {
             }
             shape?
         };
+        if guest_lane
+            && (span.kernel_only
+                || !source_guest_writable
+                || intent != carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
+                || matches!(
+                    old_inventory_extent.backing,
+                    InventoryBackingIdentity::PrivateFileView(_)
+                ))
+        {
+            return Err(TrapError::Hypervisor(
+                "guest COW writer shape is not yet converted".to_owned(),
+            ));
+        }
         let old_frame = old_inventory_extent.frame;
         // Resolve every authority needed for stage-1 publication before the
         // first physical/staged-inventory mutation.  A fork-time response can
@@ -2564,6 +2696,13 @@ impl HvfTaskState {
             .map_err(|error| {
                 TrapError::Hypervisor(format!("reserve frame COW inventory: {error}"))
             })?;
+        let guest_reservation = if guest_lane {
+            Some(authority.reserve(1, 1, 2).map_err(|error| {
+                TrapError::Hypervisor(format!("reserve guest COW grant: {error}"))
+            })?)
+        } else {
+            None
+        };
         let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
         let pooled = if fresh_destination {
             custody.frame_pool().and_then(|p| p.allocate_compound())
@@ -2574,23 +2713,27 @@ impl HvfTaskState {
             if let Some((destination, extent)) = &reused_destination {
                 // No published alias names this lane. Only the newly touched Linux
                 // page is refreshed; previously written neighbors are never copied.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        old_host.add(old_offset as usize),
-                        destination.host_addr().add(old_offset as usize),
-                        span.len,
-                    );
-                    crate::probes::hvpatch_frame_cow_copy(
-                        old_frame.raw(),
-                        old_ipa,
-                        std::slice::from_raw_parts(old_host.add(old_offset as usize), span.len),
-                        std::slice::from_raw_parts(
+                if !guest_lane {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            old_host.add(old_offset as usize),
                             destination.host_addr().add(old_offset as usize),
                             span.len,
-                        ),
-                    );
+                        );
+                        crate::probes::hvpatch_frame_cow_copy(
+                            old_frame.raw(),
+                            old_ipa,
+                            std::slice::from_raw_parts(old_host.add(old_offset as usize), span.len),
+                            std::slice::from_raw_parts(
+                                destination.host_addr().add(old_offset as usize),
+                                span.len,
+                            ),
+                        );
+                    }
                 }
-                drop(old_source);
+                if !guest_lane {
+                    drop(old_source.take());
+                }
                 (
                     destination.host_addr(),
                     destination.physical_ipa(),
@@ -2600,32 +2743,36 @@ impl HvfTaskState {
                 let host_ptr = handle.as_mut_ptr();
                 let physical_ipa = handle.ipa();
                 carrick_observability::probes::hvpatch_frame_pool_hit(0, physical_ipa);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        old_host,
-                        host_ptr,
-                        CowArmedRanges::COMPOUND_SIZE as usize,
+                if !guest_lane {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            old_host,
+                            host_ptr,
+                            CowArmedRanges::COMPOUND_SIZE as usize,
+                        );
+                    }
+                    let source = unsafe {
+                        std::slice::from_raw_parts(
+                            old_host.cast_const(),
+                            CowArmedRanges::COMPOUND_SIZE as usize,
+                        )
+                    };
+                    let destination = unsafe {
+                        std::slice::from_raw_parts(
+                            host_ptr.cast_const(),
+                            CowArmedRanges::COMPOUND_SIZE as usize,
+                        )
+                    };
+                    crate::probes::hvpatch_frame_cow_copy(
+                        old_frame.raw(),
+                        old_physical_ipa,
+                        source,
+                        destination,
                     );
                 }
-                let source = unsafe {
-                    std::slice::from_raw_parts(
-                        old_host.cast_const(),
-                        CowArmedRanges::COMPOUND_SIZE as usize,
-                    )
-                };
-                let destination = unsafe {
-                    std::slice::from_raw_parts(
-                        host_ptr.cast_const(),
-                        CowArmedRanges::COMPOUND_SIZE as usize,
-                    )
-                };
-                crate::probes::hvpatch_frame_cow_copy(
-                    old_frame.raw(),
-                    old_physical_ipa,
-                    source,
-                    destination,
-                );
-                drop(old_source);
+                if !guest_lane {
+                    drop(old_source.take());
+                }
                 let owner_generation = register_pooled_global_frame_host_owner_in(
                     custody,
                     handle,
@@ -2642,32 +2789,36 @@ impl HvfTaskState {
                     TrapError::Hypervisor(format!("allocate frame COW backing: {error}"))
                 })?;
                 let new_host_ptr = new_host.as_ptr();
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        old_host,
-                        new_host_ptr,
-                        CowArmedRanges::COMPOUND_SIZE as usize,
+                if !guest_lane {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            old_host,
+                            new_host_ptr,
+                            CowArmedRanges::COMPOUND_SIZE as usize,
+                        );
+                    }
+                    let source = unsafe {
+                        std::slice::from_raw_parts(
+                            old_host.cast_const(),
+                            CowArmedRanges::COMPOUND_SIZE as usize,
+                        )
+                    };
+                    let destination = unsafe {
+                        std::slice::from_raw_parts(
+                            new_host_ptr.cast_const(),
+                            CowArmedRanges::COMPOUND_SIZE as usize,
+                        )
+                    };
+                    crate::probes::hvpatch_frame_cow_copy(
+                        old_frame.raw(),
+                        old_physical_ipa,
+                        source,
+                        destination,
                     );
                 }
-                let source = unsafe {
-                    std::slice::from_raw_parts(
-                        old_host.cast_const(),
-                        CowArmedRanges::COMPOUND_SIZE as usize,
-                    )
-                };
-                let destination = unsafe {
-                    std::slice::from_raw_parts(
-                        new_host_ptr.cast_const(),
-                        CowArmedRanges::COMPOUND_SIZE as usize,
-                    )
-                };
-                crate::probes::hvpatch_frame_cow_copy(
-                    old_frame.raw(),
-                    old_physical_ipa,
-                    source,
-                    destination,
-                );
-                drop(old_source);
+                if !guest_lane {
+                    drop(old_source.take());
+                }
                 let mut new_lease = GlobalFrameStage2Lease::reserve(
                     CowArmedRanges::COMPOUND_SIZE,
                     CowArmedRanges::COMPOUND_SIZE,
@@ -2702,6 +2853,34 @@ impl HvfTaskState {
         let backing = reused_extent.map_or_else(HvfVmState::private_backing_identity, |extent| {
             extent.backing
         });
+        let mut guest_backing = if let Some(reservation) = guest_reservation {
+            Some(GuestCowPreparedBacking::prepare(
+                custody.clone(),
+                authority.clone(),
+                self.frame_inventory.ledger.clone(),
+                reservation,
+                std::num::NonZeroU64::new(identity.mm)
+                    .ok_or_else(|| TrapError::Hypervisor("zero COW MM".to_owned()))?,
+                InventoryMappingStage {
+                    gpa: new_physical_ipa,
+                    length: CowArmedRanges::COMPOUND_SIZE,
+                    permissions: carrick_hal::MemPerms {
+                        read: true,
+                        write: true,
+                        exec: true,
+                    },
+                    backing,
+                    inherited_frame: None,
+                    stage2_lease: Some((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: new_host_ptr as usize,
+                        generation: owner_generation,
+                    },
+                },
+            )?)
+        } else {
+            None
+        };
         let split = match HvfVmState::stage_cow_inventory_split(
             &mut reservation,
             old_inventory_key,
@@ -2709,7 +2888,10 @@ impl HvfTaskState {
             &fragment_shapes,
             retirement,
             CowInventoryReplacementStage {
-                existing: reused_extent,
+                existing: guest_backing
+                    .as_ref()
+                    .map(|grant| grant.extent)
+                    .or(reused_extent),
                 gpa: new_physical_ipa,
                 backing,
                 stage2_owner: InventoryStage2OwnerIdentity {
@@ -2720,7 +2902,7 @@ impl HvfTaskState {
         ) {
             Ok(split) => split,
             Err(error) => {
-                if fresh_destination {
+                if fresh_destination && !guest_lane {
                     let _ = retire_global_frame_host_owner_in(
                         custody,
                         new_physical_ipa,
@@ -2772,7 +2954,38 @@ impl HvfTaskState {
         // Journal this transaction's descriptor pre-images rather than
         // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let mut preserved_protection_receipt = None;
-        let page_table_result = {
+        let page_table_result = if let Some(grant) = guest_backing.as_ref() {
+            (|| -> Result<(), TrapError> {
+                let tables = self.page_tables_authority();
+                let txn = tables
+                    .prepare_guest_descriptor_txn(
+                        grant.receipt.mm(),
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
+                            va: span.va,
+                            len: span.len as u64,
+                            old_ipa: carrick_mmu_core::aarch64::SubstrateGpa(old_ipa),
+                            new_ipa: carrick_mmu_core::aarch64::SubstrateGpa(new_ipa),
+                            backing: grant.backing()?,
+                        },
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("prepare guest COW compound: {error:?}"))
+                    })?;
+                let verified = flush_stage1.publish(&txn).unwrap_or_else(|error| {
+                    carrick_fatal!(
+                        "hvpatch::cow",
+                        "guest COW publication lacks a verified completion: {error}"
+                    );
+                });
+                if *verified.txn() != txn || verified.cow_repoint().is_none() {
+                    carrick_fatal!(
+                        "hvpatch::cow",
+                        "guest COW receipt names another transaction"
+                    );
+                }
+                Ok(())
+            })()
+        } else {
             const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
             const AP_MASK: u64 = 0b11 << 6;
             const AP_USER_RW: u64 = 0b01 << 6;
@@ -2924,26 +3137,28 @@ impl HvfTaskState {
                 )
         };
         if let Err(error) = page_table_result {
-            let _ = self.page_tables_authority().edit(
-                || Err(()),
-                |manager| {
-                    let manager_base = manager.base();
-                    let page_table_resolver =
-                        self.page_table_resolver(manager_base, Some(page_table_host));
-                    // SAFETY: the COW quiesce and topology guards remain held;
-                    // no vCPU can walk or edit this mm while the journalled
-                    // pre-images are replayed into its live backing.
-                    let _ = unsafe { manager.rollback_undo(page_table_resolver) };
-                    Ok::<(), ()>(())
-                },
-            );
-            if let Err(flush_error) = flush_stage1() {
-                carrick_fatal!(
-                    "hvpatch::mm_authority",
-                    "HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
+            if !guest_lane {
+                let _ = self.page_tables_authority().edit(
+                    || Err(()),
+                    |manager| {
+                        let manager_base = manager.base();
+                        let page_table_resolver =
+                            self.page_table_resolver(manager_base, Some(page_table_host));
+                        // SAFETY: the COW quiesce and topology guards remain held;
+                        // no vCPU can walk or edit this mm while the journalled
+                        // pre-images are replayed into its live backing.
+                        let _ = unsafe { manager.rollback_undo(page_table_resolver) };
+                        Ok::<(), ()>(())
+                    },
                 );
+                if let Err(flush_error) = flush_stage1.flush() {
+                    carrick_fatal!(
+                        "hvpatch::mm_authority",
+                        "HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
+                    );
+                }
             }
-            if fresh_destination {
+            if fresh_destination && !guest_lane {
                 let _ = retire_global_frame_host_owner_in(
                     custody,
                     new_physical_ipa,
@@ -2953,18 +3168,24 @@ impl HvfTaskState {
             return Err(error);
         }
         // Publication succeeded: the journalled pre-images are no longer needed.
-        let _ = self.page_tables_authority().edit(
-            || Err(()),
-            |manager| {
-                manager.commit_undo();
-                Ok::<(), ()>(())
-            },
-        );
-        if let Err(error) = flush_stage1() {
-            carrick_fatal!(
-                "hvpatch::mm_authority",
-                "HVPatch COW stage-1 TLBI failed: {error}"
+        if !guest_lane {
+            let _ = self.page_tables_authority().edit(
+                || Err(()),
+                |manager| {
+                    manager.commit_undo();
+                    Ok::<(), ()>(())
+                },
             );
+            if let Err(error) = flush_stage1.flush() {
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "HVPatch COW stage-1 TLBI failed: {error}"
+                );
+            }
+        }
+        drop(old_source.take());
+        if let Some(grant) = guest_backing.as_mut() {
+            grant.commit();
         }
         emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Stage1Published);
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
@@ -3206,14 +3427,16 @@ impl HvfTaskState {
             );
         }
         self.cow_armed.lock().disarm(span);
-        self.mm_access.host_cow_stats.record_host_cow_resolution();
+        if !guest_lane {
+            self.mm_access.host_cow_stats.record_host_cow_resolution();
+        }
         Ok(true)
     }
 
     pub(crate) fn refresh_fork_process_state_in(
         &mut self,
         custody: &std::sync::Arc<CarrierVmCustody>,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         let generation_address =
             crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64;
@@ -3403,7 +3626,7 @@ impl HvfVmState {
         syndrome: u64,
         far: u64,
         ttbr0: u64,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
         if is_stage1_cow_write_fault(syndrome) {
             let fault_va = strip_pointer_tag(far);
@@ -3443,7 +3666,7 @@ impl HvfVmState {
         va: u64,
         len: usize,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         if intent != carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
             || !carrick_observability::probes::hvpatch_mm_maintenance_begin(
@@ -3506,7 +3729,7 @@ impl HvfVmState {
         va: u64,
         len: usize,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
-        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         if len == 0 {
             return Ok(());

@@ -36,32 +36,9 @@ impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
         &mut self,
         frame: carrick_el1_abi::TrapFrame,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
-        let unavailable = |what: &str| TrapError::Hypervisor(format!("guest drain call: {what}"));
-        let region = carrick_el1_abi::get_el1_region_host_ptr();
-        if region == 0 {
-            return Err(unavailable("no EL1 region"));
-        }
-        let offset = carrick_el1_abi::descriptor_drain_frame_offset(frame.slot as usize)
-            .ok_or_else(|| unavailable("slot out of range"))?;
-        // SAFETY: the EL1 region owner keeps the region alive while it is
-        // installed; the header is its first 32 bytes.
-        let header = carrick_el1_abi::ImageHeader::read_from_prefix(unsafe {
-            std::slice::from_raw_parts(
-                region as *const u8,
-                std::mem::size_of::<carrick_el1_abi::ImageHeader>(),
-            )
+        run_drain_call(frame, |entry, frame_va| {
+            self.0.run_el1_service_call(entry, frame_va)
         })
-        .ok_or_else(|| unavailable("no EL1 image header"))?;
-        let host_frame = (region + offset as usize) as *mut carrick_el1_abi::TrapFrame;
-        // SAFETY: the offset lies in this vCPU slot's own EL1 stack, below the
-        // vector's trap frame, 16-aligned; this host thread owns the vCPU.
-        unsafe { host_frame.write_volatile(frame) };
-        self.0.run_el1_service_call(
-            carrick_el1_abi::EL1_REGION_BASE + header.entry_offset,
-            carrick_el1_abi::EL1_REGION_BASE + offset,
-        )?;
-        // SAFETY: as above; EL1 answered in place before `hvc #1`.
-        Ok(unsafe { host_frame.read_volatile() })
     }
 
     fn settle(
@@ -153,4 +130,37 @@ pub fn publish_copyout<V: GuestDrainVenue>(
     receipts
         .pop()
         .ok_or_else(|| TrapError::Hypervisor("guest copyout has no verified receipt".to_owned()))
+}
+
+/// Run the shared descriptor service using an already borrowed driving vCPU.
+pub(crate) fn run_drain_call(
+    frame: carrick_el1_abi::TrapFrame,
+    mut run: impl FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+    let unavailable = |what: &str| TrapError::Hypervisor(format!("guest drain call: {what}"));
+    let region = carrick_el1_abi::get_el1_region_host_ptr();
+    if region == 0 {
+        return Err(unavailable("no EL1 region"));
+    }
+    let offset = carrick_el1_abi::descriptor_drain_frame_offset(frame.slot as usize)
+        .ok_or_else(|| unavailable("slot out of range"))?;
+    // SAFETY: the EL1 region owner keeps the region alive while it is
+    // installed; the header is its first 32 bytes.
+    let header = carrick_el1_abi::ImageHeader::read_from_prefix(unsafe {
+        std::slice::from_raw_parts(
+            region as *const u8,
+            std::mem::size_of::<carrick_el1_abi::ImageHeader>(),
+        )
+    })
+    .ok_or_else(|| unavailable("no EL1 image header"))?;
+    let host_frame = (region + offset as usize) as *mut carrick_el1_abi::TrapFrame;
+    // SAFETY: the offset lies in this vCPU slot's own EL1 stack, below the
+    // vector's trap frame, 16-aligned; this host thread owns the vCPU.
+    unsafe { host_frame.write_volatile(frame) };
+    run(
+        carrick_el1_abi::EL1_REGION_BASE + header.entry_offset,
+        carrick_el1_abi::EL1_REGION_BASE + offset,
+    )?;
+    // SAFETY: as above; EL1 answered in place before `hvc #1`.
+    Ok(unsafe { host_frame.read_volatile() })
 }
