@@ -130,6 +130,14 @@ impl Default for DescriptorTxnSlots {
 pub const EL1_DESCRIPTOR_TXN_OFFSET: u64 = EL1_COUNTERS_OFFSET + 0x8_0000;
 pub const EL1_DESCRIPTOR_TXN_BASE: u64 = EL1_REGION_BASE + EL1_DESCRIPTOR_TXN_OFFSET;
 
+/// Two temporary kernel-only aliases for one exact-MM COW copy. The MM's
+/// single editor owns both slots; they are invalid outside that copy. These
+/// are virtual aliases, not another frame pool or persistent backing owner.
+pub const EL1_COW_COPY_OFFSET: u64 = 0x1A_0000;
+pub const EL1_COW_COPY_BASE: u64 = EL1_REGION_BASE + EL1_COW_COPY_OFFSET;
+pub const EL1_COW_COPY_SIZE: u64 = 2 * 4096;
+const _: () = assert!(EL1_COW_COPY_OFFSET + EL1_COW_COPY_SIZE <= crate::EL1_STACKS_OFFSET);
+
 const _: () = assert!(core::mem::size_of::<Counters>() as u64 <= 0x8_0000);
 const _: () = assert!(
     EL1_DESCRIPTOR_TXN_OFFSET.is_multiple_of(core::mem::align_of::<DescriptorTxnSlots>() as u64)
@@ -147,7 +155,9 @@ const _: () = assert!(
 );
 
 /// Layout facts folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const DESCRIPTOR_TXN_LAYOUT_FACTS: [u64; 6] = [
+pub const DESCRIPTOR_TXN_LAYOUT_FACTS: [u64; 8] = [
+    EL1_COW_COPY_OFFSET,
+    EL1_COW_COPY_SIZE,
     EL1_DESCRIPTOR_TXN_OFFSET,
     DESCRIPTOR_TXN_PROTOCOL_VERSION,
     core::mem::size_of::<DescriptorTxnSlot>() as u64,

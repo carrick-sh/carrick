@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mem-ee882e3fc121b6de)
+
+running 1 test
+test memory::el1_shim_tests::el1_cow_copy_slots_are_invalid_kernel_leaves_in_each_process_root ... FAILED
+
+failures:
+
+---- memory::el1_shim_tests::el1_cow_copy_slots_are_invalid_kernel_leaves_in_each_process_root stdout ----
+
+thread 'memory::el1_shim_tests::el1_cow_copy_slots_are_invalid_kernel_leaves_in_each_process_root' (34626734) panicked at crates/carrick-mem/src/memory.rs:8367:13:
+assertion `left != right` failed: copy slots need preallocated page leaves
+  left: 1
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    memory::el1_shim_tests::el1_cow_copy_slots_are_invalid_kernel_leaves_in_each_process_root
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 175 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-mem --lib`

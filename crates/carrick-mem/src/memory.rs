@@ -3590,7 +3590,31 @@ pub fn stage1_hvpatch_page_tables() -> Vec<u8> {
     let mut bytes = stage1_identity_page_tables();
     let mut visited = vec![false; bytes.len() / TABLE_BYTES];
     scope_table(&mut bytes, 0, 0, &mut visited);
-    bytes
+    // Reserve the COW aliases before the root becomes live. Splitting this
+    // one kernel block here means EL1 can map a granted source/replacement
+    // without allocating tables while it owns the exact-MM editor. The
+    // aliases have no live translation outside that bounded copy operation.
+    let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
+        bytes,
+        LINUX_PAGE_TABLES_BASE,
+        AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    if let Err(error) = manager.set_prot_none(
+        carrick_el1_abi::EL1_COW_COPY_BASE,
+        carrick_el1_abi::EL1_COW_COPY_SIZE as usize,
+        None,
+    ) {
+        carrick_fatal!(
+            "mem::stage1_tables",
+            "reserve EL1 COW copy aliases: {error:?}"
+        );
+    }
+    manager.into_bytes().unwrap_or_else(|error| {
+        carrick_fatal!(
+            "mem::stage1_tables",
+            "serialize EL1 COW copy aliases: {error:?}"
+        );
+    })
 }
 
 /// Build the carrier-owned stage-1 translation root for scoped EL1 maintenance
@@ -8353,6 +8377,33 @@ mod el1_shim_tests {
             "identity page is per-process (private snapshot on fork)"
         );
         assert_eq!(region.bytes().len(), LINUX_IDENTITY_PAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn el1_cow_copy_slots_are_invalid_kernel_leaves_in_each_process_root() {
+        let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let base = carrick_el1_abi::EL1_COW_COPY_BASE;
+        for address in [base, base + 4096] {
+            let walk = manager.debug_walk(address);
+            assert_ne!(walk[2] & 3, 1, "copy slots need preallocated page leaves");
+            assert_eq!(walk[3] & 1, 0, "idle copy slots must not translate");
+            assert_eq!(
+                walk[3] & (3 << 6),
+                0,
+                "EL0 must never access the copy aliases"
+            );
+            assert_eq!(walk[3] & 0x0000_FFFF_FFFF_F000, address);
+        }
+        assert!(manager.translate(base - 4096).is_some());
+        assert!(
+            manager
+                .translate(base + carrick_el1_abi::EL1_COW_COPY_SIZE)
+                .is_some()
+        );
     }
 
     #[test]

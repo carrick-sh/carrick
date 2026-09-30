@@ -222,8 +222,8 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
         ttbr0: u64,
     ) -> Option<DescriptorReceipt> {
         use carrick_mmu_core::aarch64::descriptor_txn::{
-            InlineJournal, PrimaryTableWords, apply_submitted_descriptor_txn,
-            outcome_requires_invalidation,
+            DescriptorOp, InlineJournal, PrimaryTableWords, execute_descriptor_txn,
+            outcome_requires_invalidation, plan_descriptor_op,
         };
         let maintenance = El1TableMaintenance { ttbr0 };
         let words = unsafe {
@@ -236,13 +236,49 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
         }
         .ok()?;
         let mut journal = InlineJournal::new();
-        let receipt = apply_submitted_descriptor_txn(
-            slot,
-            mm_key,
-            &words,
-            carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
-            &mut journal,
-        )?;
+        let root = carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK);
+        let claimed = slot.claim_for_mm(mm_key)?;
+        let outcome = match claimed.txn() {
+            Err(refusal) => DescriptorOutcome::Refused(refusal),
+            Ok(txn) if txn.root != root => DescriptorOutcome::Refused(
+                carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot,
+            ),
+            Ok(txn) => {
+                // COW's bytes and live repoint are one guest operation under
+                // the caller's exact-MM editor. Host custody retains both
+                // backing owners until this transaction's receipt settles.
+                let copied = if let DescriptorOp::CowRepoint {
+                    old_ipa, new_ipa, ..
+                } = txn.op
+                {
+                    plan_descriptor_op(&words, root, txn.op)
+                        .map_err(DescriptorOutcome::Refused)
+                        .and_then(|_| {
+                            carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_copy_aliases(
+                                &words, root, carrick_el1_abi::EL1_COW_COPY_BASE,
+                                old_ipa, new_ipa, |source, destination| {
+                                    // SAFETY: the aliases expose exactly the pinned
+                                    // distinct source/destination pages, source RO,
+                                    // destination RW, both kernel-only. They are
+                                    // revoked before the copy result escapes.
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            source as *const u8, destination as *mut u8, 4096,
+                                        );
+                                    }
+                                },
+                            )
+                        })
+                } else {
+                    Ok(())
+                };
+                match copied {
+                    Ok(()) => execute_descriptor_txn(&words, root, txn, &mut journal).outcome,
+                    Err(outcome) => outcome,
+                }
+            }
+        };
+        let receipt = claimed.complete(outcome);
         if let DescriptorOutcome::Indeterminate(refusal) = receipt.outcome {
             panic!("EL1 descriptor transaction rollback failed: {refusal:?}");
         }
