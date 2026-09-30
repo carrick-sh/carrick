@@ -79,14 +79,31 @@ MM/page/read receipts preserve arming. See adapter memory-integration
 `copyout.md` and raw logs. Production admission remains disabled; no signed
 activation or checkpoint acceptance is claimed. Do not restart this slice.
 
-**Next implementation:** connect `HvfVmState::perform_frame_cow` to retained
-replacement backing, an actual EL1 copy window, descriptor repoint and inventory
-commit. Existing `GuestCowContinuation`/`GuestCowBackingTransaction` are helpers,
-not a connected transport. Continue private/shared repoints, replacement grants,
-retired reuse, engine protection/alias/discard and exec writers; source review
-is recorded in `copyout.md`, not yet a complete writer census. Preserve file and
-shared mappings. Join reservation policy/lifecycle before activation. No broad
-signed boot campaign between these prerequisite conversions.
+**Guest copy transport prerequisite:** adapter `9b0047959` now reserves two
+invalid kernel-only aliases at EL1 offsets `[0x1A0000,0x1A2000)` and the hardware
+descriptor handler uses them to copy a page before CowRepoint. Both aliases are
+revoked before completion; failed revocation is fatal. This reuses the descriptor
+submission/receipt channel. Boot-layout red/green, revocation mutation control,
+four window tests (including two roots), EL1/ABI/memory/MMU suites, affected
+Clippy and hardware EL1 image build pass. See adapter `cow-window.md`. No signed
+COW execution or production host submission is claimed.
+
+**Next implementation:** connect `HvfVmState::perform_frame_cow` allocation and
+staged inventory to that guest descriptor service, retaining both exact owners
+until completion. Preserve 16 KiB physical-compound versus 4 KiB semantic-fragment
+rules, private-file lane reuse and protection. Do not create an unsafe partial
+commit by replacing a compound transaction with unrelated per-page commits.
+Retire superseded host copying and unused guest-copy orchestration as joined.
+Then convert private/shared repoints, replacement grants, retired reuse, engine
+protection/alias/discard and exec writers; join reservation policy/lifecycle.
+No more window scaffolding or broad boot campaigns are the next action.
+
+**Dependency review after two prerequisite intervals:** copyout and the guest
+copy transport remove concrete missing operations but have not activated the
+lane. Continue only the real backing transaction next; extra helper tests,
+accounting or documentation cannot substitute for that integration. This is a
+bounded reason to finish the existing dependency, not a reset of the impact
+counter. Full acceptance and all later ARM64 stages remain required.
 
 **Priority rules:** before each implementation task, name the production caller,
 the authority or host operation being replaced, and the decisive observable
@@ -106,7 +123,7 @@ resume their investigation only for a new discriminating test or a concrete
 dependency. No new broad capture campaign. x86 remains deferred.
 
 Current accepted base remains local main `f304f8415`; development integration is
-adapter `a5ca5ed03` (clean). No checkpoint has been accepted by this work.
+adapter `9b0047959` (clean). No checkpoint has been accepted by this work.
 
 ## Historical state and evidence rules
 
