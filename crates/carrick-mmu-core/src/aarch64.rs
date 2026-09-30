@@ -4473,6 +4473,17 @@ impl PageTableManager {
         rule: TerminalRule,
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
+        // A teardown is the only thing that can empty a sub-table, so this is
+        // where the reclaim sweep becomes worth re-running.
+        if matches!(
+            rule,
+            TerminalRule::Pt {
+                op: Some(PtOp::Invalidate | PtOp::Retire),
+                ..
+            }
+        ) {
+            self.reclaim_pending = true;
+        }
         let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
         let mut cur = va;
         let mut changed = false;
@@ -4588,12 +4599,15 @@ impl PageTableManager {
     /// only the predecessor's frame lease; neither their output nor their EL1
     /// permission tags may become authority for the successor. A live private
     /// terminal (including a prepared one) is not a vacant mapping slot.
-    pub fn clear_retired_for_new_mapping(
+    /// Refuse a new mapping over `[va, va+len)` while any terminal there is
+    /// a live (prepared or resident) or malformed EL1-private leaf. Read-only:
+    /// the journal-less host editor validates before a retired-leaf reset so
+    /// a refusal leaves no partial edit.
+    pub fn check_vacant_for_new_mapping(
         &mut self,
         va: u64,
         len: usize,
-        source: Option<&mut dyn TableArenaSource>,
-    ) -> Result<PageTableApplyOutcome, PageTableError> {
+    ) -> Result<(), PageTableError> {
         let end = va
             .checked_add(len as u64)
             .ok_or(PageTableError::BadAddress)?;
@@ -4617,6 +4631,16 @@ impl PageTableManager {
                 .checked_add(span)
                 .ok_or(PageTableError::BadAddress)?;
         }
+        Ok(())
+    }
+
+    pub fn clear_retired_for_new_mapping(
+        &mut self,
+        va: u64,
+        len: usize,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        self.check_vacant_for_new_mapping(va, len)?;
         // Validated above, so the shared rule refuses nothing here: only
         // EL1-private retired leaves change (other retired leaves keep their
         // retained output for same-VA reuse and file-fault classification).
