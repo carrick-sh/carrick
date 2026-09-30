@@ -1534,8 +1534,8 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
-      "function": "perform_foreign_cow_transaction",
-      "ordinal_in_function": 14,
+      "function": "finish_foreign_cow_publication",
+      "ordinal_in_function": 1,
       "fingerprint": "bcb0b280839c17b89a9efbf0c533468a0dd67df9d48c88122c7dfb553415015c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
@@ -1545,8 +1545,8 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
-      "function": "perform_foreign_cow_transaction",
-      "ordinal_in_function": 15,
+      "function": "finish_foreign_cow_publication",
+      "ordinal_in_function": 2,
       "fingerprint": "08d6f068c815dd3d2fc0b9fef56b1ba989a69444e3a406320fd46a1b61eb40d1",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
@@ -1556,8 +1556,8 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
-      "function": "perform_foreign_cow_transaction",
-      "ordinal_in_function": 16,
+      "function": "finish_foreign_cow_publication",
+      "ordinal_in_function": 3,
       "fingerprint": "c0699f4295648eabeeaaffc4e349d80f4187d9d0ac7fae1c30c507b7ad705d8d",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
@@ -1567,8 +1567,8 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
-      "function": "perform_foreign_cow_transaction",
-      "ordinal_in_function": 17,
+      "function": "finish_foreign_cow_publication",
+      "ordinal_in_function": 4,
       "fingerprint": "0619f6e2a7de311ef74ec253c209d084b1e1e12e3ef07e3348730be86e35e163",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
@@ -1578,8 +1578,8 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
-      "function": "perform_foreign_cow_transaction",
-      "ordinal_in_function": 18,
+      "function": "finish_foreign_cow_publication",
+      "ordinal_in_function": 5,
       "fingerprint": "a6d14189af9b37a2b2aaa91bc4fad8e02628ea956dddf6a022c43393bbd34cf7",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
@@ -1589,8 +1589,8 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
-      "function": "perform_foreign_cow_transaction",
-      "ordinal_in_function": 19,
+      "function": "finish_foreign_cow_publication",
+      "ordinal_in_function": 6,
       "fingerprint": "8547ebe3f7f5134faaccca7695219974e4f55ad4b6eff17638a3f9882ce34ba2",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
@@ -1876,7 +1876,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 4,
+      "ordinal_in_function": 5,
       "fingerprint": "2b7393b10e23cd3b894db7f690bfc2b28934e4b2dc9123876cb231a3de5c63fa",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_rollback",
@@ -1887,7 +1887,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 5,
+      "ordinal_in_function": 6,
       "fingerprint": "2b7393b10e23cd3b894db7f690bfc2b28934e4b2dc9123876cb231a3de5c63fa",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_tlbi",
@@ -1898,7 +1898,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 6,
+      "ordinal_in_function": 7,
       "fingerprint": "2b7393b10e23cd3b894db7f690bfc2b28934e4b2dc9123876cb231a3de5c63fa",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_inventory",
@@ -1909,7 +1909,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 7,
+      "ordinal_in_function": 8,
       "fingerprint": "2b7393b10e23cd3b894db7f690bfc2b28934e4b2dc9123876cb231a3de5c63fa",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_inventory",
@@ -1920,7 +1920,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 8,
+      "ordinal_in_function": 9,
       "fingerprint": "2b7393b10e23cd3b894db7f690bfc2b28934e4b2dc9123876cb231a3de5c63fa",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_inventory",
@@ -1931,7 +1931,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 9,
+      "ordinal_in_function": 10,
       "fingerprint": "2b7393b10e23cd3b894db7f690bfc2b28934e4b2dc9123876cb231a3de5c63fa",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_mm_authority",
@@ -1942,7 +1942,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 10,
+      "ordinal_in_function": 11,
       "fingerprint": "2b7393b10e23cd3b894db7f690bfc2b28934e4b2dc9123876cb231a3de5c63fa",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_inventory",
@@ -1953,7 +1953,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 11,
+      "ordinal_in_function": 12,
       "fingerprint": "2b7393b10e23cd3b894db7f690bfc2b28934e4b2dc9123876cb231a3de5c63fa",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_inventory",
@@ -1964,7 +1964,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 12,
+      "ordinal_in_function": 13,
       "fingerprint": "bb9653a0ab932d45a8fe5b48e9fc6e6db6445ab141076f86e80db41362d6df2b",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_inventory",
@@ -1975,7 +1975,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 13,
+      "ordinal_in_function": 14,
       "fingerprint": "b2ecfdcbb58ef8d709f8a63e96bf0ec6ec3bc9cbed614ff14513314fec6b0ae5",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_inventory",
@@ -1986,7 +1986,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
-      "ordinal_in_function": 14,
+      "ordinal_in_function": 15,
       "fingerprint": "b2ecfdcbb58ef8d709f8a63e96bf0ec6ec3bc9cbed614ff14513314fec6b0ae5",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_inventory",
@@ -2029,12 +2029,12 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "function": "GuestPreparedBacking::prepare_owned",
+      "function": "GuestPreparedBacking::prepare_owned_for",
       "ordinal_in_function": 1,
-      "fingerprint": "89d5352a18fd4358b4cf328c3c3346fb3391c4b88911ee5b29e804abcc15909c",
+      "fingerprint": "11b6b93538861d301dec9208a65ef9fdc137e8718b586bcc46b4c661e08121a6",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::cow",
-      "rationale": "Kernel frame-grant application failed before publication; rolling back the unpublished stage-2 staging this call just made cannot legitimately fail, so refusal leaves backend inventory holding an unowned extent.",
+      "rationale": "Kernel frame-grant application failed before publication; rolling back the unpublished stage-2 staging this call just made cannot legitimately fail, so refusal leaves backend inventory holding an unowned extent. Re-reviewed 2026-09-29: unchanged abort moved by the guest foreign-COW extraction (shared host/guest publication tail or renamed helper).",
       "sink": "fatal",
       "domain": "hvpatch::cow"
     },
@@ -2163,10 +2163,10 @@
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
       "ordinal_in_function": 1,
-      "fingerprint": "7a904b80a35d38ad2dcc43c2fc087617f0b1770e64020aa7ecad62d522b3e1ec",
+      "fingerprint": "d4b296b638e18f12eab3fc35ba41376aacf9dfffcc088aabd2c64d73170c22d6",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization",
-      "rationale": "A later chunk of guest sparse publication failed to prepare after earlier chunks were published through EL1; with no descriptor rollback for those chunks, continuing leaves a partially mapped sparse extent.",
+      "rationale": "A later chunk of guest sparse publication failed to prepare after earlier chunks were published through EL1; with no descriptor rollback for those chunks, continuing leaves a partially mapped sparse extent. Re-reviewed 2026-09-29: unchanged abort moved by the guest foreign-COW extraction (shared host/guest publication tail or renamed helper).",
       "sink": "fatal",
       "domain": "hvpatch::sparse_materialization"
     },
@@ -2174,10 +2174,10 @@
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
       "ordinal_in_function": 2,
-      "fingerprint": "7a904b80a35d38ad2dcc43c2fc087617f0b1770e64020aa7ecad62d522b3e1ec",
+      "fingerprint": "d4b296b638e18f12eab3fc35ba41376aacf9dfffcc088aabd2c64d73170c22d6",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization",
-      "rationale": "A sparse MapAlias was submitted to EL1 under exact-MM exclusion; without verified completion the extent may be live, so retirement callbacks and inventory commit cannot proceed soundly.",
+      "rationale": "A sparse MapAlias was submitted to EL1 under exact-MM exclusion; without verified completion the extent may be live, so retirement callbacks and inventory commit cannot proceed soundly. Re-reviewed 2026-09-29: unchanged abort moved by the guest foreign-COW extraction (shared host/guest publication tail or renamed helper).",
       "sink": "fatal",
       "domain": "hvpatch::sparse_materialization"
     },
@@ -2185,10 +2185,10 @@
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
       "ordinal_in_function": 3,
-      "fingerprint": "7a904b80a35d38ad2dcc43c2fc087617f0b1770e64020aa7ecad62d522b3e1ec",
+      "fingerprint": "d4b296b638e18f12eab3fc35ba41376aacf9dfffcc088aabd2c64d73170c22d6",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization",
-      "rationale": "The verified EL1 receipt must name the exact submitted sparse transaction; another transaction means completions crossed and the sparse mapping is unauthenticated.",
+      "rationale": "The verified EL1 receipt must name the exact submitted sparse transaction; another transaction means completions crossed and the sparse mapping is unauthenticated. Re-reviewed 2026-09-29: unchanged abort moved by the guest foreign-COW extraction (shared host/guest publication tail or renamed helper).",
       "sink": "fatal",
       "domain": "hvpatch::sparse_materialization"
     },
@@ -2257,6 +2257,105 @@
       "rationale": "After kernel rollback the backend must retire the unpublished alias staging for the same extents; refusal desynchronizes backend inventory from kernel frame authority.",
       "sink": "fatal",
       "domain": "hvpatch::alias"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+      "function": "perform_foreign_guest_cow",
+      "ordinal_in_function": 1,
+      "fingerprint": "18e6411edabbc35df741467c264cbc41ba2e582aec716816d37fd38f9a5e9f82",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_cow",
+      "rationale": "The foreign CowRepoint was submitted to EL1 under the target's pause and borrowed-TTBR0 admission; without a verified completion the target leaf state is unknown, so the replacement can neither commit nor roll back.",
+      "sink": "fatal",
+      "domain": "hvpatch::foreign_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+      "function": "perform_foreign_guest_cow",
+      "ordinal_in_function": 2,
+      "fingerprint": "17337c83e4d6b50b18563ab34322c75a629148c67334c329405713498a8376b9",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_cow",
+      "rationale": "The verified EL1 receipt must name the exact submitted foreign CowRepoint; another transaction means completions crossed and the target leaf is unauthenticated.",
+      "sink": "fatal",
+      "domain": "hvpatch::foreign_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+      "function": "perform_foreign_guest_cow",
+      "ordinal_in_function": 3,
+      "fingerprint": "5dcef0b217ed0e5d50b2536dab3b8de32454ca17536b7dc8d60ffd5373a59f00",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "EL1 already published the replacement leaf in the target MM; failing to commit the matching inventory split leaves a live translation without carrier ledger authority.",
+      "sink": "fatal",
+      "domain": "hvpatch::frame_inventory"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+      "function": "perform_foreign_guest_cow",
+      "ordinal_in_function": 4,
+      "fingerprint": "02c23299c7825e2615bf4a0190d442ded9efc4eac51fb28feb79afc13410951a",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "The kernel's receipt for the committed foreign COW split must authenticate against its challenge; failure means kernel and carrier disagree about a published replacement.",
+      "sink": "fatal",
+      "domain": "hvpatch::frame_inventory"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+      "function": "perform_foreign_guest_cow",
+      "ordinal_in_function": 5,
+      "fingerprint": "79821caa6eadc33760e3d328368b122f0f3be132e84e96fe43c20aae9de29221",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "The COW compound size is a nonzero constant; a zero frame length here means the layout constants are corrupt.",
+      "sink": "fatal",
+      "domain": "hvpatch::frame_inventory"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+      "function": "perform_foreign_guest_cow",
+      "ordinal_in_function": 6,
+      "fingerprint": "bc3cae26040894157d05184ae9a497f95056b120a7a54f8226d702c477240744",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "An armed foreign COW span covering the fault must be nonempty; zero length violates the armed-range invariant after publication.",
+      "sink": "fatal",
+      "domain": "hvpatch::cow_token"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+      "function": "perform_foreign_guest_cow",
+      "ordinal_in_function": 7,
+      "fingerprint": "c0a7a8661df7cf5ec88dcefa0df845e0d0406c9a42ca0530e88ff22f2e293395",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "After commit, the published replacement mapping must be live in kernel authority; otherwise the target translates to frames the kernel does not own.",
+      "sink": "fatal",
+      "domain": "hvpatch::frame_inventory"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+      "function": "perform_foreign_guest_cow",
+      "ordinal_in_function": 8,
+      "fingerprint": "fc46eff91fd89c228b696acb403f7c4f08e5c02102169e260681edc7daf14bfd",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "The foreign COW proof minted at the split revision must name the replacement's owner generation; a different generation means the owner was replaced mid-transaction.",
+      "sink": "fatal",
+      "domain": "hvpatch::host_alias"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_replacing",
+      "ordinal_in_function": 4,
+      "fingerprint": "d4b296b638e18f12eab3fc35ba41376aacf9dfffcc088aabd2c64d73170c22d6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization",
+      "rationale": "The kernel's foreign sparse grant proof must name the MM the publication targets; a proof for another MM means the grant and the descriptors would bind different address spaces.",
+      "sink": "fatal",
+      "domain": "hvpatch::sparse_materialization"
     }
   ]
 }

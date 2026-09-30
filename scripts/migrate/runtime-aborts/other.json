@@ -574,6 +574,17 @@
       "rationale": "After retirement, unregistering the alias is the last cleanup step; failure leaves backend alias metadata naming a mapping the MM no longer has.",
       "sink": "fatal",
       "domain": "aarch64::alias_cleanup"
+    },
+    {
+      "file": "crates/carrick-aarch64/src/descriptor_drain.rs",
+      "function": "run_foreign_drain_call",
+      "ordinal_in_function": 1,
+      "fingerprint": "d01ae49ffa53d4a78efef5b9aaac0c03c925c7e94840d78b2547d30712d58043",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::descriptor_drain",
+      "rationale": "After a foreign drain the caller vCPU must get its own TTBR0 back; failure leaves the caller executing with another MM's address space.",
+      "sink": "fatal",
+      "domain": "aarch64::descriptor_drain"
     }
   ]
 }

@@ -2955,6 +2955,17 @@
       "rationale": "Forwarding admission failed before publication under the lifecycle and forwarding locks; releasing the host-resource backing this call just retained cannot legitimately fail.",
       "sink": "fatal",
       "domain": "ipc::description"
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "<BorrowedAsidAdmission as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "cf1c4dffe5cd450b64c850eba3b96cc61b25bbd3fec5a2e7ee7277dac4d9c257",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "An armed borrowed-TTBR0 admission must record residency on release; failure means the target ASID's retirement could skip the broadcast invalidation owed for the caller vCPU's cached translations.",
+      "sink": "fatal",
+      "domain": "hvpatch::stage1_mm"
     }
   ]
 }
