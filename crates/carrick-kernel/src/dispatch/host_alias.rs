@@ -101,6 +101,25 @@ impl HostAliasTransaction {
     }
 }
 
+impl HostAliasTransaction {
+    /// Hand the delegated root's proposal for this pending mmap to the
+    /// install: it commits or refuses with the install. `false` when this
+    /// transaction is no longer pending; the proposal is then refused.
+    pub(crate) fn attach_root_proposal(&self, proposal: mem::RootAliasProposal) -> bool {
+        let mut phase = self.transactions.phase.lock();
+        match &mut *phase {
+            HostAliasPhase::Pending {
+                id,
+                commit: Some(commit),
+            } if *id == self.id && commit.mmap.is_some() && commit.root_proposal.is_none() => {
+                commit.root_proposal = Some(proposal);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Drop for HostAliasTransaction {
     fn drop(&mut self) {
         if self.armed {
@@ -147,6 +166,9 @@ pub struct HostAliasCommit {
     io_uring_mapping: Option<super::ioring::IoUringMapping>,
     io_uring_mm: Option<Arc<crate::kernel::Mm>>,
     shmat: Option<sysv::HostAliasShmatCommit>,
+    /// A delegated root's proposal for the mapped range: committed with the
+    /// install, refused (by drop) when the install is abandoned.
+    root_proposal: Option<mem::RootAliasProposal>,
 }
 
 impl HostAliasCommit {
@@ -158,6 +180,7 @@ impl HostAliasCommit {
             io_uring_mapping: None,
             io_uring_mm: None,
             shmat: None,
+            root_proposal: None,
         }
     }
 
@@ -167,6 +190,7 @@ impl HostAliasCommit {
             io_uring_mapping: None,
             io_uring_mm: None,
             shmat: None,
+            root_proposal: None,
         }
     }
 
@@ -180,6 +204,7 @@ impl HostAliasCommit {
             io_uring_mapping: Some(mapping),
             io_uring_mm: Some(mm),
             shmat: None,
+            root_proposal: None,
         }
     }
 
@@ -189,6 +214,7 @@ impl HostAliasCommit {
             io_uring_mapping: None,
             io_uring_mm: None,
             shmat: Some(shmat),
+            root_proposal: None,
         }
     }
 }
@@ -492,6 +518,9 @@ impl SyscallDispatcher {
         if let Some(mmap) = commit.mmap {
             let start = mmap.start;
             let len = mmap.len;
+            if let Some(proposal) = commit.root_proposal {
+                proposal.commit_host_owned();
+            }
             self.commit_host_alias_mmap_observed(&authority, mmap);
             if let Some(mm) = commit.io_uring_mm {
                 mm.replace_io_uring_mappings(start, len, commit.io_uring_mapping);

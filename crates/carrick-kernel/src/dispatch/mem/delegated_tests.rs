@@ -1905,3 +1905,123 @@ fn delegated_readers_cost_the_queried_range_not_the_root_population() {
          the unrelated population: {walked:?}; all: {few:?} vs {many:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S2 fencing: a root-owned anonymous mmap the runtime installs as a host
+// alias (`MapHostAlias`) holds its root proposal until the install commits.
+// A failed install leaves the root exactly as it was.
+// ---------------------------------------------------------------------------
+
+/// Every committed root mapping, in address order.
+fn root_mappings(root: &Root) -> Vec<(u64, u64, u64, u32)> {
+    let mut seen = Vec::new();
+    root.lock()
+        .observe_mappings(&mut |mapping| {
+            seen.push((
+                mapping.range.start(),
+                mapping.range.end(),
+                mapping.protection.bits(),
+                mapping.flags.bits(),
+            ))
+        })
+        .unwrap();
+    seen
+}
+
+/// A root-eligible `mmap(MAP_FIXED)` the host serves with a host alias: a
+/// heap address above the break has no identity backing.
+fn alias_mmap(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut CountingMmapMemory,
+    address: u64,
+) -> crate::dispatch::HostAliasTransaction {
+    match host_mmap(
+        dispatcher,
+        memory,
+        address,
+        2 * PAGE,
+        RW,
+        ANON | LINUX_MAP_FIXED,
+        -1,
+    ) {
+        DispatchOutcome::MapHostAlias {
+            transaction, va, ..
+        } => {
+            assert_eq!(va, GuestVa(address));
+            transaction
+        }
+        other => panic!("expected a host-alias install, got {other:?}"),
+    }
+}
+
+#[test]
+fn delegated_failed_alias_install_leaves_the_root_exactly_as_it_was() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let heap = dispatcher.mem().lock().layout.heap_base;
+    let hole = heap + 64 * PAGE;
+    let owned = heap + 96 * PAGE;
+    // A root-owned mapping the second MAP_FIXED would replace.
+    root.guest_mmap(Placement::Fixed(owned), 2 * PAGE, READ)
+        .unwrap();
+    for address in [hole, owned] {
+        let before = (
+            root_mappings(&root),
+            proc_rows(&dispatcher),
+            root.lock().generation(),
+        );
+        let transaction = alias_mmap(&mut dispatcher, &mut memory, address);
+        // The runtime could not install it: the transaction is dropped.
+        drop(transaction);
+        assert_eq!(
+            (
+                root_mappings(&root),
+                proc_rows(&dispatcher),
+                root.lock().generation()
+            ),
+            before,
+            "{address:#x}: an aborted alias install must leave no trace"
+        );
+        // The range is free to be placed exactly as before.
+        let refused = root.guest_mmap(
+            Placement::NoReplace(address),
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        );
+        assert_eq!(
+            refused.is_ok(),
+            address == hole,
+            "{address:#x}: {refused:?}"
+        );
+        if address == hole {
+            root.guest_munmap(hole, 2 * PAGE);
+        }
+    }
+}
+
+#[test]
+fn delegated_committed_alias_install_replaces_the_range_with_its_host_row() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let heap = dispatcher.mem().lock().layout.heap_base;
+    let owned = heap + 96 * PAGE;
+    root.guest_mmap(Placement::Fixed(owned), 2 * PAGE, READ)
+        .unwrap();
+    let transaction = alias_mmap(&mut dispatcher, &mut memory, owned);
+    transaction
+        .with_claim_for_test(|install| dispatcher.commit_host_alias_install(install))
+        .expect("claim")
+        .expect("commit");
+    let node = root.lock().mapping(owned).unwrap();
+    assert!(!node.anonymous, "the alias mapping is host-owned");
+    assert_eq!(node.protection, ReservationProtection::READ_WRITE);
+    assert_eq!(
+        node.range,
+        ReservationRange::new(owned, owned + 2 * PAGE).unwrap()
+    );
+    let row = proc_row_at(&dispatcher, owned).expect("a /proc row");
+    assert!(row.read && row.write);
+    assert_eq!((row.start, row.end), (owned, owned + 2 * PAGE));
+}
