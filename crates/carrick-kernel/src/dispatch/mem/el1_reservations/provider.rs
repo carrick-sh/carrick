@@ -34,6 +34,10 @@ pub(in crate::dispatch) struct ReservationProviderSlot {
     /// bounded try-lock sized for EL1 critical sections; two host threads of
     /// one MM must queue here instead of refusing each other with `Busy`.
     host_serial: Arc<parking_lot::Mutex<()>>,
+    /// Root node reads by every host-venue step on this MM's root: the
+    /// work-budget instrument of the delegated readers' cost contracts.
+    #[cfg(test)]
+    node_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ReservationProviderSlot {
@@ -43,6 +47,8 @@ impl ReservationProviderSlot {
             provider: self.provider.clone(),
             // A successor MM has its own root, hence its own host queue.
             host_serial: Arc::default(),
+            #[cfg(test)]
+            node_reads: Arc::default(),
         }
     }
 }
@@ -55,6 +61,8 @@ pub(in crate::dispatch) struct DelegatedRoot {
     provider: Arc<dyn HostReservationProvider>,
     host_serial: Arc<parking_lot::Mutex<()>>,
     mm: ReservationMm,
+    #[cfg(test)]
+    node_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DelegatedRoot {
@@ -70,7 +78,17 @@ impl DelegatedRoot {
         if model.mm() != self.mm || !model.is_admitted() {
             return Err(Refusal::Stale);
         }
-        step(&mut model)
+        let result = step(&mut model);
+        #[cfg(test)]
+        self.node_reads
+            .fetch_add(model.work, std::sync::atomic::Ordering::Relaxed);
+        result
+    }
+
+    /// Root node reads by this MM's host-venue steps so far.
+    #[cfg(test)]
+    pub(in crate::dispatch) fn node_reads(&self) -> usize {
+        self.node_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The admission step: the exact published root before it is sealed.
@@ -125,6 +143,8 @@ impl DispatchMmAuthority {
             provider: slot.provider.clone().ok_or(Refusal::ForeignMapping)?,
             host_serial: Arc::clone(&slot.host_serial),
             mm: ReservationMm::new(self.mm_id.raw()).ok_or(Refusal::Invalid)?,
+            #[cfg(test)]
+            node_reads: Arc::clone(&slot.node_reads),
         })
     }
 

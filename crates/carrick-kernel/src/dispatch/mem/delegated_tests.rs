@@ -1768,3 +1768,140 @@ fn delegated_residency_of_two_adjacent_mappings_survives_only_where_unretired() 
         Some(vec![0, 0, 1, 0])
     );
 }
+
+// ---------------------------------------------------------------------------
+// S2 cost contract: a delegated reader's root work scales with the range it
+// names, never with how many OTHER root nodes the MM holds. The instrument is
+// root node reads (`DelegatedRoot::node_reads`), a deterministic
+// architectural work unit.
+// ---------------------------------------------------------------------------
+
+/// Root node populations the budget compares: a toy process and one holding
+/// hundreds of unrelated, non-coalescing anonymous mappings.
+const FEW_NODES: u64 = 16;
+const MANY_NODES: u64 = 512;
+
+/// One small query's root node reads, on an MM holding `population`
+/// unrelated root nodes far from the queried page.
+fn delegated_reader_reads(population: u64) -> Vec<(&'static str, usize)> {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    // The unrelated population: alternating protection so nothing coalesces.
+    let far = LINUX_MMAP_BASE + 64 * PAGE;
+    for index in 0..population {
+        let prot = if index % 2 == 0 {
+            ReservationProtection::READ_WRITE
+        } else {
+            READ
+        };
+        root.guest_mmap(Placement::Fixed(far + index * 2 * PAGE), PAGE, prot)
+            .unwrap();
+    }
+    // A finite RLIMIT_AS: every proposal charges the whole MM.
+    dispatcher
+        .capture_one_task_context()
+        .unwrap()
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::As, |_| {
+            Ok::<_, std::convert::Infallible>(carrick_abi::LinuxRlimit::new(
+                1 << 46,
+                LINUX_RLIM_INFINITY,
+            ))
+        })
+        .unwrap();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    let delegated = dispatcher.mem().lock().delegated_root().cloned().unwrap();
+    let mut out = Vec::new();
+    let mut measure =
+        |name: &'static str,
+         dispatcher: &mut SyscallDispatcher,
+         memory: &mut CountingMmapMemory,
+         query: &mut dyn FnMut(&mut SyscallDispatcher, &mut CountingMmapMemory)| {
+            let before = delegated.node_reads();
+            query(dispatcher, memory);
+            out.push((name, delegated.node_reads() - before));
+        };
+    measure("mmap", &mut dispatcher, &mut memory, &mut |d, m| {
+        assert_eq!(
+            returned(host_mmap(
+                d,
+                m,
+                base,
+                2 * PAGE,
+                RW,
+                ANON | LINUX_MAP_FIXED,
+                -1
+            )) as u64,
+            base
+        );
+    });
+    measure("fault plan", &mut dispatcher, &mut memory, &mut |d, _| {
+        fault_answers(d, &[base]);
+    });
+    measure("first touch", &mut dispatcher, &mut memory, &mut |d, _| {
+        d.with_resident_fault_plan_for_test(base, |plan| d.commit_resident_fault(plan));
+    });
+    measure("mincore", &mut dispatcher, &mut memory, &mut |d, m| {
+        assert_eq!(mincore(d, m, base, 2), Some(vec![1, 0]));
+    });
+    measure("mprotect", &mut dispatcher, &mut memory, &mut |d, m| {
+        assert_eq!(
+            returned(call(
+                d,
+                m,
+                SYS_MPROTECT,
+                [base, PAGE, LINUX_PROT_READ, 0, 0, 0]
+            )),
+            0
+        );
+    });
+    measure(
+        "madvise range",
+        &mut dispatcher,
+        &mut memory,
+        &mut |d, _| {
+            d.mem_view().madvise_range_meta(base, base + PAGE);
+        },
+    );
+    measure("mlock", &mut dispatcher, &mut memory, &mut |d, m| {
+        assert_eq!(returned(call(d, m, SYS_MLOCK, [base, PAGE, 0, 0, 0, 0])), 0);
+    });
+    measure(
+        "arena high water",
+        &mut dispatcher,
+        &mut memory,
+        &mut |d, _| {
+            d.mmap_arena_high_water();
+        },
+    );
+    measure("munmap", &mut dispatcher, &mut memory, &mut |d, m| {
+        assert_eq!(
+            returned(call(d, m, SYS_MUNMAP, [base, 2 * PAGE, 0, 0, 0, 0])),
+            0
+        );
+    });
+    out
+}
+
+#[test]
+fn delegated_readers_cost_the_queried_range_not_the_root_population() {
+    let few = delegated_reader_reads(FEW_NODES);
+    let many = delegated_reader_reads(MANY_NODES);
+    // A balanced root descends in O(log n): 32x the nodes roughly doubles
+    // the height (log2 16 + 1 = 5 levels, log2 512 + 1 = 10). A query that
+    // makes a fixed number of descents may therefore about double; a query
+    // that visits the unrelated population grows with it (32x).
+    const GROWTH_BOUND: usize = 3;
+    let walked: Vec<_> = few
+        .iter()
+        .zip(&many)
+        .filter(|((_, small), (_, large))| *large > GROWTH_BOUND * small)
+        .map(|((name, small), (_, large))| (*name, *small, *large))
+        .collect();
+    assert!(
+        walked.is_empty(),
+        "(query, root node reads at {FEW_NODES} nodes, at {MANY_NODES}) for queries that walk \
+         the unrelated population: {walked:?}; all: {few:?} vs {many:?}"
+    );
+}
