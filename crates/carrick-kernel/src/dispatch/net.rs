@@ -2758,7 +2758,7 @@ impl<'a> NetView<'a> {
                     if efd_flags.contains(LinuxEfdFlags::SEMAPHORE) {
                         carrick_el1_abi::ipc::pipe::EventMode::Semaphore
                     } else { carrick_el1_abi::ipc::pipe::EventMode::Counter },
-                ).map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?),
+                ).map_err(|error| DispatchError::Errno(error.errno()))?),
                 // EFD_NONBLOCK == O_NONBLOCK, so the isolated bit IS the
                 // status-flag word the base expects.
                 base: OpenDescriptionBase::new((efd_flags & LinuxEfdFlags::NONBLOCK).bits()),

@@ -1440,6 +1440,60 @@ mod overlay_dispatch_tests {
         );
     }
 
+    /// A zone-wide file table (the authority's store ceiling) is the only
+    /// limit below RLIMIT_NOFILE: pipe2 and eventfd2 report ENFILE there,
+    /// never ENOMEM, and a close makes room again.
+    #[test]
+    fn serial_host_el1_ipc_pipe2_and_eventfd2_report_enfile_at_the_zone_limit() {
+        use carrick_el1_abi::ipc::{IPC_OBJECT_SEGMENT, IPC_OFD_SEGMENT};
+        const NOFILE: u64 = 8192;
+        let mut h = Harness::new();
+        let owner = Arc::new(
+            crate::el1_ipc::HostIpc::with_limits(
+                1 << 20,
+                crate::el1_ipc::IpcLimits {
+                    objects: 2 * IPC_OBJECT_SEGMENT,
+                    descriptions: 4 * IPC_OFD_SEGMENT,
+                },
+            )
+            .unwrap(),
+        );
+        h.dispatcher
+            .kernel_binding
+            .read()
+            .kernel()
+            .install_ipc_for_test(Arc::clone(&owner));
+        let limit = h.reserve(16);
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&NOFILE.to_le_bytes());
+        bytes[8..16].copy_from_slice(&NOFILE.to_le_bytes());
+        h.memory.write_bytes(limit, &bytes).unwrap();
+        assert_eq!(returned(h.call(261, [0, 7, limit, 0, 0, 0])), 0);
+        let pair = h.reserve(8);
+        let mut pipes = 0u64;
+        let failure = loop {
+            match h.call(59, [pair, 0, 0, 0, 0, 0]) {
+                DispatchOutcome::Returned { value: 0 } => pipes += 1,
+                DispatchOutcome::Errno { errno } => break errno.get(),
+                other => panic!("pipe2: {other:?}"),
+            }
+        };
+        assert_eq!(
+            (failure, pipes),
+            (linux_errno::ENFILE.get(), 2 * IPC_OBJECT_SEGMENT as u64),
+            "the zone's object store is its file table: ENFILE, not ENOMEM"
+        );
+        assert_eq!(errno(h.call(19, [0, 0, 0, 0, 0, 0])), linux_errno::ENFILE.get());
+        // A close returns the object: the next pipe2 succeeds again.
+        let fds = h.memory.read_bytes(pair, 8).unwrap();
+        let read_fd = i32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let write_fd = i32::from_le_bytes(fds[4..8].try_into().unwrap());
+        assert_eq!(returned(h.call(57, [read_fd as u64, 0, 0, 0, 0, 0])), 0);
+        assert_eq!(returned(h.call(57, [write_fd as u64, 0, 0, 0, 0, 0])), 0);
+        assert_eq!(returned(h.call(59, [pair, 0, 0, 0, 0, 0])), 0);
+        assert_eq!(owner.region().object_count(), 2 * IPC_OBJECT_SEGMENT);
+    }
+
     #[test]
     fn blocked_sendfile_captures_input_and_output_before_input_reuse() {
         let mut h = Harness::new();
