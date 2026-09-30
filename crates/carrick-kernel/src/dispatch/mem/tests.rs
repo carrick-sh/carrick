@@ -76,6 +76,7 @@ pub struct CountingMmapMemory {
     pub(crate) zero_backing_calls: Cell<usize>,
     pub(crate) protect_calls: Cell<usize>,
     unmap_calls: Cell<usize>,
+    fail_unmap_at: Cell<Option<u64>>,
     pub(crate) protect_log: RefCell<Vec<(u64, usize, u64)>>,
 }
 
@@ -130,8 +131,14 @@ impl CountingMmapMemory {
             zero_backing_calls: Cell::new(0),
             protect_calls: Cell::new(0),
             unmap_calls: Cell::new(0),
+            fail_unmap_at: Cell::new(None),
             protect_log: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Make every `unmap_range` starting at `address` fail.
+    pub(crate) fn set_fail_unmap_at(&self, address: Option<u64>) {
+        self.fail_unmap_at.set(address);
     }
 
     pub(crate) fn with_defer_anon(mut self, defer: bool) -> Self {
@@ -203,8 +210,13 @@ impl GuestMemory for CountingMmapMemory {
         Ok(())
     }
 
-    fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+    fn unmap_range(&mut self, address: u64, _len: usize) -> Result<(), MemoryError> {
         self.unmap_calls.set(self.unmap_calls.get() + 1);
+        if self.fail_unmap_at.get() == Some(address) {
+            return Err(MemoryError::HostMap(format!(
+                "injected unmap failure at {address:#x}"
+            )));
+        }
         Ok(())
     }
 

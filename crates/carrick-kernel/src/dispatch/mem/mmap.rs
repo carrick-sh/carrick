@@ -3421,61 +3421,21 @@ impl<'a> MemView<'a> {
                 )? else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
-                    let (Ok(new_len), Ok(copy_len)) = (
-                        usize::try_from(new_size),
-                        usize::try_from(bus_rel.min(old_size)),
-                    ) else {
-                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    // Only the bytes before EOF exist to move: the region from
+                    // `bus_rel` on is deliberately inaccessible.
+                    let relocation = Relocation {
+                        source: old_address.0,
+                        source_len: old_size,
+                        destination: new_addr,
+                        destination_len: new_size,
+                        copy_len: bus_rel.min(old_size),
+                        sharing: proc_mapping_sharing(source_metadata.sharing),
+                        prot: source_metadata.prot,
+                        scrub_destination: reused,
+                        source_after: MoveSource::Reclaim,
                     };
-                    let copied = if copy_len == 0 {
-                        Vec::new()
-                    } else {
-                        match memory.read_bytes_raw(old_address.0, copy_len) {
-                            Ok(bytes) => bytes,
-                            Err(_) => {
-                                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                            }
-                        }
-                    };
-                    if reused && memory.zero_backing(new_addr, new_len).is_err() {
-                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                    }
-                    memory.set_mapping_protection_and_sharing(
-                        new_addr,
-                        new_len,
-                        false,
-                        false,
-                        proc_mapping_sharing(source_metadata.sharing),
-                    );
-                    if memory
-                        .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
-                        .is_err()
-                    {
-                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                    }
-                    if !copied.is_empty()
-                        && memory.write_bytes_unchecked(new_addr, &copied).is_err()
-                    {
-                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                    let prot_none = source_metadata.prot.is_empty();
-                    memory.set_mapping_protection(
-                        new_addr,
-                        new_len,
-                        prot_none,
-                        !prot_none && !source_metadata.prot.contains(LinuxProtFlags::WRITE),
-                    );
-                    if memory
-                        .protect_range(new_addr, new_len, source_metadata.prot.bits())
-                        .is_err()
-                    {
-                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    if let Err(errno) = this.relocate_contents(memory, relocation) {
+                        return Ok(DispatchOutcome::errno(errno));
                     }
                     // Re-publish the past-EOF tail at the destination exactly as
                     // `mmap` publishes it: no access, then the bus record that
@@ -3494,13 +3454,7 @@ impl<'a> MemView<'a> {
                         new_size,
                         &source_metadata,
                         );
-                    // Linux unmaps the source. Reclaim it exactly like munmap so
-                    // a later access faults and the VA is reusable.
-                    if let Ok(old_len) = usize::try_from(old_size)
-                        && old_len > 0
-                        && memory.unmap_range(old_address.0, old_len).is_ok()
-                    {
-                        mark_range_unmapped(memory, old_address.0, old_len);
+                    if old_size > 0 {
                         this.remove_mapping_metadata(old_address.0, old_size);
                         let mem_authority_23 = this.mem();
                         let mut mem = mem_authority_23.lock();
@@ -3630,138 +3584,47 @@ impl<'a> MemView<'a> {
                 };
                 granted
             };
-            let new_len = match usize::try_from(new_size) {
-                Ok(n) => n,
-                Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
+            // mremap MOVE on Linux UNMAPS the source (unless
+            // MREMAP_DONTUNMAP, which keeps it mapped reading zero). The one
+            // relocation backend moves the contents and reclaims (or
+            // zeroes) the source, or fails with the destination rolled back
+            // and the source intact. Reclaiming the source keeps glibc's
+            // view of which VAs are mapped and carrick's in step (the
+            // BytesIO/recv_bytes realloc-grow cascade of
+            // test_multiprocessing test_connection's 16 MiB round-trip).
+            let relocation = Relocation {
+                source: old_address.0,
+                source_len: old_size,
+                destination: new_addr,
+                destination_len: new_size,
+                copy_len: old_size.min(new_size),
+                sharing: proc_mapping_sharing(source_metadata.sharing),
+                prot: source_metadata.prot,
+                scrub_destination: reused,
+                source_after: if dontunmap {
+                    MoveSource::KeepZeroed
+                } else {
+                    MoveSource::Reclaim
+                },
             };
-            let copy_len = match usize::try_from(old_size.min(new_size)) {
-                Ok(len) => len,
-                Err(_) => {
-                    this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                }
-            };
-            let copied = if copy_len == 0 {
-                Vec::new()
-            } else {
-                match memory.read_bytes_raw(old_address.0, copy_len) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                }
-            };
-            if reused && memory.zero_backing(new_addr, new_len).is_err() {
-                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            }
-            // Publish the destination as non-executable RW while copying, but
-            // with its final sharing already installed. This is restrictive for
-            // RX sources and prevents a stale executable replacement from being
-            // observed as private/cacheable during the move.
-            memory.set_mapping_protection_and_sharing(
-                new_addr,
-                new_len,
-                false,
-                false,
-                proc_mapping_sharing(source_metadata.sharing),
-            );
-            if memory
-                .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
-                .is_err()
-            {
-                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            }
-            if !copied.is_empty()
-                && memory
-                    .write_bytes_unchecked(new_addr, &copied)
-                    .is_err()
-            {
-                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            let prot_none = source_metadata.prot.is_empty();
-            memory.set_mapping_protection(
-                new_addr,
-                new_len,
-                prot_none,
-                !prot_none && !source_metadata.prot.contains(LinuxProtFlags::WRITE),
-            );
-            if memory
-                .protect_range(new_addr, new_len, source_metadata.prot.bits())
-                .is_err()
-            {
-                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            if let Err(errno) = this.relocate_contents(memory, relocation) {
+                return Ok(DispatchOutcome::errno(errno));
             }
             this.record_remapped_dynamic_mapping(
                 new_addr,
                 new_size,
                 &source_metadata,
                 );
-            // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
-            // MREMAP_DONTUNMAP — refused above, so never true here: this handler
-            // always reclaims the source). carrick previously LEAKED it: the
-            // source VA stayed mapped with its stale bytes and was never
-            // returned to the allocator, so `mmap_next` ran away and glibc's
-            // view of which VAs are mapped diverged from carrick's (glibc
-            // considers the source freed). Reclaim the source exactly like
-            // munmap, so a later access faults and the VA is reusable —
-            // matching Linux and keeping the mmapped-chunk bookkeeping
-            // coherent across the BytesIO/recv_bytes realloc-grow cascade
-            // (test_multiprocessing test_connection's 16 MiB round-trip).
-            // Guard: the destination must not overlap the source (it never does —
-            // `new_addr` is freshly bump-allocated or a disjoint free region —
-            // but reclaiming an overlapping source would unmap the live copy).
             let dst_overlaps_src = new_addr < old_address.0.wrapping_add(old_size)
                 && old_address.0 < new_addr.wrapping_add(new_size);
-            if dontunmap {
-                // `MREMAP_DONTUNMAP` keeps the source MAPPED, as fresh
-                // zero-filled anonymous memory: the pages move to the
-                // destination and the old address reads back zero rather than
-                // faulting. carrick copies instead of re-pointing page tables,
-                // so zeroing the source produces the same guest-visible result
-                // -- the destination holds the bytes, the source reads zero,
-                // and the VMA and its allocator bookkeeping stay exactly as
-                // they were.
-                if let Ok(old_len) = usize::try_from(old_size)
-                    && old_len > 0
-                    && memory.zero_backing(old_address.0, old_len).is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            if !dontunmap && !dst_overlaps_src && old_size > 0 {
+                this.remove_mapping_metadata(old_address.0, old_size);
+                let mem_authority_26 = this.mem();
+                let mut mem = mem_authority_26.lock();
+                if let Some(arena) = mem.host_arena_mut() {
+                    arena.release(old_address.0, old_size);
                 }
-            } else if !dst_overlaps_src
-                && let Ok(old_len) = usize::try_from(old_size)
-                    && old_len > 0
-                {
-                    if let Err(first) = memory.unmap_range(old_address.0, old_len)
-                        && let Err(retry) = memory.unmap_range(old_address.0, old_len)
-                    {
-                        // The destination is already published; returning would
-                        // expose two owners while reporting failure. Retain
-                        // fail-stop semantics so host teardown reclaims both --
-                        // but SAY WHY. This aborted with no output at all, so
-                        // locating it needed a 7.5 GiB core; an abort that
-                        // prints nothing is indistinguishable from a crash.
-                        eprintln!(
-                            "carrick: FATAL: mremap MOVE published                              0x{new_addr:x}+0x{new_size:x} but could not reclaim source                              0x{:x}+0x{old_len:x}: {first}; retry: {retry}",
-                            old_address.0
-                        );
-                        carrick_fatal!(
-                            "dispatch::mremap",
-                            "mremap move could not reclaim source address range"
-                        );
-                    }
-                    mark_range_unmapped(memory, old_address.0, old_len);
-                    this.remove_mapping_metadata(old_address.0, old_size);
-                    let mem_authority_26 = this.mem();
-                    let mut mem = mem_authority_26.lock();
-                    if let Some(arena) = mem.host_arena_mut() {
-                        arena.release(old_address.0, old_size);
-                    }
-                }
+            }
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::returned_u64(new_addr)?)
         }

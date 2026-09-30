@@ -2019,6 +2019,113 @@ impl<'a> MemView<'a> {
         Ok(())
     }
 
+    /// The one `mremap` relocation backend, shared by root-owned and
+    /// host-owned moves. The destination is already placed (a fresh or
+    /// reused arena range, or a root proposal). Publishes it RW with its
+    /// final sharing, copies `copy_len` bytes from the source, publishes the
+    /// final protection, then either zeroes the source
+    /// ([`MoveSource::KeepZeroed`], `MREMAP_DONTUNMAP`) or reclaims it
+    /// ([`MoveSource::Reclaim`]). Any failure, including a source the
+    /// backend cannot reclaim, rolls the destination back so the source
+    /// stays the only owner of the contents: mremap(2) then fails with
+    /// ENOMEM/EFAULT and changes nothing. No retry, no second owner.
+    ///
+    /// Contents move by copy: `GuestMemory` has no private-anonymous page
+    /// transfer (a stage-1 leaf plus frame-ownership move with rollback),
+    /// so the cost is O(copy_len) bytes rather than O(pages) leaf edits.
+    /// Callers publish their metadata only after `Ok`.
+    pub(in crate::dispatch::mem) fn relocate_contents<M: CurrentMmMemory>(
+        &self,
+        memory: &mut M,
+        relocation: Relocation,
+    ) -> Result<(), LinuxErrno> {
+        let Relocation {
+            source,
+            source_len,
+            destination,
+            destination_len,
+            copy_len,
+            sharing,
+            prot,
+            scrub_destination,
+            source_after,
+        } = relocation;
+        let rollback = |this: &Self, memory: &mut M, errno: LinuxErrno| -> LinuxErrno {
+            match this.rollback_fresh_arena_mapping(memory, destination, destination_len) {
+                Ok(()) => errno,
+                // The destination could not be unpublished either: report
+                // the syscall failure; the rollback itself fail-stops under
+                // concurrent-exec protection.
+                Err(_) => LINUX_ENOMEM,
+            }
+        };
+        let (Ok(dest_len), Ok(copy), Ok(src_len)) = (
+            usize::try_from(destination_len),
+            usize::try_from(copy_len),
+            usize::try_from(source_len),
+        ) else {
+            return Err(rollback(self, memory, LINUX_ENOMEM));
+        };
+        let copied = if copy == 0 {
+            Vec::new()
+        } else {
+            match memory.read_bytes_raw(source, copy) {
+                Ok(bytes) => bytes,
+                Err(_) => return Err(rollback(self, memory, LINUX_EFAULT)),
+            }
+        };
+        if scrub_destination && memory.zero_backing(destination, dest_len).is_err() {
+            return Err(rollback(self, memory, LINUX_ENOMEM));
+        }
+        // RW, non-executable, with the final sharing already installed while
+        // the bytes land: an executable replacement is never observable as
+        // private/cacheable mid-move.
+        memory.set_mapping_protection_and_sharing(destination, dest_len, false, false, sharing);
+        if memory
+            .protect_range(destination, dest_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
+            .is_err()
+        {
+            return Err(rollback(self, memory, LINUX_ENOMEM));
+        }
+        if !copied.is_empty() && memory.write_bytes_unchecked(destination, &copied).is_err() {
+            return Err(rollback(self, memory, LINUX_EFAULT));
+        }
+        let prot_none = prot.is_empty();
+        memory.set_mapping_protection(
+            destination,
+            dest_len,
+            prot_none,
+            !prot_none && !prot.contains(LinuxProtFlags::WRITE),
+        );
+        if memory
+            .protect_range(destination, dest_len, prot.bits())
+            .is_err()
+        {
+            return Err(rollback(self, memory, LINUX_ENOMEM));
+        }
+        if src_len == 0 {
+            return Ok(());
+        }
+        match source_after {
+            MoveSource::KeepZeroed => {
+                if memory.zero_backing(source, src_len).is_err() {
+                    return Err(rollback(self, memory, LINUX_ENOMEM));
+                }
+            }
+            MoveSource::Reclaim => {
+                let overlaps = destination < source.saturating_add(source_len)
+                    && source < destination.saturating_add(destination_len);
+                if !overlaps {
+                    if memory.unmap_range(source, src_len).is_err() {
+                        return Err(rollback(self, memory, LINUX_ENOMEM));
+                    }
+                    mark_range_unmapped(memory, source, src_len);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Roll back a freshly allocated private-arena mapping. Native direct
     /// execution cannot return while a failed publication remains host-mapped:
     /// retry once, then retain Task 51's fail-stop behavior so process teardown
@@ -2056,6 +2163,31 @@ impl<'a> MemView<'a> {
         }
         Ok(())
     }
+}
+
+/// What happens to an `mremap` source once its contents moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::dispatch::mem) enum MoveSource {
+    /// The source is unmapped (a plain move).
+    Reclaim,
+    /// `MREMAP_DONTUNMAP`: the source stays mapped and reads back zero.
+    KeepZeroed,
+}
+
+/// One `mremap` relocation for [`MemView::relocate_contents`].
+#[derive(Clone, Copy, Debug)]
+pub(in crate::dispatch::mem) struct Relocation {
+    pub(in crate::dispatch::mem) source: u64,
+    pub(in crate::dispatch::mem) source_len: u64,
+    pub(in crate::dispatch::mem) destination: u64,
+    pub(in crate::dispatch::mem) destination_len: u64,
+    /// Bytes that exist to move (at most the smaller length).
+    pub(in crate::dispatch::mem) copy_len: u64,
+    pub(in crate::dispatch::mem) sharing: carrick_guest_mem::MappingSharing,
+    pub(in crate::dispatch::mem) prot: LinuxProtFlags,
+    /// The destination may hold a prior mapping's bytes.
+    pub(in crate::dispatch::mem) scrub_destination: bool,
+    pub(in crate::dispatch::mem) source_after: MoveSource,
 }
 
 macro_rules! forward_mem_handlers {
