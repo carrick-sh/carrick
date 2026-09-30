@@ -3166,7 +3166,10 @@ fn finish_foreign_cow_publication(
     });
     lease_guard.retained = committed.clone();
     if host_resolved {
-        lease.state.host_cow_stats.record_host_cow_resolution();
+        lease
+            .state
+            .host_cow_stats
+            .record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::ForeignPublication);
     }
     CarrierForeignCowReceipt {
         snapshot: committed,
