@@ -911,6 +911,18 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(None)
     }
 
+    /// Undo exactly what [`Self::prepare_el1_frame_grant`] published for a
+    /// grant whose leaves were never exposed. `Ok(false)`: the span no
+    /// longer holds that grant's backing; nothing changed.
+    fn roll_back_el1_frame_grant(
+        &mut self,
+        _grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend prepared no EL1 frame grant".to_owned(),
+        ))
+    }
+
     /// Refresh fork-private process state after the child frame inventory and
     /// exact MM/COW authority are live, but before the child enters guest code.
     fn refresh_fork_process_state(

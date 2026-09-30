@@ -716,3 +716,88 @@ fn guest_lane_declines_frame_grant_replacement_before_any_transition() {
     let fresh_only = &body[decline..];
     assert!(fresh_only[..200].contains("return Ok(None)"));
 }
+
+/// A refused grant's rollback retires only the exact alias its preparation
+/// registered: same span, semantic IPA and owner incarnation. A successor
+/// owner at the same IPA, a split fragment, or a second overlapping alias
+/// is not the grant's backing and must never be retired in its name.
+#[test]
+fn el1_frame_grant_rollback_matches_only_the_grants_own_alias() {
+    use super::*;
+    let grant = carrick_hal::threaded::El1FrameGrantRollback {
+        mm_key: 9,
+        semantic_base: 0x4000_0000,
+        len: 0x4000,
+        ready: carrick_hal::El1FrameGrantReady {
+            physical_ipa: 0x9b_4000_0000,
+            frame_id: 1,
+            mapping_id: 2,
+            owner_generation: 17,
+            inventory_revision: 4,
+        },
+    };
+    let alias = AliasBacking {
+        start: grant.semantic_base,
+        ipa: grant.ready.physical_ipa,
+        host_addr: 0x1_0000_0000,
+        size: grant.len as usize,
+        physical_ipa: grant.ready.physical_ipa,
+        physical_host_addr: 0x1_0000_0000,
+        physical_size: grant.len as usize,
+        perms: 7,
+        guest_writable: true,
+        sharing: GuestMappingSharing::Private,
+        ownership_scope: alias_ownership_scope(
+            GuestMappingSharing::Private,
+            None,
+            ContainerRootToken::ROOT,
+        ),
+        inventory_backing: HvfVmState::private_backing_identity(),
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: 17,
+    };
+    assert!(is_exactly_el1_frame_grant(&[(1, alias)], grant));
+    assert!(!is_exactly_el1_frame_grant(&[], grant), "already retired");
+    let successor = AliasBacking {
+        owner_generation: 18,
+        ..alias
+    };
+    assert!(!is_exactly_el1_frame_grant(&[(1, successor)], grant));
+    let fragment = AliasBacking {
+        size: 0x1000,
+        ..alias
+    };
+    assert!(!is_exactly_el1_frame_grant(&[(1, fragment)], grant));
+    let moved = AliasBacking {
+        ipa: alias.ipa + 0x4000,
+        ..alias
+    };
+    assert!(!is_exactly_el1_frame_grant(&[(1, moved)], grant));
+    assert!(!is_exactly_el1_frame_grant(
+        &[(1, alias), (2, fragment)],
+        grant
+    ));
+}
+
+/// Both refusal sites hand the grant to the one backend rollback; the
+/// backend's rollback is the only inverse of `prepare_el1_frame_grant`.
+#[test]
+fn el1_frame_grant_rollback_retires_through_the_unmap_path_then_restores_pristine() {
+    let source = include_str!("../cow_engine.rs");
+    let body = source
+        .rsplit_once("pub(crate) fn roll_back_el1_frame_grant(")
+        .unwrap()
+        .1
+        .split("\n    pub(crate) fn ")
+        .next()
+        .unwrap();
+    let guard = body
+        .find("is_exactly_el1_frame_grant(")
+        .expect("exact identity guard");
+    let retire = body
+        .find("self.unregister_process_alias(")
+        .expect("unmap retirement");
+    let pristine = body.find(".restore_pristine(").expect("pristine restore");
+    assert!(guard < retire && retire < pristine);
+}
