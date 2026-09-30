@@ -1,0 +1,35 @@
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 46.09s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-0e30fc82960c1af7)
+
+running 22 tests
+test kernel::frame_inventory::tests::duplicate_mapping_inside_one_reserved_batch_is_rejected_atomically ... ok
+test kernel::frame_inventory::tests::every_event_failpoint_rolls_back_the_whole_batch ... ok
+test kernel::frame_inventory::tests::provenance_entropy_batch_discards_inherited_and_failed_bytes ... ok
+test kernel::frame_inventory::tests::protect_then_atomic_unmap_retire_advances_generation_and_reclaims_rows ... ok
+test kernel::frame_inventory::tests::one_frame_can_join_aliases_from_distinct_mms ... ok
+test kernel::frame_inventory::tests::kernel_apply_receipt_is_opaque_mm_and_mapping_frame_exact ... ok
+test kernel::frame_inventory::tests::per_mm_mapping_counts_track_the_mapping_table ... ok
+test kernel::frame_inventory::tests::guessed_ids_cannot_forge_a_reserved_transaction_capability ... ok
+test kernel::frame_inventory::tests::invalid_lifecycle_ordering_and_duplicate_mapping_roll_back_exactly ... ok
+test kernel::frame_inventory::tests::rejects_an_unreserved_new_frame_even_with_a_reserved_mapping ... ok
+test kernel::frame_inventory::tests::rejects_duplicate_transaction_generation_length_order_and_cross_mm_reuse ... ok
+test kernel::frame_inventory::tests::sparse_40_gib_extent_stays_one_k1_frame_and_mapping ... ok
+test kernel::frame_inventory::tests::provenance_entropy_batch_refills_once_per_eight_tokens ... ok
+test kernel::frame_inventory::tests::unpublished_prepare_rolls_back_without_revision_or_join_changes ... ok
+test kernel::frame_inventory::tests::unused_candidate_ids_burn_in_the_runtime_registry ... ok
+test kernel::frame_inventory::tests::unpublished_apply_receipt_rolls_back_only_its_exact_mm_mappings ... ok
+test kernel::frame_inventory::tests::retirement_emptiness_is_decided_under_the_applying_lock ... ok
+test kernel::frame_inventory::tests::shared_frame_aliases_and_copied_frames_have_exact_sorted_joins ... ok
+test kernel::frame_inventory::tests::published_mapping_can_split_into_exact_subranges_of_the_same_frame ... ok
+test kernel::frame_inventory::tests::retirement_batch_query_matches_point_queries_across_shared_and_private_frames ... ok
+test kernel::frame_inventory::tests::completed_mapping_churn_reclaims_rows_and_provenance ... ok
+test kernel::frame_inventory::tests::high_alias_frame_keeps_constant_size_apply_state ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 2329 filtered out; finished in 0.02s
+

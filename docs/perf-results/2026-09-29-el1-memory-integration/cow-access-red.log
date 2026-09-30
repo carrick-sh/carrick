@@ -1,0 +1,41 @@
+   Compiling carrick-mmu-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mmu-core)
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.08s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-795688a8226b9d93)
+
+running 16 tests
+test aarch64::descriptor_txn::copy_window::tests::cow_copy_aliases_are_scoped_kernel_only_and_removed_before_completion ... ok
+
+thread 'aarch64::descriptor_txn::tests::executor::cow_backend_user_preserves_denied_and_invalid_neighbors' (34713251) panicked at crates/carrick-mmu-core/src/aarch64/descriptor_txn.rs:2582:26:
+expected an applied outcome, got Refused(NotCowArmed)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test aarch64::descriptor_txn::copy_window::tests::cow_copy_aliases_at_the_same_va_are_private_to_each_mm_root ... ok
+test aarch64::descriptor_txn::copy_window::tests::cow_copy_aliases_refuse_busy_slots_and_roll_back_partial_mapping ... ok
+test aarch64::descriptor_txn::tests::cow_receipt_names_the_exact_repoint_for_the_backing_adapter ... ok
+test aarch64::descriptor_txn::copy_window::tests::cow_copy_aliases_report_failed_revocation_as_indeterminate ... ok
+test aarch64::descriptor_txn::tests::executor::cow_compound_preserves_readonly_prot_none_and_prepared_neighbors ... ok
+
+thread 'aarch64::descriptor_txn::tests::executor::cow_kernel_repoint_never_grants_el0_access' (34713255) panicked at crates/carrick-mmu-core/src/aarch64/descriptor_txn.rs:2582:26:
+expected an applied outcome, got Refused(NotCowArmed)
+test aarch64::descriptor_txn::tests::executor::a_guest_cow_copy_is_exact_and_only_from_the_still_shared_frame ... ok
+test aarch64::tests::allocation_free_guest_cow_resolution_never_upgrades_shared_leaf_and_detects_stale_tlb ... ok
+test aarch64::descriptor_txn::tests::executor::cow_compound_refuses_overlapping_copy_extents ... ok
+test aarch64::descriptor_txn::tests::executor::cow_repoint_commits_the_compound_under_one_journal ... ok
+test aarch64::descriptor_txn::tests::executor::cow_repoint_installs_the_private_copy_and_restores_write ... ok
+test aarch64::descriptor_txn::tests::executor::cow_backend_user_preserves_denied_and_invalid_neighbors ... FAILED
+test aarch64::descriptor_txn::tests::executor::cow_kernel_repoint_never_grants_el0_access ... FAILED
+test aarch64::descriptor_txn::tests::executor::cow_compound_failure_restores_every_original_leaf ... ok
+test aarch64::tests::kernel_cow_arm_and_alias_preserve_el1_only_access ... ok
+test aarch64::tests::compound_cow_repoint_preserves_mixed_semantic_permissions ... ok
+
+failures:
+
+failures:
+    aarch64::descriptor_txn::tests::executor::cow_backend_user_preserves_denied_and_invalid_neighbors
+    aarch64::descriptor_txn::tests::executor::cow_kernel_repoint_never_grants_el0_access
+
+test result: FAILED. 14 passed; 2 failed; 0 ignored; 0 measured; 146 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

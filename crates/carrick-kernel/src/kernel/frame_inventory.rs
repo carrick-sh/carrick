@@ -565,14 +565,32 @@ impl FrameInventoryAuthority {
         gpa: Gpa,
         length: FrameLength,
     ) -> bool {
+        self.mapping_live_revision(mm, mapping, frame, gpa, length)
+            .is_some()
+    }
+
+    /// O(1) exact live-row authentication and its inventory revision under one
+    /// lock. Existing COW replacement lanes need no new inventory publication.
+    pub fn mapping_live_revision(
+        &self,
+        mm: MmId,
+        mapping: MappingId,
+        frame: FrameId,
+        gpa: Gpa,
+        length: FrameLength,
+    ) -> Option<u64> {
         let state = self.state.lock();
-        state.mappings.get(&mapping).is_some_and(|entry| {
-            entry.state == MappingState::Published
-                && entry.mm == mm
-                && entry.frame == frame
-                && entry.gpa == gpa
-                && entry.length == length
-        })
+        state
+            .mappings
+            .get(&mapping)
+            .filter(|entry| {
+                entry.state == MappingState::Published
+                    && entry.mm == mm
+                    && entry.frame == frame
+                    && entry.gpa == gpa
+                    && entry.length == length
+            })
+            .map(|_| state.revision)
     }
 
     /// Exact point query tied to the same global inventory revision carried by
@@ -587,15 +605,7 @@ impl FrameInventoryAuthority {
         gpa: Gpa,
         length: FrameLength,
     ) -> bool {
-        let state = self.state.lock();
-        state.revision == revision
-            && state.mappings.get(&mapping).is_some_and(|entry| {
-                entry.state == MappingState::Published
-                    && entry.mm == mm
-                    && entry.frame == frame
-                    && entry.gpa == gpa
-                    && entry.length == length
-            })
+        self.mapping_live_revision(mm, mapping, frame, gpa, length) == Some(revision)
     }
 
     /// Live mappings naming `frame`, across every mm; `None` once the frame

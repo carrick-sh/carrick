@@ -397,6 +397,44 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         Ok((receipt, owner_generation))
     }
 
+    fn authenticate_frame_backing(
+        &self,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        gpa: carrick_guest_mem::Gpa,
+        length: carrick_hal::FrameLength,
+    ) -> Result<
+        (
+            std::num::NonZeroU64,
+            carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let owner = self.owner_inventory.retain_current(gpa, length)?;
+        let revision = self
+            .kernel
+            .frame_inventory()
+            .mapping_live_revision(self.mm, mapping, frame, gpa, length)
+            .filter(|_| owner.is_current())
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                std::io::Error::other("COW destination mapping or owner is not current")
+            })?;
+        let nonzero = |value| {
+            std::num::NonZeroU64::new(value)
+                .ok_or_else(|| std::io::Error::other("COW destination has a zero identity"))
+        };
+        Ok((
+            nonzero(self.mm.raw())?,
+            carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                frame_id: nonzero(frame.raw())?,
+                mapping_id: nonzero(mapping.raw())?,
+                owner_generation: nonzero(owner.generation().raw_for_probe())?,
+                inventory_revision: revision,
+            },
+        ))
+    }
+
     fn rollback_frame_grant(
         &self,
         receipt: &carrick_hal::FrameInventoryApplyReceipt,
@@ -3642,9 +3680,31 @@ mod tests {
             length,
         ));
 
+        let (authenticated_mm, existing) = authority
+            .authenticate_frame_backing(mapping, frame, gpa, length)
+            .expect("authenticate existing COW destination without a new grant");
+        assert_eq!(authenticated_mm.get(), mm.raw());
+        assert_eq!(existing.mapping_id.get(), mapping.raw());
+        assert_eq!(existing.frame_id.get(), frame.raw());
+        assert_eq!(
+            existing.owner_generation.get(),
+            current_owner.raw_for_probe()
+        );
+        assert_eq!(existing.inventory_revision.get(), receipt.revision());
+        assert!(
+            authority
+                .authenticate_frame_backing(mapping, frame, Gpa(gpa.0 + 4096), length)
+                .is_err()
+        );
+
         authority
             .rollback_frame_grant(&receipt)
             .expect("roll back unpublished frame grant");
+        assert!(
+            authority
+                .authenticate_frame_backing(mapping, frame, gpa, length)
+                .is_err()
+        );
         assert!(
             !kernel
                 .frame_inventory()

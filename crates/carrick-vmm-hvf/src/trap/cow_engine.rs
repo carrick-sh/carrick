@@ -2611,18 +2611,6 @@ impl HvfTaskState {
             }
             shape?
         };
-        if guest_lane
-            && (span.kernel_only
-                || intent != carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
-                || matches!(
-                    old_inventory_extent.backing,
-                    InventoryBackingIdentity::PrivateFileView(_)
-                ))
-        {
-            return Err(TrapError::Hypervisor(
-                "guest COW writer shape is not yet converted".to_owned(),
-            ));
-        }
         let old_frame = old_inventory_extent.frame;
         // Resolve every authority needed for stage-1 publication before the
         // first physical/staged-inventory mutation.  A fork-time response can
@@ -2695,7 +2683,7 @@ impl HvfTaskState {
             .map_err(|error| {
                 TrapError::Hypervisor(format!("reserve frame COW inventory: {error}"))
             })?;
-        let guest_reservation = if guest_lane {
+        let guest_reservation = if guest_lane && fresh_destination {
             Some(authority.reserve(1, 1, 2).map_err(|error| {
                 TrapError::Hypervisor(format!("reserve guest COW grant: {error}"))
             })?)
@@ -2880,6 +2868,41 @@ impl HvfTaskState {
         } else {
             None
         };
+        let guest_identity = if guest_lane {
+            if let Some(grant) = guest_backing.as_ref() {
+                Some(grant.backing()?)
+            } else {
+                let extent = reused_extent.ok_or_else(|| {
+                    TrapError::Hypervisor("guest COW has no destination owner".to_owned())
+                })?;
+                let length = carrick_hal::FrameLength::from_mapping_extent(
+                    std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE)
+                        .ok_or_else(|| TrapError::Hypervisor("zero COW compound".to_owned()))?,
+                );
+                let (mm, backing) = authority
+                    .authenticate_frame_backing(
+                        extent.mapping,
+                        extent.frame,
+                        carrick_guest_mem::Gpa(new_physical_ipa),
+                        length,
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("authenticate reused COW backing: {error}"))
+                    })?;
+                if mm.get() != identity.mm
+                    || backing.mapping_id.get() != extent.mapping.raw()
+                    || backing.frame_id.get() != extent.frame.raw()
+                    || backing.owner_generation.get() != owner_generation
+                {
+                    return Err(TrapError::Hypervisor(
+                        "reused COW backing identity mismatch".to_owned(),
+                    ));
+                }
+                Some(backing)
+            }
+        } else {
+            None
+        };
         let split = match HvfVmState::stage_cow_inventory_split(
             &mut reservation,
             old_inventory_key,
@@ -2953,18 +2976,36 @@ impl HvfTaskState {
         // Journal this transaction's descriptor pre-images rather than
         // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let mut preserved_protection_receipt = None;
-        let page_table_result = if let Some(grant) = guest_backing.as_ref() {
+        let page_table_result = if let Some(backing) = guest_identity {
             (|| -> Result<(), TrapError> {
+                use carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess;
+                let access = if span.kernel_only {
+                    CowRepointAccess::Kernel
+                } else {
+                    let mut writable_pages = 0_u8;
+                    for index in 0..(span.len as u64 / PAGE_SIZE) {
+                        if source_guest_writable
+                            && !self
+                                .protections
+                                .range_write_denied(span.va + index * PAGE_SIZE, 1)
+                        {
+                            writable_pages |= 1 << index;
+                        }
+                    }
+                    CowRepointAccess::User { writable_pages }
+                };
                 let tables = self.page_tables_authority();
                 let txn = tables
                     .prepare_guest_descriptor_txn(
-                        grant.receipt.mm(),
+                        std::num::NonZeroU64::new(identity.mm)
+                            .ok_or_else(|| TrapError::Hypervisor("zero COW MM".to_owned()))?,
                         carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
+                            access,
                             va: span.va,
                             len: span.len as u64,
                             old_ipa: carrick_mmu_core::aarch64::SubstrateGpa(old_ipa),
                             new_ipa: carrick_mmu_core::aarch64::SubstrateGpa(new_ipa),
-                            backing: grant.backing()?,
+                            backing,
                         },
                     )
                     .map_err(|error| {
@@ -2981,6 +3022,42 @@ impl HvfTaskState {
                         "hvpatch::cow",
                         "guest COW receipt names another transaction"
                     );
+                }
+                // Maintenance can repoint a still-invalid page. Retain the
+                // same exact-leaf receipt consumed by the later protection
+                // publication, after authenticating EL1's completion.
+                if frame_cow_preserves_guest_protection(intent) {
+                    let live = tables
+                        .with_manager(|manager| {
+                            let resolver =
+                                self.page_table_resolver(manager.base(), Some(page_table_host));
+                            // SAFETY: exact-MM exclusion and source/destination
+                            // custody remain held until backing commit below.
+                            unsafe { manager.debug_walk_host(resolver, receipt_va) }
+                        })
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "hvpatch::cow",
+                                "completed guest COW lost its page tables"
+                            )
+                        })
+                        .unwrap_or_else(|error| {
+                            carrick_fatal!(
+                                "hvpatch::cow",
+                                "completed guest COW cannot read its leaf: {error:?}"
+                            )
+                        });
+                    let leaf = live[3];
+                    let expected_ipa = new_ipa + (receipt_va - span.va);
+                    if leaf & 0x0000_FFFF_FFFF_F000 != expected_ipa {
+                        carrick_fatal!(
+                            "hvpatch::cow",
+                            "completed guest COW leaf names another backing"
+                        )
+                    }
+                    preserved_protection_receipt =
+                        Some((receipt_va, leaf, expected_ipa, leaf & (0b11 << 6)));
+                    crate::probes::pt_alias_walk(receipt_va, live, 1 << 3);
                 }
                 Ok(())
             })()

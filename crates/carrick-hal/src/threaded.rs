@@ -2474,6 +2474,28 @@ pub trait FrameCowAuthority: Send + Sync {
         )))
     }
 
+    /// Authenticate an already-published replacement lane without creating a
+    /// second grant. The caller retains exact-MM exclusion and the destination
+    /// owner pin through EL1 completion; the authority checks the kernel row
+    /// and independently retained physical owner at the returned revision.
+    fn authenticate_frame_backing(
+        &self,
+        _mapping: crate::MappingId,
+        _frame: crate::FrameId,
+        _gpa: carrick_guest_mem::Gpa,
+        _length: crate::FrameLength,
+    ) -> Result<
+        (
+            std::num::NonZeroU64,
+            carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        Err(Box::new(std::io::Error::other(
+            "frame authority cannot authenticate existing backing",
+        )))
+    }
+
     /// Roll back a frame grant whose inventory became live but whose guest
     /// leaf was never published. The opaque receipt prevents a backend from
     /// choosing which MM or mapping the kernel removes.
