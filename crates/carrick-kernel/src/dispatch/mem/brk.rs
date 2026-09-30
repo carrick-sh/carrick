@@ -66,10 +66,10 @@ impl<'a> MemView<'a> {
                         return Ok(DispatchOutcome::returned_u64(current)?);
                     };
                     let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
-                    if cx.memory.protect_range(grow_start, grow_len, rw).is_err() {
+                    if let Err(error) = cx.memory.protect_range(grow_start, grow_len, rw) {
                         carrick_fatal!(
                             "dispatch::brk",
-                            "protect_range failed during brk heap expansion"
+                            "protect_range failed during brk heap expansion 0x{grow_start:x}+0x{grow_len:x}: {error}"
                         );
                     }
                     cx.memory.set_mapping_protection(grow_start, grow_len, false, false);

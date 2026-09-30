@@ -67,6 +67,9 @@ struct Stage1AuthorityInner {
     live_owner: LiveDescriptorOwner,
     /// Last guest descriptor transaction generation issued for this MM.
     txn_generation: u64,
+    /// The guest lane was admitted for this MM before its live backing was
+    /// bound; `bind_live_backing` completes the selection.
+    guest_lane_pending: bool,
 }
 
 impl Drop for Stage1AuthorityInner {
@@ -222,6 +225,7 @@ impl Stage1Authority {
                 image_pool,
                 live_owner: LiveDescriptorOwner::Host,
                 txn_generation: 0,
+                guest_lane_pending: false,
             })),
         }
     }
@@ -230,26 +234,52 @@ impl Stage1Authority {
     ///
     /// # Safety
     /// `resolver` must uphold the safety contracts of `HostArenaResolver`.
-    pub unsafe fn bind_live_backing(&self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
+    ///
+    /// Returns `true` when this binding completed a guest lane selection
+    /// that was admitted before the backing existed.
+    pub unsafe fn bind_live_backing(
+        &self,
+        resolver: Arc<dyn HostArenaResolver + Send + Sync>,
+    ) -> bool {
         let mut inner = self.inner.lock();
         inner.host_resolver = Some(Arc::clone(&resolver));
+        let promote = inner.guest_lane_pending
+            && inner.live_owner == LiveDescriptorOwner::Host
+            && inner
+                .manager
+                .as_ref()
+                .is_none_or(|manager| !manager.has_unsynced_edits());
         if let Some(manager) = inner.manager.as_mut() {
             unsafe { manager.make_live(resolver) };
+            if promote {
+                manager.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+            }
         }
+        if promote {
+            inner.live_owner = LiveDescriptorOwner::Guest;
+            inner.guest_lane_pending = false;
+        }
+        promote
     }
 
     /// Create the `Exclusive` authority of a forked child around its private
     /// image. The child shares this authority's image pool, so its image
     /// returns to the parent's pool when the child retires.
     pub fn child_with_manager(&self, manager: PageTableManager) -> Self {
-        let (image_pool, live_owner) = {
+        let (image_pool, live_owner, pending) = {
             let inner = self.inner.lock();
-            (Arc::clone(&inner.image_pool), inner.live_owner)
+            (
+                Arc::clone(&inner.image_pool),
+                inner.live_owner,
+                inner.guest_lane_pending,
+            )
         };
         let child = Self::with_pool(Some(manager), image_pool);
         // The child's image was built and published offline; once live, it
-        // belongs to the same lane as its parent.
+        // belongs to the same lane as its parent, including a parent whose
+        // guest selection still awaits its live backing.
         child.select_live_descriptor_owner(live_owner);
+        child.inner.lock().guest_lane_pending = pending;
         child
     }
 
@@ -273,6 +303,41 @@ impl Stage1Authority {
         if let Some(manager) = inner.manager.as_mut() {
             manager.set_live_descriptor_owner(owner);
         }
+    }
+
+    /// Select the guest-owned lane only when EL1 can edit the exact tables
+    /// the host reads: the authority must hold a live host resolver, and an
+    /// installed manager is made live on it, so every host walk and every
+    /// transaction plan reads the hardware-visible descriptors EL1 edits
+    /// rather than an owned copy last synced by a host edit. Without a
+    /// resolver, or with host edits not yet synced, the lane is refused and
+    /// stays host-owned.
+    pub fn select_guest_descriptor_owner(&self) -> Result<GuestLaneSelection, GuestLaneRefusal> {
+        let mut inner = self.inner.lock();
+        if inner.live_owner == LiveDescriptorOwner::Guest {
+            return Ok(GuestLaneSelection::Selected);
+        }
+        let Some(resolver) = inner.host_resolver.clone() else {
+            // Admitted before the MM's live backing exists (an initial
+            // runner prepared on a handoff engine): `bind_live_backing`
+            // completes the selection once EL1 and the host share tables.
+            inner.guest_lane_pending = true;
+            return Ok(GuestLaneSelection::Deferred);
+        };
+        if let Some(manager) = inner.manager.as_mut() {
+            if manager.has_unsynced_edits() {
+                // Never discard a host edit that has not reached hardware.
+                return Err(GuestLaneRefusal::UnsyncedEdits);
+            }
+            if !manager.is_live() {
+                // SAFETY: the resolver was bound through `bind_live_backing`,
+                // whose caller authenticated it for this authority's arenas.
+                unsafe { manager.make_live(resolver) };
+            }
+            manager.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        }
+        inner.live_owner = LiveDescriptorOwner::Guest;
+        Ok(GuestLaneSelection::Selected)
     }
 
     /// The venue that owns this address space's live descriptor stores.
@@ -1030,6 +1095,28 @@ pub fn protection_terminal_rules(
     }
     push(cursor, end, rule(false));
     plan
+}
+
+/// An admitted guest descriptor lane selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestLaneSelection {
+    /// EL1 owns the MM's live descriptors now.
+    Selected,
+    /// Awaiting the MM's live backing; completed by `bind_live_backing`.
+    Deferred,
+}
+
+/// Why a guest descriptor lane selection was refused (the MM stays on the
+/// host-owned lane).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestLaneRefusal {
+    /// The build's writer census does not admit the lane.
+    Census,
+    /// No live host resolver is bound, so EL1 and the host would not edit
+    /// and read the same descriptors.
+    NoLiveResolver,
+    /// Host edits are staged but not synced to hardware.
+    UnsyncedEdits,
 }
 
 pub struct Stage1Editor<'a> {
@@ -2221,6 +2308,70 @@ mod tests {
         fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
             (*self).host_const_ptr_for_base(base)
         }
+    }
+
+    /// Guest lane selection needs EL1 and the host to edit and read the same
+    /// descriptors. Admitted before the MM's live backing exists, it is
+    /// deferred and completed by `bind_live_backing`; a child forked in
+    /// between inherits the pending selection; host edits not yet synced
+    /// refuse promotion rather than being discarded.
+    #[test]
+    fn guest_lane_selection_waits_for_live_backing_and_never_drops_unsynced_edits() {
+        let resolver = || {
+            Arc::new(BufferResolver {
+                buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
+                base: LINUX_PAGE_TABLES_BASE,
+            }) as Arc<dyn HostArenaResolver + Send + Sync>
+        };
+
+        let authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        assert_eq!(
+            authority.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Deferred)
+        );
+        assert_eq!(authority.live_descriptor_owner(), LiveDescriptorOwner::Host);
+        let child = authority.child_with_manager(test_manager());
+        assert!(unsafe { authority.bind_live_backing(resolver()) });
+        assert_eq!(
+            authority.live_descriptor_owner(),
+            LiveDescriptorOwner::Guest
+        );
+        assert_eq!(
+            authority.with_manager(|m| (m.is_live(), m.live_descriptor_owner())),
+            Some((true, LiveDescriptorOwner::Guest))
+        );
+        assert!(
+            unsafe { child.bind_live_backing(resolver()) },
+            "a child forked while the selection was pending completes it too"
+        );
+        assert!(
+            !unsafe { authority.bind_live_backing(resolver()) },
+            "only the first binding completes a selection"
+        );
+
+        // Already bound: the selection is immediate.
+        let bound = Stage1Authority::new_with_manager(Some(test_manager()));
+        assert!(!unsafe { bound.bind_live_backing(resolver()) });
+        assert_eq!(
+            bound.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Selected)
+        );
+
+        // A bound authority whose owned manager holds unsynced host edits is
+        // refused: making it live would discard them.
+        let mut staged = test_manager();
+        staged.set_prot_none(LINUX_MMAP_BASE, 0x1000, None).unwrap();
+        assert!(
+            staged.has_unsynced_edits(),
+            "fixture must hold unsynced edits"
+        );
+        let dirty = Stage1Authority::new_with_manager(Some(staged));
+        dirty.inner.lock().host_resolver = Some(resolver());
+        assert_eq!(
+            dirty.select_guest_descriptor_owner(),
+            Err(GuestLaneRefusal::UnsyncedEdits)
+        );
+        assert_eq!(dirty.live_descriptor_owner(), LiveDescriptorOwner::Host);
     }
 
     #[test]

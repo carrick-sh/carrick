@@ -2733,6 +2733,16 @@ fn el1_fork_cow_resolves_in_guest() {
         let cow = carrick_embed::host_cow_snapshot()
             .checked_delta(&cow_before)
             .expect("host COW ledger must be complete and belong to the same carrier");
+        // Which lane the workload's MMs actually ran on: a host-resolved COW
+        // count means little without knowing the guest lane was selected.
+        println!(
+            "el1-sched fork-cow pages={pages} guest_lane_selected={} guest_lane_refused={} \
+             refused[census,no_resolver,unsynced]={:?} deferred={}",
+            cow.guest_lane_selected,
+            cow.guest_lane_refused,
+            cow.guest_lane_refused_reasons,
+            cow.guest_lane_deferred
+        );
         let grants_after = carrick_embed::el1_frame_grant_stats();
         let faults_after = read_el1_counters().map_or(0, |c| {
             c.fault_taken.load(std::sync::atomic::Ordering::Relaxed)

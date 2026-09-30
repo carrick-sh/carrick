@@ -886,6 +886,17 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Vec::new()
     }
 
+    /// Record whether a lane selection made EL1 the owner of this MM's live
+    /// descriptors, in the backend's carrier-scoped accounting.
+    fn record_guest_descriptor_lane(
+        &self,
+        _outcome: Result<
+            crate::stage1_authority::GuestLaneSelection,
+            crate::stage1_authority::GuestLaneRefusal,
+        >,
+    ) {
+    }
+
     fn bind_frame_cow(
         &mut self,
         _authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,

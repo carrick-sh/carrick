@@ -652,15 +652,22 @@ impl MmAccessState {
         self.page_tables.read().clone()
     }
 
+    /// A live binding that completed a deferred guest lane selection is a
+    /// selection of this carrier's MM.
+    fn record_guest_lane_promotion(&self, promoted: bool) {
+        if promoted {
+            self.host_cow_stats.record_guest_lane_selected();
+        }
+    }
+
     pub(crate) fn set_live_resolver(
         &self,
         resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
     ) {
         *self.live_resolver.write() = Some(std::sync::Arc::clone(&resolver));
         // SAFETY: `resolver` is authenticated by the caller/live state.
-        unsafe {
-            self.page_tables.read().bind_live_backing(resolver);
-        }
+        let promoted = unsafe { self.page_tables.read().bind_live_backing(resolver) };
+        self.record_guest_lane_promotion(promoted);
     }
 
     pub(crate) fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {
@@ -671,9 +678,9 @@ impl MmAccessState {
         page_tables.adopt_unshared_predecessor(&previous);
         if let Some(ref resolver) = *self.live_resolver.read() {
             // SAFETY: `resolver` was authenticated when stored in `self.live_resolver`.
-            unsafe {
-                page_tables.bind_live_backing(std::sync::Arc::clone(resolver));
-            }
+            let promoted =
+                unsafe { page_tables.bind_live_backing(std::sync::Arc::clone(resolver)) };
+            self.record_guest_lane_promotion(promoted);
         }
         if cow_refusal_diagnostics_enabled() && !previous.shares_exact_authority(&page_tables) {
             let old_root = previous.root_base();

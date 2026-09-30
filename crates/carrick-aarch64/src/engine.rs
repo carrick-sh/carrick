@@ -4069,7 +4069,17 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.page_tables.live_descriptor_owner()
     }
 
+    fn record_guest_descriptor_lane_census_refusal(&self) {
+        self.vm
+            .record_guest_descriptor_lane(Err(crate::stage1_authority::GuestLaneRefusal::Census));
+    }
+
     fn select_live_descriptor_owner(&mut self, owner: LiveDescriptorOwner) -> bool {
+        if owner == LiveDescriptorOwner::Guest {
+            let outcome = self.page_tables.select_guest_descriptor_owner();
+            self.vm.record_guest_descriptor_lane(outcome);
+            return outcome == Ok(crate::stage1_authority::GuestLaneSelection::Selected);
+        }
         self.page_tables.select_live_descriptor_owner(owner);
         true
     }

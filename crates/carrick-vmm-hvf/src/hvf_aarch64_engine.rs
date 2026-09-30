@@ -46,6 +46,12 @@ pub struct HostCowStats {
 struct HostCowLedgerInner {
     host_cow_resolutions: std::sync::atomic::AtomicU64,
     admitted_mms: std::sync::atomic::AtomicU64,
+    guest_lane_selected: std::sync::atomic::AtomicU64,
+    guest_lane_refused: std::sync::atomic::AtomicU64,
+    guest_lane_refused_census: std::sync::atomic::AtomicU64,
+    guest_lane_refused_no_resolver: std::sync::atomic::AtomicU64,
+    guest_lane_refused_unsynced: std::sync::atomic::AtomicU64,
+    guest_lane_deferred: std::sync::atomic::AtomicU64,
 }
 
 /// Carrier-owned host COW accounting. Each carrier custody owns exactly one;
@@ -75,6 +81,16 @@ pub struct HostCowSnapshot {
     /// MMs admitted to the carrier; a delta of zero means the workload never
     /// created an MM, so a zero resolution delta would prove nothing.
     pub admitted_mms: u64,
+    /// Lane selections (initial runner, exec) that made EL1 the owner of an
+    /// MM's live descriptors, and ones refused because the precondition or
+    /// the live binding did not admit it.
+    pub guest_lane_selected: u64,
+    pub guest_lane_refused: u64,
+    /// Refusals by reason (census, no live resolver, unsynced host edits).
+    pub guest_lane_refused_reasons: [u64; 3],
+    /// Selections admitted before the MM's live backing existed; each is
+    /// counted again in `guest_lane_selected` when the binding completes it.
+    pub guest_lane_deferred: u64,
 }
 
 impl HostCowSnapshot {
@@ -91,7 +107,36 @@ impl HostCowSnapshot {
                 .host_cow_resolutions
                 .checked_sub(before.host_cow_resolutions)?,
             admitted_mms: self.admitted_mms.checked_sub(before.admitted_mms)?,
+            guest_lane_selected: self
+                .guest_lane_selected
+                .checked_sub(before.guest_lane_selected)?,
+            guest_lane_refused: self
+                .guest_lane_refused
+                .checked_sub(before.guest_lane_refused)?,
+            guest_lane_refused_reasons: [
+                self.guest_lane_refused_reasons[0]
+                    .checked_sub(before.guest_lane_refused_reasons[0])?,
+                self.guest_lane_refused_reasons[1]
+                    .checked_sub(before.guest_lane_refused_reasons[1])?,
+                self.guest_lane_refused_reasons[2]
+                    .checked_sub(before.guest_lane_refused_reasons[2])?,
+            ],
+            guest_lane_deferred: self
+                .guest_lane_deferred
+                .checked_sub(before.guest_lane_deferred)?,
         })
+    }
+}
+
+impl HostCowStats {
+    /// Credit a guest lane selection completed for this MM to its carrier
+    /// ledger (a detached MM has none).
+    pub(crate) fn record_guest_lane_selected(&self) {
+        if let Some(ledger) = &self.ledger {
+            ledger.record_guest_lane(Ok(
+                carrick_aarch64::stage1_authority::GuestLaneSelection::Selected,
+            ));
+        }
     }
 }
 
@@ -103,7 +148,50 @@ impl HostCowLedger {
             complete: true,
             host_cow_resolutions: self.inner.host_cow_resolutions.load(Ordering::Relaxed),
             admitted_mms: self.inner.admitted_mms.load(Ordering::Relaxed),
+            guest_lane_selected: self.inner.guest_lane_selected.load(Ordering::Relaxed),
+            guest_lane_refused: self.inner.guest_lane_refused.load(Ordering::Relaxed),
+            guest_lane_refused_reasons: [
+                self.inner.guest_lane_refused_census.load(Ordering::Relaxed),
+                self.inner
+                    .guest_lane_refused_no_resolver
+                    .load(Ordering::Relaxed),
+                self.inner
+                    .guest_lane_refused_unsynced
+                    .load(Ordering::Relaxed),
+            ],
+            guest_lane_deferred: self.inner.guest_lane_deferred.load(Ordering::Relaxed),
         }
+    }
+
+    /// Record one guest descriptor lane selection outcome for an MM of this
+    /// carrier.
+    pub(crate) fn record_guest_lane(
+        &self,
+        outcome: Result<
+            carrick_aarch64::stage1_authority::GuestLaneSelection,
+            carrick_aarch64::stage1_authority::GuestLaneRefusal,
+        >,
+    ) {
+        use carrick_aarch64::stage1_authority::{GuestLaneRefusal, GuestLaneSelection};
+        use std::sync::atomic::Ordering;
+        let inner = &self.inner;
+        match outcome {
+            Ok(GuestLaneSelection::Selected) => {
+                inner.guest_lane_selected.fetch_add(1, Ordering::Relaxed)
+            }
+            Ok(GuestLaneSelection::Deferred) => {
+                inner.guest_lane_deferred.fetch_add(1, Ordering::Relaxed)
+            }
+            Err(reason) => {
+                inner.guest_lane_refused.fetch_add(1, Ordering::Relaxed);
+                match reason {
+                    GuestLaneRefusal::Census => &inner.guest_lane_refused_census,
+                    GuestLaneRefusal::NoLiveResolver => &inner.guest_lane_refused_no_resolver,
+                    GuestLaneRefusal::UnsyncedEdits => &inner.guest_lane_refused_unsynced,
+                }
+                .fetch_add(1, Ordering::Relaxed)
+            }
+        };
     }
 
     /// Admit one MM: the returned handle credits this ledger.
@@ -2086,6 +2174,19 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         len: usize,
     ) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
         self.state.armed_frame_cow_ranges(va, len)
+    }
+
+    fn record_guest_descriptor_lane(
+        &self,
+        outcome: Result<
+            carrick_aarch64::stage1_authority::GuestLaneSelection,
+            carrick_aarch64::stage1_authority::GuestLaneRefusal,
+        >,
+    ) {
+        self.state
+            .custody()
+            .host_cow_ledger
+            .record_guest_lane(outcome);
     }
 
     fn bind_frame_cow(
