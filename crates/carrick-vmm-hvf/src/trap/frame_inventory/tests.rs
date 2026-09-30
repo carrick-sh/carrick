@@ -849,6 +849,51 @@ fn root_exec_test_plan() -> GuestMappingPlan {
     }
 }
 
+/// The image's EL1 region is a kernel-only persistent carrier mapping, so
+/// exec rebuild remaps it with `map_kernel_aliased`. That remap must not
+/// replace the idle EL1 COW copy window with a kernel block: EL1 would then
+/// refuse every guest COW copy in the rebuilt MM (`CopyWindowAbsent`).
+#[test]
+fn exec_rebuild_keeps_the_el1_cow_copy_window_idle() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let mut plan = root_exec_test_plan();
+    plan.mappings.push(exec_mapping_for_order(
+        carrick_mem::memory::LINUX_EL1_KERNEL_BASE,
+        carrick_mem::memory::LINUX_EL1_KERNEL_SIZE,
+    ));
+    let input = carrick_mmu_core::aarch64::PageTableManager::new(
+        plan.mappings[1].image.as_ref().clone(),
+        crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    assert!(input.cow_copy_window_is_idle(), "fixture boot image");
+    let GlobalExecPlan { plan: rebuilt, .. } = prepare_global_exec_plan(&plan, None).unwrap();
+    let root = rebuilt.stage1_page_tables_base.unwrap();
+    let table = rebuilt
+        .mappings
+        .iter()
+        .find(|mapping| mapping.ipa_start == root)
+        .expect("rebuilt table mapping");
+    let rebuilt_tables = carrick_mmu_core::aarch64::PageTableManager::new(
+        table.image.as_ref().clone(),
+        root,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    assert!(
+        rebuilt_tables.cow_copy_window_is_idle(),
+        "exec rebuild lost the EL1 COW copy window: {:x?}",
+        [
+            rebuilt_tables.debug_walk(carrick_el1_abi::EL1_COW_COPY_BASE),
+            rebuilt_tables.debug_walk(carrick_el1_abi::EL1_COW_COPY_BASE + 0x1000),
+        ]
+    );
+    assert_eq!(
+        rebuilt_tables.translate(carrick_el1_abi::EL1_COW_COPY_BASE - 0x1000),
+        Some(carrick_el1_abi::EL1_COW_COPY_BASE - 0x1000),
+        "the rest of the EL1 region stays mapped"
+    );
+}
+
 #[test]
 fn root_exec_plan_owns_every_materialized_stage2_extent() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
