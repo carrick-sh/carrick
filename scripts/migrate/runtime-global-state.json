@@ -92,7 +92,7 @@
     {
       "kind": "env_var",
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "symbol": "mmap::CARRICK_MINCORE_EXACT",
+      "symbol": "mmap_served::CARRICK_MINCORE_EXACT",
       "fingerprint": "4a6206a3e2aa3f4e04f5c34445cd1c90feb37bd6c3bd184e83a49cad3b165ad6",
       "classification": "config_debug",
       "rationale": "CARRICK_MINCORE_EXACT is the bisection hatch for first-touch residency observation, which arms a fault on each private anonymous page so mincore(2) can tell a written page from an untouched one. Default ON; =0 restores the previous behaviour, where every page of a live VMA reported resident. Read-only configuration selecting whether the arm runs; it carries no per-process state, so it is carrier-wide by construction and cannot be a scope defect."
@@ -692,10 +692,10 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "symbol": "mremap::CARRICK_FAULT_DEBUG",
+      "symbol": "mremap_served::CARRICK_FAULT_DEBUG",
       "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in mremap::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/dispatch/mem/mmap.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in mremap_served::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/dispatch/mem/mmap.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var_os",
