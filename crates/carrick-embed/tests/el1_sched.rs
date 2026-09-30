@@ -3018,11 +3018,11 @@ fn el1_delegated_root_concurrent_vma_ops() {
         runs.push((rounds, forwarded));
     }
     for pair in runs.windows(2) {
-        for i in 0..3 {
+        for (i, (name, _)) in DELEGATED_SYSCALLS.iter().enumerate() {
             assert_eq!(
                 pair[1].1[i], pair[0].1[i],
-                "forwarded {} grew with rounds {}->{} ({} -> {}): per-call forwarding on a delegated MM",
-                DELEGATED_SYSCALLS[i].0, pair[0].0, pair[1].0, pair[0].1[i], pair[1].1[i]
+                "forwarded {name} grew with rounds {}->{} ({} -> {}): per-call forwarding on a delegated MM",
+                pair[0].0, pair[1].0, pair[0].1[i], pair[1].1[i]
             );
         }
     }
