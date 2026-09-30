@@ -2211,6 +2211,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.roll_back_el1_frame_grant(grant)
     }
 
+    fn complete_el1_frame_grant(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<(), TrapError> {
+        self.state.complete_el1_frame_grant(grant)
+    }
+
     fn refresh_fork_process_state(
         &mut self,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,

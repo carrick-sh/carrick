@@ -5,20 +5,6 @@
 use super::*;
 use carrick_fatal::carrick_fatal;
 
-/// Refuse an unconverted host descriptor writer before allocating, copying,
-/// staging inventory or editing a live image. Converted callers submit an
-/// owned EL1 transaction and retain backing until its verified completion.
-pub(crate) fn require_host_cow_lane(
-    authority: &carrick_aarch64::Stage1Authority,
-) -> Result<(), TrapError> {
-    if authority.live_descriptor_owner() == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest {
-        return Err(TrapError::Hypervisor(
-            "host descriptor writer requires conversion to owned EL1 publication".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 /// Check the engine's completed mapping before publishing alias metadata.
 /// Walk terminal spans, not every page of a coarse block; perform no writes,
 /// splits, allocation or TLB operations. The caller retains MM exclusion.
@@ -305,6 +291,81 @@ fn is_exactly_el1_frame_grant(
             && alias.owner_generation == grant.ready.owner_generation
             && alias.sharing == GuestMappingSharing::Private
     )
+}
+
+/// One guest-lane EL1 frame grant that replaces a private predecessor,
+/// between its preparation and the settlement of EL1's receipt for it.
+///
+/// The grant's backing, inventory mapping and stage-2 owner are published at
+/// preparation (the descriptor transaction must name them), but the old owner
+/// may be retired only after EL1's verified completion. Its alias therefore
+/// stays unregistered until then: the process alias registry holds exactly
+/// one owner per span, and retiring the predecessor by span must not take the
+/// replacement with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingEl1GrantReplacement {
+    /// The exact grant, as settlement names it to completion or rollback.
+    pub(crate) grant: carrick_hal::threaded::El1FrameGrantRollback,
+    /// The predecessor's physical leases, planned at preparation. Completion
+    /// requires the span to still name exactly these before retiring them.
+    pub(crate) predecessor_leases: std::collections::BTreeSet<(u64, u64)>,
+    /// The grant's own alias, registered only after the predecessor retires.
+    pub(crate) alias: AliasBacking,
+}
+
+/// MM-owned ledger of [`PendingEl1GrantReplacement`]s. Settlement may run on
+/// any vCPU bound to the MM, so this lives in the MM's access state, not in
+/// an engine. A leaf lock: never held while taking another.
+#[derive(Debug, Default)]
+pub(crate) struct PendingEl1GrantReplacements {
+    entries: Vec<PendingEl1GrantReplacement>,
+}
+
+impl PendingEl1GrantReplacements {
+    /// Whether any pending replacement overlaps `[va, va + len)`.
+    pub(crate) fn overlaps(&self, va: u64, len: u64) -> bool {
+        let end = va.saturating_add(len);
+        self.entries.iter().any(|entry| {
+            entry.grant.semantic_base < end
+                && va < entry.grant.semantic_base.saturating_add(entry.grant.len)
+        })
+    }
+
+    /// Record a prepared replacement. `false`: its span overlaps one already
+    /// pending (the caller declines before publishing, so this never holds
+    /// two owners for one span).
+    pub(crate) fn insert(&mut self, entry: PendingEl1GrantReplacement) -> bool {
+        if self.overlaps(entry.grant.semantic_base, entry.grant.len) {
+            return false;
+        }
+        self.entries.push(entry);
+        true
+    }
+
+    /// Remove and return the replacement pending for exactly `grant`. A grant
+    /// with the same span but another owner generation or frame never
+    /// matches: it is a different incarnation.
+    pub(crate) fn take(
+        &mut self,
+        grant: &carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Option<PendingEl1GrantReplacement> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.grant == *grant)?;
+        Some(self.entries.swap_remove(index))
+    }
+}
+
+/// How the registry rows of a retirement's leases stand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AliasRetirementRows {
+    /// The leases are registered process aliases over the span: retire them.
+    Registered,
+    /// The leases belong to a guest-lane replacement grant whose alias was
+    /// never registered. Only its inventory, stage-2 owner and local rows
+    /// retire; the span's registered owner and its receipts are untouched.
+    NeverRegistered,
 }
 
 #[derive(Clone, Copy)]
@@ -1357,16 +1418,19 @@ impl HvfVmState {
         if forbidden_alias || forbidden_mapping {
             return Ok(None);
         }
-        // A replacement retires an old owner, which on the guest-owned lane
-        // may happen only after EL1's verified descriptor completion. Decline
-        // it here, before any transition: EL1 forwards the fault and the host
-        // first-touch path publishes it through `publish_replacing`, whose
-        // retirement callback runs only after the verified receipt. Fresh
-        // grants (no predecessor) stay on this bulk path on both lanes.
-        let replaces = !aliases.is_empty() || !overlapping_mappings.is_empty();
-        if replaces
-            && self.page_tables_authority().live_descriptor_owner()
-                == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+        // A replacement retires an old owner. The host lane folds that
+        // retirement into the grant's own inventory commit, so Ready names the
+        // final revision. On the guest-owned lane the old owner may retire
+        // only after EL1's verified completion: the grant is published here
+        // with its alias held back, and `complete_el1_frame_grant` retires the
+        // predecessor and registers the grant when the receipt settles.
+        let guest_lane = self.page_tables_authority().live_descriptor_owner()
+            == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
+        if guest_lane
+            && self
+                .el1_grant_replacements
+                .lock()
+                .overlaps(request.semantic_base, request.len)
         {
             return Ok(None);
         }
@@ -1390,12 +1454,9 @@ impl HvfVmState {
                     .map(|mapping| (mapping.physical_ipa, mapping.physical_size as u64)),
             )
             .collect();
-        let mut retirement = if replacement_leases.is_empty() {
+        let planned = if replacement_leases.is_empty() {
             None
         } else {
-            // Guest-owned MMs declined replacement above; this stays a
-            // host-lane-only writer.
-            require_host_cow_lane(&self.page_tables_authority())?;
             let planned =
                 self.plan_process_alias_retirement(request.semantic_base, semantic_len)?;
             if planned.inventory.is_none()
@@ -1406,6 +1467,14 @@ impl HvfVmState {
                 return Ok(None);
             }
             Some(planned)
+        };
+        // Host lane: retired inside the grant's commit. Guest lane: only the
+        // planned leases travel, and the retirement is re-prepared against
+        // the live inventory when EL1's receipt settles.
+        let (mut retirement, predecessor_leases) = match planned {
+            None => (None, None),
+            Some(planned) if guest_lane => (None, Some(planned.planned_leases)),
+            Some(planned) => (Some(planned), None),
         };
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
             carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
@@ -1436,7 +1505,36 @@ impl HvfVmState {
                 );
             });
         }
-        register_shared_alias(published.alias);
+        match predecessor_leases {
+            None => register_shared_alias(published.alias),
+            Some(predecessor_leases) => {
+                let pending = PendingEl1GrantReplacement {
+                    grant: carrick_hal::threaded::El1FrameGrantRollback {
+                        mm_key: request.mm_key,
+                        semantic_base: request.semantic_base,
+                        len: request.len,
+                        ready: published.ready,
+                    },
+                    predecessor_leases,
+                    alias: published.alias,
+                };
+                // The overlap check above ran under this MM's mutation
+                // authority, which every writer of this ledger holds.
+                let recorded = self.el1_grant_replacements.lock().insert(pending);
+                if !recorded {
+                    // Should the check ever be bypassed, nothing exposed the
+                    // grant and its transition is uncommitted: retire exactly
+                    // its own publication and decline.
+                    self.retire_unregistered_el1_frame_grant(
+                        request.semantic_base,
+                        semantic_len,
+                        published.alias,
+                        &registry,
+                    )?;
+                    return Ok(None);
+                }
+            }
+        }
         drop(registry);
         let physical_grant = (
             published.alias.physical_ipa,
@@ -1481,6 +1579,35 @@ impl HvfVmState {
             )));
         }
         let len = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
+        let pending = self.el1_grant_replacements.lock().take(&grant);
+        if let Some(pending) = pending {
+            // A replacement EL1 never exposed: its predecessor was never
+            // touched and stays exactly as it was. Retire only the grant's
+            // own (unregistered) publication.
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
+                identity.linux_pid,
+                identity.linux_tid,
+            );
+            self.retire_unregistered_el1_frame_grant(
+                grant.semantic_base,
+                len,
+                pending.alias,
+                &registry,
+            )?;
+            drop(registry);
+            let deferred = self.deferred_anonymous_state().ok_or_else(|| {
+                TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
+            })?;
+            deferred
+                .restore_pristine(carrick_guest_mem::GuestVa(grant.semantic_base), len)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "restore EL1 frame-grant pristine span: {error:?}"
+                    ))
+                })?;
+            return Ok(true);
+        }
         let aliases = alias_registry().lock().overlapping_process_aliases(
             grant.semantic_base,
             len,
@@ -1500,6 +1627,101 @@ impl HvfVmState {
                 TrapError::Hypervisor(format!("restore EL1 frame-grant pristine span: {error:?}"))
             })?;
         Ok(true)
+    }
+
+    /// Finish what [`Self::prepare_el1_frame_grant`] deferred on the
+    /// guest-owned lane, once EL1's receipt for the grant has verified and
+    /// before residency is committed. A fresh grant registered everything at
+    /// preparation. A replacement now retires its predecessor, re-prepared
+    /// against the live inventory (a peer MM may have changed a shared
+    /// frame's population since) and required to name exactly the leases
+    /// planned at preparation, then registers its own alias: the host lane's
+    /// order (retire, then register) under one frame-registry hold. The
+    /// caller holds the MM's mutation authority.
+    pub(crate) fn complete_el1_frame_grant(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<(), TrapError> {
+        let identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("EL1 frame-grant completion has no mm identity".to_owned())
+        })?;
+        if identity.mm != grant.mm_key {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 frame-grant completion for mm {} on mm {}",
+                grant.mm_key, identity.mm
+            )));
+        }
+        let Some(pending) = self.el1_grant_replacements.lock().take(&grant) else {
+            return Ok(());
+        };
+        let len = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
+        let retirement = self.prepare_process_alias_retirement(grant.semantic_base, len)?;
+        if retirement.planned_leases != pending.predecessor_leases {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 frame-grant replacement at 0x{:x}: predecessor changed before completion: planned={:?} live={:?}",
+                grant.semantic_base, pending.predecessor_leases, retirement.planned_leases
+            )));
+        }
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+            identity.linux_pid,
+            identity.linux_tid,
+        );
+        self.commit_process_alias_retirement(grant.semantic_base, len, retirement, &registry)?;
+        register_shared_alias(pending.alias);
+        drop(registry);
+        Ok(())
+    }
+
+    /// Retire exactly one guest-lane replacement grant's own publication
+    /// (inventory mapping, stage-2 owner, local row) while its alias was
+    /// never registered: the span's registered predecessor, its receipts and
+    /// its local rows are untouched. `registry` is the caller's live
+    /// frame-registry hold; this never takes it.
+    fn retire_unregistered_el1_frame_grant(
+        &mut self,
+        va: u64,
+        len: usize,
+        alias: AliasBacking,
+        registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+    ) -> Result<(), TrapError> {
+        let authority = self.cow_authority.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "EL1 frame-grant retirement has no inventory authority".to_owned(),
+            )
+        })?;
+        let leases =
+            std::collections::BTreeSet::from([(alias.physical_ipa, alias.physical_size as u64)]);
+        let inventory = {
+            let inventory = self.frame_inventory.lock();
+            Self::inventory_lease_retirement_shape(&inventory, &leases, &|frame| {
+                authority.frame_mapping_count(frame).map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "query EL1 frame-grant retirement mapping count: {error}"
+                    ))
+                })
+            })?
+        };
+        if inventory.mappings.is_empty() {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 frame-grant replacement at 0x{va:x} has no inventory row to retire"
+            )));
+        }
+        let prepared = self.reserve_process_alias_retirement(PreparedProcessAliasRetirement {
+            planned_leases: leases,
+            diagnostic_before: Vec::new(),
+            disarm_spans: Vec::new(),
+            inventory: Some(inventory),
+            reservation: None,
+        })?;
+        self.commit_process_alias_retirement_inner(
+            va,
+            len,
+            prepared,
+            Some(registry),
+            AliasRetirementAuthorityState::Pending,
+            AliasRetirementRows::NeverRegistered,
+        )
     }
 
     pub(crate) fn materialize_sparse_mmap_extent_inner(
@@ -5420,6 +5642,7 @@ impl HvfVmState {
                 prepared,
                 None,
                 AliasRetirementAuthorityState::Pending,
+                AliasRetirementRows::Registered,
             )
         }
     }
@@ -5431,7 +5654,16 @@ impl HvfVmState {
         va: u64,
         len: usize,
     ) -> Result<PreparedProcessAliasRetirement, TrapError> {
-        let mut prepared = self.plan_process_alias_retirement(va, len)?;
+        let planned = self.plan_process_alias_retirement(va, len)?;
+        self.reserve_process_alias_retirement(planned)
+    }
+
+    /// Reserve the independent kernel transaction a planned retirement
+    /// commits with. Dropping the result leaves everything unchanged.
+    fn reserve_process_alias_retirement(
+        &self,
+        mut prepared: PreparedProcessAliasRetirement,
+    ) -> Result<PreparedProcessAliasRetirement, TrapError> {
         if let Some(retirement) = prepared.inventory.as_ref() {
             let event_count = retirement
                 .mappings
@@ -5536,6 +5768,7 @@ impl HvfVmState {
             prepared,
             Some(registry),
             AliasRetirementAuthorityState::Pending,
+            AliasRetirementRows::Registered,
         )
     }
 
@@ -5552,6 +5785,7 @@ impl HvfVmState {
             prepared,
             Some(registry),
             AliasRetirementAuthorityState::AppliedWithReplacement,
+            AliasRetirementRows::Registered,
         )
     }
 
@@ -5562,6 +5796,7 @@ impl HvfVmState {
         prepared: PreparedProcessAliasRetirement,
         registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
         authority_state: AliasRetirementAuthorityState,
+        rows: AliasRetirementRows,
     ) -> Result<(), TrapError> {
         if prepared.inventory.is_some() && registry.is_none() {
             return Err(TrapError::Hypervisor(
@@ -5582,29 +5817,42 @@ impl HvfVmState {
             inventory,
             reservation,
         } = prepared;
-        self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
-        let actual_leases = unregister_alias(va, len, self.mm_root_slot, self.container_root);
+        let registered = rows == AliasRetirementRows::Registered;
+        if registered {
+            self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
+        }
+        // A grant whose alias was never registered has no registry rows to
+        // retire; its planned leases are exactly its own publication.
+        let actual_leases = if registered {
+            unregister_alias(va, len, self.mm_root_slot, self.container_root)
+        } else {
+            planned_leases.clone()
+        };
         if actual_leases != planned_leases {
             carrick_fatal!(
                 "hvpatch::host_alias",
                 "HVPatch alias registry changed under the mm guard: planned={planned_leases:?} actual={actual_leases:?}"
             );
         }
-        record_alias_unmap_lifecycle(
-            CowDiagnosticLifecycleSite::AliasUnmap,
-            &custody,
-            Some(identity),
-            self.mm_root_slot,
-            self.container_root,
-            &diagnostic_before,
-        );
+        if registered {
+            record_alias_unmap_lifecycle(
+                CowDiagnosticLifecycleSite::AliasUnmap,
+                &custody,
+                Some(identity),
+                self.mm_root_slot,
+                self.container_root,
+                &diagnostic_before,
+            );
+        }
         let Some(retirement) = inventory else {
             if reservation.is_some() {
                 return Err(TrapError::Hypervisor(
                     "alias retirement reserved inventory without a retirement plan".to_owned(),
                 ));
             }
-            self.split_local_rows_for_unmap(va, len);
+            if registered {
+                self.split_local_rows_for_unmap(va, len);
+            }
             // A surviving fragment of a compound still needs its COW arm.
             // The planner emits spans only for leases it actually retires.
             let mut armed = self.cow_armed.lock();
@@ -5741,7 +5989,9 @@ impl HvfVmState {
                     mapped_region_matches_retired_inventory_extent(mapping, retired[0])
                 });
         }
-        self.split_local_rows_for_unmap(va, len);
+        if registered {
+            self.split_local_rows_for_unmap(va, len);
+        }
         let mut armed = self.cow_armed.lock();
         for span in disarm_spans {
             armed.disarm(span);
