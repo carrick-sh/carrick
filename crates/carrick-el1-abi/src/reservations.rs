@@ -113,7 +113,7 @@ impl ReservationNodeFlags {
     /// `MADV_DONTDUMP`.
     pub const DONTDUMP: Self = Self(1 << 6);
     pub const ANONYMOUS_PRIVATE: Self = Self(Self::ANONYMOUS.0 | Self::PRIVATE.0);
-    /// Host-edited attributes; any of them makes a node host-owned.
+    /// Attributes the host sets with `set_flags` (`mlock`, `madvise`).
     pub const ATTRIBUTES: Self = Self(
         Self::GROWSDOWN.0
             | Self::LOCKED.0
@@ -121,6 +121,11 @@ impl ReservationNodeFlags {
             | Self::WIPEONFORK.0
             | Self::DONTDUMP.0,
     );
+    /// Attributes a private anonymous VMA keeps across EL1 edits: they ride
+    /// `mprotect` splits and `mremap` moves, and never make the node
+    /// host-owned. `GROWSDOWN` is not one of them (a stack is host-owned).
+    pub const CARRIED: Self =
+        Self(Self::LOCKED.0 | Self::DONTFORK.0 | Self::WIPEONFORK.0 | Self::DONTDUMP.0);
     const ALL: u32 = Self::ANONYMOUS_PRIVATE.0 | Self::ATTRIBUTES.0;
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
@@ -145,9 +150,10 @@ impl ReservationNodeFlags {
     pub const fn difference(self, other: Self) -> Self {
         Self(self.0 & !other.0)
     }
-    /// EL1 may propose edits only over plain private anonymous nodes.
+    /// EL1 may propose edits only over private anonymous nodes, whatever
+    /// [`Self::CARRIED`] attributes they hold.
     pub const fn root_editable(self) -> bool {
-        self.0 == Self::ANONYMOUS_PRIVATE.0
+        self.0 & !Self::CARRIED.0 == Self::ANONYMOUS_PRIVATE.0
     }
     /// `RLIMIT_DATA` covers private writable non-stack mappings (getrlimit(2),
     /// mmap(2)); shared, stack and read-only nodes are not charged.
@@ -311,8 +317,10 @@ mod flag_tests {
             ReservationNodeFlags::WIPEONFORK,
             ReservationNodeFlags::DONTDUMP,
         ] {
-            assert!(!anon.union(flag).root_editable());
+            assert!(anon.union(flag).root_editable());
+            assert!(ReservationNodeFlags::CARRIED.contains(flag));
             assert!(ReservationNodeFlags::ATTRIBUTES.contains(flag));
+            assert!(!ReservationNodeFlags::PRIVATE.union(flag).root_editable());
         }
         assert_eq!(ReservationNodeFlags::from_bits(1 << 7), None);
     }

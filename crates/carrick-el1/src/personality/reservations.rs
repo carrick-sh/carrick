@@ -17,7 +17,7 @@ const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
-const VERSION: u64 = 3;
+const VERSION: u64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -75,6 +75,10 @@ pub enum MoveTarget {
     /// `MREMAP_MAYMOVE | MREMAP_FIXED`: relocate to exactly this address,
     /// replacing root-editable anonymous nodes there.
     Fixed(u64),
+    /// `MREMAP_MAYMOVE | MREMAP_DONTUNMAP` (with `MREMAP_FIXED` when
+    /// `Some`): the source mapping stays, and a same-size destination is
+    /// prepared with the source's protection and attributes.
+    KeepSource(Option<u64>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +104,9 @@ struct Pending {
     request: ReservationRequest,
     result: u64,
     new_brk: u64,
+    /// Node attributes of a created (`Prepare`/`Move`) node: plain for
+    /// `mmap`/`brk`, the source's for an `mremap` extension or destination.
+    flags: u32,
     /// Spare nodes: split at each edited range boundary (two for `range`,
     /// two more for a `Move` source) plus the new node.
     nodes: [u32; 5],
@@ -708,6 +715,7 @@ impl Reservations<'_> {
         new_brk: u64,
         require_coverage: bool,
         source: Option<ReservationRange>,
+        flags: ReservationNodeFlags,
     ) -> Result<Decision, Refusal> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
@@ -808,6 +816,7 @@ impl Reservations<'_> {
             request,
             result,
             new_brk,
+            flags: flags.bits(),
             nodes,
         });
         Ok(Decision::Work(request))
@@ -930,6 +939,7 @@ impl Reservations<'_> {
             self.brk_current(),
             false,
             None,
+            ReservationNodeFlags::ANONYMOUS_PRIVATE,
         )
     }
     pub fn munmap(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
@@ -941,8 +951,11 @@ impl Reservations<'_> {
             self.brk_current(),
             false,
             None,
+            ReservationNodeFlags::EMPTY,
         )
     }
+    /// Change the protection of every node in `range`; each keeps its own
+    /// [`ReservationNodeFlags::CARRIED`] attributes.
     pub fn mprotect(
         &mut self,
         range: ReservationRange,
@@ -956,14 +969,21 @@ impl Reservations<'_> {
             self.brk_current(),
             true,
             None,
+            ReservationNodeFlags::EMPTY,
         )
     }
     /// `mremap(2)` of an anonymous range as one proposal. `source` must lie in
-    /// one root-editable node (`Hole` otherwise: the decoder's EFAULT);
-    /// host-owned sources and out-of-layout growth are `ForeignMapping`.
-    /// Shrink retires the tail, in-place growth prepares the extension, and a
-    /// relocation is one `Move` whose completion retires the source and
-    /// prepares the destination atomically.
+    /// one root-editable node (`Hole` otherwise: the decoder's EFAULT); a
+    /// host-owned source is `ForeignMapping`. Shrink retires the tail;
+    /// in-place growth prepares the extension when nothing (of any owner, or
+    /// the layout's end) is in the way, else `Limit` without
+    /// `MREMAP_MAYMOVE`; a relocation is one `Move` whose completion retires
+    /// the source and prepares the destination atomically; `KeepSource`
+    /// prepares a same-size destination and keeps the source. Every created
+    /// node carries the source's protection and attributes. Growing a
+    /// `LOCKED` source is subject to `RLIMIT_MEMLOCK`, which this root does
+    /// not hold: the host venue admits it before proposing (the EL1 decoder
+    /// forwards `mremap`).
     pub fn mremap(
         &mut self,
         source: ReservationRange,
@@ -976,13 +996,21 @@ impl Reservations<'_> {
         if self.pending().is_some() {
             return Err(Refusal::Busy);
         }
-        if new_len == 0 || matches!(target, MoveTarget::Fixed(addr) if !addr.is_multiple_of(4096)) {
+        let fixed = match target {
+            MoveTarget::Fixed(address) | MoveTarget::KeepSource(Some(address)) => Some(address),
+            _ => None,
+        };
+        if new_len == 0 || fixed.is_some_and(|address| !address.is_multiple_of(4096)) {
             return Err(Refusal::Invalid);
         }
         let new_len = new_len
             .checked_add(4095)
             .map(|v| v & !4095)
             .ok_or(Refusal::Limit)?;
+        let keep_source = matches!(target, MoveTarget::KeepSource(_));
+        if keep_source && new_len != source.len() {
+            return Err(Refusal::Invalid);
+        }
         let node = self
             .next(source.start())
             .filter(|n| n.start <= source.start() && n.end >= source.end())
@@ -991,8 +1019,14 @@ impl Reservations<'_> {
             return Err(Refusal::ForeignMapping);
         }
         let prot = node.protection();
+        let flags = node.flags();
         let brk = self.brk_current();
-        if let MoveTarget::Fixed(address) = target {
+        let (operation, moved) = if keep_source {
+            (ReservationOperation::Prepare, None)
+        } else {
+            (ReservationOperation::Move, Some(source))
+        };
+        if let Some(address) = fixed {
             let range = address
                 .checked_add(new_len)
                 .and_then(|end| ReservationRange::new(address, end))
@@ -1000,66 +1034,52 @@ impl Reservations<'_> {
             if range.start() < source.end() && source.start() < range.end() {
                 return Err(Refusal::Invalid);
             }
-            return self.proposal(
-                range,
-                prot,
-                ReservationOperation::Move,
-                address,
-                brk,
-                false,
-                Some(source),
-            );
+            return self.proposal(range, prot, operation, address, brk, false, moved, flags);
         }
-        if new_len <= source.len() {
-            if new_len == source.len() {
-                return Ok(Decision::Complete(source.start()));
+        if !keep_source {
+            if new_len <= source.len() {
+                if new_len == source.len() {
+                    return Ok(Decision::Complete(source.start()));
+                }
+                let tail = ReservationRange::new(source.start() + new_len, source.end())
+                    .ok_or(Refusal::Invalid)?;
+                return self.proposal(
+                    tail,
+                    ReservationProtection::NONE,
+                    ReservationOperation::Retire,
+                    source.start(),
+                    brk,
+                    false,
+                    None,
+                    ReservationNodeFlags::EMPTY,
+                );
             }
-            let tail = ReservationRange::new(source.start() + new_len, source.end())
-                .ok_or(Refusal::Invalid)?;
-            return self.proposal(
-                tail,
-                ReservationProtection::NONE,
-                ReservationOperation::Retire,
-                source.start(),
-                brk,
-                false,
-                None,
-            );
-        }
-        let extension = source
-            .start()
-            .checked_add(new_len)
-            .and_then(|end| ReservationRange::new(source.end(), end));
-        let free =
-            extension.is_some_and(|r| self.next(r.start()).is_none_or(|n| n.start >= r.end()));
-        if let Some(extension) = extension.filter(|_| free) {
-            if !self.in_layout(extension) {
-                return Err(Refusal::ForeignMapping);
+            let extension = source
+                .start()
+                .checked_add(new_len)
+                .and_then(|end| ReservationRange::new(source.end(), end))
+                .filter(|r| self.in_layout(*r));
+            let free =
+                extension.is_some_and(|r| self.next(r.start()).is_none_or(|n| n.start >= r.end()));
+            if let Some(extension) = extension.filter(|_| free) {
+                return self.proposal(
+                    extension,
+                    prot,
+                    ReservationOperation::Prepare,
+                    source.start(),
+                    brk,
+                    false,
+                    None,
+                    flags,
+                );
             }
-            return self.proposal(
-                extension,
-                prot,
-                ReservationOperation::Prepare,
-                source.start(),
-                brk,
-                false,
-                None,
-            );
-        }
-        if target == MoveTarget::InPlace {
-            return Err(Refusal::Limit);
+            if target == MoveTarget::InPlace {
+                return Err(Refusal::Limit);
+            }
         }
         let address = self.first_fit(new_len).ok_or(Refusal::Limit)?;
         let range = ReservationRange::new(address, address + new_len).ok_or(Refusal::Invalid)?;
-        self.proposal(
-            range,
-            prot,
-            ReservationOperation::Move,
-            address,
-            brk,
-            false,
-            Some(source),
-        )
+        self.proposal(range, prot, operation, address, brk, false, moved, flags)
     }
     pub fn brk(&mut self, requested: u64) -> Result<Decision, Refusal> {
         if !self.state().admitted {
@@ -1100,7 +1120,16 @@ impl Reservations<'_> {
         } else {
             (ReservationProtection::NONE, ReservationOperation::Retire)
         };
-        match self.proposal(range, prot, op, requested, requested, false, None) {
+        match self.proposal(
+            range,
+            prot,
+            op,
+            requested,
+            requested,
+            false,
+            None,
+            ReservationNodeFlags::ANONYMOUS_PRIVATE,
+        ) {
             Err(Refusal::Limit | Refusal::ForeignMapping) => Ok(Decision::Complete(old)),
             result => result,
         }
@@ -1140,6 +1169,32 @@ impl Reservations<'_> {
             self.table.release(freed, self.banks);
         }
     }
+    /// Rewrite the protection of every node inside the fully covered `range`,
+    /// splitting straddlers at its bounds and keeping each node's flags.
+    fn reprotect_range(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+        spares: &mut Spares,
+    ) {
+        self.split_at(range.start(), spares);
+        self.split_at(range.end(), spares);
+        let mut cursor = range.start();
+        while cursor < range.end() {
+            let Some(n) = self.next(cursor).filter(|n| n.start < range.end()) else {
+                break;
+            };
+            let (tree, freed) = self.erase(self.state().tree, n.start);
+            self.state_mut().tree = tree;
+            let mut edited = n;
+            edited.prot = prot.bits();
+            edited.left = 0;
+            edited.right = 0;
+            self.write(freed, edited);
+            self.insert_coalescing(freed);
+            cursor = n.end;
+        }
+    }
     pub fn complete(&mut self, completion: ReservationCompletion) -> Result<u64, Refusal> {
         let pending = self.state().pending.ok_or(Refusal::Stale)?;
         if !completion.authenticates(pending.request)
@@ -1162,8 +1217,13 @@ impl Reservations<'_> {
         if let Some(source) = pending.request.source {
             self.remove_range(source, &mut spares);
         }
-        self.remove_range(range, &mut spares);
-        if creates {
+        if pending.request.operation == ReservationOperation::Protect {
+            // Each covered node keeps its own carried attributes.
+            self.reprotect_range(range, pending.request.protection, &mut spares);
+        } else {
+            self.remove_range(range, &mut spares);
+        }
+        if creates && pending.request.operation != ReservationOperation::Protect {
             let id = spares.take();
             self.write(
                 id,
@@ -1171,7 +1231,7 @@ impl Reservations<'_> {
                     start: range.start(),
                     end: range.end(),
                     prot: pending.request.protection.bits(),
-                    flags: ReservationNodeFlags::ANONYMOUS_PRIVATE.bits(),
+                    flags: pending.flags,
                     ..NodeData::default()
                 },
             );
@@ -2410,13 +2470,10 @@ mod tests {
         let rw = ReservationProtection::READ_WRITE;
         let d = g.mmap(Placement::Fixed(0x100000), 0x4000, rw).unwrap();
         complete(&mut g, d);
-        for flag in [
-            ReservationNodeFlags::LOCKED,
-            ReservationNodeFlags::DONTFORK,
-            ReservationNodeFlags::WIPEONFORK,
-            ReservationNodeFlags::DONTDUMP,
-            ReservationNodeFlags::GROWSDOWN,
-        ] {
+        // A grow-down stack is host-owned: every edit touching it forwards.
+        // (The carried attributes ride EL1 edits instead; see
+        // `reservation_carried_attributes_ride_el1_edits`.)
+        for flag in [ReservationNodeFlags::GROWSDOWN] {
             let before = g.generation();
             g.set_flags(range(0x101000, 0x102000), flag, ReservationNodeFlags::EMPTY)
                 .unwrap();
@@ -2596,6 +2653,215 @@ mod tests {
         let generation = g.generation();
         assert!(g.pending().is_none());
         assert_eq!(g.generation(), generation);
+    }
+
+    /// Every attribute set on one node, in address order.
+    fn nodes(g: &mut Reservations<'_>) -> std::vec::Vec<(u64, u64, u64, u32)> {
+        let mut seen = std::vec::Vec::new();
+        g.observe_mappings(&mut |m| {
+            seen.push((
+                m.range.start(),
+                m.range.end(),
+                m.protection.bits(),
+                m.flags.bits(),
+            ))
+        })
+        .unwrap();
+        seen
+    }
+
+    #[test]
+    fn reservation_carried_attributes_ride_el1_edits() {
+        let table = table();
+        let mut g = admitted(&table, 0, 9);
+        let rw = ReservationProtection::READ_WRITE;
+        let r = ReservationProtection::from_bits(1).unwrap();
+        let anon = ReservationNodeFlags::ANONYMOUS_PRIVATE.bits();
+        for flag in [
+            ReservationNodeFlags::LOCKED,
+            ReservationNodeFlags::DONTFORK,
+            ReservationNodeFlags::WIPEONFORK,
+            ReservationNodeFlags::DONTDUMP,
+        ] {
+            let d = g.mmap(Placement::Fixed(0x100000), 0x4000, rw).unwrap();
+            complete(&mut g, d);
+            g.set_flags(range(0x101000, 0x103000), flag, ReservationNodeFlags::EMPTY)
+                .unwrap();
+            let flagged = anon | flag.bits();
+            // mlock(2)/madvise(2) attributes stay with the VMA across
+            // mprotect(2): the range is still EL1's, and the edit keeps
+            // each node's attributes while changing its protection.
+            let d = g.mprotect(range(0x100000, 0x102000), r).unwrap();
+            complete(&mut g, d);
+            assert_eq!(
+                nodes(&mut g),
+                [
+                    (0x100000, 0x101000, 1, anon),
+                    (0x101000, 0x102000, 1, flagged),
+                    (0x102000, 0x103000, 3, flagged),
+                    (0x103000, 0x104000, 3, anon),
+                ]
+            );
+            assert!(g.fault_plan(0x101000, 4096, r).is_ok());
+            assert_eq!(
+                decide(&mut g, 226, [0x101000, 0x1000, 3, 0, 0, 0]),
+                AnonymousRouteKind::Work
+            );
+            // mmap(MAP_FIXED) replaces the attributed VMA with a plain one.
+            let d = g.mmap(Placement::Fixed(0x101000), 0x1000, r).unwrap();
+            complete(&mut g, d);
+            assert_eq!(g.mapping(0x101000).unwrap().flags.bits(), anon);
+            // munmap(2) retires attributed memory like any other.
+            let d = g.munmap(range(0x100000, 0x104000)).unwrap();
+            complete(&mut g, d);
+            assert!(nodes(&mut g).is_empty());
+        }
+    }
+
+    #[test]
+    fn reservation_mremap_carries_source_attributes() {
+        let table = table();
+        let mut g = admitted(&table, 0, 10);
+        let rw = ReservationProtection::READ_WRITE;
+        let carried = ReservationNodeFlags::LOCKED.union(ReservationNodeFlags::DONTDUMP);
+        let flagged = ReservationNodeFlags::ANONYMOUS_PRIVATE
+            .union(carried)
+            .bits();
+        let d = g.mmap(Placement::Fixed(0x100000), 0x2000, rw).unwrap();
+        complete(&mut g, d);
+        g.set_flags(
+            range(0x100000, 0x102000),
+            carried,
+            ReservationNodeFlags::EMPTY,
+        )
+        .unwrap();
+        // In-place growth extends the same VMA, attributes included.
+        let d = g
+            .mremap(range(0x100000, 0x102000), 0x3000, MoveTarget::InPlace)
+            .unwrap();
+        assert_eq!(complete(&mut g, d), 0x100000);
+        assert_eq!(nodes(&mut g), [(0x100000, 0x103000, 3, flagged)]);
+        // A move carries them to the destination.
+        let d = g
+            .mremap(
+                range(0x100000, 0x103000),
+                0x3000,
+                MoveTarget::Fixed(0x200000),
+            )
+            .unwrap();
+        assert_eq!(complete(&mut g, d), 0x200000);
+        assert_eq!(nodes(&mut g), [(0x200000, 0x203000, 3, flagged)]);
+        // MREMAP_DONTUNMAP: the source VMA stays mapped and the
+        // destination is a second VMA with the source's attributes.
+        let d = g
+            .mremap(
+                range(0x200000, 0x203000),
+                0x3000,
+                MoveTarget::KeepSource(Some(0x300000)),
+            )
+            .unwrap();
+        let Decision::Work(request) = d else { panic!() };
+        assert_eq!(request.operation, ReservationOperation::Prepare);
+        assert_eq!(request.source, None);
+        assert_eq!(complete(&mut g, d), 0x300000);
+        assert_eq!(
+            nodes(&mut g),
+            [
+                (0x200000, 0x203000, 3, flagged),
+                (0x300000, 0x303000, 3, flagged)
+            ]
+        );
+        let d = g
+            .mremap(
+                range(0x300000, 0x303000),
+                0x3000,
+                MoveTarget::KeepSource(None),
+            )
+            .unwrap();
+        let placed = complete(&mut g, d);
+        assert!(placed != 0x300000 && g.mapping(placed).is_some());
+        // DONTUNMAP needs old_size == new_size and a disjoint destination.
+        assert_eq!(
+            g.mremap(
+                range(0x200000, 0x203000),
+                0x4000,
+                MoveTarget::KeepSource(None)
+            ),
+            Err(Refusal::Invalid)
+        );
+        assert_eq!(
+            g.mremap(
+                range(0x200000, 0x203000),
+                0x3000,
+                MoveTarget::KeepSource(Some(0x201000))
+            ),
+            Err(Refusal::Invalid)
+        );
+        // A grow-down stack stays host-owned.
+        g.set_flags(
+            range(0x200000, 0x201000),
+            ReservationNodeFlags::GROWSDOWN,
+            ReservationNodeFlags::EMPTY,
+        )
+        .unwrap();
+        assert_eq!(
+            g.mremap(range(0x200000, 0x201000), 0x1000, MoveTarget::MayMove),
+            Err(Refusal::ForeignMapping)
+        );
+        assert!(g.pending().is_none());
+    }
+
+    #[test]
+    fn reservation_mremap_growth_stops_at_the_next_mapping_of_any_owner() {
+        // mremap(2): an in-place expansion fails "because other mappings
+        // are in the way"; any owner's node is in the way, and a hole that
+        // exactly fits is not.
+        let table = table();
+        let mut g = admitted(&table, 0, 11);
+        let rw = ReservationProtection::READ_WRITE;
+        let d = g.mmap(Placement::Fixed(0x100000), 0x1000, rw).unwrap();
+        complete(&mut g, d);
+        g.insert_opaque(
+            range(0x102000, 0x103000),
+            ReservationProtection::from_bits(1).unwrap(),
+            ReservationNodeFlags::PRIVATE,
+        )
+        .unwrap();
+        assert_eq!(
+            g.mremap(range(0x100000, 0x101000), 0x3000, MoveTarget::InPlace),
+            Err(Refusal::Limit)
+        );
+        let d = g
+            .mremap(range(0x100000, 0x101000), 0x3000, MoveTarget::MayMove)
+            .unwrap();
+        let Decision::Work(request) = d else { panic!() };
+        assert_eq!(request.operation, ReservationOperation::Move);
+        assert!(request.range.start() >= 0x103000);
+        g.refuse(request).unwrap();
+        // The one-page hole fits exactly: grow in place up to the obstacle.
+        let d = g
+            .mremap(range(0x100000, 0x101000), 0x2000, MoveTarget::InPlace)
+            .unwrap();
+        assert_eq!(complete(&mut g, d), 0x100000);
+        assert_eq!(
+            g.mapping(0x101000).unwrap().range,
+            range(0x100000, 0x102000)
+        );
+        assert!(!g.mapping(0x102000).unwrap().anonymous);
+        // Growth past the end of the layout is blocked in place too: no
+        // ForeignMapping forward for an anonymous source.
+        let d = g.mmap(Placement::Fixed(0xfff000), 0x1000, rw).unwrap();
+        complete(&mut g, d);
+        assert_eq!(
+            g.mremap(range(0xfff000, 0x1000000), 0x2000, MoveTarget::InPlace),
+            Err(Refusal::Limit)
+        );
+        let d = g
+            .mremap(range(0xfff000, 0x1000000), 0x2000, MoveTarget::MayMove)
+            .unwrap();
+        let Decision::Work(request) = d else { panic!() };
+        assert_eq!(request.operation, ReservationOperation::Move);
+        g.refuse(request).unwrap();
     }
 
     #[test]
