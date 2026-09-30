@@ -4589,6 +4589,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 crate::stage1_authority::GuestLaneSelection::Selected,
             ));
         }
+        self.vm.record_host_lane_sample(
+            crate::stage1_authority::GuestLaneSite::ForkPlan,
+            &self.page_tables,
+        );
         let guest_lane = self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest;
         let page_tables_absent = self.page_tables.is_none();
         if page_tables_absent && guest_lane {

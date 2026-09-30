@@ -55,12 +55,16 @@ struct HostCowLedgerInner {
     guest_cow_settled: std::sync::atomic::AtomicU64,
     guest_cow_provisioned: std::sync::atomic::AtomicU64,
     host_cow_by_path: [std::sync::atomic::AtomicU64; HostCowPath::COUNT],
+    /// Host-lane samples by `[cause][site]`, flattened.
+    host_lane_samples: [std::sync::atomic::AtomicU64; HostLaneCause::COUNT * GuestLaneSite::COUNT],
     /// The most host COW resolutions any one MM of the carrier has credited.
     host_cow_max_per_mm: std::sync::atomic::AtomicU64,
     /// COWs the host completed for an MM already on the guest lane (not in
     /// `host_cow_resolutions`), by path.
     guest_lane_host_cow_by_path: [std::sync::atomic::AtomicU64; HostCowPath::COUNT],
 }
+
+use carrick_aarch64::stage1_authority::{GuestLaneSite, HostLaneCause};
 
 /// Which host path completed a host COW resolution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +142,11 @@ pub struct HostCowSnapshot {
     pub guest_cow_provisioned: u64,
     /// `host_cow_resolutions` by [`HostCowPath`].
     pub host_cow_by_path: [u64; HostCowPath::COUNT],
+    /// Why MMs sampled on the host lane were there: `[cause][site]` with
+    /// causes `[never_selected, pending_no_backing, pending_no_manager,
+    /// pending_unsynced_edits, pending_awaiting_bind, authority_mismatch]`
+    /// and sites `[initial_bind, fork_plan, host_cow]`.
+    pub host_lane_samples: [[u64; GuestLaneSite::COUNT]; HostLaneCause::COUNT],
     /// The most host COW resolutions any single MM has credited, absolute
     /// (a maximum is not differenced): near `host_cow_resolutions` means one
     /// MM (a parent) owns them; near the per-fork rate means they are spread
@@ -196,6 +205,16 @@ impl HostCowSnapshot {
                 delta
             },
             host_cow_max_per_mm: self.host_cow_max_per_mm,
+            host_lane_samples: {
+                let mut delta = [[0; GuestLaneSite::COUNT]; HostLaneCause::COUNT];
+                for (cause, row) in delta.iter_mut().enumerate() {
+                    for (site, slot) in row.iter_mut().enumerate() {
+                        *slot = self.host_lane_samples[cause][site]
+                            .checked_sub(before.host_lane_samples[cause][site])?;
+                    }
+                }
+                delta
+            },
             guest_lane_host_cow_by_path: {
                 let mut delta = [0; HostCowPath::COUNT];
                 for (slot, (now, then)) in delta.iter_mut().zip(
@@ -249,6 +268,12 @@ impl HostCowLedger {
                 self.inner.host_cow_by_path[path].load(Ordering::Relaxed)
             }),
             host_cow_max_per_mm: self.inner.host_cow_max_per_mm.load(Ordering::Relaxed),
+            host_lane_samples: core::array::from_fn(|cause| {
+                core::array::from_fn(|site| {
+                    self.inner.host_lane_samples[cause * GuestLaneSite::COUNT + site]
+                        .load(Ordering::Relaxed)
+                })
+            }),
             guest_lane_host_cow_by_path: core::array::from_fn(|path| {
                 self.inner.guest_lane_host_cow_by_path[path].load(Ordering::Relaxed)
             }),
@@ -316,6 +341,13 @@ impl HostCowStats {
     }
 
     /// Replacement grants provisioned for this MM's guest COW.
+    pub(crate) fn record_host_lane_cause(&self, site: GuestLaneSite, cause: HostLaneCause) {
+        if let Some(ledger) = &self.ledger {
+            ledger.inner.host_lane_samples[cause as usize * GuestLaneSite::COUNT + site as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_guest_cow_provisioned(&self, grants: u64) {
         if let Some(ledger) = &self.ledger {
             ledger
@@ -2310,6 +2342,29 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         len: usize,
     ) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
         self.state.armed_frame_cow_ranges(va, len)
+    }
+
+    fn record_host_lane_sample(
+        &self,
+        site: carrick_aarch64::stage1_authority::GuestLaneSite,
+        engine_authority: &carrick_aarch64::Stage1Authority,
+    ) {
+        let backend = self.state.task.mm_access_authority();
+        let cause = if engine_authority.live_descriptor_owner()
+            == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+        {
+            None
+        } else if backend
+            .page_tables_authority()
+            .shares_exact_authority(engine_authority)
+        {
+            engine_authority.host_lane_cause()
+        } else {
+            Some(HostLaneCause::AuthorityMismatch)
+        };
+        if let Some(cause) = cause {
+            backend.host_cow_stats.record_host_lane_cause(site, cause);
+        }
     }
 
     fn record_guest_descriptor_lane(
