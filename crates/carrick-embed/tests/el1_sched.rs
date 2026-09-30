@@ -2649,6 +2649,15 @@ fn el1_fork_cow_resolves_in_guest() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
+    // The carrier VM (and its host-COW ledger) is published by its first
+    // container run. Baselines taken before that read incomplete and must
+    // never be differenced, so warm the carrier with a one-fork workload
+    // first; every measured delta then lies inside one live ledger.
+    run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(120));
+    assert!(
+        carrick_embed::host_cow_snapshot().complete,
+        "warm-up must publish the carrier's host COW ledger"
+    );
     let mut runs = Vec::new();
 
     for pages in SCALES {
