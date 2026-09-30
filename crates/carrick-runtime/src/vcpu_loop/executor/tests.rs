@@ -101,7 +101,7 @@ struct FakeBinding {
     residency_condvar: parking_lot::Condvar,
 }
 
-fn test_guest_cpu_state(marker: u64) -> GuestCpuState {
+pub(crate) fn test_guest_cpu_state(marker: u64) -> GuestCpuState {
     GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
         gprs: std::array::from_fn(|index| marker + index as u64),
         pc: marker + 0x1000,

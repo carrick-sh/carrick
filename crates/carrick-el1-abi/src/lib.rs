@@ -3029,6 +3029,32 @@ pub fn peek_served_with_work(slot: usize) -> bool {
     current_task.served_with_work.load(Ordering::Acquire) != 0
 }
 
+/// What a thread owes the host after EL1 served its syscall with work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServedBoundary {
+    /// The call is complete; only owed wakes are delivered (pipe, eventfd,
+    /// inotify). The guest resumes after the syscall instruction.
+    Completed,
+    /// EL1 edited the guest tables but the host must still commit the call's
+    /// metadata (a retired `munmap`, an `mprotect` whose VMA journal was
+    /// full). The host runs the call again, and it must see the ORIGINAL
+    /// arguments: EL1 overwrote x0 with the result, so `x0` here is the
+    /// argument 0 EL1 preserved. Never re-read x0 from the mutated frame.
+    ReplayOriginal { x0: u64 },
+}
+
+/// Classify a served-with-work call `nr` whose preserved argument 0 is
+/// `orig_arg0`.
+pub const fn served_boundary(nr: u64, orig_arg0: u64) -> ServedBoundary {
+    match nr {
+        SYS_MUNMAP | SYS_MPROTECT => ServedBoundary::ReplayOriginal { x0: orig_arg0 },
+        _ => ServedBoundary::Completed,
+    }
+}
+
+const SYS_MUNMAP: u64 = 215;
+const SYS_MPROTECT: u64 = 226;
+
 /// Read the preserved original argument 0 for an executor slot.
 pub fn get_orig_arg0(slot: usize) -> u64 {
     let ptr = get_el1_region_host_ptr();
@@ -3541,6 +3567,19 @@ impl Default for InotifyNameCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_served_munmap_or_mprotect_replays_with_the_preserved_argument() {
+        assert_eq!(
+            served_boundary(226, 0x6000),
+            ServedBoundary::ReplayOriginal { x0: 0x6000 }
+        );
+        assert_eq!(
+            served_boundary(215, 0x7000),
+            ServedBoundary::ReplayOriginal { x0: 0x7000 }
+        );
+        assert_eq!(served_boundary(64, 9), ServedBoundary::Completed);
+    }
+
     use super::*;
 
     #[test]

@@ -1530,7 +1530,10 @@ where
             // retires stage-2/frame-inventory backing in bulk, and commits VMA
             // metadata. Reapplying retirement there is idempotent and remains
             // temporary until mmap-family policy itself moves into EL1.
-            if matches!(request.number.raw(), 215 | 226) {
+            if matches!(
+                carrick_el1_abi::served_boundary(request.number.raw(), original_args.0[0]),
+                carrick_el1_abi::ServedBoundary::ReplayOriginal { .. }
+            ) {
                 (syscall, None)
             } else {
                 let val = frame.args[0] as i64;
