@@ -107,6 +107,7 @@ impl carrick_hal::FrameCowAuthority for LiveForkReceiptAuthority {
 
 #[test]
 fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mapping =
         carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(42).unwrap());
     let parent_mapping =
@@ -173,6 +174,7 @@ fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
 
 #[test]
 fn empty_pending_fork_frame_publication_needs_no_authority_and_emits_nothing() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut task = HvfTaskState::neutral();
     let mut events = Vec::new();
 
@@ -185,6 +187,7 @@ fn empty_pending_fork_frame_publication_needs_no_authority_and_emits_nothing() {
 
 #[test]
 fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mapping =
         carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(52).unwrap());
     let parent_mapping =
@@ -305,6 +308,7 @@ fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
 
 #[test]
 fn bind_frame_cow_authenticates_and_drains_pending_receipts() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mapping =
         carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(62).unwrap());
     let parent_mapping =
@@ -374,6 +378,7 @@ fn bind_frame_cow_authenticates_and_drains_pending_receipts() {
 /// below reads the source rather than building one.
 #[test]
 fn an_unmap_supersedes_the_cow_receipts_naming_its_range_first() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let source = concat!(include_str!("../trap.rs"), include_str!("cow_engine.rs"));
     // `rsplit_once`, not `split_once`: this test's own string literal is
     // the FIRST occurrence in the file, and matching it makes the test
@@ -417,6 +422,7 @@ fn an_unmap_supersedes_the_cow_receipts_naming_its_range_first() {
 /// and fail-stops (`ltp-mmap04`, after the two PROT_NONE cases).
 #[test]
 fn a_private_repoint_supersedes_the_previous_cow_receipt_before_publication() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let source = include_str!("cow_engine.rs");
     let body = source
         .split_once("pub(crate) fn publish_private_repoint(")
@@ -439,6 +445,7 @@ fn a_private_repoint_supersedes_the_previous_cow_receipt_before_publication() {
 
 #[test]
 fn pending_fork_frame_authentication_false_and_error_paths_fail_closed() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let source = include_str!("../trap.rs");
     let helper = source
         .rsplit_once("fn publish_pending_fork_frame_receipts_with(")
@@ -486,6 +493,7 @@ fn test_state(rollbacks: &Arc<AtomicUsize>) -> HvpatchCarrierTaskState {
 
 #[test]
 fn prepared_abort_rolls_back_inventory_before_dropping_carrier_leases() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let state = HvpatchCarrierTaskState::Test {
@@ -540,6 +548,7 @@ fn owner_key(
 
 #[test]
 fn carrier_keys_are_exact_nonreused_and_terminal_retirement_rolls_back() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let first = directory
@@ -562,11 +571,9 @@ fn carrier_keys_are_exact_nonreused_and_terminal_retirement_rolls_back() {
     assert_eq!(rollbacks.load(Ordering::SeqCst), 3);
 }
 
-static ALIAS_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
 #[test]
 fn injected_alias_and_directory_failures_rollback_before_visibility() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     for failpoint in [1, 2] {
         let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
         let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -645,6 +652,7 @@ fn alias(host: usize, perms: u64) -> AliasBacking {
 /// the POPULATION visits `DENSE_ROWS`.
 #[test]
 fn a_va_window_query_does_not_pay_for_every_materialized_extent() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const DENSE_ROWS: u64 = 2048;
     const PAGE: u64 = 0x1000;
     const BASE: u64 = 0x7000_0000_0000;
@@ -743,6 +751,7 @@ fn a_va_window_query_does_not_pay_for_every_materialized_extent() {
 /// so the unindexed scans are kept as the oracle here.
 #[test]
 fn window_indexed_lookups_match_a_full_scan() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let scope_a = AliasOwnershipScope::MmRootSlot {
         base: 0x1000_0000,
         size: 0x4000,
@@ -839,6 +848,7 @@ fn window_indexed_lookups_match_a_full_scan() {
 
 #[test]
 fn alias_registry_row_total_tracks_its_buckets() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut registry = AliasRegistry::default();
     let scope_a = AliasOwnershipScope::MmRootSlot {
         base: 0x1000_0000,
@@ -912,6 +922,7 @@ fn alias_registry_row_total_tracks_its_buckets() {
 
 #[test]
 fn alias_registry_keeps_distant_same_ipa_rows_in_one_mm() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let scope = AliasOwnershipScope::MmRootSlot {
         base: 0x3100_0000,
         size: 0x4000,
@@ -944,6 +955,7 @@ fn alias_registry_keeps_distant_same_ipa_rows_in_one_mm() {
 
 #[test]
 fn alias_registry_replace_all_discards_stale_rows_from_every_index() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let scope = AliasOwnershipScope::MmRootSlot {
         base: 0x3150_0000,
         size: 0x4000,
@@ -1007,6 +1019,7 @@ fn alias_registry_replace_all_discards_stale_rows_from_every_index() {
 
 #[test]
 fn alias_registry_batch_removal_matches_rebuilt_state() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let scope_a = AliasOwnershipScope::MmRootSlot {
         base: 0x3500_0000,
         size: 0x4000,
@@ -1116,6 +1129,7 @@ fn alias_registry_batch_removal_matches_rebuilt_state() {
 
 #[test]
 fn alias_registry_batch_removal_does_not_scan_scope_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const TOTAL_ROWS: usize = 10_000;
     let scope = AliasOwnershipScope::MmRootSlot {
         base: 0x3400_0000,
@@ -1154,6 +1168,7 @@ fn alias_registry_batch_removal_does_not_scan_scope_rows() {
 
 #[test]
 fn cow_retention_physical_index_does_not_scan_foreign_alias_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const FOREIGN_OWNERS: usize = 512;
     let root_slot = (0x3300_0000_u64, 0x4000_u64);
     let scope = AliasOwnershipScope::MmRootSlot {
@@ -1211,6 +1226,7 @@ fn cow_retention_physical_index_does_not_scan_foreign_alias_rows() {
 
 #[test]
 fn private_cow_retention_query_ignores_global_and_removed_wide_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const DISTRACTORS: usize = 512;
     let root_slot = (0x3350_0000_u64, 0x4000_u64);
     let owned_scope = AliasOwnershipScope::MmRootSlot {
@@ -1284,6 +1300,7 @@ fn private_cow_retention_query_ignores_global_and_removed_wide_rows() {
 
 #[test]
 fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let physical = (0x5fff_2200_0000_u64, 0x4000_u64);
     let registry = std::sync::Arc::new(parking_lot::Mutex::new(AliasRegistry::default()));
     let mut retired = alias(0x7800_0000, 3);
@@ -1385,6 +1402,7 @@ fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
 
 #[test]
 fn exact_owner_cleanup_does_not_scan_foreign_physical_extents() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const FOREIGN_OWNERS: usize = 512;
     let physical = (0x5fff_2600_0000_u64, 0x4000_u64);
     let mut registry = AliasRegistry::default();
@@ -1430,7 +1448,7 @@ fn exact_owner_cleanup_does_not_scan_foreign_physical_extents() {
 
 #[test]
 fn alias_receipts_retire_distant_same_ipa_rows_independently() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let directory = HvpatchCarrierTaskStateDirectory::default();
     let first = alias(0x7100_0000, 3);
     let mut distant = first;
@@ -1458,7 +1476,7 @@ fn alias_receipts_retire_distant_same_ipa_rows_independently() {
 fn alias_receipt_batch_cost_scales_with_rows_plus_changes() {
     const EXISTING: usize = 512;
     const CHANGES: usize = 64;
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let _restore = foreign_mm_tests::ExternalAliasStateRestore::capture();
     clear_alias_registry();
     clear_replay_mappings();
@@ -1509,6 +1527,7 @@ fn alias_receipt_batch_cost_scales_with_rows_plus_changes() {
 
 #[test]
 fn retiring_one_owner_does_not_scan_foreign_alias_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const FOREIGN_OWNERS: usize = 512;
     let retiring_root_slot = (0x4fff_1000_0000_u64, 0x4000_u64);
     let retiring_scope = AliasOwnershipScope::MmRootSlot {
@@ -1570,7 +1589,7 @@ fn retiring_one_owner_does_not_scan_foreign_alias_rows() {
 
 #[test]
 fn exit_cost_is_bounded_by_own_rows() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let mut registry = AliasRegistry::default();
     let directory = HvpatchCarrierTaskStateDirectory::default();
 
@@ -1663,7 +1682,7 @@ fn exit_cost_is_bounded_by_own_rows() {
 
 #[test]
 fn alias_receipt_restores_exact_registry_and_replay_preimages() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let preimage = alias(0x1111_0000, 1);
     let replacement = alias(0x2222_0000, 3);
     register_shared_alias(preimage);
@@ -1699,7 +1718,7 @@ fn alias_receipt_restores_exact_registry_and_replay_preimages() {
 
 #[test]
 fn alias_retirement_never_restores_over_a_later_writer() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let preimage = alias(0x5555_0000, 1);
     let owned = alias(0x6666_0000, 3);
     let later = alias(0x7777_0000, 5);
@@ -1717,7 +1736,7 @@ fn alias_retirement_never_restores_over_a_later_writer() {
 
 #[test]
 fn buried_alias_owner_retires_without_clobbering_successor() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let preimage = alias(0x8888_0000, 1);
     let first_value = alias(0x9999_0000, 3);
     let second_value = alias(0xaaaa_0000, 5);
@@ -1739,7 +1758,7 @@ fn buried_alias_owner_retires_without_clobbering_successor() {
 
 #[test]
 fn external_writer_between_owned_versions_becomes_effective_base() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let preimage = alias(0xbbbb_0000, 1);
     let first_value = alias(0xcccc_0000, 3);
     let external = alias(0xdddd_0000, 5);
@@ -1762,7 +1781,7 @@ fn external_writer_between_owned_versions_becomes_effective_base() {
 
 #[test]
 fn repeated_alias_key_exhaustion_is_preflighted_without_partial_publication() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let preimage = alias(0xf111_0000, 1);
     let first_value = alias(0xf222_0000, 3);
     let second_value = alias(0xf333_0000, 5);
@@ -1793,7 +1812,7 @@ fn repeated_alias_key_exhaustion_is_preflighted_without_partial_publication() {
 
 #[test]
 fn unregister_alias_does_not_scan_foreign_owners() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     clear_alias_registry();
     clear_replay_mappings();
     const FOREIGN: usize = 512;
@@ -1837,6 +1856,7 @@ fn unregister_alias_does_not_scan_foreign_owners() {
 
 #[test]
 fn unregister_last_alias_does_not_rebuild_earlier_exact_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const PREFIX: usize = 512;
     let mut registry = AliasRegistry::default();
     let mut mine = alias(0x9000_0000, 3);
@@ -1889,6 +1909,7 @@ fn unregister_last_alias_does_not_rebuild_earlier_exact_rows() {
 /// suffix pass legitimate rather than merely cheaper.
 #[test]
 fn unregister_one_alias_costs_the_same_at_any_mm_size() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const NEIGHBOURS: usize = 4096;
     // Room for the binary search's comparisons (log2 4097 ~ 12) and the
     // per-key promotion, and nothing that scales with NEIGHBOURS.
@@ -1948,6 +1969,7 @@ fn unregister_one_alias_costs_the_same_at_any_mm_size() {
 /// failed". The neighbour must survive untouched and must not be retired.
 #[test]
 fn unregister_leaves_a_row_that_begins_at_the_unmap_end_untouched() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut registry = AliasRegistry::default();
     let victim = alias(0x9000_0000, 3);
     let mut neighbour = victim;
@@ -1987,6 +2009,7 @@ fn unregister_leaves_a_row_that_begins_at_the_unmap_end_untouched() {
 
 #[test]
 fn unregister_alias_matches_full_snapshot_invalidation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = HvpatchCarrierTaskStateDirectory::default();
     let owner = owner_key(&directory, 88, 1);
     let mut root = alias(0x9000_0000, 3);
@@ -2122,7 +2145,7 @@ fn unregister_alias_matches_full_snapshot_invalidation() {
 
 #[test]
 fn external_unregister_and_clear_invalidate_owned_versions() {
-    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     let preimage = alias(0xf666_0000, 1);
     let owned = alias(0xf777_0000, 3);
     register_shared_alias(preimage);
@@ -2214,6 +2237,7 @@ pub(crate) fn test_kernel_apply(
 
 #[test]
 fn a_superseded_fork_inheritance_no_longer_blocks_retirement() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let id = |raw| {
         std::num::NonZeroU64::new(raw)
             .map(carrick_hal::MappingId::from_kernel_allocation)
@@ -2282,6 +2306,7 @@ fn a_superseded_fork_inheritance_no_longer_blocks_retirement() {
 
 #[test]
 fn inventory_phase_is_process_owned_and_exactly_ordered() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let mut sibling = HvpatchTaskInventoryAuthority::SiblingShared {
         ledger: Arc::clone(&ledger),
@@ -2410,6 +2435,7 @@ fn inventory_phase_is_process_owned_and_exactly_ordered() {
 
 #[test]
 fn only_a_non_owning_authority_reports_a_shared_process_inventory() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = || Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     // vfork / CLONE_VM: the ledger belongs to the process whose kernel mm
     // this task shares. Retirement is the owner's job.
@@ -2446,6 +2472,7 @@ fn only_a_non_owning_authority_reports_a_shared_process_inventory() {
 
 #[test]
 fn shared_process_activation_has_no_process_inventory_transaction() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let mut shared = HvpatchTaskInventoryAuthority::SharedProcess {
         ledger: Arc::clone(&ledger),
@@ -2474,6 +2501,7 @@ fn shared_process_activation_has_no_process_inventory_transaction() {
 
 #[test]
 fn active_inventory_activation_is_idempotent_for_thread_siblings() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let receipt = test_kernel_apply(
         empty_inventory_commit(101),
@@ -2494,6 +2522,7 @@ fn active_inventory_activation_is_idempotent_for_thread_siblings() {
 
 #[test]
 fn exec_predecessor_authority_retires_without_aborting_active_drop() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let receipt = test_kernel_apply(
         empty_inventory_commit(102),
@@ -2530,6 +2559,7 @@ fn exec_predecessor_authority_retires_without_aborting_active_drop() {
 
 #[test]
 fn exclusive_rebind_retires_predecessor_authority() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let receipt = test_kernel_apply(
@@ -2613,6 +2643,7 @@ fn exclusive_rebind_retires_predecessor_authority() {
 /// (`holder=registration-cleanup`).
 #[test]
 fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
@@ -2770,6 +2801,7 @@ fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
 /// numeric slot.
 #[test]
 fn shared_process_authority_preserves_the_exact_mm_access_arc() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let cow_armed = Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
     let cow_deferred_publications = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -2805,6 +2837,7 @@ fn shared_process_authority_preserves_the_exact_mm_access_arc() {
 
 #[test]
 fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
@@ -2895,6 +2928,7 @@ fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
 
 #[test]
 fn shared_mm_retires_carrier_before_final_task_authority() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -2951,7 +2985,8 @@ fn shared_mm_retires_carrier_before_final_task_authority() {
 }
 
 #[test]
-fn process_descriptor_lease_retires_while_host_backing_is_live() {
+fn serial_host_process_descriptor_lease_retires_while_host_backing_is_live() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         0x4000,
         crate::host_mapping::HostMappingKind::PrivateAnon,
@@ -3004,6 +3039,7 @@ fn process_descriptor_lease_retires_while_host_backing_is_live() {
 
 #[test]
 fn exhausted_nonce_aborts_prepared_authority_before_visibility() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     directory.next.store(u64::MAX, Ordering::SeqCst);
     let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -3018,6 +3054,7 @@ fn exhausted_nonce_aborts_prepared_authority_before_visibility() {
 
 #[test]
 fn carrier_token_is_rejected_by_a_different_directory_instance() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let first = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let second = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -3033,6 +3070,7 @@ fn carrier_token_is_rejected_by_a_different_directory_instance() {
 
 #[test]
 fn duplicate_core_key_rejects_different_linux_metadata() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let binding = directory
@@ -3058,6 +3096,7 @@ fn duplicate_core_key_rejects_different_linux_metadata() {
 /// activation, after the child had already been published.
 #[test]
 fn prepared_task_authority_rejects_half_a_cow_authority() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let armed = || Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
     let publications = || Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -3102,6 +3141,7 @@ fn prepared_task_authority_rejects_half_a_cow_authority() {
 
 #[test]
 fn committed_child_requires_fresh_exact_kernel_cow_binding() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (issuer, verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::new(
         std::num::NonZeroU64::new(0x881).unwrap(),
