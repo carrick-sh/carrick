@@ -1265,6 +1265,19 @@ impl HvfVmState {
         if forbidden_alias || forbidden_mapping {
             return Ok(None);
         }
+        // A replacement retires an old owner, which on the guest-owned lane
+        // may happen only after EL1's verified descriptor completion. Decline
+        // it here, before any transition: EL1 forwards the fault and the host
+        // first-touch path publishes it through `publish_replacing`, whose
+        // retirement callback runs only after the verified receipt. Fresh
+        // grants (no predecessor) stay on this bulk path on both lanes.
+        let replaces = !aliases.is_empty() || !overlapping_mappings.is_empty();
+        if replaces
+            && self.page_tables_authority().live_descriptor_owner()
+                == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+        {
+            return Ok(None);
+        }
         let Some(deferred_state) = self.deferred_anonymous_state() else {
             return Ok(None);
         };
@@ -1288,9 +1301,8 @@ impl HvfVmState {
         let mut retirement = if replacement_leases.is_empty() {
             None
         } else {
-            // Fresh grants only prepare backing. Replacement additionally
-            // retires an old owner, which the guest lane may authorize only
-            // after its descriptor receipt has been settled.
+            // Guest-owned MMs declined replacement above; this stays a
+            // host-lane-only writer.
             require_host_cow_lane(&self.page_tables_authority())?;
             let planned =
                 self.plan_process_alias_retirement(request.semantic_base, semantic_len)?;
