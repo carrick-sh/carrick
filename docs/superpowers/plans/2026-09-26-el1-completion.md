@@ -107,14 +107,27 @@ source metadata. MMU 160, EL1 114 and affected all-target Clippy pass. See
 `cow-permissions-*` receipts. This is executor/model evidence; admission remains
 disabled and successful real-authority COW execution is still unproven.
 
-**Next implementation:** finish the joined transaction's kernel-only, legacy,
-maintenance and private-file shapes using the existing permission-preserving
-MMU rules. Compose successful backing completion with the
-real kernel authority. Then convert private/shared repoints, replacement grants,
-retired reuse, foreign-MM COW, engine protection/alias/discard and exec writers;
-join reservation policy/lifecycle. The concrete caller checklist is retained in
-adapter `cow-join.md`; it is not an exhaustive writer-closure claim. No second
-copy transport or broad boot campaign is the next action.
+**Local COW shape conversion (development):** adapter `09afdd4c5` routes
+kernel-only, legacy user, maintenance and private-file reuse through the existing
+compound EL1 transaction. Protocol v4 carries typed access authority; tagged
+private permissions remain EL1-owned. Maintenance retains the exact completion
+leaf for deferred protection publication. Reused private-file destinations retain
+their pin and authenticate the existing kernel row/MM/owner/revision without a
+duplicate grant. The remaining local COW shape refusal is removed. Red controls,
+MMU 163, EL1 114, inventory 22, backend 11, the real kernel-inventory authority
+witness and affected Clippy pass; see `cow-access.md`. The authority witness uses
+the existing fixed-owner fixture; it is not full carrier/hardware COW execution.
+Admission remains disabled and signed COW acceptance remains open.
+
+**Next implementation:** convert private/shared repoint publishers, replacement
+grants, retired reuse, sparse replacement and foreign-MM publication, then the
+remaining engine protection/alias/discard and exec writers. Join reservation
+policy/lifecycle as the production writer dependencies close. Successful complete
+COW execution with real ownership and signed guest proof remains part of the
+connected memory milestone. No second copy transport or broad boot campaign.
+The caller checklist in adapter `cow-join.md` is historical at its recorded
+source; `cow-access.md` records the local COW progression. Neither claims an
+exhaustive writer-closure audit.
 
 **Dependency review after two prerequisite intervals:** copyout and the guest
 copy transport remove concrete missing operations but have not activated the
@@ -141,7 +154,7 @@ resume their investigation only for a new discriminating test or a concrete
 dependency. No new broad capture campaign. x86 remains deferred.
 
 Current accepted base remains local main `f304f8415`; development integration is
-adapter `1b121731c` (clean development commit).
+adapter `09afdd4c5` (clean development commit).
 No checkpoint has been accepted by this work.
 
 **Execution correction after the renewed rabbit-hole warning:** keep one active
