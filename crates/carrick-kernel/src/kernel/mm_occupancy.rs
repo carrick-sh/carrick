@@ -634,6 +634,38 @@ impl SpaceTables {
     }
 }
 
+/// The carrier's settlement of guest EL1 COW completions
+/// ([`carrick_el1_abi::CowGrantSettlement`]). Installed once the carrier
+/// maps its EL1 region; every host exclusion of a published MM's EL1 editor
+/// in the zone runs it before the host touches that MM's translations or
+/// frames, and the retirement of a published MM releases its pool records.
+static GUEST_COW_SETTLEMENT: parking_lot::RwLock<
+    Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>>,
+> = parking_lot::RwLock::new(None);
+
+/// Install the carrier's guest COW settlement (replacing a previous one).
+pub fn install_guest_cow_settlement(settlement: Arc<dyn carrick_el1_abi::CowGrantSettlement>) {
+    *GUEST_COW_SETTLEMENT.write() = Some(settlement);
+}
+
+fn guest_cow_settlement() -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
+    GUEST_COW_SETTLEMENT.read().clone()
+}
+
+/// Run right after the host excluded an MM's EL1 editor in `tables`: fold
+/// every guest COW EL1 completed for the MM into the host authorities while
+/// no EL1 editor can add another.
+fn settle_excluded(tables: SpaceTables, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
+    // Private (VM-free test) tables have no EL1 region; their tests install
+    // a recording settlement to observe exactly when this runs.
+    if !tables.zone && !cfg!(test) {
+        return;
+    }
+    if let Some(settlement) = guest_cow_settlement() {
+        settlement.settle(excluded);
+    }
+}
+
 /// An MM's fence copied into its published address space's gate.
 struct SpaceGate {
     tables: SpaceTables,
@@ -643,9 +675,11 @@ struct SpaceGate {
 impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
     fn raise(&self) {
         if self.tables.live() {
-            self.tables
+            let excluded = self
+                .tables
                 .spaces
                 .raise_and_wait_for_editor(self.index, core::hint::spin_loop);
+            settle_excluded(self.tables, &excluded);
         }
     }
 
@@ -683,16 +717,23 @@ impl std::fmt::Debug for El1EditorExclusion {
 /// it).
 pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
     let zone = crate::el1_zone::zone()?;
-    let tables = SpaceTables {
-        spaces: &zone.spaces,
-        occupancy: &zone.occupancy,
-        zone: true,
-    };
+    exclude_el1_editor_in(
+        SpaceTables {
+            spaces: &zone.spaces,
+            occupancy: &zone.occupancy,
+            zone: true,
+        },
+        mm,
+    )
+}
+
+fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclusion> {
     let key = mm.raw();
     let index = tables.spaces.find(key)?;
-    tables
+    let excluded = tables
         .spaces
         .raise_and_wait_for_editor(index, core::hint::spin_loop);
+    settle_excluded(tables, &excluded);
     Some(El1EditorExclusion { tables, index, key })
 }
 
@@ -960,9 +1001,17 @@ impl Drop for AddressSpacePublication {
         if !self.tables.live() {
             return;
         }
-        self.tables
+        let excluded = self
+            .tables
             .spaces
             .close_and_wait_for_editor(self.index, core::hint::spin_loop);
+        // The MM is gone: its guest COW grants and unsettled completions
+        // retire with its inventory; only their pool records remain to free.
+        if self.tables.zone
+            && let Some(settlement) = guest_cow_settlement()
+        {
+            settlement.release(&excluded);
+        }
         drain_space(self.tables.occupancy, self.mm);
         retire_reservation_root(self.tables, self.index, self.mm);
         let _serial = SPACES_LOCK.lock();

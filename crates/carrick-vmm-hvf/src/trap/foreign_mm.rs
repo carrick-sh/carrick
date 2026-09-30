@@ -352,6 +352,11 @@ pub(crate) struct MmAccessState {
     pub(crate) cow_runtime: parking_lot::RwLock<Option<MmCowRuntimeBinding>>,
     pub(crate) cow_rollback_scratch:
         parking_lot::Mutex<Option<carrick_mmu_core::aarch64::PageTableManager>>,
+    /// Serializes settlement of this MM's guest COW completions: two host
+    /// exclusions of the MM (a pause and a mutation guard) may overlap.
+    pub(crate) guest_cow_settlement: parking_lot::Mutex<()>,
+    /// Grants the next empty-pool refill provisions for this MM.
+    pub(crate) guest_cow_batch: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) foreign_cow_failpoint: std::sync::atomic::AtomicU8,
     /// Host-only unit tests have no EL1 region; they supply its slots here.
@@ -610,6 +615,10 @@ impl MmAccessState {
             cow_runtime: parking_lot::RwLock::new(None),
             deferred_anonymous: parking_lot::RwLock::new(None),
             cow_rollback_scratch: parking_lot::Mutex::new(None),
+            guest_cow_settlement: parking_lot::Mutex::new(()),
+            guest_cow_batch: std::sync::atomic::AtomicUsize::new(
+                super::guest_cow::GUEST_COW_FIRST_BATCH,
+            ),
             #[cfg(test)]
             foreign_cow_failpoint: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
@@ -662,6 +671,12 @@ impl MmAccessState {
             MmAccessLiveResolver::new(&state, legacy_test_carrier_vm_custody_arc().clone());
         state.set_live_resolver(resolver);
         state
+    }
+
+    /// Void deferred COW publication receipts a repoint of `[va, va + len)`
+    /// superseded (see `supersede_cow_receipts_in`).
+    pub(crate) fn supersede_cow_receipts(&self, va: u64, len: u64) {
+        super::cow_engine::supersede_cow_receipts_in(&self.cow_deferred_publications, va, len);
     }
 
     pub(crate) fn install_identity(
