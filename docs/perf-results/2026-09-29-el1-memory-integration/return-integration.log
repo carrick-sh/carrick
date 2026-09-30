@@ -1,0 +1,19 @@
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-aarch64)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.44s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-d38a4fda3eb6fe59)
+
+running 6 tests
+test trap::global_frame::allocator_stats_tests::el1_lifecycle_exit_without_munmap_accounts_at_three_scales ... ok
+test trap::global_frame::allocator_stats_tests::el1_lifecycle_pins_failed_unmap_and_reuse_at_three_scales ... ok
+test trap::global_frame::allocator_stats_tests::el1_lifecycle_pooled_returns_retain_host_storage_at_three_scales ... ok
+test trap::global_frame::allocator_stats_tests::el1_lifecycle_regrant_requires_a_return_receipt_at_three_scales ... ok
+test trap::global_frame::allocator_stats_tests::el1_lifecycle_scope_mm_generation_and_overflow_fail_closed ... ok
+test trap::global_frame::allocator_stats_tests::el1_lifecycle_unpublished_custodies_do_not_leak_into_current_carrier ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 603 filtered out; finished in 0.02s
+

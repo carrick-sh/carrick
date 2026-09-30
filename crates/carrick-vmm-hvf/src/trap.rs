@@ -189,24 +189,123 @@ pub(crate) mod host_writes;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
 
-/// Monotonic diagnostics for physical leases published through the EL1
-/// anonymous frame-grant path. A return is counted only when the exact tagged
-/// stage-2 lease reaches the global IPA allocator's successful release point.
+/// One carrier accounting lifetime. Holding the token prevents identity reuse.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug)]
+pub struct El1FrameGrantScope(std::sync::Arc<()>);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PartialEq for El1FrameGrantScope {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Eq for El1FrameGrantScope {}
+
+/// Exact kernel MM generation used by the EL1 frame-grant request.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct El1FrameGrantMm(std::num::NonZeroU64);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl El1FrameGrantMm {
+    pub fn new(mm_key: u64) -> Option<Self> {
+        std::num::NonZeroU64::new(mm_key).map(Self)
+    }
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Carrier/MM scoped physical grant accounting. `complete == false` rejects
+/// absent authority or counter overflow. A logical return does not imply that
+/// the IPA or host storage was released; those have separate counters.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct El1FrameGrantStats {
+    pub scope: Option<El1FrameGrantScope>,
+    pub mm: Option<El1FrameGrantMm>,
+    pub complete: bool,
     pub grants_succeeded: u64,
     pub returns_completed: u64,
+    /// Reuse of a returned exact IPA extent in this carrier, not a claim
+    /// about the host kernel reusing the same physical pages.
     pub reused_grants: u64,
     pub bytes_granted: u64,
     pub bytes_returned: u64,
+    pub ipa_bytes_returned: u64,
+    pub pooled_reusable_bytes: u64,
+    pub host_backing_released_bytes: u64,
 }
 
-/// Snapshot EL1 anonymous frame-grant diagnostics.
-///
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use global_frame::El1FrameGrantObserver;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl El1FrameGrantStats {
+    /// Difference only complete measurements of the same carrier and MM.
+    pub fn checked_delta(&self, before: &Self) -> Option<Self> {
+        if !self.complete
+            || !before.complete
+            || self.scope.is_none()
+            || self.scope != before.scope
+            || self.mm != before.mm
+        {
+            return None;
+        }
+        Some(Self {
+            scope: self.scope.clone(),
+            mm: self.mm,
+            complete: true,
+            grants_succeeded: self.grants_succeeded.checked_sub(before.grants_succeeded)?,
+            returns_completed: self
+                .returns_completed
+                .checked_sub(before.returns_completed)?,
+            reused_grants: self.reused_grants.checked_sub(before.reused_grants)?,
+            bytes_granted: self.bytes_granted.checked_sub(before.bytes_granted)?,
+            bytes_returned: self.bytes_returned.checked_sub(before.bytes_returned)?,
+            ipa_bytes_returned: self
+                .ipa_bytes_returned
+                .checked_sub(before.ipa_bytes_returned)?,
+            pooled_reusable_bytes: self
+                .pooled_reusable_bytes
+                .checked_sub(before.pooled_reusable_bytes)?,
+            host_backing_released_bytes: self
+                .host_backing_released_bytes
+                .checked_sub(before.host_backing_released_bytes)?,
+        })
+    }
+
+    /// Bytes still retained by active leases or post-retirement backing owners.
+    /// This is allocation attribution to the granting MM, including retention
+    /// caused by fork peers; it is not a count of that MM's virtual mappings.
+    pub fn retained_backing_bytes(&self) -> Option<u64> {
+        self.complete.then_some(())?;
+        self.bytes_granted.checked_sub(
+            self.pooled_reusable_bytes
+                .checked_add(self.host_backing_released_bytes)?,
+        )
+    }
+
+    /// Capture the published carrier's accounting lifetime, retaining access
+    /// through final-MM and VM teardown without retaining guest backing.
+    pub fn observe_current() -> Option<El1FrameGrantObserver> {
+        let carrier = persistent_carrier_cell().lock();
+        match carrier.as_ref()? {
+            PersistentCarrierCellEntry::Published(carrier) => Some(El1FrameGrantObserver::new(
+                &carrier.carrier_foreign_mm_transport.custody,
+            )),
+            PersistentCarrierCellEntry::CreateCleanup { .. } => None,
+        }
+    }
+}
+
+/// Snapshot only the currently published carrier; absence is incomplete.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
-    global_frame::snapshot_el1_frame_grant_stats()
+    El1FrameGrantStats::observe_current()
+        .map_or_else(El1FrameGrantStats::default, |observer| observer.snapshot())
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod execve_rebuild;

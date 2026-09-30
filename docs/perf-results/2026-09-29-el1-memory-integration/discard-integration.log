@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-d38a4fda3eb6fe59)
+
+running 1 test
+test trap::frame_inventory::tests::el1_partial_discard_peer_retention_three_scales ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 608 filtered out; finished in 0.00s
+

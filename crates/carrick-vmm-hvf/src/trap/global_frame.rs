@@ -136,15 +136,63 @@ impl GlobalFrameIpaAllocator {
     }
 }
 
-#[derive(Debug, Default)]
-struct El1FrameGrantLedger {
+#[derive(Debug)]
+pub(crate) struct El1FrameGrantLedger {
     active: std::collections::BTreeSet<(u64, u64)>,
     returned: std::collections::BTreeSet<(u64, u64)>,
     stats: El1FrameGrantStats,
+    by_mm: std::collections::BTreeMap<El1FrameGrantMm, El1FrameGrantStats>,
+}
+
+impl Default for El1FrameGrantLedger {
+    fn default() -> Self {
+        Self {
+            active: Default::default(),
+            returned: Default::default(),
+            by_mm: Default::default(),
+            stats: El1FrameGrantStats {
+                scope: Some(El1FrameGrantScope(std::sync::Arc::new(()))),
+                complete: true,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+/// A snapshot handle owns accounting only, never physical backing or a VM.
+#[derive(Clone, Debug)]
+pub struct El1FrameGrantObserver {
+    ledger: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
+}
+impl El1FrameGrantObserver {
+    pub(crate) fn new(custody: &CarrierVmCustody) -> Self {
+        Self {
+            ledger: std::sync::Arc::clone(&custody.el1_frame_grants),
+        }
+    }
+    pub fn snapshot(&self) -> El1FrameGrantStats {
+        self.ledger.lock().stats.clone()
+    }
+    pub fn snapshot_mm(&self, mm: El1FrameGrantMm) -> Option<El1FrameGrantStats> {
+        self.ledger.lock().by_mm.get(&mm).cloned()
+    }
+    pub fn snapshots_by_mm(&self) -> Vec<El1FrameGrantStats> {
+        self.ledger.lock().by_mm.values().cloned().collect()
+    }
+}
+
+fn add_grant_counter(counter: &mut u64, complete: &mut bool, amount: u64) {
+    match counter.checked_add(amount) {
+        Some(value) => *counter = value,
+        None => {
+            *complete = false;
+            *counter = u64::MAX;
+        }
+    }
 }
 
 impl El1FrameGrantLedger {
-    fn mark_grant(&mut self, base: u64, length: u64) -> Result<(), TrapError> {
+    fn mark_grant(&mut self, base: u64, length: u64, mm: El1FrameGrantMm) -> Result<(), TrapError> {
         if length == 0
             || !base.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
             || !length.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
@@ -155,27 +203,46 @@ impl El1FrameGrantLedger {
             )));
         }
         let key = (base, length);
-        // This ledger only feeds allocator statistics. Some host return paths
-        // (process teardown, host-side munmap of an EL1 grant) release the
-        // extent without `mark_return`; a re-grant of the same extent is then
-        // counted as reuse rather than aborting the carrier.
-        if !self.active.insert(key) {
-            self.returned.insert(key);
+        if self.active.contains(&key) {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 frame regrant precedes exact return: base=0x{base:x} length=0x{length:x}"
+            )));
         }
-        self.stats.grants_succeeded = self.stats.grants_succeeded.saturating_add(1);
-        self.stats.bytes_granted = self.stats.bytes_granted.saturating_add(length);
-        if self.returned.contains(&key) {
-            self.stats.reused_grants = self.stats.reused_grants.saturating_add(1);
-        }
+        self.active.insert(key);
+        let reused = self.returned.contains(&key);
+        self.update(mm, |stats| {
+            add_grant_counter(&mut stats.grants_succeeded, &mut stats.complete, 1);
+            add_grant_counter(&mut stats.bytes_granted, &mut stats.complete, length);
+            if reused {
+                add_grant_counter(&mut stats.reused_grants, &mut stats.complete, 1);
+            }
+        });
         Ok(())
     }
 
-    fn mark_return(&mut self, base: u64, length: u64) {
-        let key = (base, length);
-        if self.active.remove(&key) {
-            self.returned.insert(key);
-            self.stats.returns_completed = self.stats.returns_completed.saturating_add(1);
-            self.stats.bytes_returned = self.stats.bytes_returned.saturating_add(length);
+    fn update(&mut self, mm: El1FrameGrantMm, mut update: impl FnMut(&mut El1FrameGrantStats)) {
+        let scoped = self.by_mm.entry(mm).or_insert_with(|| El1FrameGrantStats {
+            scope: self.stats.scope.clone(),
+            mm: Some(mm),
+            complete: true,
+            ..Default::default()
+        });
+        update(scoped);
+        update(&mut self.stats);
+    }
+
+    fn mark_return(&mut self, base: u64, length: u64, mm: El1FrameGrantMm, release_ipa: bool) {
+        if self.active.remove(&(base, length)) {
+            self.returned.insert((base, length));
+            self.update(mm, |stats| {
+                add_grant_counter(&mut stats.returns_completed, &mut stats.complete, 1);
+                add_grant_counter(&mut stats.bytes_returned, &mut stats.complete, length);
+                if release_ipa {
+                    add_grant_counter(&mut stats.ipa_bytes_returned, &mut stats.complete, length);
+                }
+            });
+        } else {
+            self.update(mm, |stats| stats.complete = false);
         }
     }
 }
@@ -183,6 +250,426 @@ impl El1FrameGrantLedger {
 #[cfg(test)]
 mod allocator_stats_tests {
     use super::*;
+    fn test_mm() -> El1FrameGrantMm {
+        El1FrameGrantMm::new(1).unwrap()
+    }
+    use crate::trap::frame_inventory_backend_tests::global_frame_allocator_test_lock;
+
+    #[test]
+    fn el1_lifecycle_scope_mm_generation_and_overflow_fail_closed() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        for scale in [1, 8, 64] {
+            let a = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let b = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let observer = El1FrameGrantObserver::new(&a);
+            assert_ne!(
+                observer.snapshot().scope,
+                El1FrameGrantObserver::new(&b).snapshot().scope
+            );
+            assert!(
+                observer
+                    .snapshot()
+                    .checked_delta(&El1FrameGrantObserver::new(&b).snapshot())
+                    .is_none()
+            );
+            assert!(
+                observer
+                    .snapshot()
+                    .checked_delta(&El1FrameGrantStats::default())
+                    .is_none()
+            );
+            let length = CowArmedRanges::COMPOUND_SIZE;
+            for mm_key in 1..=scale {
+                let mut lease = GlobalFrameStage2Lease::reserve(length, length).unwrap();
+                let (base, length) = lease.key();
+                lease.mark_mapped();
+                let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    length as usize,
+                    crate::host_mapping::HostMappingKind::FrameCow,
+                )
+                .unwrap();
+                let generation = register_global_frame_host_owner_in(&a, lease, host, 3).unwrap();
+                let before = observer.snapshot();
+                assert!(mark_el1_frame_grant_in(&a, base, length, mm_key, generation + 1).is_err());
+                assert_eq!(observer.snapshot(), before);
+                assert!(mark_el1_frame_grant_in(&a, base, length, 0, generation).is_err());
+                mark_el1_frame_grant_in(&a, base, length, mm_key, generation).unwrap();
+                assert_eq!(
+                    observer
+                        .snapshot_mm(El1FrameGrantMm::new(mm_key).unwrap())
+                        .unwrap()
+                        .retained_backing_bytes(),
+                    Some(length)
+                );
+                assert!(
+                    retire_global_frame_host_owner_if_generation_in_using(
+                        &a,
+                        base,
+                        length,
+                        generation,
+                        &mut |_, _| Ok(())
+                    )
+                    .is_retired()
+                );
+                let mm = observer
+                    .snapshot_mm(El1FrameGrantMm::new(mm_key).unwrap())
+                    .unwrap();
+                assert!(mm.complete);
+                assert_eq!(mm.retained_backing_bytes(), Some(0));
+                assert_eq!(mm.host_backing_released_bytes, length);
+                assert_eq!(mm.ipa_bytes_returned, length);
+                assert_eq!(mm.pooled_reusable_bytes, 0);
+            }
+            assert_eq!(El1FrameGrantObserver::new(&b).snapshot().bytes_granted, 0);
+            assert_eq!(observer.snapshots_by_mm().len(), scale as usize);
+            assert!(
+                observer
+                    .snapshot()
+                    .checked_delta(&observer.snapshot_mm(test_mm()).unwrap())
+                    .is_none()
+            );
+            drop(a);
+            assert_eq!(observer.snapshot().bytes_granted, scale * length);
+            assert_eq!(observer.snapshot().retained_backing_bytes(), Some(0));
+        }
+        let mut ledger = El1FrameGrantLedger::default();
+        ledger.stats.bytes_granted = u64::MAX;
+        ledger.mark_grant(0x8000_0000, 0x4000, test_mm()).unwrap();
+        assert!(!ledger.stats.complete);
+        assert_eq!(ledger.stats.retained_backing_bytes(), None);
+    }
+
+    fn grant_owned(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+    ) -> (u64, std::sync::Arc<GlobalFrameHostOwner>) {
+        let length = CowArmedRanges::COMPOUND_SIZE;
+        let mut lease = GlobalFrameStage2Lease::reserve(length, length).unwrap();
+        let (base, length) = lease.key();
+        // The callback supplied by the test is the entire stage-2 backend.
+        lease.mark_mapped();
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            length as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .unwrap();
+        register_global_frame_host_owner_in(custody, lease, host, 3).unwrap();
+        mark_el1_frame_grant_in(
+            custody,
+            base,
+            length,
+            1,
+            global_frame_host_owner_generation_in(custody, base, length),
+        )
+        .unwrap();
+        let owner = std::sync::Arc::clone(
+            custody
+                .global_frame_host_owners
+                .lock()
+                .get(&(base, length))
+                .unwrap()
+                .owner(),
+        );
+        (base, owner)
+    }
+
+    #[test]
+    fn el1_lifecycle_unpublished_custodies_do_not_leak_into_current_carrier() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        let mut observed = Vec::new();
+        for scale in [1, 8, 64] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            for _ in 0..scale {
+                let (base, owner) = grant_owned(&custody);
+                assert!(
+                    retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        base,
+                        owner.length(),
+                        owner.generation(),
+                        &mut |_, _| Ok(()),
+                    )
+                    .is_retired()
+                );
+            }
+            observed.push((scale, el1_frame_grant_stats().bytes_granted));
+        }
+        assert!(
+            observed.iter().all(|&(_, bytes)| bytes == 0),
+            "{observed:?}"
+        );
+    }
+
+    #[test]
+    fn el1_lifecycle_pins_failed_unmap_and_reuse_at_three_scales() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        for scale in [1, 8, 64] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let before = El1FrameGrantObserver::new(&custody).snapshot();
+            let length = CowArmedRanges::COMPOUND_SIZE;
+            let mut grants = Vec::new();
+            let mut unmaps = 0;
+            for _ in 0..scale {
+                let (base, owner) = grant_owned(&custody);
+                let pin = owner.pin().unwrap();
+                let result = retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    base,
+                    length,
+                    owner.generation(),
+                    &mut |_, _| {
+                        unmaps += 1;
+                        Ok(())
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+                ));
+                grants.push((base, owner, pin));
+            }
+            assert_eq!(unmaps, 0);
+            assert_eq!(
+                El1FrameGrantObserver::new(&custody)
+                    .snapshot()
+                    .bytes_returned,
+                before.bytes_returned
+            );
+            let mut retained = Vec::new();
+            for (base, owner, pin) in grants {
+                drop(pin);
+                let failed = retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    base,
+                    length,
+                    owner.generation(),
+                    &mut |_, _| {
+                        unmaps += 1;
+                        Err(CarrierStage2BackendError::HvReturn(1))
+                    },
+                );
+                assert!(matches!(
+                    failed,
+                    GlobalFrameRetirementOutcome::RetryPending { .. }
+                ));
+                retained.push((base, owner));
+            }
+            assert_eq!(
+                El1FrameGrantObserver::new(&custody)
+                    .snapshot()
+                    .bytes_returned,
+                before.bytes_returned
+            );
+            assert_eq!(
+                custody.global_frame_host_owners.lock().len(),
+                scale as usize
+            );
+            for (base, owner) in retained {
+                let retired = retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    base,
+                    length,
+                    owner.generation(),
+                    &mut |_, _| {
+                        unmaps += 1;
+                        Ok(())
+                    },
+                );
+                assert!(retired.is_retired());
+                let released = El1FrameGrantObserver::new(&custody).snapshot();
+                // Duplicate finalization of this exact owner must not count twice.
+                assert!(finalize_global_frame_owner_record(&custody, &owner).is_err());
+                assert_eq!(El1FrameGrantObserver::new(&custody).snapshot(), released);
+                let weak_backing = std::sync::Arc::downgrade(&owner.mapping);
+                assert!(
+                    weak_backing.upgrade().is_some(),
+                    "IPA return is not host backing drop"
+                );
+                drop(owner);
+                assert!(weak_backing.upgrade().is_none());
+            }
+            let after = El1FrameGrantObserver::new(&custody).snapshot();
+            assert_eq!(after.bytes_returned - before.bytes_returned, scale * length);
+            assert_eq!(after.returns_completed - before.returns_completed, scale);
+            assert_eq!(unmaps, 2 * scale);
+            assert!(custody.global_frame_host_owners.lock().is_empty());
+            for _ in 0..scale {
+                let (base, owner) = grant_owned(&custody);
+                assert!(
+                    retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        base,
+                        length,
+                        owner.generation(),
+                        &mut |_, _| Ok(()),
+                    )
+                    .is_retired()
+                );
+            }
+            let reused = El1FrameGrantObserver::new(&custody).snapshot();
+            assert_eq!(reused.reused_grants - after.reused_grants, scale);
+            assert_eq!(
+                reused.bytes_returned - before.bytes_returned,
+                2 * scale * length
+            );
+        }
+    }
+
+    #[test]
+    fn el1_lifecycle_pooled_returns_retain_host_storage_at_three_scales() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        for scale in [1, 8, 64] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let pool = std::sync::Arc::new(
+                crate::frame_pool::PreMappedFramePool::new_test_fixture(scale),
+            );
+            let before = El1FrameGrantObserver::new(&custody).snapshot();
+            let mut owners = Vec::new();
+            for _ in 0..scale {
+                let handle = pool.allocate_compound().unwrap();
+                let key = (handle.ipa(), handle.len() as u64);
+                register_pooled_global_frame_host_owner_in(&custody, handle, 3).unwrap();
+                mark_el1_frame_grant_in(
+                    &custody,
+                    key.0,
+                    key.1,
+                    1,
+                    global_frame_host_owner_generation_in(&custody, key.0, key.1),
+                )
+                .unwrap();
+                let owner = std::sync::Arc::clone(
+                    custody
+                        .global_frame_host_owners
+                        .lock()
+                        .get(&key)
+                        .unwrap()
+                        .owner(),
+                );
+                assert!(
+                    retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        key.0,
+                        key.1,
+                        owner.generation(),
+                        &mut |_, _| panic!("pool must retain its stage-2 map"),
+                    )
+                    .is_retired()
+                );
+                owners.push(owner);
+            }
+            assert_eq!(
+                pool.allocated_count(),
+                scale,
+                "owner projections still retain pool handles"
+            );
+            let retained = El1FrameGrantObserver::new(&custody).snapshot();
+            assert_eq!(retained.pooled_reusable_bytes, 0);
+            assert_eq!(
+                retained.retained_backing_bytes(),
+                Some(scale as u64 * CowArmedRanges::COMPOUND_SIZE)
+            );
+            drop(owners);
+            assert_eq!(pool.allocated_count(), 0);
+            let backing = El1FrameGrantObserver::new(&custody).snapshot();
+            assert!(backing.complete);
+            assert_eq!(
+                backing.pooled_reusable_bytes,
+                scale as u64 * CowArmedRanges::COMPOUND_SIZE
+            );
+            assert_eq!(backing.ipa_bytes_returned, 0);
+            assert_eq!(backing.host_backing_released_bytes, 0);
+            assert_eq!(backing.retained_backing_bytes(), Some(0));
+            assert_eq!(
+                pool.pool_size(),
+                scale * CowArmedRanges::COMPOUND_SIZE as usize
+            );
+            let after = El1FrameGrantObserver::new(&custody).snapshot();
+            assert_eq!(
+                after.returns_completed - before.returns_completed,
+                scale as u64
+            );
+            let handles: Vec<_> = (0..scale)
+                .map(|_| pool.allocate_compound().unwrap())
+                .collect();
+            assert!(handles.iter().all(|handle| unsafe {
+                std::slice::from_raw_parts(handle.as_ptr(), handle.len())
+                    .iter()
+                    .all(|byte| *byte == 0)
+            }));
+            drop(handles);
+        }
+    }
+
+    #[test]
+    fn el1_lifecycle_regrant_requires_a_return_receipt_at_three_scales() {
+        let mut observations = Vec::new();
+        for scale in [1, 8, 64] {
+            let mut ledger = El1FrameGrantLedger::default();
+            let length = CowArmedRanges::COMPOUND_SIZE;
+            for index in 0..scale {
+                let base = 0x8000_0000 + index * length;
+                ledger.mark_grant(base, length, test_mm()).unwrap();
+                let before = ledger.stats.clone();
+                let rejected = ledger.mark_grant(base, length, test_mm()).is_err();
+                observations.push((scale, rejected && ledger.stats == before));
+            }
+        }
+        assert!(
+            observations.iter().all(|(_, valid)| *valid),
+            "{observations:?}"
+        );
+    }
+
+    #[test]
+    fn el1_lifecycle_exit_without_munmap_accounts_at_three_scales() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        let mut observations = Vec::new();
+        for scale in [1, 8, 64] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let before = El1FrameGrantObserver::new(&custody).snapshot();
+            let length = CowArmedRanges::COMPOUND_SIZE;
+            for _ in 0..scale {
+                let mut lease = GlobalFrameStage2Lease::reserve(length, length).unwrap();
+                let (base, length) = lease.key();
+                lease.mark_test_mapped_without_backend();
+                let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    length as usize,
+                    crate::host_mapping::HostMappingKind::PerMmKernelState,
+                )
+                .unwrap();
+                register_global_frame_host_owner_in(&custody, lease, host, 3).unwrap();
+                mark_el1_frame_grant_in(
+                    &custody,
+                    base,
+                    length,
+                    1,
+                    global_frame_host_owner_generation_in(&custody, base, length),
+                )
+                .unwrap();
+            }
+            let generation = custody.setup_generation().unwrap();
+            custody.begin_destroy(generation).unwrap();
+            custody.commit_destroy(generation).unwrap();
+            finalize_carrier_exit_global_frame_owners_in_using(
+                &custody,
+                &mut release_retired_stage2_ipa,
+            )
+            .unwrap();
+            let after = El1FrameGrantObserver::new(&custody).snapshot();
+            assert_eq!(after.grants_succeeded - before.grants_succeeded, scale);
+            observations.push((
+                scale,
+                after.returns_completed - before.returns_completed,
+                after.bytes_returned - before.bytes_returned,
+            ));
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|&(scale, returns, bytes)| returns == scale
+                    && bytes == scale * CowArmedRanges::COMPOUND_SIZE),
+            "{observations:?}"
+        );
+    }
 
     #[test]
     fn el1_grant_stats_count_owned_and_pooled_return_and_reuse() {
@@ -190,7 +677,9 @@ mod allocator_stats_tests {
         let mut ledger = El1FrameGrantLedger::default();
         let length = CowArmedRanges::COMPOUND_SIZE;
         let first = allocator.allocate(length, length).expect("first extent");
-        ledger.mark_grant(first, length).expect("tag first grant");
+        ledger
+            .mark_grant(first, length, test_mm())
+            .expect("tag first grant");
         assert_eq!(
             ledger.stats,
             El1FrameGrantStats {
@@ -199,30 +688,33 @@ mod allocator_stats_tests {
                 reused_grants: 0,
                 bytes_granted: length,
                 bytes_returned: 0,
+                ..ledger.stats.clone()
             }
         );
         allocator
             .release(first, length)
             .expect("return first grant");
-        ledger.mark_return(first, length);
+        ledger.mark_return(first, length, test_mm(), true);
 
         let second = allocator.allocate(length, length).expect("reuse extent");
         assert_eq!(second, first, "best-fit allocator must reuse returned IPA");
-        ledger.mark_grant(second, length).expect("tag reused grant");
+        ledger
+            .mark_grant(second, length, test_mm())
+            .expect("tag reused grant");
         allocator
             .release(second, length)
             .expect("return reused grant");
-        ledger.mark_return(second, length);
+        ledger.mark_return(second, length, test_mm(), true);
 
         let pooled = first + (16 * length);
         ledger
-            .mark_grant(pooled, length)
+            .mark_grant(pooled, length, test_mm())
             .expect("tag pooled grant outside allocator exact extents");
-        ledger.mark_return(pooled, length);
+        ledger.mark_return(pooled, length, test_mm(), true);
         ledger
-            .mark_grant(pooled, length)
+            .mark_grant(pooled, length, test_mm())
             .expect("reuse pooled grant");
-        ledger.mark_return(pooled, length);
+        ledger.mark_return(pooled, length, test_mm(), true);
         assert_eq!(
             ledger.stats,
             El1FrameGrantStats {
@@ -231,6 +723,7 @@ mod allocator_stats_tests {
                 reused_grants: 2,
                 bytes_granted: length * 4,
                 bytes_returned: length * 4,
+                ..ledger.stats.clone()
             }
         );
     }
@@ -243,31 +736,80 @@ pub(crate) fn global_frame_ipa_allocator() -> &'static parking_lot::Mutex<Global
     ALLOCATOR.get_or_init(|| parking_lot::Mutex::new(GlobalFrameIpaAllocator::new()))
 }
 
-fn el1_frame_grant_ledger() -> &'static parking_lot::Mutex<El1FrameGrantLedger> {
-    static LEDGER: std::sync::OnceLock<parking_lot::Mutex<El1FrameGrantLedger>> =
-        std::sync::OnceLock::new();
-    LEDGER.get_or_init(|| parking_lot::Mutex::new(El1FrameGrantLedger::default()))
-}
-
-pub(super) fn snapshot_el1_frame_grant_stats() -> El1FrameGrantStats {
-    el1_frame_grant_ledger().lock().stats
-}
-
 pub(crate) fn mark_el1_frame_grant_in(
     custody: &CarrierVmCustody,
     base: u64,
     length: u64,
+    mm_key: u64,
+    expected_generation: u64,
 ) -> Result<(), TrapError> {
-    if global_frame_host_owner_identity_in(custody, base, length).is_none() {
-        return Err(TrapError::Hypervisor(format!(
-            "EL1 frame grant has no exact live host owner: base=0x{base:x} length=0x{length:x}"
-        )));
+    let mm = El1FrameGrantMm::new(mm_key)
+        .ok_or_else(|| TrapError::Hypervisor("EL1 grant has no MM generation".to_owned()))?;
+    // Serialize receipt publication with exact owner retirement. A standalone
+    // identity lookup followed by ledger insertion can publish a grant after
+    // its owner has already returned the IPA.
+    let owners = custody.global_frame_host_owners.lock();
+    let owner = owners
+        .get(&(base, length))
+        .and_then(GlobalFrameOwnerEntry::live_owner)
+        .ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "EL1 frame grant has no exact live host owner: base=0x{base:x} length=0x{length:x}"
+            ))
+        })?;
+    if owner.generation() != expected_generation {
+        return Err(TrapError::Hypervisor(
+            "EL1 grant owner generation changed".to_owned(),
+        ));
     }
-    el1_frame_grant_ledger().lock().mark_grant(base, length)
+    let mut receipt = owner.mapping.el1_grant.lock();
+    if receipt.is_some() {
+        return Err(TrapError::Hypervisor(
+            "EL1 owner already has a grant receipt".to_owned(),
+        ));
+    }
+    custody
+        .el1_frame_grants
+        .lock()
+        .mark_grant(base, length, mm)?;
+    *receipt = Some(El1FrameGrantReceipt {
+        base,
+        length,
+        mm,
+        returned: false,
+        pooled: !matches!(&owner.mapping.backing, GlobalFrameBacking::Owned(_)),
+        ledger: std::sync::Arc::clone(&custody.el1_frame_grants),
+    });
+    Ok(())
 }
 
-fn mark_el1_frame_grant_return(base: u64, length: u64) {
-    el1_frame_grant_ledger().lock().mark_return(base, length);
+/// Owned by the physical mapping across VM replay and shared-MM retention.
+/// Taking this receipt after terminal release prevents an old owner from
+/// recording a return against a successor at the same IPA.
+#[derive(Debug)]
+struct El1FrameGrantReceipt {
+    base: u64,
+    length: u64,
+    mm: El1FrameGrantMm,
+    returned: bool,
+    pooled: bool,
+    ledger: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
+}
+
+impl Drop for El1FrameGrantReceipt {
+    fn drop(&mut self) {
+        self.ledger.lock().update(self.mm, |stats| {
+            if !self.returned {
+                stats.complete = false;
+            }
+            let counter = if self.pooled {
+                &mut stats.pooled_reusable_bytes
+            } else {
+                &mut stats.host_backing_released_bytes
+            };
+            add_grant_counter(counter, &mut stats.complete, self.length);
+        });
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -533,6 +1075,9 @@ pub(crate) struct GlobalFrameSharedMapping {
     pub(crate) code_content: super::code_content::CodeContent,
     backing: GlobalFrameBacking,
     logical_pin_count: parking_lot::Mutex<u64>,
+    // Declared after backing: its Drop receipt observes completed backing Drop,
+    // including pooled-handle recycling, rather than mere stage-2 retirement.
+    el1_grant: parking_lot::Mutex<Option<El1FrameGrantReceipt>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -557,6 +1102,7 @@ impl GlobalFrameSharedMapping {
             code_content: super::code_content::CodeContent::new(mapping.len()),
             backing: GlobalFrameBacking::Owned(mapping),
             logical_pin_count: parking_lot::Mutex::new(0),
+            el1_grant: parking_lot::Mutex::new(None),
         }
     }
 
@@ -565,6 +1111,7 @@ impl GlobalFrameSharedMapping {
             code_content: super::code_content::CodeContent::new(handle.len()),
             backing: GlobalFrameBacking::Pooled(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
+            el1_grant: parking_lot::Mutex::new(None),
         }
     }
 
@@ -573,6 +1120,7 @@ impl GlobalFrameSharedMapping {
             code_content: super::code_content::CodeContent::new(handle.len()),
             backing: GlobalFrameBacking::PooledRoot(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
+            el1_grant: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1821,9 +2369,24 @@ pub(crate) fn finalize_global_frame_owner_record(
 pub(crate) fn finalize_global_frame_owner_record_using(
     custody: &CarrierVmCustody,
     owner: &GlobalFrameHostOwner,
-    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+    release_ipa_fn: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
-    finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa)
+    let mut receipt = owner.mapping.el1_grant.lock();
+    if let Some(receipt) = receipt.as_mut() {
+        let mut ledger = receipt.ledger.lock();
+        let release_ipa = owner
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.release_ipa);
+        // Publish the receipt before another grant can reuse the returned IPA.
+        finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa_fn)?;
+        if !receipt.returned {
+            ledger.mark_return(receipt.base, receipt.length, receipt.mm, release_ipa);
+            receipt.returned = true;
+        }
+    } else {
+        finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa_fn)?;
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2707,7 +3270,6 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                 .pending_global_frame_directory_retries
                 .lock()
                 .complete(((ipa, length), generation));
-            mark_el1_frame_grant_return(ipa, length);
         }
         _ => {}
     }

@@ -145,9 +145,15 @@ pub use carrick_kernel::observe::{
 };
 pub use carrick_kernel::run_result::{RunResult, RuntimeError, TerminalReason};
 pub use carrick_runtime::compat::CompatReport;
+/// Current-carrier frame accounting. On HVF, retain the handle returned by
+/// `El1FrameGrantStats::observe_current()` before teardown to inspect the same
+/// carrier afterwards. Its `snapshots_by_mm()` attributes physical grants and
+/// delayed returns to each granting MM. Require `complete` and matching `scope`
+/// before comparing snapshots; returned leases and released host storage differ.
+pub use carrick_runtime::{El1FrameGrantStats, el1_frame_grant_stats};
 pub use carrick_runtime::{
-    El1FrameGrantStats, el1_frame_grant_stats, read_el1_counters, reset_el1_counters,
-    vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total, vcpu_run_exit_classes, vcpu_run_exits_total,
+    read_el1_counters, reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total,
+    vcpu_run_exit_classes, vcpu_run_exits_total,
 };
 pub use carrick_spec::{
     Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec, SecuritySpec,

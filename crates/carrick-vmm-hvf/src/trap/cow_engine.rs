@@ -1049,7 +1049,7 @@ impl HvfVmState {
         );
         self.mappings.insert(published.region);
         transition.commit();
-        mark_el1_frame_grant_in(self.custody(), physical_grant.0, physical_grant.1).unwrap_or_else(
+        mark_el1_frame_grant_in(self.custody(), physical_grant.0, physical_grant.1, request.mm_key, published.ready.owner_generation).unwrap_or_else(
             |error| {
             carrick_fatal!(
                 "hvpatch::el1_frame_grant",
