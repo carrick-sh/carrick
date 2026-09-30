@@ -1494,9 +1494,7 @@ impl MemView<'_> {
                     request
                 }
                 Ok(Decision::Complete(value)) => {
-                    return Ok(Some(DispatchOutcome::Returned {
-                        value: value as i64,
-                    }));
+                    return Ok(Some(DispatchOutcome::returned_u64_or_errno(value)));
                 }
                 // Growth over a limit, or nothing in place and no room.
                 Err(Refusal::Limit) => return Ok(Some(DispatchOutcome::errno(LINUX_ENOMEM))),
@@ -1518,9 +1516,9 @@ impl MemView<'_> {
                     matches!(outcome, DispatchOutcome::Returned { value: 0 })
                 })?;
                 return Ok(Some(match outcome? {
-                    DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
-                        value: old_address as i64,
-                    },
+                    DispatchOutcome::Returned { value: 0 } => {
+                        DispatchOutcome::returned_u64_or_errno(old_address)
+                    }
                     other => other,
                 }));
             }
@@ -1611,9 +1609,7 @@ impl MemView<'_> {
             return Ok(DispatchOutcome::errno(errno));
         }
         self.mark_vma_dispatch(&mut dispatch);
-        Ok(DispatchOutcome::Returned {
-            value: old_address as i64,
-        })
+        Ok(DispatchOutcome::returned_u64_or_errno(old_address))
     }
 
     /// A relocation: the destination receives the contents; the source is
@@ -1706,9 +1702,7 @@ impl MemView<'_> {
             return Ok(DispatchOutcome::errno(errno));
         }
         self.mark_vma_dispatch(&mut dispatch);
-        Ok(DispatchOutcome::Returned {
-            value: destination.start() as i64,
-        })
+        Ok(DispatchOutcome::returned_u64_or_errno(destination.start()))
     }
 }
 
