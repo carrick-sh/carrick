@@ -180,7 +180,15 @@ pub(crate) fn refill_guest_cow_pool(
     let batch = state
         .guest_cow_batch
         .load(std::sync::atomic::Ordering::Relaxed);
-    let provisioned = provision_guest_cow_grants(state, custody, pool, batch)?;
+    // A grant that cannot be made (no frame, a full kernel reservation)
+    // leaves this fault to the host COW path; grants already published stay.
+    let provisioned = match provision_guest_cow_grants(state, custody, pool, batch) {
+        Ok(provisioned) => provisioned,
+        Err(error) => {
+            tracing::debug!(target: "carrick::guest_cow", %error, "guest COW refill failed");
+            0
+        }
+    };
     state.guest_cow_batch.store(
         next_guest_cow_batch(batch),
         std::sync::atomic::Ordering::Relaxed,
