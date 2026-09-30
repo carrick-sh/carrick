@@ -303,6 +303,27 @@ impl Stage1Authority {
         })
     }
 
+    /// Record the live backing WITHOUT making the manager live: the
+    /// authority keeps editing its owned copy on the host lane, and a guest
+    /// lane selection (immediate now, since the backing is known) makes it
+    /// live at that point. A selection already pending completes here,
+    /// exactly as [`Self::bind_live_backing`] would. Returns whether it did.
+    ///
+    /// # Safety
+    /// `resolver` must uphold the safety contracts of `HostArenaResolver`.
+    pub unsafe fn record_live_backing(
+        &self,
+        resolver: Arc<dyn HostArenaResolver + Send + Sync>,
+    ) -> bool {
+        let pending = {
+            let mut inner = self.inner.lock();
+            inner.host_resolver = Some(Arc::clone(&resolver));
+            inner.guest_lane_pending && inner.live_owner == LiveDescriptorOwner::Host
+        };
+        // SAFETY: forwarded contract.
+        pending && unsafe { self.bind_live_backing(resolver) }
+    }
+
     /// Create the `Exclusive` authority of a forked child around its private
     /// image. The child shares this authority's image pool, so its image
     /// returns to the parent's pool when the child retires.
