@@ -2,7 +2,7 @@
 
 use super::anonymous::broken_root;
 use super::*;
-use carrick_el1::memory::reservations::Mapping;
+use carrick_el1::memory::reservations::{Mapping, Refusal, Reservations};
 use carrick_el1_abi::{ReservationProtection, ReservationRange};
 use carrick_fatal::carrick_fatal;
 
@@ -228,6 +228,27 @@ pub(in crate::dispatch) enum FirstTouchOwner {
     Unmapped,
 }
 
+/// The parts of `range` the root holds no committed node for. A pending
+/// proposal is not part of the committed tree, so its range reads as holes
+/// wherever it does not replace a committed node.
+pub(in crate::dispatch) fn root_holes(
+    model: &mut Reservations<'_>,
+    range: ReservationRange,
+) -> Result<Vec<(u64, u64)>, Refusal> {
+    let mut holes = Vec::new();
+    let mut cursor = range.start();
+    model.observe_range(range, &mut |mapping| {
+        if mapping.range.start() > cursor {
+            holes.push((cursor, mapping.range.start()));
+        }
+        cursor = cursor.max(mapping.range.end());
+    })?;
+    if cursor < range.end() {
+        holes.push((cursor, range.end()));
+    }
+    Ok(holes)
+}
+
 impl MemState {
     /// Who answers `page`'s first-touch facts (see [`FirstTouchOwner`]).
     pub(in crate::dispatch) fn first_touch_owner(&self, page: u64) -> FirstTouchOwner {
@@ -338,11 +359,58 @@ impl MemState {
         let range = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))?;
         Some(ResidentFaultRange { range, prot })
     }
+
+    /// Retire the host's residency facts for `holes`: ranges the root held
+    /// no node for, now handed out again. They describe pages of a mapping
+    /// the guest venue retired without the host, so they must not survive
+    /// into the new mapping.
+    pub(in crate::dispatch) fn retire_stale_first_touch(&mut self, holes: &[(u64, u64)]) {
+        for &(start, end) in holes {
+            let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))
+            else {
+                continue;
+            };
+            let _ = self
+                .deferred_anonymous
+                .retire(GuestVa(start), (end - start) as usize);
+            locked_ranges_remove(&mut self.resident_ranges, range);
+            locked_ranges_remove(&mut self.resident_tracked_ranges, range);
+            locked_ranges_remove(&mut self.locked_ranges, range);
+            self.resident_fault_ranges.disarm(range);
+        }
+    }
+
+    /// Hand a demoted root node's first-touch observation to the host: its
+    /// pages become host-owned, so the host tracks them and arms every page
+    /// not yet resident at the node's protection.
+    pub(in crate::dispatch) fn adopt_root_first_touch(&mut self, mapping: &Mapping) {
+        let (start, end) = (mapping.range.start(), mapping.range.end());
+        if super::anonymous::in_heap(start, end, self.layout) {
+            return;
+        }
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
+            return;
+        };
+        locked_ranges_insert(&mut self.resident_tracked_ranges, range);
+        self.resident_fault_ranges.disarm(range);
+        let prot = LinuxProtFlags::from_bits_truncate(mapping.protection.bits());
+        if prot.is_empty() {
+            return;
+        }
+        let mut untouched = vec![range];
+        for resident in &self.resident_ranges {
+            locked_ranges_remove(&mut untouched, *resident);
+        }
+        for sub in untouched {
+            self.resident_fault_ranges.arm(sub, prot);
+        }
+    }
 }
 
 /// The pages of `range` that lie inside a first-touch tracked extent and have
 /// not been committed resident: exactly the pages whose leaf must stay
-/// invalid so their first touch is still observed.
+/// invalid so their first touch is still observed. On a delegated MM the
+/// root-owned extents are tracked too.
 pub(crate) fn tracked_nonresident_subranges(
     mem: &MemState,
     range: carrick_vfs::GuestMemoryRange,
@@ -352,8 +420,11 @@ pub(crate) fn tracked_nonresident_subranges(
         let start = tracked.start().raw().max(range.start().raw());
         let end = tracked.end().raw().min(range.end().raw());
         if let Some(sub) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
-            out.push(sub);
+            locked_ranges_insert(&mut out, sub);
         }
+    }
+    for (extent, _) in mem.root_first_touch_extents(range.start().raw(), range.end().raw()) {
+        locked_ranges_insert(&mut out, extent);
     }
     for resident in &mem.resident_ranges {
         locked_ranges_remove(&mut out, *resident);
