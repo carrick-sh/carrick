@@ -163,7 +163,22 @@ impl PipeRecord {
         if capacity > bytes_len || pages > slots_len {
             return Err(Error::Storage);
         }
-        Ok(Self {
+        Ok(Self::fresh(page_size, pages))
+    }
+
+    /// A fresh pipe record with no ring storage yet (Linux allocates pipe
+    /// pages on demand): one reader and one writer reference, empty, with
+    /// the rounded `requested` capacity. Everything but a write works on it
+    /// ([`Pipe::attach`] accepts it with empty storage); the first write
+    /// refuses with [`Error::Storage`] before any effect, so the venue can
+    /// provide storage ([`Pipe::replace_storage`]) and retry.
+    pub fn unbacked(page_size: usize, requested: usize) -> Result<Self, Error> {
+        let capacity = Pipe::rounded_capacity(page_size, requested)?;
+        Ok(Self::fresh(page_size, capacity / page_size))
+    }
+
+    const fn fresh(page_size: usize, pages: usize) -> Self {
+        Self {
             page_size: page_size as u64,
             capacity_pages: pages as u64,
             head: 0,
@@ -171,7 +186,7 @@ impl PipeRecord {
             unread: 0,
             readers: 1,
             writers: 1,
-        })
+        }
     }
 }
 
@@ -241,7 +256,9 @@ impl<'a> Pipe<'a, &'a mut PipeRecord> {
     /// View an existing shared record over its storage. The caller holds the
     /// object's lock for the view's lifetime. O(1) invariant checks reject a
     /// record that does not describe this storage (fail closed: `Corrupt`);
-    /// per-page metadata is checked where it is used.
+    /// per-page metadata is checked where it is used. Empty `bytes` and
+    /// `slots` attach an *unbacked* pipe ([`PipeRecord::unbacked`]), which
+    /// must hold no page.
     pub fn attach(
         record: &'a mut PipeRecord,
         bytes: &'a mut [u8],
@@ -251,12 +268,14 @@ impl<'a> Pipe<'a, &'a mut PipeRecord> {
         let page_size = usize::try_from(r.page_size).map_err(|_| Error::Corrupt)?;
         validate_page_size(page_size).map_err(|_| Error::Corrupt)?;
         let pages = usize::try_from(r.capacity_pages).map_err(|_| Error::Corrupt)?;
+        let unbacked = bytes.is_empty() && slots.is_empty();
         let fits = pages
             .checked_mul(page_size)
-            .is_some_and(|n| n <= bytes.len() && n <= i32::MAX as usize);
+            .is_some_and(|n| (unbacked || n <= bytes.len()) && n <= i32::MAX as usize);
         if pages == 0
             || !fits
-            || pages > slots.len()
+            || (!unbacked && pages > slots.len())
+            || (unbacked && (r.used != 0 || r.unread != 0))
             || r.head >= r.capacity_pages
             || r.used > r.capacity_pages
             || r.unread > r.used.saturating_mul(r.page_size)
@@ -293,6 +312,11 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
             End::Reader => self.st().readers as usize,
             End::Writer => self.st().writers as usize,
         }
+    }
+    /// Whether ring storage for the current capacity is attached. An
+    /// unbacked pipe holds no byte; its first write needs storage.
+    pub fn is_backed(&self) -> bool {
+        self.bytes.len() >= self.capacity() && self.slots.len() >= self.st().capacity_pages as usize
     }
 
     /// Move live storage to a separately provisioned extent. The caller holds
@@ -394,10 +418,20 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         if (pages as u64) < self.st().used {
             return Step::quiet(Err(Error::Busy));
         }
+        let old_pages = self.st().capacity_pages as usize;
+        if self.bytes.is_empty() && self.slots.is_empty() {
+            // Unbacked: no byte to move; storage is sized at the first write.
+            if pages == old_pages {
+                return Step::quiet(Ok(capacity));
+            }
+            let s = self.state.borrow_mut();
+            s.head = 0;
+            s.capacity_pages = pages as u64;
+            return Step::changed(capacity, false, pages > old_pages);
+        }
         if capacity > self.bytes.len() || pages > self.slots.len() {
             return Step::quiet(Err(Error::Storage));
         }
-        let old_pages = self.st().capacity_pages as usize;
         if pages == old_pages {
             return Step::quiet(Ok(capacity));
         }
@@ -560,6 +594,10 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         let s = *self.st();
         if s.readers == 0 {
             return Step::quiet(Err(Error::BrokenPipe));
+        }
+        if !self.is_backed() {
+            // Before any effect: the venue provides storage and retries.
+            return Step::quiet(Err(Error::Storage));
         }
         let page_size = s.page_size as usize;
         let pages = s.capacity_pages as usize;
