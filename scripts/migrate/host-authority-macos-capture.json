@@ -11259,15 +11259,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 105780,
-        "byte_start": 105762,
+        "byte_end": 105926,
+        "byte_start": 105908,
         "column": 29,
         "column_end": 47,
         "column_start": 29,
         "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-        "line": 2323,
-        "line_end": 2323,
-        "line_start": 2323
+        "line": 2325,
+        "line_end": 2325,
+        "line_start": 2325
       }
     },
     {
@@ -11665,15 +11665,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 88937,
-        "byte_start": 88915,
+        "byte_end": 89083,
+        "byte_start": 89061,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-        "line": 1984,
-        "line_end": 1984,
-        "line_start": 1984
+        "line": 1986,
+        "line_end": 1986,
+        "line_start": 1986
       }
     },
     {
@@ -11725,15 +11725,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 42049,
-        "byte_start": 42027,
+        "byte_end": 42170,
+        "byte_start": 42148,
         "column": 9,
         "column_end": 31,
         "column_start": 9,
         "file": "crates/carrick-kernel/src/el1_delegation.rs",
-        "line": 1108,
-        "line_end": 1108,
-        "line_start": 1108
+        "line": 1112,
+        "line_end": 1112,
+        "line_start": 1112
       }
     },
     {
@@ -11745,15 +11745,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 60562,
-        "byte_start": 60540,
+        "byte_end": 60683,
+        "byte_start": 60661,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-kernel/src/el1_delegation.rs",
-        "line": 1611,
-        "line_end": 1611,
-        "line_start": 1611
+        "line": 1615,
+        "line_end": 1615,
+        "line_start": 1615
       }
     },
     {
@@ -11937,9 +11937,9 @@
       }
     }
   ],
-  "rows_sha256": "ffafc932f1ca8c4054ca4702533828c3f5b67d8368854026525db6b96b524e02",
+  "rows_sha256": "3fd67d1f1db7080662c4a4b83580d251829d1f58f706ad0bb0a9e31da3101853",
   "schema": 1,
-  "source_head": "9cf31948cf7427f84a0a5975e6c04f7ee40544a0",
+  "source_head": "ba0770f927cdec65f58bf236e7aa4f1ae9f6fdb4",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
