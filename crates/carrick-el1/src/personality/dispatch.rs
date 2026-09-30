@@ -283,8 +283,7 @@ where
                 counters.served[nr].fetch_add(1, Ordering::Relaxed);
                 if let Some(task) = cur_task {
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    task.served_with_work.store(1, Ordering::Release);
-                    return Action::ServedWithWork;
+                    return task.leave_served_with_work();
                 }
             }
         }
@@ -317,8 +316,7 @@ where
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
                 }
                 if task.has_pending_host_work() {
-                    task.served_with_work.store(1, Ordering::Release);
-                    return Action::ServedWithWork;
+                    return task.leave_served_with_work();
                 }
                 return Action::Served;
             }
@@ -358,8 +356,7 @@ where
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
                 }
                 if task.has_pending_host_work() {
-                    task.served_with_work.store(1, Ordering::Release);
-                    return Action::ServedWithWork;
+                    return task.leave_served_with_work();
                 }
                 return Action::Served;
             }
@@ -391,8 +388,7 @@ where
                     counters.served[27].fetch_add(1, Ordering::Relaxed);
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
                     if task.has_pending_host_work() {
-                        task.served_with_work.store(1, Ordering::Release);
-                        return Action::ServedWithWork;
+                        return task.leave_served_with_work();
                     }
                     return Action::Served;
                 }
@@ -415,8 +411,7 @@ where
                 task.orig_arg0.store(orig_x0, Ordering::Relaxed);
                 claim_owed_inotify_wake(task, inotify_table);
                 if task.has_pending_host_work() {
-                    task.served_with_work.store(1, Ordering::Release);
-                    return Action::ServedWithWork;
+                    return task.leave_served_with_work();
                 }
                 return Action::Served;
             }
@@ -457,8 +452,7 @@ where
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
                     claim_owed_inotify_wake(task, inotify_table);
                     if task.has_pending_host_work() {
-                        task.served_with_work.store(1, Ordering::Release);
-                        return Action::ServedWithWork;
+                        return task.leave_served_with_work();
                     }
                 }
                 return Action::Served;
@@ -486,8 +480,7 @@ where
                         claim_owed_inotify_wake(task, inotify_table);
                     }
                     if task.has_pending_host_work() {
-                        task.served_with_work.store(1, Ordering::Release);
-                        return Action::ServedWithWork;
+                        return task.leave_served_with_work();
                     }
                 }
                 return Action::Served;
@@ -505,8 +498,7 @@ where
                 && task.has_pending_host_work()
             {
                 task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                task.served_with_work.store(1, Ordering::Release);
-                return Action::ServedWithWork;
+                return task.leave_served_with_work();
             }
             return Action::Served;
         }
