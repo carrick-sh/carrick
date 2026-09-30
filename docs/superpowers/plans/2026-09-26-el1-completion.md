@@ -46,6 +46,9 @@ records scope, evidence, excluded branches and resume obligations. This status
 supersedes all historical active/next statements below; do not resume without
 a user request. No checkpoint or end-to-end completion is claimed.
 
+See the [paused handoff and unfinished branch inventory](2026-09-29-el1-paused-handoff.md)
+for preserved branch heads, dirty inotify files, evidence limits and resume order.
+
 ## User-requested consolidation and stopping point
 
 The user requested a clean stopping point and fast-forward of current work to
