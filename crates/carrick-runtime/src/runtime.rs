@@ -2516,6 +2516,9 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
         self.mem.shared_futex_location(guest_addr)
     }
+    fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
+        self.mem.caller_el1_call()
+    }
 }
 
 impl<M: CurrentMmMemory, T: SyscallTrap> CurrentMmMemory for SplitView<'_, M, T> {}

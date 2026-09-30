@@ -88,24 +88,54 @@ fn guest_lane_refuses_host_cow_before_copy_or_publication() {
             .contains("require_host_cow_lane("),
         "retained reuse is converted; it must not refuse the guest lane"
     );
-    for (source, entry, first_effect) in [
+    // The foreign writers are converted too: a guest-owned target publishes
+    // through the caller vCPU the runtime lent, authenticated against the
+    // exact target before any allocation, reservation or transition.
+    let foreign = include_str!("../foreign_mm.rs");
+    for (entry, guard, first_effect) in [
         (
-            include_str!("../foreign_mm.rs"),
-            "fn perform_foreign_cow_transaction(",
-            "let executable_span",
+            "fn perform_foreign_guest_cow(",
+            "ForeignEl1Publisher::authenticate(",
+            ".reserve(",
         ),
         (
-            include_str!("../sparse_materialization.rs"),
-            "fn publish_replacing(",
-            "let semantic_len",
+            "fn materialize_foreign_pristine_write(",
+            "ForeignStage1Services::for_target(",
+            ".begin_materialization(",
+        ),
+        (
+            "fn materialize_foreign_private_file_write(",
+            "ForeignStage1Services::for_target(",
+            ".begin_private_file_materialization(",
         ),
     ] {
-        let body = source.split_once(entry).unwrap().1;
-        let guard = body
-            .find("require_host_cow_lane(")
-            .expect("guest lane must refuse before host work");
+        let body = foreign.split_once(entry).unwrap().1;
+        let body = body.split("\n}\n").next().unwrap();
+        let guard = body.find(guard).expect(entry);
         assert!(guard < body.find(first_effect).unwrap(), "{entry}");
     }
+    let sparse = include_str!("../sparse_materialization.rs");
+    let body = sparse.split_once("fn publish_replacing(").unwrap().1;
+    let body = body.split("\n}\n").next().unwrap();
+    assert!(
+        body.find("guest_publication_available()").unwrap()
+            < body.find("let semantic_len").unwrap()
+    );
+    assert!(
+        !body.contains("require_host_cow_lane("),
+        "foreign sparse publication is converted; it must not refuse the guest lane"
+    );
+    let cow = foreign
+        .split_once("fn perform_foreign_cow_transaction(")
+        .unwrap()
+        .1;
+    let cow = cow.split("\n}\n").next().unwrap();
+    assert!(!cow.contains("require_host_cow_lane("));
+    assert!(
+        cow.find("return perform_foreign_guest_cow(").unwrap()
+            < cow.find("OwnedHostMapping::map_shared_anon").unwrap(),
+        "the guest lane leaves before the host lane allocates or copies"
+    );
 }
 
 #[test]

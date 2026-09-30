@@ -2325,7 +2325,35 @@ fn debug_tid() -> i64 {
 // `unmap_range`/`repoint_private` edit the live stage-1 tables so the GUEST's own
 // EL0 access honours mmap/mprotect/munmap permissions.
 
+impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
+    fn slot(&self) -> Option<usize> {
+        self.vcpu.mailbox_slot()
+    }
+
+    fn drain_foreign(&mut self, mm_key: u64, ttbr0: u64) -> Result<u64, String> {
+        let slot = self
+            .vcpu
+            .mailbox_slot()
+            .ok_or_else(|| "caller vCPU has no EL1 slot".to_owned())?;
+        let vcpu = std::cell::RefCell::new(&mut self.vcpu);
+        crate::descriptor_drain::run_foreign_drain_call(
+            slot,
+            mm_key,
+            ttbr0,
+            || vcpu.borrow().get_sys_reg(SysReg::Ttbr0),
+            |value| vcpu.borrow_mut().set_sys_reg(SysReg::Ttbr0, value),
+            |entry, frame_va| run_el1_service_call_on::<V>(&mut vcpu.borrow_mut(), entry, frame_va),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
+    fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
+        self.vcpu.mailbox_slot()?;
+        Some(self)
+    }
+
     fn bind_deferred_anonymous_state(
         &mut self,
         state: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,

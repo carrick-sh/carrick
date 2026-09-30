@@ -396,6 +396,14 @@ pub trait ForeignMmInvalidator {
         binding: ForeignMmBinding,
         deadline: Instant,
     ) -> Result<(), ForeignMmTransportError>;
+
+    /// The caller's vCPU, lent for this exact-target scope when the runtime
+    /// drives the mutation from one. A guest-owned target publishes only
+    /// through it (EL1 under host custody); `None` refuses that publication
+    /// before any mutation.
+    fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
+        None
+    }
 }
 
 /// Content status for participating carrier host writes only. No variant grants

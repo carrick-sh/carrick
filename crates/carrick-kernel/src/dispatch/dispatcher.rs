@@ -169,13 +169,13 @@ impl std::fmt::Debug for CarrierBridges {
     }
 }
 
-struct ForkCloneObservedArgs<'a> {
+struct ForkCloneObservedArgs<'a, 'guard> {
     observed_parent_mm_id: crate::kernel::MmId,
     observed_child_mm_id: crate::kernel::MmId,
     parent_guest_pid: u32,
     child_guest_pid: u32,
     prepared_mm: PreparedDispatchMmFork,
-    permit: &'a mm_mutation::HostAliasPermit<'a>,
+    permit: &'a mm_mutation::HostAliasPermit<'guard>,
 }
 
 impl SyscallDispatcher {
@@ -585,7 +585,7 @@ impl SyscallDispatcher {
 
     fn fork_clone_with_prepared_mm_authorized_observed(
         &self,
-        args: ForkCloneObservedArgs<'_>,
+        args: ForkCloneObservedArgs<'_, '_>,
         mut observe_install: impl FnMut(bool),
     ) -> Result<Self, crate::kernel::SnapshotError> {
         let ForkCloneObservedArgs {
@@ -1429,6 +1429,15 @@ pub(in crate::dispatch) trait MmExecutorReleaser {
         dispatcher: &SyscallDispatcher,
         op: &mut dyn FnMut(),
     ) -> Result<(), super::outcome::DispatchError>;
+    /// [`Self::release_and_run`], lending the syscall's own vCPU to `op`
+    /// when this releaser owns the syscall's memory; `None` otherwise.
+    fn release_and_run_lending(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        op: &mut dyn FnMut(Option<&mut dyn carrick_guest_mem::CallerEl1Call>),
+    ) -> Result<(), super::outcome::DispatchError> {
+        self.release_and_run(dispatcher, &mut || op(None))
+    }
 }
 
 impl<M: carrick_guest_mem::CurrentMmMemory> MmExecutorReleaser for super::SyscallCtx<'_, M> {
@@ -1457,6 +1466,24 @@ impl<M: carrick_guest_mem::CurrentMmMemory> MmExecutorReleaser for super::Syscal
                 run();
             }
         })
+    }
+    fn release_and_run_lending(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        op: &mut dyn FnMut(Option<&mut dyn carrick_guest_mem::CallerEl1Call>),
+    ) -> Result<(), super::outcome::DispatchError> {
+        let mut caller = self.memory.caller_el1_call();
+        let mut f = Some(op);
+        dispatcher.with_current_mm_executor_released_parts(
+            self.kernel,
+            self.execution_lease,
+            self.mm_executor.as_deref_mut(),
+            || {
+                if let Some(run) = f.take() {
+                    run(caller.take());
+                }
+            },
+        )
     }
 }
 
@@ -1567,7 +1594,7 @@ pub(in crate::dispatch) trait ProcCrossSubsystem: Send + Sync {
     fn with_current_mm_executor_released(
         &self,
         ctx: &mut dyn MmExecutorReleaser,
-        op: &mut dyn FnMut(),
+        op: &mut dyn FnMut(Option<&mut dyn carrick_guest_mem::CallerEl1Call>),
     ) -> Result<(), super::outcome::DispatchError>;
     fn close_draining_file_table(
         &self,
@@ -1654,9 +1681,9 @@ impl ProcCrossSubsystem for SyscallDispatcher {
     fn with_current_mm_executor_released(
         &self,
         ctx: &mut dyn MmExecutorReleaser,
-        op: &mut dyn FnMut(),
+        op: &mut dyn FnMut(Option<&mut dyn carrick_guest_mem::CallerEl1Call>),
     ) -> Result<(), super::outcome::DispatchError> {
-        ctx.release_and_run(self, op)
+        ctx.release_and_run_lending(self, op)
     }
     fn close_draining_file_table(
         &self,

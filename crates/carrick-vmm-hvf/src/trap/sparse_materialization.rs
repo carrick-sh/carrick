@@ -934,9 +934,6 @@ pub(super) fn publish_replacing(
         .page_tables_authority()
         .live_descriptor_owner()
         == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
-    if context.foreign.is_some() {
-        require_host_cow_lane(&context.state.page_tables_authority())?;
-    }
     if guest_lane && !flush_stage1.guest_publication_available() {
         return Err(TrapError::Hypervisor(
             "guest sparse publication requires its driving vCPU".to_owned(),
@@ -980,37 +977,69 @@ pub(super) fn publish_replacing(
 
     let (inventory_mapping, foreign_receipt) = if guest_lane {
         use carrick_mmu_core::aarch64::descriptor_txn::{AliasAccess, DescriptorOp, PageSpan};
-        let mut prepared = super::cow_engine::GuestPreparedBacking::prepare_owned(
-            context.custody.clone(),
-            context.authority.clone(),
-            context.state.frame_inventory.ledger.clone(),
-            reservation,
-            context.mm_key,
-            InventoryMappingStage {
-                gpa: physical_ipa,
-                length: physical_len,
-                permissions: carrick_hal::MemPerms {
-                    read: true,
-                    write: !page_granular_arm,
-                    exec: true,
-                },
-                backing: inventory_backing,
-                inherited_frame: None,
-                stage2_lease: Some((physical_ipa, physical_len)),
-                stage2_owner: InventoryStage2OwnerIdentity {
-                    host_addr: physical_host as usize,
-                    generation: owner_generation,
-                },
+        let stage = InventoryMappingStage {
+            gpa: physical_ipa,
+            length: physical_len,
+            permissions: carrick_hal::MemPerms {
+                read: true,
+                write: !page_granular_arm,
+                exec: true,
             },
-            owner_rollback,
-        )?;
+            backing: inventory_backing,
+            inherited_frame: None,
+            stage2_lease: Some((physical_ipa, physical_len)),
+            stage2_owner: InventoryStage2OwnerIdentity {
+                host_addr: physical_host as usize,
+                generation: owner_generation,
+            },
+        };
+        // A foreign first write is published user-accessible at once (the
+        // host lane's `set_rw`); the grant is its final kernel commit, so the
+        // kernel mints the foreign proof with it.
+        let (mut prepared, access) = if context.foreign.is_some() {
+            let semantic = std::num::NonZeroUsize::new(semantic_len).ok_or_else(|| {
+                TrapError::Hypervisor("empty foreign sparse publication".to_owned())
+            })?;
+            (
+                super::cow_engine::GuestPreparedBacking::prepare_owned_foreign(
+                    context.custody.clone(),
+                    context.authority.clone(),
+                    context.state.frame_inventory.ledger.clone(),
+                    reservation,
+                    context.mm_key,
+                    stage,
+                    owner_rollback,
+                    (carrick_guest_mem::GuestVa(start), semantic),
+                )?,
+                AliasAccess::User {
+                    writable: true,
+                    executable: context
+                        .state
+                        .protections
+                        .range_executable(start, semantic_len),
+                },
+            )
+        } else {
+            (
+                super::cow_engine::GuestPreparedBacking::prepare_owned(
+                    context.custody.clone(),
+                    context.authority.clone(),
+                    context.state.frame_inventory.ledger.clone(),
+                    reservation,
+                    context.mm_key,
+                    stage,
+                    owner_rollback,
+                )?,
+                AliasAccess::Deferred,
+            )
+        };
         let backing = prepared.backing()?;
         let tables = context.state.page_tables_authority();
         let mut current = start;
         while current < end {
             let count = (end - current).min(TWO_MIB);
             let op = DescriptorOp::MapAlias {
-                access: AliasAccess::Deferred,
+                access,
                 span: PageSpan::new(current, count),
                 target_ipa: carrick_mmu_core::aarch64::SubstrateGpa(
                     semantic_ipa + (current - start),
@@ -1044,7 +1073,38 @@ pub(super) fn publish_replacing(
             current += count;
         }
         prepared.commit();
-        (prepared.extent, None)
+        let foreign_receipt = match (&context.foreign, prepared.take_foreign_proof()) {
+            (None, None) => None,
+            (Some(requested), Some(proof)) => {
+                let mut mapping_ids = requested.mapping_ids.clone();
+                mapping_ids.retain(|id| !proof.unmapped.contains(id));
+                mapping_ids.extend(proof.prepared.iter().copied());
+                mapping_ids.sort_unstable();
+                mapping_ids.dedup();
+                let mut snapshot = requested.clone();
+                snapshot.mapping_ids = mapping_ids;
+                snapshot.frame_inventory_revision =
+                    carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+                        prepared.revision(),
+                    );
+                Some(CarrierForeignCowReceipt {
+                    snapshot,
+                    start: carrick_guest_mem::GuestVa(start),
+                    len: semantic_len,
+                    mapping: prepared.extent.mapping,
+                    frame: prepared.extent.frame,
+                    physical_base: carrick_guest_mem::Gpa(physical_ipa),
+                    physical_len,
+                    owner_generation: proof.owner_generation,
+                    kernel_proof: proof.kernel_proof,
+                })
+            }
+            _ => carrick_fatal!(
+                "hvpatch::sparse_materialization",
+                "guest sparse grant proof does not match its publication's MM"
+            ),
+        };
+        (prepared.extent, foreign_receipt)
     } else {
         let inventory_mapping = {
             let mut inventory = context.state.frame_inventory.ledger.lock();
