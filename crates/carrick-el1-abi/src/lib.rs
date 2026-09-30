@@ -678,6 +678,17 @@ impl CurrentTask {
         self.pending_host_work.store(1, Ordering::Release);
     }
 
+    /// Leave for the host with a syscall EL1 already served: its result is
+    /// in the frame and its effects are taken, so the host must complete it,
+    /// never dispatch it again. The flag and the action are one step; no
+    /// path may return [`Action::ServedWithWork`] without this.
+    #[inline]
+    #[must_use]
+    pub fn leave_served_with_work(&self) -> Action {
+        self.served_with_work.store(1, Ordering::Release);
+        Action::ServedWithWork
+    }
+
     #[inline]
     pub fn clear_pending_host_work(&self) {
         self.pending_host_work.store(0, Ordering::Release);
