@@ -2578,6 +2578,9 @@ impl PageTableManager {
         target.offline_private_image = self.offline_private_image;
         target.stage1_exclusive = self.stage1_exclusive;
         target.reclaim_pending = self.reclaim_pending;
+        // An offline copy is never guest-owned (as `snapshot_image`), even
+        // when the pooled target last belonged to a guest-owned MM.
+        target.live_descriptor_owner = LiveDescriptorOwner::Host;
         target.dirty.clear();
         target.dirty.extend_from_slice(&self.dirty);
         target.undo = self.undo.clone();
@@ -11611,6 +11614,23 @@ mod tests {
                 page += PT_PAGE;
             }
         }
+    }
+
+    /// A recycled image is overwritten by `snapshot_into`, whose result must
+    /// equal `snapshot_image`: an offline copy is never guest-owned, even
+    /// when the pooled image last belonged to a guest-owned MM.
+    #[test]
+    fn recycled_snapshot_is_an_offline_host_owned_image() {
+        let mut source = hvpatch_manager();
+        source.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        assert_eq!(
+            source.snapshot_image().unwrap().live_descriptor_owner(),
+            LiveDescriptorOwner::Host
+        );
+        let mut recycled = hvpatch_manager();
+        recycled.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        source.snapshot_into(&mut recycled).unwrap();
+        assert_eq!(recycled.live_descriptor_owner(), LiveDescriptorOwner::Host);
     }
 
     /// Every host-originated range rule produces the same terminal
