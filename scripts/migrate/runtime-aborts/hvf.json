@@ -2411,6 +2411,28 @@
       "rationale": "A settled grant's record must return to the pool exactly once; failure means the pool's single-owner state machine was violated and the record could be reissued while referenced.",
       "sink": "fatal",
       "domain": "hvpatch::guest_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_cow.rs",
+      "function": "<CarrierGuestCowSettlement as CowGrantSettlement>::settle",
+      "ordinal_in_function": 1,
+      "fingerprint": "3d1ada1184706f8286c2e0e50338a62bf423b20f7d9e7bb403017958dc183513",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_cow",
+      "rationale": "EL1 COW completions exist only for MMs whose COW runtime was bound (which registers the MM's exact state in custody); a completion for an MM never bound means the pool and the carrier's custody disagree, and there is no state to settle it into.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_cow.rs",
+      "function": "require_guest_cow_settled",
+      "ordinal_in_function": 1,
+      "fingerprint": "d1faedff9fe4a8c6887d478ccc3604c9f86b2cc751003eb1abdb33b883658569",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_cow",
+      "rationale": "The host is about to build a fork child from, or host-COW, the MM's frames after the exclusion that settles EL1 COW completions; a completion still pending means settlement missed this MM, and building from the host's stale view would inherit or retire a frame while a live leaf names another one.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_cow"
     }
   ]
 }
