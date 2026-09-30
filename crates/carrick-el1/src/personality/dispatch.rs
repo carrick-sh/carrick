@@ -240,9 +240,22 @@ where
     let cur_task = current_tasks.get(slot);
     let nr = frame.x[8] as usize;
 
-    // Entry check: if pending_host_work is set, forward immediately without serving.
+    // Entry check: if pending_host_work is set, forward immediately without
+    // serving -- unless the slot's switched-in record owns a pending object
+    // operation. Its thread is re-issuing the SVC to resume that operation,
+    // which only the adapter may take (before any fd lookup); forwarding
+    // would let the host run the call afresh while the record kept the
+    // operation for the thread's next read or write. The adapter completes,
+    // parks or hands it back, and a served result still leaves with the
+    // pending work (`ServedWithWork`).
+    let resumes_operation = zone.as_ref().is_some_and(|zone| {
+        SlotId::from_index(slot)
+            .and_then(|slot| zone.tables.slot(slot).current())
+            .is_some_and(|record| zone.tables.record(record).has_object_operation())
+    });
     if let Some(task) = cur_task
         && task.has_pending_host_work()
+        && !resumes_operation
     {
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
