@@ -17,11 +17,18 @@ const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
-const VERSION: u64 = 5;
+const VERSION: u64 = 6;
 /// Nodes each root keeps for its host venue: enough for the net growth of
 /// any one host syscall's mirror (at most two straddler splits per edit
 /// boundary pair, demotion and placeholder included).
 pub const HOST_RESERVE: u32 = 8;
+/// Retired resident extents one root can hold between EL1 retirement and the
+/// host's stage-2/inventory receipt. A full journal forwards the next
+/// resident retirement, so the host drains before serving it.
+pub const DEFERRED_RETURNS: usize = 8;
+/// Table-wide journal slots shared by every root (at most
+/// [`DEFERRED_RETURNS`] each). Per-root state has no room to grow.
+const DEFERRED_SLOTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -94,6 +101,29 @@ pub enum MoveTarget {
     KeepSource(Option<u64>),
 }
 
+/// A resident extent EL1 retired at stage-1 (its terminals keep their output
+/// as `SW_RETIRED`) whose stage-2 and frame-inventory return is still owed.
+/// The frames stay unreusable, and no `Prepare` may hand the range out again,
+/// until the host venue reconciles the extent and acknowledges `sequence`
+/// ([`Reservations::acknowledge_deferred_returns`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeferredReturn {
+    pub range: ReservationRange,
+    /// The newest completed request whose retirement this extent covers.
+    pub sequence: ReservationSequence,
+}
+
+/// One root's journal slot, reserved by [`Reservations::reserve_return`]
+/// before a retirement's descriptor step and consumed by its commit or
+/// released by its refusal.
+#[must_use]
+#[derive(Debug)]
+pub struct ReturnSlot {
+    index: usize,
+    /// Joins the owed extent already in the slot.
+    merge: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Complete(u64),
@@ -152,6 +182,17 @@ struct Root {
     locked: AtomicU64,
     epoch: AtomicU64,
     state: UnsafeCell<MaybeUninit<State>>,
+}
+
+/// One owed return ([`DeferredReturn`]). `mm` is the owning root's published
+/// key (never reused), 0 when free. A slot is claimed, written, edited and
+/// freed only under its owner's root guard; other roots read `mm` alone.
+#[repr(C)]
+struct DeferredSlot {
+    mm: AtomicU64,
+    start: AtomicU64,
+    end: AtomicU64,
+    sequence: AtomicU64,
 }
 // Access to state requires the root's nonblocking exclusive guard.
 unsafe impl Sync for Root {}
@@ -302,6 +343,12 @@ unsafe impl Sync for Node {}
 pub struct SharedReservations {
     layout_hash: AtomicU64,
     roots: [Root; ROOTS],
+    /// Lock-free mirror of each root's `State::admitted`, one bit per root:
+    /// set at admission, cleared at publish and retirement. Lets the guest
+    /// venue route an unadmitted MM exactly as before without the guard,
+    /// whose own `admitted` stays the authority.
+    admitted: [AtomicU64; ROOTS / 64],
+    deferred: [DeferredSlot; DEFERRED_SLOTS],
     allocated: AtomicU32,
     free: AtomicU64,
     nodes: [Node; NODES],
@@ -317,6 +364,9 @@ const LAYOUT_HASH: u64 = {
         core::mem::size_of::<Node>() as u64,
         core::mem::size_of::<Pending>() as u64,
         core::mem::offset_of!(SharedReservations, roots) as u64,
+        core::mem::offset_of!(SharedReservations, admitted) as u64,
+        core::mem::offset_of!(SharedReservations, deferred) as u64,
+        core::mem::size_of::<DeferredSlot>() as u64,
         core::mem::offset_of!(SharedReservations, nodes) as u64,
         core::mem::offset_of!(SharedReservations, storage) as u64,
         core::mem::offset_of!(Root, state) as u64,
@@ -398,11 +448,32 @@ impl SharedReservations {
                     retired_below: 0,
                 });
             }
+            self.set_admitted(index, false);
             root.key.store(mm.raw(), Ordering::Release);
             Ok(())
         };
         root.locked.store(0, Ordering::Release);
         result
+    }
+
+    /// Whether `mm`'s published root at `index` has been admitted, read
+    /// without the guard. A hint: `true` routes the syscall to the root
+    /// (whose guard rechecks); `false` means no root owns the MM's anonymous
+    /// memory yet, so the caller keeps its pre-delegation path.
+    pub fn admitted(&self, index: usize, mm: ReservationMm) -> bool {
+        self.layout_hash.load(Ordering::Acquire) == LAYOUT_HASH
+            && self.roots.get(index).is_some_and(|root| {
+                self.admitted[index / 64].load(Ordering::Acquire) & (1 << (index % 64)) != 0
+                    && root.key.load(Ordering::Acquire) == mm.raw()
+            })
+    }
+    fn set_admitted(&self, index: usize, admitted: bool) {
+        let bit = 1u64 << (index % 64);
+        if admitted {
+            self.admitted[index / 64].fetch_or(bit, Ordering::AcqRel);
+        } else {
+            self.admitted[index / 64].fetch_and(!bit, Ordering::AcqRel);
+        }
     }
 
     pub fn lock(&self, index: usize, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
@@ -927,6 +998,15 @@ impl Reservations<'_> {
         }
         if !self.in_layout(range) {
             return Err(Refusal::ForeignMapping);
+        }
+        // A retired resident extent's frames are unreusable until the
+        // host's inventory receipt: its VA is not handed out again first.
+        if matches!(
+            operation,
+            ReservationOperation::Prepare | ReservationOperation::Move
+        ) && self.return_owed_within(range)
+        {
+            return Err(Refusal::Busy);
         }
         let mut cursor = range.start();
         let mut bytes = 0;
@@ -1603,6 +1683,174 @@ impl Reservations<'_> {
         self.state_mut().pending = None;
         Ok(pending.result)
     }
+    fn index(&self) -> usize {
+        // SAFETY-free arithmetic: `root` borrows an element of `roots`.
+        (self.root as *const Root as usize - self.table.roots.as_ptr() as usize)
+            / core::mem::size_of::<Root>()
+    }
+    fn mark_admitted(&self) {
+        self.table.set_admitted(self.index(), true);
+    }
+    /// This root's journal slots. Only this root's guard edits them.
+    fn deferred_slots(&self) -> impl Iterator<Item = &DeferredSlot> + '_ {
+        let mm = self.mm.raw();
+        self.table
+            .deferred
+            .iter()
+            .filter(move |slot| slot.mm.load(Ordering::Acquire) == mm)
+    }
+    fn deferred(&self) -> impl Iterator<Item = DeferredReturn> + '_ {
+        self.deferred_slots().filter_map(|slot| {
+            Some(DeferredReturn {
+                range: ReservationRange::new(
+                    slot.start.load(Ordering::Relaxed),
+                    slot.end.load(Ordering::Relaxed),
+                )?,
+                sequence: ReservationSequence::new(slot.sequence.load(Ordering::Relaxed))?,
+            })
+        })
+    }
+    fn return_owed_within(&self, range: ReservationRange) -> bool {
+        self.deferred()
+            .any(|owed| owed.range.start() < range.end() && range.start() < owed.range.end())
+    }
+    /// The slot `range` would join (abutting or overlapping an owed extent),
+    /// else a free slot when this root is under its share. `None`: full.
+    fn deferred_slot_for(&self, range: ReservationRange) -> Option<(usize, bool)> {
+        let mm = self.mm.raw();
+        let mut owned = 0;
+        for (index, slot) in self.table.deferred.iter().enumerate() {
+            if slot.mm.load(Ordering::Acquire) != mm {
+                continue;
+            }
+            owned += 1;
+            let (start, end) = (
+                slot.start.load(Ordering::Relaxed),
+                slot.end.load(Ordering::Relaxed),
+            );
+            if start <= range.end() && range.start() <= end {
+                return Some((index, true));
+            }
+        }
+        if owned >= DEFERRED_RETURNS {
+            return None;
+        }
+        self.table
+            .deferred
+            .iter()
+            .position(|slot| slot.mm.load(Ordering::Acquire) == 0)
+            .map(|index| (index, false))
+    }
+    /// Reserve the journal slot for one resident retirement of `range`
+    /// BEFORE its descriptor step, so the commit after that step cannot
+    /// fail for lack of room. `Busy` when this root's share or the table is
+    /// full: the retirement is then forwarded and the host drains first.
+    pub fn reserve_return(&mut self, range: ReservationRange) -> Result<ReturnSlot, Refusal> {
+        let mm = self.mm.raw();
+        loop {
+            let (index, merge) = self.deferred_slot_for(range).ok_or(Refusal::Busy)?;
+            // A free slot may be claimed by another root first; rescan (each
+            // lost race is another root's progress, and the table is
+            // bounded). The claimed slot's empty range is not yet an extent.
+            if merge
+                || self.table.deferred[index]
+                    .mm
+                    .compare_exchange(0, mm, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return Ok(ReturnSlot { index, merge });
+            }
+        }
+    }
+    /// Give back a reservation whose retirement was not committed.
+    pub fn release_return(&mut self, slot: ReturnSlot) {
+        let entry = &self.table.deferred[slot.index];
+        if !slot.merge && entry.mm.load(Ordering::Acquire) == self.mm.raw() {
+            entry.mm.store(0, Ordering::Release);
+        }
+    }
+    /// Host venue, at its next boundary for this MM: every extent whose
+    /// stage-1 terminals EL1 retired and whose stage-2/inventory return is
+    /// owed. The extents are disjoint.
+    pub fn observe_deferred_returns(&self, visit: &mut dyn FnMut(DeferredReturn)) {
+        for owed in self.deferred() {
+            visit(owed);
+        }
+    }
+    /// Host venue: stage-1 retired leaves, stage-2 and the frame inventory
+    /// of every owed extent up to `through` were reconciled as one
+    /// transaction. Only then do those frames and VAs become reusable.
+    /// Returns the number of extents released.
+    pub fn acknowledge_deferred_returns(
+        &mut self,
+        through: ReservationSequence,
+    ) -> Result<usize, Refusal> {
+        if !self.state().admitted {
+            return Err(Refusal::Stale);
+        }
+        let mut released = 0;
+        for slot in self.deferred_slots() {
+            if slot.sequence.load(Ordering::Relaxed) <= through.raw() {
+                slot.start.store(0, Ordering::Relaxed);
+                slot.end.store(0, Ordering::Relaxed);
+                slot.sequence.store(0, Ordering::Relaxed);
+                slot.mm.store(0, Ordering::Release);
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+    /// Complete a pending `Retire` (or a `Prepare` replacing resident memory)
+    /// whose stage-1 terminals the guest venue retired, and journal the
+    /// range as an owed return in `slot` ([`Self::reserve_return`]).
+    /// `completion.backing()` returned nothing yet: the frames stay in the
+    /// inventory, unreusable, until the host acknowledges this request's
+    /// sequence. A refusal releases `slot`.
+    pub fn complete_deferring_return(
+        &mut self,
+        completion: ReservationCompletion,
+        slot: ReturnSlot,
+    ) -> Result<u64, Refusal> {
+        let request = match self.pending() {
+            Some(request)
+                if matches!(
+                    request.operation,
+                    ReservationOperation::Retire | ReservationOperation::Prepare
+                ) && completion.backing().returned_bytes == 0 =>
+            {
+                request
+            }
+            Some(_) => {
+                self.release_return(slot);
+                return Err(Refusal::Invalid);
+            }
+            None => {
+                self.release_return(slot);
+                return Err(Refusal::Stale);
+            }
+        };
+        let result = match self.complete(completion) {
+            Ok(result) => result,
+            Err(refusal) => {
+                self.release_return(slot);
+                return Err(refusal);
+            }
+        };
+        let (range, sequence) = (request.range, request.sequence.raw());
+        let entry = &self.table.deferred[slot.index];
+        if slot.merge {
+            // Abutting or overlapping: one extent, owed until the newer
+            // sequence is acknowledged.
+            entry.start.fetch_min(range.start(), Ordering::Relaxed);
+            entry.end.fetch_max(range.end(), Ordering::Relaxed);
+            entry.sequence.fetch_max(sequence, Ordering::Relaxed);
+        } else {
+            entry.start.store(range.start(), Ordering::Relaxed);
+            entry.end.store(range.end(), Ordering::Relaxed);
+            entry.sequence.store(sequence, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
     pub fn refuse(&mut self, request: ReservationRequest) -> Result<(), Refusal> {
         let pending = self.state().pending.ok_or(Refusal::Stale)?;
         if pending.request != request {
@@ -1796,7 +2044,9 @@ impl Reservations<'_> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
-        if self.pending().is_some() {
+        // Fork plans from settled memory only: retired extents whose
+        // frames the host has not reconciled are not settled.
+        if self.pending().is_some() || self.deferred().next().is_some() {
             return Err(Refusal::Busy);
         }
         if child.state().admitted || child.state().tree != 0 || child.pending().is_some() {
@@ -1828,6 +2078,7 @@ impl Reservations<'_> {
         state.retired_below = retired_below;
         state.admitted = true;
         state.generation += 1;
+        child.mark_admitted();
         Ok(())
     }
     fn copy_in_order(&mut self, id: u32, list: &mut CopyList) -> Result<(), Refusal> {
@@ -1903,6 +2154,7 @@ impl Reservations<'_> {
             return Err(Refusal::Stale);
         }
         self.state_mut().admitted = true;
+        self.mark_admitted();
         Ok(())
     }
     pub fn is_admitted(&self) -> bool {
@@ -1927,9 +2179,14 @@ impl Reservations<'_> {
         Ok(())
     }
     /// Called after final-MM descriptor/backing settlement, never sibling exit.
+    /// Owed returns must be reconciled first: the MM's frames are only
+    /// settled once every EL1-retired extent has its inventory receipt.
     pub fn retire(mut self) -> Result<(), Refusal> {
-        if self.pending().is_some() {
+        if self.pending().is_some() || self.deferred().next().is_some() {
             return Err(Refusal::Busy);
+        }
+        for slot in self.deferred_slots() {
+            slot.mm.store(0, Ordering::Release);
         }
         self.release_tree(self.state().tree);
         self.state_mut().tree = 0;
@@ -1937,6 +2194,7 @@ impl Reservations<'_> {
         self.root
             .epoch
             .store(self.state().generation, Ordering::Relaxed);
+        self.table.set_admitted(self.index(), false);
         self.root.key.store(0, Ordering::Release);
         Ok(())
     }

@@ -310,6 +310,32 @@ where
         return Action::Forward;
     }
 
+    // A delegated MM's anonymous memory has one owner, its admitted
+    // reservation root: brk/mmap/munmap/mprotect are its transactions, the
+    // descriptor editors only their descriptor step. No admitted root: the
+    // MM keeps the paths below unchanged.
+    #[cfg(target_os = "none")]
+    if matches!(nr, 214 | 215 | 222 | 226)
+        && let (Some(zone), Some(task)) = (zone.as_ref(), cur_task)
+    {
+        let orig_x0 = frame.x[0];
+        match memory::serve_delegated_anonymous(
+            frame,
+            counters,
+            task,
+            &zone.tables.spaces,
+            memory::reservations::shared_guest(),
+            &mut memory::HardwareAnonymousEditor,
+        ) {
+            memory::DelegatedAnonymous::NotDelegated => {}
+            memory::DelegatedAnonymous::Served => {
+                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                return Action::Served;
+            }
+            memory::DelegatedAnonymous::Forward => return Action::Forward,
+        }
+    }
+
     #[cfg(target_os = "none")]
     if nr == 226
         && let Some(zone) = zone.as_ref()
