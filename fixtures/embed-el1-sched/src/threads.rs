@@ -1024,6 +1024,129 @@ fn start_storm(count: usize, stop: std::sync::Arc<AtomicU32>) -> Vec<std::thread
         .collect()
 }
 
+/// Why one fork of `fork-storm` failed, so a red line names the stage.
+enum ForkStormFailure {
+    /// `fork` returned -1 with this errno.
+    Fork { errno: i32 },
+    /// The child's report did not arrive: `poll` timed out, was interrupted
+    /// (errno), hung up without data, or the read came up short.
+    Report(ReportFailure),
+    /// The child reported, but it was not exactly one thread (`threads`
+    /// counts `/proc/self/task`) or its own thread clone/join failed.
+    Membership { threads: u64 },
+    /// The child ended other than `exit(0)`.
+    Reap(ReapOutcome),
+}
+
+enum ReportFailure {
+    PollTimeout,
+    PollError { errno: i32 },
+    HangupWithoutData { revents: i16 },
+    ShortRead { have: usize, errno: i32 },
+}
+
+enum ReapOutcome {
+    Exited(i32),
+    Signaled(i32),
+    TimedOut,
+    WaitError { errno: i32 },
+}
+
+impl std::fmt::Display for ForkStormFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fork { errno } => write!(f, "fork errno={errno}"),
+            Self::Report(ReportFailure::PollTimeout) => write!(f, "report poll timed out"),
+            Self::Report(ReportFailure::PollError { errno }) => {
+                write!(f, "report poll errno={errno}")
+            }
+            Self::Report(ReportFailure::HangupWithoutData { revents }) => {
+                write!(f, "report hangup without data revents={revents:#x}")
+            }
+            Self::Report(ReportFailure::ShortRead { have, errno }) => {
+                write!(f, "report short read have={have} errno={errno}")
+            }
+            Self::Membership { threads } => {
+                write!(f, "child threads={threads} or its clone/join failed")
+            }
+            Self::Reap(ReapOutcome::Exited(code)) => write!(f, "child exit code={code}"),
+            Self::Reap(ReapOutcome::Signaled(signal)) => {
+                write!(f, "child killed by signal={signal}")
+            }
+            Self::Reap(ReapOutcome::TimedOut) => write!(f, "child not reaped in 20s"),
+            Self::Reap(ReapOutcome::WaitError { errno }) => write!(f, "waitpid errno={errno}"),
+        }
+    }
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// `poll_read_count`, with the reason it failed.
+fn read_report(fd: libc::c_int, timeout_ms: libc::c_int) -> Result<u64, ReportFailure> {
+    let mut bytes = [0u8; 8];
+    let mut have = 0;
+    while have < bytes.len() {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc == 0 {
+            return Err(ReportFailure::PollTimeout);
+        }
+        if rc < 0 {
+            return Err(ReportFailure::PollError {
+                errno: last_errno(),
+            });
+        }
+        if (pfd.revents & libc::POLLIN) == 0 {
+            return Err(ReportFailure::HangupWithoutData {
+                revents: pfd.revents,
+            });
+        }
+        let n = unsafe { libc::read(fd, bytes[have..].as_mut_ptr().cast(), bytes.len() - have) };
+        if n <= 0 {
+            return Err(ReportFailure::ShortRead {
+                have,
+                errno: if n < 0 { last_errno() } else { 0 },
+            });
+        }
+        have += n as usize;
+    }
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// `reap`, with how the child ended.
+fn reap_outcome(pid: i32, total: Duration) -> ReapOutcome {
+    let start = Instant::now();
+    loop {
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid {
+            if libc::WIFEXITED(status) {
+                return ReapOutcome::Exited(libc::WEXITSTATUS(status));
+            }
+            return ReapOutcome::Signaled(libc::WTERMSIG(status));
+        }
+        if rc < 0 {
+            return ReapOutcome::WaitError {
+                errno: last_errno(),
+            };
+        }
+        if start.elapsed() > total {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+            return ReapOutcome::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 pub fn fork_storm(forks: usize) -> i32 {
     let stop = std::sync::Arc::new(AtomicU32::new(0));
     let storm = start_storm(8, stop.clone());
@@ -1031,13 +1154,22 @@ pub fn fork_storm(forks: usize) -> i32 {
     let storm_started = wait_true(Duration::from_secs(20), || {
         STORM_SPAWNED.load(Ordering::Relaxed) >= 64
     });
-    let mut bad = 0;
+    let mut failures: Vec<(usize, ForkStormFailure)> = Vec::new();
     let mut child_threads_seen = Vec::new();
-    for _ in 0..forks {
+    for round in 0..forks {
         let pipe = make_pipe();
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            bad += 1;
+            failures.push((
+                round,
+                ForkStormFailure::Fork {
+                    errno: last_errno(),
+                },
+            ));
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
             continue;
         }
         if pid == 0 {
@@ -1052,18 +1184,24 @@ pub fn fork_storm(forks: usize) -> i32 {
             unsafe { libc::_exit(0) };
         }
         unsafe { libc::close(pipe[1]) };
-        match poll_read_count(pipe[0], 20_000) {
-            Some(packed) => {
+        match read_report(pipe[0], 20_000) {
+            Ok(packed) => {
                 child_threads_seen.push(packed & 0xffff_ffff);
                 if packed >> 32 != 1 {
-                    bad += 1;
+                    failures.push((
+                        round,
+                        ForkStormFailure::Membership {
+                            threads: packed & 0xffff_ffff,
+                        },
+                    ));
                 }
             }
-            None => bad += 1,
+            Err(report) => failures.push((round, ForkStormFailure::Report(report))),
         }
         unsafe { libc::close(pipe[0]) };
-        if reap(pid, Duration::from_secs(20)) != Some(0) {
-            bad += 1;
+        match reap_outcome(pid, Duration::from_secs(20)) {
+            ReapOutcome::Exited(0) => {}
+            other => failures.push((round, ForkStormFailure::Reap(other))),
         }
     }
     stop.store(1, Ordering::Release);
@@ -1071,7 +1209,11 @@ pub fn fork_storm(forks: usize) -> i32 {
         let _ = handle.join();
     }
     let spawned = STORM_SPAWNED.load(Ordering::Relaxed);
+    let bad = failures.len();
     let ok = bad == 0 && storm_started;
+    for (round, failure) in failures.iter().take(8) {
+        println!("fork-storm failure round {round}: {failure}");
+    }
     println!(
         "fork-storm forks={forks} storm_spawned={spawned} bad={bad} child_thread_counts={child_threads_seen:?} ok={ok}"
     );
