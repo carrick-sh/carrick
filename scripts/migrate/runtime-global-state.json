@@ -83,6 +83,14 @@
     },
     {
       "kind": "env_var",
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
+      "symbol": "el1_reservations_enabled::CARRICK_EL1_RESERVATIONS",
+      "fingerprint": "a8fa7484593a9e8c204fa4042d8a8fc67836035f678e5c36e92333bd24e78c38",
+      "classification": "config_debug",
+      "rationale": "Exact =0 hatch CARRICK_EL1_RESERVATIONS in crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs that keeps every MM in host setup (no delegated anonymous root admission, S3 T4), read once per carrier process."
+    },
+    {
+      "kind": "env_var",
       "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
       "symbol": "madvise::CARRICK_MINCORE_EXACT",
       "fingerprint": "4a6206a3e2aa3f4e04f5c34445cd1c90feb37bd6c3bd184e83a49cad3b165ad6",
@@ -1312,6 +1320,14 @@
       "fingerprint": "368ee47b5b49d42b13dc24e69a5145d6adfd06c080fe2b2d3ce7e7cc7f4da277",
       "classification": "host_kernel_object",
       "rationale": "Host-fd keyed archive write forensics table AR_MAGIC_WRITES tracking concurrent writes to host file descriptors."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
+      "symbol": "el1_reservations_enabled::ENABLED",
+      "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_EL1_RESERVATIONS hatch in crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs; read once, immutable for the carrier's life."
     },
     {
       "kind": "static",
