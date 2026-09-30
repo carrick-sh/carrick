@@ -7092,3 +7092,43 @@ fn proc_regions_hides_the_mmap_arena_reservation_on_the_host_setup_lane() {
     );
     assert!(regions.iter().any(|r| r.start == 0x1_0000_0000));
 }
+
+/// mprotect(2)/proc(5): once a protected page is restored, its neighbours are
+/// identical again and Linux shows ONE `rw-p` row. Carrick kept the three
+/// rows the split produced (`el1_delegated_root_concurrent_vma_ops`: the
+/// pre-fork region read back as `[0x5000,0x6000)` plus the rest).
+#[test]
+fn mprotect_and_restore_leaves_one_merged_dynamic_row() {
+    use carrick_abi::LinuxProtFlags;
+    let mut mem = MemState::new();
+    let (start, end) = (0x60_0000_5000u64, 0x60_0001_5000u64);
+    let rw = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    mem.dynamic_maps.push(ProcMapsEntry {
+        start,
+        end,
+        read: true,
+        write: true,
+        execute: false,
+        sharing: carrick_vfs::ProcMapSharing::Private,
+        path: String::new(),
+    });
+    mem.semantic_vmas = VmaMap::from_vec(vec![SemanticVma {
+        start,
+        end,
+        read: true,
+        write: true,
+        execute: false,
+        provenance: VmaBackingProvenance::PrivateAnonymous,
+        fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+        dump_policy: carrick_abi::VmaDumpPolicy::Include,
+        droppable: false,
+        path: String::new(),
+        file_page_offset: None,
+    }]);
+
+    mem.set_mapping_prot(start + 0x1000, start + 0x2000, LinuxProtFlags::READ);
+    assert_eq!(mem.dynamic_maps.len(), 3, "the protect splits the row");
+    mem.set_mapping_prot(start + 0x1000, start + 0x2000, rw);
+    let rows: Vec<_> = mem.dynamic_maps.iter().map(|r| (r.start, r.end)).collect();
+    assert_eq!(rows, vec![(start, end)], "the restore must re-merge");
+}
