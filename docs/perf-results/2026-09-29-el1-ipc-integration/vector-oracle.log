@@ -1,0 +1,16 @@
+nr65_4_4 result=8 errno=0 drain=-1 value=0
+nr65_8_8 result=8 errno=0 drain=-1 value=0
+nr65_16 result=8 errno=0 drain=-1 value=0
+nr65_0_8 result=8 errno=0 drain=-1 value=0
+nr65_4_8 result=8 errno=0 drain=-1 value=0
+nr65_8_4 result=8 errno=0 drain=-1 value=0
+nr65_0_0 result=0 errno=0 drain=8 value=42
+nr65_ result=0 errno=0 drain=8 value=42
+nr66_4_4 result=-1 errno=22 drain=-1 value=0
+nr66_8_8 result=16 errno=0 drain=8 value=2
+nr66_16 result=-1 errno=22 drain=-1 value=0
+nr66_0_8 result=-1 errno=22 drain=-1 value=0
+nr66_4_8 result=-1 errno=22 drain=-1 value=0
+nr66_8_4 result=8 errno=0 drain=8 value=1
+nr66_0_0 result=0 errno=0 drain=-1 value=0
+nr66_ result=0 errno=0 drain=-1 value=0

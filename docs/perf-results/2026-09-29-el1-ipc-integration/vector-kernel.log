@@ -1,0 +1,41 @@
+    Blocking waiting for file lock on build directory
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 53.74s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 32 tests
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_description_refusal_rolls_back_object ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_mixed_subscriber_wakes_once ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_guest_only_eventfd_has_no_host_readiness ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_status_flags_share_one_description ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_guest_writer_pin_delays_eof_after_host_close ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_flags_are_shared_per_endpoint ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_guest_write_host_read_and_reverse ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_proxy_subscription_ends_with_lease ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_second_description_refusal_rolls_back ... ok
+test dispatch::fs::tests::serial_host_el1_ipc_pipe_capacity_admission_matches_shared_rounding ... ok
+test dispatch::fs::tests::serial_host_el1_ipc_splice_endpoint_survives_final_slot_close ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_vector_retains_prefix_tail_and_description ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_closes_enrollment_gap ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_survives_fd_reuse ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_eventfd_vector_fault_progress ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_eventfd_vector_semantics ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_production_eventfd_table_shares_data_with_guest_view ... ok
+test el1_ipc::table::tests::serial_host_el1_ipc_owned_table_fork_replace_exec_and_retire ... ok
+test el1_ipc::table::tests::serial_host_el1_ipc_owned_table_releases_resources_after_unlocking ... ok
+test el1_ipc::table::tests::serial_host_el1_ipc_owned_tables_reclaim_extent_and_identity_capacity ... ok
+test el1_ipc::tests::serial_host_el1_ipc_descriptor_admission_reclaims_extents ... ok
+test el1_ipc::tests::serial_host_el1_ipc_host_subscription_lifetime_is_exact ... ok
+test el1_ipc::tests::serial_host_el1_ipc_pool_refusal_has_no_partial_admission ... ok
+test el1_ipc::tests::serial_host_el1_ipc_pool_reuses_released_storage ... ok
+test kernel::continuation::ipc::tests::serial_host_el1_ipc_finish_releases_host_forwarding_token ... ok
+test kernel::continuation::ipc::tests::serial_host_el1_ipc_guest_wake_delivered_at_its_kernel_boundary ... ok
+test kernel::continuation::ipc::tests::serial_host_el1_ipc_runtime_backing_retains_the_kernel_authority ... ok
+test kernel::objects::ipc::tests::serial_host_el1_ipc_file_table_fork_exec_and_refusal ... ok
+test kernel::objects::ipc::tests::serial_host_el1_ipc_file_table_publishes_mutations_and_functional_retirement ... ok
+test kernel::objects::tests::serial_host_el1_ipc_host_description_alias_and_functional_retirement ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 2308 filtered out; finished in 0.06s
+

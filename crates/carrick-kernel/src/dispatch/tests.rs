@@ -58,6 +58,95 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn serial_host_el1_ipc_eventfd_vector_semantics() {
+        for (nr, sizes, expected, remaining) in [
+            (65, vec![4, 4], 8, None),
+            (65, vec![8, 8], 8, None),
+            (65, vec![0, 8], 8, None),
+            (65, vec![4], -22, Some(42)),
+            (65, vec![], 0, Some(42)),
+            (66, vec![8, 8], 16, Some(2)),
+            (66, vec![4, 4], -22, None),
+            (66, vec![16], -22, None),
+            (66, vec![0, 8], -22, None),
+            (66, vec![8, 4], 8, Some(1)),
+            (66, vec![], 0, None),
+        ] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let reporter = CompatReporter::default();
+            let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
+            let initial = if nr == 65 { 42 } else { 0 };
+            let create = dispatcher.dispatch(&context, SyscallRequest::new(19, SyscallArgs([initial, 2048, 0, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            let DispatchOutcome::Returned { value: fd } = create else { panic!("{create:?}"); };
+            for (index, len) in sizes.iter().enumerate() {
+                let address = 0x4100 + index as u64 * 32;
+                memory.write_bytes(address, &1u64.to_ne_bytes()).unwrap();
+                memory.write_bytes(0x4000 + index as u64 * 16, LinuxIovec::new(address, *len).as_bytes()).unwrap();
+            }
+            let result = dispatcher.dispatch(&context, SyscallRequest::new(nr, SyscallArgs([fd as u64, 0x4000, sizes.len() as u64, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            let expected_outcome = if expected < 0 { DispatchOutcome::errno(LINUX_EINVAL) } else { DispatchOutcome::Returned { value: expected } };
+            assert_eq!(result, expected_outcome, "nr={nr} sizes={sizes:?}");
+            if nr == 65 && expected == 8 {
+                let mut delivered = Vec::new();
+                for (index, len) in sizes.iter().enumerate() {
+                    let count = (*len as usize).min(8 - delivered.len());
+                    delivered.extend(memory.read_bytes(0x4100 + index as u64 * 32, count).unwrap());
+                    if delivered.len() == 8 { break; }
+                }
+                assert_eq!(delivered, 42u64.to_ne_bytes());
+            }
+            let drain = dispatcher.dispatch(&context, SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4300, 8, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            if let Some(value) = remaining {
+                assert_eq!(drain, DispatchOutcome::Returned { value: 8 });
+                assert_eq!(memory.read_bytes(0x4300, 8).unwrap(), (value as u64).to_ne_bytes());
+            } else { assert_eq!(drain, DispatchOutcome::errno(LINUX_EAGAIN)); }
+        }
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_eventfd_vector_fault_progress() {
+        for (nr, first_len, expected, counter) in [
+            (65, 0, -14, None),
+            (65, 4, -14, None),
+            (65, 8, 8, None),
+            (66, 0, -14, None),
+            (66, 4, -22, None),
+            (66, 8, 8, Some(1u64)),
+        ] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let reporter = CompatReporter::default();
+            let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
+            let initial = if nr == 65 { 42 } else { 0 };
+            let create = dispatcher.dispatch(&context, SyscallRequest::new(19, SyscallArgs([initial, 2048, 0, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            let DispatchOutcome::Returned { value: fd } = create else { panic!("{create:?}"); };
+            memory.write_bytes(0x4100, &1u64.to_ne_bytes()).unwrap();
+            let mut iovecs = Vec::new();
+            if first_len != 0 { iovecs.push(LinuxIovec::new(0x4100, first_len)); }
+            iovecs.push(LinuxIovec::new(1, 8));
+            for (index, iovec) in iovecs.iter().enumerate() {
+                memory.write_bytes(0x4000 + index as u64 * 16, iovec.as_bytes()).unwrap();
+            }
+            let result = dispatcher.dispatch(&context, SyscallRequest::new(nr, SyscallArgs([fd as u64, 0x4000, iovecs.len() as u64, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            let wanted = match expected {
+                -14 => DispatchOutcome::errno(LINUX_EFAULT),
+                -22 => DispatchOutcome::errno(LINUX_EINVAL),
+                value => DispatchOutcome::Returned { value },
+            };
+            assert_eq!(result, wanted, "nr={nr} first_len={first_len}");
+            if nr == 65 && first_len != 0 {
+                assert_eq!(memory.read_bytes(0x4100, first_len as usize).unwrap(), 42u64.to_ne_bytes()[..first_len as usize]);
+            }
+            let drain = dispatcher.dispatch(&context, SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4300, 8, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            if let Some(value) = counter {
+                assert_eq!(drain, DispatchOutcome::Returned { value: 8 });
+                assert_eq!(memory.read_bytes(0x4300, 8).unwrap(), value.to_ne_bytes());
+            } else { assert_eq!(drain, DispatchOutcome::errno(LINUX_EAGAIN)); }
+        }
+    }
+
+    #[test]
     fn serial_host_el1_ipc_production_eventfd_table_shares_data_with_guest_view() {
         use carrick_el1_abi::ipc::{fd, IpcBacking};
         use carrick_el1_abi::ipc_tables::IpcTableMap;
@@ -88,20 +177,25 @@ mod overlay_dispatch_tests {
 
     #[test]
     fn serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity() {
-        blocking_eventfd_owned_write(false, false);
+        blocking_eventfd_owned_write(false, false, false);
     }
 
     #[test]
     fn serial_host_el1_ipc_blocking_eventfd_write_survives_fd_reuse() {
-        blocking_eventfd_owned_write(true, false);
+        blocking_eventfd_owned_write(true, false, false);
     }
 
     #[test]
     fn serial_host_el1_ipc_blocking_eventfd_write_closes_enrollment_gap() {
-        blocking_eventfd_owned_write(false, true);
+        blocking_eventfd_owned_write(false, true, false);
     }
 
-    fn blocking_eventfd_owned_write(reuse_fd: bool, drain_before_enrollment: bool) {
+    #[test]
+    fn serial_host_el1_ipc_blocking_eventfd_vector_retains_prefix_tail_and_description() {
+        blocking_eventfd_owned_write(true, false, true);
+    }
+
+    fn blocking_eventfd_owned_write(reuse_fd: bool, drain_before_enrollment: bool, vector: bool) {
         use crate::kernel::continuation::{
             BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass,
             fold_continuation_completion, test_support,
@@ -134,6 +228,16 @@ mod overlay_dispatch_tests {
             DispatchOutcome::Returned { value: 8 }
         );
         memory.write_bytes(0x4000, &7u64.to_ne_bytes()).unwrap();
+        let write = if vector {
+            // Zero succeeds without freeing capacity; seven blocks; eleven is
+            // retained as a later scalar operation on the same description.
+            for (index, value) in [0u64, 7, 11].into_iter().enumerate() {
+                let address = 0x4100 + index as u64 * 8;
+                memory.write_bytes(address, &value.to_ne_bytes()).unwrap();
+                memory.write_bytes(0x4200 + index as u64 * 16, LinuxIovec::new(address, 8).as_bytes()).unwrap();
+            }
+            SyscallRequest::new(66, SyscallArgs([fd as u64, 0x4200, 3, 0, 0, 0]))
+        } else { write };
         let blocked = dispatcher
             .dispatch(&context, write, &mut memory, &reporter)
             .unwrap();
@@ -218,6 +322,10 @@ mod overlay_dispatch_tests {
             );
             memory.write_bytes(0x4000, &99u64.to_ne_bytes()).unwrap();
         }
+        if vector {
+            memory.write_bytes(0x4108, &99u64.to_ne_bytes()).unwrap();
+            memory.write_bytes(0x4110, &99u64.to_ne_bytes()).unwrap();
+        }
         let mut event = std::pin::pin!(service.event(token));
         let Poll::Ready(Ok(event)) = event.as_mut().poll(&mut Context::from_waker(Waker::noop()))
         else {
@@ -226,7 +334,7 @@ mod overlay_dispatch_tests {
         let completion = continuation.resume(event, &context).unwrap().completion;
         assert_eq!(
             fold_continuation_completion(completion, &dispatcher, &context, &mut memory).unwrap(),
-            Some(DispatchOutcome::Returned { value: 8 })
+            Some(DispatchOutcome::Returned { value: if vector { 24 } else { 8 } })
         );
         assert_eq!(
             dispatcher
@@ -235,7 +343,7 @@ mod overlay_dispatch_tests {
             DispatchOutcome::Returned { value: 8 }
         );
         let delivered = memory.read_bytes(0x4020, 8).unwrap();
-        assert_eq!(u64::from_ne_bytes(delivered.try_into().unwrap()), 7);
+        assert_eq!(u64::from_ne_bytes(delivered.try_into().unwrap()), if vector { 18 } else { 7 });
         if reuse_fd {
             let read_replacement =
                 SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4020, 8, 0, 0, 0]));
