@@ -249,11 +249,6 @@ fn el1_ipc_layout_is_frozen_and_fits_one_metadata_extent() {
         "directory head {} bytes",
         core::mem::size_of::<IpcDirectory>()
     );
-    // The elastic stores' reservations fit the directory span, in order.
-    assert!(IPC_OBJECTS_OFFSET >= core::mem::size_of::<IpcDirectory>());
-    assert!(IPC_OFDS_OFFSET >= IPC_OBJECTS_OFFSET + IPC_MAX_OBJECTS * 64);
-    assert!(IPC_WAKE_LEAVES_OFFSET >= IPC_OFDS_OFFSET + IPC_MAX_OFDS * 64);
-    assert!(IPC_DIRECTORY_BYTES as u64 <= crate::EL1_IPC_DIRECTORY_SPAN);
 }
 
 #[test]

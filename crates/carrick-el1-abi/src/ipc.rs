@@ -442,6 +442,15 @@ pub const IPC_DIRECTORY_BYTES: usize = (IPC_WAKE_LEAVES_OFFSET
     + HOST_WAKE_LEAF_WORDS * core::mem::size_of::<AtomicU64>())
 .next_multiple_of(0x4000);
 const _: () = assert!(IPC_OBJECTS_OFFSET.is_multiple_of(core::mem::align_of::<IpcObjectRecord>()));
+// The elastic stores' reservations follow the head, in order, without overlap.
+const _: () = assert!(IPC_OBJECTS_OFFSET >= core::mem::size_of::<IpcDirectory>());
+const _: () = assert!(
+    IPC_OFDS_OFFSET
+        >= IPC_OBJECTS_OFFSET + IPC_MAX_OBJECTS * core::mem::size_of::<IpcObjectRecord>()
+);
+const _: () = assert!(
+    IPC_WAKE_LEAVES_OFFSET >= IPC_OFDS_OFFSET + IPC_MAX_OFDS * core::mem::size_of::<OfdRecord>()
+);
 const _: () = assert!(IPC_OFDS_OFFSET.is_multiple_of(core::mem::align_of::<OfdRecord>()));
 
 /// Layout facts of this ABI; see [`IPC_LAYOUT_HASH`].

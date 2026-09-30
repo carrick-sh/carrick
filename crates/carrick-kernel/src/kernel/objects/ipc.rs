@@ -66,7 +66,7 @@ impl Binding {
                     binding.owner.release(backing).unwrap_or_else(|_| {
                         carrick_fatal!("ipc::table", "stdio admission rollback failed")
                     });
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
             binding.stdio.push(description);

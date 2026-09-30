@@ -1174,7 +1174,7 @@ impl FileDescription {
                 owner.release(backing).unwrap_or_else(|_| {
                     carrick_fatal!("ipc::description", "forwarding admission rollback failed")
                 });
-                return Err(error.into());
+                return Err(error);
             }
         };
         let flags = description.flags();
