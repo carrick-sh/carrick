@@ -153,3 +153,26 @@ Each stage has an exact `=0` hatch where it adds behaviour.
 | L3 | EL1 personality `lifecycle.rs`. | S3-T1, L2 | `CARRICK_EL1_THREADS=0`, `CARRICK_EL1_SIGMASK=0` |
 | L4 | Runtime: settle-before-context, adoption, gates. | L1, L3 | — |
 | L6 | Director's signed ladder. | L4 | — |
+
+## Director rulings after L1 (2026-09-30)
+
+1. **Pre-issued identities shift guest-visible numbering.** A task primed
+   after its first thread clone holds up to 4 tids and namespace ids
+   ahead of use, so a later fork elsewhere is numbered after them.
+   Accepted: Linux assigns pids to concurrent processes in no guaranteed
+   order. Landing is conditional on `just conformance-probes` and
+   `conformance smoke` showing no pid-dependent diffs on the landing
+   artifact.
+2. **Bind at claim, not publication.** Creds, blocked mask and affinity
+   bind at the clone instant (claim). This supersedes "bound at
+   publication" in section 1: Linux copies them when clone runs.
+3. **No `reserved_tid → TaskKey` map.** Settle is global and costs one
+   atomic load when nothing is pending.
+4. **The ForkClosing gate is load-bearing.** Settle publishes a birth even
+   while a fork transaction holds the task. L4 must close the gate before
+   any fork or exec transaction takes the task.
+5. **Unsettled births hold `Arc<Kernel>`.** exit_group, exec and carrier
+   teardown must settle or revoke every pending birth. L4 adds a test
+   that the kernel drops.
+6. **Pool entries carry no runtime backend.** They hold tid, namespace id
+   and uid credit only. The runtime backend is prepared at adoption.
