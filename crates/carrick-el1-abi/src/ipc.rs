@@ -383,7 +383,7 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::offset_of!(IpcOperationSlot, op) as u64,
 ];
 
-/// FNV-1a over [`LAYOUT_FACTS`] and the fd core's layout facts. Written into
+/// FNV-1a over `LAYOUT_FACTS` and the fd core's layout facts. Written into
 /// the header by the initializing venue; an attach compiled with a different
 /// layout fails closed.
 pub const IPC_LAYOUT_HASH: u64 = {
