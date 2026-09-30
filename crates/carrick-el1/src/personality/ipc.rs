@@ -1482,6 +1482,84 @@ mod tests {
         assert_eq!(host_calls(&w), 0);
     }
 
+    /// A woken thread re-issues its SVC to resume the operation its record
+    /// owns. Pending host work on the slot must not forward that SVC before
+    /// the operation is taken: the host would run the call afresh (consuming
+    /// the value) while the record kept the operation, and the thread's next
+    /// read or write would resume the stale one instead (a write turned into
+    /// a second read: both sides of a ping-pong parked reading, every write
+    /// consumed; el1_ipc_two_processes_blocking under guest admission).
+    #[test]
+    fn el1_ipc_io_pending_host_work_cannot_orphan_a_resumed_operation() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 0, EventMode::Counter, BLOCK);
+        let (r2, _, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        // A's buffer is real memory: the dispatcher's validated copy writes it.
+        let mut value = [0u8; 8];
+        let buf = value.as_mut_ptr() as u64;
+        w.mem.map(MM, buf, 8);
+        w.mem.write(OTHER_MM, 0x10000, &7u64.to_ne_bytes());
+        let b_write = syscall(SYS_WRITE, e, 0x10000, 8, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let mut f = syscall(SYS_READ, e, buf, 8, A_SVC);
+        assert_eq!(w.call(&mut f), SWITCHED, "A reads nothing and parks");
+        f = b_write;
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8), "B writes, A woken");
+        let mut g = syscall(SYS_READ, r2, 0x10000, 1, B_SVC);
+        assert_eq!(w.call(&mut g), SWITCHED, "B parks: the vCPU runs A");
+        reenter(&mut g, A_SVC);
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(w.zone.record(current).has_object_operation());
+        // The slot's task as EL1 published it for A, with host work pending.
+        let tasks: Vec<CurrentTask> = (0..=SLOT.raw() as usize)
+            .map(|_| CurrentTask::new())
+            .collect();
+        let task = &tasks[SLOT.raw() as usize];
+        for (to, from) in [
+            (&task.task_id, &w.task.task_id),
+            (&task.thread_serial, &w.task.thread_serial),
+            (&task.file_table, &w.task.file_table),
+            (&task.zone_mm, &w.task.zone_mm),
+            (&task.generation, &w.task.generation),
+        ] {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        task.mark_pending_host_work();
+        let venue = w.venue();
+        // SAFETY: all-zero is a valid empty name cache.
+        let names: &carrick_el1_abi::InotifyNameCache = unsafe {
+            &*std::alloc::alloc_zeroed(Layout::new::<carrick_el1_abi::InotifyNameCache>()).cast()
+        };
+        let mut cpu = FakeCpu::default();
+        let action = crate::personality::dispatch::dispatch_syscall_with_ipc(
+            &mut g,
+            w.counters,
+            &tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            names,
+            Some(crate::personality::dispatch::Zone {
+                tables: &w.zone,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+            }),
+            Some(&venue),
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            (action, g.x[0]),
+            (carrick_el1_abi::Action::ServedWithWork, 8),
+            "the owned read completes and leaves with its result"
+        );
+        assert_eq!(u64::from_ne_bytes(value), 7);
+        assert!(!w.zone.record(current).has_object_operation());
+        assert_eq!(task.served_with_work.load(Ordering::Acquire), 1);
+    }
+
     /// N communicating pairs of processes, pipes both ways plus an eventfd,
     /// after setup: exact payloads, zero allocations, zero host calls, and
     /// exactly twice the copy work for twice the rounds.
