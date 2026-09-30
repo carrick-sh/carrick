@@ -733,7 +733,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     }
 
     fn acquire(&self, record: &'a TableRecord) -> Result<Locked<'a>, Error> {
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
         loop {
             if record
                 .lock
@@ -742,7 +742,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             {
                 return Ok(Locked { record });
             }
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             if !self.wait.wait(attempt) {
                 return Err(Error::Contended);
             }
@@ -1057,7 +1057,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// retains nothing. `Contended` only while a writer keeps changing the
     /// table's extent or identity past the wait policy.
     pub fn get(&self, table: TableId, fd: Fd) -> Result<Description, Error> {
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
         loop {
             let (record, seq, storage) = self.read_table(table)?;
             let entry = Self::slot(&storage, fd);
@@ -1065,7 +1065,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             if Self::slot(&storage, fd) == entry && record.unchanged_since(seq) {
                 return snapshot?.ok_or(Error::BadFd);
             }
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             if !self.wait.wait(attempt) {
                 return Err(Error::Contended);
             }
@@ -1080,7 +1080,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             return Err(Error::StaleTable);
         }
         let record = self.core.tables.get(id.index).ok_or(Error::StaleTable)?;
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
         loop {
             let seq = record.seq.load(Ordering::Acquire);
             if seq & 1 == 0 {
@@ -1094,7 +1094,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
                     return Ok((record, seq, self.storage(extent)?));
                 }
             }
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             if !self.wait.wait(attempt) {
                 return Err(Error::Contended);
             }
@@ -1434,7 +1434,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// waits for [`Authority::unpin`]. A pin that landed on a reused record
     /// is handed to the caller as [`Error::PinRaced`].
     pub fn pin(&self, table: TableId, fd: Fd) -> Result<(OfdPin, Description), Error> {
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
         loop {
             let (record, seq, storage) = self.read_table(table)?;
             let settled = |entry: Option<Entry>| {
@@ -1476,7 +1476,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
                     Err(error) => return Err(error),
                 }
             }
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             if !self.wait.wait(attempt) {
                 return Err(Error::Contended);
             }

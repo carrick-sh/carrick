@@ -66,12 +66,12 @@
 //! object's lock word names its holder ([`IpcLockHolder`]). Descriptor
 //! lookups and pins take no table lock (they validate the table's sequence
 //! count), so a description is pinned before any object work; then one
-//! object lock. Both venues wait for an object lock's holder: every object
-//! section is short and never waits on another vCPU's progress, and an EL1
-//! holder a host kick stops mid-section is resumed to completion on its
-//! vCPU, so a contended object never turns a transfer into a host round
-//! trip. Table mutations stay the host's, and a bounded `LockWait` still
-//! refuses with `Contended` before effects. No lock is held across I/O, a WFI, a context switch or a host wait,
+//! object lock. EL1 waits for an EL1 holder (its section never waits on
+//! another vCPU, and one a host kick stops mid-section is resumed to
+//! completion on its vCPU), so another vCPU's transfer never turns this one
+//! into a host round trip. A host holder may itself wait for this vCPU to
+//! stop, so EL1 waits for it only a bounded while and then refuses with
+//! `Contended` before effects; the host waits for any holder. No lock is held across I/O, a WFI, a context switch or a host wait,
 //! and nothing allocates under a lock: pool storage is provisioned by the
 //! host before it takes any lock. A write to an unbacked pipe refuses with
 //! `pipe::Error::Storage` before any effect; EL1 then forwards the call and
@@ -1234,7 +1234,7 @@ impl<'a> IpcRegion<'a> {
         wait: &W,
     ) -> Result<IpcObjectGuard<'a>, IpcError> {
         let record = self.record(object.index).ok_or(IpcError::Stale)?;
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
         while record
             .lock
             .compare_exchange_weak(
@@ -1245,7 +1245,7 @@ impl<'a> IpcRegion<'a> {
             )
             .is_err()
         {
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             if !wait.wait(attempt) {
                 return Err(IpcError::Contended);
             }
@@ -1296,7 +1296,7 @@ impl<'a> IpcRegion<'a> {
         record: &'a IpcObjectRecord,
         wait: &W,
     ) -> Result<IpcObjectGuard<'a>, IpcError> {
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
         while record
             .lock
             .compare_exchange_weak(
@@ -1307,7 +1307,7 @@ impl<'a> IpcRegion<'a> {
             )
             .is_err()
         {
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             if !wait.wait(attempt) {
                 push(&self.dir.free_objects, index as usize, &record.next_free);
                 return Err(IpcError::Contended);

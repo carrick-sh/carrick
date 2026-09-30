@@ -150,6 +150,23 @@ impl IpcTables for GuestTables {
 
 const EL1_WAIT: BoundedSpin = BoundedSpin(EL1_GUEST_LOCK_SPINS);
 
+/// An object lock's wait, by holder: unbounded while EL1 on another vCPU
+/// holds it, bounded ([`EL1_GUEST_LOCK_SPINS`]) while a host thread does.
+struct ObjectLockWait<'r, 'a> {
+    region: &'r IpcRegion<'a>,
+    object: IpcObjectHandle,
+}
+impl LockWait for ObjectLockWait<'_, '_> {
+    fn wait(&self, attempt: u32) -> bool {
+        core::hint::spin_loop();
+        attempt <= EL1_GUEST_LOCK_SPINS
+            || matches!(
+                self.region.lock_holder(self.object),
+                Some(IpcLockHolder::El1 { .. }) | None
+            )
+    }
+}
+
 /// Wait for a lock held only by another party's short section (an object
 /// or queue lock: never held across I/O, a switch or a host wait).
 struct Finish;
@@ -407,13 +424,13 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 }
             }
         };
-        // Wait for the object lock's holder (`Finish`), never forward: a
-        // holder's section is short and never waits on this vCPU. A host
-        // thread's takes no guest-progress lock; an EL1 holder that a host
-        // kick stopped mid-section is resumed to completion on its vCPU
-        // (`should_resume_mid_el1`). Giving up turned a transfer that could
-        // complete into a host round trip.
-        let mut guard = match region.lock(object, &Finish) {
+        // Wait for an EL1 holder: its section never waits on another vCPU,
+        // and one a host kick stopped mid-section is resumed to completion
+        // on its vCPU (`should_resume_mid_el1`); giving up turned a transfer
+        // that could complete into a host round trip. A host holder is
+        // waited for only a bounded while: it may itself wait for this vCPU
+        // to stop, which a kick landing in EL1 never does.
+        let mut guard = match region.lock(object, &ObjectLockWait { region, object }) {
             Ok(guard) => guard,
             Err(_) => {
                 let why = match region.lock_holder(object) {
@@ -1401,11 +1418,11 @@ mod tests {
         assert_eq!(backed, 1);
     }
 
-    /// An object lock is held only for short sections that never wait on
-    /// the waiter: a host thread's, or an EL1 holder's that the host resumes
-    /// to completion when a kick lands mid-section. So EL1 waits for the
-    /// holder instead of turning a transfer that can complete into a host
-    /// round trip (`object_busy_el1` in el1_ipc_pairs_blocking, n=8).
+    /// An EL1 holder's object section never waits on another vCPU, and the
+    /// host resumes it to completion when a kick lands mid-section. So EL1
+    /// waits for such a holder instead of turning a transfer that can
+    /// complete into a host round trip (`object_busy_el1` in
+    /// el1_ipc_pairs_blocking, n=8).
     #[test]
     fn el1_ipc_io_contended_object_lock_waits_for_its_holder_instead_of_forwarding() {
         let mut w = world();
@@ -1419,10 +1436,12 @@ mod tests {
         std::thread::scope(|s| {
             let calling = &calling;
             s.spawn(move || {
-                // A holder stopped far longer than any bounded spin: it
-                // releases only well after the call started waiting (the
-                // green result waits for it whatever the timing).
-                let guard = region.lock(object, &HostWait).unwrap();
+                // EL1 on another vCPU, stopped far longer than any bounded
+                // spin (a host kick mid-section): it releases only well after
+                // the call started waiting (the green result waits for it
+                // whatever the timing).
+                let other_vcpu = region.for_el1_slot(5);
+                let guard = other_vcpu.lock(object, &HostWait).unwrap();
                 held_tx.send(()).unwrap();
                 while !calling.load(Ordering::Acquire) {
                     core::hint::spin_loop();
@@ -1436,7 +1455,7 @@ mod tests {
             calling.store(true, Ordering::Release);
             assert_eq!(
                 region.lock_holder(object),
-                Some(carrick_el1_abi::ipc::IpcLockHolder::Host)
+                Some(carrick_el1_abi::ipc::IpcLockHolder::El1 { slot: 5 })
             );
             let mut f = syscall(SYS_WRITE, wfd, 0x10000, 4, A_SVC);
             assert_eq!(
@@ -1451,6 +1470,58 @@ mod tests {
                 .ipc_leaves
                 .iter()
                 .all(|n| n.load(Ordering::Relaxed) == 0)
+        );
+    }
+
+    /// A host thread may hold an object lock while it waits for this very
+    /// vCPU to stop (a host copy into guest memory that needs every vCPU of
+    /// the address space out), and a kick landing in EL1 is resumed there:
+    /// waiting for a host holder past the bound deadlocks (an EL1 panic on
+    /// the wait counter in `pipelargewrite`). EL1 leaves before any effect.
+    #[test]
+    fn el1_ipc_io_host_held_object_lock_forwards_instead_of_waiting_for_the_host() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (_r, wfd, object) = w.pipe(t, NONBLOCK);
+        w.mem.map(MM, 0x10000, PAGE);
+        w.mem.write(MM, 0x10000, b"ping");
+        let region = w.region;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let returned = std::sync::atomic::AtomicBool::new(false);
+        let gave_up = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let (returned, gave_up) = (&returned, &gave_up);
+            s.spawn(move || {
+                // Holds until EL1 leaves (as a host holder waiting for this
+                // vCPU would); a bounded fallback keeps a red test finite.
+                let guard = region.lock(object, &HostWait).unwrap();
+                held_tx.send(()).unwrap();
+                let mut spins = 0u64;
+                while !returned.load(Ordering::Acquire) {
+                    spins += 1;
+                    if spins > 400_000_000 {
+                        gave_up.store(true, Ordering::Release);
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                drop(guard);
+            });
+            held_rx.recv().unwrap();
+            let mut f = syscall(SYS_WRITE, wfd, 0x10000, 4, A_SVC);
+            let before = f;
+            let served = w.call(&mut f);
+            returned.store(true, Ordering::Release);
+            assert!(
+                !gave_up.load(Ordering::Acquire),
+                "EL1 waited for a host holder that waits for it"
+            );
+            assert_eq!(served, IpcServed::Forward);
+            assert_eq!((f.x, f.elr), (before.x, before.elr), "no effect");
+        });
+        assert_eq!(
+            w.counters.ipc_leaves[IpcLeave::ObjectBusyHost as usize].load(Ordering::Relaxed),
+            1
         );
     }
 
