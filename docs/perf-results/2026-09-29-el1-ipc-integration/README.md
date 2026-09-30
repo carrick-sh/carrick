@@ -431,3 +431,14 @@ tail, source-buffer mutation, fd reuse and absence from the host reactor.
 Final focused kernel tests: 32 passed; affected kernel/runtime Clippy and
 format checks passed. Red/green logs are retained. Signed mixed-venue
 qualification is next; multi-process liveness and counter bounds remain open.
+
+Signed mixed-venue qualification passes on 6970e3e, run
+el1-ipc-vector-20260929-a: both pipe and eventfd complete 128 checked
+roundtrips. Pipe records 127 guest parks; eventfd records 128. Each performs
+at least 128 host readv and writev calls alongside EL1 scalar transfers.
+The unentitled negative control passes and scoped cleanup reports zero
+leftovers. Exact manifest, log and independently hashed preserved binaries
+are recorded in vector-signed-artifacts.jsonl, vector-signed.log and
+vector-preserved.json. This closes the reproduced vector coherence defect;
+it does not close the independent multi-process liveness/counter blockers,
+zero-IPC-exit proof, signals/partial progress, or full checkpoint acceptance.
