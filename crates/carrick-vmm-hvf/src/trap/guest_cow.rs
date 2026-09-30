@@ -196,6 +196,43 @@ pub(crate) fn refill_guest_cow_pool(
     Ok(provisioned > 0)
 }
 
+impl CarrierVmCustody {
+    /// Record `state` as the backend state of MM `mm`, where every binding
+    /// of the MM's COW runtime lands (the state its executors use).
+    pub(crate) fn register_guest_cow_state(&self, mm: u64, state: &std::sync::Arc<MmAccessState>) {
+        let mut states = self.guest_cow_states.lock();
+        states.retain(|_, weak| weak.strong_count() > 0);
+        states.insert(mm, std::sync::Arc::downgrade(state));
+    }
+
+    /// The live backend state bound for MM `mm`: `Err` when none was ever
+    /// bound, `Ok(None)` when it has been dropped (the MM retired).
+    pub(crate) fn guest_cow_state(
+        &self,
+        mm: u64,
+    ) -> Result<Option<std::sync::Arc<MmAccessState>>, ()> {
+        self.guest_cow_states
+            .lock()
+            .get(&mm)
+            .map(std::sync::Weak::upgrade)
+            .ok_or(())
+    }
+}
+
+/// Fail closed where the host is about to build from, or edit, `mm`'s frames
+/// and translations: every EL1 COW completion of the MM must already be
+/// settled (the exclusion the caller holds runs the settlement). Building a
+/// fork child or a host COW from unsettled state inherits or retires a frame
+/// by the host's stale view while a live leaf still names another one.
+pub(crate) fn require_guest_cow_settled(mm: u64, site: &'static str) {
+    if carrick_el1_abi::cow_grant_pool_host().is_some_and(|pool| pool.has_completions_for(mm)) {
+        carrick_fatal!(
+            "hvpatch::guest_cow",
+            "{site} for MM {mm} with unsettled EL1 COW completions"
+        );
+    }
+}
+
 /// One replacement compound, stage-2 mapped and registered as a live global
 /// frame owner: its host pointer, IPA and owner generation.
 fn allocate_grant_compound(
@@ -528,18 +565,18 @@ fn settle_one(
 }
 
 /// The carrier's settlement, run by every host exclusion of an MM's EL1
-/// editor: the MM's backend state is found by its exact key in the
-/// carrier's MM directory.
+/// editor: the MM's backend state is the one its COW runtime was last bound
+/// to, by exact MM id, in the carrier's custody.
 pub struct CarrierGuestCowSettlement {
-    transport: std::sync::Weak<CarrierForeignMmTransport>,
+    custody: std::sync::Weak<CarrierVmCustody>,
     #[cfg(test)]
     pool: Option<&'static CowGrantPool>,
 }
 
 impl CarrierGuestCowSettlement {
-    pub(crate) fn new(transport: &std::sync::Arc<CarrierForeignMmTransport>) -> Self {
+    pub(crate) fn new(custody: &std::sync::Arc<CarrierVmCustody>) -> Self {
         Self {
-            transport: std::sync::Arc::downgrade(transport),
+            custody: std::sync::Arc::downgrade(custody),
             #[cfg(test)]
             pool: None,
         }
@@ -558,28 +595,6 @@ impl CarrierGuestCowSettlement {
         }
         carrick_el1_abi::cow_grant_pool_host()
     }
-
-    fn state_for(
-        &self,
-        mm: u64,
-    ) -> Option<(
-        std::sync::Arc<MmAccessState>,
-        std::sync::Arc<CarrierVmCustody>,
-    )> {
-        let transport = self.transport.upgrade()?;
-        let state = transport
-            .states
-            .read()
-            .values()
-            .filter_map(std::sync::Weak::upgrade)
-            .find(|state| {
-                state
-                    .identity
-                    .read()
-                    .is_some_and(|(id, _)| id.raw_for_probe() == mm)
-            })?;
-        Some((state, std::sync::Arc::clone(&transport.custody)))
-    }
 }
 
 impl CowGrantSettlement for CarrierGuestCowSettlement {
@@ -587,16 +602,26 @@ impl CowGrantSettlement for CarrierGuestCowSettlement {
         let Some(pool) = self.pool() else {
             return;
         };
-        if !pool.any_completed() {
+        if !pool.any_completed() || pool.completions(excluded).next().is_none() {
             return;
         }
-        // No backend state: the MM is retiring. Its inventory retires the
-        // grants EL1 used with every other mapping, and its publication's
-        // retirement releases the records.
-        let Some((state, custody)) = self.state_for(excluded.key()) else {
+        let Some(custody) = self.custody.upgrade() else {
             return;
         };
-        settle_guest_cow_completions(&state, &custody, pool, excluded);
+        match custody.guest_cow_state(excluded.key()) {
+            Ok(Some(state)) => {
+                settle_guest_cow_completions(&state, &custody, pool, excluded);
+            }
+            // The MM retired: its inventory retires the grants EL1 used
+            // with every other mapping, and its publication's retirement
+            // releases the records.
+            Ok(None) => {}
+            Err(()) => carrick_fatal!(
+                "hvpatch::guest_cow",
+                "EL1 COW completions for MM {} whose COW runtime was never bound",
+                excluded.key()
+            ),
+        }
     }
 
     fn release(&self, excluded: &ExcludedEditor<'_>) {

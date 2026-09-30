@@ -1711,6 +1711,8 @@ impl HvfTaskState {
             container_root: self.container_root,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
         });
+        self.custody_arc()
+            .register_guest_cow_state(identity.mm, &self.mm_access);
         self.publish_pending_fork_frame_receipts();
         if let Some(ref mut reg) = self.registration {
             reg.cow_authority = Some(authority);
@@ -2429,7 +2431,7 @@ pub(crate) struct PersistentExecutorSpec {
 impl PersistentExecutorSpec {
     /// The carrier's guest COW settlement over its MM directory.
     pub(crate) fn guest_cow_settlement(&self) -> CarrierGuestCowSettlement {
-        CarrierGuestCowSettlement::new(&self.carrier_foreign_mm_transport)
+        CarrierGuestCowSettlement::new(&self.carrier_foreign_mm_transport.custody)
     }
 
     pub(crate) fn reservation_metadata_access(
@@ -5489,6 +5491,7 @@ impl HvpatchTaskRegistration {
             container_root: task_mm.container_root,
             persistent_vm_lifecycle: true,
         });
+        custody.register_guest_cow_state(cow_identity.mm, &mm_access);
         Ok(HvfTaskState {
             #[cfg(not(test))]
             custody: std::sync::Arc::clone(&self.custody),

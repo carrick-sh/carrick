@@ -411,6 +411,28 @@ impl CowGrantPool {
             })
     }
 
+    /// Host (read-only): whether `mm_key` has a completion awaiting
+    /// settlement. A host path that builds from the MM's frames asserts this
+    /// is false after the exclusion that settles it.
+    #[must_use]
+    pub fn has_completions_for(&self, mm_key: u64) -> bool {
+        self.any_completed()
+            && self.used.iter().enumerate().any(|(word_index, bits)| {
+                let mut bits = bits.load(Ordering::Acquire);
+                while bits != 0 {
+                    let slot = word_index * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let record = &self.records[slot];
+                    if record.state.load(Ordering::Acquire) & STATE_MASK == USED
+                        && record.mm_key.load(Ordering::Relaxed) == mm_key
+                    {
+                        return true;
+                    }
+                }
+                false
+            })
+    }
+
     /// Host: whether any MM has a completion awaiting settlement.
     #[must_use]
     pub fn any_completed(&self) -> bool {
@@ -723,6 +745,20 @@ mod tests {
         assert_eq!(pool.ready(7).count(), 0);
         assert!(!pool.any_completed());
         assert_eq!(pool.ready(8).count(), 1, "another MM keeps its grants");
+    }
+
+    #[test]
+    fn pending_completions_are_visible_per_mm_until_settled() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let pool = CowGrantPool::new();
+        pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+        let claimed = pool.claim(7).unwrap();
+        assert!(!pool.has_completions_for(7), "a claim is not a completion");
+        assert!(pool.complete(&completion(claimed)));
+        assert!(pool.has_completions_for(7));
+        assert!(!pool.has_completions_for(8));
+        assert!(pool.finish(&excluded(&spaces, 7), &claimed));
+        assert!(!pool.has_completions_for(7));
     }
 
     #[test]

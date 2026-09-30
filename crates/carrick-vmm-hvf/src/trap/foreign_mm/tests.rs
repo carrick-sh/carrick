@@ -12186,7 +12186,9 @@ mod guest_cow {
         let spaces = AddressSpaces::new();
         let transport = Arc::new(CarrierForeignMmTransport::new());
         transport.register(&child.snapshot, &child.state);
-        let settlement = CarrierGuestCowSettlement::new(&transport).with_pool(pool);
+        // As every COW runtime binding does, the carrier records the MM's state.
+        custody.register_guest_cow_state(mm, &child.state);
+        let settlement = CarrierGuestCowSettlement::new(&custody).with_pool(pool);
         settlement.settle(&spaces.unpublished(mm + 1).unwrap());
         assert_eq!(
             pool.completions(&spaces.unpublished(mm).unwrap()).count(),
@@ -12243,6 +12245,41 @@ mod guest_cow {
             .expect("read the settled MM");
         assert_eq!(&bytes, b"old!");
         let _ = settle_guest_cow_completions;
+    }
+
+    /// The executors' state for an MM is bound through the COW runtime
+    /// (`runtime_task_state`), which never enters the foreign-MM directory:
+    /// settlement must find it by MM id in the carrier, not by scanning
+    /// foreign bindings (which named no state, or another state, for it).
+    #[test]
+    fn settlement_finds_the_state_the_mms_cow_runtime_was_bound_to() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (mut child, pool) = forked_guest_child(746, 0x9a01_3300_0000, 0x9b01_3300_0000);
+        let mm = child.snapshot.mm.get();
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        let grant = pool.ready(mm).next().unwrap();
+        child
+            .owners
+            .0
+            .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+        assert!(matches!(
+            el1_write_fault(&child, pool, TEST_VA),
+            GuestCowOutcome::Resolved(_)
+        ));
+        custody.register_guest_cow_state(mm, &child.state);
+        let spaces = AddressSpaces::new();
+        CarrierGuestCowSettlement::new(&custody)
+            .with_pool(pool)
+            .settle(&spaces.unpublished(mm).unwrap());
+        assert_eq!(
+            pool.completions(&spaces.unpublished(mm).unwrap()).count(),
+            0,
+            "the completion is settled into the MM's bound state"
+        );
+        assert!(child.state.cow_armed.lock().span_for(TEST_VA).is_none());
     }
 
     fn old_key_root(child: &InstalledMm) -> (u64, u64) {
