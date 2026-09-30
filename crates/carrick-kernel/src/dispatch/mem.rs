@@ -502,6 +502,47 @@ pub struct MemState {
 pub(crate) use carrick_mem::memory::MemoryLayout;
 
 impl MemState {
+    /// Apply `mprotect(start..end, prot)` to every Linux-visible row the host
+    /// lane keeps, then re-merge `dynamic_maps` rows that the split left as
+    /// identical neighbours (Linux merges adjacent VMAs once their flags
+    /// match again, so a protect-and-restore must leave one row).
+    pub(in crate::dispatch) fn set_mapping_prot(
+        &mut self,
+        start: u64,
+        end: u64,
+        prot: LinuxProtFlags,
+    ) {
+        let mem = self;
+        let len = end - start;
+        update_proc_map_prot(&mut mem.dynamic_maps, start, len, prot);
+        mem.semantic_vmas.update_prot(
+            start,
+            end,
+            prot.contains(LinuxProtFlags::READ),
+            prot.contains(LinuxProtFlags::WRITE),
+            prot.contains(LinuxProtFlags::EXEC),
+        );
+        coalesce_dynamic_maps_around(mem, start, end);
+
+        let layout = mem.layout;
+        if let Some(regions) = mem.address_space_regions.as_mut() {
+            let mut visible = Vec::new();
+            let mut reservations = Vec::new();
+            for region in regions.drain(..) {
+                if boot_region_is_hidden_reservation(&region, layout) {
+                    reservations.push(region);
+                } else {
+                    visible.push(region);
+                }
+            }
+            update_proc_map_prot(&mut visible, start, len, prot);
+            visible.extend(reservations);
+            visible.sort_by_key(|region| region.start);
+            *regions = visible;
+        }
+        mem.mirror_host_rows(start, end);
+    }
+
     pub(super) fn new() -> Self {
         Self::new_with_layout(MemoryLayout::hvf_default())
     }
@@ -1450,32 +1491,7 @@ impl<'a> MemView<'a> {
         if mem.venue_owns(start, end) {
             return;
         }
-        update_proc_map_prot(&mut mem.dynamic_maps, start, len, prot);
-        mem.semantic_vmas.update_prot(
-            start,
-            end,
-            prot.contains(LinuxProtFlags::READ),
-            prot.contains(LinuxProtFlags::WRITE),
-            prot.contains(LinuxProtFlags::EXEC),
-        );
-
-        let layout = mem.layout;
-        if let Some(regions) = mem.address_space_regions.as_mut() {
-            let mut visible = Vec::new();
-            let mut reservations = Vec::new();
-            for region in regions.drain(..) {
-                if boot_region_is_hidden_reservation(&region, layout) {
-                    reservations.push(region);
-                } else {
-                    visible.push(region);
-                }
-            }
-            update_proc_map_prot(&mut visible, start, len, prot);
-            visible.extend(reservations);
-            visible.sort_by_key(|region| region.start);
-            *regions = visible;
-        }
-        mem.mirror_host_rows(start, end);
+        mem.set_mapping_prot(start, end, prot);
     }
 
     /// Reset memory-accounting state that Linux destroys across `execve(2)`.
