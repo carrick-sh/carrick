@@ -1,0 +1,6 @@
+65 bad result=-1 errno=14 drain=-1 value=0
+65 goodbad result=8 errno=0 drain=-1 value=0
+65 shortbad result=-1 errno=14 drain=-1 value=0
+66 bad result=-1 errno=14 drain=-1 value=0
+66 goodbad result=8 errno=0 drain=8 value=1
+66 shortbad result=-1 errno=22 drain=-1 value=0

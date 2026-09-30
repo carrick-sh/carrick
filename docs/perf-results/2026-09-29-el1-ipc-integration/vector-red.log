@@ -1,0 +1,31 @@
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 47.50s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 1 test
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_eventfd_vector_semantics ... FAILED
+
+failures:
+
+---- dispatch::overlay_dispatch_tests::serial_host_el1_ipc_eventfd_vector_semantics stdout ----
+
+thread 'dispatch::overlay_dispatch_tests::serial_host_el1_ipc_eventfd_vector_semantics' (34519987) panicked at crates/carrick-kernel/src/dispatch/tests.rs:89:13:
+assertion `left == right` failed: nr=65 sizes=[4, 4]
+  left: Errno { errno: LinuxErrno(22) }
+ right: Returned { value: 8 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::overlay_dispatch_tests::serial_host_el1_ipc_eventfd_vector_semantics
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2337 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

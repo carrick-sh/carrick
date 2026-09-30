@@ -1446,6 +1446,29 @@ impl<'a> FsView<'a> {
             let Some(mut open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            if let OpenDescription::EventFd { state, .. } = &*open {
+                let state = Arc::clone(state);
+                drop(open);
+                let total = iovecs.iter().try_fold(0u64, |n, i| n.checked_add(i.iov_len).ok_or(LINUX_EINVAL))?;
+                if total == 0 { return Ok(DispatchOutcome::Returned { value: 0 }); }
+                if total < 8 { return Ok(DispatchOutcome::errno(LINUX_EINVAL)); }
+                let Some(authority) = this.captured_slot_authority(fd.0) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                let mut copied = false;
+                let result = state.read_with(|value| {
+                    copied = matches!(read_from_contents_at(memory, &value.to_ne_bytes(), 0, &iovecs), Ok(8));
+                    // Linux eventfd read_iter consumes the counter even when
+                    // the user copy faults (native vector-fault oracle).
+                    true
+                });
+                return Ok(match result {
+                    Ok(_) if copied => DispatchOutcome::Returned { value: 8 },
+                    Ok(_) => DispatchOutcome::errno(LINUX_EFAULT),
+                    Err(LINUX_EAGAIN) => would_block_outcome(-1, libc::POLLIN, nonblocking, None, WaitFdAuthority::logical(authority)),
+                    Err(errno) => DispatchOutcome::errno(errno),
+                });
+            }
             // readv() on a regular file opened write-only (O_WRONLY) → EBADF.
             if matches!(
                 &*open,
@@ -3360,6 +3383,52 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             let nonblocking = this.io_is_nonblocking(fd, 0);
+
+            // eventfd's legacy vector write is one scalar counter operation
+            // per iovec, including invalid zero/short segments. It is not a
+            // concatenated byte stream. Reuse the scalar object and owned wait.
+            if let Some(file) = this.open_file(fd) {
+                let state = file.description.read_for_io().and_then(|open| match &*open {
+                    OpenDescription::EventFd { state, .. } => Some(Arc::clone(state)),
+                    _ => None,
+                });
+                if let Some(state) = state {
+                    let Some(lease) = file.description.retain_fd_lease() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    let length = iovecs.iter().try_fold(0u64, |n, i| n.checked_add(i.iov_len).ok_or(LINUX_EINVAL))?;
+                    if length == 0 { return Ok(DispatchOutcome::Returned { value: 0 }); }
+                    let mut total = 0usize;
+                    for (index, iovec) in iovecs.iter().enumerate() {
+                        if iovec.iov_len != 8 {
+                            return Ok(if total == 0 { DispatchOutcome::errno(LINUX_EINVAL) } else { DispatchOutcome::returned_len_or_errno(total) });
+                        }
+                        let bytes = match cx.memory.read_bytes(iovec.iov_base, 8) {
+                            Ok(bytes) => bytes,
+                            Err(_) => return Ok(if total == 0 { DispatchOutcome::errno(LINUX_EFAULT) } else { DispatchOutcome::returned_len_or_errno(total) }),
+                        };
+                        let outcome = write_eventfd(this, &bytes, &state);
+                        match outcome {
+                            DispatchOutcome::Returned { value: 8 } => total += 8,
+                            DispatchOutcome::Errno { errno: LINUX_EAGAIN } if !nonblocking => {
+                                let value = LinuxEventfdValue::read_from_bytes(&bytes).map_err(|_| LINUX_EINVAL)?.value;
+                                // Capture only complete scalar values through
+                                // the first error boundary. The parked operation
+                                // owns the same description and committed prefix.
+                                let mut tail = Vec::new();
+                                for next in &iovecs[index + 1..] {
+                                    if next.iov_len != 8 { break; }
+                                    let Ok(bytes) = cx.memory.read_bytes(next.iov_base, 8) else { break; };
+                                    tail.extend_from_slice(&bytes);
+                                }
+                                return Ok(DispatchOutcome::BlockingWrite(BlockingWrite::eventfd(Arc::clone(&state), lease, value, tid).with_writev_tail(tail, total)));
+                            }
+                            other => return Ok(if total == 0 { other } else { DispatchOutcome::returned_len_or_errno(total) }),
+                        }
+                    }
+                    return Ok(DispatchOutcome::returned_len_or_errno(total));
+                }
+            }
 
             struct HostWritevTarget {
                 host_fd: i32,

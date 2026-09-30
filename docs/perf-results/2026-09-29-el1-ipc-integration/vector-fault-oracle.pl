@@ -1,0 +1,2 @@
+use strict; use warnings;
+for my $nr (65,66) {for my $shape ('bad','goodbad','shortbad') {my $f=syscall(19,$nr==65?42:0,2048);my $b=pack('Q',1);my $v=pack('Q Q',1,8);$v=pack('P Q',$b,$shape eq 'shortbad'?4:8).$v if $shape ne 'bad';$!=0;my $r=syscall($nr,$f,$v,$shape eq 'bad'?1:2);my $e=0+$!;my $out="\0"x8;my $dr=syscall(63,$f,$out,8);print "$nr $shape result=$r errno=$e drain=$dr value=".unpack('Q',$out)."\n";syscall(57,$f);}}

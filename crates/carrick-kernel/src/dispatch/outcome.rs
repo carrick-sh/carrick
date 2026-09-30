@@ -68,7 +68,6 @@ pub enum BlockingWriteTarget {
 pub struct EventFdWriteLease {
     state: Arc<super::fd_table::EventFdState>,
     _description: crate::kernel::objects::FileDescriptionFdLease,
-    value: u64,
 }
 
 impl PartialEq for BlockingWriteTarget {
@@ -149,9 +148,8 @@ impl BlockingWrite {
             target: BlockingWriteTarget::EventFd(Arc::new(EventFdWriteLease {
                 state,
                 _description: description,
-                value,
             })),
-            bytes: Vec::new(),
+            bytes: value.to_ne_bytes().to_vec(),
             offset: 0,
             committed_prefix: 0,
             tid,
@@ -292,17 +290,30 @@ pub fn drive_blocking_write(
             drive_in_memory_pipe_write(write, &endpoint, host_signal)
         }
         BlockingWriteTarget::EventFd(endpoint) => {
-            if write.offset == 8 {
-                return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(8));
-            }
-            match endpoint.state.write_value(endpoint.value) {
-                Ok(()) => {
-                    write.offset = 8;
-                    BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(8))
+            while write.offset < write.bytes.len() {
+                let Some(bytes) = write.bytes.get(write.offset..write.offset + 8) else {
+                    return BlockingWriteStep::Done(DispatchOutcome::errno(
+                        carrick_abi::LINUX_EINVAL,
+                    ));
+                };
+                let Ok(bytes) = <[u8; 8]>::try_from(bytes) else {
+                    return BlockingWriteStep::Done(DispatchOutcome::errno(
+                        carrick_abi::LINUX_EINVAL,
+                    ));
+                };
+                match endpoint.state.write_value(u64::from_ne_bytes(bytes)) {
+                    Ok(()) => write.offset += 8,
+                    Err(LINUX_EAGAIN) => return BlockingWriteStep::Wait,
+                    Err(errno) => {
+                        return BlockingWriteStep::Done(if write.offset() == 0 {
+                            DispatchOutcome::errno(errno)
+                        } else {
+                            DispatchOutcome::returned_len_or_errno(write.offset())
+                        });
+                    }
                 }
-                Err(LINUX_EAGAIN) => BlockingWriteStep::Wait,
-                Err(errno) => BlockingWriteStep::Done(DispatchOutcome::errno(errno)),
             }
+            BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()))
         }
     }
 }

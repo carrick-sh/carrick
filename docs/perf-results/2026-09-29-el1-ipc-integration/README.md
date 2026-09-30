@@ -412,3 +412,22 @@ Next: red-first VM-free eventfd vector coverage, oracle multi-iovec/fault
 semantics, then connect vector calls to existing shared object semantics.
 No new semantic implementation, host FD or weakened bounds. Existing
 multi-pair liveness remains open and separate.
+
+## Eventfd vector coherence correction
+
+The mixed signed witness reproduced EINVAL on a valid eventfd writev. Native
+ARM64 Linux also distinguishes readv (one eight-byte scatter read) from
+writev (one scalar write per segment). The split read regression failed
+with EINVAL before the adapter fix. Both operations now use the existing
+shared EventFdState. Vector writes retain their committed prefix, remaining
+values and functional description in the existing BlockingWrite continuation.
+No host fd or second counter implementation is introduced.
+
+Native oracle source/output: vector-oracle.pl/log and vector-fault-oracle.pl/log;
+image identity is the previously retained eventfd-vector-oracle-image.txt.
+Counter consumption on read copy faults, partial write progress, empty vectors
+and invalid segments are covered. The blocked vector witness checks prefix,
+tail, source-buffer mutation, fd reuse and absence from the host reactor.
+Final focused kernel tests: 32 passed; affected kernel/runtime Clippy and
+format checks passed. Red/green logs are retained. Signed mixed-venue
+qualification is next; multi-process liveness and counter bounds remain open.
