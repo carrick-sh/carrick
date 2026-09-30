@@ -367,7 +367,12 @@ pub struct IpcHeader {
 pub struct IpcDirectory {
     header: IpcHeader,
     free_objects: AtomicU64,
-    _reserved: [u64; 7],
+    /// Owed host wakes a host boundary found with no live delivery target
+    /// for their object's incarnation, and so left owed and indexed rather
+    /// than consumed. Must stay zero: nonzero names a host subscriber whose
+    /// wake target was never registered or was dropped while it waited.
+    owed_host_wakes_without_target: AtomicU64,
+    _reserved: [u64; 6],
     fd: IpcFdCore,
     objects: [IpcObjectRecord; IPC_OBJECTS],
     free_operations: AtomicU64,
@@ -390,6 +395,7 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::size_of::<usize>() as u64,
     core::mem::size_of::<IpcDirectory>() as u64,
     core::mem::align_of::<IpcDirectory>() as u64,
+    core::mem::offset_of!(IpcDirectory, owed_host_wakes_without_target) as u64,
     core::mem::offset_of!(IpcDirectory, fd) as u64,
     core::mem::offset_of!(IpcDirectory, objects) as u64,
     core::mem::size_of::<IpcFdCore>() as u64,
@@ -799,7 +805,8 @@ impl<'a> IpcRegion<'a> {
     pub fn write_host_wake_census(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
         write!(
             out,
-            "ipc host-wake index: summary={:#x}",
+            "ipc host-wake index: owed_without_target={} summary={:#x}",
+            self.owed_host_wakes_without_target(),
             self.dir.host_wake_summary.load(Ordering::Acquire)
         )?;
         for (word, bits) in self.dir.host_wake_words.iter().enumerate() {
@@ -1141,6 +1148,14 @@ impl<'a> IpcRegion<'a> {
         visited
     }
 
+    /// Owed host wakes a boundary found with no live delivery target (see
+    /// [`IpcObjectGuard::retain_undeliverable_host_wake`]). Must stay zero.
+    pub fn owed_host_wakes_without_target(&self) -> u64 {
+        self.dir
+            .owed_host_wakes_without_target
+            .load(Ordering::Relaxed)
+    }
+
     /// Host: take (and clear) the owed-wake flag of `object`.
     pub fn take_host_wake(&self, object: IpcObjectHandle) -> bool {
         self.record(object.index).is_some_and(|r| {
@@ -1440,13 +1455,7 @@ impl<'a> IpcObjectGuard<'a> {
         let host_owed = changed && r.host_subscribers.load(Ordering::Relaxed) != 0;
         if host_owed {
             r.host_wake_owed.store(1, Ordering::Release);
-            let index = self.handle.index as usize;
-            self.region.dir.host_wake_words[index / 64]
-                .fetch_or(1u64 << (index % 64), Ordering::Release);
-            self.region
-                .dir
-                .host_wake_summary
-                .fetch_or(1u64 << (index / 64), Ordering::Release);
+            self.index_host_wake();
         }
         IpcWake {
             object: self.handle,
@@ -1456,6 +1465,40 @@ impl<'a> IpcObjectGuard<'a> {
             host_owed,
         }
     }
+    /// Set this object's bits in the owed-wake index: object bit before
+    /// summary bit, so a boundary that sees the summary finds the object.
+    fn index_host_wake(&self) {
+        let index = self.handle.index as usize;
+        self.region.dir.host_wake_words[index / 64]
+            .fetch_or(1u64 << (index % 64), Ordering::Release);
+        self.region
+            .dir
+            .host_wake_summary
+            .fetch_or(1u64 << (index / 64), Ordering::Release);
+    }
+
+    /// Host, under this lock: consume the owed host wake, for delivery to a
+    /// target the caller already holds alive.
+    pub fn take_host_wake(&mut self) -> bool {
+        self.record.host_wake_owed.swap(0, Ordering::AcqRel) != 0
+    }
+
+    /// Host, under this lock, with no live delivery target for this
+    /// incarnation: never consume the owed wake. Keep it owed and put it
+    /// back in the index (a boundary drained it) for the boundary after a
+    /// target exists, and count the refusal. False: nothing was owed.
+    pub fn retain_undeliverable_host_wake(&mut self) -> bool {
+        if self.record.host_wake_owed.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.index_host_wake();
+        self.region
+            .dir
+            .owed_host_wakes_without_target
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     fn publish_kind(self, kind: u32) -> IpcObjectHandle {
         self.record.host_subscribers.store(0, Ordering::Relaxed);
         self.record.host_wake_owed.store(0, Ordering::Relaxed);
