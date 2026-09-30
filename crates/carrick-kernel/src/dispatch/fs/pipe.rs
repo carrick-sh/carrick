@@ -381,6 +381,17 @@ impl PipeInner {
     pub(crate) fn pipe_id(&self) -> u64 {
         self.pipe_id
     }
+    /// The reader-wake sequence of this pipe incarnation: advanced under the
+    /// object lock by every write and writer release, from either venue. An
+    /// ET interest compares it across samples because a byte count cannot
+    /// see a drain served in EL1 followed by a refill. `None` once retired.
+    pub(crate) fn read_arrival_generation(&self) -> Option<u64> {
+        self.owner
+            .region()
+            .observe(self.object)
+            .ok()
+            .map(|seqs| seqs.read)
+    }
     pub(crate) fn buffered_bytes(&self) -> usize {
         // Epoll can retain an observation after the last functional endpoint
         // closes. Authenticate the incarnation without retaining it or reading

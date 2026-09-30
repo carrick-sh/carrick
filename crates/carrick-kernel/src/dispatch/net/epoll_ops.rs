@@ -536,6 +536,39 @@ impl<'a> NetView<'a> {
         }
     }
 
+    /// Reader-wake sequence of a shared IPC object (pipe read end, eventfd)
+    /// behind this interest. EL1 serves those reads and writes in-guest, so
+    /// the host never dispatches the drain that `epoll_rearm_after_io` would
+    /// use to re-arm the ET latch; the object's own sequence, advanced by
+    /// every write in either venue, is the arrival edge instead.
+    fn description_ipc_read_arrival(desc: &crate::kernel::FileDescription) -> Option<u64> {
+        let open = desc.inspect()?;
+        match &*open {
+            OpenDescription::PipeReader { pipe, .. } => pipe.read_arrival_generation(),
+            OpenDescription::EventFd { state, .. } => state.read_arrival_generation(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn ipc_read_arrival_for_interest(
+        &self,
+        slot: &EpollInterest,
+        fd: i32,
+    ) -> Option<u64> {
+        if let Some(target) = &slot.target {
+            if target.fd_ref_count() == 0 {
+                return None;
+            }
+            Self::description_ipc_read_arrival(target)
+        } else {
+            Self::description_ipc_read_arrival(&self.open_file(fd)?.description)
+        }
+    }
+
+    pub(super) fn ipc_read_arrival_for_poll(&self, fd: i32) -> Option<u64> {
+        Self::description_ipc_read_arrival(&self.open_file(fd)?.description)
+    }
+
     pub(super) fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
         if let Some(open_file) = self.open_file(fd) {
             let host_fd = Self::description_host_fd_for_poll(&open_file.description);
@@ -1338,6 +1371,12 @@ impl<'a> NetView<'a> {
                                     None => this
                                         .listening_socket_readiness_sample_for_poll(gfd, requested),
                                 };
+                                // Sampled before readiness: a write landing in
+                                // between re-delivers once, never hides an edge.
+                                let ipc_arrival_generation = match slot {
+                                    Some(s) => this.ipc_read_arrival_for_interest(s, gfd),
+                                    None => this.ipc_read_arrival_for_poll(gfd),
+                                };
                                 let mut raw = listener_sample.as_ref().map_or_else(
                                     || match slot {
                                         Some(s) => {
@@ -1366,13 +1405,15 @@ impl<'a> NetView<'a> {
                                 } else {
                                     edge_readiness_count
                                 };
-                                let inzone_arrival_generation =
-                                    listener_sample.as_ref().and_then(|sample| {
+                                let inzone_arrival_generation = listener_sample
+                                    .as_ref()
+                                    .and_then(|sample| {
                                         sample.inzone.and_then(|snapshot| {
                                             (snapshot.pending > 0)
                                                 .then_some(snapshot.arrival_generation)
                                         })
-                                    });
+                                    })
+                                    .or(ipc_arrival_generation);
                                 let host_listener_count =
                                     listener_sample.as_ref().and_then(|sample| {
                                         (sample.inzone.is_some()
@@ -1510,6 +1551,8 @@ impl<'a> NetView<'a> {
                 let requested = interest.event.events;
                 let listener_sample =
                     this.listening_socket_readiness_sample_for_interest(interest, *fd, requested);
+                // Sampled before readiness (see the drained-edge path).
+                let ipc_arrival_generation = this.ipc_read_arrival_for_interest(interest, *fd);
                 let raw_ready = listener_sample.as_ref().map_or_else(
                     || this.epoll_ready_events_for_interest(interest, *fd, requested),
                     |sample| sample.ready.bits(),
@@ -1519,11 +1562,14 @@ impl<'a> NetView<'a> {
                 } else {
                     0
                 };
-                let inzone_arrival_generation = listener_sample.as_ref().and_then(|sample| {
-                    sample.inzone.and_then(|snapshot| {
-                        (snapshot.pending > 0).then_some(snapshot.arrival_generation)
+                let inzone_arrival_generation = listener_sample
+                    .as_ref()
+                    .and_then(|sample| {
+                        sample.inzone.and_then(|snapshot| {
+                            (snapshot.pending > 0).then_some(snapshot.arrival_generation)
+                        })
                     })
-                });
+                    .or(ipc_arrival_generation);
                 let host_listener_count = listener_sample.as_ref().and_then(|sample| {
                     sample
                         .host_ready
@@ -1660,6 +1706,8 @@ impl<'a> NetView<'a> {
                 let requested = interest.event.events;
                 let listener_sample =
                     this.listening_socket_readiness_sample_for_interest(interest, *fd, requested);
+                // Sampled before readiness (see the drained-edge path).
+                let ipc_arrival_generation = this.ipc_read_arrival_for_interest(interest, *fd);
                 let raw_ready = listener_sample.as_ref().map_or_else(
                     || this.epoll_ready_events_for_interest(interest, *fd, requested),
                     |sample| sample.ready.bits(),
@@ -1669,11 +1717,14 @@ impl<'a> NetView<'a> {
                 } else {
                     0
                 };
-                let inzone_arrival_generation = listener_sample.as_ref().and_then(|sample| {
-                    sample.inzone.and_then(|snapshot| {
-                        (snapshot.pending > 0).then_some(snapshot.arrival_generation)
+                let inzone_arrival_generation = listener_sample
+                    .as_ref()
+                    .and_then(|sample| {
+                        sample.inzone.and_then(|snapshot| {
+                            (snapshot.pending > 0).then_some(snapshot.arrival_generation)
+                        })
                     })
-                });
+                    .or(ipc_arrival_generation);
                 let read_growth = if requested & LINUX_EPOLLET != 0
                     && raw_ready & READ_READY_BITS != 0
                     && if inzone_arrival_generation.is_some() {
