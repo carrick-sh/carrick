@@ -382,7 +382,7 @@ pub struct HostIpc {
     /// [`ipc_descriptor_area`]), each allocated only for its own kind: a
     /// descriptor extent retired while a lock-free EL1 or host lookup still
     /// reads it is only ever reused as another extent (atomic words), never
-    /// as ring bytes, and the mapping lives as long as this owner (every
+    /// as ring bytes, and the pool memory lives as long as this owner (every
     /// view borrows it; the carrier retains the owner while it maps it).
     rings: Mutex<Pool>,
     descriptors: Mutex<Pool>,
