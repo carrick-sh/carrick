@@ -267,7 +267,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.ipc-two-process"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -826,7 +828,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.ipc-two-process"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -894,6 +898,7 @@
         "kernel.el1.files.shared-inode",
         "kernel.el1.guest-run-queue",
         "kernel.el1.inotify",
+        "kernel.el1.ipc-two-process",
         "kernel.el1.zone-entry-at-open",
         "kernel.inotify.readiness",
         "kernel.inotify.watch-churn",
@@ -920,6 +925,7 @@
         "kernel.el1.files.shared-inode",
         "kernel.el1.guest-run-queue",
         "kernel.el1.inotify",
+        "kernel.el1.ipc-two-process",
         "kernel.el1.transparent",
         "kernel.el1.zone-entry-at-open",
         "kernel.fs.write-seek",
@@ -2968,6 +2974,7 @@
         "kernel.el1.anonymous-munmap",
         "kernel.el1.anonymous-permissions",
         "kernel.el1.anonymous-retirement",
+        "kernel.el1.delegated-root-fork",
         "kernel.el1.zone-entry-at-open",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
@@ -3047,9 +3054,11 @@
       "contracts": [
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
+        "kernel.el1.delegated-root-fork",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.fork-cow",
         "kernel.el1.guest-run-queue",
+        "kernel.el1.ipc-two-process",
         "kernel.fork.filetable",
         "kernel.fork.mappings",
         "kernel.fork.stage1-image",
@@ -3095,6 +3104,7 @@
         "kernel.el1.anonymous-permissions",
         "kernel.el1.anonymous-reservations",
         "kernel.el1.anonymous-retirement",
+        "kernel.el1.delegated-root-fork",
         "kernel.el1.fault-entry",
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
@@ -3158,6 +3168,7 @@
       "contracts": [
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-permissions",
+        "kernel.el1.delegated-root-fork",
         "kernel.el1.fault-entry",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.current-read-reuse",

@@ -1,0 +1,40 @@
+schema_version = 1
+id = "kernel.el1.ipc-two-process"
+title = "Two-process blocking pipe and eventfd IPC is served and parked in the guest"
+guest_surfaces = [
+  "syscall:read",
+  "syscall:write",
+  "syscall:eventfd2",
+  "syscall:pipe2",
+  "syscall:clone",
+  "kernel:continuation",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 pipe / man 7 pipe: a read on an empty pipe with a live writer blocks until data is written; writes of at most PIPE_BUF bytes are atomic",
+  "man 2 eventfd: a read blocks while the counter is zero and returns the counter value once it is nonzero",
+  "man 2 fork: parent and child hold independent descriptor tables over the same open descriptions",
+]
+fixture = "embed:el1-sched ipc-processes pipe|eventfd 1|8|64 128"
+scale_points = [1, 8, 64]
+rationale = "Request/response IPC between forked processes (`pairs` concurrent pairs, 128 rounds each) must be carried by the in-guest scheduler: each read and write is served at EL1, and a read that would block parks the thread in the guest and is woken by the peer's write without a host exit. `el1_ipc_two_processes_blocking` asserts, per kind and pair count, served read[63] and write[64] each at least 2 * pairs * rounds, at least pairs * rounds guest parks, and fewer forwarded reads than pairs * rounds (a continuation that fell back forwards one read per round). Forwarding every blocking read instead would cost one host park and wake per round, growing with the loop."
+
+[bindings]
+embed = "carrick-embed::el1_sched::el1_ipc_two_processes_blocking"
+
+[bindings.unresolved]
+vm_free = "VM-free scheduler tests cover continuation park and wake, but not forked-process descriptor sharing through live EL1 trap frames."
+docker = "Linux semantics of pipe and eventfd blocking are fixed by man pages; the fixture checks the completed round count itself. Same-source Docker differential binding remains open."
+embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts served[63]/[64] >= 2*pairs*rounds, zero-fallback parks >= pairs*rounds, and forwarded read[63] < pairs*rounds outside the contract evaluator."
+
+# Integer-expressible form of "forwarded reads < rounds per pair": every scale
+# unit is one pair, and the fixture may forward fewer than `rounds` (128) reads
+# per pair, so host dispatches for one pair stay below that plus a fixed
+# start-up base. Served lower bounds and parks are asserted by the embed test.
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 512
+per_unit = 127
+layers = ["embed-structural"]
+rationale = "Forwarded reads stay below pairs * rounds (127 per pair for 128 rounds, plus fixed scaffolding for fork, thread start and join): blocking reads are parked and woken in the guest instead of forwarded per round. The per-pair coefficient is an upper bound on the dispatch population the test's forwarded-read assertion admits, not an allowance for the writes, which are served at EL1."
