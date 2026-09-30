@@ -22,6 +22,10 @@ const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 /// A lent caller vCPU bound to one authenticated target MM.
 pub(crate) struct ForeignEl1Publisher<'a> {
     caller: &'a mut dyn carrick_guest_mem::CallerEl1Call,
+    /// The target ASID generation's admission for the borrowed-TTBR0
+    /// windows: it lives until this publisher drops, so the target cannot
+    /// finish retiring (or recycle its ASID) while a window may be open.
+    admission: Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>,
     tables: carrick_aarch64::Stage1Authority,
     slots: Option<&'static carrick_el1_abi::DescriptorTxnSlots>,
     mm_key: std::num::NonZeroU64,
@@ -44,12 +48,6 @@ impl<'a> ForeignEl1Publisher<'a> {
         if tables.live_descriptor_owner() != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest {
             return Err(Error::AuthorityUnavailable);
         }
-        let caller = invalidator
-            .caller_el1_call()
-            .ok_or(Error::AuthorityUnavailable)?;
-        if caller.slot().is_none() {
-            return Err(Error::AuthorityUnavailable);
-        }
         let mm_key = std::num::NonZeroU64::new(mm.raw_for_probe()).ok_or(Error::MissingBinding)?;
         let root = binding.stage1_root.raw();
         let live_root = tables
@@ -58,9 +56,20 @@ impl<'a> ForeignEl1Publisher<'a> {
         if root & !TTBR_BADDR_MASK != 0 || live_root != root {
             return Err(Error::MissingBinding);
         }
+        // Refused (no mutation yet) when the target generation is retiring.
+        let admission = invalidator.admit_borrowed_ttbr0(
+            carrick_hal::ForeignMmBinding::for_aarch64(binding.asid, binding.stage1_root),
+        )?;
+        let caller = invalidator
+            .caller_el1_call()
+            .ok_or(Error::AuthorityUnavailable)?;
+        if caller.slot().is_none() {
+            return Err(Error::AuthorityUnavailable);
+        }
         let ttbr0 = root | (u64::from(binding.asid.raw_for_probe()) << 48);
         Ok(Self {
             caller,
+            admission,
             tables,
             slots: target.descriptor_txn_slots(),
             mm_key,
@@ -114,7 +123,7 @@ impl carrick_aarch64::descriptor_drain::GuestDrainVenue for ForeignEl1Publisher<
         }
         let answer = self
             .caller
-            .drain_foreign(self.mm_key.get(), self.ttbr0)
+            .drain_foreign(self.mm_key.get(), self.ttbr0, &mut *self.admission)
             .map_err(|error| TrapError::Hypervisor(format!("foreign EL1 drain: {error}")))?;
         let mut answered = frame;
         answered.x[0] = answer;

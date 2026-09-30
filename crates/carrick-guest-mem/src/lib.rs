@@ -993,9 +993,26 @@ pub trait CallerEl1Call {
     /// Run EL1's host-driven descriptor drain for `mm_key` on this vCPU with
     /// TTBR0_EL1 = `ttbr0` (the target's root and ASID) installed for exactly
     /// the call, so EL1's copy window and ASID maintenance address the target.
-    /// The vCPU's own TTBR0 is restored before returning. Returns EL1's
-    /// answer word (applied count, plus the blocked bit).
-    fn drain_foreign(&mut self, mm_key: u64, ttbr0: u64) -> Result<u64, String>;
+    /// `admission` is armed before the TTBR0 is installed; the vCPU's own
+    /// TTBR0 is restored before returning. Returns EL1's answer word (applied
+    /// count, plus the blocked bit).
+    fn drain_foreign(
+        &mut self,
+        mm_key: u64,
+        ttbr0: u64,
+        admission: &mut dyn BorrowedTtbr0Admission,
+    ) -> Result<u64, String>;
+}
+
+/// Admission of the target address space's ASID generation for vCPUs that
+/// borrow its TTBR0 without running it, minted by the owner of ASID
+/// residency. While it lives the generation cannot finish retirement; once
+/// armed, the generation's retirement owes (and waits to issue) a broadcast
+/// invalidation that reaches every vCPU that borrowed it.
+pub trait BorrowedTtbr0Admission: Send {
+    /// Record that a vCPU may now cache this generation's translations.
+    /// Called before the TTBR0 is installed; idempotent.
+    fn arm(&mut self) -> Result<(), String>;
 }
 
 /// Marker trait for guest memory views that genuinely represent the currently
