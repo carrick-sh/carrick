@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-435a2ef3804478cb)
+
+running 11 tests
+test trap::cow_engine::tests::host_cow_accounting_is_mm_scoped_and_survives_retirement ... ok
+test trap::cow_engine::tests::guest_cow_caller_requires_driving_vcpu_before_touching_backing ... ok
+test trap::cow_engine::tests::guest_lane_refuses_host_cow_before_copy_or_publication ... ok
+test trap::cow_engine::tests::guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner ... ok
+test trap::cow_engine::tests::alias_unmap_takes_frame_registry_guard_only_for_inventory_publication ... ok
+test trap::cow_engine::tests::alias_retirement_commit_takes_the_callers_registry_guard_and_never_locks_the_leaf ... ok
+test trap::cow_engine::tests::host_cow_counter_counts_only_completed_local_and_foreign_transactions ... ok
+test trap::cow_engine::tests::frame_inventory_publication_and_retirement_sites_hold_registry_guard ... ok
+test trap::cow_engine::tests::frame_publication_sites_contain_no_carrier_topology_lock ... ok
+test trap::cow_engine::tests::alias_registry_queries_never_authenticate_frame_owners_under_the_lock ... ok
+test trap::cow_engine::tests::fork_exec_exit_and_unmap_sites_contain_no_carrier_topology_lock ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 606 filtered out; finished in 0.01s
+

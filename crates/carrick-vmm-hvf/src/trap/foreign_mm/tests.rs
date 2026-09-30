@@ -7229,7 +7229,7 @@ fn semantic_lookup_rejects_foreign_va_alias_at_same_live_ipa() {
 }
 
 #[test]
-fn shared_extent_repoint_subpage_resolves_covering_owner_and_repoints_leaf() {
+fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
@@ -7344,9 +7344,74 @@ fn shared_extent_repoint_subpage_resolves_covering_owner_and_repoints_leaf() {
         .expect("translate source subpage through live stage-1 page table");
     assert_eq!(repoint_ipa, extent_base + 0x1000);
 
-    // Repointing a 4 KiB sub-page at offset 0x1000 succeeds via the covering production mapping.
+    // The engine owns descriptor publication. Bookkeeping must not repair an
+    // unpublished target, even when its physical owner is authentic.
+    let before = task.translate_va(repoint_va);
+    let before_mappings = task.mappings.len();
+    let unpublished = task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len);
+    assert!(
+        unpublished.is_err(),
+        "bookkeeping wrote an unpublished leaf"
+    );
+    assert_eq!(task.translate_va(repoint_va), before);
+    assert_eq!(task.mappings.len(), before_mappings);
+
+    // Model the engine's completed publication, then prohibit host edits.
+    // A successful metadata commit in this lane cannot rely on a second edit.
+    let tables = task.page_tables_authority();
+    tables
+        .edit(
+            || Err(TrapError::Hypervisor("missing test tables".to_owned())),
+            |manager| {
+                manager
+                    .map_aliased(repoint_va, repoint_ipa, repoint_len as u64, true)
+                    .map_err(|error| TrapError::Hypervisor(format!("test publication: {error}")))
+            },
+        )
+        .expect("engine publication");
+    // A correct first leaf cannot authorize bookkeeping for an unpublished
+    // neighbor or for another physical output.
+    assert!(
+        task.publish_shared_repoint(repoint_va, repoint_ipa, 2 * repoint_len)
+            .is_err()
+    );
+    assert!(
+        task.publish_shared_repoint(repoint_va, repoint_ipa + 0x1000, repoint_len)
+            .is_err()
+    );
+    assert_eq!(task.mappings.len(), before_mappings);
+    tables
+        .edit(
+            || Err(TrapError::Hypervisor("missing test tables".to_owned())),
+            |manager| {
+                manager
+                    .map_aliased(repoint_va, repoint_ipa, repoint_len as u64, false)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("test read-only publication: {error}"))
+                    })
+            },
+        )
+        .expect("read-only publication");
+    assert!(
+        task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len)
+            .is_err()
+    );
+    assert_eq!(task.mappings.len(), before_mappings);
+    tables
+        .edit(
+            || Err(TrapError::Hypervisor("missing test tables".to_owned())),
+            |manager| {
+                manager
+                    .map_aliased(repoint_va, repoint_ipa, repoint_len as u64, true)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("test writable publication: {error}"))
+                    })
+            },
+        )
+        .expect("writable publication");
+    tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
     task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len)
-        .expect("repoint 4 KiB sub-page of covering shared extent");
+        .expect("record published 4 KiB sub-page of covering shared extent");
 
     // translate_va on the repointed VA returns extent_base + 0x1000.
     assert_eq!(

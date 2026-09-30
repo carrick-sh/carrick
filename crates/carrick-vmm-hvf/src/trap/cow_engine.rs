@@ -20,6 +20,46 @@ pub(crate) fn require_host_cow_lane(
     Ok(())
 }
 
+/// Check the engine's completed mapping before publishing alias metadata.
+/// Walk terminal spans, not every page of a coarse block; perform no writes,
+/// splits, allocation or TLB operations. The caller retains MM exclusion.
+fn require_published_repoint(
+    authority: &carrick_aarch64::Stage1Authority,
+    va: u64,
+    ipa: u64,
+    len: usize,
+) -> Result<(), TrapError> {
+    use carrick_mmu_core::aarch64::{LeafAccess, terminal_descriptor_permits_el0, terminal_entry};
+    let refusal =
+        || TrapError::Hypervisor("repoint alias has no completed stage-1 publication".to_owned());
+    let end = va.checked_add(len as u64).ok_or_else(refusal)?;
+    if len == 0 || ipa.checked_add(len as u64).is_none() {
+        return Err(refusal());
+    }
+    authority
+        .with_manager(|manager| {
+            let mut current = va;
+            while current < end {
+                let walk = manager.try_debug_walk(current).map_err(|_| refusal())?;
+                let (level, leaf) = terminal_entry(walk);
+                if level == 0
+                    || !terminal_descriptor_permits_el0(leaf, LeafAccess::Write)
+                    || !terminal_descriptor_permits_el0(leaf, LeafAccess::Execute)
+                {
+                    return Err(refusal());
+                }
+                let span = 1_u64 << (39 - 9 * level);
+                let output = (leaf & 0x0000_ffff_ffff_f000 & !(span - 1)) | (current & (span - 1));
+                if output != ipa + (current - va) {
+                    return Err(refusal());
+                }
+                current += (span - (current & (span - 1))).min(end - current);
+            }
+            Ok(())
+        })
+        .ok_or_else(refusal)?
+}
+
 /// A new replacement is published in the kernel inventory before EL1 may
 /// copy it, while the old mapping remains live. Only the final descriptor
 /// receipt allows this provisional grant to survive the COW transaction.
@@ -1975,7 +2015,6 @@ impl HvfTaskState {
         target_ipa: u64,
         len: usize,
     ) -> Result<(), TrapError> {
-        require_host_cow_lane(&self.page_tables_authority())?;
         let target_end = target_ipa.checked_add(len as u64).ok_or_else(|| {
             TrapError::Hypervisor("shared repoint target IPA overflow".to_owned())
         })?;
@@ -2138,20 +2177,9 @@ impl HvfTaskState {
                 mapping_owner_generation
             };
 
-        self.page_tables_authority().edit(
-            || {
-                Err(TrapError::Hypervisor(
-                    "repoint shared leaf stage-1 tables are absent".to_owned(),
-                ))
-            },
-            |tables| {
-                tables
-                    .map_aliased(va, target_ipa, len as u64, true)
-                    .map_err(|e| {
-                        TrapError::Hypervisor(format!("repoint shared leaf pt edit: {e:?}"))
-                    })
-            },
-        )?;
+        // The engine already published and invalidated this mapping. This
+        // adapter commits ownership metadata, never a second descriptor edit.
+        require_published_repoint(&self.page_tables_authority(), va, target_ipa, len)?;
 
         let shared_key_offset = shared_key_offset.saturating_add(semantic_offset);
         let sharing = GuestMappingSharing::GlobalShared;

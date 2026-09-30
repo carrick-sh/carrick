@@ -1,0 +1,9 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.59s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-435a2ef3804478cb)
+
+running 1 test
+test trap::foreign_mm::tests::shared_extent_repoint_requires_published_leaf_and_only_records_owner ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 616 filtered out; finished in 0.03s
+
