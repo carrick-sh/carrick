@@ -45,7 +45,7 @@ preserve evidence; their older “next” statements are not competing work orde
 
 **Diagnosis:** development has accumulated useful foundations and regression
 receipts faster than it has activated production ownership. On adapter source
-`cb285ae30` plus the current copyout WIP, guest descriptor admission still has
+`a5ca5ed03` after the copyout conversion, guest descriptor admission still has
 `host_copyout=false` and `backend_writers=false`; anonymous reservation dispatch
 has only test callers. A passing helper or ordinary boot test cannot demonstrate
 that either disabled path executes. The controller itself compounded drift by
@@ -69,11 +69,24 @@ Steps 2 and 3 may interleave where an exact dependency requires it. Do not flip
 admission booleans to bypass an unconverted writer. File/shared mapping and
 host-boundary semantics remain part of the conversion review.
 
-**Work already in progress:** copyout WIP is preserved in `wt-cp3-adapter`.
-The focused model test `prepared_copyout_publishes_only_its_page_through_the_guest_executor`
-passed after its retained red. It does not close copyout validation, activate
-production ownership or accept any checkpoint. Finish this bounded dependency;
-do not restart its implementation or expand it into a diagnostics project.
+**Completed prerequisite:** copyout is committed in adapter `a5ca5ed03`.
+The engine's prepared-copyout caller now uses the shared fork/EL1 descriptor
+drain; the runtime retains exact-MM exclusion and kernel residency commits
+only after an exact Publish/Write receipt. Retained model red/green, 11 runtime
+descriptor tests, 15 kernel first-touch tests, affected Clippy and formatting
+pass. Refused root/backing/editor/permission leaves remain unchanged; wrong
+MM/page/read receipts preserve arming. See adapter memory-integration
+`copyout.md` and raw logs. Production admission remains disabled; no signed
+activation or checkpoint acceptance is claimed. Do not restart this slice.
+
+**Next implementation:** connect `HvfVmState::perform_frame_cow` to retained
+replacement backing, an actual EL1 copy window, descriptor repoint and inventory
+commit. Existing `GuestCowContinuation`/`GuestCowBackingTransaction` are helpers,
+not a connected transport. Continue private/shared repoints, replacement grants,
+retired reuse, engine protection/alias/discard and exec writers; source review
+is recorded in `copyout.md`, not yet a complete writer census. Preserve file and
+shared mappings. Join reservation policy/lifecycle before activation. No broad
+signed boot campaign between these prerequisite conversions.
 
 **Priority rules:** before each implementation task, name the production caller,
 the authority or host operation being replaced, and the decisive observable
@@ -93,7 +106,7 @@ resume their investigation only for a new discriminating test or a concrete
 dependency. No new broad capture campaign. x86 remains deferred.
 
 Current accepted base remains local main `f304f8415`; development integration is
-adapter `cb285ae30` plus WIP. No checkpoint has been accepted by this reset.
+adapter `a5ca5ed03` (clean). No checkpoint has been accepted by this work.
 
 ## Historical state and evidence rules
 
