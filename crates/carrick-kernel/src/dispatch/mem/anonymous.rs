@@ -1042,7 +1042,9 @@ impl MemView<'_> {
         let flags: u64 = cx.typed_arg(3);
         let new_address: GuestPtr = cx.typed_arg(4);
         self.demote_for_host_edit(old_address.0, old_size);
-        if flags & crate::linux_abi::LINUX_MREMAP_FIXED != 0 {
+        if carrick_abi::LinuxMremapFlags::from_bits_retain(flags)
+            .contains(carrick_abi::LinuxMremapFlags::FIXED)
+        {
             self.demote_for_host_edit(new_address.0, new_size);
         }
         let outcome = self.mremap_served(cx);
