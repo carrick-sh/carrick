@@ -114,6 +114,27 @@ pub struct SpaceEditor<'a> {
     owner: NonZeroU64,
 }
 
+/// Proof that the host has excluded the guest EL1 editor of address space
+/// `key`: its gate was raised or closed and no admitted editor remained, or
+/// no published entry names `key` (EL1 edits only published spaces, and a
+/// freed key is never published again). Only [`AddressSpaces`] mints it, and
+/// it borrows the table, so host code that must run without a concurrent
+/// EL1 editor of `key` can demand one instead of trusting a comment. It is
+/// valid until the matching [`AddressSpaces::lower`]; it is neither `Clone`
+/// nor `Copy`, and holders use it within the exclusion that produced it.
+#[derive(Debug)]
+pub struct ExcludedEditor<'a> {
+    key: u64,
+    _spaces: core::marker::PhantomData<&'a AddressSpaces>,
+}
+
+impl ExcludedEditor<'_> {
+    /// The exact address space (the host MM id) whose editor is excluded.
+    pub fn key(&self) -> u64 {
+        self.key
+    }
+}
+
 impl<'a> SpaceEditor<'a> {
     pub fn mmap_next(&self) -> u64 {
         self.entry.mmap_next.load(Ordering::Acquire)
@@ -268,11 +289,16 @@ impl AddressSpaces {
 
     /// Host: permanently close the entry and wait for its admitted guest
     /// editor before retiring the roots or reusing the entry.
-    pub fn close_and_wait_for_editor(&self, index: SpaceIndex, mut wait: impl FnMut()) {
+    pub fn close_and_wait_for_editor(
+        &self,
+        index: SpaceIndex,
+        mut wait: impl FnMut(),
+    ) -> ExcludedEditor<'_> {
         self.close(index);
         while self.entry(index).active_editor.load(Ordering::SeqCst) != 0 {
             wait();
         }
+        self.excluded(index)
     }
 
     /// Host: a page-table pause of the space began; EL1 may not install it
@@ -284,11 +310,32 @@ impl AddressSpaces {
     /// Host: raise the page-table gate and wait until an already admitted
     /// guest editor acknowledges completion. SeqCst ordering makes the race
     /// exhaustive: the host sees the editor, or the guest sees the gate.
-    pub fn raise_and_wait_for_editor(&self, index: SpaceIndex, mut wait: impl FnMut()) {
+    pub fn raise_and_wait_for_editor(
+        &self,
+        index: SpaceIndex,
+        mut wait: impl FnMut(),
+    ) -> ExcludedEditor<'_> {
         self.raise(index);
         while self.entry(index).active_editor.load(Ordering::SeqCst) != 0 {
             wait();
         }
+        self.excluded(index)
+    }
+
+    fn excluded(&self, index: SpaceIndex) -> ExcludedEditor<'_> {
+        ExcludedEditor {
+            key: self.entry(index).key.load(Ordering::SeqCst),
+            _spaces: core::marker::PhantomData,
+        }
+    }
+
+    /// Host: proof that no EL1 editor of `key` can exist because no
+    /// published entry names it. `None` while one does: raise its gate.
+    pub fn unpublished(&self, key: u64) -> Option<ExcludedEditor<'_>> {
+        (key != 0 && self.find(key).is_none()).then_some(ExcludedEditor {
+            key,
+            _spaces: core::marker::PhantomData,
+        })
     }
 
     /// Host: the pause [`Self::raise`] counted ended.
@@ -412,6 +459,34 @@ mod tests {
     use super::*;
     use core::num::NonZeroU64;
     use std::sync::{Arc, mpsc};
+
+    #[test]
+    fn exclusion_proofs_name_exactly_the_excluded_space() {
+        let spaces = AddressSpaces::new();
+        let index = spaces.publish_closed(7, 0x1_0000, 0x1_0000).unwrap();
+        spaces.open(index);
+        assert!(
+            spaces.unpublished(7).is_none(),
+            "a published space needs its gate raised"
+        );
+        assert_eq!(spaces.unpublished(8).map(|proof| proof.key()), Some(8));
+        assert!(spaces.unpublished(0).is_none());
+        let proof = spaces.raise_and_wait_for_editor(index, || unreachable!());
+        assert_eq!(proof.key(), 7);
+        assert!(
+            spaces
+                .try_begin_edit(index, 7, NonZeroU64::new(1).unwrap())
+                .is_none(),
+            "no EL1 editor while the proof's gate is raised"
+        );
+        spaces.lower(index);
+        assert_eq!(
+            spaces
+                .close_and_wait_for_editor(index, || unreachable!())
+                .key(),
+            7
+        );
+    }
 
     #[test]
     fn a_published_space_is_granted_only_while_its_gate_is_open() {

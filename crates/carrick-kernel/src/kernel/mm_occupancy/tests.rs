@@ -745,3 +745,80 @@ fn a_zone_vcpu_moved_off_the_mm_is_drained_while_it_stays_in_guest() {
     assert_eq!(occupancy.vacate_any(slot), mm(42_202).raw());
     vcpu.flag.leave_guest();
 }
+
+/// Records every settlement: the MM key, and whether its EL1 editor was
+/// already gone and the gate raised in `spaces` when it ran.
+struct RecordingSettlement {
+    spaces: &'static AddressSpaces,
+    runs: parking_lot::Mutex<Vec<(u64, bool)>>,
+}
+
+impl carrick_el1_abi::CowGrantSettlement for RecordingSettlement {
+    fn settle(&self, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
+        let key = excluded.key();
+        let exclusive = self.spaces.find(key).is_some_and(|index| {
+            self.spaces.active_editor(index).is_none() && self.spaces.gate(index) != 0
+        });
+        self.runs.lock().push((key, exclusive));
+    }
+    fn release(&self, _excluded: &carrick_sched_core::ExcludedEditor<'_>) {}
+}
+
+/// Guest EL1 COW completions must be settled before the host touches an
+/// MM, and only while no EL1 editor can add one: both host exclusions of an
+/// MM's editor (its page-table pause and a mutation guard) run the
+/// settlement after the admitted editor left and with the gate raised.
+#[test]
+fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
+    let (spaces, occupancy) = space_tables();
+    let recorder = Arc::new(RecordingSettlement {
+        spaces,
+        runs: parking_lot::Mutex::new(Vec::new()),
+    });
+    install_guest_cow_settlement(recorder.clone());
+    // Other tests pause their own MMs through private tables too.
+    let ours = || -> Vec<(u64, bool)> {
+        recorder
+            .runs
+            .lock()
+            .iter()
+            .copied()
+            .filter(|(key, _)| *key == 42_301)
+            .collect()
+    };
+    let mm_fence = fence();
+    let publication = publish_for_test(spaces, occupancy, mm(42_301), &mm_fence, 0x3800).unwrap();
+    let index = spaces.find(42_301).unwrap();
+    let editor = spaces
+        .try_begin_edit(index, 42_301, std::num::NonZeroU64::new(9).unwrap())
+        .expect("EL1 edits the open space");
+    let host_fence = Arc::clone(&mm_fence);
+    let host = std::thread::spawn(move || host_fence.set_quiescing());
+    for _ in 0..1_000_000 {
+        if spaces.gate(index) != 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        ours().is_empty(),
+        "no settlement while EL1 may still complete a COW"
+    );
+    drop(editor);
+    host.join().unwrap();
+    assert_eq!(ours(), vec![(42_301, true)]);
+    mm_fence.end();
+
+    let exclusion = exclude_el1_editor_in(
+        SpaceTables {
+            spaces,
+            occupancy,
+            zone: false,
+        },
+        mm(42_301),
+    )
+    .expect("published");
+    assert_eq!(ours(), vec![(42_301, true), (42_301, true)]);
+    drop(exclusion);
+    drop(publication);
+}

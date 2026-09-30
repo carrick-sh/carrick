@@ -34,6 +34,7 @@
 //! forwarded and the host resolves it as before).
 
 use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
+use carrick_sched_core::ExcludedEditor;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -368,10 +369,15 @@ impl CowGrantPool {
         core::array::from_fn(|index| self.declined[index].load(Ordering::Relaxed))
     }
 
-    /// Host, while it excludes `mm_key`'s EL1 editor: every completion of
-    /// the MM, oldest slot first. The host settles each and then frees it
-    /// with [`Self::finish`].
-    pub fn completions(&self, mm_key: u64) -> impl Iterator<Item = CowGrantCompletion> + '_ {
+    /// Host, while it excludes the MM's EL1 editor: every completion of the
+    /// MM, oldest slot first. The host settles each and then frees it with
+    /// [`Self::finish`]. The exclusion proof is what makes the records
+    /// final: no EL1 editor of the MM can complete or claim meanwhile.
+    pub fn completions<'p>(
+        &'p self,
+        excluded: &ExcludedEditor<'_>,
+    ) -> impl Iterator<Item = CowGrantCompletion> + 'p {
+        let mm_key = excluded.key();
         self.used
             .iter()
             .enumerate()
@@ -389,7 +395,9 @@ impl CowGrantPool {
                         {
                             continue;
                         }
-                        let grant = record.grant(slot, word)?;
+                        let Some(grant) = record.grant(slot, word) else {
+                            continue;
+                        };
                         return Some(CowGrantCompletion {
                             grant,
                             span_va: record.span_va.load(Ordering::Relaxed),
@@ -424,16 +432,40 @@ impl CowGrantPool {
         })
     }
 
-    /// Host: free a settled completion. Only the exact (slot, epoch) the
-    /// host settled may free the record.
-    pub fn finish(&self, grant: &CowGrant) -> bool {
-        self.release(grant, USED)
+    /// Host, while it excludes the grant MM's EL1 editor: free a settled
+    /// completion. Only the exact (slot, epoch) the host settled may free it.
+    pub fn finish(&self, excluded: &ExcludedEditor<'_>, grant: &CowGrant) -> bool {
+        grant.mm_key == excluded.key() && self.release(grant, USED)
     }
 
     /// Host, while it excludes the grant MM's EL1 editor: withdraw an unused
-    /// grant (MM retiring, pool shrinking). `false` if EL1 already used it.
-    pub fn revoke(&self, grant: &CowGrant) -> bool {
-        self.release(grant, READY)
+    /// grant. `false` if EL1 already used it.
+    pub fn revoke(&self, excluded: &ExcludedEditor<'_>, grant: &CowGrant) -> bool {
+        grant.mm_key == excluded.key() && self.release(grant, READY)
+    }
+
+    /// Host, while it excludes the MM's EL1 editor, as the MM retires: free
+    /// every record it holds, ready or used. The MM's backend inventory
+    /// retires their frames with the rest of its mappings.
+    pub fn release_mm(&self, excluded: &ExcludedEditor<'_>) -> usize {
+        let mm_key = excluded.key();
+        let mut released = 0;
+        for offset in 0..COW_GRANT_PROBES {
+            let slot = Self::probe(mm_key, offset);
+            let record = &self.records[slot];
+            let word = record.state.load(Ordering::Acquire);
+            if record.mm_key.load(Ordering::Relaxed) != mm_key {
+                continue;
+            }
+            let Some(grant) = record.grant(slot, word) else {
+                continue;
+            };
+            if matches!(word & STATE_MASK, READY | USED) && self.release(&grant, word & STATE_MASK)
+            {
+                released += 1;
+            }
+        }
+        released
     }
 
     fn release(&self, grant: &CowGrant, from: u64) -> bool {
@@ -458,16 +490,28 @@ impl CowGrantPool {
         freed
     }
 
-    /// Host, while it excludes `mm_key`'s EL1 editor: whether EL1 holds a
-    /// claimed grant of the MM. Always `false` under a correct exclusion.
+    /// Host, while it excludes the MM's EL1 editor: whether EL1 still holds
+    /// a claimed grant of the MM. Always `false` under a correct exclusion.
     #[must_use]
-    pub fn claimed_by(&self, mm_key: u64) -> bool {
+    pub fn claimed_by(&self, excluded: &ExcludedEditor<'_>) -> bool {
+        let mm_key = excluded.key();
         (0..COW_GRANT_PROBES).any(|offset| {
             let record = &self.records[Self::probe(mm_key, offset)];
             record.state.load(Ordering::Acquire) & STATE_MASK == CLAIMED
                 && record.mm_key.load(Ordering::Relaxed) == mm_key
         })
     }
+}
+
+/// The host's settlement of guest COW completions, installed by the carrier
+/// and run by every host exclusion of an MM's EL1 editor before the host
+/// touches that MM's translations or frames.
+pub trait CowGrantSettlement: Send + Sync {
+    /// Settle every completion of the excluded MM.
+    fn settle(&self, excluded: &ExcludedEditor<'_>);
+    /// The excluded MM is retiring: free its pool records (its inventory
+    /// retires their frames).
+    fn release(&self, excluded: &ExcludedEditor<'_>);
 }
 
 impl Default for CowGrantPool {
@@ -541,6 +585,12 @@ mod tests {
         }
     }
 
+    /// No published address space names these test MMs: EL1 cannot edit
+    /// them, which is the exclusion the host API demands.
+    fn excluded(spaces: &carrick_sched_core::AddressSpaces, mm: u64) -> ExcludedEditor<'_> {
+        spaces.unpublished(mm).unwrap()
+    }
+
     fn completion(grant: CowGrant) -> CowGrantCompletion {
         CowGrantCompletion {
             grant,
@@ -553,6 +603,9 @@ mod tests {
 
     #[test]
     fn a_grant_moves_ready_claimed_used_and_back_to_empty() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let seven = excluded(&spaces, 7);
+        let eight = excluded(&spaces, 8);
         let pool = CowGrantPool::new();
         let published = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
         assert_eq!(pool.ready(7).collect::<Vec<_>>(), vec![published]);
@@ -563,53 +616,63 @@ mod tests {
             pool.claim(7).is_none(),
             "one owner: a claimed grant is gone"
         );
-        assert!(pool.claimed_by(7));
+        assert!(pool.claimed_by(&seven));
         assert!(
-            !pool.revoke(&published),
+            !pool.revoke(&seven, &published),
             "the host cannot revoke a claimed grant"
         );
         let done = completion(claimed);
         assert!(pool.complete(&done));
-        assert!(!pool.claimed_by(7));
+        assert!(!pool.claimed_by(&seven));
         assert!(pool.any_completed());
-        assert_eq!(pool.completions(7).collect::<Vec<_>>(), vec![done]);
-        assert_eq!(pool.completions(8).count(), 0);
+        assert_eq!(pool.completions(&seven).collect::<Vec<_>>(), vec![done]);
+        assert_eq!(pool.completions(&eight).count(), 0);
         assert!(
-            !pool.revoke(&published),
+            !pool.revoke(&seven, &published),
             "a used grant is settled, not revoked"
         );
-        assert!(pool.finish(&published));
-        assert!(!pool.finish(&published), "settled exactly once");
+        assert!(
+            !pool.finish(&eight, &published),
+            "another MM's exclusion settles nothing"
+        );
+        assert!(pool.finish(&seven, &published));
+        assert!(!pool.finish(&seven, &published), "settled exactly once");
         assert!(!pool.any_completed());
         assert_eq!(pool.resolved(), 1);
     }
 
     #[test]
     fn an_abandoned_claim_is_ready_again_and_revocable() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
         let pool = CowGrantPool::new();
         let grant = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
         let claimed = pool.claim(7).unwrap();
         assert!(pool.abandon(&claimed));
         assert!(!pool.abandon(&claimed));
-        assert!(pool.revoke(&grant));
+        assert!(pool.revoke(&excluded(&spaces, 7), &grant));
         assert!(pool.claim(7).is_none());
         assert_eq!(pool.ready(7).count(), 0);
     }
 
     #[test]
     fn a_stale_host_handle_never_settles_or_revokes_a_successor() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let seven = excluded(&spaces, 7);
         let pool = CowGrantPool::new();
         let first = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        assert!(pool.revoke(&first));
+        assert!(pool.revoke(&seven, &first));
         let second = pool.publish(7, 0x8_0000_8000, backing(20)).unwrap();
         assert_eq!(second.slot, first.slot, "the chain reuses the freed record");
         assert_ne!(second.epoch, first.epoch);
-        assert!(!pool.revoke(&first), "the old epoch names no live grant");
+        assert!(
+            !pool.revoke(&seven, &first),
+            "the old epoch names no live grant"
+        );
         let claimed = pool.claim(7).unwrap();
         assert_eq!(claimed.backing, backing(20));
         assert!(pool.complete(&completion(claimed)));
-        assert!(!pool.finish(&first));
-        assert!(pool.finish(&second));
+        assert!(!pool.finish(&seven, &first));
+        assert!(pool.finish(&seven, &second));
     }
 
     #[test]
@@ -645,6 +708,21 @@ mod tests {
             "an MM's chain is bounded"
         );
         assert_eq!(pool.ready(7).count(), COW_GRANT_PROBES);
+    }
+
+    #[test]
+    fn a_retiring_mm_releases_exactly_its_own_records() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let pool = CowGrantPool::new();
+        pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+        pool.publish(7, 0x8_0000_8000, backing(20)).unwrap();
+        pool.publish(8, 0x8_0000_c000, backing(30)).unwrap();
+        let used = pool.claim(7).unwrap();
+        assert!(pool.complete(&completion(used)));
+        assert_eq!(pool.release_mm(&excluded(&spaces, 7)), 2);
+        assert_eq!(pool.ready(7).count(), 0);
+        assert!(!pool.any_completed());
+        assert_eq!(pool.ready(8).count(), 1, "another MM keeps its grants");
     }
 
     #[test]

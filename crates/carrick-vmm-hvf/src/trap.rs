@@ -341,6 +341,10 @@ pub(crate) use execve_rebuild::*;
 mod foreign_mm;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod frame_inventory;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod guest_cow;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use guest_cow::CarrierGuestCowSettlement;
 mod memory_protection;
 pub(crate) use self::memory_protection::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2423,6 +2427,11 @@ pub(crate) struct PersistentExecutorSpec {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PersistentExecutorSpec {
+    /// The carrier's guest COW settlement over its MM directory.
+    pub(crate) fn guest_cow_settlement(&self) -> CarrierGuestCowSettlement {
+        CarrierGuestCowSettlement::new(&self.carrier_foreign_mm_transport)
+    }
+
     pub(crate) fn reservation_metadata_access(
         &self,
     ) -> Option<crate::metadata_grant::CarrierMetadataAccess> {
