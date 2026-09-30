@@ -279,6 +279,30 @@ impl Stage1Authority {
         promote
     }
 
+    /// Why this authority is on the host lane right now, or `None` when EL1
+    /// owns its live descriptors. Pure observation, no state changes.
+    pub fn host_lane_cause(&self) -> Option<HostLaneCause> {
+        let inner = self.inner.lock();
+        if inner.live_owner == LiveDescriptorOwner::Guest {
+            return None;
+        }
+        Some(if !inner.guest_lane_pending {
+            HostLaneCause::NeverSelected
+        } else if inner.host_resolver.is_none() {
+            HostLaneCause::PendingNoBacking
+        } else if inner.manager.is_none() {
+            HostLaneCause::PendingNoManager
+        } else if inner
+            .manager
+            .as_ref()
+            .is_some_and(|manager| manager.has_unsynced_edits())
+        {
+            HostLaneCause::PendingUnsyncedEdits
+        } else {
+            HostLaneCause::PendingAwaitingBind
+        })
+    }
+
     /// Complete a guest lane selection that is still pending although the
     /// live backing is already bound: a promotion `bind_live_backing`
     /// refused (host edits that could not be synced) is otherwise retried by
@@ -1146,6 +1170,48 @@ pub enum GuestLaneSelection {
     Selected,
     /// Awaiting the MM's live backing; completed by `bind_live_backing`.
     Deferred,
+}
+
+/// Lifecycle point at which an MM's lane was sampled (see
+/// [`HostLaneCause`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum GuestLaneSite {
+    /// The MM's stage-1 authority was bound to its live backing.
+    InitialBind = 0,
+    /// Fork planning, after the pending-selection retry.
+    ForkPlan = 1,
+    /// A COW the host completed for an MM on the host lane.
+    HostCow = 2,
+}
+
+impl GuestLaneSite {
+    pub const COUNT: usize = 3;
+}
+
+/// Why an MM is on the host descriptor lane at a sampled instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum HostLaneCause {
+    /// No guest selection was ever admitted on this authority (select never
+    /// ran for it, or ran on another authority object).
+    NeverSelected = 0,
+    /// Selection admitted; no live backing is bound to this authority.
+    PendingNoBacking = 1,
+    /// Selection admitted; the authority holds no manager to promote.
+    PendingNoManager = 2,
+    /// Selection admitted; host edits are staged and unsynced.
+    PendingUnsyncedEdits = 3,
+    /// Selection admitted, backing bound, nothing blocks it: only a bind
+    /// that never happened is missing.
+    PendingAwaitingBind = 4,
+    /// The authority the engine plans with is not the one the backend binds
+    /// its live backing and COW lane to.
+    AuthorityMismatch = 5,
+}
+
+impl HostLaneCause {
+    pub const COUNT: usize = 6;
 }
 
 /// Why a guest descriptor lane selection was refused (the MM stays on the
@@ -3137,5 +3203,52 @@ mod tests {
         );
         assert!(!unbound.complete_pending_guest_lane());
         assert_eq!(unbound.live_descriptor_owner(), LiveDescriptorOwner::Host);
+    }
+
+    /// Every way an MM can sit on the host lane is named, without side
+    /// effects, so a signed run can say which one a stranded parent is in.
+    #[test]
+    fn host_lane_cause_names_why_a_pending_selection_has_not_completed() {
+        let resolver = Arc::new(BufferResolver {
+            buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
+            base: LINUX_PAGE_TABLES_BASE,
+        }) as Arc<dyn HostArenaResolver + Send + Sync>;
+        let never = Stage1Authority::new_with_manager(Some(test_manager()));
+        assert_eq!(never.host_lane_cause(), Some(HostLaneCause::NeverSelected));
+
+        let pending = Stage1Authority::new_with_manager(Some(test_manager()));
+        assert_eq!(
+            pending.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Deferred)
+        );
+        assert_eq!(
+            pending.host_lane_cause(),
+            Some(HostLaneCause::PendingNoBacking)
+        );
+        pending.inner.lock().host_resolver = Some(Arc::clone(&resolver));
+        assert_eq!(
+            pending.host_lane_cause(),
+            Some(HostLaneCause::PendingAwaitingBind)
+        );
+        assert_eq!(
+            pending.host_lane_cause(),
+            Some(HostLaneCause::PendingAwaitingBind),
+            "observation changes nothing"
+        );
+        assert!(pending.complete_pending_guest_lane());
+        assert_eq!(pending.host_lane_cause(), None);
+
+        let mut staged = test_manager();
+        staged.set_prot_none(LINUX_MMAP_BASE, 0x1000, None).unwrap();
+        let dirty = Stage1Authority::new_with_manager(Some(staged));
+        assert_eq!(
+            dirty.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Deferred)
+        );
+        dirty.inner.lock().host_resolver = Some(resolver);
+        assert_eq!(
+            dirty.host_lane_cause(),
+            Some(HostLaneCause::PendingUnsyncedEdits)
+        );
     }
 }

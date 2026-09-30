@@ -1104,3 +1104,31 @@ fn frame_cow_repoints_only_pages_that_name_the_faulting_frame() {
         },
     );
 }
+
+#[test]
+fn host_lane_samples_are_counted_by_cause_and_site() {
+    use crate::hvf_aarch64_engine::HostCowLedger;
+    use carrick_aarch64::stage1_authority::{GuestLaneSite, HostLaneCause};
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let carrier = HostCowLedger::default();
+    let before = carrier.snapshot();
+    let mm = carrier.admit_mm();
+    mm.record_host_lane_cause(GuestLaneSite::ForkPlan, HostLaneCause::PendingNoBacking);
+    mm.record_host_lane_cause(GuestLaneSite::HostCow, HostLaneCause::PendingNoBacking);
+    mm.record_host_lane_cause(GuestLaneSite::HostCow, HostLaneCause::PendingNoBacking);
+    mm.record_host_lane_cause(GuestLaneSite::InitialBind, HostLaneCause::NeverSelected);
+    let delta = carrier.snapshot().checked_delta(&before).unwrap();
+    assert_eq!(
+        delta.host_lane_samples[HostLaneCause::PendingNoBacking as usize],
+        [0, 1, 2]
+    );
+    assert_eq!(
+        delta.host_lane_samples[HostLaneCause::NeverSelected as usize],
+        [1, 0, 0]
+    );
+    assert_eq!(
+        delta.host_lane_samples.iter().flatten().sum::<u64>(),
+        4,
+        "every sample has one cause and one site"
+    );
+}

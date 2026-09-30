@@ -2755,7 +2755,10 @@ fn el1_fork_cow_resolves_in_guest() {
              host_cow_resolutions={} \
              host_cow_by_path[stage_fault,syscall_copy_out,backing_maintenance,\
              privileged_internal,foreign_publication]={:?} host_cow_max_per_mm={} \
-             guest_lane_host_cow_by_path[same order]={:?}",
+             guest_lane_host_cow_by_path[same order]={:?} \
+             host_lane_samples[cause=never_selected,pending_no_backing,pending_no_manager,\
+             pending_unsynced_edits,pending_awaiting_bind,authority_mismatch][site=initial_bind,\
+             fork_plan,host_cow]={:?}",
             pool_after.0.saturating_sub(pool_before.0),
             core::array::from_fn::<u64, { carrick_el1_abi::COW_DECLINE_REASONS }, _>(|i| {
                 pool_after.1[i].saturating_sub(pool_before.1[i])
@@ -2766,6 +2769,7 @@ fn el1_fork_cow_resolves_in_guest() {
             cow.host_cow_by_path,
             cow.host_cow_max_per_mm,
             cow.guest_lane_host_cow_by_path,
+            cow.host_lane_samples,
         );
         let grants_after = carrick_embed::el1_frame_grant_stats();
         let faults_after = read_el1_counters().map_or(0, |c| {

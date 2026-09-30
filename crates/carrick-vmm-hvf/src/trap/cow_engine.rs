@@ -4181,6 +4181,8 @@ impl HvfTaskState {
             self.mm_access
                 .host_cow_stats
                 .record_host_cow_resolution(path);
+            self.mm_access
+                .sample_host_lane(carrick_aarch64::stage1_authority::GuestLaneSite::HostCow);
         }
         Ok(true)
     }

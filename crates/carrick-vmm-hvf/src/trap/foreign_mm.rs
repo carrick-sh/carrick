@@ -699,6 +699,14 @@ impl MmAccessState {
         }
     }
 
+    /// Sample why this MM's authority is on the host lane (nothing when it
+    /// is guest-owned) at `site`.
+    pub(crate) fn sample_host_lane(&self, site: carrick_aarch64::stage1_authority::GuestLaneSite) {
+        if let Some(cause) = self.page_tables_authority().host_lane_cause() {
+            self.host_cow_stats.record_host_lane_cause(site, cause);
+        }
+    }
+
     pub(crate) fn set_live_resolver(
         &self,
         resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
@@ -707,6 +715,7 @@ impl MmAccessState {
         // SAFETY: `resolver` is authenticated by the caller/live state.
         let promoted = unsafe { self.page_tables.read().bind_live_backing(resolver) };
         self.record_guest_lane_promotion(promoted);
+        self.sample_host_lane(carrick_aarch64::stage1_authority::GuestLaneSite::InitialBind);
     }
 
     pub(crate) fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {
@@ -720,6 +729,7 @@ impl MmAccessState {
             let promoted =
                 unsafe { page_tables.bind_live_backing(std::sync::Arc::clone(resolver)) };
             self.record_guest_lane_promotion(promoted);
+            self.sample_host_lane(carrick_aarch64::stage1_authority::GuestLaneSite::InitialBind);
         }
         if cow_refusal_diagnostics_enabled() && !previous.shares_exact_authority(&page_tables) {
             let old_root = previous.root_base();
