@@ -86,7 +86,7 @@ pub use debug::{
 pub use exec::{ExecError, ExecPrepareError, PreparedExec};
 pub use fd_ceiling::FdCeilingAuthority;
 pub use frame_inventory::{
-    FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
+    ExactMappingRow, FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
     FrameInventorySnapshot, FrameRow, MappingRow,
 };
 pub use ids::{
