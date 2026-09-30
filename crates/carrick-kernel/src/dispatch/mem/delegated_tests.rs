@@ -681,6 +681,15 @@ fn fault_answers(dispatcher: &SyscallDispatcher, pages: &[u64]) -> Vec<FaultAnsw
         .collect()
 }
 
+fn mincore(
+    dispatcher: &SyscallDispatcher,
+    memory: &CountingMmapMemory,
+    address: u64,
+    pages: u64,
+) -> Option<Vec<u8>> {
+    dispatcher.mincore_residency_vector(memory, address, pages, PAGE)
+}
+
 const RW: u64 = LINUX_PROT_READ | LINUX_PROT_WRITE;
 
 #[test]
@@ -725,6 +734,26 @@ fn delegated_host_venue_arming_follows_guest_venue_edits() {
     twin.munmap(base + PAGE, PAGE);
     twin.same("after a guest-venue munmap", |d, _| {
         fault_answers(d, &pages)
+    });
+}
+
+#[test]
+fn delegated_mincore_across_root_and_file_mappings_reads_the_root() {
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.anonymous(base, 2 * PAGE, RW);
+    twin.file(base + 2 * PAGE);
+    twin.same(
+        "untouched anonymous pages beside a loaded file page",
+        |d, m| mincore(d, m, base, 3),
+    );
+    assert_eq!(
+        mincore(&twin.delegated, &twin.delegated_memory, base, 3),
+        Some(vec![0, 0, 1])
+    );
+    twin.touch(base + PAGE);
+    twin.same("after the first touch of one anonymous page", |d, m| {
+        mincore(d, m, base, 3)
     });
 }
 

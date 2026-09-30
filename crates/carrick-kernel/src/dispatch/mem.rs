@@ -1747,7 +1747,8 @@ impl<'a> MemView<'a> {
     /// mincore03), while a file-backed or populated mlocked mapping is
     /// (mincore02/04). Pages outside every post-exec VMA belong to loader-
     /// populated initial regions (ELF text/data, heap, stack, trampolines) and
-    /// stay resident, matching the prior conservative default.
+    /// stay resident, matching the prior conservative default. On a delegated
+    /// MM the root's anonymous rows outside the heap count as post-exec VMAs.
     pub(in crate::dispatch::mem) fn mincore_residency_vector(
         &self,
         memory: &impl CurrentMmMemory,
@@ -1761,13 +1762,20 @@ impl<'a> MemView<'a> {
         let mm_key = self.mm_authority().mm_id.raw();
         let guest_residency = carrick_el1_abi::frame_grant_residency_host();
         let zero_reads = mem.deferred_anonymous.snapshot().zero_read_resident;
+        // A delegated root's anonymous rows outside the heap are post-exec
+        // VMAs exactly like `dynamic_maps` (the heap stays loader-populated).
+        let end = address.checked_add(pages.checked_mul(page_size)?)?;
+        let root_rows = mem.root_first_touch_extents(address, end);
         let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
         for index in 0..pages {
             let page = address.checked_add(index.checked_mul(page_size)?)?;
             let in_dynamic = mem
                 .dynamic_maps
                 .iter()
-                .any(|m| page >= m.start && page < m.end);
+                .any(|m| page >= m.start && page < m.end)
+                || root_rows
+                    .iter()
+                    .any(|(row, _)| row.start().raw() <= page && page < row.end().raw());
             let resident = if in_dynamic {
                 ranges_contain_page(&mem.resident_ranges, page)
                     || guest_residency.is_some_and(|table| table.is_guest_committed(mm_key, page))
