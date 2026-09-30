@@ -1877,6 +1877,13 @@ where
                                 process.pid(),
                                 kernel_context.task().key().id.raw(),
                             );
+                            // The lane decides who applies the staged alias
+                            // inventory: this arm on the host lane; the backend,
+                            // before its EL1 `MapAlias`, on the guest-owned lane
+                            // (the leaf carries the applied inventory revision).
+                            // The lane is fixed per MM and never demoted.
+                            let guest_lane = engine.live_descriptor_owner()
+                                == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
                             if let Err(error) = engine.begin_alias_inventory(reservation) {
                                 let abandoned = kernel_context
                                     .kernel()
@@ -1910,7 +1917,9 @@ where
                                     .kernel()
                                     .frame_inventory()
                                     .abandon(inventory_transaction);
-                                debug_assert!(abandoned);
+                                // A guest-lane backend that had applied the batch
+                                // rolled it back itself; its reservation is spent.
+                                debug_assert!(abandoned || guest_lane);
                                 drop(registry);
                                 drop(install);
                                 tracing::error!(
@@ -1945,12 +1954,25 @@ where
                                     },
                                 )
                             };
-                            let Some(commit) = engine.take_alias_inventory() else {
-                                return Err(refuse(
-                                    Site::InventoryCommitMissing,
-                                    "backend staged no alias inventory commit".to_owned(),
-                                    None,
-                                ));
+                            let commit = match (engine.take_alias_inventory(), guest_lane) {
+                                (Some(commit), false) => Some(commit),
+                                // Applied by the backend before publication.
+                                (None, true) => None,
+                                (None, false) => {
+                                    return Err(refuse(
+                                        Site::InventoryCommitMissing,
+                                        "backend staged no alias inventory commit".to_owned(),
+                                        None,
+                                    ));
+                                }
+                                (Some(_), true) => {
+                                    return Err(refuse(
+                                        Site::InventoryPublish,
+                                        "guest-lane backend published an alias without applying its inventory"
+                                            .to_owned(),
+                                        None,
+                                    ));
+                                }
                             };
                             // Publish to the kernel frame-inventory authority BEFORE
                             // releasing the registry guard. Staging above made a fresh
@@ -1968,7 +1990,9 @@ where
                             // staging order, as the registry reuse relies on. Lock order
                             // is unchanged: the authority mutex is a leaf
                             // (`frame_inventory.rs` never calls out while holding it).
-                            let published = apply_alias_frame_inventory(&kernel_context, commit);
+                            let published = commit.map_or(Ok(()), |commit| {
+                                apply_alias_frame_inventory(&kernel_context, commit)
+                            });
                             drop(registry);
                             if let Err(error) = published {
                                 return Err(refuse(

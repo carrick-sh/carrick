@@ -174,6 +174,34 @@ pub struct Aarch64VcpuSnapshot {
     pub fpcr: u32,
 }
 
+/// Why a guest-lane host alias publication
+/// ([`Aarch64Vmm::publish_guest_host_alias`]) did not complete, typed by what
+/// the backend has already undone, so the caller's rollback cannot repeat or
+/// skip a step.
+#[derive(Debug)]
+pub enum GuestAliasRefusal {
+    /// Refused before the kernel inventory authority saw the alias. The
+    /// staged alias inventory is still armed and no descriptor was submitted:
+    /// the caller discards the staging and retires the VA span, exactly as
+    /// the host lane does after a refused `map_aliased`.
+    BeforeInventory(TrapError),
+    /// The inventory was applied and publication then refused. The backend
+    /// has retired every leaf of the VA span through EL1, then rolled the
+    /// kernel grant and its own staged extents back, in that order, so no
+    /// leaf ever names a mapping the authority no longer knows. Nothing
+    /// remains staged; the caller only unregisters the alias.
+    RolledBack(TrapError),
+}
+
+impl GuestAliasRefusal {
+    #[must_use]
+    pub fn into_error(self) -> TrapError {
+        match self {
+            Self::BeforeInventory(error) | Self::RolledBack(error) => error,
+        }
+    }
+}
+
 /// The driving vCPU's maintenance and guest publication venue. Backing
 /// transactions retain their owners while invoking these synchronous steps.
 pub trait Stage1Services {
@@ -1006,6 +1034,40 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         payload: &[u8],
         backing: HostAliasBacking,
     ) -> Result<(u64, bool), TrapError>;
+
+    /// Guest-owned lane half of `map_host_alias`, after [`Self::add_alias`]
+    /// staged the alias frame inventory. Applies that inventory to the kernel
+    /// authority FIRST, so the EL1 `MapAlias` names the mapping's real
+    /// inventory revision, then publishes the VA -> `gpa` leaves through the
+    /// driving vCPU. A refusal reports how far it got; see
+    /// [`GuestAliasRefusal`].
+    fn publish_guest_host_alias(
+        &mut self,
+        _va: u64,
+        _gpa: u64,
+        _len: u64,
+        _writable: bool,
+        _services: &mut dyn Stage1Services,
+    ) -> Result<(), GuestAliasRefusal> {
+        Err(GuestAliasRefusal::BeforeInventory(TrapError::Hypervisor(
+            "backend cannot publish guest host aliases".to_owned(),
+        )))
+    }
+
+    /// Guest-owned lane `restore_shared_identity`: republish `[va, va+len)`
+    /// of the shared aperture onto its own identity IPA through EL1, named by
+    /// the aperture's live inventory extent. Like the host lane, this edits
+    /// only stage-1; no alias or ownership metadata is recorded.
+    fn restore_guest_shared_identity(
+        &mut self,
+        _va: u64,
+        _len: usize,
+        _services: &mut dyn Stage1Services,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend cannot restore guest shared identity".to_owned(),
+        ))
+    }
 
     /// Prepare private-anonymous backing retirement before any stage-1 edit.
     /// `None` refuses without mutation. The caller owns MM mutation exclusion.
