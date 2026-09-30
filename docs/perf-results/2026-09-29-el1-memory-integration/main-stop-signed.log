@@ -1,0 +1,91 @@
+   Compiling serde_core v1.0.228
+   Compiling syn v2.0.117
+   Compiling log v0.4.29
+   Compiling once_cell v1.21.4
+   Compiling smallvec v1.15.1
+   Compiling errno v0.3.14
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-sched-core)
+   Compiling digest v0.10.7
+   Compiling carrick-mmu-core v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-mmu-core)
+   Compiling carrick-pipe-core v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-pipe-core)
+   Compiling rustix v1.1.4
+   Compiling sha2 v0.10.9
+   Compiling parking_lot_core v0.9.12
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-el1-image)
+   Compiling tracing-core v0.1.36
+   Compiling parking_lot v0.12.5
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-fd-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-el1-abi)
+   Compiling tempfile v3.27.0
+   Compiling serde_json v1.0.149
+   Compiling pest_generator v2.8.6
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling tracing-attributes v0.1.31
+   Compiling clap_derive v4.6.1
+   Compiling pest_derive v2.8.6
+   Compiling dtrace-parser v0.3.0
+   Compiling scroll v0.13.0
+   Compiling goblin v0.10.5
+   Compiling tracing v0.1.44
+   Compiling zerocopy v0.8.48
+   Compiling clap v4.6.1
+   Compiling serde v1.0.228
+   Compiling usdt-impl v0.6.0
+   Compiling serde_tokenstream v0.2.3
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling toml_edit v0.22.27
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+   Compiling dof v0.4.0
+   Compiling carrick-abi v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-guest-mem)
+   Compiling toml v0.8.23
+   Compiling usdt v0.6.0
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-observability)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-mem)
+   Compiling carrick-signal-linux v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-signal-linux)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-hal)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-thread)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-host-bsd)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-aarch64)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-vmm-hvf)
+    Finished `release` profile [optimized + debuginfo] target(s) in 48.86s
+/Volumes/CaseSensitive/carrick/target/release/deps/hvf_fork_probe-00f1d6d901e71c31.tmp.70623: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/target/release/deps/hvf_fork_probe-00f1d6d901e71c31
+/Volumes/CaseSensitive/carrick/target/release/deps/hvf_bl_exit_free_probe-c75f4a56630a7f3a.tmp.70623: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/target/release/deps/hvf_bl_exit_free_probe-c75f4a56630a7f3a
+/Volumes/CaseSensitive/carrick/target/release/deps/hvf_compute_baseline_probe-64d77d0de39ab6b2.tmp.70623: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/target/release/deps/hvf_compute_baseline_probe-64d77d0de39ab6b2
+/Volumes/CaseSensitive/carrick/target/release/deps/hvf_svc_tax_probe-78f1411ea7e3a1a3.tmp.70623: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/target/release/deps/hvf_svc_tax_probe-78f1411ea7e3a1a3
+/Volumes/CaseSensitive/carrick/target/release/deps/hvf_kernel_memory_probe-7cc56b58d1d04843.tmp.70623: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/target/release/deps/hvf_kernel_memory_probe-7cc56b58d1d04843
+/Volumes/CaseSensitive/carrick/target/release/deps/hvf_info_load_probe-05f217bf0b6167fc.tmp.70623: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/target/release/deps/hvf_info_load_probe-05f217bf0b6167fc
+/Volumes/CaseSensitive/carrick/target/release/deps/el1_descriptor_service-e17e886b42dcb7b3.tmp.70623: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/target/release/deps/el1_descriptor_service-e17e886b42dcb7b3
+/Volumes/CaseSensitive/carrick/target/release/deps/carrick_vmm_hvf-54c19edcc82d25ac.tmp.70623: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/target/release/deps/carrick_vmm_hvf-54c19edcc82d25ac
+test-signed: running /Volumes/CaseSensitive/carrick/target/release/deps/el1_descriptor_service-e17e886b42dcb7b3 serial_host_el1_descriptor_service --ignored --nocapture
+
+running 1 test
+test serial_host_el1_descriptor_service_executes_and_settles ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+/Volumes/CaseSensitive/carrick/target/release/deps/carrick_vmm_hvf-54c19edcc82d25ac.noent.70623: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/target/release/deps/carrick_vmm_hvf-54c19edcc82d25ac.noent.70623
+
+running 1 test
+test trap::stage2_backend::unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 619 filtered out; finished in 0.00s
+
+remaining carrick procs (run-id el1-main-stop-20260929-a) = 0
+remaining carrick procs (run-id el1-main-stop-20260929-a-cli) = 0
+test-signed: receipt target/test-results/carrick-vmm-hvf-signed-artifacts.jsonl
+test-signed: OK (carrick-vmm-hvf: 1 invoked signed executable(s) passed, 8 signed, negative control passed)
