@@ -578,3 +578,79 @@ fn serial_host_el1_ipc_guest_wake_delivered_at_its_kernel_boundary() {
         )
         .unwrap();
 }
+
+/// A host-blocked eventfd reader (a host subscriber) is woken only through
+/// the owed-wake index an EL1 write publishes; EL1 signals that index to
+/// the host solely by marking its slot's pending host work. Every boundary
+/// that consumes that flag must deliver the wake: a switched-in thread's
+/// served-with-work exit and an idle exit alike, not only the host path of
+/// the executor's own thread. Otherwise the reader sleeps until some
+/// unrelated later boundary drains the index; with everyone else parked,
+/// never (`el1_ipc_two_processes_blocking`, eventfd n=8).
+#[test]
+fn serial_host_el1_ipc_every_slot_boundary_delivers_owed_host_wakes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    const SLOT: usize = 3;
+    // A private, zeroed EL1 region (the host maps a fresh one per carrier).
+    let region_bytes = vec![0u8; carrick_el1_abi::EL1_REGION_SIZE as usize];
+    carrick_el1_abi::record_el1_region_host_ptr(region_bytes.as_ptr() as usize);
+    let task = |slot: usize| {
+        let at = region_bytes.as_ptr() as usize
+            + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+            + slot * std::mem::size_of::<carrick_el1_abi::CurrentTask>();
+        // SAFETY: inside the zeroed region; all-zero is an empty task.
+        unsafe { &*(at as *const carrick_el1_abi::CurrentTask) }
+    };
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = context.kernel().ipc().unwrap();
+    let object = owner
+        .create_eventfd(0, carrick_el1_abi::ipc::EventMode::Counter)
+        .unwrap();
+    let queue = owner.wait_queue(object);
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&wakes);
+    let reader = queue.enroll_callback(move |_| {
+        seen.fetch_add(1, Ordering::Relaxed);
+    });
+    // One EL1 eventfd write, as `personality::ipc::run` performs it: step and
+    // publish under the object lock, then mark the slot's pending host work.
+    let el1_write = || {
+        let region = owner.region();
+        let mut guard = region.lock(object, &HostIpcWait).unwrap();
+        let step = guard.eventfd().unwrap().try_write(1);
+        assert!(guard.publish(step.wake).host_owed);
+        drop(guard);
+        task(SLOT).mark_pending_host_work();
+    };
+    // A switched-in thread whose write was served with work owed exits;
+    // the executor adopts it (the syscall is complete, not dispatched).
+    el1_write();
+    task(SLOT).served_with_work.store(1, Ordering::Release);
+    assert!(crate::el1_delegation::settle_el1_boundary(
+        SLOT,
+        context.kernel()
+    ));
+    let adopted = wakes.load(Ordering::Relaxed);
+    // The writer then parks and the vCPU idles out for the pending work.
+    el1_write();
+    assert!(!crate::el1_delegation::settle_el1_boundary(
+        SLOT,
+        context.kernel()
+    ));
+    let idled = wakes.load(Ordering::Relaxed);
+    assert!(!task(SLOT).has_pending_host_work());
+    drop(reader);
+    owner
+        .release(IpcBacking::EventFd { object }.encode())
+        .unwrap();
+    carrick_el1_abi::record_el1_region_host_ptr(0);
+    assert_eq!(
+        (adopted, idled),
+        (1, 2),
+        "each boundary that consumes pending host work delivers the owed wake"
+    );
+}

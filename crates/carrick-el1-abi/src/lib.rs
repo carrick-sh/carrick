@@ -2779,6 +2779,17 @@ pub fn clear_pending_host_work(slot: usize) {
     current_task.pending_host_work.store(0, Ordering::Release);
 }
 
+/// Check and atomically clear return-to-user work for the vCPU at `slot`.
+pub fn take_pending_host_work(slot: usize) -> bool {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return false;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.pending_host_work.swap(0, Ordering::AcqRel) != 0
+}
+
 /// Mark return-to-user work pending for all vCPU slots.
 pub fn mark_pending_host_work_all() {
     let ptr = get_el1_region_host_ptr();
