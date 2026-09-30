@@ -1239,6 +1239,55 @@ mod tests {
         assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4));
     }
 
+    /// With stocked rings (the host keeps them provisioned), the first write
+    /// of a fresh pipe is served in EL1: it takes a ring from the stock under
+    /// the object lock, with no host exit. The stock only shrinks by that.
+    #[test]
+    fn el1_ipc_io_first_write_takes_a_stocked_ring_without_forwarding() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        for _ in 0..2 {
+            let ring = IpcPipeStorage {
+                offset: w.bump(65536 + 16 * 8),
+                ring_bytes: 65536,
+                pages: 16,
+            };
+            assert_eq!(w.region.stock_ring(ring), Ok(()));
+        }
+        let object = w.unbacked_pipe_object();
+        let open = |w: &World, end, access| {
+            w.host()
+                .open(
+                    t,
+                    Fd(0),
+                    Description::new(IpcBacking::Pipe { object, end }.encode(), access, NONBLOCK),
+                    false,
+                )
+                .unwrap()
+                .0
+        };
+        let r = open(&w, End::Reader, AccessMode::ReadOnly);
+        let wfd = open(&w, End::Writer, AccessMode::WriteOnly);
+        w.mem.map(MM, 0x10000, PAGE);
+        w.mem.write(MM, 0x10000, b"ping");
+        let mut f = syscall(SYS_WRITE, wfd, 0x10000, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4), "served in EL1");
+        let mut f = syscall(SYS_READ, r, 0x10000, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4));
+        assert_eq!(host_calls(&w), 0);
+        let mut g = w.region.lock(object, &HostWait).unwrap();
+        assert!(g.pipe().unwrap().is_backed());
+        drop(g);
+        // One stocked ring is left; a third pipe takes it, a fourth forwards.
+        let mut backed = 0;
+        for _ in 0..2 {
+            let other = w.unbacked_pipe_object();
+            let mut g = w.region.lock(other, &HostWait).unwrap();
+            backed += usize::from(g.provide_ring_from_stock().unwrap());
+        }
+        assert_eq!(backed, 1);
+    }
+
     #[test]
     fn el1_ipc_io_copy_faults_forward_before_effects_and_keep_prefixes() {
         let mut w = world();

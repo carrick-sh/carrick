@@ -1197,3 +1197,55 @@ fn el1_ipc_too_small_retained_ring_is_retired_at_creation() {
         "retired storage must be collected before the next creation"
     );
 }
+
+/// The ring stock holds only default-capacity rings inside the pool, is
+/// bounded, and is spent only by a live, readable, default-capacity pipe
+/// that has no ring yet; every other case keeps the stock intact.
+#[test]
+fn el1_ipc_ring_stock_is_bounded_and_spent_only_on_first_writes() {
+    let fx = fixture(1 << 20);
+    let mut odd = fx.pipe_storage();
+    odd.ring_bytes = 8192;
+    odd.pages = 2;
+    assert_eq!(fx.region.stock_ring(odd), Err(odd), "not a stock ring");
+    let outside = IpcPipeStorage {
+        offset: fx.pool_len,
+        ..fx.pipe_storage()
+    };
+    assert_eq!(fx.region.stock_ring(outside), Err(outside));
+    let stocked = fx.pipe_storage();
+    assert_eq!(fx.region.stock_ring(stocked), Ok(()));
+    let mut none = None;
+    let pipe = fx.region.create_pipe(65536, &mut none, &Spin).unwrap();
+    let big = fx.region.create_pipe(1 << 20, &mut none, &Spin).unwrap();
+    let mut g = fx.region.lock(big, &Spin).unwrap();
+    assert_eq!(g.provide_ring_from_stock(), Ok(false), "sized by the host");
+    drop(g);
+    let mut g = fx.region.lock(pipe, &Spin).unwrap();
+    assert_eq!(g.provide_ring_from_stock(), Ok(true));
+    assert_eq!(g.storage(), stocked);
+    assert_eq!(g.provide_ring_from_stock(), Ok(true), "already backed");
+    drop(g);
+    let other = fx.region.create_pipe(65536, &mut none, &Spin).unwrap();
+    let mut g = fx.region.lock(other, &Spin).unwrap();
+    assert_eq!(g.provide_ring_from_stock(), Ok(false), "stock empty");
+    assert!(g.pipe().unwrap().release(End::Reader).result.is_ok());
+    drop(g);
+    assert_eq!(fx.region.stock_ring(fx.pipe_storage()), Ok(()));
+    let mut g = fx.region.lock(other, &Spin).unwrap();
+    assert_eq!(
+        g.provide_ring_from_stock(),
+        Ok(false),
+        "EPIPE spends no ring"
+    );
+    drop(g);
+    // Fill the stock (one extent repeated: nothing takes these back).
+    let ring = fx.pipe_storage();
+    let mut fill = 1;
+    while fx.region.ring_stock_has_room() {
+        assert_eq!(fx.region.stock_ring(ring), Ok(()));
+        fill += 1;
+    }
+    assert_eq!(fill, IPC_RING_STOCK);
+    assert_eq!(fx.region.stock_ring(ring), Err(ring), "bounded");
+}
