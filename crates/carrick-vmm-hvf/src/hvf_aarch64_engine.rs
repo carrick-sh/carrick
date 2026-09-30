@@ -51,6 +51,7 @@ struct HostCowLedgerInner {
     guest_lane_refused_census: std::sync::atomic::AtomicU64,
     guest_lane_refused_no_resolver: std::sync::atomic::AtomicU64,
     guest_lane_refused_unsynced: std::sync::atomic::AtomicU64,
+    guest_lane_refused_hatch: std::sync::atomic::AtomicU64,
     guest_lane_deferred: std::sync::atomic::AtomicU64,
     guest_cow_settled: std::sync::atomic::AtomicU64,
     guest_cow_provisioned: std::sync::atomic::AtomicU64,
@@ -131,8 +132,9 @@ pub struct HostCowSnapshot {
     /// the live binding did not admit it.
     pub guest_lane_selected: u64,
     pub guest_lane_refused: u64,
-    /// Refusals by reason (census, no live resolver, unsynced host edits).
-    pub guest_lane_refused_reasons: [u64; 3],
+    /// Refusals by reason (census, no live resolver, unsynced host edits,
+    /// operator hatch `CARRICK_EL1_DESCRIPTOR_LANE=0`).
+    pub guest_lane_refused_reasons: [u64; 4],
     /// Selections admitted before the MM's live backing existed; each is
     /// counted again in `guest_lane_selected` when the binding completes it.
     pub guest_lane_deferred: u64,
@@ -177,14 +179,17 @@ impl HostCowSnapshot {
             guest_lane_refused: self
                 .guest_lane_refused
                 .checked_sub(before.guest_lane_refused)?,
-            guest_lane_refused_reasons: [
-                self.guest_lane_refused_reasons[0]
-                    .checked_sub(before.guest_lane_refused_reasons[0])?,
-                self.guest_lane_refused_reasons[1]
-                    .checked_sub(before.guest_lane_refused_reasons[1])?,
-                self.guest_lane_refused_reasons[2]
-                    .checked_sub(before.guest_lane_refused_reasons[2])?,
-            ],
+            guest_lane_refused_reasons: {
+                let mut delta = [0; 4];
+                for (slot, (now, then)) in delta.iter_mut().zip(
+                    self.guest_lane_refused_reasons
+                        .iter()
+                        .zip(&before.guest_lane_refused_reasons),
+                ) {
+                    *slot = now.checked_sub(*then)?;
+                }
+                delta
+            },
             guest_lane_deferred: self
                 .guest_lane_deferred
                 .checked_sub(before.guest_lane_deferred)?,
@@ -260,6 +265,7 @@ impl HostCowLedger {
                 self.inner
                     .guest_lane_refused_unsynced
                     .load(Ordering::Relaxed),
+                self.inner.guest_lane_refused_hatch.load(Ordering::Relaxed),
             ],
             guest_lane_deferred: self.inner.guest_lane_deferred.load(Ordering::Relaxed),
             guest_cow_settled: self.inner.guest_cow_settled.load(Ordering::Relaxed),
@@ -286,10 +292,11 @@ impl HostCowLedger {
         &self,
         outcome: Result<
             carrick_aarch64::stage1_authority::GuestLaneSelection,
-            carrick_aarch64::stage1_authority::GuestLaneRefusal,
+            carrick_mmu_core::aarch64::GuestLaneRefusal,
         >,
     ) {
-        use carrick_aarch64::stage1_authority::{GuestLaneRefusal, GuestLaneSelection};
+        use carrick_aarch64::stage1_authority::GuestLaneSelection;
+        use carrick_mmu_core::aarch64::GuestLaneRefusal;
         use std::sync::atomic::Ordering;
         let inner = &self.inner;
         match outcome {
@@ -305,6 +312,7 @@ impl HostCowLedger {
                     GuestLaneRefusal::Census => &inner.guest_lane_refused_census,
                     GuestLaneRefusal::NoLiveResolver => &inner.guest_lane_refused_no_resolver,
                     GuestLaneRefusal::UnsyncedEdits => &inner.guest_lane_refused_unsynced,
+                    GuestLaneRefusal::OperatorHatch => &inner.guest_lane_refused_hatch,
                 }
                 .fetch_add(1, Ordering::Relaxed)
             }
@@ -2371,7 +2379,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &self,
         outcome: Result<
             carrick_aarch64::stage1_authority::GuestLaneSelection,
-            carrick_aarch64::stage1_authority::GuestLaneRefusal,
+            carrick_mmu_core::aarch64::GuestLaneRefusal,
         >,
     ) {
         self.state

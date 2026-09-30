@@ -920,7 +920,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         &self,
         _outcome: Result<
             crate::stage1_authority::GuestLaneSelection,
-            crate::stage1_authority::GuestLaneRefusal,
+            carrick_mmu_core::aarch64::GuestLaneRefusal,
         >,
     ) {
     }

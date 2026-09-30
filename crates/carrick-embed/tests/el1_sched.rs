@@ -2955,7 +2955,7 @@ fn el1_fork_cow_resolves_in_guest() {
         // count means little without knowing the guest lane was selected.
         println!(
             "el1-sched fork-cow pages={pages} guest_lane_selected={} guest_lane_refused={} \
-             refused[census,no_resolver,unsynced]={:?} deferred={}",
+             refused[census,no_resolver,unsynced,hatch]={:?} deferred={}",
             cow.guest_lane_selected,
             cow.guest_lane_refused,
             cow.guest_lane_refused_reasons,

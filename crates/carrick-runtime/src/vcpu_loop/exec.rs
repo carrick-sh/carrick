@@ -2127,15 +2127,18 @@ where
         if replacement_loaded {
             crate::HVPATCH_TASK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let committed_mm = committed_context.shared().mm().id();
+        let committed_owned_mm = committed_context.shared().mm();
+        let committed_mm = committed_owned_mm.id();
         let committed_asid_generation = kernel.hvpatch_process.as_ref().map_or(
             committed_mm.raw(),
             crate::hvpatch::ProcessContext::asid_generation,
         );
-        engine.bind_task_snapshot_identity(committed_mm.raw(), committed_asid_generation);
-        super::signal::select_guest_descriptor_lane(
+        super::signal::admit_bound_mm(
             engine,
-            super::signal::GuestDescriptorLanePrecondition::current(),
+            &super::signal::BoundMm {
+                mm: committed_owned_mm,
+                asid_generation: committed_asid_generation,
+            },
         );
         #[cfg(test)]
         self.fail_exec_terminal_context_for_test(
