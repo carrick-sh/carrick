@@ -1140,10 +1140,10 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "function": "<KernelFrameCowAuthority as carrick_hal::FrameCowAuthority>::apply_foreign_cow",
       "ordinal_in_function": 2,
-      "fingerprint": "ab032d4936ccb7125fef9949f35fb08905c29069febd958860e219c2db0a35fc",
+      "fingerprint": "512dc4ffa810fb5ca350620dc6f643b8afdab59716ec8b34067aa1f61f9d1a49",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Applied foreign COW frame inventory receipt failed authorization, revision, or owner generation verification; continuing would mint an unauthenticated foreign COW proof.",
+      "rationale": "Applied foreign COW frame inventory receipt failed authorization, revision, or owner generation verification; continuing would mint an unauthenticated foreign COW proof. Re-reviewed 2026-09-30: a clean EL1 refusal (receipt NotApplied Refused/RolledBack) now returns an error and rolls the prepared backing back; this abort fires only for an unsettled or unauthenticated outcome.",
       "sink": "fatal",
       "domain": "hvpatch::frame_inventory"
     },
