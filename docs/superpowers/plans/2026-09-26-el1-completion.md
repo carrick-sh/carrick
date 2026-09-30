@@ -38,16 +38,42 @@ historical campaign verbatim. The local handoff is
 `.worktrees/EL1-HANDOFF-2026-09-29.md`; this controller supersedes its stale
 status/order statements where explicitly corrected below.
 
-**Execution status: PAUSED by user request.** Current implementation and
-controller are consolidated on local main. The signed descriptor-service test
-passed on source `4d3484cc2`; domain lint remains red on unreviewed IPC inventory
-classifications. Main's [stopping receipt](../../perf-results/2026-09-29-el1-memory-integration/stopping-point.md)
-records scope, evidence, excluded branches and resume obligations. This status
-supersedes all historical active/next statements below; do not resume without
-a user request. No checkpoint or end-to-end completion is claimed.
+**Execution status: RESUMED 2026-09-29 (user: "finish our el1 migration",
+"take the big swing", land progress on main).** The pause below is
+historical. Current state, from signed and host evidence on main:
+
+- **Writer census: engine and backend writers converted.** One shared
+  per-terminal rule (`TerminalRule`, `PageTableManager::apply_rule`,
+  `DescriptorOp::Terminal`) carries mprotect, munmap retirement, retired
+  reset, BUS tags and fork arming on both lanes (page-for-page equivalence
+  tests); table reclaim returns unlinked tables through receipts; alias
+  maps, retained reuse, sparse/file materialization, frame-grant
+  replacement (declined to the converted sparse path) and foreign-MM COW
+  (borrowed-TTBR0 ASID admission) publish through EL1. Host copyout is
+  recorded converted; `backend_writers` stays false until the admitted
+  lane passes the signed ladder.
+- **Lane selection** completes when live backing binds (deferred intent);
+  the carrier ledger records selected/deferred/refused-by-reason and the
+  fork-COW witness prints them.
+- **Admission experiment (forced locally, signed):** the lane is now
+  actually selected; el1_sched passes 17/17. Next blocker:
+  `CopyWindowAbsent` - exec-rebuilt images lose the EL1 COW copy-alias
+  leaves (worker assigned: one provisioning invariant + fork-arm
+  exclusion).
+- **Open signed reds:** anonymous reservations (host mmap/brk policy,
+  checkpoint 2), fork COW host-resolved until admission, two-process IPC
+  blocking wedge at pipe n=64 (owed-wake fix landed; census
+  discriminators in progress), inotify09 contract watchdog (pre-existing).
+- **Follow-ups:** guest-lane refusal of a kernel-staged alias batch loses
+  the host lane's abort post-mortem; `cow_armed` backend metadata can be
+  stale after EL1-resolved COW; foreign-drain retirement wait lock order.
+
+X86 remains deferred. No checkpoint closure is claimed until admission
+is enabled and the signed two-live-MM ownership witnesses pass.
 
 See the [paused handoff and unfinished branch inventory](2026-09-29-el1-paused-handoff.md)
-for preserved branch heads, dirty inotify files, evidence limits and resume order.
+for the historical branch record (all listed branches are now merged or
+superseded; their worktrees were removed).
 
 ## User-requested consolidation and stopping point
 
