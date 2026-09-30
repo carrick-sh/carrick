@@ -1769,7 +1769,7 @@ mod tests {
                 root: SubstrateGpa(ROOT),
                 op: DescriptorOp::Terminal {
                     span: PageSpan::new(VA, 4096),
-                    edit: TerminalEdit::fork_arm(false, false, true, 0, 0),
+                    edit: TerminalEdit::fork_arm(false, false, false, true, 0, 0),
                 },
                 tables: TableGrants::NONE,
             };

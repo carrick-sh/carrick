@@ -2754,7 +2754,7 @@ fn el1_fork_cow_resolves_in_guest() {
              guest_cow_provisioned={} guest_cow_settled={} \
              host_cow_resolutions={} \
              host_cow_by_path[stage_fault,syscall_copy_out,backing_maintenance,\
-             privileged_internal,foreign_publication]={:?} host_cow_first_mm={} \
+             privileged_internal,foreign_publication]={:?} host_cow_max_per_mm={} \
              guest_lane_host_cow_by_path[same order]={:?}",
             pool_after.0.saturating_sub(pool_before.0),
             core::array::from_fn::<u64, { carrick_el1_abi::COW_DECLINE_REASONS }, _>(|i| {
@@ -2764,7 +2764,7 @@ fn el1_fork_cow_resolves_in_guest() {
             cow.guest_cow_settled,
             cow.host_cow_resolutions,
             cow.host_cow_by_path,
-            cow.host_cow_first_mm,
+            cow.host_cow_max_per_mm,
             cow.guest_lane_host_cow_by_path,
         );
         let grants_after = carrick_embed::el1_frame_grant_stats();

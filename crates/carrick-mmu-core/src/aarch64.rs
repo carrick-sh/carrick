@@ -1117,6 +1117,12 @@ pub enum TerminalRule {
         reset_retired: bool,
         deny_host_buffers: bool,
         fork_arm: bool,
+        /// Before `op`, adopt a host-published EL0-writable 4 KiB leaf as
+        /// EL1-private state (the tags EL1 needs to resolve its COW itself).
+        /// Set only by fork arming of a guest-lane MM's compound-granule,
+        /// non-kernel ranges; the host editor and the EL1 executor apply
+        /// this one definition.
+        adopt_private: bool,
     },
     /// Remove EL1-private authority from prepared (invalid) file BUS-tail
     /// leaves. A resident or malformed private leaf is refused.
@@ -1132,6 +1138,20 @@ impl TerminalRule {
             reset_retired: false,
             deny_host_buffers: false,
             fork_arm: false,
+            adopt_private: false,
+        }
+    }
+
+    /// Fork COW arming of a private range, optionally adopting host-published
+    /// leaves as EL1-private so EL1 resolves their COW itself.
+    #[must_use]
+    pub const fn fork_arm(adopt_private: bool) -> Self {
+        Self::Pt {
+            op: Some(PtOp::ForkReadOnly),
+            reset_retired: false,
+            deny_host_buffers: false,
+            fork_arm: false,
+            adopt_private,
         }
     }
 }
@@ -1145,6 +1165,23 @@ pub enum TerminalRefusal {
     Resident,
     /// An EL1-private tag set with no valid encoding.
     Malformed,
+}
+
+/// The EL1-private tags a host-published leaf needs before fork arming so EL1
+/// resolves its COW itself: a valid, EL0-writable 4 KiB leaf that no EL1 grant
+/// produced gets `SW_EL1_PRIVATE` and the write (and execute) ceiling its
+/// current permission implies. Only a writable leaf qualifies: an
+/// already-restricted leaf carries no recoverable Linux write intent, so it
+/// stays with the host. Blocks stay with the host (EL1 never splits).
+fn adopt_host_leaf_as_el1_private(desc: u64, level: usize) -> u64 {
+    if level != 3
+        || desc & (VALID | SW_EL1_PRIVATE) != VALID
+        || desc & TYPE_BITS != TYPE_TABLE_OR_PAGE
+        || desc & AP_MASK != AP_RW
+    {
+        return desc;
+    }
+    desc | SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | if desc & UXN == 0 { SW_EL1_MAY_EXEC } else { 0 }
 }
 
 /// Apply `rule` to one covering terminal. `Ok(None)`: the terminal already
@@ -1170,6 +1207,7 @@ pub(crate) fn terminal_rule_edit(
             reset_retired,
             deny_host_buffers,
             fork_arm,
+            adopt_private,
         } => {
             let mut current = desc;
             if reset_retired {
@@ -1181,6 +1219,9 @@ pub(crate) fn terminal_rule_edit(
                     El1PrivateLeafState::Retired => current = 0,
                     El1PrivateLeafState::Unowned => {}
                 }
+            }
+            if adopt_private {
+                current = adopt_host_leaf_as_el1_private(current, level);
             }
             let was_resident = el1_private_leaf_state(current) == El1PrivateLeafState::Resident;
             if let Some(edited) = op.and_then(|op| {
@@ -2232,6 +2273,7 @@ impl PageTableManager {
         len: u64,
         kernel_only: bool,
         executable: bool,
+        adopt_private: bool,
     ) -> descriptor_txn::DescriptorOp {
         self.terminal_op(
             va,
@@ -2239,6 +2281,7 @@ impl PageTableManager {
             descriptor_txn::TerminalEdit::fork_arm(
                 kernel_only,
                 executable,
+                adopt_private,
                 self.asid_scoped_leaves,
                 self.layout.excluded_ipa_start,
                 self.layout.excluded_ipa_len,
@@ -4787,6 +4830,7 @@ impl PageTableManager {
                 reset_retired: true,
                 deny_host_buffers: false,
                 fork_arm: false,
+                adopt_private: false,
             },
             source,
         )?;
@@ -4866,6 +4910,7 @@ impl PageTableManager {
                 reset_retired: false,
                 deny_host_buffers: true,
                 fork_arm: false,
+                adopt_private: false,
             },
             source,
         )
@@ -5101,6 +5146,18 @@ impl PageTableManager {
         source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
         self.apply(va, len, PtOp::ReadOnly { exec }, source)
+    }
+
+    /// [`Self::set_fork_readonly`], first adopting host-published writable
+    /// 4 KiB leaves as EL1-private so EL1 can resolve their COW itself (a
+    /// guest-lane MM's compound-granule, non-kernel ranges only).
+    pub fn set_fork_readonly_adopting(
+        &mut self,
+        va: u64,
+        len: usize,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        self.apply_rule(va, len, TerminalRule::fork_arm(true), source)
     }
 
     /// Arm a private fork range read-only and make the descriptor ASID-scoped.
@@ -11513,7 +11570,7 @@ mod tests {
         .unwrap();
         let mut linked_total = 0;
         for &(va, len, kernel_only, executable) in &ranges {
-            let op = guest.fork_arm_op(va, len, kernel_only, executable);
+            let op = guest.fork_arm_op(va, len, kernel_only, executable, false);
             let plan = descriptor_txn::plan_descriptor_op(&live, SubstrateGpa(base), op).unwrap();
             let grants: TableGrants = guest
                 .reserve_primary_table_grants(plan.table_grants)
@@ -11548,6 +11605,52 @@ mod tests {
                 page += PT_PAGE;
             }
         }
+    }
+
+    /// A host-published writable leaf (no EL1 grant produced it) is invisible
+    /// to EL1 COW: fork arming left it read-only without the EL1-private tags,
+    /// so EL1 declined every write to it (`NotEl1Private`). Arming a guest-lane
+    /// MM's compound range adopts it: the classifier then sees an armed leaf
+    /// with recorded write intent, and a non-adopting arm still does not.
+    #[test]
+    fn fork_arming_adopts_host_published_leaves_for_el1_cow() {
+        use descriptor_txn::guest_cow::{GuestCowClass, GuestCowNotArmed};
+        const TWO_MIB: u64 = 1 << 21;
+        let va = LINUX_MMAP_BASE + 4 * TWO_MIB + 3 * PT_PAGE;
+        let mut image = hvpatch_manager();
+        image
+            .set_rw(va & !(TWO_MIB - 1), 2 * TWO_MIB as usize, false, None)
+            .unwrap();
+        let mut plain = image.snapshot_image().unwrap();
+        plain
+            .set_fork_readonly(va, 4 * PT_PAGE as usize, None)
+            .unwrap();
+        let leaf = terminal_descriptor(plain.debug_walk(va));
+        assert_eq!(leaf & SW_EL1_PRIVATE, 0, "host arming leaves it untagged");
+        image
+            .set_fork_readonly_adopting(va, 4 * PT_PAGE as usize, None)
+            .unwrap();
+        for page in 0..4 {
+            let leaf = terminal_descriptor(image.debug_walk(va + page * PT_PAGE));
+            assert!(
+                el1_cow(leaf),
+                "page {page}: armed and EL1-private: {leaf:#x}"
+            );
+            assert_ne!(leaf & SW_EL1_MAY_WRITE, 0, "recorded Linux write intent");
+            assert_eq!(leaf & AP_MASK, AP_RO, "hardware write restriction");
+            assert!(descriptor_txn::guest_cow::is_guest_cow_write_leaf(3, leaf));
+        }
+        // A read-only leaf has no recoverable write intent: never adopted.
+        let mut ro = image.snapshot_image().unwrap();
+        let ro_va = LINUX_MMAP_BASE + 8 * TWO_MIB;
+        ro.set_rw(ro_va, 2 * TWO_MIB as usize, false, None).unwrap();
+        ro.set_readonly(ro_va + PT_PAGE, 2 * PT_PAGE as usize, false, None)
+            .unwrap();
+        ro.set_fork_readonly_adopting(ro_va + PT_PAGE, 2 * PT_PAGE as usize, None)
+            .unwrap();
+        let leaf = terminal_descriptor(ro.debug_walk(ro_va + PT_PAGE));
+        assert_eq!(leaf & SW_EL1_PRIVATE, 0);
+        let _ = (GuestCowClass::AlreadyWritable, GuestCowNotArmed::Unmapped);
     }
 
     /// A recycled image is overwritten by `snapshot_into`, whose result must
@@ -11605,6 +11708,7 @@ mod tests {
             reset_retired,
             deny_host_buffers,
             fork_arm,
+            adopt_private: false,
         };
         // Each case gets its own disjoint neighbourhood: (va, len, rule).
         let mut image = hvpatch_manager();
@@ -11676,6 +11780,17 @@ mod tests {
             LINUX_MMAP_BASE + 20 * TWO_MIB + PT_PAGE,
             3 * PT_PAGE,
             rw(true),
+        ));
+        // Fork arming that adopts host-published writable leaves as
+        // EL1-private: one rule, both venues.
+        let adopt_va = LINUX_MMAP_BASE + 12 * TWO_MIB;
+        image
+            .set_rw(adopt_va, 2 * TWO_MIB as usize, false, None)
+            .unwrap();
+        cases.push((
+            adopt_va + 3 * PT_PAGE,
+            4 * PT_PAGE,
+            TerminalRule::fork_arm(true),
         ));
         image.declare_live_hardware_image();
 
@@ -11808,6 +11923,7 @@ mod tests {
                     reset_retired: true,
                     deny_host_buffers: false,
                     fork_arm: false,
+                    adopt_private: false,
                 },
                 DescriptorRefusal::Occupied,
             ),
