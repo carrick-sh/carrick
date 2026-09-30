@@ -1528,7 +1528,7 @@ mod tests {
 
         /// A resident writable page at `VA` and a fork arm for it.
         fn armable() -> (Arena, DescriptorTxn) {
-            use carrick_mmu_core::aarch64::descriptor_txn::ForkArmMode;
+            use carrick_mmu_core::aarch64::descriptor_txn::TerminalEdit;
             let arena = Arena::new();
             let idx = indices(VA);
             // Resident, writable, nG, EL1-private leaf.
@@ -1549,15 +1549,9 @@ mod tests {
                     generation: nz(9),
                 },
                 root: SubstrateGpa(ROOT),
-                op: DescriptorOp::ForkArm {
+                op: DescriptorOp::Terminal {
                     span: PageSpan::new(VA, 4096),
-                    arm: ForkArmMode {
-                        kernel_only: false,
-                        executable: false,
-                        asid_scoped: true,
-                        excluded_ipa: 0,
-                        excluded_len: 0,
-                    },
+                    edit: TerminalEdit::fork_arm(false, false, true, 0, 0),
                 },
                 tables: TableGrants::NONE,
             };

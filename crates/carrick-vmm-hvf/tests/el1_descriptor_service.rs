@@ -7,7 +7,7 @@ use carrick_guest_mem::GuestMemory;
 use carrick_hal::{GuestVmBackend, SyscallTrap, ThreadedEngine};
 use carrick_mem::{elf::SegmentPerms, memory::AddressSpace};
 use carrick_mmu_core::aarch64::LiveDescriptorOwner;
-use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorOp, ForkArmMode, PageSpan};
+use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorOp, PageSpan, TerminalEdit};
 use carrick_vmm_hvf::trap::new_hvf_trap_engine;
 use std::num::NonZeroU64;
 
@@ -131,15 +131,9 @@ fn serial_host_el1_descriptor_service_executes_and_settles() {
         .page_tables()
         .prepare_guest_descriptor_txn(
             mm,
-            DescriptorOp::ForkArm {
+            DescriptorOp::Terminal {
                 span: PageSpan::new(DATA, 4096),
-                arm: ForkArmMode {
-                    kernel_only: false,
-                    executable: false,
-                    asid_scoped: false,
-                    excluded_ipa: 0,
-                    excluded_len: 0,
-                },
+                edit: TerminalEdit::fork_arm(false, false, false, 0, 0),
             },
         )
         .unwrap();
