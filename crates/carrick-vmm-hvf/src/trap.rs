@@ -5450,8 +5450,7 @@ impl HvpatchTaskRegistration {
                     std::sync::Arc::clone(&cow_armed),
                     std::sync::Arc::clone(&cow_deferred_publications),
                     custody.host_cow_ledger.admit_mm(),
-                    std::sync::Arc::clone(&custody),
-                    crate::trap::foreign_mm::LiveBackingBinding::Immediate,
+                    crate::trap::foreign_mm::LiveBacking::immediate(std::sync::Arc::clone(&custody)),
                 );
                 if let Some(authority) = task_mm.mm_root_stage2.lock().take() {
                     access
@@ -7249,8 +7248,9 @@ impl HvfVmState {
                 .custody
                 .host_cow_ledger
                 .admit_mm(),
-            std::sync::Arc::clone(&plan.carrier_foreign_mm_transport.custody),
-            crate::trap::foreign_mm::LiveBackingBinding::Immediate,
+            crate::trap::foreign_mm::LiveBacking::immediate(std::sync::Arc::clone(
+                &plan.carrier_foreign_mm_transport.custody,
+            )),
         );
         for mapping in &mapped {
             if let Some(owner) = &mapping.structural_owner {

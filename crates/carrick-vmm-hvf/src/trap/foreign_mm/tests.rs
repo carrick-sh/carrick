@@ -12465,8 +12465,7 @@ mod guest_cow {
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
             crate::hvf_aarch64_engine::HostCowStats::default(),
-            custody,
-            crate::trap::foreign_mm::LiveBackingBinding::Immediate,
+            crate::trap::foreign_mm::LiveBacking::immediate(custody),
         );
         state.bind_page_tables_authority(engine_authority.clone());
         assert_eq!(
@@ -12541,8 +12540,14 @@ mod guest_cow {
                 Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                 Arc::new(parking_lot::Mutex::new(Vec::new())),
                 crate::hvf_aarch64_engine::HostCowStats::default(),
-                Arc::clone(&custody),
-                binding,
+                match binding {
+                    LiveBackingBinding::Immediate => {
+                        crate::trap::foreign_mm::LiveBacking::immediate(Arc::clone(&custody))
+                    }
+                    LiveBackingBinding::Deferred => {
+                        crate::trap::foreign_mm::LiveBacking::deferred(Arc::clone(&custody))
+                    }
+                },
             )
         };
         let authority = || {
