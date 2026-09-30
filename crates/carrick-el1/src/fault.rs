@@ -62,16 +62,22 @@ pub fn is_write_permission_fault(esr: u64) -> bool {
     matches!(ec, 0x24 | 0x25) && is_write && matches!(dfsc, 0x0c..=0x0f)
 }
 
-/// Operation needed to resolve a COW fault in EL1.
+/// Operation needed to resolve a COW fault in EL1. The caller holds the
+/// faulting MM's exact editor.
 pub trait CowResolver {
-    fn resolve_cow(&mut self, ttbr0: u64, far: u64) -> bool;
+    /// Resolve the write fault at `far` for `mm_key`, whose live root and
+    /// ASID are in `ttbr0`. `true`: retry the faulting instruction.
+    fn resolve_cow(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> bool;
+    /// The MM's editor could not be taken (another EL1 editor, or a host
+    /// pause closed its gate): the fault goes to the host.
+    fn editor_busy(&mut self) {}
 }
 
 #[derive(Default)]
 pub struct NoopCowResolver;
 
 impl CowResolver for NoopCowResolver {
-    fn resolve_cow(&mut self, _ttbr0: u64, _far: u64) -> bool {
+    fn resolve_cow(&mut self, _ttbr0: u64, _mm_key: u64, _far: u64) -> bool {
         false
     }
 }
@@ -139,28 +145,52 @@ pub struct HardwareCowResolver;
 
 #[cfg(target_os = "none")]
 impl CowResolver for HardwareCowResolver {
-    fn resolve_cow(&mut self, ttbr0: u64, far: u64) -> bool {
-        let physical_base = ttbr0 & TTBR_BADDR_MASK;
-        let words =
-            carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64;
-        let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
-        let aligned_va = far & !4095;
-        let outcome = unsafe {
-            carrick_mmu_core::aarch64::resolve_existing_el1_cow_page(
-                words,
-                physical_base,
-                byte_len,
-                aligned_va,
+    fn resolve_cow(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> bool {
+        use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
+        let maintenance = El1TableMaintenance { ttbr0 };
+        // SAFETY: the alias maps exactly this MM's primary table arena and
+        // the caller holds the MM's exact editor.
+        let Ok(words) = (unsafe {
+            PrimaryTableWords::new(
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut AtomicU64,
+                ttbr0 & TTBR_BADDR_MASK,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+                &maintenance,
             )
+        }) else {
+            return false;
         };
-        match outcome {
-            Ok(carrick_mmu_core::aarch64::GuestCowResolution::AlreadyWritable) => {
+        let outcome = crate::cow::resolve_guest_cow(
+            &crate::cow::GuestCowVenue {
+                words: &words,
+                root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
+                pool: carrick_el1_abi::cow_grant_pool_guest(),
+                copy_base: carrick_el1_abi::EL1_COW_COPY_BASE,
+            },
+            mm_key,
+            far,
+            |source, destination| {
+                // SAFETY: both aliases are mapped, distinct pages (source
+                // EL1-RO, destination EL1-RW) until the window restores them.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        source as *const u8,
+                        destination as *mut u8,
+                        4096,
+                    )
+                }
+            },
+            || {
                 let mut cpu = crate::sched::HardwareCpu;
                 crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
-                true
-            }
-            Err(_) => false,
-        }
+            },
+        );
+        !matches!(outcome, crate::cow::GuestCowOutcome::Declined(_))
+    }
+
+    fn editor_busy(&mut self) {
+        carrick_el1_abi::cow_grant_pool_guest()
+            .note_declined(carrick_el1_abi::CowDecline::EditorBusy);
     }
 }
 
@@ -721,16 +751,19 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
         };
-        let Some(grant) = spaces.grant(index, mm_key) else {
-            return Action::Forward;
-        };
         let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
             return Action::Forward;
         };
-        let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
+        // A closed gate (host pause or retirement) or another EL1 editor:
+        // the host resolves this fault.
+        let Some((grant, _editor)) = spaces
+            .grant(index, mm_key)
+            .and_then(|grant| Some((grant, spaces.try_begin_edit(index, mm_key, owner)?)))
+        else {
+            cow_resolver.editor_busy();
             return Action::Forward;
         };
-        if cow_resolver.resolve_cow(grant.ttbr0, frame.far) {
+        if cow_resolver.resolve_cow(grant.ttbr0, mm_key, frame.far) {
             return Action::Served;
         }
         return Action::Forward;
@@ -937,12 +970,12 @@ mod tests {
     #[derive(Default)]
     struct RecordingCowResolver {
         succeeds: bool,
-        calls: Vec<(u64, u64)>,
+        calls: Vec<(u64, u64, u64)>,
     }
 
     impl CowResolver for RecordingCowResolver {
-        fn resolve_cow(&mut self, ttbr0: u64, far: u64) -> bool {
-            self.calls.push((ttbr0, far));
+        fn resolve_cow(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> bool {
+            self.calls.push((ttbr0, mm_key, far));
             self.succeeds
         }
     }
@@ -1252,7 +1285,7 @@ mod tests {
             ),
             Action::Served
         );
-        assert_eq!(cow_resolver.calls, vec![(ttbr0, fault)]);
+        assert_eq!(cow_resolver.calls, vec![(ttbr0, mm, fault)]);
         assert!(!mailbox.has_guest_work());
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
     }
@@ -1285,7 +1318,7 @@ mod tests {
             ),
             Action::Forward
         );
-        assert_eq!(cow_resolver.calls, vec![(ttbr0, fault)]);
+        assert_eq!(cow_resolver.calls, vec![(ttbr0, mm, fault)]);
         assert!(!mailbox.has_guest_work());
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
     }

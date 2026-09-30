@@ -76,6 +76,7 @@
 //! host's inventory has not since moved.
 
 pub mod copy_window;
+pub mod guest_cow;
 
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
