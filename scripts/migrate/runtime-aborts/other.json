@@ -519,6 +519,28 @@
       "rationale": "Mutable KVM vCPU file descriptor accessed after drop-park in slot.",
       "sink": "fatal",
       "domain": "vmm_kvm::vcpu_fd"
+    },
+    {
+      "file": "crates/carrick-mem/src/memory.rs",
+      "function": "stage1_hvpatch_page_tables",
+      "ordinal_in_function": 1,
+      "fingerprint": "336a56f88d23d66b9e5d1c442ac85ca90030182041cc0188278cb77a4cbb85e9",
+      "verdict": "carrier_fault",
+      "failure_domain": "mem::stage1_tables",
+      "rationale": "Reserving the fixed EL1 COW copy-alias window in a freshly built page-table image operates on constant in-range addresses; failure means the layout constants overlap or the table capacity is wrong, and EL1 could not copy COW pages.",
+      "sink": "fatal",
+      "domain": "mem::stage1_tables"
+    },
+    {
+      "file": "crates/carrick-mem/src/memory.rs",
+      "function": "stage1_hvpatch_page_tables",
+      "ordinal_in_function": 2,
+      "fingerprint": "c28fbc91bbab662aed2ef06eb22672e3e289492445de88c243fd3c72471753f2",
+      "verdict": "carrier_fault",
+      "failure_domain": "mem::stage1_tables",
+      "rationale": "Serializing the freshly built page-table image cannot legitimately fail; failure means the manager produced an unrepresentable image that EL1 would boot on.",
+      "sink": "fatal",
+      "domain": "mem::stage1_tables"
     }
   ]
 }
