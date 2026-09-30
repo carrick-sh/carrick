@@ -1008,6 +1008,11 @@ pub struct SchedulerSummary {
     pub snapshot_count: u64,
     /// None means the preemption lock was contended, never an empty residency set.
     pub residencies: Option<Vec<crate::kernel::debug::dto::DebugResidencyRow>>,
+    /// Rows on host CPU run queues.
+    pub host_queued: usize,
+    /// Zone-held runnable rows and their expected owners; None when a shard
+    /// or the adoption table was contended.
+    pub zone_held: Option<Vec<crate::kernel::debug::dto::DebugZoneHeldRow>>,
 }
 
 /// What a queue insertion did with one exact row. A bare `bool` said only
@@ -1088,10 +1093,14 @@ pub(crate) struct RunQueueInner {
     online: Vec<AtomicUsize>,
     policy: Arc<dyn SchedulingPolicy>,
     event_sequence: Arc<AtomicU64>,
-    /// Threads whose next claimable row an executor adopts itself (it took
-    /// the thread off its vCPU at an exit): the row is held for it, not
-    /// placed in the guest.
-    zone_adopt: Mutex<BTreeSet<ThreadKey>>,
+    /// Threads an executor is adopting (it took a zone record of the thread
+    /// off its vCPU, or reached one at a run-queue head): the first row
+    /// published for the thread in that window is handed to the adopter
+    /// (recorded here, not placed in the guest), and the adopter owns it.
+    /// Keyed by thread, not generation: the row may be a racing wake's (a
+    /// host continuation that became ready) rather than the adoption's own,
+    /// and the adopter must claim it either way ([`Self::finish_zone_adoption`]).
+    zone_adopt: Mutex<BTreeMap<ThreadKey, Option<QueueKey>>>,
     /// Wake executors that wait in the guest (bound to a CPU, or all); set
     /// by the scheduler that owns the executor directory.
     guest_idle_waker: std::sync::OnceLock<GuestIdleWaker>,
@@ -1614,14 +1623,59 @@ impl RunQueueInner {
     /// woke it adopts it itself. With no record to spare it goes to a CPU
     /// queue, whose executor takes it on the host (and is woken for it).
     fn place_zone_row(&self, thread: &Thread, key: QueueKey) {
-        if self.zone_adopt.lock().remove(&key.thread) {
-            return;
+        {
+            let mut adopting = self.zone_adopt.lock();
+            if let Some(handed) = adopting.get_mut(&key.thread)
+                && handed.is_none()
+            {
+                // Handed to the adopter, which claims it at
+                // `finish_zone_adoption`: it has an owner.
+                *handed = Some(key);
+                return;
+            }
         }
         if crate::el1_zone::place_service(key.thread, key.generation, thread.affinity().words()[0])
         {
             return;
         }
         self.release_zone_row(key);
+    }
+
+    /// Every zone-held row, with the owner expected to run it, for a wedge
+    /// census. Never blocks: a contended shard or adoption table yields None.
+    fn zone_held_census(&self) -> Option<Vec<crate::kernel::debug::dto::DebugZoneHeldRow>> {
+        let adopting = self.zone_adopt.try_lock()?;
+        let mut rows = Vec::new();
+        for shard in &self.keys {
+            let shard = shard.try_lock()?;
+            for (key, row) in &shard.zone_held {
+                let handed = adopting.get(&key.thread) == Some(&Some(*key));
+                rows.push(crate::kernel::debug::dto::DebugZoneHeldRow {
+                    thread: crate::kernel::debug::dto::thread_key(key.thread),
+                    generation: key.generation.raw(),
+                    owner: if handed { "adopter" } else { "el1-service" }.to_owned(),
+                    state: row
+                        .thread
+                        .execution_diagnostic_until(std::time::Instant::now()),
+                });
+            }
+        }
+        Some(rows)
+    }
+
+    /// An executor starts adopting `thread`: rows published for it until
+    /// [`Self::finish_zone_adoption`] are handed to that executor. A second
+    /// concurrent adopter joins the same window (never erasing a handed row).
+    fn begin_zone_adoption(&self, thread: ThreadKey) {
+        self.zone_adopt.lock().entry(thread).or_insert(None);
+    }
+
+    /// End the adoption window of `thread`: the row handed to the adopter,
+    /// which it must claim ([`RunQueue::take_zone`]). `None`: no row was
+    /// published for the thread in the window (a racing wake coalesced it
+    /// into a row that some other owner holds).
+    fn finish_zone_adoption(&self, thread: ThreadKey) -> Option<QueueKey> {
+        self.zone_adopt.lock().remove(&thread).flatten()
     }
 
     /// Move the held row of `key` to a host run queue: no vCPU slot can take
@@ -2417,7 +2471,7 @@ impl RunQueue {
                 cpus,
                 policy,
                 event_sequence,
-                zone_adopt: Mutex::new(BTreeSet::new()),
+                zone_adopt: Mutex::new(BTreeMap::new()),
                 guest_idle_waker: std::sync::OnceLock::new(),
                 #[cfg(any(test, feature = "test-support"))]
                 close_census_gate: Mutex::new(None),
@@ -4400,22 +4454,20 @@ impl Scheduler {
         let Some(thread) = self.kernel.exact_thread_for_scheduler(key) else {
             return Ok(None);
         };
-        self.queue.inner.zone_adopt.lock().insert(key);
-        let Some(target) = thread.prepare_zone_handback(record) else {
-            self.queue.inner.zone_adopt.lock().remove(&key);
-            return Ok(None);
-        };
-        let _ = self.wake_exact(target);
-        let held = self.queue.inner.zone_adopt.lock().remove(&key);
-        if held {
-            // The wake did not queue a row (it coalesced or was refused):
-            // someone else owns this thread's next run.
-            return Ok(None);
+        self.queue.inner.begin_zone_adoption(key);
+        // A stale record (the thread has moved on, e.g. to a host wait) has
+        // no handback to prepare, but a racing wake of the thread may still
+        // publish its row inside this window: that row was handed here and
+        // is claimed below, never left held with no service record.
+        if let Some(target) = thread.prepare_zone_handback(record) {
+            let _ = self.wake_exact(target);
         }
-        let Some(generation) = thread.execution_state().generation() else {
+        let Some(handed) = self.queue.inner.finish_zone_adoption(key) else {
+            // No row was published in the window (the wake coalesced or was
+            // refused): someone else owns this thread's next run.
             return Ok(None);
         };
-        self.take_zone(executor, key, generation)
+        self.take_zone(executor, handed.thread, handed.generation)
     }
 
     fn finish_take(
@@ -5173,6 +5225,8 @@ impl Scheduler {
             need_resched: self.need_resched(),
             snapshot_count: self.snapshot_count(),
             residencies,
+            host_queued: self.queue.inner.host_queued.load(Ordering::Acquire),
+            zone_held: self.queue.inner.zone_held_census(),
         }
     }
 
@@ -7873,6 +7927,79 @@ mod tests {
                 "{cpus} guest CPUs: a zone-only handoff scanned host queues"
             );
         }
+    }
+
+    /// Contract: every runnable zone row has an owner. An executor adopting a
+    /// STALE zone record of a thread (its handback no longer prepares: the
+    /// thread moved on to a host wait) opens an adoption window keyed by
+    /// thread; the thread's host continuation becoming ready inside that
+    /// window publishes its row, which placement hands to the adopter
+    /// instead of an EL1 run queue. The adopter must claim that row. Before
+    /// the fix the window only suppressed placement and the adopter gave up
+    /// (`lost_adoptions`), leaving the row held with no service record, no
+    /// host queue entry and no owner: `el1_ipc_mixed_venue_roundtrips` run 9
+    /// (reader Runnable, continuation Ready, queued_len=1, run_queue=[]).
+    #[test]
+    fn a_wake_inside_a_failed_zone_adoption_is_claimed_by_the_adopter() {
+        let (kernel, root) = bootstrap(21_001);
+        publish(&root, 21_001);
+        let scheduler = scheduler_with_cpus(kernel, 1);
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .expect("register executor");
+        let inner = &scheduler.queue.inner;
+        let thread = root.thread().key();
+        let key = QueueKey {
+            thread,
+            generation: root.thread().execution_state().generation().unwrap(),
+        };
+        // The adopter opens its window; a stale record prepares no handback.
+        inner.begin_zone_adoption(thread);
+        // The racing wake: the host continuation's row is published.
+        {
+            let mut shard = inner.shard(key).lock();
+            shard.queued.insert(key);
+            shard.zone_held.insert(
+                key,
+                super::QueueRow {
+                    key,
+                    thread: Arc::clone(root.thread()),
+                    closing_authorized: false,
+                },
+            );
+        }
+        inner.total_queued.fetch_add(1, Ordering::SeqCst);
+        inner.place_zone_row(root.thread(), key);
+        // The wedge census names the row, its owner and its state.
+        let summary = scheduler.scheduler_summary();
+        assert_eq!(summary.host_queued, 0);
+        let held = summary.zone_held.expect("uncontended census");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].generation, key.generation.raw());
+        assert_eq!(held[0].owner, "adopter");
+        assert!(
+            held[0]
+                .state
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Runnable"))
+        );
+        // The adopter closes the window: the row is its to claim.
+        let handed = inner.finish_zone_adoption(thread);
+        let host_queued = inner.host_queued.load(Ordering::SeqCst);
+        let held = inner.shard(key).lock().zone_held.contains_key(&key);
+        assert!(
+            handed == Some(key) || host_queued == 1,
+            "a published row has no owner: handed={handed:?} host_queued={host_queued} \
+             zone_held={held}"
+        );
+        let claimed = scheduler
+            .take_zone(&executor, key.thread, key.generation)
+            .expect("take zone row");
+        assert!(claimed.is_some(), "the adopter claims the handed row");
+        assert!(!inner.shard(key).lock().zone_held.contains_key(&key));
+        // With no racing wake, the window hands nothing.
+        inner.begin_zone_adoption(thread);
+        assert_eq!(inner.finish_zone_adoption(thread), None);
     }
 
     /// One bound executor per guest CPU, so every CPU is online and placement

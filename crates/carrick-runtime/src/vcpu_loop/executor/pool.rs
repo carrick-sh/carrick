@@ -609,6 +609,8 @@ impl carrick_kernel::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebu
             need_resched: summary.need_resched,
             snapshot_count: summary.snapshot_count,
             residencies: summary.residencies,
+            host_queued: Some(summary.host_queued),
+            zone_held: summary.zone_held,
         }]
     }
 
