@@ -4577,7 +4577,7 @@ impl PageTableManager {
     /// Apply `rule` to every covering terminal of `[va, va+len)`: skip a
     /// terminal that already satisfies it, edit a covered one in place and
     /// split one the range bisects. Guest EL1 descriptor transactions apply
-    /// the same [`terminal_rule_edit`]. A refused terminal fails the edit
+    /// the same `terminal_rule_edit`. A refused terminal fails the edit
     /// (the host editor keeps no journal; callers that need atomicity
     /// validate first, as `clear_retired_for_new_mapping` does).
     pub fn apply_rule(
