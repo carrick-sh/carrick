@@ -1334,7 +1334,9 @@
       "support": "bring_up",
       "handler": "lifecycle",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.thread-lifecycle"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1354,6 +1356,7 @@
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
+        "kernel.el1.thread-lifecycle",
         "kernel.mm.address-space-occupancy"
       ],
       "claims": [],
@@ -1415,6 +1418,7 @@
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
+        "kernel.el1.thread-lifecycle",
         "kernel.futex.contention",
         "kernel.futex.requeue"
       ],
@@ -1430,7 +1434,9 @@
       "support": "bring_up",
       "handler": "thread_local",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.thread-lifecycle"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1668,6 +1674,7 @@
       "handler": "process",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.thread-lifecycle",
         "kernel.mm.native-code-content",
         "kernel.mm.native-code-drain"
       ],
@@ -1830,6 +1837,7 @@
       "handler": "signal",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.thread-lifecycle",
         "kernel.signal.lease-gap"
       ],
       "claims": [],
@@ -1860,7 +1868,8 @@
       "contracts": [
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
-        "kernel.el1.guest-scheduler"
+        "kernel.el1.guest-scheduler",
+        "kernel.el1.thread-lifecycle"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -1875,6 +1884,7 @@
       "handler": "signal",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.thread-lifecycle",
         "kernel.syscall.captured-stack"
       ],
       "claims": [],
@@ -1915,7 +1925,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.thread-lifecycle"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1954,7 +1966,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.thread-lifecycle"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2294,7 +2308,9 @@
       "support": "deferred",
       "handler": "unimplemented",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.thread-lifecycle"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "deferred refusal behavior unverified by contract"
@@ -2482,7 +2498,9 @@
       "support": "bring_up",
       "handler": "thread_local",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.thread-lifecycle"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3059,6 +3077,7 @@
         "kernel.el1.fork-cow",
         "kernel.el1.guest-run-queue",
         "kernel.el1.ipc-two-process",
+        "kernel.el1.thread-lifecycle",
         "kernel.fork.filetable",
         "kernel.fork.mappings",
         "kernel.fork.stage1-image",
@@ -3083,6 +3102,7 @@
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
+        "kernel.el1.thread-lifecycle",
         "kernel.mm.address-space-occupancy",
         "kernel.time.realtime-calibration"
       ],
@@ -3650,7 +3670,9 @@
       "support": "bring_up",
       "handler": "process",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.thread-lifecycle"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"

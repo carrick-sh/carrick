@@ -98,6 +98,7 @@ use std::time::{Duration, Instant};
 mod delegated_root;
 mod ipc;
 mod sample_buffer;
+mod threads;
 use sample_buffer::measured_samples;
 
 const SYS_FUTEX: u64 = 98;
@@ -3106,6 +3107,30 @@ fn main() {
         "kick-first-read" => {
             delegated_root::kick_first_read(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(1))
         }
+        "thread-spawn-slope" => threads::spawn_slope(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(4),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(16),
+        ),
+        "tgkill-after-clone" => {
+            threads::tgkill_after_clone(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(16))
+        }
+        "mask-storm" => threads::mask_storm(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2000)),
+        "signal-retarget" => {
+            threads::signal_retarget(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(32))
+        }
+        "tid-reuse" => threads::tid_reuse(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100)),
+        "nproc-limit" => threads::nproc_limit(),
+        "fork-storm" => threads::fork_storm(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(16)),
+        "exit-group-storm" => {
+            threads::exit_group_storm(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(4))
+        }
+        "exec-storm" => {
+            threads::exec_storm(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(4), &args[0])
+        }
+        "exec-storm-child" => threads::exec_storm_child(),
+        "ptrace-clone" => threads::ptrace_clone(),
+        "seccomp-clone" => threads::seccomp_clone(),
+        "futex-flood" => threads::futex_flood(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(192)),
         "fault-entry" => fault_entry_mode(),
         "metadata-allocator" => {
             metadata_allocator_mode(args.get(2).map(String::as_str).unwrap_or(""))
