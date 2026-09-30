@@ -20259,7 +20259,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 2847,
+      "line": 2882,
       "categories": [
         "mapping"
       ],
