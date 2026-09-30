@@ -1898,6 +1898,7 @@ impl MemView<'_> {
 
     /// A relocation: the destination receives the contents; the source is
     /// retired (`Move`) or kept as fresh zero pages (`MREMAP_DONTUNMAP`).
+    /// The backend work is the one relocation backend host moves use too.
     fn mremap_root_move<M: CurrentMmMemory>(
         &self,
         cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
@@ -1910,74 +1911,33 @@ impl MemView<'_> {
         let mut dispatch = self.begin_conditional_vma_dispatch(&permit);
         let memory = &mut *cx.memory;
         let destination = proposed.range;
-        let prot = LinuxProtFlags::from_bits_retain(proposed.protection.bits());
-        let (Ok(copy_len), Ok(source_len)) = (
-            usize::try_from(source.len().min(destination.len())),
-            usize::try_from(source.len()),
-        ) else {
-            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+        let relocation = super::Relocation {
+            source: source.start(),
+            source_len: source.len(),
+            destination: destination.start(),
+            destination_len: destination.len(),
+            copy_len: source.len().min(destination.len()),
+            sharing: carrick_guest_mem::MappingSharing::Private,
+            prot: LinuxProtFlags::from_bits_retain(proposed.protection.bits()),
+            // Only a writable hand-out below the watermark can hold a prior
+            // mapping's bytes (see `mmap_writable_high`).
+            scrub_destination: destination.start() < self.writable_high(),
+            source_after: if dontunmap {
+                super::MoveSource::KeepZeroed
+            } else {
+                super::MoveSource::Reclaim
+            },
         };
-        let copied = match memory.read_bytes_raw(source.start(), copy_len) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-        };
-        // Published writable for the copy, then with the source's protection.
-        let stale = destination.start() < self.writable_high();
-        if let Err(errno) = self.publish_fresh_anonymous(
-            memory,
-            destination.start(),
-            destination.len(),
-            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-            stale,
-        ) {
+        if let Err(errno) = self.relocate_contents(memory, relocation) {
             return Ok(DispatchOutcome::errno(errno));
         }
-        let rollback = |this: &Self, memory: &mut M, errno| {
-            this.rollback_fresh_arena_mapping(memory, destination.start(), destination.len())
-                .map(|()| DispatchOutcome::errno(errno))
-                .map_err(DispatchError::from)
-        };
-        if memory
-            .write_bytes_unchecked(destination.start(), &copied)
-            .is_err()
         {
-            return rollback(self, memory, LINUX_EFAULT);
+            let mem_authority = self.mem();
+            let mut mem = mem_authority.lock();
+            // Monotonic: a later reuse of these bytes is zeroed.
+            mem.mmap_writable_high = mem.mmap_writable_high.max(destination.end());
         }
-        let Ok(destination_len) = usize::try_from(destination.len()) else {
-            return rollback(self, memory, LINUX_ENOMEM);
-        };
-        let prot_none = prot.is_empty();
-        memory.set_mapping_protection(
-            destination.start(),
-            destination_len,
-            prot_none,
-            !prot_none && !prot.contains(LinuxProtFlags::WRITE),
-        );
-        if memory
-            .protect_range(destination.start(), destination_len, prot.bits())
-            .is_err()
-        {
-            return rollback(self, memory, LINUX_ENOMEM);
-        }
-        if dontunmap {
-            // The source stays mapped and reads back zero.
-            if memory.zero_backing(source.start(), source_len).is_err() {
-                return rollback(self, memory, LINUX_ENOMEM);
-            }
-        } else {
-            if let Err(first) = memory.unmap_range(source.start(), source_len)
-                && let Err(retry) = memory.unmap_range(source.start(), source_len)
-            {
-                // The destination is published: failing now would leave two
-                // owners of the contents.
-                carrick_fatal!(
-                    "dispatch::mremap",
-                    "root mremap move could not reclaim source {:#x}+{:#x}: {first}; retry: {retry}",
-                    source.start(),
-                    source_len
-                );
-            }
-            mark_range_unmapped(memory, source.start(), source_len);
+        if !dontunmap {
             self.remove_mapping_metadata(source.start(), source.len());
         }
         if locked

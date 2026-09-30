@@ -2177,3 +2177,58 @@ fn delegated_node_exhaustion_answers_enomem_or_succeeds_never_aborts() {
     assert_eq!(rows, mirror);
     assert_eq!(rows.len(), 3);
 }
+
+// ---------------------------------------------------------------------------
+// S2: one move backend for root and host mremap relocations. A source the
+// backend cannot reclaim fails the move before anything is published: the
+// destination is rolled back and the source keeps its contents (mremap(2)
+// fails with ENOMEM and changes nothing), never a retry and a carrier abort.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mremap_move_with_an_unreclaimable_source_fails_without_a_second_owner() {
+    for delegated in [false, true] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = delegated.then(|| Root::admit(&dispatcher));
+        let mut memory = arena_memory();
+        let a = anon_mmap(&mut dispatcher, &mut memory, 0, 2 * PAGE);
+        memory.write_bytes(a, b"keep").unwrap();
+        // A read-only neighbour forces a move.
+        let blocker = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            a + 2 * PAGE,
+            PAGE,
+            LINUX_PROT_READ,
+            ANON | LINUX_MAP_FIXED,
+            -1,
+        )) as u64;
+        assert_eq!(blocker, a + 2 * PAGE);
+        memory.set_fail_unmap_at(Some(a));
+        let before = proc_rows(&dispatcher);
+        assert_eq!(
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [a, 2 * PAGE, 4 * PAGE, MREMAP_MAYMOVE, 0]
+            ),
+            DispatchOutcome::errno(LINUX_ENOMEM),
+            "delegated={delegated}"
+        );
+        memory.set_fail_unmap_at(None);
+        assert_eq!(proc_rows(&dispatcher), before, "delegated={delegated}");
+        assert_eq!(memory.read_bytes(a, 4).unwrap(), b"keep");
+        if let Some(root) = &root {
+            let node = root.node(a).expect("the source stays a root mapping");
+            assert_eq!((node.0, node.1, node.2), (a, a + 2 * PAGE, true));
+        }
+        // The move then succeeds once the source can be reclaimed.
+        let moved = returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a, 2 * PAGE, 4 * PAGE, MREMAP_MAYMOVE, 0],
+        )) as u64;
+        assert_ne!(moved, a);
+        assert_eq!(memory.read_bytes(moved, 4).unwrap(), b"keep");
+    }
+}
