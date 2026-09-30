@@ -2805,7 +2805,7 @@ fn shared_process_authority_preserves_the_exact_mm_access_arc() {
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let cow_armed = Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
     let cow_deferred_publications = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let inherited = MmAccessState::new(
+    let inherited = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         Arc::new(MemoryProtections::default()),
         Arc::clone(&ledger),

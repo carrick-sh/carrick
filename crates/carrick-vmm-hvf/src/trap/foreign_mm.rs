@@ -585,7 +585,41 @@ pub(crate) struct MmCowRuntimeBinding {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MmAccessState {
+    /// An MM's backend state, bound to its live backing from birth: the
+    /// carrier's resolver is installed before anything can bind a stage-1
+    /// authority to it. `bind_live_backing` (and so the completion of a
+    /// deferred guest lane selection) runs only for an authority bound to a
+    /// state that has a resolver, so a state built any other way would leave
+    /// an MM's pending selection stranded on the host lane for its whole
+    /// life. The one exception, a provisional state that must not redirect
+    /// its parent's table reads, is [`Self::new_unbound`].
     pub(crate) fn new(
+        page_tables: carrick_aarch64::Stage1Authority,
+        protections: std::sync::Arc<MemoryProtections>,
+        frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+        cow_deferred_publications: std::sync::Arc<
+            parking_lot::Mutex<Vec<PendingFrameCowPublication>>,
+        >,
+        host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
+        custody: std::sync::Arc<CarrierVmCustody>,
+    ) -> std::sync::Arc<Self> {
+        let state = Self::new_unbound(
+            page_tables,
+            protections,
+            frame_inventory,
+            cow_armed,
+            cow_deferred_publications,
+            host_cow_stats,
+        );
+        let resolver = MmAccessLiveResolver::new(&state, custody);
+        state.set_live_resolver(resolver);
+        state
+    }
+
+    /// A state with no live resolver yet. Only for a provisional state whose
+    /// table authority still belongs to a live MM, and for fixtures.
+    pub(crate) fn new_unbound(
         page_tables: carrick_aarch64::Stage1Authority,
         protections: std::sync::Arc<MemoryProtections>,
         frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
@@ -657,7 +691,7 @@ impl MmAccessState {
             snapshot.binding().asid().raw_for_probe()
         );
         assert_eq!(binding.stage1_root, snapshot.binding().stage1_root());
-        let state = Self::new(
+        let state = Self::new_unbound(
             page_tables,
             protections,
             frame_inventory,
@@ -4150,7 +4184,7 @@ pub mod foreign_cow_test_support {
                     frames.stage2_references.insert(key, 1);
                 }
             }
-            let state = MmAccessState::new(
+            let state = MmAccessState::new_unbound(
                 carrick_aarch64::Stage1Authority::new_with_manager(Some(tables)),
                 std::sync::Arc::new(MemoryProtections::default()),
                 std::sync::Arc::new(parking_lot::Mutex::new(ledger)),

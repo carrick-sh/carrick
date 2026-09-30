@@ -1740,7 +1740,7 @@ impl HvfTaskState {
             pending_exec_stage2_cleanup: None,
             shared_process_mm: false,
             // Placeholder task state, not admitted to any carrier: detached.
-            mm_access: MmAccessState::new(
+            mm_access: MmAccessState::new_unbound(
                 page_tables,
                 protections,
                 frame_inventory,
@@ -1864,7 +1864,7 @@ impl HvfTaskState {
             // reserving a retirement would stage zero events against the fresh
             // ledger, and the Kernel authority rejects a zero-event commit.
             let frames = self.frame_inventory.lock().frames.clone();
-            self.mm_access = MmAccessState::new(
+            self.mm_access = MmAccessState::new_unbound(
                 self.page_tables_authority(),
                 std::sync::Arc::clone(&self.protections),
                 std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::with_frames(
@@ -1993,7 +1993,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         pending_exec_predecessor_identity: None,
         pending_exec_stage2_cleanup: None,
         shared_process_mm: false,
-        mm_access: MmAccessState::new(
+        mm_access: MmAccessState::new_unbound(
             page_tables,
             protections,
             frame_inventory,
@@ -5450,6 +5450,7 @@ impl HvpatchTaskRegistration {
                     std::sync::Arc::clone(&cow_armed),
                     std::sync::Arc::clone(&cow_deferred_publications),
                     custody.host_cow_ledger.admit_mm(),
+                    std::sync::Arc::clone(&custody),
                 );
                 if let Some(authority) = task_mm.mm_root_stage2.lock().take() {
                     access
@@ -5477,9 +5478,6 @@ impl HvpatchTaskRegistration {
                             });
                     }
                 }
-                let resolver =
-                    MmAccessLiveResolver::new(&access, std::sync::Arc::clone(&custody));
-                access.set_live_resolver(resolver);
                 access
             }))
         };
@@ -7250,6 +7248,7 @@ impl HvfVmState {
                 .custody
                 .host_cow_ledger
                 .admit_mm(),
+            std::sync::Arc::clone(&plan.carrier_foreign_mm_transport.custody),
         );
         for mapping in &mapped {
             if let Some(owner) = &mapping.structural_owner {

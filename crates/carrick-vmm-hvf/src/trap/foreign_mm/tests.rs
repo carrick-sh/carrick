@@ -3791,7 +3791,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         mm: nonzero(107),
         ..snapshot.clone()
     };
-    let replacement_state = MmAccessState::new(
+    let replacement_state = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         Arc::new(MemoryProtections::default()),
         Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
@@ -4264,7 +4264,7 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
         last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
         drop_order: None,
     });
-    let prepared_mm_access = MmAccessState::new(
+    let prepared_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         Arc::new(MemoryProtections::default()),
         task_mm
@@ -4447,7 +4447,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
         last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
         drop_order: None,
     });
-    let prepared_mm_access = MmAccessState::new(
+    let prepared_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         Arc::new(MemoryProtections::default()),
         task_mm
@@ -4600,7 +4600,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
         last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
         drop_order: None,
     });
-    let prepared_mm_access = MmAccessState::new(
+    let prepared_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         Arc::new(MemoryProtections::default()),
         task_mm
@@ -4790,7 +4790,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
         last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
         drop_order: None,
     });
-    let prepared_mm_access = MmAccessState::new(
+    let prepared_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         Arc::new(MemoryProtections::default()),
         task_mm
@@ -5508,7 +5508,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         pending_exec_predecessor_identity: None,
         pending_exec_stage2_cleanup: None,
         shared_process_mm: false,
-        mm_access: MmAccessState::new(
+        mm_access: MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             parent_inventory,
@@ -5768,7 +5768,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         .expect("prepared child deferred COW publications");
     let child_page_tables_authority =
         carrick_aarch64::Stage1Authority::new_with_manager(Some(child_page_tables));
-    let child_state = MmAccessState::new(
+    let child_state = MmAccessState::new_unbound(
         child_page_tables_authority.clone(),
         Arc::new(MemoryProtections::default()),
         Arc::clone(&child_inventory),
@@ -6960,7 +6960,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
             other.phase_name()
         ),
     };
-    let state = MmAccessState::new(
+    let state = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         Arc::new(MemoryProtections::default()),
         ledger,
@@ -7039,7 +7039,7 @@ fn owned_foreign_mm_registration_teardown_is_exact_and_stale_safe() {
         stage1_root: Gpa(0x8800_0040_0000),
     };
     let make_state = || {
-        MmAccessState::new(
+        MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
@@ -7479,7 +7479,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         pending_exec_predecessor_identity: None,
         pending_exec_stage2_cleanup: None,
         shared_process_mm: false,
-        mm_access: MmAccessState::new(
+        mm_access: MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             parent_inventory,
@@ -8031,7 +8031,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         extents: stale_extents.into(),
         ..HvpatchFrameInventory::default()
     };
-    let stale_mm_access = MmAccessState::new(
+    let stale_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         Arc::new(MemoryProtections::default()),
         Arc::new(parking_lot::Mutex::new(stale_inventory)),
@@ -12388,6 +12388,44 @@ mod guest_cow {
                 .0
                 .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
         }
+    }
+
+    /// The initial process's backend state was built with no live resolver,
+    /// so the authority the engine selected the guest lane on (deferred: no
+    /// backing yet) was bound to it without ever reaching `bind_live_backing`:
+    /// the pending intent was lost and the MM, and every child forked from it,
+    /// stayed on the host lane. A state is now born bound to its resolver.
+    #[test]
+    fn a_pending_guest_selection_completes_when_its_authority_binds_to_a_new_state() {
+        use carrick_aarch64::stage1_authority::GuestLaneSelection;
+        use carrick_mmu_core::aarch64::LiveDescriptorOwner;
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let engine_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+        assert_eq!(
+            engine_authority.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Deferred)
+        );
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let state = MmAccessState::new(
+            carrick_aarch64::Stage1Authority::new(),
+            Arc::new(MemoryProtections::default()),
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+            custody,
+        );
+        state.bind_page_tables_authority(engine_authority.clone());
+        assert_eq!(
+            engine_authority.live_descriptor_owner(),
+            LiveDescriptorOwner::Guest,
+            "binding the selected authority completes its pending selection"
+        );
     }
 
     #[test]

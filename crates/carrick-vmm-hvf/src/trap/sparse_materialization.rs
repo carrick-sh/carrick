@@ -1703,7 +1703,7 @@ mod arena_pin_tests {
             u64::from(applevisor::memory::MemPerms::ReadWrite),
         )
         .unwrap();
-        let state = MmAccessState::new(
+        let state = MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
             std::sync::Arc::new(MemoryProtections::default()),
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
@@ -2026,7 +2026,7 @@ mod arena_pin_tests {
             size,
         )
         .unwrap();
-        let state = MmAccessState::new(
+        let state = MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
             std::sync::Arc::new(MemoryProtections::default()),
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
@@ -2062,7 +2062,7 @@ mod arena_pin_tests {
         .unwrap();
         let identity = owner.record_identity();
         let pointer = owner.ptr();
-        let state = MmAccessState::new(
+        let state = MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
             std::sync::Arc::new(MemoryProtections::default()),
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
