@@ -2613,7 +2613,6 @@ impl HvfTaskState {
         };
         if guest_lane
             && (span.kernel_only
-                || !source_guest_writable
                 || intent != carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
                 || matches!(
                     old_inventory_extent.backing,
