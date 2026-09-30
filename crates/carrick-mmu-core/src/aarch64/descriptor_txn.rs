@@ -91,7 +91,7 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 8;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 9;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
@@ -894,6 +894,10 @@ pub enum DescriptorRefusal {
     /// A reclaiming edit would empty more tables than its budget (or than
     /// one receipt carries): the host must split the span.
     ReclaimCapacity = 22,
+    /// The MM's tables lack the two preallocated EL1 COW copy-alias leaves,
+    /// so EL1 cannot copy the page without allocating (a provisioning
+    /// defect of that image, distinct from exhausted table grants).
+    CopyWindowAbsent = 23,
 }
 
 impl DescriptorRefusal {
@@ -922,6 +926,7 @@ impl DescriptorRefusal {
             20 => Self::WrongMm,
             21 => Self::ExcludedOutput,
             22 => Self::ReclaimCapacity,
+            23 => Self::CopyWindowAbsent,
             _ => return None,
         })
     }

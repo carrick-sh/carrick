@@ -2425,6 +2425,13 @@ impl PageTableManager {
         self.offline_private_image = false;
     }
 
+    /// Whether host edits are staged or dirty but not yet synced to the
+    /// live backing; making such a manager live would discard them.
+    #[must_use]
+    pub fn has_unsynced_edits(&self) -> bool {
+        !self.staged.is_empty() || !self.dirty.is_empty()
+    }
+
     /// Bind or update the host arena resolver for this live manager.
     ///
     /// # Safety

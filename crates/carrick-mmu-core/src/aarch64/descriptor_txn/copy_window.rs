@@ -15,7 +15,7 @@ fn leaf<W: LiveDescriptorWords + ?Sized>(
     for shift in [39, 30, 21] {
         let descriptor = words.load(table + ((va >> shift) & 511) * 8)?;
         if descriptor & 3 != 3 {
-            return Err(DescriptorRefusal::TablesExhausted);
+            return Err(DescriptorRefusal::CopyWindowAbsent);
         }
         table = descriptor & MASK;
     }

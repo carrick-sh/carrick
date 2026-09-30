@@ -468,7 +468,11 @@ pub(super) fn select_guest_descriptor_lane<E: ThreadedEngine>(
     if engine.live_descriptor_owner() == LiveDescriptorOwner::Guest {
         return true;
     }
-    precondition.admits() && engine.select_live_descriptor_owner(LiveDescriptorOwner::Guest)
+    if !precondition.admits() {
+        engine.record_guest_descriptor_lane_census_refusal();
+        return false;
+    }
+    engine.select_live_descriptor_owner(LiveDescriptorOwner::Guest)
 }
 
 /// Host-retained copy of one submitted guest-lane frame grant: the exact

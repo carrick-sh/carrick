@@ -2964,6 +2964,10 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
 
     /// Select the venue that owns this engine's live stage-1 descriptor
     /// stores. `false`: this backend has no guest-owned lane.
+    /// Record a lane selection refused before reaching the engine (the
+    /// writer census did not admit it) in the backend's carrier accounting.
+    fn record_guest_descriptor_lane_census_refusal(&self) {}
+
     fn select_live_descriptor_owner(
         &mut self,
         _owner: carrick_mmu_core::aarch64::LiveDescriptorOwner,
