@@ -99,9 +99,17 @@ runtime continuation/backing gate is removed. MMU 159, backend 11, runtime 10,
 affected Clippy, formatting and EL1 image build pass. See `cow-join.md` and logs.
 Admission remains disabled; no signed COW execution or checkpoint acceptance.
 
-**Next implementation:** finish the joined transaction's kernel-only, read-only,
-maintenance, private-file and mixed-residency/protection shapes using the existing
-permission-preserving MMU rules. Compose successful backing completion with the
+**Private-anonymous mixed permissions:** adapter `1b121731c` fixes the next
+production transaction restriction. The red four-page witness was refused with
+PermissionDenied; it now preserves RW/read-only/PROT_NONE/prepared states while
+repointing the compound. The guest backend no longer refuses merely read-only
+source metadata. MMU 160, EL1 114 and affected all-target Clippy pass. See
+`cow-permissions-*` receipts. This is executor/model evidence; admission remains
+disabled and successful real-authority COW execution is still unproven.
+
+**Next implementation:** finish the joined transaction's kernel-only, legacy,
+maintenance and private-file shapes using the existing permission-preserving
+MMU rules. Compose successful backing completion with the
 real kernel authority. Then convert private/shared repoints, replacement grants,
 retired reuse, foreign-MM COW, engine protection/alias/discard and exec writers;
 join reservation policy/lifecycle. The concrete caller checklist is retained in
@@ -133,7 +141,7 @@ resume their investigation only for a new discriminating test or a concrete
 dependency. No new broad capture campaign. x86 remains deferred.
 
 Current accepted base remains local main `f304f8415`; development integration is
-adapter `bda5f4cb0` (clean development commit).
+adapter `1b121731c` (clean development commit).
 No checkpoint has been accepted by this work.
 
 **Execution correction after the renewed rabbit-hole warning:** keep one active
