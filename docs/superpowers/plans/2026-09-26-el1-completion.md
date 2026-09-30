@@ -88,15 +88,25 @@ four window tests (including two roots), EL1/ABI/memory/MMU suites, affected
 Clippy and hardware EL1 image build pass. See adapter `cow-window.md`. No signed
 COW execution or production host submission is claimed.
 
-**Next implementation:** connect `HvfVmState::perform_frame_cow` allocation and
-staged inventory to that guest descriptor service, retaining both exact owners
-until completion. Preserve 16 KiB physical-compound versus 4 KiB semantic-fragment
-rules, private-file lane reuse and protection. Do not create an unsafe partial
-commit by replacing a compound transaction with unrelated per-page commits.
-Retire superseded host copying and unused guest-copy orchestration as joined.
-Then convert private/shared repoints, replacement grants, retired reuse, engine
-protection/alias/discard and exec writers; join reservation policy/lifecycle.
-No more window scaffolding or broad boot campaigns are the next action.
+**Production COW caller joined (development):** adapter `bda5f4cb0` routes
+`HvfTaskState::perform_frame_cow` through the driving vCPU and the existing EL1
+descriptor service. The host retains the source owner and publishes a provisional
+replacement grant; one compound receipt precedes the existing inventory split.
+Overlapping copy extents are rejected red-first; each of four descriptor-store
+failures restores the full preimage. Real provisional-grant refusal releases
+backend references and physical ownership in the HVF model. The unused synthetic
+runtime continuation/backing gate is removed. MMU 159, backend 11, runtime 10,
+affected Clippy, formatting and EL1 image build pass. See `cow-join.md` and logs.
+Admission remains disabled; no signed COW execution or checkpoint acceptance.
+
+**Next implementation:** finish the joined transaction's kernel-only, read-only,
+maintenance, private-file and mixed-residency/protection shapes using the existing
+permission-preserving MMU rules. Compose successful backing completion with the
+real kernel authority. Then convert private/shared repoints, replacement grants,
+retired reuse, foreign-MM COW, engine protection/alias/discard and exec writers;
+join reservation policy/lifecycle. The concrete caller checklist is retained in
+adapter `cow-join.md`; it is not an exhaustive writer-closure claim. No second
+copy transport or broad boot campaign is the next action.
 
 **Dependency review after two prerequisite intervals:** copyout and the guest
 copy transport remove concrete missing operations but have not activated the
@@ -123,7 +133,32 @@ resume their investigation only for a new discriminating test or a concrete
 dependency. No new broad capture campaign. x86 remains deferred.
 
 Current accepted base remains local main `f304f8415`; development integration is
-adapter `9b0047959` (clean). No checkpoint has been accepted by this work.
+adapter `bda5f4cb0` (clean development commit).
+No checkpoint has been accepted by this work.
+
+**Execution correction after the renewed rabbit-hole warning:** keep one active
+implementation workstream: production memory ownership. The immediate COW slice
+is bounded by the real `HvfTaskState::perform_frame_cow` caller, the existing
+allocation/inventory transaction, one compound EL1 publication, and verified
+completion before source retirement. Compound rollback and refused-grant cleanup are now model-verified; the next
+decisive check is successful real-authority composition with preserved permissions.
+Another standalone transport abstraction is not a milestone. This development
+implementation is not accepted runtime evidence.
+
+Before extending that slice, reconcile the concrete remaining writer list against
+production call sites. For each refusal, record the writer to convert and its
+activation dependency; do not turn an unsupported shape into an accepted
+exclusion. Reuse the existing submission and journal mechanisms. Remove redundant
+orchestration as its real caller is joined. Do not start IPC captures, unrelated
+performance work or later subsystem implementation during this slice.
+
+Progress updates must state: production capability activated (or explicitly none),
+activation blockers removed and remaining, current decisive check, and next action.
+If an investigation consumes 30 minutes without new evidence or removing a named
+blocker, stop that investigation and choose a smaller discriminating check or a
+simpler integration. This is a reassessment trigger, never permission to weaken
+correctness or abandon the necessary dependency. Broad qualification remains at
+the connected production milestone; existing final acceptance gates remain intact.
 
 ## Historical state and evidence rules
 
