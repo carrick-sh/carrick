@@ -888,3 +888,83 @@ fn el1_ipc_host_wake_index_coalesces_without_scanning_live_objects() {
         1
     );
 }
+
+/// The wedge census names, for every parked record, the object queue it is
+/// linked on and that object's readiness: the discriminator between a lost
+/// write (object empty) and a lost wake (readable, waiter still linked).
+#[test]
+fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
+    use carrick_sched_core::object_wait::OperationToken;
+    use carrick_sched_core::{ThreadIdentity, ZoneTables};
+    use std::string::String;
+    let fx = fixture(1 << 20);
+    let t = fx.table();
+    let (_r, _w, pipe_object) = fx.pipe(t);
+    let (_e, event_object) = fx.eventfd(t, 3, EventMode::Counter);
+    {
+        let mut g = fx.region.lock(pipe_object, &Spin).unwrap();
+        assert_eq!(g.pipe().unwrap().try_write(b"hello").result, Ok(5));
+    }
+    let zone: Box<ZoneTables> = unsafe { Box::new_zeroed().assume_init() };
+    let park = |object, tid| {
+        let key = object_wait_key(object, pipe::WaitFor::Readable).unwrap();
+        zone.bind_object_wait(key, &Spin).unwrap();
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid,
+                serial: tid,
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let guard = zone.object_wait(key, &Spin).unwrap();
+        guard
+            .park(
+                guard.snapshot(),
+                record,
+                OperationToken::new(tid, 1).unwrap(),
+            )
+            .unwrap();
+        key.index()
+    };
+    let pipe_queue = park(pipe_object, 11);
+    let event_queue = park(event_object, 12);
+    let mut zone_census = String::new();
+    zone.write_census(&mut zone_census).unwrap();
+    assert!(
+        zone_census.contains(&std::format!(
+            "zone object queue {pipe_queue}: generation=1 epoch=1 "
+        )) && zone_census.contains("waiters=1 locked=false"),
+        "{zone_census}"
+    );
+    assert!(
+        zone_census.contains(&std::format!(
+            "object wait: queue={event_queue} generation=1"
+        )),
+        "{zone_census}"
+    );
+    let mut census = String::new();
+    write_ipc_wait_census(&zone, fx.region, &mut census).unwrap();
+    assert!(
+        census.contains(&std::format!(
+            "ipc object {} (queue {pipe_queue} Readable): kind=pipe generation=0",
+            pipe_object.index()
+        )) && census.contains("unread=5 capacity=65536 readers=1 writers=1"),
+        "{census}"
+    );
+    assert!(
+        census.contains(&std::format!(
+            "ipc object {} (queue {event_queue} Readable): kind=eventfd",
+            event_object.index()
+        )) && census.contains("counter=3 mode=Counter"),
+        "{census}"
+    );
+    // A held object lock is reported, never waited for.
+    let held = fx.region.lock(event_object, &Spin).unwrap();
+    let mut busy = String::new();
+    write_ipc_wait_census(&zone, fx.region, &mut busy).unwrap();
+    assert!(busy.contains("state=<locked>"), "{busy}");
+    drop(held);
+}

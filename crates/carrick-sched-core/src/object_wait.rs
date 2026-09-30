@@ -327,7 +327,44 @@ impl ObjectWaitGuard<'_> {
     }
 }
 
+/// Read-only view of one record's object-wait registration (census only;
+/// each word is read once, values may be torn across fields).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectWaitCensus {
+    /// The queue index it is linked on (0: not linked).
+    pub queue: u32,
+    /// The object incarnation it enrolled for.
+    pub generation: u64,
+    /// The owned operation token's index and generation (0: none).
+    pub operation: u64,
+    pub operation_generation: u64,
+}
+
+/// Read-only view of one object wait queue (census only).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectQueueCensus {
+    pub generation: u64,
+    pub epoch: u64,
+    pub head: u32,
+    pub tail: u32,
+    /// Records reached from `head` (bounded by the record count).
+    pub waiters: u32,
+    pub locked: bool,
+}
+
 impl ZoneRecord {
+    /// This record's object-wait registration, if it has one or owns a
+    /// pending object operation.
+    pub fn object_wait_census(&self) -> Option<ObjectWaitCensus> {
+        let census = ObjectWaitCensus {
+            queue: self.object.queue.load(Ordering::Acquire),
+            generation: self.object.generation.load(Ordering::Relaxed),
+            operation: self.object.operation.load(Ordering::Acquire),
+            operation_generation: self.object.operation_generation.load(Ordering::Relaxed),
+        };
+        (census.queue != 0 || census.operation != 0).then_some(census)
+    }
+
     pub fn has_object_operation(&self) -> bool {
         self.object.operation.load(Ordering::Acquire) != 0
     }
@@ -391,6 +428,29 @@ impl ZoneTables {
         queue.generation.store(key.generation, Ordering::Relaxed);
         queue.epoch.store(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Lock-free census of queue `index` (never takes its lock).
+    pub fn object_queue_census(&self, index: u32) -> Option<ObjectQueueCensus> {
+        let queue = self.object_waits.get(index as usize)?;
+        let head = queue.head.load(Ordering::Acquire);
+        let mut waiters = 0u32;
+        let mut cursor = head;
+        while let Some(record) = RecordId::from_raw(cursor) {
+            if waiters as usize >= ZONE_RECORDS {
+                break;
+            }
+            waiters += 1;
+            cursor = self.record(record).object.next.load(Ordering::Relaxed);
+        }
+        Some(ObjectQueueCensus {
+            generation: queue.generation.load(Ordering::Relaxed),
+            epoch: queue.epoch.load(Ordering::Relaxed),
+            head,
+            tail: queue.tail.load(Ordering::Relaxed),
+            waiters,
+            locked: queue.lock.load(Ordering::Relaxed) != 0,
+        })
     }
 
     pub fn object_wait(
