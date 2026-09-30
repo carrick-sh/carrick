@@ -86,6 +86,17 @@ fn armed_page(leaf: u64) -> bool {
     leaf & TYPE_BITS == TYPE_TABLE_OR_PAGE && el1_cow(leaf)
 }
 
+/// Whether the terminal `descriptor` at `level` is a leaf EL1 resolves as
+/// fork COW: a valid 4 KiB page, EL1-private, COW-armed and Linux-writable.
+#[must_use]
+pub fn is_guest_cow_write_leaf(level: usize, descriptor: u64) -> bool {
+    level == 3
+        && armed_page(descriptor)
+        && descriptor & SW_EL1_PRIVATE != 0
+        && descriptor & SW_EL1_MAY_WRITE != 0
+        && descriptor & AP_MASK != AP_RW
+}
+
 /// Classify an EL0 write permission fault at `far` against the live graph at
 /// `root`. The caller holds the MM's exact editor.
 pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
@@ -100,23 +111,25 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     if terminal_descriptor_permits_el0(leaf, LeafAccess::Write) {
         return Err(GuestCowClass::AlreadyWritable);
     }
-    if !armed_page(leaf)
-        || leaf & SW_EL1_PRIVATE == 0
-        || leaf & SW_EL1_MAY_WRITE == 0
-        || leaf & AP_MASK == AP_RW
-    {
+    if !is_guest_cow_write_leaf(3, leaf) {
         return Err(GuestCowClass::NotArmed);
     }
     let output = leaf & PA_MASK_4KIB;
     let compound = output & !(GUEST_COW_COMPOUND - 1);
     let lane = (output - compound) / PT_PAGE;
     let lanes = GUEST_COW_COMPOUND / PT_PAGE;
+    // The host arms and settles COW per 16 KiB VA granule; a run never
+    // leaves the fault page's granule, whatever the physical layout.
+    let granule = page & !(GUEST_COW_COMPOUND - 1);
     let moves = |index: u64| -> Result<bool, GuestCowClass> {
         // Lane `index` of the compound, at the VA the fault page's offset
         // implies. Wrapping never happens: lanes stay inside one compound.
         let Some(va) = (page + index * PT_PAGE).checked_sub(lane * PT_PAGE) else {
             return Ok(false);
         };
+        if va & !(GUEST_COW_COMPOUND - 1) != granule {
+            return Ok(false);
+        }
         Ok(l3_leaf(words, root, va)
             .map_err(GuestCowClass::Unreachable)?
             .is_some_and(|neighbour| {
@@ -215,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn the_run_follows_the_old_compound_not_the_va_granule() {
+    fn the_run_follows_the_old_compound_inside_the_va_granule() {
         let words = Words::new();
         // VA page 0x..1000 maps lane 0 of the compound; the VA granule's
         // page 0 maps another compound and is not part of this copy.
@@ -255,6 +268,33 @@ mod tests {
             }
         );
         assert_eq!(run.compound_offset(), PT_PAGE);
+    }
+
+    #[test]
+    fn a_run_never_leaves_the_fault_pages_va_granule() {
+        let words = Words::new();
+        // The compound's lanes 0..3 sit at VA pages 2..5: two VA granules.
+        for lane in 0..4 {
+            words.leaf_at(VA + (lane + 2) * PT_PAGE, armed(OLD + lane * PT_PAGE, true));
+        }
+        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 2 * PT_PAGE).unwrap();
+        assert_eq!(
+            run,
+            GuestCowRun {
+                va: VA + 2 * PT_PAGE,
+                len: 2 * PT_PAGE,
+                old_ipa: SubstrateGpa(OLD),
+            }
+        );
+        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 4 * PT_PAGE).unwrap();
+        assert_eq!(
+            run,
+            GuestCowRun {
+                va: VA + 4 * PT_PAGE,
+                len: 2 * PT_PAGE,
+                old_ipa: SubstrateGpa(OLD + 2 * PT_PAGE),
+            }
+        );
     }
 
     #[test]
