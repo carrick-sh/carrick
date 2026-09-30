@@ -15209,7 +15209,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 804,
+      "line": 826,
       "categories": [
         "mapping"
       ],
@@ -15218,7 +15218,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 805,
+      "line": 827,
       "categories": [
         "mapping"
       ],
@@ -15227,7 +15227,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 806,
+      "line": 828,
       "categories": [
         "mapping"
       ],
@@ -15236,7 +15236,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 807,
+      "line": 829,
       "categories": [
         "mapping"
       ],
@@ -15245,7 +15245,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 987,
+      "line": 1009,
       "categories": [
         "mapping"
       ],
@@ -15254,7 +15254,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 992,
+      "line": 1014,
       "categories": [
         "mapping"
       ],
@@ -15263,7 +15263,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1040,
+      "line": 1062,
       "categories": [
         "mapping"
       ],
@@ -15272,7 +15272,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1048,
+      "line": 1070,
       "categories": [
         "epoll"
       ],
@@ -15281,7 +15281,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1225,
+      "line": 1247,
       "categories": [
         "mapping"
       ],
@@ -15290,7 +15290,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1297,
+      "line": 1319,
       "categories": [
         "mapping"
       ],
@@ -15299,7 +15299,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1399,
+      "line": 1421,
       "categories": [
         "mapping"
       ],
@@ -15308,7 +15308,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1442,
+      "line": 1464,
       "categories": [
         "mapping"
       ],
@@ -15317,7 +15317,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1445,
+      "line": 1467,
       "categories": [
         "mapping"
       ],
@@ -15326,7 +15326,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1446,
+      "line": 1468,
       "categories": [
         "mapping"
       ],
@@ -15335,7 +15335,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1449,
+      "line": 1471,
       "categories": [
         "mapping"
       ],
@@ -15344,7 +15344,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1460,
+      "line": 1482,
       "categories": [
         "mapping"
       ],
@@ -15353,7 +15353,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1465,
+      "line": 1487,
       "categories": [
         "mapping"
       ],
@@ -15362,7 +15362,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1467,
+      "line": 1489,
       "categories": [
         "mapping"
       ],
@@ -15371,7 +15371,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1531,
+      "line": 1553,
       "categories": [
         "epoll"
       ],
@@ -15380,7 +15380,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/debug/dto.rs",
-      "line": 1546,
+      "line": 1568,
       "categories": [
         "mapping"
       ],
