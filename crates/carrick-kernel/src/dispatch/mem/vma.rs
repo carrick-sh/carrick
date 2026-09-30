@@ -898,22 +898,27 @@ pub(crate) fn mapped_data_rows(mem: &MemState) -> impl Iterator<Item = &ProcMaps
 pub(crate) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
     let mut maps = project_host_core_maps(mem);
     let root_rows = mem.root_anonymous_rows();
-    if !root_rows.is_empty() {
-        for row in &root_rows {
-            trim_proc_maps_for_range(&mut maps, row.start, row.end - row.start);
-        }
-        maps.extend(root_rows.iter().map(|row| ProcMapsEntry {
-            start: row.start,
-            end: row.end,
-            read: row.read,
-            write: row.write,
-            execute: row.execute,
-            sharing: ProcMapSharing::Private,
-            path: row.path.clone(),
-        }));
-        maps.sort_by_key(|map| (map.start, map.end));
+    if root_rows.is_empty() {
+        return maps;
     }
-    maps
+    // The host rows never describe root-owned memory: one linear merge.
+    maps.sort_by_key(|map| (map.start, map.end));
+    super::anonymous::merge_root_rows(
+        maps,
+        root_rows
+            .iter()
+            .map(|row| ProcMapsEntry {
+                start: row.start,
+                end: row.end,
+                read: row.read,
+                write: row.write,
+                execute: row.execute,
+                sharing: ProcMapSharing::Private,
+                path: row.path.clone(),
+            })
+            .collect(),
+        |_| false,
+    )
 }
 
 /// [`project_core_maps`] without a delegated root's anonymous rows.

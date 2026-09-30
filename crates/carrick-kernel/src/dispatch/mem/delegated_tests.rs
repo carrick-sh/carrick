@@ -919,3 +919,260 @@ fn delegated_exec_leaves_no_root_row_in_the_new_image() {
             .unwrap()
     });
 }
+
+// ---------------------------------------------------------------------------
+// S1c: mremap, madvise and mlock of root-owned anonymous memory stay in the
+// root; /proc merges the root projection with host rows exactly once.
+// ---------------------------------------------------------------------------
+
+const SYS_MLOCK: u64 = 228;
+const SYS_MUNLOCK: u64 = 229;
+const SYS_MLOCKALL: u64 = 230;
+const SYS_MUNLOCKALL: u64 = 231;
+const SYS_MADVISE: u64 = 233;
+const MCL_CURRENT: u64 = 1;
+const ANON: u64 = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+
+impl Root {
+    /// The committed root node at `address`: (start, end, anonymous, flags).
+    fn node(&self, address: u64) -> Option<(u64, u64, bool, u32)> {
+        self.lock().mapping(address).map(|mapping| {
+            (
+                mapping.range.start(),
+                mapping.range.end(),
+                mapping.anonymous,
+                mapping.flags.bits(),
+            )
+        })
+    }
+}
+
+fn anon_mmap(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut CountingMmapMemory,
+    address: u64,
+    len: u64,
+) -> u64 {
+    returned(host_mmap(dispatcher, memory, address, len, RW, ANON, -1)) as u64
+}
+
+/// No private anonymous row is host-owned for `[start, end)`.
+fn host_owns_no_anonymous_row(dispatcher: &SyscallDispatcher, start: u64, end: u64) -> bool {
+    let authority = dispatcher.mem();
+    let mem = authority.lock();
+    !mem.semantic_vmas
+        .iter()
+        .any(|vma| vma.start < end && start < vma.end && vma.provenance.is_private_anonymous())
+        && !mem
+            .dynamic_maps
+            .iter()
+            .any(|row| row.start < end && start < row.end)
+}
+
+fn locked_memory(dispatcher: &SyscallDispatcher) -> Vec<(u64, u64)> {
+    let context = dispatcher.capture_one_task_context().unwrap();
+    dispatcher
+        .synthetic_proc_context(&context)
+        .locked_memory
+        .iter()
+        .map(|range| (range.start().raw(), range.end().raw()))
+        .collect()
+}
+
+const ANON_FLAGS: u32 = carrick_el1_abi::ReservationNodeFlags::ANONYMOUS_PRIVATE.bits();
+const LOCKED: u32 = carrick_el1_abi::ReservationNodeFlags::LOCKED.bits();
+const DONTFORK: u32 = carrick_el1_abi::ReservationNodeFlags::DONTFORK.bits();
+
+#[test]
+fn delegated_madvise_attributes_stay_on_the_root_node() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+    let mut memory = arena_memory();
+    let a = anon_mmap(&mut dispatcher, &mut memory, 0, 2 * PAGE);
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        a + 2 * PAGE,
+        PAGE,
+        LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+        FILE_FD,
+    )) as u64;
+    // One madvise over the root anonymous mapping and the file mapping.
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MADVISE,
+            [
+                a + PAGE,
+                2 * PAGE,
+                carrick_abi::LINUX_MADV_DONTFORK,
+                0,
+                0,
+                0
+            ],
+        )),
+        0
+    );
+    assert_eq!(root.node(a), Some((a, a + PAGE, true, ANON_FLAGS)));
+    assert_eq!(
+        root.node(a + PAGE),
+        Some((a + PAGE, a + 2 * PAGE, true, ANON_FLAGS | DONTFORK)),
+        "madvise must not demote the root-owned range"
+    );
+    assert!(host_owns_no_anonymous_row(&dispatcher, a, a + 2 * PAGE));
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .semantic_vmas
+            .find(file)
+            .is_some_and(|vma| vma.fork_policy.copy == carrick_abi::VmaForkCopyPolicy::Omit),
+        "the host file row takes the advice"
+    );
+    // The guest venue still edits the attributed range.
+    root.guest_mprotect(a + PAGE, PAGE, ReservationProtection::NONE);
+    assert_eq!(
+        root.node(a + PAGE).map(|node| node.3),
+        Some(ANON_FLAGS | DONTFORK)
+    );
+    // The fork child omits it (MADV_DONTFORK) and keeps the rest.
+    let child_mm = crate::kernel::MmId::from_registry_allocation(
+        std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
+    );
+    let (projection_revision, projection) = dispatcher
+        .mm_authority()
+        .fork_projection_with_revision()
+        .unwrap();
+    let _ = (child_mm, projection_revision);
+    assert!(
+        projection.iter().any(|range| range.va == a + PAGE
+            && range.disposition == carrick_hal::ForkLeafDisposition::Omit)
+    );
+    assert!(
+        projection.iter().any(|range| range.va == a
+            && range.disposition == carrick_hal::ForkLeafDisposition::Preserve)
+    );
+}
+
+#[test]
+fn delegated_mlock_is_a_root_attribute_visible_to_proc_and_lock_readers() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+    let mut memory = arena_memory();
+    let a = anon_mmap(&mut dispatcher, &mut memory, 0, 2 * PAGE);
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        a + 2 * PAGE,
+        PAGE,
+        LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+        FILE_FD,
+    )) as u64;
+    // mlock across the root mapping and the file mapping.
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MLOCK,
+            [a + PAGE, 2 * PAGE, 0, 0, 0, 0]
+        )),
+        0
+    );
+    assert_eq!(
+        root.node(a + PAGE),
+        Some((a + PAGE, a + 2 * PAGE, true, ANON_FLAGS | LOCKED))
+    );
+    assert_eq!(locked_memory(&dispatcher), [(a + PAGE, file + PAGE)]);
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .locked_ranges
+            .iter()
+            .all(|range| range.start().raw() >= file),
+        "the host lock table holds only host-owned ranges"
+    );
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MADVISE,
+            [a + PAGE, PAGE, carrick_abi::LINUX_MADV_DONTNEED, 0, 0, 0],
+        ),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    // A guest-venue munmap of the locked page retires the lock with it.
+    root.guest_munmap(a + PAGE, PAGE);
+    assert_eq!(locked_memory(&dispatcher), [(file, file + PAGE)]);
+    // munlock of the file, then mlockall(MCL_CURRENT) locks every mapping,
+    // root-owned ones included.
+    returned(call(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MUNLOCK,
+        [file, PAGE, 0, 0, 0, 0],
+    ));
+    assert!(locked_memory(&dispatcher).is_empty());
+    returned(call(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MLOCKALL,
+        [MCL_CURRENT, 0, 0, 0, 0, 0],
+    ));
+    assert_eq!(root.node(a).map(|node| node.3), Some(ANON_FLAGS | LOCKED));
+    assert!(
+        locked_memory(&dispatcher)
+            .iter()
+            .any(|(start, end)| *start <= a && a + PAGE <= *end),
+        "mlockall(MCL_CURRENT) missed the root mapping"
+    );
+    returned(call(&mut dispatcher, &mut memory, SYS_MUNLOCKALL, [0; 6]));
+    assert!(locked_memory(&dispatcher).is_empty());
+    assert_eq!(root.node(a).map(|node| node.3), Some(ANON_FLAGS));
+}
+
+#[test]
+fn delegated_proc_rows_merge_the_root_heap_with_boot_regions_once() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let layout = dispatcher.mem().lock().layout;
+    let heap_end = layout.heap_base + layout.heap_size;
+    let region = |start: u64, end: u64| ProcMapsEntry {
+        start,
+        end,
+        read: true,
+        write: true,
+        execute: false,
+        sharing: carrick_vfs::ProcMapSharing::Private,
+        path: String::new(),
+    };
+    dispatcher.mem().lock().address_space_regions = Some(vec![
+        region(layout.heap_base, heap_end),
+        region(layout.mmap_base, layout.mmap_base + layout.mmap_size),
+    ]);
+    let root = Root::admit(&dispatcher);
+    let brk = root.guest_brk(layout.heap_base + 2 * PAGE);
+    assert_eq!(brk, layout.heap_base + 2 * PAGE);
+    let mut memory = arena_memory();
+    let a = anon_mmap(&mut dispatcher, &mut memory, 0, PAGE);
+    let rows = proc_rows(&dispatcher);
+    let covering = |address: u64| {
+        rows.iter()
+            .filter(|row| row.start <= address && address < row.end)
+            .count()
+    };
+    // The heap and the anonymous mapping are each described once (the
+    // hidden arena reservation is carrick's own backing row).
+    assert_eq!(covering(layout.heap_base), 1, "{rows:?}");
+    assert_eq!(
+        covering(brk + PAGE),
+        0,
+        "no row may describe the heap past the break: {rows:?}"
+    );
+    assert!(covering(a) >= 1);
+    let _ = dispatcher;
+}

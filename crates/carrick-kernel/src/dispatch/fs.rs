@@ -1019,6 +1019,7 @@ impl<'a> FsView<'a> {
         let brk_current = mem.program_break();
         let mmap_next = mem.arena_high_water();
         let address_space_regions = mem.proc_regions();
+        let locked_memory = mem.locked_view().into_owned();
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
         let oom_score_adj = hvpatch_process
@@ -1081,7 +1082,7 @@ impl<'a> FsView<'a> {
             runtime_endpoint_container: Some(context.container().id()),
             auxv: mem.linux_auxv_image,
             address_space_regions,
-            locked_memory: mem.locked_ranges,
+            locked_memory,
             brk_current,
             mmap_next,
             heap_base: mem.layout.heap_base,

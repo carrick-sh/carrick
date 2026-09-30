@@ -12,9 +12,9 @@
 //!
 //! Production admission currently fails closed with `ForeignMapping`. Once a
 //! root is admitted (today only by the conformance fixture), brk, mmap, munmap,
-//! mprotect placement and the anonymous-private rows have one owner, the root
-//! (`anonymous::AnonymousAuthority`); mremap and attribute-changing madvise
-//! are host-served over demoted rows. Fault planning and mincore ask the root
+//! mprotect, mremap placement, the anonymous-private rows and their
+//! mlock/madvise attributes have one owner, the root
+//! (`anonymous::AnonymousAuthority`). Fault planning and mincore ask the root
 //! which anonymous pages exist and at which protection
 //! (`fault::FirstTouchOwner`); the host keeps only the residency its own
 //! venue committed, retired where the root hands a hole out again and handed
@@ -207,7 +207,7 @@ impl MemView<'_> {
     /// (`admit_host_snapshot`).
     #[cfg(test)]
     pub(in crate::dispatch) fn delegate_anonymous_for_test(&self) -> Result<(), Refusal> {
-        use super::anonymous::{opaque_flags, root_owned_row};
+        use super::anonymous::{carried_flags, opaque_flags, root_owned_row};
         use carrick_el1_abi::ReservationNodeFlags;
         let root = self.mm_authority().delegated_root()?;
         let (address_limit, data_limit) = self
@@ -230,7 +230,7 @@ impl MemView<'_> {
                 let prot = ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?;
                 let flags = if root_owned_row(vma, &mem) {
                     owned.push((vma.start, vma.end));
-                    ReservationNodeFlags::ANONYMOUS_PRIVATE
+                    ReservationNodeFlags::ANONYMOUS_PRIVATE.union(carried_flags(vma))
                 } else {
                     opaque_flags(vma, &mem)
                 };
@@ -251,11 +251,32 @@ impl MemView<'_> {
             model.finish_import()
         })?;
         // The root now owns these rows; the host keeps no second copy.
-        for (start, end) in owned {
+        for &(start, end) in &owned {
             mem.semantic_vmas.remove_range(start, end);
             trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, end - start);
+            // A visible boot region is a host row too (hidden backing rows
+            // are carrick's own and never trimmed).
+            trim_live_boot_regions_for_range(&mut mem, start, end - start);
         }
         mem.delegate_anonymous(root.clone());
+        // Their locks become root attributes (`set_locked` routes each
+        // piece to its owner).
+        for (start, end) in owned {
+            let locked: Vec<_> = mem
+                .locked_ranges
+                .iter()
+                .filter_map(|range| {
+                    carrick_vfs::GuestMemoryRange::new(
+                        GuestVa(range.start().raw().max(start)),
+                        GuestVa(range.end().raw().min(end)),
+                    )
+                })
+                .collect();
+            for range in locked {
+                locked_ranges_remove(&mut mem.locked_ranges, range);
+                mem.set_locked(range, true);
+            }
+        }
         self.with_charged_root(&mem, &root, |_| Ok(()))
     }
 }

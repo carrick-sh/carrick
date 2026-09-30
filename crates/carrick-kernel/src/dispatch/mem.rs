@@ -1188,12 +1188,9 @@ impl<'a> MemView<'a> {
         };
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
-        // A delegated root's anonymous nodes carry no policy: the edited
-        // range becomes host-owned, then its rows are mirrored back.
-        mem.demote_root_rows(start, end);
-        mem.semantic_vmas
-            .update_policy(start, end, copy_update, child_update, dump_update);
-        mem.mirror_host_rows(start, end);
+        // Root-owned anonymous memory keeps its node and takes the
+        // attribute; host rows take the policy.
+        mem.update_policy(start, end, copy_update, child_update, dump_update);
     }
 
     /// Whether `[start, start + len)` is fully covered by VMAs whose contents
@@ -1922,7 +1919,7 @@ impl<'a> MemView<'a> {
         if limit == 0 {
             return Err(LINUX_EPERM);
         }
-        let locked = locked_ranges_total(&self.mem().lock().locked_ranges);
+        let locked = locked_ranges_total(&self.mem().lock().locked_view());
         if locked.checked_add(length).is_none_or(|total| total > limit) {
             return Err(LINUX_ENOMEM);
         }

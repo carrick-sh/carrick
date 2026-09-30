@@ -153,7 +153,7 @@ impl<'a> MemView<'a> {
         if covered_to < end {
             fully_mapped = false;
         }
-        let locked = mem.locked_ranges.iter().any(|r| {
+        let locked = mem.locked_view().iter().any(|r| {
             let (rs, re) = (r.start().raw(), r.end().raw());
             rs < end && re > start
         });
@@ -227,12 +227,12 @@ impl<'a> MemView<'a> {
 
     fn add_locked_range(&self, range: carrick_vfs::GuestMemoryRange) -> Result<(), LinuxErrno> {
         self.check_locked_range_limit(range)?;
-        locked_ranges_insert(&mut self.mem().lock().locked_ranges, range);
+        self.mem().lock().set_locked(range, true);
         Ok(())
     }
 
     fn remove_locked_range(&self, range: carrick_vfs::GuestMemoryRange) {
-        locked_ranges_remove(&mut self.mem().lock().locked_ranges, range);
+        self.mem().lock().set_locked(range, false);
     }
 
     pub(super) fn lock_current_mappings(
@@ -242,7 +242,7 @@ impl<'a> MemView<'a> {
     ) -> Result<(), LinuxErrno> {
         let mem_authority_40 = self.mem();
         let mem = mem_authority_40.lock();
-        let mut ranges = mem.locked_ranges.clone();
+        let mut ranges = mem.locked_view().into_owned();
         if let Some(regions) = &mem.address_space_regions {
             for region in regions {
                 if let Some(range) =
@@ -252,10 +252,17 @@ impl<'a> MemView<'a> {
                 }
             }
         }
-        for region in &mem.dynamic_maps {
-            if let Some(range) =
-                carrick_vfs::GuestMemoryRange::new(GuestVa(region.start), GuestVa(region.end))
-            {
+        for (start, end) in mem
+            .dynamic_maps
+            .iter()
+            .map(|region| (region.start, region.end))
+            .chain(
+                mem.root_anonymous_rows()
+                    .iter()
+                    .map(|row| (row.start, row.end)),
+            )
+        {
+            if let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
                 locked_ranges_insert(&mut ranges, range);
             }
         }
@@ -276,7 +283,11 @@ impl<'a> MemView<'a> {
                 self.populate_resident_range(memory, *range)?;
             }
         }
-        self.mem().lock().locked_ranges = ranges;
+        let authority = self.mem();
+        let mut mem = authority.lock();
+        for range in ranges {
+            mem.set_locked(range, true);
+        }
         Ok(())
     }
 
@@ -292,7 +303,7 @@ impl<'a> MemView<'a> {
         };
         let mem_authority_36 = self.mem();
         let mem = mem_authority_36.lock();
-        let mut next = mem.locked_ranges.clone();
+        let mut next = mem.locked_view().into_owned();
         locked_ranges_insert(&mut next, range);
         if let Some(limit) = memlock_limit {
             if limit == 0 {
@@ -445,7 +456,7 @@ impl<'a> MemView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             if flags & LINUX_MS_INVALIDATE != 0 {
-                let locked = this.mem().lock().locked_ranges.iter().any(|range| {
+                let locked = this.mem().lock().locked_view().iter().any(|range| {
                     range.start().raw() < end && range.end().raw() > address.0
                 });
                 if locked {
@@ -545,7 +556,7 @@ impl<'a> MemView<'a> {
         mm_mutation fn munlockall(this, cx) {
             let permit = cx.mm_mutation.host_alias_permit();
             let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
-            this.mem().lock().locked_ranges.clear();
+            this.mem().lock().unlock_all();
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
