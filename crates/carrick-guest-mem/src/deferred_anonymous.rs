@@ -438,6 +438,20 @@ impl DeferredAnonymousState {
         })
     }
 
+    /// Undo one committed pristine materialization whose physical
+    /// publication was retired before any leaf exposed it (a refused EL1
+    /// frame grant): the span is pristine zero again. Logical zero-read
+    /// residency stays as the commit left it.
+    pub fn restore_pristine(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<(), DeferredAnonymousError> {
+        let range = extent(start, len)?;
+        insert(&mut self.state.lock().pristine, range);
+        Ok(())
+    }
+
     /// Lock an exact pristine zero span through physical publication. A
     /// materialized hole refuses the bulk transaction without changing either
     /// pristine provenance or logical zero-read residency.
@@ -611,6 +625,23 @@ mod tests {
         state.retire(GuestVa(0x3000), 4096).unwrap();
         assert!(!state.covers_pristine(GuestVa(0x3001), 2));
         assert!(state.snapshot().zero_read_resident.is_empty());
+    }
+
+    #[test]
+    fn a_rolled_back_pristine_materialization_restores_the_exact_snapshot() {
+        let state = DeferredAnonymousState::new();
+        let base = GuestVa(0x40_0000);
+        state.reserve_fresh(base, 8 * PAGE as usize).unwrap();
+        let before = state.snapshot();
+        let grant = GuestVa(0x40_0000 + 2 * PAGE);
+        state
+            .begin_pristine_materialization(grant, 4 * PAGE as usize)
+            .unwrap()
+            .expect("pristine span")
+            .commit();
+        assert!(!state.covers_pristine(grant, PAGE as usize));
+        state.restore_pristine(grant, 4 * PAGE as usize).unwrap();
+        assert_eq!(state.snapshot(), before);
     }
 
     #[test]

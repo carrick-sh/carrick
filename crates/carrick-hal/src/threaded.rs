@@ -2690,6 +2690,17 @@ pub struct El1FrameGrantPublication {
     pub ready: El1FrameGrantReady,
 }
 
+/// Exactly what one successful `prepare_el1_frame_grant` published for a
+/// grant whose leaves were then never exposed (refused, rolled back, or never
+/// submitted): the semantic span and the backend identity it returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct El1FrameGrantRollback {
+    pub mm_key: u64,
+    pub semantic_base: u64,
+    pub len: u64,
+    pub ready: El1FrameGrantReady,
+}
+
 /// How an engine exposed a prepared EL1 frame grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum El1FrameGrantPublished {
@@ -3015,6 +3026,20 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "backend issued no guest descriptor transaction".to_owned(),
+        ))
+    }
+
+    /// Undo exactly what `prepare_el1_frame_grant` published (backing,
+    /// inventory, alias and mapping metadata, the pristine-zero transition)
+    /// for a grant whose leaves were never exposed. The caller holds the MM's
+    /// mutation authority. `Ok(false)`: the span no longer holds this grant's
+    /// backing (a later unmap already retired it); nothing was changed.
+    fn roll_back_el1_frame_grant(
+        &mut self,
+        _grant: El1FrameGrantRollback,
+    ) -> Result<bool, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend prepared no EL1 frame grant".to_owned(),
         ))
     }
 

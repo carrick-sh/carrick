@@ -106,6 +106,51 @@ impl DescriptorTxnSlots {
             .filter(move |slot| slot.submitted_for(mm_key))
     }
 
+    /// EL1: every slot holding a submission for `mm_key`, in the host's
+    /// submission order. The host prepares and submits one MM's
+    /// transactions under that MM's mutation guard with generations
+    /// increasing per MM, but each lands in whichever slot was free: an
+    /// async frame-grant `Prepare` can sit in a higher slot than a later
+    /// retirement of the same range. Applying in slot order would land the
+    /// grant after the retirement and re-expose retired backing, so
+    /// executors apply in generation order. Each step takes the oldest
+    /// submission newer than the last one returned, so it terminates.
+    pub fn submitted_in_order(&self, mm_key: u64) -> impl Iterator<Item = &DescriptorTxnSlot> + '_ {
+        let mut after = 0;
+        core::iter::from_fn(move || {
+            let next = self
+                .submitted_for(mm_key)
+                .map(|slot| (slot.submitted_generation(), slot))
+                .filter(|&(generation, _)| generation > after)
+                .min_by_key(|&(generation, _)| generation)?;
+            after = next.0;
+            Some(next.1)
+        })
+    }
+
+    /// Either venue: a transaction for `mm_key` is submitted or still being
+    /// applied, so a receipt (and the invalidation before it) is to come.
+    /// A slot keeps its summary bit until the host consumes the receipt.
+    #[must_use]
+    pub fn in_flight_for(&self, mm_key: u64) -> bool {
+        self.submitted
+            .iter()
+            .enumerate()
+            .flat_map(|(word, bits)| {
+                let mut bits = bits.load(Ordering::Acquire);
+                core::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    Some(word * 64 + bit)
+                })
+            })
+            .filter_map(|index| self.slots.get(index))
+            .any(|slot| slot.in_flight_for(mm_key))
+    }
+
     /// Either venue: an in-flight transaction for `mm_key` covers `va`.
     #[must_use]
     pub fn pending_covering(&self, mm_key: u64, va: u64) -> bool {
@@ -274,7 +319,10 @@ mod tests {
         assert!(slots.pending_covering(7, 0x4000_1abc));
         assert!(!slots.pending_covering(7, 0x4000_2000));
         let claimed = slots.slot(3).unwrap().claim_for_mm(7).unwrap();
-        let _ = claimed.complete(DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot));
+        let _ = claimed.complete(
+            DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+            || {},
+        );
         assert_eq!(
             slots.submitted_for(7).count(),
             0,
@@ -288,5 +336,34 @@ mod tests {
                 .iter()
                 .all(|w| w.load(Ordering::Relaxed) == 0)
         );
+    }
+
+    #[test]
+    fn one_mms_submissions_are_served_in_generation_order_not_slot_order() {
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorOp, PageSpan, TableGrants};
+        use core::num::NonZeroU64;
+        let nz = |v| NonZeroU64::new(v).unwrap();
+        let txn = |mm, generation| DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: nz(mm),
+                generation: nz(generation),
+            },
+            root: SubstrateGpa(0x8800_0000_0000),
+            op: DescriptorOp::Retire(PageSpan::new(0x4000_0000, 0x2000)),
+            tables: TableGrants::NONE,
+        };
+        let slots = DescriptorTxnSlots::new();
+        for (slot, generation) in [(0, 9), (70, 2), (5, 4), (200, 7)] {
+            assert!(slots.submit(slot, &txn(7, generation)));
+        }
+        assert!(slots.submit(1, &txn(8, 1)), "another MM is not interleaved");
+        let mut order = [0; 5];
+        let mut served = 0;
+        for slot in slots.submitted_in_order(7) {
+            order[served] = slot.submitted_generation();
+            served += 1;
+        }
+        assert_eq!(order[..served], [2, 4, 7, 9]);
     }
 }
