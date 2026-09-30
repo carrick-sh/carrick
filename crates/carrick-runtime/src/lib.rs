@@ -281,7 +281,7 @@ pub struct HostCowSnapshot {
     pub admitted_mms: u64,
     pub guest_lane_selected: u64,
     pub guest_lane_refused: u64,
-    pub guest_lane_refused_reasons: [u64; 3],
+    pub guest_lane_refused_reasons: [u64; 4],
     pub guest_lane_deferred: u64,
     pub guest_cow_settled: u64,
     pub guest_cow_provisioned: u64,

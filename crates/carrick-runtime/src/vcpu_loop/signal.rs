@@ -411,6 +411,34 @@ fn el1_frame_grants_enabled() -> bool {
     })
 }
 
+/// The operator's choice for the guest descriptor lane, read once per carrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DescriptorLaneHatch {
+    /// The lane is admitted wherever the writer census admits it.
+    Default,
+    /// `CARRICK_EL1_DESCRIPTOR_LANE=0`: every MM stays on the host-owned
+    /// lane, whatever the census says.
+    Disabled,
+}
+
+impl DescriptorLaneHatch {
+    /// Parse `CARRICK_EL1_DESCRIPTOR_LANE`: exactly `0` (trimmed) disables.
+    pub(super) fn from_env_value(value: Option<&str>) -> Self {
+        match value {
+            Some(value) if value.trim() == "0" => Self::Disabled,
+            _ => Self::Default,
+        }
+    }
+
+    /// This carrier's hatch.
+    pub(super) fn current() -> Self {
+        static HATCH: std::sync::OnceLock<DescriptorLaneHatch> = std::sync::OnceLock::new();
+        *HATCH.get_or_init(|| {
+            Self::from_env_value(std::env::var("CARRICK_EL1_DESCRIPTOR_LANE").ok().as_deref())
+        })
+    }
+}
+
 /// Every host writer family that still stores live stage-1 descriptors. The
 /// guest-owned lane is admitted for an MM only when every one of them submits
 /// descriptor transactions instead; a single unconverted writer would be
@@ -436,15 +464,20 @@ pub(super) struct GuestDescriptorLanePrecondition {
 impl GuestDescriptorLanePrecondition {
     /// The writer census of this build. Host copyout publishes through the
     /// verified EL1 Publish/Write receipt before the kernel commits residency
-    /// (`commit_prepared_host_write` -> `publish_copyout`). The backend
-    /// writers are not all converted, so no MM may select the lane yet.
+    /// (`commit_prepared_host_write` -> `publish_copyout`). Every backend
+    /// writer family submits descriptor transactions on the guest lane: the
+    /// shared terminal rule (mprotect, munmap retirement, retired reset, BUS
+    /// tags, fork arming), table reclaim receipts, alias maps, retained
+    /// reuse, sparse/file materialization, frame-grant replacement and
+    /// foreign-MM COW; exec publishes an offline image before the new MM
+    /// selects its lane.
     pub(super) fn current() -> Self {
         Self {
             slots_placed: carrick_el1_abi::descriptor_txn_slots_host().is_some(),
             frame_grants: true,
             host_copyout: true,
             fork_parent_arming: true,
-            backend_writers: false,
+            backend_writers: true,
         }
     }
 
@@ -455,24 +488,64 @@ impl GuestDescriptorLanePrecondition {
             && self.fork_parent_arming
             && self.backend_writers
     }
+
+    /// Whether an MM may select the guest lane under `hatch`. The operator
+    /// hatch is its own reason, never folded into a census field.
+    pub(super) fn admission(
+        self,
+        hatch: DescriptorLaneHatch,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestLaneRefusal> {
+        use carrick_mmu_core::aarch64::GuestLaneRefusal;
+        if hatch == DescriptorLaneHatch::Disabled {
+            return Err(GuestLaneRefusal::OperatorHatch);
+        }
+        if !self.admits() {
+            return Err(GuestLaneRefusal::Census);
+        }
+        Ok(())
+    }
 }
 
 /// Select the guest-owned lane for `engine`'s MM when the precondition
 /// admits it. Called where an engine binds an MM (initial runner and exec);
 /// fork children inherit their parent's lane. Never demotes a guest-owned MM.
-pub(super) fn select_guest_descriptor_lane<E: ThreadedEngine>(
+fn select_guest_descriptor_lane<E: ThreadedEngine>(
     engine: &mut E,
     precondition: GuestDescriptorLanePrecondition,
+    hatch: DescriptorLaneHatch,
 ) -> bool {
     use carrick_mmu_core::aarch64::LiveDescriptorOwner;
     if engine.live_descriptor_owner() == LiveDescriptorOwner::Guest {
         return true;
     }
-    if !precondition.admits() {
-        engine.record_guest_descriptor_lane_census_refusal();
+    if let Err(reason) = precondition.admission(hatch) {
+        engine.record_guest_descriptor_lane_refusal(reason);
         return false;
     }
     engine.select_live_descriptor_owner(LiveDescriptorOwner::Guest)
+}
+
+/// An MM an engine has just made its own: the initial runner's MM, or the
+/// replacement MM an exec committed. It carries the kernel's ownership of
+/// the MM, so the MM's admission to guest ownership decides from the MM
+/// itself rather than from a bare generation.
+pub(super) struct BoundMm {
+    pub(super) mm: std::sync::Arc<carrick_kernel::kernel::objects::Mm>,
+    pub(super) asid_generation: u64,
+}
+
+/// Admit an MM an engine binds: bind the engine's snapshot identity to it
+/// and select its live descriptor lane. This is the single admission point
+/// for the initial runner and exec commit. Fork children do not pass here:
+/// they inherit their parent's lane with their stage-1 authority
+/// (`Stage1Authority::child_with_manager`) at fork commit.
+pub(super) fn admit_bound_mm<E: ThreadedEngine>(engine: &mut E, bound: &BoundMm) -> bool {
+    engine.bind_task_snapshot_identity(bound.mm.id().raw(), bound.asid_generation);
+    select_guest_descriptor_lane(
+        engine,
+        GuestDescriptorLanePrecondition::current(),
+        DescriptorLaneHatch::current(),
+    )
 }
 
 /// Host-retained copy of one submitted guest-lane frame grant: the exact
@@ -2669,11 +2742,51 @@ mod guest_descriptor_lane_tests {
     }
 
     #[test]
-    fn the_lane_stays_unselected_until_every_writer_is_converted() {
+    fn every_writer_family_is_converted_and_the_hatch_refuses_by_its_own_reason() {
+        use carrick_mmu_core::aarch64::GuestLaneRefusal;
         let current = GuestDescriptorLanePrecondition::current();
-        assert!(!current.admits());
         assert!(current.frame_grants && current.fork_parent_arming);
-        assert!(current.host_copyout && !current.backend_writers);
+        assert!(current.host_copyout && current.backend_writers);
+        let placed = GuestDescriptorLanePrecondition {
+            slots_placed: true,
+            ..current
+        };
+        assert_eq!(placed.admission(DescriptorLaneHatch::Default), Ok(()));
+        assert_eq!(
+            placed.admission(DescriptorLaneHatch::Disabled),
+            Err(GuestLaneRefusal::OperatorHatch)
+        );
+        let unplaced = GuestDescriptorLanePrecondition {
+            slots_placed: false,
+            ..current
+        };
+        assert_eq!(
+            unplaced.admission(DescriptorLaneHatch::Default),
+            Err(GuestLaneRefusal::Census)
+        );
+        assert_eq!(
+            unplaced.admission(DescriptorLaneHatch::Disabled),
+            Err(GuestLaneRefusal::OperatorHatch),
+            "the hatch is reported as itself, never as a census gap"
+        );
+        for (value, hatch) in [
+            (None, DescriptorLaneHatch::Default),
+            (Some("0"), DescriptorLaneHatch::Disabled),
+            (Some(" 0\n"), DescriptorLaneHatch::Disabled),
+            (Some("1"), DescriptorLaneHatch::Default),
+            (Some(""), DescriptorLaneHatch::Default),
+            (Some("00"), DescriptorLaneHatch::Default),
+        ] {
+            assert_eq!(
+                DescriptorLaneHatch::from_env_value(value),
+                hatch,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lane_is_refused_while_any_writer_family_is_unconverted() {
         let all = GuestDescriptorLanePrecondition {
             slots_placed: true,
             frame_grants: true,
@@ -3409,19 +3522,19 @@ mod guest_descriptor_lane_tests {
         for (source, bind, retire) in [
             (
                 binding,
-                "engine.bind_task_snapshot_identity(mm.raw(), asid_generation);",
+                "let owned_mm = context.shared().mm();",
                 "table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);",
             ),
             (
                 exec,
-                "engine.bind_task_snapshot_identity(committed_mm.raw(), committed_asid_generation);",
+                "let committed_owned_mm = committed_context.shared().mm();",
                 "table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);",
             ),
         ] {
             let after_bind = source.split(bind).nth(1).expect("MM bind site");
-            let next = &after_bind[..after_bind.len().min(400)];
-            assert!(next.contains("select_guest_descriptor_lane("));
-            assert!(next.contains("GuestDescriptorLanePrecondition::current()"));
+            let next = &after_bind[..after_bind.len().min(600)];
+            assert!(next.contains("super::signal::admit_bound_mm("));
+            assert!(!next.contains("bind_task_snapshot_identity("));
             let after_retire = source.split(retire).nth(1).expect("retirement site");
             let next = &after_retire[..after_retire.len().min(200)];
             assert!(next.contains("withdraw_guest_descriptor_work("));

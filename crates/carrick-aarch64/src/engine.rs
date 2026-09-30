@@ -4126,9 +4126,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.page_tables.live_descriptor_owner()
     }
 
-    fn record_guest_descriptor_lane_census_refusal(&self) {
-        self.vm
-            .record_guest_descriptor_lane(Err(crate::stage1_authority::GuestLaneRefusal::Census));
+    fn record_guest_descriptor_lane_refusal(
+        &self,
+        reason: carrick_mmu_core::aarch64::GuestLaneRefusal,
+    ) {
+        self.vm.record_guest_descriptor_lane(Err(reason));
     }
 
     fn select_live_descriptor_owner(&mut self, owner: LiveDescriptorOwner) -> bool {

@@ -5608,15 +5608,18 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
         .map_err(|error| {
             RuntimeError::Configuration(format!("capture initial runner task authority: {error}"))
         })?;
-    let mm = context.shared().mm().id();
+    let owned_mm = context.shared().mm();
+    let mm = owned_mm.id();
     let asid_generation = kernel
         .hvpatch_process
         .as_ref()
         .map_or(mm.raw(), crate::hvpatch::ProcessContext::asid_generation);
-    engine.bind_task_snapshot_identity(mm.raw(), asid_generation);
-    super::signal::select_guest_descriptor_lane(
+    super::signal::admit_bound_mm(
         engine,
-        super::signal::GuestDescriptorLanePrecondition::current(),
+        &super::signal::BoundMm {
+            mm: owned_mm,
+            asid_generation,
+        },
     );
     if let Some(process) = kernel.hvpatch_process.as_ref() {
         let owner_inventory = engine.frame_cow_owner_inventory().ok_or_else(|| {

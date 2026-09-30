@@ -15,8 +15,9 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOp, DescriptorReceipt, DescriptorTxn, DescriptorTxnId, VerifiedDescriptorReceipt,
 };
 use carrick_mmu_core::aarch64::{
-    GuestTxnPrepareError, GuestTxnSettleError, HostArenaResolver, LiveDescriptorOwner,
-    PageTableApplyOutcome, PageTableError, PageTableManager, PtOp, TableArenaSource, TerminalRule,
+    GuestLaneRefusal, GuestTxnPrepareError, GuestTxnSettleError, HostArenaResolver,
+    LiveDescriptorOwner, PageTableApplyOutcome, PageTableError, PageTableManager, PtOp,
+    TableArenaSource, TerminalRule,
 };
 
 /// Explicit sharing lifecycle for stage-1 page tables across process fork/execve boundaries.
@@ -1209,19 +1210,6 @@ pub enum HostLaneCause {
 
 impl HostLaneCause {
     pub const COUNT: usize = 6;
-}
-
-/// Why a guest descriptor lane selection was refused (the MM stays on the
-/// host-owned lane).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GuestLaneRefusal {
-    /// The build's writer census does not admit the lane.
-    Census,
-    /// No live host resolver is bound, so EL1 and the host would not edit
-    /// and read the same descriptors.
-    NoLiveResolver,
-    /// Host edits are staged but not synced to hardware.
-    UnsyncedEdits,
 }
 
 pub struct Stage1Editor<'a> {

@@ -50,6 +50,22 @@ pub enum LiveDescriptorOwner {
     Guest,
 }
 
+/// Why a guest descriptor lane selection was refused (the MM stays on the
+/// host-owned lane).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestLaneRefusal {
+    /// The build's writer census does not admit the lane.
+    Census,
+    /// No live host resolver is bound, so EL1 and the host would not edit
+    /// and read the same descriptors.
+    NoLiveResolver,
+    /// Host edits are staged but not synced to hardware.
+    UnsyncedEdits,
+    /// The operator hatch `CARRICK_EL1_DESCRIPTOR_LANE=0` keeps every MM on
+    /// the host-owned lane.
+    OperatorHatch,
+}
+
 /// Narrow substrate guest-physical address type for stage-1 table arena boundaries.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
