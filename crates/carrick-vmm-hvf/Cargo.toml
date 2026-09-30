@@ -72,4 +72,6 @@ cc = "1"
 
 [dev-dependencies]
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+# The real EL1 guest-COW resolver drives the host settlement model tests.
+carrick-el1 = { path = "../carrick-el1" }
 sha2.workspace = true

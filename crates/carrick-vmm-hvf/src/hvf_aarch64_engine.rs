@@ -52,6 +52,8 @@ struct HostCowLedgerInner {
     guest_lane_refused_no_resolver: std::sync::atomic::AtomicU64,
     guest_lane_refused_unsynced: std::sync::atomic::AtomicU64,
     guest_lane_deferred: std::sync::atomic::AtomicU64,
+    guest_cow_settled: std::sync::atomic::AtomicU64,
+    guest_cow_provisioned: std::sync::atomic::AtomicU64,
 }
 
 /// Carrier-owned host COW accounting. Each carrier custody owns exactly one;
@@ -91,6 +93,10 @@ pub struct HostCowSnapshot {
     /// Selections admitted before the MM's live backing existed; each is
     /// counted again in `guest_lane_selected` when the binding completes it.
     pub guest_lane_deferred: u64,
+    /// COW faults EL1 resolved with a pool grant that the host settled.
+    pub guest_cow_settled: u64,
+    /// Replacement grants the host provisioned into the EL1 pool.
+    pub guest_cow_provisioned: u64,
 }
 
 impl HostCowSnapshot {
@@ -124,6 +130,12 @@ impl HostCowSnapshot {
             guest_lane_deferred: self
                 .guest_lane_deferred
                 .checked_sub(before.guest_lane_deferred)?,
+            guest_cow_settled: self
+                .guest_cow_settled
+                .checked_sub(before.guest_cow_settled)?,
+            guest_cow_provisioned: self
+                .guest_cow_provisioned
+                .checked_sub(before.guest_cow_provisioned)?,
         })
     }
 }
@@ -160,6 +172,8 @@ impl HostCowLedger {
                     .load(Ordering::Relaxed),
             ],
             guest_lane_deferred: self.inner.guest_lane_deferred.load(Ordering::Relaxed),
+            guest_cow_settled: self.inner.guest_cow_settled.load(Ordering::Relaxed),
+            guest_cow_provisioned: self.inner.guest_cow_provisioned.load(Ordering::Relaxed),
         }
     }
 
@@ -211,6 +225,26 @@ impl HostCowStats {
     pub fn host_cow_resolutions(&self) -> u64 {
         self.host_cow_resolutions
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A guest EL1 COW completion of this MM was settled (not a host COW).
+    pub(crate) fn record_guest_cow_settled(&self) {
+        if let Some(ledger) = &self.ledger {
+            ledger
+                .inner
+                .guest_cow_settled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Replacement grants provisioned for this MM's guest COW.
+    pub(crate) fn record_guest_cow_provisioned(&self, grants: u64) {
+        if let Some(ledger) = &self.ledger {
+            ledger
+                .inner
+                .guest_cow_provisioned
+                .fetch_add(grants, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn record_host_cow_resolution(&self) {
@@ -1684,6 +1718,12 @@ pub fn persistent_executor_factory_authority(
 }
 
 impl HvpatchPersistentExecutorFactoryAuthority {
+    /// The settlement of guest EL1 COW completions for every MM of this
+    /// carrier, to install where the host excludes an MM's EL1 editor.
+    pub fn guest_cow_settlement(&self) -> Arc<dyn carrick_el1_abi::CowGrantSettlement> {
+        Arc::new(self.spec.guest_cow_settlement())
+    }
+
     /// Retain the exact carrier region and generation for reservation metadata.
     pub fn reservation_metadata_access(
         &self,

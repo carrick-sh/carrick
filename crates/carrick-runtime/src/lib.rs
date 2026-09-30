@@ -283,6 +283,8 @@ pub struct HostCowSnapshot {
     pub guest_lane_refused: u64,
     pub guest_lane_refused_reasons: [u64; 3],
     pub guest_lane_deferred: u64,
+    pub guest_cow_settled: u64,
+    pub guest_cow_provisioned: u64,
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

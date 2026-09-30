@@ -405,7 +405,12 @@ mod tests {
             invalidations.get() >= 1,
             "the MM's stale RO translations are invalidated"
         );
-        assert_eq!(pool.completions(MM).collect::<Vec<_>>(), vec![expected]);
+        let spaces = AddressSpaces::new();
+        let excluded = spaces.unpublished(MM).unwrap();
+        assert_eq!(
+            pool.completions(&excluded).collect::<Vec<_>>(),
+            vec![expected]
+        );
         assert_eq!(pool.resolved(), 1);
         assert_eq!(pool.ready(MM).count(), 0);
     }
@@ -590,7 +595,10 @@ mod tests {
         let index = open.publish_closed(MM, ROOT | ASID, ROOT | ASID).unwrap();
         open.open(index);
         assert_eq!(dispatch(&open, &mut resolver), Action::Served);
-        assert_eq!(pool.completions(MM).count(), 1);
+        // The host settles with the MM's editor excluded (here: unpublished).
+        let host = AddressSpaces::new();
+        let excluded = host.unpublished(MM).unwrap();
+        assert_eq!(pool.completions(&excluded).count(), 1);
         assert_eq!(arena.leaf(VA) & PA, GRANT);
         const _: () = assert!(GRANT.is_multiple_of(COW_GRANT_SIZE));
     }

@@ -373,6 +373,8 @@ impl Drop for OwnerCleanup {
 struct TestForeignCowAuthority {
     live: Arc<parking_lot::RwLock<TestSnapshot>>,
     old_frame: carrick_hal::FrameId,
+    /// Kernel mappings of the old frame across MMs (2: a fork peer shares it).
+    old_frame_mappings: usize,
     allow_quiesce: bool,
     serial: std::sync::atomic::AtomicU64,
     published: parking_lot::Mutex<Option<(carrick_hal::MappingId, carrick_hal::FrameId, Gpa, u64)>>,
@@ -392,6 +394,7 @@ impl TestForeignCowAuthority {
         Self {
             live: Arc::clone(&installed.live.0),
             old_frame,
+            old_frame_mappings: 2,
             allow_quiesce: false,
             serial: std::sync::atomic::AtomicU64::new(
                 installed.snapshot.mm.get().saturating_mul(1_000),
@@ -652,7 +655,7 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
         &self,
         frame: carrick_hal::FrameId,
     ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok((frame == self.old_frame).then_some(2))
+        Ok((frame == self.old_frame).then_some(self.old_frame_mappings))
     }
 }
 
@@ -5798,6 +5801,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     let cow_authority = Arc::new(TestForeignCowAuthority {
         live: Arc::clone(&child_live.0),
         old_frame: vvar_extent.frame,
+        old_frame_mappings: 2,
         allow_quiesce: true,
         serial: std::sync::atomic::AtomicU64::new(871_000),
         published: parking_lot::Mutex::new(None),
@@ -11984,4 +11988,390 @@ fn host_retained_reuse_repoints_through_the_host_editor() {
         fixture.task.cow_deferred_publications.lock().len(),
         OWNER_LEN / 4096
     );
+}
+
+/// Host-driven guest EL1 fork COW: the real EL1 resolver (claim, copy
+/// through the MM's copy window, `CowRepoint` with the shared executor) runs
+/// over the fixture MM's live table owner memory with a grant the host
+/// provisioned; the carrier settlement then folds the completion into the
+/// backend inventory, the kernel inventory, the alias registry and the arm
+/// state.
+mod guest_cow {
+    use super::*;
+    use crate::trap::guest_cow::{provision_guest_cow_grants, settle_guest_cow_completions};
+    use carrick_el1::cow::{GuestCowOutcome, GuestCowVenue, resolve_guest_cow};
+    use carrick_el1_abi::{AddressSpaces, CowGrantPool, CowGrantSettlement, EL1_COW_COPY_BASE};
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::aarch64::descriptor_txn::{PrimaryTableWords, TableMaintenance};
+
+    const PA: u64 = 0x0000_FFFF_FFFF_F000;
+    const AP: u64 = 0b11 << 6;
+    const AP_RO_EL0: u64 = 0b11 << 6;
+    const AP_RW_EL0: u64 = 0b01 << 6;
+    const NG: u64 = 1 << 11;
+    const COW: u64 = 1 << 55;
+    const PRIVATE: u64 = 1 << 56;
+    const MAY_WRITE: u64 = 1 << 57;
+
+    struct Maintenance;
+    impl TableMaintenance for Maintenance {
+        fn publish_barrier(&self) {}
+        fn invalidate_range(&self, _va: u64, _len: u64) {}
+    }
+
+    /// The live L3 word for `va` in the fixture's table owner memory.
+    fn leaf_word(root: u64, va: u64) -> *mut u64 {
+        let mut table = root;
+        for shift in [39, 30, 21] {
+            let entry = model_owner_host(table + ((va >> shift) & 511) * 8) as *mut u64;
+            // SAFETY: the table owner is live for the fixture's lifetime.
+            let descriptor = unsafe { entry.read_volatile() };
+            assert_eq!(
+                descriptor & 3,
+                3,
+                "fixture walk of 0x{va:x} hit a non-table"
+            );
+            table = descriptor & PA;
+        }
+        model_owner_host(table + ((va >> 12) & 511) * 8) as *mut u64
+    }
+
+    /// A forked child: its 16 KiB data compound is EL1-private and armed in
+    /// the live tables (Linux-writable), armed in the backend, and the MM
+    /// owns the guest descriptor lane with its copy window provisioned.
+    fn forked_guest_child(
+        ordinal: u64,
+        root: u64,
+        data: u64,
+    ) -> (InstalledMm, &'static CowGrantPool) {
+        let child = install_mm(
+            &CarrierForeignMmTransport::new(),
+            ordinal,
+            root,
+            data,
+            *b"old!",
+        );
+        let resolver = child.state.live_resolver.read().clone().unwrap();
+        child
+            .state
+            .page_tables_authority()
+            .edit(
+                || panic!("fixture manager"),
+                |editor| {
+                    editor.manager.provision_cow_copy_window(None)?;
+                    // SAFETY: the fixture resolver maps the fixture arena.
+                    unsafe { editor.sync_to_host(&resolver) }
+                },
+            )
+            .expect("provision the copy window");
+        for page in 0..4 {
+            let word = leaf_word(root, TEST_VA + page * 4096);
+            // SAFETY: the table owner is live for the fixture's lifetime.
+            unsafe {
+                let leaf = word.read_volatile();
+                assert_eq!(leaf & PA, data + page * 4096);
+                word.write_volatile((leaf & !AP) | AP_RO_EL0 | NG | COW | PRIVATE | MAY_WRITE);
+            }
+        }
+        let (authority, _lease, _invalidator) = prepare_foreign_cow(&child);
+        drop(authority);
+        child
+            .state
+            .page_tables_authority()
+            .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+        (child, Box::leak(Box::new(CowGrantPool::new())))
+    }
+
+    /// EL1's fault path, modelled only in where memory lives.
+    fn el1_write_fault(child: &InstalledMm, pool: &CowGrantPool, va: u64) -> GuestCowOutcome {
+        let root = child.owners.0[0].0;
+        let words = unsafe {
+            PrimaryTableWords::new(
+                model_owner_host(root).cast(),
+                root,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                &Maintenance,
+            )
+        }
+        .unwrap();
+        resolve_guest_cow(
+            &GuestCowVenue {
+                words: &words,
+                root: SubstrateGpa(root),
+                pool,
+                copy_base: EL1_COW_COPY_BASE,
+            },
+            child.snapshot.mm.get(),
+            va,
+            |source, destination| {
+                // The copy window's live aliases say which frames to copy.
+                // SAFETY: both aliases name live, distinct owner pages.
+                unsafe {
+                    let from = leaf_word(root, source).read_volatile();
+                    let to = leaf_word(root, destination).read_volatile();
+                    assert_ne!(from & 1, 0);
+                    assert_ne!(to & 1, 0);
+                    std::ptr::copy_nonoverlapping(
+                        model_owner_host(from & PA),
+                        model_owner_host(to & PA),
+                        4096,
+                    );
+                }
+            },
+            || {},
+        )
+    }
+
+    #[test]
+    fn a_provisioned_grant_serves_el1_and_settles_into_every_host_authority() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (mut child, pool) = forked_guest_child(741, 0x9a01_2c00_0000, 0x9b01_2c00_0000);
+        let mm = child.snapshot.mm.get();
+        let old_key = child.owners.0[1];
+        let old_mapping = child.snapshot.mapping_ids[1];
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+
+        assert_eq!(
+            provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap(),
+            1
+        );
+        let grant = pool.ready(mm).next().expect("published grant");
+        let new_key = (grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE);
+        child.owners.0.push(new_key);
+        assert!(
+            child
+                .state
+                .frame_inventory
+                .ledger
+                .lock()
+                .extents
+                .contains_key(&new_key),
+            "a grant is an inventory extent of its MM before any VA maps it"
+        );
+
+        // EL1: the whole armed compound moves, no host exit.
+        let outcome = el1_write_fault(&child, pool, TEST_VA + 0x1008);
+        let GuestCowOutcome::Resolved(completion) = outcome else {
+            panic!("EL1 must resolve the armed write: {outcome:?}");
+        };
+        assert_eq!(
+            (
+                completion.span_va,
+                completion.span_len,
+                completion.old_ipa,
+                completion.new_ipa
+            ),
+            (TEST_VA, 0x4000, old_key.0, grant.physical_ipa)
+        );
+        let root = child.owners.0[0].0;
+        let leaf = unsafe { leaf_word(root, TEST_VA).read_volatile() };
+        assert_eq!(leaf & PA, grant.physical_ipa);
+        assert_eq!(leaf & AP, AP_RW_EL0);
+        assert_eq!(leaf & COW, 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(model_owner_host(grant.physical_ipa), 4) },
+            b"old!",
+            "EL1 copied the shared bytes"
+        );
+
+        // Before settlement the host still believes the span shares the old
+        // compound: every host authority names it, and the span is armed.
+        assert!(child.state.cow_armed.lock().span_for(TEST_VA).is_some());
+        assert!(child.live.0.read().mapping_ids.contains(&old_mapping));
+
+        // Settlement needs the MM's editor excluded; another MM's proof
+        // settles nothing.
+        let spaces = AddressSpaces::new();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        transport.register(&child.snapshot, &child.state);
+        let settlement = CarrierGuestCowSettlement::new(&transport).with_pool(pool);
+        settlement.settle(&spaces.unpublished(mm + 1).unwrap());
+        assert_eq!(
+            pool.completions(&spaces.unpublished(mm).unwrap()).count(),
+            1
+        );
+        settlement.settle(&spaces.unpublished(mm).unwrap());
+
+        assert_eq!(
+            pool.completions(&spaces.unpublished(mm).unwrap()).count(),
+            0
+        );
+        assert!(!pool.any_completed());
+        assert!(
+            child.state.cow_armed.lock().span_for(TEST_VA).is_none(),
+            "the settled span is disarmed"
+        );
+        let live = child.live.0.read().clone();
+        assert!(
+            !live.mapping_ids.contains(&old_mapping),
+            "old mapping unmapped"
+        );
+        assert!(
+            live.mapping_ids
+                .contains(&carrick_hal::MappingId::from_kernel_allocation(
+                    grant.backing.mapping_id
+                ))
+        );
+        let alias = alias_registry()
+            .lock()
+            .newest_matching_for_process(
+                Some(old_key_root(&child)),
+                ContainerRootToken::ROOT,
+                |alias| alias.start == TEST_VA,
+            )
+            .expect("replacement alias");
+        assert_eq!(alias.physical_ipa, grant.physical_ipa);
+        assert!(alias.guest_writable);
+        assert_eq!(child.state.host_cow_stats.host_cow_resolutions(), 0);
+        // A foreign reader of the settled MM reads the private copy.
+        let settled = child.live.0.read().clone();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let lease = carrick_hal::ForeignMmEndpoint::for_carrier(transport.clone())
+            .retain(&settled, deadline)
+            .expect("retain the settled MM");
+        let mut bytes = [0; 4];
+        lease
+            .read(
+                &child.live,
+                &settled,
+                GuestVa(TEST_VA),
+                &mut bytes,
+                deadline,
+            )
+            .expect("read the settled MM");
+        assert_eq!(&bytes, b"old!");
+        let _ = settle_guest_cow_completions;
+    }
+
+    fn old_key_root(child: &InstalledMm) -> (u64, u64) {
+        child.owners.0[0]
+    }
+
+    /// The fork peer still maps the old compound: settling keeps its owner.
+    /// The last reference retires the old stage-2 owner at settlement.
+    #[test]
+    fn settlement_retires_the_old_compound_only_with_its_last_reference() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        for (ordinal, mappings) in [(742_u64, 2_usize), (743, 1)] {
+            let _stub = ScopedStage2MapTestStub::enable();
+            let (mut child, pool) = forked_guest_child(
+                ordinal,
+                0x9a01_2e00_0000 + (ordinal - 742) * 0x100_0000,
+                0x9b01_2e00_0000 + (ordinal - 742) * 0x100_0000,
+            );
+            let mut authority = TestForeignCowAuthority::new(&child);
+            authority.old_frame_mappings = mappings;
+            child.state.cow_runtime.write().as_mut().unwrap().authority = Arc::new(authority);
+            let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+            provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+            let grant = pool.ready(child.snapshot.mm.get()).next().unwrap();
+            child
+                .owners
+                .0
+                .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+            assert!(matches!(
+                el1_write_fault(&child, pool, TEST_VA),
+                GuestCowOutcome::Resolved(_)
+            ));
+            let old_key = child.owners.0[1];
+            let spaces = AddressSpaces::new();
+            let excluded = spaces.unpublished(child.snapshot.mm.get()).unwrap();
+            assert_eq!(
+                settle_guest_cow_completions(&child.state, &custody, pool, &excluded),
+                1
+            );
+            assert_eq!(
+                global_frame_host_owner_identity(old_key.0, old_key.1).is_some(),
+                mappings > 1,
+                "old owner with {mappings} kernel mapping(s)"
+            );
+            assert!(
+                !child
+                    .state
+                    .frame_inventory
+                    .ledger
+                    .lock()
+                    .extents
+                    .contains_key(&old_key),
+                "this MM no longer maps the old compound"
+            );
+        }
+    }
+
+    /// The host refills only when EL1 could have resolved the fault itself
+    /// and found no grant: the refill doubles per empty pool, so faults cost
+    /// exits logarithmically; a pool that still holds a grant, an unarmed
+    /// leaf, or an MM EL1 cannot install leaves the fault to the host COW.
+    #[test]
+    fn the_host_refills_only_an_empty_pool_for_an_el1_resolvable_fault() {
+        use crate::trap::guest_cow::{GUEST_COW_FIRST_BATCH, refill_guest_cow_pool};
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (mut child, pool) = forked_guest_child(745, 0x9a01_3200_0000, 0x9b01_3200_0000);
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let mm = child.snapshot.mm.get();
+        assert!(
+            !refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA, |_| false).unwrap(),
+            "EL1 cannot install an unpublished MM: no grants for it"
+        );
+        assert!(
+            !refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA + 0x10_0000, |_| true)
+                .unwrap(),
+            "an unarmed page is the host's"
+        );
+        assert_eq!(pool.ready(mm).count(), 0);
+        assert!(refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA, |_| true).unwrap());
+        assert_eq!(pool.ready(mm).count(), GUEST_COW_FIRST_BATCH);
+        assert!(
+            !refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA, |_| true).unwrap(),
+            "EL1 declined with grants in the pool: the host resolves it"
+        );
+        let spaces = AddressSpaces::new();
+        let excluded = spaces.unpublished(mm).unwrap();
+        for grant in pool.ready(mm).collect::<Vec<_>>() {
+            child
+                .owners
+                .0
+                .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+            assert!(pool.revoke(&excluded, &grant));
+        }
+        assert!(refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA, |_| true).unwrap());
+        assert_eq!(
+            pool.ready(mm).count(),
+            2 * GUEST_COW_FIRST_BATCH,
+            "the next empty pool gets twice the grants"
+        );
+        for grant in pool.ready(mm).collect::<Vec<_>>() {
+            child
+                .owners
+                .0
+                .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+        }
+    }
+
+    #[test]
+    fn grants_are_provisioned_only_for_a_guest_owned_mm() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (child, pool) = forked_guest_child(744, 0x9a01_3100_0000, 0x9b01_3100_0000);
+        child
+            .state
+            .page_tables_authority()
+            .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Host);
+        let before = format!("{:?}", *child.state.frame_inventory.ledger.lock());
+        assert!(
+            provision_guest_cow_grants(&child.state, legacy_test_carrier_vm_custody_arc(), pool, 4)
+                .is_err()
+        );
+        assert_eq!(pool.ready(child.snapshot.mm.get()).count(), 0);
+        assert_eq!(
+            format!("{:?}", *child.state.frame_inventory.ledger.lock()),
+            before
+        );
+    }
 }

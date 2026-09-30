@@ -2390,10 +2390,10 @@ pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
 pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 
 pub use carrick_sched_core::{
-    BoundedSpin, Claim, CurrentHandback, Exhausted, Handback, HostClaim, HostPlacement,
-    HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef, SlotDrain, SlotId, SlotState,
-    SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord, WakeRefusal, Waker, ZONE_SLOTS,
-    ZoneRecord, ZoneTables,
+    AddressSpaces, BoundedSpin, Claim, CurrentHandback, ExcludedEditor, Exhausted, Handback,
+    HostClaim, HostPlacement, HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef,
+    SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord,
+    WakeRefusal, Waker, ZONE_SLOTS, ZoneRecord, ZoneTables,
 };
 
 /// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex
