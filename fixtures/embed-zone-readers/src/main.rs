@@ -20,6 +20,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -195,22 +196,94 @@ fn check(how: &str, path: &str, got: &[u8], want: &[u8], read_seq: u64) {
     if got == want {
         return;
     }
+    // Snapshot at once, then compare the snapshot: a mismatch whose bytes
+    // change while this report is built is a store that reached the buffer
+    // after read(2) returned, and must be named as such rather than
+    // described from bytes that have since become correct.
+    let snapshot: Vec<u8> = got
+        .iter()
+        // SAFETY: `byte` is a valid reference into `got`.
+        .map(|byte| unsafe { std::ptr::read_volatile(byte) })
+        .collect();
     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-    let first = got.iter().zip(want).take_while(|(a, b)| a == b).count();
+    let first = snapshot
+        .iter()
+        .zip(want)
+        .take_while(|(a, b)| a == b)
+        .count();
     let at = first & !15;
-    let got_record = got.get(at..(at + 16).min(got.len())).unwrap_or(&[]);
+    let got_record = snapshot
+        .get(at..(at + 16).min(snapshot.len()))
+        .unwrap_or(&[]);
+    let want_record = want.get(at..(at + 16).min(want.len())).unwrap_or(&[]);
     eprintln!(
-        "MISMATCH pid={} {how} {path} len={} want={} first_diff={first} got_record={:?}",
+        "MISMATCH pid={} {how} {path} len={} want={} first_diff={first} got_record={:02x?} want_record={:02x?} snapshot_matches={}",
         std::process::id(),
-        got.len(),
+        snapshot.len(),
         want.len(),
-        String::from_utf8_lossy(got_record)
+        got_record,
+        want_record,
+        snapshot == want
     );
     eprintln!(
         "FORENSICS pid={} {how} {path} {}",
         std::process::id(),
-        forensics(got, got.as_ptr() as usize, want, read_seq)
+        forensics(&snapshot, got.as_ptr() as usize, want, read_seq)
     );
+    // Were the wrong bytes still wrong after the report? Late arrival names
+    // an asynchronous or unordered writer; persistent names a wrong copy.
+    let later: Vec<u8> = got
+        .iter()
+        // SAFETY: as above.
+        .map(|byte| unsafe { std::ptr::read_volatile(byte) })
+        .collect();
+    let first_later = later.iter().zip(want).take_while(|(a, b)| a == b).count();
+    eprintln!(
+        "LATE pid={} {how} {path} changed_since_snapshot={} later_matches={} later_first_diff={first_later}",
+        std::process::id(),
+        later != snapshot,
+        later == want
+    );
+    // Per-CPU view: yield between samples so the thread can run on other
+    // vCPUs, and record which CPU saw which bytes at the first wrong record.
+    // A value that follows the CPU names a stale translation on one vCPU; a
+    // value that only changes once names a late store.
+    let mut samples = String::new();
+    for _ in 0..16 {
+        // SAFETY: sched_yield(2) takes no arguments.
+        unsafe { raw_syscall0(124) };
+        let cpu = getcpu();
+        let now: Vec<u8> = got[at..(at + 16).min(got.len())]
+            .iter()
+            // SAFETY: as above.
+            .map(|byte| unsafe { std::ptr::read_volatile(byte) })
+            .collect();
+        samples.push_str(&format!(" cpu{cpu}:{}", u8::from(now == want_record)));
+    }
+    eprintln!(
+        "PERCPU pid={} tid={} {how} {path} at=0x{at:x}{samples}",
+        std::process::id(),
+        tid()
+    );
+}
+
+/// getcpu(2): the CPU this thread is running on.
+fn getcpu() -> u32 {
+    let mut cpu: u32 = u32::MAX;
+    let ret: u64;
+    // SAFETY: getcpu writes one u32 through the first pointer; the others are
+    // NULL, which Linux accepts.
+    unsafe {
+        std::arch::asm!(
+            "svc #0",
+            in("x8") 168u64,
+            inlateout("x0") &mut cpu as *mut u32 as u64 => ret,
+            in("x1") 0u64,
+            in("x2") 0u64,
+            options(nostack)
+        );
+    }
+    if ret == 0 { cpu } else { u32::MAX }
 }
 
 /// read(2) in 4 KiB steps, or pread(2) in 8 KiB steps, to EOF. Returns the
@@ -340,6 +413,7 @@ fn main() {
         std::fs::write(format!("{DIR}/s-{id}"), content(id, size_for(id))).expect("create a file");
     }
     let mut failed_children = 0;
+    let mut failures: Vec<String> = Vec::new();
     for round in 0..rounds {
         let children: Vec<_> = (0..procs)
             .map(|_| {
@@ -352,15 +426,37 @@ fn main() {
             })
             .collect();
         for mut child in children {
-            if !child.wait().map(|status| status.success()).unwrap_or(false) {
-                failed_children += 1;
+            let pid = child.id();
+            match child.wait() {
+                Ok(status) if status.success() => {}
+                // Every failure names its reason here, on both streams, so a
+                // child that died by a signal, or whose own report was lost,
+                // is never a silent failure.
+                outcome => {
+                    failed_children += 1;
+                    let reason = match outcome {
+                        Ok(status) => format!(
+                            "code={:?} signal={:?} core={}",
+                            status.code(),
+                            status.signal(),
+                            status.core_dumped()
+                        ),
+                        Err(error) => format!("wait failed: {error}"),
+                    };
+                    let line = format!("CHILD_FAILED round={round} pid={pid} {reason}");
+                    eprintln!("{line}");
+                    failures.push(line);
+                }
             }
         }
     }
     if failed_children == 0 {
         println!("zone_readers_ok");
     } else {
-        println!("zone_readers_failed children={failed_children}");
+        println!(
+            "zone_readers_failed children={failed_children} [{}]",
+            failures.join("; ")
+        );
         std::process::exit(1);
     }
 }
