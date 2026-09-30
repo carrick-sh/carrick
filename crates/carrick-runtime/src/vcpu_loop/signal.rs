@@ -434,14 +434,15 @@ pub(super) struct GuestDescriptorLanePrecondition {
 }
 
 impl GuestDescriptorLanePrecondition {
-    /// The writer census of this build. Host copyout (pending the kernel's
-    /// deferred first-touch commit) and the backend writers are not
-    /// converted, so no MM may select the lane yet.
+    /// The writer census of this build. Host copyout publishes through the
+    /// verified EL1 Publish/Write receipt before the kernel commits residency
+    /// (`commit_prepared_host_write` -> `publish_copyout`). The backend
+    /// writers are not all converted, so no MM may select the lane yet.
     pub(super) fn current() -> Self {
         Self {
             slots_placed: carrick_el1_abi::descriptor_txn_slots_host().is_some(),
             frame_grants: true,
-            host_copyout: false,
+            host_copyout: true,
             fork_parent_arming: true,
             backend_writers: false,
         }
@@ -2500,7 +2501,7 @@ mod guest_descriptor_lane_tests {
         let current = GuestDescriptorLanePrecondition::current();
         assert!(!current.admits());
         assert!(current.frame_grants && current.fork_parent_arming);
-        assert!(!current.host_copyout && !current.backend_writers);
+        assert!(current.host_copyout && !current.backend_writers);
         let all = GuestDescriptorLanePrecondition {
             slots_placed: true,
             frame_grants: true,
