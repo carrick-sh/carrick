@@ -1522,13 +1522,14 @@ where
                 request,
             };
             // EL1 has already made the resident private-anonymous munmap
-            // guest-visible by retiring its exact live terminals. The syscall
+            // (or the permission narrowing of an mprotect) guest-visible by
+            // editing its exact live terminals. The syscall
             // still crosses this one typed boundary so the ordinary
             // exact-context mutation route authenticates the original request,
             // retires stage-2/frame-inventory backing in bulk, and commits VMA
             // metadata. Reapplying retirement there is idempotent and remains
             // temporary until mmap-family policy itself moves into EL1.
-            if request.number.raw() == 215 {
+            if matches!(request.number.raw(), 215 | 226) {
                 (syscall, None)
             } else {
                 let val = frame.args[0] as i64;
