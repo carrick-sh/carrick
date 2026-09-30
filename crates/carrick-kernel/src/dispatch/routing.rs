@@ -63,6 +63,21 @@ pub const MM_MUTATION_SYSCALLS: &[u64] = &[
     25, 196, 214, 215, 216, 222, 226, 227, 228, 229, 230, 231, 232, 233, 284,
 ];
 
+/// The mapping syscalls whose host venue may mirror host rows into a
+/// delegated root after their backend work, and for which ENOMEM is a Linux
+/// answer (map-count exhaustion): `shmat`, `munmap`, `mremap`, `mmap`,
+/// `mprotect`, `mlock`, `munlock`, `mlockall`, `madvise`, `mlock2`. `brk`
+/// answers exhaustion with the unchanged break; `msync`, `mincore`,
+/// `munlockall` and `fcntl` never add root nodes.
+fn mm_mutation_may_mirror(number: u64) -> bool {
+    matches!(
+        number,
+        196 | MUNMAP | 216 | 222 | 226 | 228 | 229 | 230 | 233 | 284
+    )
+}
+
+const MUNMAP: u64 = 215;
+
 pub fn syscall_requires_mm_mutation(number: u64, _args: SyscallArgs) -> bool {
     MM_MUTATION_SYSCALLS.contains(&number)
 }
@@ -193,9 +208,34 @@ impl SyscallDispatcher {
         mut ctx: MutationSyscallCtx<'_, 'authority, 'lease, M>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_mutation_handler(ctx.request.number.raw())?;
+        if let Some(errno) = self.secure_host_venue_metadata(&ctx.request) {
+            return Some(errno.map(DispatchOutcome::errno));
+        }
         Some(resources::with_captured_resources(ctx.kernel, || {
             handler(self, &mut ctx)
         }))
+    }
+
+    /// A delegated MM's mapping syscall secures the root nodes its host
+    /// commits may need before any backend work; `Some` is the answer when
+    /// it cannot (ENOMEM, as at the map-count limit).
+    fn secure_host_venue_metadata(
+        &self,
+        request: &SyscallRequest,
+    ) -> Option<Result<carrick_abi::LinuxErrno, DispatchError>> {
+        let number = request.number.raw();
+        if !mm_mutation_may_mirror(number) {
+            return None;
+        }
+        let view = self.mem_view();
+        let munmap = if number == MUNMAP {
+            let [address, length, ..] = request.args.0;
+            // A malformed range fails the syscall's own validation first.
+            Some(view.munmap_edit_range(address, length)?)
+        } else {
+            None
+        };
+        view.secure_host_venue_metadata(munmap).transpose()
     }
 
     /// Focused unit-test boundary for mutation handlers. Production callers

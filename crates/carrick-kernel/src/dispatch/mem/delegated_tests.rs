@@ -2025,3 +2025,155 @@ fn delegated_committed_alias_install_replaces_the_range_with_its_host_row() {
     assert!(row.read && row.write);
     assert_eq!((row.start, row.end), (owned, owned + 2 * PAGE));
 }
+
+// ---------------------------------------------------------------------------
+// S2 fencing: root node exhaustion is a typed, recoverable outcome. A host
+// syscall that may need root metadata after its backend work secures it
+// first, or answers ENOMEM (Linux's answer when a mapping edit would exceed
+// the map count) before touching anything.
+// ---------------------------------------------------------------------------
+
+/// (start, end, protection bits) of one row or node.
+type Row = (u64, u64, u64);
+
+/// The root's opaque (host-owned) nodes and the host's rows in
+/// `[start, end)`: after every host syscall the first mirrors the second.
+fn host_rows_and_mirror(
+    dispatcher: &SyscallDispatcher,
+    root: &Root,
+    start: u64,
+    end: u64,
+) -> (Vec<Row>, Vec<Row>) {
+    let rows = dispatcher
+        .mem()
+        .lock()
+        .semantic_vmas
+        .overlapping(start, end)
+        .map(|vma| {
+            let prot =
+                u64::from(vma.read) | (u64::from(vma.write) << 1) | (u64::from(vma.execute) << 2);
+            (vma.start, vma.end, prot)
+        })
+        .collect();
+    let mut mirror = Vec::new();
+    root.lock()
+        .observe_nodes(
+            ReservationRange::new(start, end).unwrap(),
+            &mut |mapping, _| {
+                if !mapping.anonymous {
+                    mirror.push((
+                        mapping.range.start(),
+                        mapping.range.end(),
+                        mapping.protection.bits(),
+                    ));
+                }
+            },
+        )
+        .unwrap();
+    (rows, mirror)
+}
+
+#[test]
+fn delegated_node_exhaustion_answers_enomem_or_succeeds_never_aborts() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let pages = 8u64;
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; (8 * PAGE) as usize]);
+    let mut memory = arena_memory();
+    let file = LINUX_MMAP_BASE + 4 * PAGE;
+    assert_eq!(
+        returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            file,
+            pages * PAGE,
+            LINUX_PROT_READ,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+            FILE_FD,
+        )) as u64,
+        file
+    );
+    // Exhaust the shared node pool from the guest venue.
+    let far = LINUX_MMAP_BASE + 64 * PAGE;
+    let mut index = 0;
+    loop {
+        let prot = if index % 2 == 0 {
+            ReservationProtection::READ_WRITE
+        } else {
+            READ
+        };
+        match root.guest_mmap(Placement::Fixed(far + index * 2 * PAGE), PAGE, prot) {
+            Ok(_) => index += 1,
+            Err(Refusal::MetadataRequired) => break,
+            Err(other) => panic!("unexpected refusal {other:?}"),
+        }
+    }
+    // Host-served edits that split host rows need nodes after their
+    // backend work: each one succeeds or answers ENOMEM, and the root
+    // mirrors the host rows exactly either way.
+    let mut answers = Vec::new();
+    for page in (1..pages).step_by(2) {
+        let outcome = call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [file + page * PAGE, PAGE, 0, 0, 0, 0],
+        );
+        assert!(
+            outcome == DispatchOutcome::Returned { value: 0 }
+                || outcome == DispatchOutcome::errno(LINUX_ENOMEM),
+            "{outcome:?}"
+        );
+        answers.push(outcome);
+        let (rows, mirror) = host_rows_and_mirror(&dispatcher, &root, file, file + pages * PAGE);
+        assert_eq!(rows, mirror, "the root mirrors the host rows");
+    }
+    assert!(
+        answers.contains(&DispatchOutcome::errno(LINUX_ENOMEM)),
+        "an exhausted pool must eventually refuse: {answers:?}"
+    );
+    // A root-owned anonymous mmap with no node to propose from: ENOMEM.
+    assert_eq!(
+        host_mmap(&mut dispatcher, &mut memory, 0, PAGE, RW, ANON, -1),
+        DispatchOutcome::errno(LINUX_ENOMEM)
+    );
+    // Unmapping whole mappings needs no node, so an exhausted process can
+    // always recover: the freed nodes refill the host reserve and a
+    // splitting edit is admitted again.
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MUNMAP,
+            [file, pages * PAGE, 0, 0, 0, 0],
+        )),
+        0
+    );
+    let (rows, mirror) = host_rows_and_mirror(&dispatcher, &root, file, file + pages * PAGE);
+    assert!(rows.is_empty() && mirror.is_empty(), "{rows:?} {mirror:?}");
+    root.guest_munmap(far, 2 * PAGE);
+    assert_eq!(
+        returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            file,
+            3 * PAGE,
+            LINUX_PROT_READ,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+            FILE_FD,
+        )) as u64,
+        file
+    );
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [file + PAGE, PAGE, 0, 0, 0, 0],
+        )),
+        0
+    );
+    let (rows, mirror) = host_rows_and_mirror(&dispatcher, &root, file, file + 3 * PAGE);
+    assert_eq!(rows, mirror);
+    assert_eq!(rows.len(), 3);
+}

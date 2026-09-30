@@ -1219,6 +1219,45 @@ impl MemView<'_> {
         })
     }
 
+    /// Before a host mapping syscall of a delegated MM does any work: secure
+    /// the root nodes its host commits (mirrors, demotions, placeholders)
+    /// may net consume after the backend work. `munmap` needs only the
+    /// splits at its two ends, so a process can always unmap whole mappings
+    /// (and so refill the reserve) at exhaustion; every other mapping
+    /// syscall needs the full `HOST_RESERVE` bound. `Some(ENOMEM)` is the
+    /// syscall's answer when the node pool is exhausted (the map-count
+    /// limit), given before anything changed. No-op in host setup.
+    pub(in crate::dispatch) fn secure_host_venue_metadata(
+        &self,
+        munmap: Option<ReservationRange>,
+    ) -> Result<Option<LinuxErrno>, DispatchError> {
+        let Some(root) = self.mem().lock().delegated_root().cloned() else {
+            return Ok(None);
+        };
+        let secured = root.with_root(|model| {
+            let needed = match munmap {
+                Some(range) => model.retire_nodes_needed(range),
+                None => carrick_el1::memory::reservations::HOST_RESERVE,
+            };
+            model.secure_host_nodes(needed)
+        });
+        match secured {
+            Ok(()) => Ok(None),
+            Err(Refusal::MetadataRequired) => Ok(Some(LINUX_ENOMEM)),
+            Err(refusal) => Err(DispatchError::ReservationAuthority(refusal)),
+        }
+    }
+
+    /// The `munmap` edit range of `[address, address + length)`, for
+    /// [`Self::secure_host_venue_metadata`].
+    pub(in crate::dispatch) fn munmap_edit_range(
+        &self,
+        address: u64,
+        length: u64,
+    ) -> Option<ReservationRange> {
+        edit_range(address, length, self.linux_page_size())
+    }
+
     /// Open a root proposal as this syscall's host venue. `Ok(Err)` is the
     /// root's semantic answer (limit, collision, foreign mapping, hole).
     fn propose(
@@ -1238,7 +1277,8 @@ impl MemView<'_> {
                 refusal @ (Refusal::Limit
                 | Refusal::Collision
                 | Refusal::ForeignMapping
-                | Refusal::Hole),
+                | Refusal::Hole
+                | Refusal::MetadataRequired),
             ) => Ok(Err(refusal)),
             Err(refusal) => Err(DispatchError::ReservationAuthority(refusal)),
         }
@@ -1290,9 +1330,12 @@ impl MemView<'_> {
                 mem.retire_stale_first_touch(&holes);
                 Ok(Ok(placed.start()))
             }
-            Err(refusal @ (Refusal::Limit | Refusal::Collision | Refusal::ForeignMapping)) => {
-                Ok(Err(refusal))
-            }
+            Err(
+                refusal @ (Refusal::Limit
+                | Refusal::Collision
+                | Refusal::ForeignMapping
+                | Refusal::MetadataRequired),
+            ) => Ok(Err(refusal)),
             Err(refusal) => Err(DispatchError::ReservationAuthority(refusal)),
         }
     }
@@ -1357,7 +1400,11 @@ impl MemView<'_> {
                     mem.retire_stale_first_touch(&holes);
                     return Ok(grant(mem, request.range.start()));
                 }
-                Err(Refusal::Limit | Refusal::Collision) => return Ok(None),
+                // ENOMEM: no room, a MAP_FIXED_NOREPLACE collision, or no
+                // root node left to record it (a map-count exhaustion).
+                Err(Refusal::Limit | Refusal::Collision | Refusal::MetadataRequired) => {
+                    return Ok(None);
+                }
                 // The root cannot own it (outside the layout, or a fixed
                 // range over host-owned nodes): the host serves it.
                 Err(_) => {}
@@ -1370,6 +1417,7 @@ impl MemView<'_> {
             mem.demote_root_rows(requested, end);
             return match self.place_host_served(mem, &root, placement, length, congruence)? {
                 Ok(address) => Ok(grant(mem, address)),
+                Err(Refusal::MetadataRequired) => Ok(None),
                 // Linux honours MAP_FIXED anywhere in the address space; the
                 // host maps it outside the root's layout too.
                 Err(_) => Ok(Some((requested, false))),
@@ -1378,6 +1426,7 @@ impl MemView<'_> {
         if let Placement::Hint(hint) = placement {
             match self.place_host_served(mem, &root, placement, length, congruence)? {
                 Ok(address) => return Ok(grant(mem, address)),
+                Err(Refusal::MetadataRequired) => return Ok(None),
                 Err(Refusal::ForeignMapping) => {
                     // An out-of-layout hint: Linux honours a free hint
                     // anywhere, and the host serves it with an alias VA.
@@ -1396,6 +1445,7 @@ impl MemView<'_> {
         }
         match self.place_host_served(mem, &root, Placement::Anywhere, length, congruence)? {
             Ok(address) => Ok(grant(mem, address)),
+            Err(Refusal::MetadataRequired) => Ok(None),
             // The arena is full: the host's high alias window.
             Err(_) => Ok(find_canonical_high_va_gap(mem, length, congruence)),
         }
@@ -1495,9 +1545,12 @@ impl MemView<'_> {
         };
         match self.propose(&mut mem, &root, step)? {
             Ok(_) => Ok(None),
-            // mprotect(2) ENOMEM: a range with unmapped pages, or (RLIMIT_DATA)
-            // a private mapping made writable past the limit.
-            Err(Refusal::Hole | Refusal::Limit) => Ok(Some(LINUX_ENOMEM)),
+            // mprotect(2) ENOMEM: a range with unmapped pages, (RLIMIT_DATA)
+            // a private mapping made writable past the limit, or a split
+            // past the map count (no root node left to record it).
+            Err(Refusal::Hole | Refusal::Limit | Refusal::MetadataRequired) => {
+                Ok(Some(LINUX_ENOMEM))
+            }
             Err(_) => {
                 mem.demote_root_rows(range.start(), range.end());
                 Ok(None)
@@ -1724,8 +1777,11 @@ impl MemView<'_> {
                 Ok(Decision::Complete(value)) => {
                     return Ok(Some(DispatchOutcome::returned_u64_or_errno(value)));
                 }
-                // Growth over a limit, or nothing in place and no room.
-                Err(Refusal::Limit) => return Ok(Some(DispatchOutcome::errno(LINUX_ENOMEM))),
+                // Growth over a limit, nothing in place and no room, or no
+                // root node left to record it.
+                Err(Refusal::Limit | Refusal::MetadataRequired) => {
+                    return Ok(Some(DispatchOutcome::errno(LINUX_ENOMEM)));
+                }
                 Err(Refusal::Hole) => return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT))),
                 Err(Refusal::Invalid) => return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL))),
                 // A fixed destination the root cannot own.

@@ -18,6 +18,10 @@ const NODES: usize = 1024;
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
 const VERSION: u64 = 5;
+/// Nodes each root keeps for its host venue: enough for the net growth of
+/// any one host syscall's mirror (at most two straddler splits per edit
+/// boundary pair, demotion and placeholder included).
+pub const HOST_RESERVE: u32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -127,9 +131,14 @@ struct State {
     generation: u64,
     sequence: u64,
     tree: u32,
+    /// Head of this root's host-venue node reserve (linked through
+    /// `Node::next_free`, private to this root while reserved).
+    host_reserve_head: u32,
     layout: Layout,
     pending: Option<Pending>,
     admitted: bool,
+    /// Nodes in the host-venue reserve.
+    host_reserved: u32,
     /// Last minted [`ReservationIncarnation`].
     minted: u64,
     /// Every incarnation at or below this one has had anonymous memory
@@ -339,6 +348,10 @@ pub struct Reservations<'a> {
     pub work: usize,
     banks: Option<&'a dyn storage::NodeBanks>,
     node_capacity: u32,
+    /// This guard serves the host venue: nodes it frees refill the root's
+    /// host reserve before the shared pool, so a host commit that retires
+    /// and re-inserts cannot lose its own nodes to another MM in between.
+    host_venue: bool,
 }
 impl Drop for Reservations<'_> {
     fn drop(&mut self) {
@@ -376,9 +389,11 @@ impl SharedReservations {
                     generation: root.epoch.load(Ordering::Relaxed) + 1,
                     sequence: 0,
                     tree: 0,
+                    host_reserve_head: 0,
                     layout,
                     pending: None,
                     admitted: false,
+                    host_reserved: 0,
                     minted: 0,
                     retired_below: 0,
                 });
@@ -419,6 +434,7 @@ impl SharedReservations {
             work: 0,
             banks,
             node_capacity: self.storage.capacity(),
+            host_venue: false,
         };
         if (banks.is_none() && !identity && self.storage.capacity() > NODES as u32)
             || banks.is_some_and(|banks| banks.count() < self.storage.bank_count())
@@ -1023,7 +1039,102 @@ impl Reservations<'_> {
     }
     fn release_spares(&mut self, nodes: [u32; 5]) {
         for node in nodes {
-            self.table.release(node, self.banks);
+            self.free_node(node);
+        }
+    }
+    /// Return a node: refill this root's host reserve first, then the
+    /// shared pool.
+    fn free_node(&mut self, id: u32) {
+        if id == 0 {
+            return;
+        }
+        if self.host_venue && self.state().host_reserved < HOST_RESERVE {
+            let head = self.state().host_reserve_head;
+            self.table
+                .node(id, self.banks)
+                .next_free
+                .store(head, Ordering::Relaxed);
+            self.state_mut().host_reserve_head = id;
+            self.state_mut().host_reserved += 1;
+        } else {
+            self.table.release(id, self.banks);
+        }
+    }
+    /// One node for a host-venue commit: the shared pool, else this root's
+    /// reserve. Pool exhaustion or contention never fails a host commit the
+    /// reserve covers.
+    fn host_node(&mut self) -> Result<u32, Refusal> {
+        if let Ok(id) = self.table.allocate(self.banks, self.node_capacity) {
+            return Ok(id);
+        }
+        let head = self.state().host_reserve_head;
+        if head == 0 {
+            return Err(Refusal::MetadataRequired);
+        }
+        let next = self
+            .table
+            .node(head, self.banks)
+            .next_free
+            .load(Ordering::Relaxed);
+        self.state_mut().host_reserve_head = next;
+        self.state_mut().host_reserved -= 1;
+        Ok(head)
+    }
+    /// [`Self::allocate_spares`] for a host-venue commit ([`Self::host_node`]).
+    fn host_spares(&mut self, needed: usize) -> Result<[u32; 5], Refusal> {
+        let mut nodes = [0; 5];
+        for slot in nodes.iter_mut().take(needed) {
+            match self.host_node() {
+                Ok(node) => *slot = node,
+                Err(reason) => {
+                    self.release_spares(nodes);
+                    return Err(reason);
+                }
+            }
+        }
+        Ok(nodes)
+    }
+    /// Before a host syscall does any backend work: fill this root's host
+    /// reserve from the shared pool as far as it goes, then require
+    /// `needed` reserved nodes (the most the syscall's host commits may net
+    /// consume; see [`HOST_RESERVE`]). `MetadataRequired` is the syscall's
+    /// ENOMEM (a map-count exhaustion), answered before anything changed. A
+    /// lost free-list race means another allocation completed, so the
+    /// attempt is repeated; exhaustion ends it.
+    pub fn secure_host_nodes(&mut self, needed: u32) -> Result<(), Refusal> {
+        self.host_venue = true;
+        while self.state().host_reserved < HOST_RESERVE {
+            let id = match self.table.allocate(self.banks, self.node_capacity) {
+                Ok(id) => id,
+                Err(Refusal::Busy) => continue,
+                Err(_) => break,
+            };
+            self.free_node(id);
+        }
+        if self.state().host_reserved < needed.min(HOST_RESERVE) {
+            return Err(Refusal::MetadataRequired);
+        }
+        Ok(())
+    }
+    /// Nodes a host retire of `range` needs: one per node straddling an end.
+    pub fn retire_nodes_needed(&mut self, range: ReservationRange) -> u32 {
+        self.splits_needed(range) as u32
+    }
+    /// Nodes currently in this root's host reserve.
+    pub fn host_reserve(&self) -> u32 {
+        self.state().host_reserved
+    }
+    fn drain_host_reserve(&mut self) {
+        while self.state().host_reserve_head != 0 {
+            let head = self.state().host_reserve_head;
+            let next = self
+                .table
+                .node(head, self.banks)
+                .next_free
+                .load(Ordering::Relaxed);
+            self.state_mut().host_reserve_head = next;
+            self.state_mut().host_reserved -= 1;
+            self.table.release(head, self.banks);
         }
     }
     /// Where [`Self::mmap`] places `len` bytes, without proposing anything.
@@ -1388,7 +1499,7 @@ impl Reservations<'_> {
             }
             let (tree, freed) = self.erase(self.state().tree, n.start);
             self.state_mut().tree = tree;
-            self.table.release(freed, self.banks);
+            self.free_node(freed);
         }
     }
     /// Rewrite the protection of every node inside the fully covered `range`,
@@ -1565,7 +1676,7 @@ impl Reservations<'_> {
         {
             return Err(Refusal::Collision);
         }
-        let id = self.table.allocate(self.banks, self.node_capacity)?;
+        let id = self.host_node()?;
         let mut node = NodeData {
             start: range.start(),
             end: range.end(),
@@ -1579,6 +1690,7 @@ impl Reservations<'_> {
         Ok(())
     }
     fn host_edit_admitted(&mut self) -> Result<u64, Refusal> {
+        self.host_venue = true;
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
@@ -1612,7 +1724,7 @@ impl Reservations<'_> {
     pub fn retire_opaque(&mut self, range: ReservationRange) -> Result<(), Refusal> {
         let generation = self.host_edit_admitted()?;
         let needed = self.splits_needed(range);
-        let mut spares = Spares(self.allocate_spares(needed)?);
+        let mut spares = Spares(self.host_spares(needed)?);
         self.remove_range(range, &mut spares);
         self.release_spares(spares.0);
         self.state_mut().generation = generation;
@@ -1646,7 +1758,7 @@ impl Reservations<'_> {
             return Err(Refusal::Hole);
         }
         let needed = self.splits_needed(range);
-        let mut spares = Spares(self.allocate_spares(needed)?);
+        let mut spares = Spares(self.host_spares(needed)?);
         self.split_at(range.start(), &mut spares);
         self.split_at(range.end(), &mut spares);
         self.release_spares(spares.0);
@@ -1767,7 +1879,7 @@ impl Reservations<'_> {
         {
             let (tree, freed) = self.erase(self.state().tree, left.start);
             self.state_mut().tree = tree;
-            self.table.release(freed, self.banks);
+            self.free_node(freed);
             n.start = left.start;
         }
         if let Some(right) = self.next(n.end)
@@ -1777,7 +1889,7 @@ impl Reservations<'_> {
         {
             let (tree, freed) = self.erase(self.state().tree, right.start);
             self.state_mut().tree = tree;
-            self.table.release(freed, self.banks);
+            self.free_node(freed);
             n.end = right.end;
         }
         self.write(id, n);
@@ -1821,6 +1933,7 @@ impl Reservations<'_> {
         }
         self.release_tree(self.state().tree);
         self.state_mut().tree = 0;
+        self.drain_host_reserve();
         self.root
             .epoch
             .store(self.state().generation, Ordering::Relaxed);
@@ -3445,5 +3558,48 @@ mod tests {
             assert_eq!(g.charges().bytes, count * 0x1000);
             assert_eq!(g.work, 1);
         }
+    }
+
+    #[test]
+    fn reservation_host_reserve_covers_host_commits_at_exhaustion() {
+        let table = table();
+        let mut g = admitted(&table, 0, 13);
+        g.secure_host_nodes(HOST_RESERVE).unwrap();
+        assert_eq!(g.host_reserve(), HOST_RESERVE);
+        let rw = ReservationProtection::READ_WRITE;
+        let r = ReservationProtection::from_bits(1).unwrap();
+        g.insert_opaque(range(0x200000, 0x204000), r, ReservationNodeFlags::PRIVATE)
+            .unwrap();
+        // Exhaust the shared pool with guest-venue mappings.
+        let mut page = 0;
+        loop {
+            let prot = if page % 2 == 0 { rw } else { r };
+            match g.mmap(Placement::Fixed(0x300000 + page * 0x2000), 0x1000, prot) {
+                Ok(d) => {
+                    complete(&mut g, d);
+                    page += 1;
+                }
+                Err(Refusal::MetadataRequired) => break,
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+        // Guest-venue frees never refill the host reserve.
+        assert_eq!(g.host_reserve(), HOST_RESERVE);
+        // A host commit that splits needs nodes the pool no longer has.
+        g.retire_opaque(range(0x201000, 0x202000)).unwrap();
+        assert_eq!(g.host_reserve(), HOST_RESERVE - 1);
+        g.insert_opaque(range(0x201000, 0x202000), rw, ReservationNodeFlags::PRIVATE)
+            .unwrap();
+        assert_eq!(g.host_reserve(), HOST_RESERVE - 2);
+        // Admission refuses what the reserve cannot cover, before any edit.
+        assert_eq!(
+            g.secure_host_nodes(HOST_RESERVE),
+            Err(Refusal::MetadataRequired)
+        );
+        g.secure_host_nodes(0).unwrap();
+        // Host retires refill the reserve first.
+        g.retire_opaque(range(0x200000, 0x204000)).unwrap();
+        assert_eq!(g.host_reserve(), HOST_RESERVE);
+        g.secure_host_nodes(HOST_RESERVE).unwrap();
     }
 }
