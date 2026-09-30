@@ -1374,6 +1374,13 @@ impl DescriptorTxnSlot {
             && self.mm_key.load(Ordering::Relaxed) == mm_key
     }
 
+    /// The host generation of the current submission, as submitted. Read
+    /// after [`Self::submitted_for`] observed the submission.
+    #[must_use]
+    pub fn submitted_generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     /// Either venue: a transaction for `mm_key` is submitted or being
     /// applied, so its receipt (and the invalidation before it) is still
     /// to come.
