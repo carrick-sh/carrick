@@ -5,7 +5,7 @@
     "table_guard": 167,
     "description_guard": 202,
     "description_backing": 24,
-    "epoll": 421,
+    "epoll": 422,
     "stream": 176,
     "mapping": 1220,
     "lifecycle": 32
@@ -23,7 +23,7 @@
     "table_guard": 26,
     "description_guard": 38,
     "description_backing": 8,
-    "epoll": 43,
+    "epoll": 44,
     "stream": 21,
     "mapping": 102,
     "lifecycle": 10
@@ -13138,6 +13138,15 @@
       "scope_kind": "test_or_definition"
     },
     {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs",
+      "line": 666,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// reader, poll, epoll) are owed a wake and must receive it, not only the",
+      "scope_kind": "test_or_definition"
+    },
+    {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
       "line": 34,
       "categories": [
@@ -13148,7 +13157,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
-      "line": 130,
+      "line": 143,
       "categories": [
         "mapping"
       ],
