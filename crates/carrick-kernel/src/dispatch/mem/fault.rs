@@ -1,6 +1,9 @@
 //! Anonymous first-touch fault arming, residency tracking, and grow-down stack fault resolution.
 
+use super::anonymous::broken_root;
 use super::*;
+use carrick_el1::memory::reservations::Mapping;
+use carrick_el1_abi::{ReservationProtection, ReservationRange};
 use carrick_fatal::carrick_fatal;
 
 #[derive(Clone, Copy)]
@@ -205,6 +208,138 @@ fn bus_fault_contains(ranges: &[(u64, u64)], address: u64) -> bool {
     })
 }
 
+/// Who answers one page's first-touch facts.
+///
+/// On a delegated MM the root owns whether an anonymous page exists and at
+/// which protection; the host keeps only what its own venue backed. A page
+/// the root holds as plain anonymous memory outside the heap is tracked from
+/// the root (EL1 reservations are metadata backed on demand, so every such
+/// page is observed on first touch). A root hole has nothing to observe:
+/// whatever the host recorded there describes a mapping the guest venue has
+/// already retired.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::dispatch) enum FirstTouchOwner {
+    /// Host setup, a host-owned (opaque) root node, the root's heap, or the
+    /// range this MM's pending host proposal holds: the host's own arming.
+    Host,
+    /// A root-owned anonymous page outside the heap.
+    Root(Mapping),
+    /// No root node covers the page.
+    Unmapped,
+}
+
+impl MemState {
+    /// Who answers `page`'s first-touch facts (see [`FirstTouchOwner`]).
+    pub(in crate::dispatch) fn first_touch_owner(&self, page: u64) -> FirstTouchOwner {
+        let Some(root) = self.delegated_root() else {
+            return FirstTouchOwner::Host;
+        };
+        if self.venue_owns(page, page.saturating_add(1)) {
+            return FirstTouchOwner::Host;
+        }
+        let mapping = root
+            .with_root(|model| Ok(model.mapping(page)))
+            .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal));
+        match mapping {
+            None => FirstTouchOwner::Unmapped,
+            Some(mapping)
+                if mapping.anonymous
+                    && !super::anonymous::in_heap(
+                        mapping.range.start(),
+                        mapping.range.end(),
+                        self.layout,
+                    ) =>
+            {
+                FirstTouchOwner::Root(mapping)
+            }
+            Some(_) => FirstTouchOwner::Host,
+        }
+    }
+
+    /// The root-owned first-touch extents (anonymous nodes outside the heap)
+    /// overlapping `[start, end)`, clipped to it, in address order. Empty in
+    /// host setup.
+    pub(in crate::dispatch) fn root_first_touch_extents(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Vec<(carrick_vfs::GuestMemoryRange, ReservationProtection)> {
+        let Some(root) = self.delegated_root() else {
+            return Vec::new();
+        };
+        let Some(range) = ReservationRange::new(start, end) else {
+            return Vec::new();
+        };
+        let layout = self.layout;
+        let mut extents = Vec::new();
+        root.with_root(|model| {
+            model.observe_range(range, &mut |mapping| {
+                let (node_start, node_end) = (mapping.range.start(), mapping.range.end());
+                if !mapping.anonymous || super::anonymous::in_heap(node_start, node_end, layout) {
+                    return;
+                }
+                if let Some(clipped) = carrick_vfs::GuestMemoryRange::new(
+                    GuestVa(node_start.max(start)),
+                    GuestVa(node_end.min(end)),
+                ) {
+                    extents.push((clipped, mapping.protection));
+                }
+            })
+        })
+        .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal));
+        extents
+    }
+
+    /// The protection a first touch of root-owned `page` publishes, or
+    /// `None` when it is already resident or inaccessible.
+    fn root_armed_prot(&self, mapping: &Mapping, page: u64) -> Option<LinuxProtFlags> {
+        if ranges_contain_page(&self.resident_ranges, page) {
+            return None;
+        }
+        let prot = LinuxProtFlags::from_bits_truncate(mapping.protection.bits());
+        (!prot.is_empty()).then_some(prot)
+    }
+
+    /// The root-derived counterpart of [`FirstTouchArming::grant_for_page`]:
+    /// the contiguous non-resident run of same-protection root-owned pages
+    /// around `page`, clipped to one `max_len`-aligned window.
+    fn root_grant_for_page(
+        &self,
+        mapping: &Mapping,
+        page: u64,
+        max_len: u64,
+    ) -> Option<ResidentFaultRange> {
+        if max_len == 0 {
+            return None;
+        }
+        let prot = self.root_armed_prot(mapping, page)?;
+        let window_start = page - page % max_len;
+        let window_end = window_start.checked_add(max_len)?;
+        let (mut start, mut end) = (page, page.checked_add(1)?);
+        for (extent, protection) in self.root_first_touch_extents(window_start, window_end) {
+            if protection != mapping.protection {
+                continue;
+            }
+            let (extent_start, extent_end) = (extent.start().raw(), extent.end().raw());
+            if extent_start <= end && start <= extent_end {
+                start = start.min(extent_start);
+                end = end.max(extent_end);
+            }
+        }
+        // Committed pages split the run, exactly as a commit disarms them.
+        let resident = &self.resident_ranges;
+        let index = resident.partition_point(|range| range.end().raw() <= page);
+        if let Some(below) = index.checked_sub(1).and_then(|index| resident.get(index)) {
+            start = start.max(below.end().raw());
+        }
+        if let Some(above) = resident.get(index) {
+            end = end.min(above.start().raw());
+        }
+        let range = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))?;
+        Some(ResidentFaultRange { range, prot })
+    }
+}
+
 /// The pages of `range` that lie inside a first-touch tracked extent and have
 /// not been committed resident: exactly the pages whose leaf must stay
 /// invalid so their first touch is still observed.
@@ -330,11 +465,14 @@ impl<'a> MemView<'a> {
         // fault and `resident_tracked_ranges` is one entry per live anonymous
         // extent. `growdown_ranges` stays a scan — there is one entry per
         // MAP_GROWSDOWN VMA and a process has a handful.
-        let tracked = ranges_contain_page(&mem.resident_tracked_ranges, page)
-            || mem
-                .growdown_ranges
-                .iter()
-                .any(|&(low, _current, end)| page >= low && page < end);
+        let tracked = match mem.first_touch_owner(page) {
+            FirstTouchOwner::Host => ranges_contain_page(&mem.resident_tracked_ranges, page),
+            FirstTouchOwner::Root(_) => true,
+            FirstTouchOwner::Unmapped => false,
+        } || mem
+            .growdown_ranges
+            .iter()
+            .any(|&(low, _current, end)| page >= low && page < end);
         if !tracked {
             crate::probes::hvpatch_first_touch_deliver(
                 addr,
@@ -372,7 +510,8 @@ impl<'a> MemView<'a> {
                 let obstacle = mem
                     .dynamic_maps
                     .iter()
-                    .any(|map| map.start < current && map.end > low && map.start != current);
+                    .any(|map| map.start < current && map.end > low && map.start != current)
+                    || mem.root_anonymous_overlaps(low, current - low);
                 if obstacle {
                     return None;
                 }
@@ -520,7 +659,12 @@ impl<'a> MemView<'a> {
         if bus_fault_contains(&mem.bus_fault_ranges, page) {
             return None;
         }
-        let prot = mem.resident_fault_ranges.prot_for_page(page)?.bits();
+        let prot = match mem.first_touch_owner(page) {
+            FirstTouchOwner::Host => mem.resident_fault_ranges.prot_for_page(page)?,
+            FirstTouchOwner::Root(mapping) => mem.root_armed_prot(&mapping, page)?,
+            FirstTouchOwner::Unmapped => return None,
+        }
+        .bits();
         Some(ResidentFaultPlan {
             page,
             prot,
@@ -542,7 +686,11 @@ impl<'a> MemView<'a> {
         let page = page_floor(address, page_size);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        let grant = mem.resident_fault_ranges.grant_for_page(page, max_len)?;
+        let grant = match mem.first_touch_owner(page) {
+            FirstTouchOwner::Host => mem.resident_fault_ranges.grant_for_page(page, max_len)?,
+            FirstTouchOwner::Root(mapping) => mem.root_grant_for_page(&mapping, page, max_len)?,
+            FirstTouchOwner::Unmapped => return None,
+        };
         let mut start = grant.range.start().raw();
         let mut end = grant.range.end().raw();
         // First-touch arming may cover an eager private-file snapshot's BUS

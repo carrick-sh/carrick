@@ -501,3 +501,265 @@ fn delegated_fork_child_owns_the_parents_rows_in_host_setup() {
     assert!(row(&child, first).is_some());
     assert!(root.lock().mapping(first).is_none());
 }
+
+// S1d: every host reader of placement on a delegated MM answers from the
+// root, merged with the host's opaque rows. Each test runs one sequence on a
+// host-setup MM (every edit a host syscall) and on a delegated MM (the
+// root-owned edits made by the guest venue) and compares the reader.
+
+impl Root {
+    /// What guest EL1 does for `munmap` of anonymous memory on its own venue.
+    fn guest_munmap(&self, start: u64, len: u64) {
+        let mut root = self.lock();
+        let decision = root
+            .munmap(ReservationRange::new(start, start + len).unwrap())
+            .unwrap();
+        commit(&mut root, decision);
+    }
+}
+
+fn reservation_prot(prot: u64) -> ReservationProtection {
+    ReservationProtection::from_bits(prot).unwrap()
+}
+
+/// One sequence, two MMs: `host` is in host setup, `delegated` has an
+/// admitted root.
+struct Twin {
+    host: SyscallDispatcher,
+    host_memory: CountingMmapMemory,
+    delegated: SyscallDispatcher,
+    delegated_memory: CountingMmapMemory,
+    root: Root,
+}
+
+impl Twin {
+    fn new() -> Self {
+        let host = SyscallDispatcher::new();
+        let delegated = SyscallDispatcher::new();
+        let root = Root::admit(&delegated);
+        for dispatcher in [&host, &delegated] {
+            install_host_file_fd(dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+        }
+        Self {
+            host,
+            host_memory: arena_memory(),
+            delegated,
+            delegated_memory: arena_memory(),
+            root,
+        }
+    }
+
+    fn both(&mut self, mut step: impl FnMut(&mut SyscallDispatcher, &mut CountingMmapMemory)) {
+        step(&mut self.host, &mut self.host_memory);
+        step(&mut self.delegated, &mut self.delegated_memory);
+    }
+
+    /// Anonymous private memory at `address`: a host `mmap(MAP_FIXED)` on
+    /// the host-setup MM, a guest-venue root edit on the delegated MM.
+    fn anonymous(&mut self, address: u64, len: u64, prot: u64) {
+        assert_eq!(
+            returned(host_mmap(
+                &mut self.host,
+                &mut self.host_memory,
+                address,
+                len,
+                prot,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                -1,
+            )) as u64,
+            address
+        );
+        assert_eq!(
+            self.root
+                .guest_mmap(Placement::Fixed(address), len, reservation_prot(prot)),
+            Ok(address)
+        );
+    }
+
+    /// Host-venue anonymous `mmap(MAP_FIXED)` on both MMs.
+    fn host_anonymous(&mut self, address: u64, len: u64, prot: u64) {
+        self.both(|dispatcher, memory| {
+            assert_eq!(
+                returned(host_mmap(
+                    dispatcher,
+                    memory,
+                    address,
+                    len,
+                    prot,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    -1,
+                )) as u64,
+                address
+            );
+        });
+    }
+
+    /// A host private file mapping at `address` on both MMs.
+    fn file(&mut self, address: u64) {
+        self.both(|dispatcher, memory| {
+            assert_eq!(
+                returned(host_mmap(
+                    dispatcher,
+                    memory,
+                    address,
+                    PAGE,
+                    LINUX_PROT_READ,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+                    FILE_FD,
+                )) as u64,
+                address
+            );
+        });
+    }
+
+    fn mprotect(&mut self, address: u64, len: u64, prot: u64) {
+        assert_eq!(
+            returned(call(
+                &mut self.host,
+                &mut self.host_memory,
+                SYS_MPROTECT,
+                [address, len, prot, 0, 0, 0],
+            )),
+            0
+        );
+        self.root
+            .guest_mprotect(address, len, reservation_prot(prot));
+    }
+
+    fn munmap(&mut self, address: u64, len: u64) {
+        assert_eq!(
+            returned(call(
+                &mut self.host,
+                &mut self.host_memory,
+                SYS_MUNMAP,
+                [address, len, 0, 0, 0, 0],
+            )),
+            0
+        );
+        self.root.guest_munmap(address, len);
+    }
+
+    /// The first touch of `page` on both MMs, through the host fault path.
+    fn touch(&mut self, page: u64) {
+        self.both(|dispatcher, _| {
+            dispatcher.with_resident_fault_plan_for_test(page, |plan| {
+                dispatcher.commit_resident_fault(plan)
+            });
+        });
+    }
+
+    /// Assert `reader` answers the same on both MMs.
+    fn same<T: PartialEq + std::fmt::Debug>(
+        &self,
+        what: &str,
+        reader: impl Fn(&SyscallDispatcher, &CountingMmapMemory) -> T,
+    ) {
+        assert_eq!(
+            reader(&self.delegated, &self.delegated_memory),
+            reader(&self.host, &self.host_memory),
+            "{what}: the delegated MM (left) must answer as the host-setup MM (right)"
+        );
+    }
+}
+
+/// Every fault-planning answer for `pages`: the trap classifier, the
+/// first-touch plan and the bulk frame-grant plan.
+type FaultAnswer = (bool, Option<u64>, Option<(u64, u64, u64)>);
+
+fn fault_answers(dispatcher: &SyscallDispatcher, pages: &[u64]) -> Vec<FaultAnswer> {
+    pages
+        .iter()
+        .map(|&page| {
+            (
+                dispatcher.fault_requires_mm_mutation(page),
+                dispatcher.with_resident_fault_plan_for_test(page, |plan| plan.prot()),
+                dispatcher.with_resident_frame_grant_plan_for_test(page, 4 * PAGE, |plan| {
+                    (plan.start(), plan.len(), plan.prot())
+                }),
+            )
+        })
+        .collect()
+}
+
+const RW: u64 = LINUX_PROT_READ | LINUX_PROT_WRITE;
+
+#[test]
+fn delegated_fault_on_a_root_owned_page_is_planned_from_the_root() {
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.anonymous(base, 2 * PAGE, RW);
+    twin.file(base + 2 * PAGE);
+    let pages = [base, base + PAGE, base + 2 * PAGE, base + 3 * PAGE];
+    let answers = |twin: &Twin, what: &str| {
+        twin.same(what, |dispatcher, _| fault_answers(dispatcher, &pages));
+    };
+    answers(&twin, "a fresh root-owned mapping beside a file mapping");
+    assert!(
+        twin.delegated.fault_requires_mm_mutation(base),
+        "a root-owned page's first touch is the host's to serve"
+    );
+
+    twin.mprotect(base + PAGE, PAGE, LINUX_PROT_READ);
+    answers(&twin, "after an mprotect of one root-owned page");
+
+    twin.touch(base + PAGE);
+    answers(&twin, "after the first touch of the read-only page");
+
+    twin.munmap(base, PAGE);
+    answers(&twin, "after an munmap of a root-owned page");
+}
+
+#[test]
+fn delegated_host_venue_arming_follows_guest_venue_edits() {
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    // Host venue: the host armed first touch at read-write.
+    twin.host_anonymous(base, 2 * PAGE, RW);
+    let pages = [base, base + PAGE, base + 2 * PAGE];
+    twin.same("host-venue mapping", |d, _| fault_answers(d, &pages));
+    // The guest venue then narrows and retires it without the host.
+    twin.mprotect(base, PAGE, LINUX_PROT_READ);
+    twin.same("after a guest-venue mprotect", |d, _| {
+        fault_answers(d, &pages)
+    });
+    twin.munmap(base + PAGE, PAGE);
+    twin.same("after a guest-venue munmap", |d, _| {
+        fault_answers(d, &pages)
+    });
+}
+
+#[test]
+fn delegated_stack_growth_stops_at_a_root_owned_mapping() {
+    let mut twin = Twin::new();
+    let stack = LINUX_MMAP_BASE + 16 * PAGE;
+    twin.both(|dispatcher, memory| {
+        assert_eq!(
+            returned(host_mmap(
+                dispatcher,
+                memory,
+                stack,
+                PAGE,
+                RW,
+                LINUX_MAP_PRIVATE
+                    | LINUX_MAP_ANONYMOUS
+                    | LINUX_MAP_FIXED
+                    | carrick_abi::LINUX_MAP_GROWSDOWN,
+                -1,
+            )) as u64,
+            stack
+        );
+    });
+    // A root-owned mapping inside the stack's growth window.
+    twin.anonymous(stack - 4 * PAGE, PAGE, RW);
+    for page in [stack - PAGE, stack - 6 * PAGE] {
+        twin.same("the grow-down plan", |d, _| {
+            d.with_mmap_growdown_fault_plan_for_test(page, |plan| (plan.start(), plan.len()))
+        });
+    }
+    assert_eq!(
+        twin.delegated
+            .with_mmap_growdown_fault_plan_for_test(stack - 6 * PAGE, |plan| plan.start()),
+        None,
+        "the stack cannot grow over a root-owned mapping"
+    );
+}
