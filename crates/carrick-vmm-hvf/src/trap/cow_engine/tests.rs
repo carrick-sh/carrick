@@ -999,3 +999,26 @@ fn host_cow_resolutions_are_classified_by_the_path_that_completed_them() {
         "every resolution has exactly one path"
     );
 }
+
+#[test]
+fn host_cow_is_split_by_admission_order_and_by_lane() {
+    use crate::hvf_aarch64_engine::{HostCowLedger, HostCowPath};
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let carrier = HostCowLedger::default();
+    let before = carrier.snapshot();
+    let first = carrier.admit_mm();
+    let child = carrier.admit_mm();
+    first.record_host_cow_resolution(HostCowPath::StageFault);
+    first.record_host_cow_resolution(HostCowPath::StageFault);
+    child.record_host_cow_resolution(HostCowPath::StageFault);
+    child.record_guest_lane_host_cow(HostCowPath::SyscallCopyOut);
+    first.record_guest_lane_host_cow(HostCowPath::StageFault);
+    let delta = carrier.snapshot().checked_delta(&before).unwrap();
+    assert_eq!(delta.host_cow_resolutions, 3);
+    assert_eq!(delta.host_cow_first_mm, 2, "only the first admitted MM");
+    assert_eq!(
+        delta.guest_lane_host_cow_by_path,
+        [1, 1, 0, 0, 0],
+        "guest-lane host COWs are apart from host_cow_resolutions"
+    );
+}

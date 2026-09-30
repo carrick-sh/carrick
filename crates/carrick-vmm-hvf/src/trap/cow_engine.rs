@@ -4171,10 +4171,15 @@ impl HvfTaskState {
             );
         }
         self.cow_armed.lock().disarm(span);
-        if !guest_lane {
-            self.mm_access.host_cow_stats.record_host_cow_resolution(
-                crate::hvf_aarch64_engine::HostCowPath::of_trigger(trigger.class),
-            );
+        let path = crate::hvf_aarch64_engine::HostCowPath::of_trigger(trigger.class);
+        if guest_lane {
+            self.mm_access
+                .host_cow_stats
+                .record_guest_lane_host_cow(path);
+        } else {
+            self.mm_access
+                .host_cow_stats
+                .record_host_cow_resolution(path);
         }
         Ok(true)
     }

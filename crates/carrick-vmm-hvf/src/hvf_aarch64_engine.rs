@@ -40,6 +40,8 @@ use std::sync::Arc;
 pub struct HostCowStats {
     host_cow_resolutions: Arc<std::sync::atomic::AtomicU64>,
     ledger: Option<HostCowLedger>,
+    /// Admission order within the carrier ledger (0 = the first MM admitted).
+    ordinal: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +57,11 @@ struct HostCowLedgerInner {
     guest_cow_settled: std::sync::atomic::AtomicU64,
     guest_cow_provisioned: std::sync::atomic::AtomicU64,
     host_cow_by_path: [std::sync::atomic::AtomicU64; HostCowPath::COUNT],
+    /// Host COW resolutions credited by the first MM the carrier admitted.
+    host_cow_first_mm: std::sync::atomic::AtomicU64,
+    /// COWs the host completed for an MM already on the guest lane (not in
+    /// `host_cow_resolutions`), by path.
+    guest_lane_host_cow_by_path: [std::sync::atomic::AtomicU64; HostCowPath::COUNT],
 }
 
 /// Which host path completed a host COW resolution.
@@ -133,6 +140,11 @@ pub struct HostCowSnapshot {
     pub guest_cow_provisioned: u64,
     /// `host_cow_resolutions` by [`HostCowPath`].
     pub host_cow_by_path: [u64; HostCowPath::COUNT],
+    /// Part of `host_cow_resolutions` credited by the first admitted MM.
+    pub host_cow_first_mm: u64,
+    /// Host-completed COWs of MMs on the guest lane, by [`HostCowPath`];
+    /// these are NOT in `host_cow_resolutions`.
+    pub guest_lane_host_cow_by_path: [u64; HostCowPath::COUNT],
 }
 
 impl HostCowSnapshot {
@@ -182,6 +194,20 @@ impl HostCowSnapshot {
                 }
                 delta
             },
+            host_cow_first_mm: self
+                .host_cow_first_mm
+                .checked_sub(before.host_cow_first_mm)?,
+            guest_lane_host_cow_by_path: {
+                let mut delta = [0; HostCowPath::COUNT];
+                for (slot, (now, then)) in delta.iter_mut().zip(
+                    self.guest_lane_host_cow_by_path
+                        .iter()
+                        .zip(&before.guest_lane_host_cow_by_path),
+                ) {
+                    *slot = now.checked_sub(*then)?;
+                }
+                delta
+            },
         })
     }
 }
@@ -223,6 +249,10 @@ impl HostCowLedger {
             host_cow_by_path: core::array::from_fn(|path| {
                 self.inner.host_cow_by_path[path].load(Ordering::Relaxed)
             }),
+            host_cow_first_mm: self.inner.host_cow_first_mm.load(Ordering::Relaxed),
+            guest_lane_host_cow_by_path: core::array::from_fn(|path| {
+                self.inner.guest_lane_host_cow_by_path[path].load(Ordering::Relaxed)
+            }),
         }
     }
 
@@ -260,10 +290,11 @@ impl HostCowLedger {
     /// Admit one MM: the returned handle credits this ledger.
     pub(crate) fn admit_mm(&self) -> HostCowStats {
         use std::sync::atomic::Ordering;
-        self.inner.admitted_mms.fetch_add(1, Ordering::Relaxed);
+        let ordinal = self.inner.admitted_mms.fetch_add(1, Ordering::Relaxed);
         HostCowStats {
             host_cow_resolutions: Arc::default(),
             ledger: Some(self.clone()),
+            ordinal: Some(ordinal),
         }
     }
 }
@@ -296,10 +327,25 @@ impl HostCowStats {
         }
     }
 
+    /// The host completed a COW for an MM already on the guest lane. Not a
+    /// host COW resolution; counted apart so the lane split is visible.
+    pub(crate) fn record_guest_lane_host_cow(&self, path: HostCowPath) {
+        if let Some(ledger) = &self.ledger {
+            ledger.inner.guest_lane_host_cow_by_path[path as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_host_cow_resolution(&self, path: HostCowPath) {
         use std::sync::atomic::Ordering;
         if let Some(ledger) = &self.ledger {
             ledger.inner.host_cow_by_path[path as usize].fetch_add(1, Ordering::Relaxed);
+            if self.ordinal == Some(0) {
+                ledger
+                    .inner
+                    .host_cow_first_mm
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         let bump = |n: u64| n.checked_add(1);
         let own =

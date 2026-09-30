@@ -130,11 +130,11 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     if leaf & VALID == 0 {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped));
     }
-    if !armed_page(leaf) {
-        return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed));
-    }
     if leaf & SW_EL1_PRIVATE == 0 {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotEl1Private));
+    }
+    if !armed_page(leaf) {
+        return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed));
     }
     if leaf & SW_EL1_MAY_WRITE == 0 {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent));
@@ -332,7 +332,7 @@ mod tests {
         words.leaf_at(VA, OLD | 3 | AF | AP_RO_EL0 | NG);
         assert_eq!(
             classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
-            Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed))
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotEl1Private))
         );
         // Armed page without Linux write intent: a real protection fault.
         words.leaf_at(VA, armed(OLD, false));
