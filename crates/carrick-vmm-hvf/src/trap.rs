@@ -176,6 +176,9 @@ pub use mapping_plan::*;
 
 mod sparse_materialization;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod guest_alias;
+
 mod sysreg;
 use sysreg::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

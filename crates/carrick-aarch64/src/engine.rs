@@ -2896,6 +2896,26 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             address: va,
             length: len,
         })?;
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            // EL1 publishes the identity leaves (`MapAlias` named by the
+            // aperture's live inventory extent) with the host editor's
+            // `map_aliased` user flags. Stage-1 only, like the host lane.
+            let slot = self.mailbox_slot();
+            let carrier_root = self.vm.carrier_maintenance_root().ok();
+            let mut services = EngineStage1Services::<V> {
+                vcpu: &mut self.vcpu,
+                tables: self.page_tables.clone(),
+                slot,
+                process_asid: self.process_asid,
+                carrier_root,
+            };
+            return self
+                .vm
+                .restore_guest_shared_identity(va, len, &mut services)
+                .map_err(|error| {
+                    MemoryError::HostMap(format!("guest shared identity restore: {error}"))
+                });
+        }
         self.pt_edit_and_flush_after_adopting(va, len, |mgr| {
             mgr.map_aliased(va, va, len_u64, true)
                 .map(|changed| PageTableApplyOutcome::new(changed, changed))
@@ -3440,6 +3460,9 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         let (gpa, writable) = self
             .vm
             .add_alias(va.raw(), ipa.raw(), len, payload, backing)?;
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            return self.map_host_alias_on_guest_lane(va, gpa, len, writable);
+        }
         let mut descriptors = [0_u64; 4];
         let page_table_result = self.pt_edit_and_flush(|mgr| {
             let changed = mgr.map_aliased(va.raw(), gpa, len, writable)?;
@@ -3589,6 +3612,96 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         carrick_observability::probes::signal_restore(r.saved_pc, r.frame_sp, r.magic);
         self.vcpu.prepare_register_resume()?;
         Ok(r.sigmask)
+    }
+}
+
+impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
+    /// Guest-owned lane of [`SyscallTrap::map_host_alias`], after `add_alias`
+    /// staged stage-2 backing and inventory. The backend applies the
+    /// inventory, then publishes the leaves through EL1 (the kernel authority
+    /// must know the mapping before a `MapAlias` can name its revision). On
+    /// refusal the end state equals the host lane's cleanup: the VA span
+    /// retired at stage-1, no inventory for the alias, the alias
+    /// unregistered and the range marked unmapped.
+    fn map_host_alias_on_guest_lane(
+        &mut self,
+        va: GuestVa,
+        gpa: u64,
+        len: u64,
+        writable: bool,
+    ) -> Result<(), TrapError> {
+        use crate::vmm::GuestAliasRefusal;
+        let slot = self.mailbox_slot();
+        let carrier_root = self.vm.carrier_maintenance_root().ok();
+        let mut services = EngineStage1Services::<V> {
+            vcpu: &mut self.vcpu,
+            tables: self.page_tables.clone(),
+            slot,
+            process_asid: self.process_asid,
+            carrier_root,
+        };
+        let refusal =
+            match self
+                .vm
+                .publish_guest_host_alias(va.raw(), gpa, len, writable, &mut services)
+            {
+                Ok(()) => {
+                    // EL1 wrote the leaves, so only the live walk (bit 2) is a
+                    // receipt; the host manager image does not see them.
+                    let live = self.live_pt_debug_walk(va.raw());
+                    let flags = i32::from(self.is_forked_child)
+                        | (1 << 2)
+                        | (i32::from(live.is_err()) << 1);
+                    carrick_observability::probes::pt_alias_walk(
+                        va.raw(),
+                        live.unwrap_or([0_u64; 4]),
+                        flags,
+                    );
+                    return Ok(());
+                }
+                Err(refusal) => refusal,
+            };
+        let cleanup_len = usize::try_from(len).unwrap_or_else(|_| {
+            carrick_fatal!(
+                "aarch64::alias_cleanup",
+                "guest alias length {len:#x} exceeded host pointer width during failure cleanup unwinding"
+            );
+        });
+        let error = match refusal {
+            GuestAliasRefusal::BeforeInventory(error) => {
+                // The authority never saw the mapping: discard the staging
+                // first (see the host-lane arm), then retire whatever the VA
+                // span held, as the host lane's `unmap_aliased` does.
+                self.vm.abandon_alias_inventory();
+                if let Err(retire) = self.apply_stage1_rules(
+                    (va.raw(), cleanup_len),
+                    &[(va.raw(), cleanup_len, TerminalRule::pt(PtOp::Retire))],
+                ) {
+                    carrick_fatal!(
+                        "aarch64::alias_cleanup",
+                        "failed to retire guest alias range at {:#x} (len {:#x}) after a refused publication: {retire}",
+                        va.raw(),
+                        cleanup_len
+                    );
+                }
+                error
+            }
+            // The backend retired the span and rolled the grant back.
+            GuestAliasRefusal::RolledBack(error) => error,
+        };
+        if let Err(unregister) = self.vm.on_unmap(va.raw(), cleanup_len) {
+            carrick_fatal!(
+                "aarch64::alias_cleanup",
+                "failed to unregister guest alias at {:#x} (len {:#x}) after a refused publication: {unregister}",
+                va.raw(),
+                cleanup_len
+            );
+        }
+        self.set_unmapped(va.raw(), cleanup_len, true);
+        Err(memory_error_to_trap_error(
+            MemoryError::HostMap(format!("guest alias publication: {error}")),
+            "stage-1 alias page table mapping failed",
+        ))
     }
 }
 
