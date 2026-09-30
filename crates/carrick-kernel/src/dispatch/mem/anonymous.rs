@@ -18,6 +18,8 @@
 //!   `mprotect` of root-owned anonymous memory) is ONE root proposal, held
 //!   pending across the unchanged backend work and completed or refused with
 //!   the syscall's outcome; the host records no row for it;
+//! - `mremap` of root-owned anonymous memory is ONE root `mremap` proposal
+//!   the same way, its backend work (copy, zero, retire) done by the host;
 //! - `madvise` fork/dump attributes and `mlock` state of root-owned memory
 //!   are root node attributes (`set_flags`), never host rows: the range
 //!   stays EL1-editable, and every lock reader asks [`MemState::locked_view`];
@@ -690,12 +692,11 @@ impl MemState {
         let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
             return false;
         };
+        let within = |range: ReservationRange| range.start() <= start && end <= range.end();
         matches!(
             delegated.venue,
             Some(HostVenue::Proposal(request))
-                if request.operation != ReservationOperation::Move
-                    && request.range.start() <= start
-                    && end <= request.range.end()
+                if within(request.range) || request.source.is_some_and(within)
         )
     }
 
@@ -1359,13 +1360,30 @@ impl MemView<'_> {
         &self,
         cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        // mremap is host-served on a delegated MM (S1c moves it to the
-        // root's `mremap`): demote the source and a fixed destination.
         let old_address: GuestPtr = cx.typed_arg(0);
         let old_size: u64 = cx.typed_arg(1);
         let new_size: u64 = cx.typed_arg(2);
         let flags: u64 = cx.typed_arg(3);
         let new_address: GuestPtr = cx.typed_arg(4);
+        let root = self.mem().lock().delegated_root().cloned();
+        if let Some(root) = root {
+            let request = match super::mmap::mremap_request(
+                self.linux_page_size(),
+                old_address.0,
+                old_size,
+                new_size,
+                flags,
+                new_address.0,
+            ) {
+                Ok(request) => request,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            if let Some(outcome) = self.mremap_root(cx, &root, request)? {
+                return Ok(outcome);
+            }
+        }
+        // Any other source is host-served: demote the source and a fixed
+        // destination (no-op in host setup).
         self.demote_for_host_edit(old_address.0, old_size);
         if carrick_abi::LinuxMremapFlags::from_bits_retain(flags)
             .contains(carrick_abi::LinuxMremapFlags::FIXED)
@@ -1376,6 +1394,337 @@ impl MemView<'_> {
         self.settle_host_venue(&outcome, |_, _| false)?;
         outcome
     }
+
+    /// `mremap` of root-owned anonymous memory as ONE root `mremap`
+    /// proposal: the root decides the shape (shrink, in-place growth, move,
+    /// `MREMAP_DONTUNMAP`) and the placement, the host does the backend
+    /// work, and the outcome completes or refuses the proposal. `None`: the
+    /// source is not root-owned anonymous arena memory (host-served).
+    fn mremap_root<M: CurrentMmMemory>(
+        &self,
+        cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
+        root: &DelegatedRoot,
+        request: super::mmap::MremapRequest,
+    ) -> Result<Option<DispatchOutcome>, DispatchError> {
+        use carrick_el1::memory::reservations::MoveTarget;
+        let super::mmap::MremapRequest {
+            old_address,
+            old_size,
+            new_size,
+            new_address,
+            may_move,
+            move_fixed,
+            dontunmap,
+        } = request;
+        let layout = self.mem().lock().layout;
+        let Some(old_end) = old_address.checked_add(old_size).filter(|_| old_size != 0) else {
+            return Ok(None);
+        };
+        if !range_within(old_address, old_size, layout.mmap_base, layout.mmap_size) {
+            return Ok(None);
+        }
+        let mappings = MemState::root_mappings(root, old_address, old_end);
+        if !mappings.iter().any(|mapping| mapping.anonymous) {
+            return Ok(None);
+        }
+        // mremap(2) EFAULT: the old range must be one mapping; a hole or
+        // two mappings (of any owner or attributes) is refused before any
+        // other effect.
+        let [node] = mappings.as_slice() else {
+            return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
+        };
+        if node.range.start() > old_address
+            || node.range.end() < old_end
+            || !node.flags.root_editable()
+        {
+            return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
+        }
+        let node = *node;
+        if move_fixed {
+            let in_layout = new_address
+                .checked_add(new_size)
+                .is_some_and(|end| in_layout(new_address, end, layout));
+            if !in_layout {
+                // An out-of-layout destination is a host alias placement.
+                return Ok(None);
+            }
+            if super::overlaps_el0_clock_stub(new_address, new_size) {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EPERM)));
+            }
+        }
+        // mremap(2) EAGAIN: expanding a locked mapping past RLIMIT_MEMLOCK.
+        let locked = node.flags.contains(ReservationNodeFlags::LOCKED);
+        if locked && new_size > old_size && !self.cred_snapshot().euid.is_root() {
+            let limit = self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur;
+            let held = super::locked_ranges_total(&self.mem().lock().locked_view());
+            if held
+                .checked_add(new_size - old_size)
+                .is_none_or(|total| total > limit)
+            {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EAGAIN)));
+            }
+        }
+        // MREMAP_FIXED discards whatever the destination held first, like
+        // mmap(MAP_FIXED): one munmap of the destination through the same
+        // authority as the syscall.
+        if move_fixed && self.guest_vma_overlaps(new_address, new_size) {
+            let unmapped = with_args(cx, [new_address, new_size, 0, 0, 0, 0], |cx| {
+                self.munmap(cx)
+            })?;
+            if unmapped != (DispatchOutcome::Returned { value: 0 }) {
+                return Ok(Some(unmapped));
+            }
+        }
+        let target = match (dontunmap, move_fixed, may_move) {
+            (true, true, _) => MoveTarget::KeepSource(Some(new_address)),
+            (true, false, _) => MoveTarget::KeepSource(None),
+            (false, true, _) => MoveTarget::Fixed(new_address),
+            (false, false, true) => MoveTarget::MayMove,
+            (false, false, false) => MoveTarget::InPlace,
+        };
+        let source =
+            reservation_range(old_address, old_end).map_err(DispatchError::ReservationAuthority)?;
+        let proposed = {
+            let authority = self.mem();
+            let mut mem = authority.lock();
+            match self.with_charged_root(&mem, root, |model| model.mremap(source, new_size, target))
+            {
+                Ok(Decision::Work(request)) => {
+                    mem.open_venue(HostVenue::Proposal(request));
+                    request
+                }
+                Ok(Decision::Complete(value)) => {
+                    return Ok(Some(DispatchOutcome::Returned {
+                        value: value as i64,
+                    }));
+                }
+                // Growth over a limit, or nothing in place and no room.
+                Err(Refusal::Limit) => return Ok(Some(DispatchOutcome::errno(LINUX_ENOMEM))),
+                Err(Refusal::Hole) => return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT))),
+                Err(Refusal::Invalid) => return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL))),
+                // A fixed destination the root cannot own.
+                Err(Refusal::ForeignMapping | Refusal::Collision) => return Ok(None),
+                Err(refusal) => return Err(DispatchError::ReservationAuthority(refusal)),
+            }
+        };
+        let outcome = match proposed.operation {
+            ReservationOperation::Retire => {
+                // Shrink: the tail is retired exactly as munmap retires it.
+                let tail = proposed.range;
+                let outcome = with_args(cx, [tail.start(), tail.len(), 0, 0, 0, 0], |cx| {
+                    self.munmap_served(cx)
+                });
+                self.settle_host_venue(&outcome, |outcome, _| {
+                    matches!(outcome, DispatchOutcome::Returned { value: 0 })
+                })?;
+                return Ok(Some(match outcome? {
+                    DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
+                        value: old_address as i64,
+                    },
+                    other => other,
+                }));
+            }
+            ReservationOperation::Prepare if !dontunmap => {
+                self.mremap_root_extend(cx, proposed, old_address, locked)
+            }
+            _ => self.mremap_root_move(cx, proposed, source, dontunmap, locked),
+        };
+        self.settle_host_venue(&outcome, |outcome, request| {
+            matches!(outcome, DispatchOutcome::Returned { value }
+                if *value as u64 == request.range.start()
+                    || request.operation == ReservationOperation::Prepare && !dontunmap)
+        })?;
+        outcome.map(Some)
+    }
+
+    /// Publish `[start, start+len)` as fresh private anonymous memory with
+    /// `prot`: zeroed first when a prior mapping may have dirtied it.
+    fn publish_fresh_anonymous<M: CurrentMmMemory>(
+        &self,
+        memory: &mut M,
+        start: u64,
+        len: u64,
+        prot: LinuxProtFlags,
+        stale: bool,
+    ) -> Result<(), LinuxErrno> {
+        let length = usize::try_from(len).map_err(|_| LINUX_ENOMEM)?;
+        if stale && memory.zero_backing(start, length).is_err() {
+            return Err(LINUX_ENOMEM);
+        }
+        let prot_none = prot.is_empty();
+        memory.set_mapping_protection_and_sharing(
+            start,
+            length,
+            prot_none,
+            !prot_none && !prot.contains(LinuxProtFlags::WRITE),
+            carrick_guest_mem::MappingSharing::Private,
+        );
+        if memory.protect_range(start, length, prot.bits()).is_err() {
+            mark_range_unmapped(memory, start, length);
+            return Err(LINUX_ENOMEM);
+        }
+        let mem_authority = self.mem();
+        let mut mem = mem_authority.lock();
+        // Monotonic: a later reuse of these bytes is zeroed.
+        mem.mmap_writable_high = mem.mmap_writable_high.max(start.saturating_add(len));
+        Ok(())
+    }
+
+    fn writable_high(&self) -> u64 {
+        self.mem().lock().mmap_writable_high
+    }
+
+    fn populate_locked<M: CurrentMmMemory>(
+        &self,
+        memory: &mut M,
+        start: u64,
+        len: u64,
+    ) -> Result<(), LinuxErrno> {
+        match guest_range(start, start.saturating_add(len)) {
+            Some(range) => self.populate_resident_range(memory, range),
+            None => Ok(()),
+        }
+    }
+
+    /// In-place growth: the root's extension becomes part of the mapping.
+    fn mremap_root_extend<M: CurrentMmMemory>(
+        &self,
+        cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
+        proposed: ReservationRequest,
+        old_address: u64,
+        locked: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let permit = cx.mm_mutation.host_alias_permit();
+        let mut dispatch = self.begin_conditional_vma_dispatch(&permit);
+        let memory = &mut *cx.memory;
+        let extension = proposed.range;
+        let prot = LinuxProtFlags::from_bits_retain(proposed.protection.bits());
+        let stale = extension.start() < self.writable_high();
+        if let Err(errno) =
+            self.publish_fresh_anonymous(memory, extension.start(), extension.len(), prot, stale)
+        {
+            return Ok(DispatchOutcome::errno(errno));
+        }
+        if locked
+            && let Err(errno) = self.populate_locked(memory, extension.start(), extension.len())
+        {
+            return Ok(DispatchOutcome::errno(errno));
+        }
+        self.mark_vma_dispatch(&mut dispatch);
+        Ok(DispatchOutcome::Returned {
+            value: old_address as i64,
+        })
+    }
+
+    /// A relocation: the destination receives the contents; the source is
+    /// retired (`Move`) or kept as fresh zero pages (`MREMAP_DONTUNMAP`).
+    fn mremap_root_move<M: CurrentMmMemory>(
+        &self,
+        cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
+        proposed: ReservationRequest,
+        source: ReservationRange,
+        dontunmap: bool,
+        locked: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let permit = cx.mm_mutation.host_alias_permit();
+        let mut dispatch = self.begin_conditional_vma_dispatch(&permit);
+        let memory = &mut *cx.memory;
+        let destination = proposed.range;
+        let prot = LinuxProtFlags::from_bits_retain(proposed.protection.bits());
+        let (Ok(copy_len), Ok(source_len)) = (
+            usize::try_from(source.len().min(destination.len())),
+            usize::try_from(source.len()),
+        ) else {
+            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+        };
+        let copied = match memory.read_bytes_raw(source.start(), copy_len) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+        };
+        // Published writable for the copy, then with the source's protection.
+        let stale = destination.start() < self.writable_high();
+        if let Err(errno) = self.publish_fresh_anonymous(
+            memory,
+            destination.start(),
+            destination.len(),
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            stale,
+        ) {
+            return Ok(DispatchOutcome::errno(errno));
+        }
+        let rollback = |this: &Self, memory: &mut M, errno| {
+            this.rollback_fresh_arena_mapping(memory, destination.start(), destination.len())
+                .map(|()| DispatchOutcome::errno(errno))
+                .map_err(DispatchError::from)
+        };
+        if memory
+            .write_bytes_unchecked(destination.start(), &copied)
+            .is_err()
+        {
+            return rollback(self, memory, LINUX_EFAULT);
+        }
+        let Ok(destination_len) = usize::try_from(destination.len()) else {
+            return rollback(self, memory, LINUX_ENOMEM);
+        };
+        let prot_none = prot.is_empty();
+        memory.set_mapping_protection(
+            destination.start(),
+            destination_len,
+            prot_none,
+            !prot_none && !prot.contains(LinuxProtFlags::WRITE),
+        );
+        if memory
+            .protect_range(destination.start(), destination_len, prot.bits())
+            .is_err()
+        {
+            return rollback(self, memory, LINUX_ENOMEM);
+        }
+        if dontunmap {
+            // The source stays mapped and reads back zero.
+            if memory.zero_backing(source.start(), source_len).is_err() {
+                return rollback(self, memory, LINUX_ENOMEM);
+            }
+        } else {
+            if let Err(first) = memory.unmap_range(source.start(), source_len)
+                && let Err(retry) = memory.unmap_range(source.start(), source_len)
+            {
+                // The destination is published: failing now would leave two
+                // owners of the contents.
+                carrick_fatal!(
+                    "dispatch::mremap",
+                    "root mremap move could not reclaim source {:#x}+{:#x}: {first}; retry: {retry}",
+                    source.start(),
+                    source_len
+                );
+            }
+            mark_range_unmapped(memory, source.start(), source_len);
+            self.remove_mapping_metadata(source.start(), source.len());
+        }
+        if locked
+            && let Err(errno) = self.populate_locked(memory, destination.start(), destination.len())
+        {
+            return Ok(DispatchOutcome::errno(errno));
+        }
+        self.mark_vma_dispatch(&mut dispatch);
+        Ok(DispatchOutcome::Returned {
+            value: destination.start() as i64,
+        })
+    }
+}
+
+/// Run `f` with `cx` carrying `args` in place of the syscall's own: mremap
+/// composes the munmap its Linux semantics name (a shrunk tail, a
+/// `MREMAP_FIXED` destination) through the one munmap authority.
+fn with_args<'a, 'm, 'x, M: CurrentMmMemory, R>(
+    cx: &mut MutationSyscallCtx<'a, 'm, 'x, M>,
+    args: [u64; 6],
+    f: impl FnOnce(&mut MutationSyscallCtx<'a, 'm, 'x, M>) -> R,
+) -> R {
+    let saved = cx.request.args;
+    cx.request.args = crate::compat::SyscallArgs(args);
+    let result = f(cx);
+    cx.request.args = saved;
+    result
 }
 
 #[cfg(test)]
