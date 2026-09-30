@@ -332,6 +332,15 @@ impl Kernel {
             });
         }
         drop(state);
+        // A pending process-directed signal this thread was to receive goes to
+        // a sibling now: wake them so a parked wait re-examines the queue.
+        if context.shared().pending_signals().received_by(
+            tid,
+            LinuxTid::for_task_leader(context.task.key().id),
+            carrick_abi::SigSet::EMPTY.complement(),
+        ) {
+            context.task.wake();
+        }
         if tid != LinuxTid::for_task_leader(context.task.key().id)
             && let Some(region) = context.task.pid_ns_region()
         {

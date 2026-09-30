@@ -329,18 +329,113 @@ impl PendingQueue {
 /// revalidation.
 #[derive(Debug, Default)]
 pub struct TaskPendingSignals {
-    queue: Mutex<PendingQueue>,
+    queue: Mutex<TaskPendingQueue>,
     pending_hint: AtomicU64,
     revision: ObjectRevision,
+}
+
+/// The process-directed queue plus, per pending signal, the thread a
+/// `kill(tid)`/`rt_sigqueueinfo(tid)` named. Linux keeps such a signal in the
+/// shared queue but hands it to the named thread when that thread does not
+/// block it; the leader is the recipient otherwise. The recipient only decides
+/// which thread's interruptible wait the signal breaks: any thread may still
+/// dequeue it at its own delivery boundary.
+#[derive(Debug, Default)]
+struct TaskPendingQueue {
+    queue: PendingQueue,
+    named_recipients: BTreeMap<LinuxSignal, LinuxTid>,
+}
+
+impl std::ops::Deref for TaskPendingQueue {
+    type Target = PendingQueue;
+
+    fn deref(&self) -> &PendingQueue {
+        &self.queue
+    }
+}
+
+impl std::ops::DerefMut for TaskPendingQueue {
+    fn deref_mut(&mut self) -> &mut PendingQueue {
+        &mut self.queue
+    }
+}
+
+impl TaskPendingQueue {
+    /// Record who receives `signal` when this enqueue made it pending. A
+    /// signal already pending keeps its recipient: a coalesced standard signal
+    /// is not sent again, and later real-time instances follow the first.
+    fn designate(&mut self, signal: LinuxSignal, was_pending: bool, named: Option<LinuxTid>) {
+        if was_pending {
+            return;
+        }
+        match named {
+            Some(tid) => {
+                self.named_recipients.insert(signal, tid);
+            }
+            None => {
+                self.named_recipients.remove(&signal);
+            }
+        }
+    }
+
+    /// The thread whose wait a pending `signal` interrupts: the named thread,
+    /// else the task leader.
+    fn recipient(&self, signal: LinuxSignal, leader: LinuxTid) -> LinuxTid {
+        self.named_recipients
+            .get(&signal)
+            .copied()
+            .unwrap_or(leader)
+    }
+
+    /// Every pending signal with its recipient.
+    fn recipients(&self, leader: LinuxTid) -> Vec<(LinuxSignal, LinuxTid)> {
+        (1..=64)
+            .filter(|&signum| self.queue.present().contains(signum))
+            .filter_map(|signum| LinuxSignal::for_signal_number(signum).ok())
+            .map(|signal| (signal, self.recipient(signal, leader)))
+            .collect()
+    }
+}
+
+/// Recipients of the task queue observed by one waiting thread
+/// ([`SignalAuthority::foreign_task_recipients`]).
+struct TaskRecipientSnapshot {
+    leader: LinuxTid,
+    recipients: Vec<(LinuxSignal, LinuxTid)>,
+    /// Signals another live thread receives because it does not block them.
+    claimed: SigSet,
+}
+
+impl TaskRecipientSnapshot {
+    /// The task-queue signals `me` may take for its wait, revalidated under
+    /// the queue lock: a signal whose recipient is not `me` and changed since
+    /// the sample (or that became pending since) is left to its recipient,
+    /// which the enqueue's task wake reaches.
+    fn available(&self, queue: &TaskPendingQueue, me: LinuxTid) -> SigSet {
+        let mut available = queue.present().difference(self.claimed);
+        for (signal, recipient) in queue.recipients(self.leader) {
+            let sampled = self
+                .recipients
+                .iter()
+                .any(|&(seen, seen_recipient)| seen == signal && seen_recipient == recipient);
+            if recipient != me && !sampled {
+                available = available.without(signal.raw());
+            }
+        }
+        available
+    }
 }
 
 impl TaskPendingSignals {
     pub const fn new() -> Self {
         Self {
-            queue: Mutex::new(PendingQueue {
-                present: SigSet::EMPTY,
-                standard_siginfos: BTreeMap::new(),
-                realtime: BTreeMap::new(),
+            queue: Mutex::new(TaskPendingQueue {
+                queue: PendingQueue {
+                    present: SigSet::EMPTY,
+                    standard_siginfos: BTreeMap::new(),
+                    realtime: BTreeMap::new(),
+                },
+                named_recipients: BTreeMap::new(),
             }),
             pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
@@ -364,15 +459,55 @@ impl TaskPendingSignals {
     }
 
     pub fn enqueue_standard(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
-        let mut queue = self.queue.lock();
-        let _ = queue.enqueue_standard(signal, siginfo);
-        self.publish_queue(&queue);
+        self.enqueue(signal, siginfo, None);
     }
 
     pub fn enqueue_realtime(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        self.enqueue(signal, siginfo, None);
+    }
+
+    /// Enqueue a process-directed signal whose sender named thread `named`
+    /// (`kill`/`rt_sigqueueinfo` by a non-leader tid). It stays in the shared
+    /// queue; `named` is its recipient while it does not block it.
+    pub fn enqueue_named(
+        &self,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+        named: LinuxTid,
+    ) {
+        self.enqueue(signal, siginfo, Some(named));
+    }
+
+    fn enqueue(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>, named: Option<LinuxTid>) {
         let mut queue = self.queue.lock();
-        let _ = queue.enqueue_realtime(signal, siginfo);
+        let was_pending = queue.present().contains(signal.raw());
+        if signal.is_realtime() {
+            let _ = queue.enqueue_realtime(signal, siginfo);
+        } else {
+            let _ = queue.enqueue_standard(signal, siginfo);
+        }
+        queue.designate(signal, was_pending, named);
         self.publish_queue(&queue);
+    }
+
+    /// Each pending signal with the thread whose wait it interrupts.
+    pub(crate) fn recipients(&self, leader: LinuxTid) -> Vec<(LinuxSignal, LinuxTid)> {
+        self.queue.lock().recipients(leader)
+    }
+
+    /// Whether a pending signal in `signals` is received by `tid`. Linux
+    /// retargets such a signal when its recipient blocks it or exits; here
+    /// the other threads' waits take it once woken, so the caller wakes the
+    /// task.
+    pub(crate) fn received_by(&self, tid: LinuxTid, leader: LinuxTid, signals: SigSet) -> bool {
+        if !self.may_be_nonempty() {
+            return false;
+        }
+        self.queue
+            .lock()
+            .recipients(leader)
+            .into_iter()
+            .any(|(signal, recipient)| recipient == tid && signals.contains(signal.raw()))
     }
 
     pub fn take_lowest_in(&self, wanted: SigSet) -> Option<PendingSignal> {
@@ -389,8 +524,9 @@ impl TaskPendingSignals {
     pub fn replace_entries(&self, entries: &[PendingSignal]) {
         let replacement = PendingQueue::from_entries(entries);
         let mut queue = self.queue.lock();
-        if *queue != replacement {
-            *queue = replacement;
+        if queue.queue != replacement {
+            queue.queue = replacement;
+            queue.named_recipients.clear();
             self.publish_queue(&queue);
         }
     }
@@ -1038,6 +1174,36 @@ impl SignalAuthority {
             .is_empty()
     }
 
+    /// Which process-directed pending signals another thread receives, sampled
+    /// before the canonical lock transaction: a recipient's mask lives behind
+    /// its own signal-state lock, which cannot nest under this thread's.
+    fn foreign_task_recipients(&self) -> TaskRecipientSnapshot {
+        let leader = LinuxTid::for_task_leader(self.task.key().id);
+        let me = self.thread.key().tid;
+        let mut snapshot = TaskRecipientSnapshot {
+            leader,
+            recipients: self.task_pending.recipients(leader),
+            claimed: SigSet::EMPTY,
+        };
+        let mut masks: BTreeMap<LinuxTid, Option<SigSet>> = BTreeMap::new();
+        for &(signal, recipient) in &snapshot.recipients {
+            if recipient == me {
+                continue;
+            }
+            let blocked = *masks.entry(recipient).or_insert_with(|| {
+                self.task
+                    .thread(recipient)
+                    .map(|thread| thread.signal_state().blocked())
+            });
+            // A live recipient that does not block the signal receives it. A
+            // gone recipient, or one that blocks it, leaves it to any thread.
+            if blocked.is_some_and(|blocked| !blocked.contains(signal.raw())) {
+                snapshot.claimed = snapshot.claimed.with(signal.raw());
+            }
+        }
+        snapshot
+    }
+
     /// Atomically choose and reserve one signal for an interruptible wait.
     /// Pending ownership, the live effective mask, exact action and both
     /// generations are sampled under one canonical lock transaction. Ignored
@@ -1064,15 +1230,7 @@ impl SignalAuthority {
         temporary: WaitSigMask,
         host_slot: Option<(i32, i32)>,
     ) -> Option<SignalWaitReservation> {
-        let leader_tid = LinuxTid::for_task_leader(self.task.key().id);
-        let is_leader = self.thread.key().tid == leader_tid;
-        let leader_blocked = if !is_leader {
-            self.task
-                .thread(leader_tid)
-                .map(|l| l.signal_state().blocked())
-        } else {
-            None
-        };
+        let recipients = self.foreign_task_recipients();
         let generation_guard = self.task.lock_signal_generation();
         let mut thread = self.thread.signal_state.lock();
         let mut task = self.task_pending.queue.lock();
@@ -1113,11 +1271,7 @@ impl SignalAuthority {
         );
         let mask_generation = self.thread.revision.load();
         let action_generation = self.sighand.revision.load();
-        let available_task = if let Some(leader_mask) = leader_blocked {
-            task.present().intersect(leader_mask)
-        } else {
-            task.present()
-        };
+        let available_task = recipients.available(&task, self.thread.key().tid);
         loop {
             let candidates = thread
                 .pending()

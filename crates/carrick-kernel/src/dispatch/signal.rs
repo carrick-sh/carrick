@@ -959,8 +959,21 @@ impl<'a> SignalView<'a> {
         tid: crate::thread::ThreadId,
         mask: SigSet,
     ) {
-        Self::required_signal_thread(context, tid)
-            .update_signal_state(|state| state.set_blocked(sanitize_signal_mask(mask)));
+        let thread = Self::required_signal_thread(context, tid);
+        let newly_blocked = thread.update_signal_state(|state| {
+            let previous = state.blocked();
+            state.set_blocked(sanitize_signal_mask(mask));
+            state.blocked().difference(previous)
+        });
+        // Blocking a pending process-directed signal this thread was to
+        // receive hands it to a sibling: wake them to re-examine the queue.
+        if context.shared().pending_signals().received_by(
+            thread.key().tid,
+            crate::kernel::LinuxTid::for_task_leader(context.task().key().id),
+            newly_blocked,
+        ) {
+            context.task().wake();
+        }
     }
 
     /// Lowest-numbered pending signal that is NOT currently blocked, cleared
@@ -1457,12 +1470,12 @@ impl<'a> SignalView<'a> {
         if !hvpatch_owns_specific_process_signal(crate::dispatch::hvpatch_lane_active(), pid) {
             return None;
         }
-        let target_key = if u32::try_from(pid).is_ok_and(|p| p == self.identity_pid()) {
-            Some(ctx.kernel.task().key())
+        let target = if u32::try_from(pid).is_ok_and(|p| p == self.identity_pid()) {
+            Some(ProcessSignalTarget::process(ctx.kernel.task().key()))
         } else {
             hvpatch_process_signal_target(ctx.kernel, pid)
         };
-        let Some(target_key) = target_key else {
+        let Some(target) = target else {
             if hvpatch_signal_observes_zombie(ctx.kernel, pid) {
                 // Addressable but no longer running: the signal is dropped and
                 // the call succeeds, exactly as Linux does for a zombie.
@@ -1470,7 +1483,7 @@ impl<'a> SignalView<'a> {
             }
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
         };
-        Some(self.hvpatch_exact_process_signal(ctx.kernel, target_key, signum, siginfo))
+        Some(self.hvpatch_exact_process_signal_to(ctx.kernel, target, signum, siginfo))
     }
 
     /// Deliver through one exact HVPatch process identity. Pidfds already hold
@@ -1485,6 +1498,23 @@ impl<'a> SignalView<'a> {
         signum: u64,
         siginfo: Option<LinuxSiginfo>,
     ) -> DispatchOutcome {
+        self.hvpatch_exact_process_signal_to(
+            context,
+            ProcessSignalTarget::process(target_key),
+            signum,
+            siginfo,
+        )
+    }
+
+    /// [`Self::hvpatch_exact_process_signal`] for a target that may have been
+    /// addressed by one of its thread ids, which then receives the signal.
+    fn hvpatch_exact_process_signal_to(
+        &self,
+        context: &crate::kernel::KernelContext,
+        target: ProcessSignalTarget,
+        signum: u64,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> DispatchOutcome {
         let kernel = context.kernel();
         let signal = if signum == 0 {
             None
@@ -1494,7 +1524,13 @@ impl<'a> SignalView<'a> {
                 Err(_) => return DispatchOutcome::errno(LINUX_EINVAL),
             }
         };
-        match kernel.authorize_signal_target_exact(context, target_key, None, signal) {
+        let authorization = match target.named_thread {
+            Some(named) => {
+                kernel.authorize_process_signal_via_thread(context, target.task, named, signal)
+            }
+            None => kernel.authorize_signal_target_exact(context, target.task, None, signal),
+        };
+        match authorization {
             crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
                 if signal.is_none_or(|signal| {
                     kernel.post_signal_to_authorized_target(&ticket, signal, siginfo)
@@ -1541,8 +1577,8 @@ impl<'a> SignalView<'a> {
                     || names_self_pid(i64::from(raw))
                 {
                     Some(context.task().key().id)
-                } else if let Some(target_key) = hvpatch_process_signal_target(context, raw) {
-                    Some(target_key.id)
+                } else if let Some(target) = hvpatch_process_signal_target(context, raw) {
+                    Some(target.task.id)
                 } else {
                     return Some(DispatchOutcome::errno(LINUX_ESRCH));
                 }
@@ -3343,10 +3379,27 @@ pub(crate) fn ns_visible_sender_pid(context: &crate::kernel::KernelContext) -> i
         })
 }
 
+/// A process-directed signal target: the exact task and, when the sender
+/// addressed it by a non-leader thread id, that thread (its recipient).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessSignalTarget {
+    pub(crate) task: crate::kernel::TaskKey,
+    pub(crate) named_thread: Option<crate::kernel::ThreadKey>,
+}
+
+impl ProcessSignalTarget {
+    pub(crate) const fn process(task: crate::kernel::TaskKey) -> Self {
+        Self {
+            task,
+            named_thread: None,
+        }
+    }
+}
+
 fn hvpatch_process_signal_target(
     context: &crate::kernel::KernelContext,
     pid: i32,
-) -> Option<crate::kernel::TaskKey> {
+) -> Option<ProcessSignalTarget> {
     // TRANSITIONAL identity bridge: in the raw (non-namespaced) lane
     // `getpid(2)` still answers the CARRIER's host pid (`logical_pid()`
     // falls back to `std::process::id()` — the retired 1:1 model's
@@ -3368,18 +3421,22 @@ fn hvpatch_process_signal_target(
         .and_then(|internal| crate::kernel::TaskId::from_abi_positive(internal).ok());
     task_target
         .and_then(|target| context.kernel().live_task_key(target))
+        .map(ProcessSignalTarget::process)
         .or_else(|| {
             let tid = crate::namespace::pid::guest_tid_to_kernel_for(context, pid)
                 .and_then(|tid| crate::kernel::LinuxTid::from_abi_positive(tid).ok())?;
             context
                 .kernel()
                 .live_keys_for_thread(None, tid)
-                .and_then(|(task, _thread)| {
+                .and_then(|(task, thread)| {
                     context
                         .kernel()
                         .live_task(task.id)
                         .filter(|task_ref| task_ref.container().id() == context.container().id())
-                        .map(|_| task)
+                        .map(|_| ProcessSignalTarget {
+                            task,
+                            named_thread: Some(thread),
+                        })
                 })
         })
 }
@@ -3722,9 +3779,113 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            hvpatch_process_signal_target(&root, sibling_tid.raw()),
+            hvpatch_process_signal_target(&root, sibling_tid.raw()).map(|target| target.task),
             Some(root.task().key())
         );
+    }
+
+    /// `kill(tid)` from a second live process names a non-leader thread: the
+    /// signal is process-directed (shared pending), but the named thread is
+    /// the recipient while it does not block it. The leader, parked in an
+    /// interruptible wait with the signal unblocked, must not be interrupted
+    /// by it (witness `el1_thread_lifecycle_tgkill_right_after_clone`: the
+    /// leader's `poll` returned EINTR, so round 0 read no peer reply).
+    #[test]
+    fn kill_by_tid_from_peer_is_received_by_the_named_thread_not_the_leader() {
+        let dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let plan =
+            crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap();
+        let peer = root
+            .kernel()
+            .reserve_fork(&root, plan, "kill-by-tid-peer".to_owned(), None)
+            .unwrap()
+            .prepare_reference(crate::thread::ThreadId::synthetic_for_tests(8_201))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let root = root
+            .kernel()
+            .context(root.task().key().id, root.thread().key().tid)
+            .unwrap();
+        let sibling_tid = dispatcher
+            .register_one_task_thread(&root, crate::thread::ThreadId::synthetic_for_tests(8_202))
+            .unwrap();
+        let sibling = root
+            .kernel()
+            .context(root.task().key().id, sibling_tid)
+            .unwrap();
+        let usr2 =
+            crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR2).unwrap();
+        root.shared().sighand().install_action(
+            usr2,
+            LinuxSigaction {
+                sa_handler: 0x1234_0000,
+                sa_flags: 0,
+                sa_restorer: 0,
+                sa_mask: [0],
+            },
+        );
+
+        let target = hvpatch_process_signal_target(&peer, sibling_tid.raw())
+            .expect("the peer resolves the sibling tid");
+        assert_eq!(target.task, root.task().key());
+        assert_eq!(
+            target.named_thread.map(|thread| thread.tid),
+            Some(sibling_tid)
+        );
+        assert_eq!(
+            dispatcher.signal_view().hvpatch_exact_process_signal_to(
+                &peer,
+                target,
+                carrick_abi::LINUX_SIGUSR2 as u64,
+                None
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        assert!(
+            root.signal_authority()
+                .reserve_deliverable_for_wait(carrick_abi::WaitSigMask::NONE)
+                .is_none(),
+            "the leader's wait took a signal addressed to thread {sibling_tid:?}"
+        );
+        let reserved = sibling
+            .signal_authority()
+            .reserve_deliverable_for_wait(carrick_abi::WaitSigMask::NONE)
+            .expect("the named thread receives the signal");
+        assert_eq!(reserved.dequeue().pending.signal, usr2);
+
+        // Retarget: a second send names the sibling, which then blocks it.
+        // The signal stays process-pending and the leader's wait takes it.
+        let target = hvpatch_process_signal_target(&peer, sibling_tid.raw()).unwrap();
+        assert_eq!(
+            dispatcher.signal_view().hvpatch_exact_process_signal_to(
+                &peer,
+                target,
+                carrick_abi::LINUX_SIGUSR2 as u64,
+                None
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let wake_before = root.task().wake_generation();
+        dispatcher.restore_signal_mask(
+            &sibling,
+            sibling.thread().registry_id(),
+            SigSet::EMPTY.with(carrick_abi::LINUX_SIGUSR2),
+        );
+        assert!(
+            root.task().wake_generation() > wake_before,
+            "blocking a signal it was to receive must wake the siblings"
+        );
+        let reserved = root
+            .signal_authority()
+            .reserve_deliverable_for_wait(carrick_abi::WaitSigMask::NONE)
+            .expect("the leader receives the signal its recipient blocked");
+        assert_eq!(reserved.dequeue().pending.signal, usr2);
     }
 
     #[test]

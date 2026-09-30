@@ -63,6 +63,10 @@ pub struct AuthorizedSignalTarget {
     domain: Arc<KernelDomain>,
     task: Weak<Task>,
     thread: Option<Weak<crate::kernel::objects::Thread>>,
+    /// A process-directed signal whose sender named this non-leader thread
+    /// (`kill(tid)`): delivery stays process-directed, the thread is its
+    /// recipient ([`crate::kernel::TaskPendingSignals::enqueue_named`]).
+    named_recipient: Option<LinuxTid>,
 }
 
 impl Kernel {
@@ -182,7 +186,31 @@ impl Kernel {
             domain: Arc::clone(self.domain()),
             task: Arc::downgrade(&target),
             thread: thread.as_ref().map(Arc::downgrade),
+            named_recipient: None,
         })
+    }
+
+    /// Authorize a process-directed signal addressed by one of the task's
+    /// thread ids (`kill`/`rt_sigqueueinfo` given a non-leader tid). Policy is
+    /// checked against the named thread, exactly as a thread-directed send;
+    /// the signal is queued process-wide with that thread as its recipient.
+    pub fn authorize_process_signal_via_thread(
+        &self,
+        caller: &KernelContext,
+        target_task: TaskKey,
+        named: ThreadKey,
+        signal: Option<LinuxSignal>,
+    ) -> ExactSignalTargetAuthorization {
+        match self.authorize_signal_target_exact(caller, target_task, Some(named), signal) {
+            ExactSignalTargetAuthorization::Allowed(ticket) => {
+                ExactSignalTargetAuthorization::Allowed(AuthorizedSignalTarget {
+                    thread: None,
+                    named_recipient: Some(named.tid),
+                    ..ticket
+                })
+            }
+            other => other,
+        }
     }
 
     /// Apply a default-stop action to one live Linux task without signaling
@@ -771,10 +799,10 @@ impl Kernel {
             });
         } else {
             let pending = task.shared().pending_signals();
-            if signal.is_realtime() {
-                pending.enqueue_realtime(signal, siginfo);
-            } else {
-                pending.enqueue_standard(signal, siginfo);
+            match target.named_recipient {
+                Some(named) => pending.enqueue_named(signal, siginfo, named),
+                None if signal.is_realtime() => pending.enqueue_realtime(signal, siginfo),
+                None => pending.enqueue_standard(signal, siginfo),
             }
         }
         let continued = if signal.raw() == carrick_abi::LINUX_SIGCONT {
