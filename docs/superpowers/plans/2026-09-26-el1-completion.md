@@ -406,6 +406,30 @@ its explicit fixture race as a bounded validation obligation. Do not spend
 the next interval expanding accounting or rerunning unchanged helper suites;
 connect a production owner. Keep host pause removal last.
 
+**Carrier provider connection:** adapter `96e912e6a` joins reservation
+candidate `f2efa3716` and installs the carrier-bound host provider before
+worker admission. Owned metadata access retains the exact carrier mapping
+and VM generation; prepared views pin dynamic extents and cache unchanged
+storage generations. The lifetime/retirement witness is red-first; 27 kernel
+reservation tests, 114 EL1 + 56 ABI tests and affected Clippy pass.
+
+Signed `el1-reservation-provider-20260929-a` passes the existing first-touch
+parent/child regression at 256/1024/4096 pages (99/106/136 exits), entitlement
+negative control and zero-leftover cleanup. Exact bytes/manifest are retained
+in adapter memory-integration `provider-*` receipts. This is joined boot
+regression evidence, not anonymous-policy activation or complete provider
+operation coverage. `MemState` remains the anonymous owner and admission
+still refuses a second owner.
+
+**Next implementation:** convert `Aarch64EngineCore::commit_prepared_host_write`
+and `KernelFrameCowAuthority::commit_host_first_touch` to use guest descriptor
+publication while retaining exact-MM exclusion and committing arming only
+with an authenticated receipt. Reuse `plan_host_first_touch` and
+`commit_host_first_touch_after_guest_publish`; these currently have no runtime
+callers. Preserve Linux write permission and cross-MM/reuse rejection. Then
+continue reservation policy ownership and the remaining backend writers.
+The host page-table pause stays until the complete writer census is converted.
+
 ### A. Close batch-3 lifecycle blockers
 
 Deferred investigation: [signed deferred handback ordering](2026-09-29-el1-signed-handback-proof.md).
