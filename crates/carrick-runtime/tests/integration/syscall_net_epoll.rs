@@ -13,6 +13,14 @@ mod support;
 
 #[cfg(target_os = "macos")]
 use carrick_kernel::dispatch::{FdWaitCompletion, ThreadCtx, WaitFds};
+#[cfg(target_os = "macos")]
+use carrick_kernel::kernel::Scheduler;
+#[cfg(target_os = "macos")]
+use carrick_kernel::kernel::continuation::test_support::{await_event, capture, publish};
+#[cfg(target_os = "macos")]
+use carrick_kernel::kernel::continuation::{
+    BlockedContinuation, CarrierWaitService, ContinuationCompletion,
+};
 use carrick_runtime::linux_abi::{
     LINUX_AF_INET, LINUX_EMFILE, LINUX_SIOCGIFINDEX, LINUX_SIOCGIFNAME, LINUX_SOCK_STREAM,
     LinuxGuestAbi, LinuxX8664EpollEvent,
@@ -934,13 +942,36 @@ fn blocking_eventfd_read_waits_until_writer_updates_counter() {
     let read_memory = Arc::new(Mutex::new(LinearMemory::new(0x4000, vec![0; 0x100])));
     let read_memory_for_thread = Arc::clone(&read_memory);
     let reader = std::thread::spawn(move || {
-        let outcome = dispatch_threaded_with_wait_notify(
-            &read_threaded,
-            &read_memory_for_thread,
-            test_tid(10),
-            SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
-            Some(wait_tx),
+        let read = SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0]));
+        let outcome =
+            dispatch_threaded_once(&read_threaded, &read_memory_for_thread, test_tid(10), read);
+        // The eventfd has no host readiness descriptor: the blocking read
+        // parks as a continuation on the object's own wait queue, exactly as
+        // the carrier's executor does, never on a host thread.
+        let DispatchOutcome::WaitOnFds { ref fds, .. } = outcome else {
+            panic!("empty blocking eventfd read must park: {outcome:?}");
+        };
+        wait_tx.send(fds.clone()).unwrap();
+        let context = read_threaded.dispatcher.capture_one_task_context().unwrap();
+        let generation = publish(&context, 0x986);
+        let mut continuation =
+            BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+                .expect("eventfd read continuation");
+        let service =
+            CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(context.kernel()))));
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).expect("enroll");
+        let token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach");
+        let event = await_event(&service, token).expect("eventfd wake");
+        assert_eq!(
+            continuation.resume(event, &context).unwrap().completion,
+            ContinuationCompletion::Redispatch
         );
+        let outcome =
+            dispatch_threaded_once(&read_threaded, &read_memory_for_thread, test_tid(10), read);
         let value = read_eventfd_value(&*read_memory_for_thread.lock().unwrap(), 0x4000).value;
         tx.send((outcome, value)).unwrap();
     });
