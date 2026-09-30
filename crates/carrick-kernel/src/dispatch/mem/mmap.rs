@@ -146,7 +146,7 @@ fn overlaps_clock_stub(address: u64, length: u64) -> Result<bool, LinuxErrno> {
 
 impl<'a> MemView<'a> {
     define_syscall! {
-        mm_mutation fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
+        mm_mutation fn mmap_served(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let mut flags = flags;
@@ -1275,13 +1275,27 @@ impl<'a> MemView<'a> {
                         .and_then(OpenDescription::shared_alias_host_fd)
                         .is_some()
                 });
+            // A plain private anonymous mapping a delegated root can own
+            // itself; every other mapping is host-served on a delegated MM.
+            let root_eligible = map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && map_sharing == MmapSharing::Private
+                && !map_flags.intersects(
+                    LinuxMmapFlags::GROWSDOWN | LinuxMmapFlags::LOCKED | LinuxMmapFlags::DROPPABLE,
+                );
             let congruence = if file_lowering_eligible {
                 MmapGrantCongruence::for_file_offset(offset, page_size)
             } else {
                 MmapGrantCongruence::Any
             };
             let (address, reused) =
-                match this.next_mmap_address(requested.0, length, prot, flags, congruence) {
+                match this.next_mmap_address(
+                    requested.0,
+                    length,
+                    prot,
+                    flags,
+                    congruence,
+                    root_eligible,
+                )? {
                 Some(pair) => pair,
                 None => {
                     // A length that could not fit an EMPTY address space is a
@@ -2242,7 +2256,7 @@ impl<'a> MemView<'a> {
             Ok(DispatchOutcome::returned_u64(address)?)
         }
 
-        mm_mutation fn munmap(this, cx, address: GuestPtr, length: u64) {
+        mm_mutation fn munmap_served(this, cx, address: GuestPtr, length: u64) {
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();
@@ -2428,11 +2442,8 @@ impl<'a> MemView<'a> {
                     "overlay carve_source_range failed during anonymous arena munmap"
                 );
             }
-            if address.0.checked_add(aligned_len) == Some(mem.mmap_next) {
-                let mem = &mut *mem;
-                lower_mmap_next(&mut mem.mmap_next, &mut mem.free_regions, address.0);
-            } else {
-                free_regions_insert(&mut mem.free_regions, address.0, aligned_len);
+            if let Some(arena) = mem.host_arena_mut() {
+                arena.release(address.0, aligned_len);
             }
             drop(mem);
             if had_vma {
@@ -2441,7 +2452,7 @@ impl<'a> MemView<'a> {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        mm_mutation fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
+        mm_mutation fn mremap_served(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let memory = &mut *cx.memory;
@@ -2768,7 +2779,10 @@ impl<'a> MemView<'a> {
                         pf.bits(),
                         LINUX_MAP_FIXED,
                         MmapGrantCongruence::Any,
+                        false,
                     )
+                    .ok()
+                    .flatten()
                     .is_none()
                 {
                     return fail(
@@ -2808,15 +2822,8 @@ impl<'a> MemView<'a> {
                     if source_in_arena {
                         let mem_authority = this.mem();
                         let mut mem = mem_authority.lock();
-                        if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
-                            let mem = &mut *mem;
-                            lower_mmap_next(
-                                &mut mem.mmap_next,
-                                &mut mem.free_regions,
-                                old_address.0,
-                            );
-                        } else {
-                            free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
+                        if let Some(arena) = mem.host_arena_mut() {
+                            arena.release(old_address.0, old_size);
                         }
                     }
                 }
@@ -3428,11 +3435,8 @@ impl<'a> MemView<'a> {
                     this.remove_mapping_metadata(tail_start, tail_len);
                     let mem_authority_22 = this.mem();
                     let mut mem = mem_authority_22.lock();
-                    if tail_end == mem.mmap_next {
-                        let mem = &mut *mem;
-                        lower_mmap_next(&mut mem.mmap_next, &mut mem.free_regions, tail_start);
-                    } else {
-                        free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
+                    if let Some(arena) = mem.host_arena_mut() {
+                        arena.release(tail_start, tail_len);
                     }
                 }
                 this.record_remapped_dynamic_mapping(
@@ -3462,8 +3466,9 @@ impl<'a> MemView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 let old_end = old_address.0.saturating_add(old_size);
-                let can_extend_in_place = old_end == this.mem().lock().mmap_next
-                    && range_within(old_address.0, new_size, layout.mmap_base, layout.mmap_size);
+                let can_extend_in_place =
+                    range_within(old_address.0, new_size, layout.mmap_base, layout.mmap_size)
+                        && this.claim_arena_tail(old_end, new_end)?;
                 if !can_extend_in_place {
                     // Something already owns the space directly above, so this
                     // has to MOVE — which is what Linux does here too. Moving a
@@ -3476,7 +3481,8 @@ impl<'a> MemView<'a> {
                         LINUX_PROT_READ | LINUX_PROT_WRITE,
                         0,
                     MmapGrantCongruence::Any,
-                ) else {
+                    false,
+                )? else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     let (Ok(new_len), Ok(copy_len)) = (
@@ -3562,15 +3568,8 @@ impl<'a> MemView<'a> {
                         this.remove_mapping_metadata(old_address.0, old_size);
                         let mem_authority_23 = this.mem();
                         let mut mem = mem_authority_23.lock();
-                        if old_end == mem.mmap_next {
-                            let mem = &mut *mem;
-                            lower_mmap_next(
-                                &mut mem.mmap_next,
-                                &mut mem.free_regions,
-                                old_address.0,
-                            );
-                        } else {
-                            free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
+                        if let Some(arena) = mem.host_arena_mut() {
+                            arena.release(old_address.0, old_size);
                         }
                     }
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
@@ -3587,7 +3586,9 @@ impl<'a> MemView<'a> {
                 {
                     let mem_authority_24 = this.mem();
                     let mut mem = mem_authority_24.lock();
-                    mem.mmap_next = new_end;
+                    if let Some(arena) = mem.host_arena_mut() {
+                        arena.mmap_next = new_end;
+                    }
                 }
                 this.record_mmap_bus_fault_range(old_end, grow_len_u64);
                 this.record_remapped_dynamic_mapping(
@@ -3599,15 +3600,12 @@ impl<'a> MemView<'a> {
                 return Ok(DispatchOutcome::returned_ptr(old_address)?);
             }
             if !must_relocate
-                && old_address.0.checked_add(old_size) == Some(this.mem().lock().mmap_next)
+                && let Some(old_end) = old_address.0.checked_add(old_size)
+                && let Some(new_end) = old_address.0.checked_add(new_size)
+                && range_within(old_address.0, new_size, layout.mmap_base, layout.mmap_size)
+                && this.claim_arena_tail(old_end, new_end)?
             {
-                let Some(old_end) = old_address.0.checked_add(old_size) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                };
-                let Some(new_end) = old_address.0.checked_add(new_size) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                };
-                if range_within(old_address.0, new_size, layout.mmap_base, layout.mmap_size) {
+                {
                     // Re-validate the freshly-grown tail with the source VMA's
                     // exact protection and sharing. Sharing is published before
                     // execute permission, so an RX shared grow can never appear
@@ -3634,7 +3632,9 @@ impl<'a> MemView<'a> {
                     {
                         let mem_authority_25 = this.mem();
                         let mut mem = mem_authority_25.lock();
-                        mem.mmap_next = new_end;
+                        if let Some(arena) = mem.host_arena_mut() {
+                            arena.mmap_next = new_end;
+                        }
                         // The dirty high-water stays monotonic so a later
                         // munmap+rebump cannot expose bytes dirtied in this tail.
                         mem.mmap_writable_high = mem.mmap_writable_high.max(new_end);
@@ -3674,7 +3674,8 @@ impl<'a> MemView<'a> {
                     LINUX_PROT_READ | LINUX_PROT_WRITE,
                     LINUX_MAP_FIXED,
                     MmapGrantCongruence::Any,
-                ) {
+                    false,
+                )? {
                     // Treat a fixed destination as reused: it may carry a prior
                     // owner's bytes, and the copy below fills only `copy_len`.
                     Some((granted, _)) => (granted, true),
@@ -3687,7 +3688,8 @@ impl<'a> MemView<'a> {
                     LINUX_PROT_READ | LINUX_PROT_WRITE,
                     0,
                     MmapGrantCongruence::Any,
-                ) else {
+                    false,
+                )? else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 granted
@@ -3820,22 +3822,15 @@ impl<'a> MemView<'a> {
                     this.remove_mapping_metadata(old_address.0, old_size);
                     let mem_authority_26 = this.mem();
                     let mut mem = mem_authority_26.lock();
-                    if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
-                        let mem = &mut *mem;
-                        lower_mmap_next(
-                            &mut mem.mmap_next,
-                            &mut mem.free_regions,
-                            old_address.0,
-                        );
-                    } else {
-                        free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
+                    if let Some(arena) = mem.host_arena_mut() {
+                        arena.release(old_address.0, old_size);
                     }
                 }
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::returned_u64(new_addr)?)
         }
 
-        mm_mutation fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
+        mm_mutation fn mprotect_served(this, cx, address: GuestPtr, length: u64, prot: u64) {
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();

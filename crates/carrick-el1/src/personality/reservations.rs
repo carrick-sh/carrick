@@ -831,14 +831,15 @@ impl Reservations<'_> {
             self.table.release(node, self.banks);
         }
     }
-    pub fn mmap(
-        &mut self,
-        placement: Placement,
-        len: u64,
-        prot: ReservationProtection,
-    ) -> Result<Decision, Refusal> {
-        if self.pending().is_some() {
-            return Err(Refusal::Busy);
+    /// Where [`Self::mmap`] places `len` bytes, without proposing anything.
+    /// The host venue places the mappings it serves itself (file, shared,
+    /// attributed) here and commits them as opaque nodes, so both venues
+    /// share one placement answer. `Collision` is `MAP_FIXED_NOREPLACE`'s
+    /// EEXIST; `ForeignMapping` is a hint outside the layout (the host serves
+    /// it); `Limit` is no fitting arena gap.
+    pub fn place(&mut self, placement: Placement, len: u64) -> Result<ReservationRange, Refusal> {
+        if !self.state().admitted {
+            return Err(Refusal::Stale);
         }
         if len == 0
             || matches!(placement, Placement::Fixed(addr) | Placement::NoReplace(addr) if !addr.is_multiple_of(4096))
@@ -879,6 +880,48 @@ impl Reservations<'_> {
         {
             return Err(Refusal::Collision);
         }
+        Ok(range)
+    }
+    /// Visit the committed mappings overlapping `range` in address order:
+    /// one bounded descent per mapping, independent of the population
+    /// outside `range`.
+    pub fn observe_range(
+        &mut self,
+        range: ReservationRange,
+        visit: &mut dyn FnMut(Mapping),
+    ) -> Result<(), Refusal> {
+        if !self.is_admitted() {
+            return Err(Refusal::Stale);
+        }
+        let generation = self.generation();
+        let mut cursor = range.start();
+        while let Some(n) = self.next(cursor) {
+            if n.start >= range.end() {
+                break;
+            }
+            // Nodes are only constructed from validated ABI ranges/protections.
+            visit(Mapping {
+                range: ReservationRange::new(n.start, n.end).ok_or(Refusal::Invalid)?,
+                protection: n.protection(),
+                anonymous: n.flags().contains(ReservationNodeFlags::ANONYMOUS),
+                flags: n.flags(),
+                generation,
+            });
+            cursor = n.end;
+        }
+        Ok(())
+    }
+    pub fn mmap(
+        &mut self,
+        placement: Placement,
+        len: u64,
+        prot: ReservationProtection,
+    ) -> Result<Decision, Refusal> {
+        if self.pending().is_some() {
+            return Err(Refusal::Busy);
+        }
+        let range = self.place(placement, len)?;
+        let address = range.start();
         self.proposal(
             range,
             prot,
@@ -2205,6 +2248,49 @@ mod tests {
             "unknown mprotect prot bit"
         );
         assert!(g.pending().is_none());
+    }
+
+    #[test]
+    fn reservation_place_answers_like_mmap_without_proposing_and_ranges_are_bounded() {
+        let table = table();
+        let mm = ReservationMm::new(7).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut g = table.lock(0, mm).unwrap();
+        assert_eq!(g.place(Placement::Anywhere, 0x1000), Err(Refusal::Stale));
+        g.finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        let generation = g.generation();
+        let placed = g.place(Placement::Anywhere, 0x1800).unwrap();
+        assert_eq!(placed.len(), 0x2000, "page-rounded like mmap");
+        assert!(g.pending().is_none(), "placement proposes nothing");
+        assert_eq!(g.generation(), generation);
+        // The host commits its own mapping there as an opaque node; the next
+        // placement (either venue) goes around it.
+        g.insert_opaque(placed, rw, ReservationNodeFlags::PRIVATE)
+            .unwrap();
+        let d = g.mmap(Placement::Anywhere, 0x1000, rw).unwrap();
+        let Decision::Work(request) = d else {
+            panic!("expected work")
+        };
+        assert_eq!(request.range.start(), placed.end());
+        complete(&mut g, d);
+        assert_eq!(
+            g.place(Placement::NoReplace(placed.start()), 0x1000),
+            Err(Refusal::Collision)
+        );
+        let mut seen = Vec::new();
+        g.observe_range(
+            range(placed.start() + 0x1000, placed.end() + 0x1000),
+            &mut |mapping| seen.push((mapping.range, mapping.anonymous)),
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (placed, false),
+                (range(placed.end(), placed.end() + 0x1000), true)
+            ]
+        );
     }
 
     #[test]

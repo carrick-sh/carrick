@@ -1624,19 +1624,13 @@ impl<'a> FsView<'a> {
         // stale VMA metadata while a host replacement is installing.
         let mem_provider = || {
             let mem = self.mem_snapshot();
-            let mut address_space_regions = mem.address_space_regions.clone();
-            if !mem.dynamic_maps.is_empty() {
-                match &mut address_space_regions {
-                    Some(regions) => regions.extend(mem.dynamic_maps.clone()),
-                    None => address_space_regions = Some(mem.dynamic_maps.clone()),
-                }
-            }
+            let address_space_regions = mem.proc_regions();
             carrick_vfs::OpenContextMemorySnapshot {
                 auxv: std::borrow::Cow::Owned(mem.linux_auxv_image.clone()),
                 address_space_regions: address_space_regions.map(std::borrow::Cow::Owned),
                 locked_memory: std::borrow::Cow::Owned(mem.locked_ranges.clone()),
                 brk_current: mem.program_break(),
-                mmap_next: mem.mmap_next,
+                mmap_next: mem.arena_high_water(),
                 heap_base: mem.layout.heap_base,
             }
         };

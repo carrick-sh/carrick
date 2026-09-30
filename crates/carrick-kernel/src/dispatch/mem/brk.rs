@@ -1,66 +1,33 @@
 //! Program break (`brk`/`sbrk`) heap management.
 //!
-//! One owner answers for the break: [`BreakAuthority::HostSetup`] while the MM
-//! is set up by the host, [`BreakAuthority::Delegated`] once the MM's shared
-//! EL1 reservation root is admitted. A delegated break has no copy in
-//! `MemState`; host-forwarded `brk` then runs the root's own `brk` proposal and
-//! completes it after the same backend work the host-setup venue performs.
+//! One owner answers for the break (see [`super::anonymous`]): the host arena
+//! while the MM is set up by the host, the shared EL1 reservation root once the
+//! MM is delegated. A delegated break has no copy in `MemState`; host-forwarded
+//! `brk` then runs the root's own `brk` proposal and completes it after the
+//! same backend work the host-setup venue performs.
 //! Growing re-validates identity leaves as RW and publishes permissions;
 //! shrinking invalidates released pages and zeroes their raw backing so subsequent
 //! re-growth re-exposes clean zero-filled anonymous memory matching Linux semantics.
 
-use super::el1_reservations::DelegatedBreak;
+use super::anonymous::{AnonymousAuthority, complete_delegated};
+use super::el1_reservations::DelegatedRoot;
 use super::*;
 use carrick_el1::memory::reservations::{Decision, Refusal};
-use carrick_el1_abi::{ReservationBackingReceipt, ReservationCompletion, ReservationOperation};
+use carrick_el1_abi::ReservationOperation;
 use carrick_fatal::carrick_fatal;
 
+/// Host-setup heap rows follow the break; a delegated root owns its heap
+/// nodes itself.
 pub(in crate::dispatch) fn update_semantic_heap_pages(
     mem: &mut MemState,
     old_page_end: u64,
     new_page_end: u64,
 ) {
+    if mem.host_arena().is_none() {
+        return;
+    }
     mem.semantic_vmas
         .update_heap_pages(old_page_end, new_page_end);
-}
-
-/// The single owner of one MM's program break.
-#[derive(Clone)]
-pub(in crate::dispatch) enum BreakAuthority {
-    /// Host setup: `MemState` owns the break value.
-    HostSetup(u64),
-    /// The exact admitted reservation root owns the break; nothing here
-    /// carries a value a caller could consult instead. Constructed only by
-    /// root admission, which production still refuses until the remaining
-    /// anonymous facts leave `MemState` (the conformance fixture seals it).
-    #[cfg_attr(not(test), allow(dead_code))]
-    Delegated(DelegatedBreak),
-}
-
-impl BreakAuthority {
-    /// The break as its owner answers it. A delegated root that cannot be
-    /// observed is a broken ownership invariant (the MM mutation permit and
-    /// the host queue exclude every host-venue contender), never a reason to
-    /// answer from a stale host value.
-    pub(super) fn observe(&self) -> u64 {
-        match self {
-            Self::HostSetup(brk) => *brk,
-            Self::Delegated(root) => root
-                .with_root(|model| Ok(model.brk_current()))
-                .unwrap_or_else(|refusal| {
-                    carrick_fatal!(
-                        "dispatch::brk",
-                        "delegated program break is unobservable: {refusal:?}"
-                    )
-                }),
-        }
-    }
-
-    /// A fork child is a different MM whose own root is not admitted: it
-    /// inherits the break VALUE in host setup, never the parent's root.
-    pub(super) fn fork_private(&self) -> Self {
-        Self::HostSetup(self.observe())
-    }
 }
 
 /// A page-granular break move both venues back identically. `pending` is the
@@ -69,7 +36,7 @@ struct BreakMove {
     requested: u64,
     old_page_end: u64,
     new_page_end: u64,
-    pending: Option<(DelegatedBreak, carrick_el1_abi::ReservationRequest)>,
+    pending: Option<(DelegatedRoot, carrick_el1_abi::ReservationRequest)>,
 }
 
 impl<'a> MemView<'a> {
@@ -79,11 +46,15 @@ impl<'a> MemView<'a> {
             let mut host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             let mem_authority_13 = this.mem();
             let mut mem = mem_authority_13.lock();
-            let step = match mem.break_authority().clone() {
-                BreakAuthority::HostSetup(current) => {
+            let step = match mem.anonymous_authority() {
+                AnonymousAuthority::HostSetup(arena) => {
+                    let current = arena.brk;
                     this.plan_host_setup_brk(&mut mem, current, requested)
                 }
-                BreakAuthority::Delegated(root) => {
+                AnonymousAuthority::Delegated(_) => {
+                    let Some(root) = mem.delegated_root().cloned() else {
+                        return Err(DispatchError::ReservationAuthority(Refusal::Stale));
+                    };
                     this.plan_delegated_brk(&mem, root, requested)?
                 }
             };
@@ -142,10 +113,10 @@ impl<'a> MemView<'a> {
             update_semantic_heap_pages(&mut mem, old_page_end, new_page_end);
             let value = match pending {
                 None => {
-                    *mem.break_authority_mut() = BreakAuthority::HostSetup(requested);
+                    set_host_break(&mut mem, requested);
                     requested
                 }
-                Some((root, request)) => complete_delegated_brk(&root, request)?,
+                Some((root, request)) => complete_delegated(&root, request)?,
             };
             host_alias_dispatch.mark_vma_revision(mem_authority_13.revision_publisher());
             Ok(DispatchOutcome::returned_u64(value)?)
@@ -190,7 +161,7 @@ impl<'a> MemView<'a> {
         }
         if new_page_end == old_page_end {
             // Same-page movement: only update byte-precise break.
-            *mem.break_authority_mut() = BreakAuthority::HostSetup(requested);
+            set_host_break(mem, requested);
             return Err(BreakAnswer {
                 value: requested,
                 changed: requested != current,
@@ -205,22 +176,16 @@ impl<'a> MemView<'a> {
     }
 
     /// Delegated venue: the exact root decides, with the host's current
-    /// limits and the charges of everything the root does not model pushed
+    /// limits and the charges of everything the root does not hold pushed
     /// first. The root guard is released before any backend work.
     fn plan_delegated_brk(
         &self,
         mem: &MemState,
-        root: DelegatedBreak,
+        root: DelegatedRoot,
         requested: u64,
     ) -> Result<Result<BreakMove, BreakAnswer>, DispatchError> {
-        let (address_limit, data_limit) = self
-            .address_space_limits_apply(true)
-            .unwrap_or((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY));
-        let (external_address, external_data) = host_owned_charges(mem);
-        let (current, decision) = root
-            .with_root(|model| {
-                model.set_limits(address_limit, data_limit);
-                model.set_external_charges(external_address, external_data);
+        let (current, decision) = self
+            .with_charged_root(mem, &root, |model| {
                 let current = model.brk_current();
                 Ok((current, model.brk(requested)?))
             })
@@ -259,7 +224,7 @@ impl<'a> MemView<'a> {
     pub(in crate::dispatch) fn push_break_limits(&self) -> Result<(), DispatchError> {
         let authority = self.mem();
         let mem = authority.lock();
-        let BreakAuthority::Delegated(root) = mem.break_authority() else {
+        let Some(root) = mem.delegated_root() else {
             return Ok(());
         };
         let (address_limit, data_limit) = self
@@ -277,7 +242,7 @@ impl<'a> MemView<'a> {
     fn refuse_brk(
         &self,
         mem: &MemState,
-        pending: Option<(DelegatedBreak, carrick_el1_abi::ReservationRequest)>,
+        pending: Option<(DelegatedRoot, carrick_el1_abi::ReservationRequest)>,
     ) -> Result<DispatchOutcome, DispatchError> {
         if let Some((root, request)) = pending {
             root.with_root(|model| model.refuse(request))
@@ -293,30 +258,12 @@ struct BreakAnswer {
     changed: bool,
 }
 
-/// Commit the delegated proposal after its backend work.
-fn complete_delegated_brk(
-    root: &DelegatedBreak,
-    request: carrick_el1_abi::ReservationRequest,
-) -> Result<u64, DispatchError> {
-    // SAFETY: the caller holds this exact MM's mutation permit and the root
-    // still holds `request` pending (it excludes every other edit). The stage-1
-    // protection, MemoryProtections publication and, for a retire, the scrub
-    // of the released pages completed above. Heap backing is identity memory:
-    // no frame was granted to or returned from the inventory. The pending
-    // sequence names this substrate transaction.
-    let completion = unsafe {
-        ReservationCompletion::after_descriptor_and_backing_commit(
-            request,
-            ReservationBackingReceipt {
-                receipt: request.sequence.raw(),
-                granted_bytes: 0,
-                returned_bytes: 0,
-            },
-        )
+/// The host-setup break. Only the host-setup venue calls this, under the
+/// same `MemState` guard that matched the host-setup authority.
+fn set_host_break(mem: &mut MemState, requested: u64) {
+    if let Some(arena) = mem.host_arena_mut() {
+        arena.brk = requested;
     }
-    .ok_or(DispatchError::ReservationAuthority(Refusal::Invalid))?;
-    root.with_root(|model| model.complete(completion))
-        .map_err(DispatchError::ReservationAuthority)
 }
 
 #[cfg(test)]

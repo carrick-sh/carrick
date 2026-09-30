@@ -473,7 +473,7 @@ impl MmExecutorParticipation {
         self.authority.seal_reservation_provider();
         let (brk_current, mmap_next) = {
             let state = self.authority.mem.lock();
-            (state.program_break(), state.mmap_next)
+            (state.program_break(), state.arena_high_water())
         };
         // The publishing process's limits seed its root; `setrlimit` on the
         // process pushes later changes.
