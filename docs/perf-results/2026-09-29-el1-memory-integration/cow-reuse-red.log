@@ -1,0 +1,30 @@
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.76s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-e6b6b13f4777ae65)
+
+running 1 test
+
+thread 'vcpu_loop::memory::tests::frame_grant_inventory_receipt_is_exact_and_rollbackable_before_leaf_publication' (34726414) panicked at crates/carrick-runtime/src/vcpu_loop/memory.rs:3646:14:
+authenticate existing COW destination without a new grant: Custom { kind: Other, error: "frame authority cannot authenticate existing backing" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test vcpu_loop::memory::tests::frame_grant_inventory_receipt_is_exact_and_rollbackable_before_leaf_publication ... FAILED
+
+failures:
+
+failures:
+    vcpu_loop::memory::tests::frame_grant_inventory_receipt_is_exact_and_rollbackable_before_leaf_publication
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 648 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-runtime --lib`
