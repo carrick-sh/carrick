@@ -1122,6 +1122,65 @@ pub(in crate::dispatch) fn complete_delegated(
         .map_err(DispatchError::ReservationAuthority)
 }
 
+/// A root proposal held open across a runtime host-alias install. Commit
+/// replaces its range with the install's host-owned row; dropping it (the
+/// install failed or was abandoned) refuses the proposal, which leaves the
+/// root exactly as it was before the syscall: a proposal never changes the
+/// committed tree.
+pub(crate) struct RootAliasProposal {
+    root: DelegatedRoot,
+    request: ReservationRequest,
+    armed: bool,
+}
+
+impl RootAliasProposal {
+    fn new(root: DelegatedRoot, request: ReservationRequest) -> Self {
+        Self {
+            root,
+            request,
+            armed: true,
+        }
+    }
+
+    /// The install committed: the root replaces the range with one opaque,
+    /// host-owned node (the host rows are mirrored over it), from the
+    /// proposal's own spare nodes.
+    pub(in crate::dispatch) fn commit_host_owned(mut self) {
+        self.armed = false;
+        let request = self.request;
+        // SAFETY: the runtime installed the host alias backing and its
+        // protection for exactly this range under the same MM mutation
+        // guard that holds the proposal; no inventory frame was granted to
+        // or returned from the root's backing.
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        };
+        let Some(completion) = completion else {
+            broken_root("a host-alias completion receipt", Refusal::Invalid)
+        };
+        self.root
+            .with_root(|model| model.complete_host_owned(completion))
+            .unwrap_or_else(|refusal| broken_root("a host-alias install commit", refusal));
+    }
+}
+
+impl Drop for RootAliasProposal {
+    fn drop(&mut self) {
+        if self.armed {
+            // Stale only when the MM (and its root) already retired: there
+            // is nothing left to restore.
+            let _ = self.root.with_root(|model| model.refuse(self.request));
+        }
+    }
+}
+
 /// A page-granular edit range, or `None` when the syscall's own validation
 /// will refuse the arguments.
 fn edit_range(address: u64, length: u64, page_size: u64) -> Option<ReservationRange> {
@@ -1399,22 +1458,22 @@ impl MemView<'_> {
                     }
                     return Ok(());
                 }
+                if request.operation == ReservationOperation::Prepare
+                    && let Ok(DispatchOutcome::MapHostAlias { transaction, .. }) = outcome
+                {
+                    // The runtime installs this mapping after the syscall,
+                    // under the same MM mutation guard. The proposal stays
+                    // pending until then: the install commits it, a failed
+                    // install refuses it, and the root never holds anything
+                    // the install did not produce.
+                    drop(mem);
+                    if transaction.attach_root_proposal(RootAliasProposal::new(root, request)) {
+                        return Ok(());
+                    }
+                    return Err(DispatchError::ReservationAuthority(Refusal::Stale));
+                }
                 root.with_root(|model| model.refuse(request))
                     .map_err(DispatchError::ReservationAuthority)?;
-                if request.operation == ReservationOperation::Prepare
-                    && matches!(outcome, Ok(DispatchOutcome::MapHostAlias { .. }))
-                {
-                    // The runtime installs this mapping after the syscall;
-                    // its commit mirrors the host rows over this placeholder.
-                    root.with_root(|model| {
-                        model.insert_opaque(
-                            request.range,
-                            ReservationProtection::NONE,
-                            ReservationNodeFlags::EMPTY,
-                        )
-                    })
-                    .map_err(DispatchError::ReservationAuthority)?;
-                }
             }
             HostVenue::Reserved(range) => mem.mirror_host_rows(range.start(), range.end()),
         }

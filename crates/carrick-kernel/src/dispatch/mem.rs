@@ -62,6 +62,7 @@ pub(crate) mod madvise;
 pub(crate) mod vma;
 pub use self::vma::*;
 pub(crate) mod anonymous;
+pub(crate) use self::anonymous::RootAliasProposal;
 pub mod el1_reservations;
 mod host_first_touch;
 pub use host_first_touch::{HostFirstTouchDescriptorReceipt, HostFirstTouchIntent};

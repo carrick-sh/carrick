@@ -1418,6 +1418,29 @@ impl Reservations<'_> {
         }
     }
     pub fn complete(&mut self, completion: ReservationCompletion) -> Result<u64, Refusal> {
+        self.complete_as(completion, false)
+    }
+    /// Complete a pending `Prepare` whose memory the host venue ended up
+    /// serving itself (a host alias install): the range is replaced exactly
+    /// as the proposal said, but by one opaque, host-owned node the guest
+    /// venue never edits. Uses only the proposal's own spares.
+    pub fn complete_host_owned(
+        &mut self,
+        completion: ReservationCompletion,
+    ) -> Result<u64, Refusal> {
+        if self
+            .pending()
+            .is_none_or(|request| request.operation != ReservationOperation::Prepare)
+        {
+            return Err(Refusal::Invalid);
+        }
+        self.complete_as(completion, true)
+    }
+    fn complete_as(
+        &mut self,
+        completion: ReservationCompletion,
+        host_owned: bool,
+    ) -> Result<u64, Refusal> {
         let pending = self.state().pending.ok_or(Refusal::Stale)?;
         if !completion.authenticates(pending.request)
             || pending.request.mm != self.mm
@@ -1426,7 +1449,11 @@ impl Reservations<'_> {
             return Err(Refusal::Stale);
         }
         let range = pending.request.range;
-        let created_flags = ReservationNodeFlags::from_bits(pending.flags).ok_or(Refusal::Stale)?;
+        let mut created_flags =
+            ReservationNodeFlags::from_bits(pending.flags).ok_or(Refusal::Stale)?;
+        if host_owned {
+            created_flags = created_flags.difference(ReservationNodeFlags::ANONYMOUS);
+        }
         let creates = pending.request.operation != ReservationOperation::Retire;
         let mut spares = Spares(pending.nodes);
         // The pending proposal excluded every other edit, so these are the
