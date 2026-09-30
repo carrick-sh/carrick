@@ -954,6 +954,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn resource_growing_vm_creation_uses_global_permit() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         assert!(VmCreateAdmission::Initial.global_permit_budget().is_some());
         assert!(
             VmCreateAdmission::ExecveRebuild
@@ -964,6 +965,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn global_permit_budget_depends_on_admission_kind() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // Every gated class is now bounded by the measured system-wide vCPU
         // ceiling (GLOBAL_VCPU_CEILING), NOT the per-VM hv_vm_get_max_vcpu_count
         // the old cap of 12 was clamped from. The true hard limit is discovered
@@ -983,6 +985,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn permit_table_is_the_arena_permit_section() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         assert_eq!(
             std::mem::size_of::<SharedPermitTable>(),
             std::mem::size_of::<carrick_kernel_arena::arena::PermitSection>()
@@ -999,6 +1002,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn vm_residency_region_is_the_arena_vm_slots_section() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let arena = carrick_kernel_arena::arena::KernelArena::global();
         assert_eq!(
             vm_residency_region().table_addr_for_test(),
@@ -1013,6 +1017,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn vm_residency_record_release_roundtrip_on_test_region() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let region = PermitRegion::new_anon_for_test();
         let pid = std::process::id();
         let token = region
@@ -1038,6 +1043,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn no_resources_backpressure_recovers_after_transient() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // NoResources for the first two attempts, then success — the loop must
         // park+retry through them and return Ok, not propagate.
         let calls = Cell::new(0u32);
@@ -1061,6 +1067,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn no_resources_backpressure_bounds_out_when_host_is_full() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // Always NoResources: the loop must give up after ~max_wait and propagate
         // the error (never hang forever). A tiny max_wait keeps the test fast.
         let calls = Cell::new(0u32);
@@ -1090,6 +1097,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn no_resources_backpressure_never_parks_on_other_errors() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // A non-NoResources error is propagated immediately, with no retry.
         let calls = Cell::new(0u32);
         let out: Result<u64, TrapError> = create_with_no_resources_backpressure_bounded(
@@ -1111,6 +1119,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn global_permit_retries_back_off_to_cap() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mut backoff = GlobalVcpuPermitBackoff::default();
         let delays: Vec<_> = (0..8).map(|_| backoff.next_delay()).collect();
 
@@ -1131,6 +1140,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn mn_budget_uses_physical_cores_but_never_exceeds_hvf_cap() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // The hypervisor ceiling is the budget; the host's core count is not a
         // correctness bound on how many guest threads may be admitted.
         assert_eq!(vcpu_gate::budget_from_limits(60, 10), 60);
@@ -1148,6 +1158,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn acquire_cannot_leave_an_unowned_count() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let r = PermitRegion::new_anon_for_test();
         let t = r.acquire(4, std::process::id()).unwrap(); // slot published owned BEFORE any count-only state
         assert_eq!(r.occupied(), 1);
@@ -1158,6 +1169,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn vcpu_destroyed_of_unregistered_vcpu_does_not_release_a_permit() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let r = PermitRegion::new_anon_for_test();
         let t = r.acquire(4, std::process::id()).unwrap();
         r.register(100, t); // vcpu 100 holds the permit
@@ -1169,6 +1181,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn release_is_generation_checked() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let r = PermitRegion::new_anon_for_test();
         let t = r.acquire(4, std::process::id()).unwrap();
         r.register(1, t);
@@ -1184,6 +1197,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn cooperative_release_frees_owned_slots_and_is_idempotent() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let r = PermitRegion::new_anon_for_test();
         let pid = std::process::id();
         let t1 = r.acquire(4, pid).unwrap();
@@ -1205,6 +1219,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn cooperative_release_is_idempotent_with_vcpu_destroyed() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let r = PermitRegion::new_anon_for_test();
         let pid = std::process::id();
         let t1 = r.acquire(4, pid).unwrap();
@@ -1222,6 +1237,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn atomic_permit_enabled_from_env_defaults_to_atomic() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // The flip: atomic admission is the DEFAULT admission path.
         // Unset → enabled.
         assert!(atomic_permit_enabled_from_env(None));
@@ -1241,6 +1257,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn cooperative_release_atomic_permit_is_noop_on_flock_path() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // `CARRICK_HVF_ATOMIC_PERMIT=0` selects the legacy flock fallback...
         assert!(!atomic_permit_enabled_from_env(Some("0")));
         // ...on which `cooperative_release_atomic_permit` early-returns 0 without
@@ -1275,6 +1292,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn execve_rebuild_releases_pre_exec_permit_and_acquires_nothing_new() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let r = PermitRegion::new_anon_for_test();
         let pid = std::process::id();
 
@@ -1323,6 +1341,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn execve_rebuild_extra_release_would_be_a_harmless_but_pointless_noop() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // Guards the "do NOT add an explicit release" half of the premise: an
         // EXTRA release bolted onto execve_rebuild alongside the existing
         // vcpu_destroyed call would target a slot vcpu_destroyed already
@@ -1350,6 +1369,7 @@ mod vm_create_admission_tests {
 
     #[test]
     fn region_address_is_inherited_across_fork() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _fork_serial = crate::fork_test_lock();
         // The MAP_ANON|MAP_SHARED region must live at the same address in a fork
         // child AND expose the same physical slot table, so a child's acquire is
@@ -1395,6 +1415,7 @@ mod vm_create_admission_tests {
     /// tripwire, not a proof the ordering is correct.
     #[test]
     fn concurrent_acquire_never_over_admits_past_budget() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1493,6 +1514,7 @@ mod vcpu_lifetime_tests {
 
     #[test]
     fn vcpus_live_for_the_vm_lifetime() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         assert_eq!(
             sites(concat!("hv_vcpu_", "destroy(")),
             [("trap/vcpu_topology.rs".to_owned(), 1)],

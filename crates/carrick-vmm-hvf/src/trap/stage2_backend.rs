@@ -261,6 +261,7 @@ impl Drop for ScopedStage2MapTestStub {
 #[test]
 #[ignore = "negative control: scripts/test-signed.sh runs it on an UNENTITLED copy of this executable"]
 fn unsigned_executable_maps_hv_denied_to_entitlement() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let outcome = applevisor::vm::VirtualMachine::with_config(
         applevisor::vm::VirtualMachineConfig::default(),
     );
@@ -442,6 +443,7 @@ pub(crate) unsafe fn inventory_hv_vm_destroy() -> applevisor_sys::hv_return_t {
 #[cfg(test)]
 #[test]
 fn raw_hvf_stage2_calls_are_inventory_gated() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let source = concat!(
         include_str!("../trap.rs"),
         include_str!("stage2_backend.rs"),
@@ -473,6 +475,7 @@ fn raw_hvf_stage2_calls_are_inventory_gated() {
 #[cfg(test)]
 #[test]
 fn raw_vm_destroy_is_custody_transaction_gated() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let source = concat!(
         include_str!("../trap.rs"),
         include_str!("stage2_backend.rs"),
@@ -497,6 +500,7 @@ fn raw_vm_destroy_is_custody_transaction_gated() {
 #[cfg(test)]
 #[test]
 fn carrier_exit_without_a_vm_is_a_recorded_no_op() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     use carrick_observability::vm_lifecycle::{VmLifecycleOperation, process_snapshot};
     fn destroy_events() -> usize {
         process_snapshot()
@@ -1200,6 +1204,7 @@ mod tests {
 
     #[test]
     fn el1_stage1_table_backing_is_stage2_writable_but_not_guest_writable() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mapping = GuestMapping {
             guest_start: carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
             ipa_start: 0x8800_0000_0000,
@@ -1230,6 +1235,7 @@ mod tests {
 
     #[test]
     fn test_stage2_abort_classifier() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let el0_pstate = 0b0000;
         let el1_pstate = 0b0101; // EL1h
 
@@ -1275,6 +1281,7 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn stage2_map_refuses_the_gic_window() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     use carrick_mem::memory::{
         LINUX_GIC_DISTRIBUTOR_BASE, LINUX_GIC_REDISTRIBUTOR_BASE, LINUX_GIC_WINDOW_BASE,
         LINUX_GIC_WINDOW_SIZE,
@@ -1548,6 +1555,7 @@ mod ipc_window_tests {
 
     #[test]
     fn el1_ipc_window_maps_directory_and_pool_as_custody_records() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new_live_fixture();
         let mut calls = Vec::new();
         let installed = install_ipc_window_using(
@@ -1572,6 +1580,7 @@ mod ipc_window_tests {
 
     #[test]
     fn el1_ipc_window_refuses_bad_geometry_and_rolls_back_a_failed_map() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new_live_fixture();
         let wrong_pool =
             install_ipc_window_using(&custody, backing(0x10_0000), |_, _, _, _| 0, |_, _| Ok(()));
