@@ -5370,7 +5370,6 @@ mod tests {
 
     #[test]
     fn rt_sigsuspend_releases_dispatch_before_waiting() {
-        use std::time::Instant;
         const MASK_PTR: u64 = 0x1000;
         let d = SyscallDispatcher::new();
         let context = d.capture_one_task_context().unwrap();
@@ -5386,24 +5385,27 @@ mod tests {
         d.restore_signal_mask(&d.exact_signal_context_for_test(), tid, original);
         let ignored = d.wait_ignored_disposition_mask(&context);
 
-        let started = Instant::now();
-        let outcome = d
-            .dispatch_threaded(
+        // Structural proof that dispatch does not wait: with nothing pending
+        // and an empty wait set, the ONLY way `dispatch_threaded` can return
+        // is by handing the wait to the run loop as an owned continuation
+        // (`WaitOnSignals`, `timeout: None`). An in-dispatch park would never
+        // return here at all (no signal is ever sent), so this call returning
+        // is the assertion; no wall-clock bound is involved, so scheduler
+        // contention from parallel tests cannot flip the verdict.
+        let dispatch = |memory: &mut crate::dispatch::LinearMemory| {
+            d.dispatch_threaded(
                 &context,
                 SyscallRequest::new(
                     133,
                     SyscallArgs::from([MASK_PTR, LINUX_RT_SIGSET_SIZE, 0, 0, 0, 0]),
                 ),
-                &mut memory,
+                memory,
                 &reporter,
                 crate::dispatch::ThreadCtx::new(tid, &registry, &futex),
             )
-            .expect("dispatch rt_sigsuspend");
-
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "rt_sigsuspend must park outside dispatch"
-        );
+            .expect("dispatch rt_sigsuspend")
+        };
+        let outcome = dispatch(&mut memory);
         assert!(matches!(
             outcome,
             DispatchOutcome::WaitOnSignals {
@@ -5420,6 +5422,29 @@ mod tests {
         assert_eq!(
             context.thread().signal_state().armed_restore_mask(),
             Some(original)
+        );
+
+        // Dispatch retained no lock or memory borrow across the return: a
+        // sibling thread (the tgkill/tkill dispatcher this syscall must not
+        // starve) can publish the wake, and re-dispatching the continuation
+        // observes it and completes with EINTR rather than waiting again.
+        // `join` is unbounded; a retained lock would hang, not flake.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    d.mark_signal_pending(
+                        &d.exact_signal_context_for_test(),
+                        tid,
+                        crate::linux_abi::LINUX_SIGUSR1,
+                    );
+                })
+                .join()
+                .expect("sibling publishes wake");
+        });
+        assert_eq!(
+            dispatch(&mut memory),
+            DispatchOutcome::errno(LINUX_EINTR),
+            "redispatch after a sibling wake completes instead of waiting again"
         );
     }
 
