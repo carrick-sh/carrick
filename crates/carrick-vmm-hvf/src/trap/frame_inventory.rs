@@ -195,6 +195,63 @@ pub(crate) struct CowInventorySplit {
     pub(crate) retirement: CowInventoryRetirementDecision,
 }
 
+/// A stage-2 lease as one alias row names it: the physical extent and the
+/// exact global-owner incarnation the row was published under. Inventory
+/// retirement selects only extents of that incarnation. An IPA is recycled to
+/// a new owner once its lease retires, so a row that outlived its incarnation
+/// names the successor's lease by address alone; resolving it by address
+/// retired an unrelated live extent (a guest COW grant EL1 had just used, the
+/// `grant is not this MM's extent` fatal).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct AuthenticatedLease {
+    lease: (u64, u64),
+    owner_generation: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AuthenticatedLease {
+    /// The lease `alias` holds, under the incarnation it was published with.
+    pub(crate) fn of_alias(alias: &AliasBacking) -> Self {
+        Self {
+            lease: (alias.physical_ipa, alias.physical_size as u64),
+            owner_generation: alias.owner_generation,
+        }
+    }
+
+    /// A lease named directly by its owner incarnation.
+    #[cfg(test)]
+    pub(crate) const fn new(lease: (u64, u64), owner_generation: u64) -> Self {
+        Self {
+            lease,
+            owner_generation,
+        }
+    }
+
+    /// The physical `(stage-2 base, length)` key.
+    pub(crate) const fn lease(&self) -> (u64, u64) {
+        self.lease
+    }
+
+    /// Whether `extent` is the incarnation this lease names.
+    pub(crate) fn admits(&self, extent: &InventoryExtent) -> bool {
+        (extent.stage2_base, extent.stage2_length) == self.lease
+            && extent.stage2_owner.generation == self.owner_generation
+    }
+
+    /// The leases in `planned` that `rows` hold, each under every incarnation
+    /// a row names. A planned lease no row names retires nothing.
+    pub(crate) fn from_rows(
+        planned: &std::collections::BTreeSet<(u64, u64)>,
+        rows: &[AliasBacking],
+    ) -> std::collections::BTreeSet<Self> {
+        rows.iter()
+            .map(Self::of_alias)
+            .filter(|lease| planned.contains(&lease.lease))
+            .collect()
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct InventoryLeaseRetirement {
@@ -399,23 +456,28 @@ impl InventoryExtentMap {
         self.extents.get_key_value(&first?)
     }
 
+    /// The extents each lease holds under exactly the incarnation it names.
     pub(crate) fn for_leases(
         &self,
-        leases: &std::collections::BTreeSet<(u64, u64)>,
+        leases: &std::collections::BTreeSet<AuthenticatedLease>,
     ) -> Vec<((u64, u64), InventoryExtent)> {
         let mut mappings = Vec::new();
         for lease in leases {
-            if let Some(keys) = self.by_lease.get(lease) {
+            if let Some(keys) = self.by_lease.get(&lease.lease()) {
                 for key in keys {
                     note_hot_path_rows(HotPathScan::FrameExtents, 1);
-                    if let Some(&extent) = self.extents.get(key) {
+                    if let Some(&extent) = self.extents.get(key)
+                        && lease.admits(&extent)
+                    {
                         mappings.push((*key, extent));
                     }
                 }
             }
         }
         // Preserve the former BTreeMap iteration order for inventory events.
+        // Two rows naming one incarnation select its extents once.
         mappings.sort_unstable_by_key(|&(key, _)| key);
+        mappings.dedup_by_key(|&mut (key, _)| key);
         mappings
     }
 }
@@ -1482,7 +1544,7 @@ impl HvfVmState {
     /// frame, which is precisely what a forking guest does.
     pub(crate) fn inventory_lease_retirement_shape(
         inventory: &HvpatchFrameInventory,
-        leases: &std::collections::BTreeSet<(u64, u64)>,
+        leases: &std::collections::BTreeSet<AuthenticatedLease>,
         authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Result<Option<usize>, TrapError>,
     ) -> Result<InventoryLeaseRetirement, TrapError> {
         let mappings = inventory.extents.for_leases(leases);

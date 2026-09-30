@@ -1693,17 +1693,21 @@ impl HvfVmState {
                 "EL1 frame-grant retirement has no inventory authority".to_owned(),
             )
         })?;
-        let leases =
-            std::collections::BTreeSet::from([(alias.physical_ipa, alias.physical_size as u64)]);
+        let lease = AuthenticatedLease::of_alias(&alias);
+        let leases = std::collections::BTreeSet::from([lease.lease()]);
         let inventory = {
             let inventory = self.frame_inventory.lock();
-            Self::inventory_lease_retirement_shape(&inventory, &leases, &|frame| {
-                authority.frame_mapping_count(frame).map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "query EL1 frame-grant retirement mapping count: {error}"
-                    ))
-                })
-            })?
+            Self::inventory_lease_retirement_shape(
+                &inventory,
+                &std::collections::BTreeSet::from([lease]),
+                &|frame| {
+                    authority.frame_mapping_count(frame).map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "query EL1 frame-grant retirement mapping count: {error}"
+                        ))
+                    })
+                },
+            )?
         };
         if inventory.mappings.is_empty() {
             return Err(TrapError::Hypervisor(format!(
@@ -5749,7 +5753,13 @@ impl HvfVmState {
         } else {
             let retirement = {
                 let inventory = self.frame_inventory.lock();
-                Self::inventory_lease_retirement_shape(&inventory, &planned_leases, &|frame| {
+                // Each lease retires only the incarnation a retiring row was
+                // published under: a row that outlived its lease names a
+                // recycled IPA, and the address alone would retire its
+                // successor.
+                let authenticated =
+                    AuthenticatedLease::from_rows(&planned_leases, &registry_before);
+                Self::inventory_lease_retirement_shape(&inventory, &authenticated, &|frame| {
                     authority.frame_mapping_count(frame).map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "query alias-retirement frame mapping count: {error}"

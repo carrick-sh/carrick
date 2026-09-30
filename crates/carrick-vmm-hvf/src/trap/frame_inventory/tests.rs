@@ -171,7 +171,7 @@ fn lease_retirement_visits_only_the_selected_extents() {
         let before = hot_path_rows_scanned(HotPathScan::FrameExtents);
         let retirement = HvfVmState::inventory_lease_retirement_shape(
             &inventory,
-            &std::collections::BTreeSet::from([target]),
+            &std::collections::BTreeSet::from([AuthenticatedLease::new(target, 0)]),
             &|_| Ok(Some(1)),
         )
         .unwrap();
@@ -2300,6 +2300,79 @@ fn child_local_mapping_authenticates_through_its_own_raii_lease() {
     mapping.stage2_lease.as_mut().unwrap().active = false;
 }
 
+/// An alias row outlives its lease's incarnation when the IPA is retired
+/// elsewhere, and the IPA is then recycled to a new owner (under the guest
+/// descriptor lane: a guest COW grant provisioned for this MM and not yet
+/// settled, so it has no row of its own). An unmap over the stale row must
+/// retire nothing of the successor: a lease is authenticated by the exact
+/// owner incarnation the row was published under, never by address. Red on
+/// address resolution: the successor's extent is selected and retired, and
+/// EL1's completion later finds its grant gone (`grant is not this MM's
+/// extent`, `el1_sched_mm_occupancy_two_processes`).
+#[test]
+fn a_stale_alias_row_never_retires_the_recycled_lease_successor() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let lease = (0xa0c0_0000_0000, 0x4000);
+    let successor_frame = carrick_hal::FrameId::from_kernel_allocation(id(81));
+    let successor = InventoryExtent {
+        frame: successor_frame,
+        mapping: carrick_hal::MappingId::from_kernel_allocation(id(82)),
+        backing: InventoryBackingIdentity::Private(81),
+        stage2_base: lease.0,
+        stage2_length: lease.1,
+        stage2_owner: InventoryStage2OwnerIdentity {
+            host_addr: 0x7000_0000,
+            generation: 5169,
+        },
+    };
+    let mut inventory = HvpatchFrameInventory::default();
+    inventory.extents.insert(lease, successor);
+    {
+        let mut frames = inventory.frames.lock();
+        frames.references.insert(successor_frame, 1);
+        frames
+            .extent_references
+            .insert((successor_frame, lease.0, lease.1), 1);
+        frames.stage2_references.insert(lease, 1);
+    }
+    let row = |owner_generation| AliasBacking {
+        start: 0x6000_126c_000,
+        ipa: lease.0,
+        host_addr: 0x7000_0000,
+        size: 0x4000,
+        physical_ipa: lease.0,
+        physical_host_addr: 0x7000_0000,
+        physical_size: 0x4000,
+        perms: 3,
+        guest_writable: true,
+        sharing: GuestMappingSharing::Private,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(2)),
+        inventory_backing: InventoryBackingIdentity::Private(5190),
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation,
+    };
+    let planned = std::collections::BTreeSet::from([lease]);
+    let only_owner = |_frame| Ok(Some(1usize));
+
+    let stale = AuthenticatedLease::from_rows(&planned, &[row(5083)]);
+    let shape =
+        HvfVmState::inventory_lease_retirement_shape(&inventory, &stale, &only_owner).unwrap();
+    assert!(
+        shape.mappings.is_empty() && shape.frames.is_empty() && shape.stage2_leases.is_empty(),
+        "a row of retired incarnation 5083 retired the successor at the recycled IPA: {shape:?}"
+    );
+
+    let current = AuthenticatedLease::from_rows(&planned, &[row(5083), row(5169)]);
+    let shape =
+        HvfVmState::inventory_lease_retirement_shape(&inventory, &current, &only_owner).unwrap();
+    assert_eq!(shape.mappings, vec![(lease, successor)]);
+    assert_eq!(shape.stage2_leases, planned);
+
+    // A planned lease that no retiring row names retires nothing.
+    assert!(AuthenticatedLease::from_rows(&planned, &[]).is_empty());
+}
+
 #[test]
 fn lease_retirement_waits_for_the_last_global_stage2_reference() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
@@ -2331,7 +2404,7 @@ fn lease_retirement_waits_for_the_last_global_stage2_reference() {
             .insert((frame, lease.0 + 0x4000, 0x4000), 1);
         registry.stage2_references.insert(lease, 3);
     }
-    let leases = std::collections::BTreeSet::from([lease]);
+    let leases = std::collections::BTreeSet::from([AuthenticatedLease::new(lease, 0)]);
     let authority_agrees = |_frame| Ok(Some(2usize));
     let shared =
         HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &authority_agrees)
@@ -2351,7 +2424,10 @@ fn lease_retirement_waits_for_the_last_global_stage2_reference() {
         final_owner.frames,
         std::collections::BTreeSet::from([frame])
     );
-    assert_eq!(final_owner.stage2_leases, leases);
+    assert_eq!(
+        final_owner.stage2_leases,
+        std::collections::BTreeSet::from([lease])
+    );
 }
 
 // NEXT_TEST_PHYSICAL_IPA rehomed to trap.rs stub
@@ -4460,7 +4536,7 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
     let frames = std::sync::Arc::clone(&inventory.frames);
     let retirement = HvfVmState::inventory_lease_retirement_shape(
         &inventory,
-        &std::collections::BTreeSet::from([key]),
+        &std::collections::BTreeSet::from([AuthenticatedLease::new(key, 0)]),
         &|_| Ok(Some(2)),
     )
     .expect("plan alias retirement with an out-of-population Kernel mapping");
@@ -5102,7 +5178,7 @@ fn lease_retirement_defers_to_a_sibling_mm_still_mapping_the_frame() {
             .insert((frame, lease.0, 0x4000), 1);
         registry.stage2_references.insert(lease, 1);
     }
-    let leases = std::collections::BTreeSet::from([lease]);
+    let leases = std::collections::BTreeSet::from([AuthenticatedLease::new(lease, 0)]);
 
     // Two mms map the frame; this transaction unmaps one of them.
     let sibling_still_maps = |_frame| Ok(Some(2usize));
