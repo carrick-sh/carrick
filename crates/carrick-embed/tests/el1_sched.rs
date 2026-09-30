@@ -2935,6 +2935,270 @@ fn el1_anonymous_reservations_stay_in_guest() {
     }
 }
 
+/// Per-syscall served/forwarded counters for the delegated-root witnesses.
+const DELEGATED_SYSCALLS: [(&str, usize); 3] = [("mmap", 222), ("munmap", 215), ("mprotect", 226)];
+
+fn delegated_counters() -> [[u64; 2]; 3] {
+    read_el1_counters().map_or([[0; 2]; 3], |c| {
+        DELEGATED_SYSCALLS.map(|(_, nr)| {
+            [
+                c.served[nr].load(std::sync::atomic::Ordering::Relaxed),
+                c.forwarded[nr].load(std::sync::atomic::Ordering::Relaxed),
+            ]
+        })
+    })
+}
+
+/// Contract `kernel.el1.delegated-root-fork`: a delegated parent and its forked
+/// child concurrently `mmap`, `munmap` and `mprotect` their own address spaces
+/// (plus a pre-fork COW-shared region). Each process compares its own
+/// `/proc/self/maps` with the exact rows the operation sequence implies after
+/// every step, so a cross-MM row or a missing split is a mismatch.
+///
+/// Each round issues 2 mmap, 5 munmap and 2 mprotect per process. The target:
+/// EL1 serves all of them on both delegated MMs and forwards a count that does
+/// not grow with the rounds.
+///
+/// Expected RED until S3 lands: EL1 does not yet serve mmap/munmap/mprotect on
+/// a delegated (forked) MM, so the served lower bounds and the constant
+/// forwarded count fail while the semantic maps checks may already pass. Only a
+/// recorded signed run establishes the measured failure.
+#[test]
+fn el1_delegated_root_concurrent_vma_ops() {
+    const ROUNDS: [u64; 3] = [8, 32, 128];
+    const PER_ROUND: [u64; 3] = [2, 5, 2];
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for rounds in ROUNDS {
+        let before = delegated_counters();
+        let measured = run_fixture(
+            &carrier,
+            &["delegated-root-vma", &rounds.to_string()],
+            Duration::from_secs(120),
+        );
+        let after = delegated_counters();
+        let stdout = measured.result.stdout_utf8();
+        let mut served = [0u64; 3];
+        let mut forwarded = [0u64; 3];
+        for i in 0..3 {
+            served[i] = after[i][0].saturating_sub(before[i][0]);
+            forwarded[i] = after[i][1].saturating_sub(before[i][1]);
+        }
+        println!(
+            "el1-sched delegated-root-vma rounds={rounds} exits={} served[mmap,munmap,mprotect]={served:?} forwarded[mmap,munmap,mprotect]={forwarded:?} {}",
+            measured.exits,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        for role in ["parent", "child"] {
+            assert!(
+                stdout.contains(&format!("delegated-root-vma role={role} rounds={rounds} "))
+                    && stdout.contains("map_mismatches=0 semantic_failures=0 ok=true"),
+                "{role}: /proc/self/maps or isolation mismatch: {stdout:?}"
+            );
+        }
+        assert!(
+            stdout.contains(&format!(
+                "delegated-root-vma summary rounds={rounds} parent_ok=true child_ok=true"
+            )),
+            "delegated-root-vma summary failed: {stdout:?}"
+        );
+        for i in 0..3 {
+            let expected = 2 * PER_ROUND[i] * rounds;
+            assert!(
+                served[i] >= expected,
+                "EL1 must serve every delegated-MM {}: expected >= {expected} served, got {} (forwarded {})",
+                DELEGATED_SYSCALLS[i].0,
+                served[i],
+                forwarded[i]
+            );
+        }
+        runs.push((rounds, forwarded));
+    }
+    for pair in runs.windows(2) {
+        for i in 0..3 {
+            assert_eq!(
+                pair[1].1[i], pair[0].1[i],
+                "forwarded {} grew with rounds {}->{} ({} -> {}): per-call forwarding on a delegated MM",
+                DELEGATED_SYSCALLS[i].0, pair[0].0, pair[1].0, pair[0].1[i], pair[1].1[i]
+            );
+        }
+    }
+}
+
+/// Contract `kernel.el1.delegated-root-fork`: `MAP_FIXED` in the forked child
+/// over pages still COW-shared with the parent (one range untouched, one
+/// already COW-broken) leaves the parent's bytes intact, and a parent
+/// `MAP_FIXED` over a range the child still shares leaves the child's bytes
+/// intact. Each round performs 3 `MAP_FIXED` replacements plus the
+/// fixture's own setup.
+///
+/// Expected RED until S3 lands: `MAP_FIXED` over COW-shared pages on a
+/// delegated MM is not yet served by EL1, so the served lower bound and the
+/// constant forwarded-mmap count fail. The byte-integrity checks are the
+/// Linux semantics and may already pass.
+#[test]
+fn el1_delegated_root_map_fixed_over_cow_pages() {
+    const PAGES: u64 = 64;
+    const ROUNDS: [u64; 3] = [4, 16, 64];
+    const MMAP: usize = 222;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for rounds in ROUNDS {
+        let before = delegated_counters()[0];
+        let grants_before = carrick_embed::el1_frame_grant_stats();
+        let measured = run_fixture(
+            &carrier,
+            &[
+                "delegated-root-fixed-cow",
+                &PAGES.to_string(),
+                &rounds.to_string(),
+            ],
+            Duration::from_secs(120),
+        );
+        let after = delegated_counters()[0];
+        let grants_after = carrick_embed::el1_frame_grant_stats();
+        let served = after[0].saturating_sub(before[0]);
+        let forwarded = after[1].saturating_sub(before[1]);
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched delegated-root-fixed-cow pages={PAGES} rounds={rounds} exits={} served_mmap[{MMAP}]={served} forwarded_mmap={forwarded} grants={} returns={} {}",
+            measured.exits,
+            grants_after.grants_succeeded - grants_before.grants_succeeded,
+            grants_after.returns_completed - grants_before.returns_completed,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            stdout.contains(&format!(
+                "delegated-root-fixed-cow pages={PAGES} rounds={rounds} fixed_maps={} ok=true",
+                3 * rounds
+            )),
+            "MAP_FIXED over COW pages corrupted a peer or failed: {stdout:?}"
+        );
+        assert!(
+            served >= 3 * rounds,
+            "EL1 must serve every MAP_FIXED replacement on a delegated MM: expected >= {} served, got {served} (forwarded {forwarded})",
+            3 * rounds
+        );
+        runs.push((rounds, forwarded));
+    }
+    for pair in runs.windows(2) {
+        assert_eq!(
+            pair[1].1, pair[0].1,
+            "forwarded mmap grew with rounds {}->{} ({} -> {}): per-call forwarding over COW pages",
+            pair[0].0, pair[1].0, pair[0].1, pair[1].1
+        );
+    }
+}
+
+/// Deterministic fork, then a parent stage-1 pause that kicks every vCPU, then
+/// the child's first pipe read (the n=1 case where 511 of 512 slots were
+/// marked). Two intercepted `sched_yield` markers bracket that read in the
+/// child; the host's per-reason `host_work_publications` is sampled at each, so
+/// the printed delta is exactly the work published around the forwarded read
+/// (the two forwarded markers themselves are identical for every sample and
+/// are the instrument's perturbation).
+///
+/// Target asserted: a single forwarded read marks at most one slot and never
+/// broadcasts to all slots. The bound is the director's to tighten once the
+/// signed receipt names the exact per-reason delta.
+///
+/// Expected RED while the forwarded first read of a freshly forked child still
+/// publishes pending host work to every slot (`AllSlots` greater than zero).
+#[test]
+fn el1_delegated_root_kick_then_first_read_publications() {
+    use carrick_kernel::observe::{
+        InterceptAction, InterceptedSyscall, ProcessInfo, SyscallInterceptor,
+    };
+    use std::sync::{Arc, Mutex};
+
+    const BEFORE: u64 = 0x4b49_434b_0001;
+    const AFTER: u64 = 0x4b49_434b_0002;
+    type Counts = [u64; carrick_el1_abi::HostWorkPublishReason::COUNT];
+
+    #[derive(Default)]
+    struct Samples {
+        marks: Mutex<Vec<(u64, Counts)>>,
+    }
+    impl SyscallInterceptor for Samples {
+        fn intercept(
+            &self,
+            _process: &ProcessInfo<'_>,
+            call: &InterceptedSyscall<'_>,
+        ) -> InterceptAction {
+            if call.name() == "sched_yield" {
+                let marker = call.original_args().0[0];
+                if marker == BEFORE || marker == AFTER {
+                    self.marks
+                        .lock()
+                        .unwrap()
+                        .push((marker, carrick_el1_abi::host_work_publication_counts()));
+                }
+            }
+            InterceptAction::Continue
+        }
+    }
+
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(60));
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    for rounds in [1u64, 4] {
+        let samples = Arc::new(Samples::default());
+        let result = common::run_or_fail(
+            carrier
+                .container(common::SMOKE_IMAGE)
+                .pull_policy(PullPolicy::Missing)
+                .command([FIXTURE, "kick-first-read", &rounds.to_string()])
+                .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+                .interceptor(samples.clone())
+                .run_blocking(),
+        );
+        let stdout = result.stdout_utf8();
+        assert!(result.success(), "{stdout:?} {:?}", result.stderr_utf8());
+        assert!(
+            stdout.contains(&format!("kick-first-read rounds={rounds} ok=true")),
+            "kick-first-read failed: {stdout:?}"
+        );
+        let marks = samples.marks.lock().unwrap();
+        assert_eq!(
+            marks.len() as u64,
+            2 * rounds,
+            "expected one before/after marker pair per round: {marks:?}"
+        );
+        let mut failures = Vec::new();
+        for (round, pair) in marks.chunks(2).enumerate() {
+            assert_eq!(
+                (pair[0].0, pair[1].0),
+                (BEFORE, AFTER),
+                "marker order {marks:?}"
+            );
+            let delta: Counts = std::array::from_fn(|i| pair[1].1[i] - pair[0].1[i]);
+            use carrick_el1_abi::HostWorkPublishReason as R;
+            println!(
+                "el1-sched kick-first-read rounds={rounds} round={round} host_work_publications delta slot:{} all:{} task:{} file_table:{}",
+                delta[R::DirectSlot as usize],
+                delta[R::AllSlots as usize],
+                delta[R::ExactTask as usize],
+                delta[R::FileTable as usize],
+            );
+            if delta[R::AllSlots as usize] != 0 || delta.iter().sum::<u64>() > 1 {
+                failures.push(format!("round {round}: delta {delta:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "forwarded first read published pending host work beyond one slot: {}",
+            failures.join("; ")
+        );
+    }
+}
+
 /// Contract `kernel.el1.anonymous-retirement`: `madvise(MADV_DONTNEED)` and
 /// process exit without `munmap`, under a live fork peer, return every granted
 /// frame, keep the peer's memory intact and let returned frames be reused.

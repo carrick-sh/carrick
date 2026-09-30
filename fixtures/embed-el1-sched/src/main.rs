@@ -81,6 +81,10 @@
 //!   `madvise(MADV_DONTNEED)` and process termination without `munmap` under a
 //!   live fork peer, proving elastic frame return and zero-fill on reuse.
 //!
+//! - `delegated-root-vma <rounds>`, `delegated-root-fixed-cow <pages> <rounds>`,
+//!   `kick-first-read <rounds>` (EL1 stage S3): two-process delegated-root
+//!   witnesses, described in `delegated_root.rs`.
+//!
 //! - `fault-entry`: triggers a stage-1 permission fault on a PROT_READ mapping,
 //!   catches SIGSEGV with SA_SIGINFO, verifies si_addr, mprotects PROT_READ|PROT_WRITE,
 //!   retries store, and verifies store success and register preservation.
@@ -91,6 +95,7 @@
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+mod delegated_root;
 mod ipc;
 mod sample_buffer;
 use sample_buffer::measured_samples;
@@ -3091,6 +3096,16 @@ fn main() {
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
         ),
+        "delegated-root-vma" => {
+            delegated_root::concurrent_vma(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(16))
+        }
+        "delegated-root-fixed-cow" => delegated_root::fixed_over_cow(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(64),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(8),
+        ),
+        "kick-first-read" => {
+            delegated_root::kick_first_read(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(1))
+        }
         "fault-entry" => fault_entry_mode(),
         "metadata-allocator" => {
             metadata_allocator_mode(args.get(2).map(String::as_str).unwrap_or(""))

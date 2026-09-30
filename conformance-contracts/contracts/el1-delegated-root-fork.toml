@@ -1,0 +1,40 @@
+schema_version = 1
+id = "kernel.el1.delegated-root-fork"
+title = "Forked delegated address spaces are served at EL1 without cross-MM rows or COW corruption"
+guest_surfaces = [
+  "syscall:mmap",
+  "syscall:munmap",
+  "syscall:mprotect",
+  "syscall:clone",
+  "syscall:fork",
+  "fault:permission",
+  "kernel:stage1-mmu",
+  "kernel:frame-inventory",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 fork: the child receives a private copy of the parent's address space; later mappings and protection changes in one process do not appear in the other",
+  "man 2 mmap: MAP_FIXED discards any pages in the replaced range and MAP_ANONYMOUS pages read as zero; pages of the range outside it keep their contents",
+  "man 2 mprotect: changes the protection of the pages in the range, splitting mappings as needed",
+  "man 5 proc: /proc/[pid]/maps lists exactly the calling process's mappings, one row per contiguous region with its permissions",
+]
+fixture = "embed:el1-sched delegated-root-vma 8|32|128; embed:el1-sched delegated-root-fixed-cow 64 4|16|64"
+scale_points = [8, 32, 128]
+rationale = "After fork, EL1 serves mmap, munmap and mprotect for both the parent and the child through their delegated roots. The two-process witnesses prove the semantics the delegation must not change: (a) parent and child concurrently map, split, protect and unmap, and each process's own /proc/self/maps equals the exact rows the operation sequence implies after every step, with no row from the peer's mm and a byte-for-byte restore of the starting rows; both roles write distinct marks into a pre-fork COW-shared page and each sees only its own; (b) MAP_FIXED in the child over pages still COW-shared with the parent (one range untouched, one already COW-broken) leaves the parent's bytes intact, and a later parent MAP_FIXED over a range the child still shares leaves the child's bytes intact. The structural claim is the S3 migration target: the operations are served at EL1 (served mmap/munmap/mprotect at least the issued counts) and forwarded counts stay constant as the round count grows, rather than one host forward per call on a forked mm."
+
+[bindings]
+embed = "carrick-embed::el1_sched::{el1_delegated_root_concurrent_vma_ops,el1_delegated_root_map_fixed_over_cow_pages}"
+
+[bindings.unresolved]
+vm_free = "The maps-exactness and COW-isolation claims need live guest page tables and two live address spaces; VM-free dispatch tests cannot execute EL0 data aborts or concurrent vCPUs."
+docker = "The fixtures check the Linux results themselves (exact maps rows, byte patterns), but a same-source native arm64 Docker differential binding remains open."
+embed_structural = "Not yet a registered WorkObservation binding: the signed tests assert served mmap/munmap/mprotect >= issued counts and forwarded counts equal across rounds 8/32/128 (and 4/16/64 for MAP_FIXED) outside the contract evaluator. Expected RED until S3 serves these syscalls on delegated MMs."
+production = "Serve mmap, munmap, mprotect and MAP_FIXED replacement for a delegated (forked) MM at EL1, keeping COW-shared frames and the per-mm maps view exact."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 512
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "Forwarded mmap/munmap/mprotect do not grow with the rounds: each process issues 9 (vma witness) or 3 (MAP_FIXED witness) such calls per round and EL1 serves all of them on the delegated MM, so host dispatches are the fixture's start-up and per-process lifecycle population, constant across 8, 32 and 128 rounds. The base is a ceiling for that scaffolding including the /proc/self/maps reads; the embed tests assert equality of the forwarded counts per syscall across scales."

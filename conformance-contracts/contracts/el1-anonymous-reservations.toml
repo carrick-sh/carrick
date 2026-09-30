@@ -18,7 +18,6 @@ semantic_authority = [
 fixture = "embed:el1-sched anonymous-reservations 64|256|1024"
 scale_points = [64, 256, 1024]
 rationale = "EL1 increment 2 anonymous reservation checkpoint (TASK 1). Under the authoritative EL1 memory model, anonymous reservations (mmap and brk) are decided directly by EL1 without forwarding the system call to the host. The guest kernel maintains virtual memory area (VMA) tracking, address-space holes, placement, MAP_FIXED replacement, and byte-precise break growth and shrink. Memory pages are committed lazily on first touch via authenticated host bulk frame extents, rather than requiring synchronous host reservation RPCs. The signed three-scale witness verifies that anonymous mmap and brk calls are served directly in EL1 (served[222] and served[214]), that forwarded mmap/brk counts do not grow with the reservation count, and that host exits remain sublinear in the reservation count."
-structural_budgets = []
 
 [bindings]
 embed = "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest"
@@ -26,5 +25,22 @@ embed = "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest"
 [bindings.unresolved]
 vm_free = "VM-free dispatch tests verify reservation layout and break boundaries, but do not execute live EL1 trap frames or translation-table publication."
 docker = "Native arm64 Docker differential verification for multi-scale anonymous reservations; automated same-source binding remains open."
-embed_structural = "Assert guest-served mmap and brk counters cover every reservation, forwarded mmap/brk counts identical across 64, 256 and 1024 operations, and incremental host-exit slope < 0.125 exits per reservation."
+embed_structural = "Not yet a registered WorkObservation binding: the signed test (`el1_anonymous_reservations_stay_in_guest`) asserts, outside the contract evaluator, served mmap >= count, served brk >= 2, forwarded mmap/brk equal across scales and an exit slope below 0.125 exits per added reservation (a fractional per-unit slope is not expressible in the integer affine budget schema). Intent: assert guest-served mmap and brk counters cover every reservation, forwarded mmap/brk counts identical across 64, 256 and 1024 operations, and incremental host-exit slope < 0.125 exits per reservation."
 production = "Migrate production brk and mmap dispatch handlers from unconditional Forward to authoritative EL1 service backed by the shared reservation authority."
+
+# Declared from the assertions of `el1_anonymous_reservations_stay_in_guest`
+# (scales 64/256/1024): (1) served mmap[222] >= count and served brk[214] >= 2
+# per run; (2) forwarded mmap and brk counts identical at every scale; (3)
+# incremental host-exit slope < 0.125 exits per added reservation. The metric
+# vocabulary (`WorkMetric`) has no per-syscall served/forwarded counters and the
+# affine schema has integer `per_unit` only, so (1) and (3) stay asserted by the
+# embed test (`bindings.unresolved.embed_structural`); (2) is declared below as
+# its structural consequence: forwarded host dispatches do not grow with the
+# reservation count.
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 256
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "Forwarded mmap/brk do not grow with the number of reservations: every anonymous mmap (including MAP_FIXED) and the brk growth and shrink are served at EL1, so host dispatches are the fixture's fixed start-up population, identical at 64, 256 and 1024 reservations. The base is a ceiling for that scaffolding, not a per-reservation allowance; the embed test additionally asserts equality of the forwarded mmap[222] and brk[214] counts across scales."

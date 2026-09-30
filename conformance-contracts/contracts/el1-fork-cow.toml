@@ -17,7 +17,6 @@ semantic_authority = [
 fixture = "embed:el1-sched fork-cow 20 16|64|256"
 scale_points = [16, 64, 256]
 rationale = "EL1 increment 2 fork copy-on-write checkpoint (TASK 2 and TASK 3). Prior to this increment, write permission faults on COW pages trapped through HardwareCowResolver, which returned PermissionDenied and exited to the host carrier's cow_engine for physical allocation, host copying, stage-2 mapping and descriptor update. Under guest COW ownership, EL1 directly handles write permission faults on shared read-only private pages: it acquires a private frame from its pre-mapped pool, copies page contents in guest memory, updates the stage-1 leaf to read-write (AP_RW), issues an ASID-scoped TLBI, and resumes EL0 with zero host exits. Parent and child verify memory isolation across multiple worker threads. The signed witness verifies that the carrier-scoped host COW ledger (`carrick_embed::host_cow_snapshot`, completed host COW transactions of every MM the carrier admitted, including fork children) records none, that COW faults enter EL1, that frame grants balance returns, and that incremental host exits across scales remain below 0.125 exits per added COW page. Host fault exits are reported but are not host COW resolutions and are never used as that count."
-structural_budgets = []
 
 [bindings]
 embed = "carrick-embed::el1_sched::el1_fork_cow_resolves_in_guest"
@@ -25,5 +24,28 @@ embed = "carrick-embed::el1_sched::el1_fork_cow_resolves_in_guest"
 [bindings.unresolved]
 vm_free = "VM-free table manager tests verify descriptor transitions and rollback, but cannot execute EL0 data aborts or concurrent multi-vCPU COW races."
 docker = "Native arm64 Docker differential verification for the multi-worker fork-COW fixture across 16, 64, and 256 pages; automated same-source binding remains open."
-embed_structural = "Assert a zero carrier-scoped host COW resolution delta (with the ledger having admitted at least one MM per fork), guest fault entries covering the pages written, balanced frame accounting, and incremental exit slope < 0.125 exits per added page across scales."
+embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts, outside the contract evaluator, the absolute exit ceiling `exits <= forks*pages/4+64` and the incremental exit slope < 0.125 exits per added COW page (fractional, so not expressible as an integer affine budget). Intent: assert a zero carrier-scoped host COW resolution delta (with the ledger having admitted at least one MM per fork), guest fault entries covering the pages written, balanced frame accounting, and incremental exit slope < 0.125 exits per added page across scales."
 production = "Implement in-guest frame allocation, copy, and leaf upgrade in HardwareCowResolver, reducing the host cow_engine to background backing services."
+
+# Declared from `validate_el1_memory_cow_report` and the slope assertion of
+# `el1_fork_cow_resolves_in_guest` (20 forks; 16/64/256 pages). The absolute
+# ceiling `exits <= forks * pages / 4 + 64` stays exactly as the test asserts it
+# and is not restated here (its 1/4 per-page-per-fork coefficient is fractional).
+# The schema's integer `per_unit` cannot express the per-page slope
+# (< 0.125 exits per added COW page across scales), so that assertion stays in
+# the embed test (`bindings.unresolved.embed_structural`). Two integer-valued
+# budgets are declared in its place.
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 1024
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "Resolving a COW page costs no host dispatch: with 20 forks fixed, host dispatches are the per-round process-lifecycle population (fork, thread spawns, pipes, poll, wait) and do not grow with the page count 16/64/256. The base is a ceiling for that lifecycle scaffolding; per-page growth is zero."
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "hvf_syscall_exits"
+maximum = 64
+layers = ["embed-structural"]
+rationale = "Budget kernel.el1.fork-lifecycle-exits. Distinct from the per-page COW slope above: today the fixture's HVF exits are dominated by per-round process lifecycle (fork, 8 thread spawns, pipes, poll, wait), not by COW faults, so this stays RED until thread and process lifecycle is born in the zone. It is declared so that the lifecycle cost is named and cannot be hidden behind, or relaxed into, the COW ceiling `exits <= forks*pages/4+64` that the test still asserts unchanged. The fixed 64 matches that ceiling's constant term."
