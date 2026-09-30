@@ -787,6 +787,47 @@ impl<'a> IpcRegion<'a> {
         self.dir.objects.get(index as usize)
     }
 
+    /// For a wedge post-mortem: the owed-host-wake index as a host boundary
+    /// would take it, then one census line for every live object a host
+    /// party subscribes to (a host-blocked reader or writer, poll, epoll) or
+    /// is owed a wake on. A host-side waiter is invisible to the zone census
+    /// (it holds no zone record); this is where it shows. An owed wake that
+    /// is still indexed while every slot waits in the guest was published
+    /// and never delivered; a readable object with subscribers and nothing
+    /// owed was delivered and its waiter never ran. Read-only: each object
+    /// lock is taken only when free within a few spins.
+    pub fn write_host_wake_census(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        write!(
+            out,
+            "ipc host-wake index: summary={:#x}",
+            self.dir.host_wake_summary.load(Ordering::Acquire)
+        )?;
+        for (word, bits) in self.dir.host_wake_words.iter().enumerate() {
+            let bits = bits.load(Ordering::Acquire);
+            if bits != 0 {
+                write!(out, " word{word}={bits:#x}")?;
+            }
+        }
+        writeln!(out)?;
+        for (index, record) in self.dir.objects.iter().enumerate() {
+            if record.kind.load(Ordering::Acquire) == KIND_FREE {
+                continue;
+            }
+            let indexed = self.dir.host_wake_words[index / 64].load(Ordering::Acquire)
+                & (1 << (index % 64))
+                != 0;
+            if record.host_subscribers.load(Ordering::Acquire) == 0
+                && record.host_wake_owed.load(Ordering::Acquire) == 0
+                && !indexed
+            {
+                continue;
+            }
+            write!(out, "ipc object {index} (host, indexed={indexed}): ")?;
+            self.write_object_census(index as u32, out)?;
+        }
+        Ok(())
+    }
+
     /// One census line for the object at `index`, whatever its incarnation:
     /// kind, generation, readiness sequences, host subscribers and owed
     /// wake, and (only when its lock is free within a few spins) its pipe
