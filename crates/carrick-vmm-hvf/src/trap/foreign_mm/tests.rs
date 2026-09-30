@@ -1100,7 +1100,7 @@ impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
         .map_err(|error| format!("{error:?}"))?;
         let root = carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & 0x0000_FFFF_FFFF_F000);
         let mut applied = 0;
-        for slot in self.slots.submitted_for(mm_key) {
+        for slot in self.slots.submitted_in_order(mm_key) {
             let Some(claimed) = slot.claim_for_mm(mm_key) else {
                 continue;
             };
@@ -1133,7 +1133,7 @@ impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
                     execute_descriptor_txn(&words, root, txn, &mut InlineJournal::new()).outcome
                 }
             };
-            claimed.complete(outcome);
+            claimed.complete(outcome, || {});
             applied += 1;
         }
         Ok(applied)

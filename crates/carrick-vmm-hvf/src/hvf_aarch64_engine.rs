@@ -2204,6 +2204,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.prepare_el1_frame_grant(request)
     }
 
+    fn roll_back_el1_frame_grant(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, TrapError> {
+        self.state.roll_back_el1_frame_grant(grant)
+    }
+
     fn refresh_fork_process_state(
         &mut self,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,

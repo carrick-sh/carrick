@@ -289,6 +289,24 @@ impl Drop for GuestPreparedBacking {
     }
 }
 
+/// Whether the aliases overlapping a grant's span are exactly the one alias
+/// `prepare_el1_frame_grant` registered for it: same span, same semantic IPA,
+/// same stage-2 owner generation. A generation identifies one owner
+/// incarnation, so a successor at the same IPA never matches.
+fn is_exactly_el1_frame_grant(
+    aliases: &[(u64, AliasBacking)],
+    grant: carrick_hal::threaded::El1FrameGrantRollback,
+) -> bool {
+    matches!(
+        aliases,
+        [(_, alias)] if alias.start == grant.semantic_base
+            && alias.size as u64 == grant.len
+            && alias.ipa == grant.ready.physical_ipa
+            && alias.owner_generation == grant.ready.owner_generation
+            && alias.sharing == GuestMappingSharing::Private
+    )
+}
+
 #[derive(Clone, Copy)]
 enum AliasRetirementAuthorityState {
     Pending,
@@ -1437,6 +1455,51 @@ impl HvfVmState {
             },
         );
         Ok(Some(published.ready))
+    }
+
+    /// The single inverse of [`Self::prepare_el1_frame_grant`] for a grant
+    /// whose leaves EL1 never exposed (its receipt was refused or rolled
+    /// back, or it was never submitted). Retires exactly the grant's alias,
+    /// inventory mapping and stage-2 owner through the unmap retirement,
+    /// then returns the span to pristine zero. Leaving them registered kept
+    /// backing and a committed pristine transition for a span with no
+    /// descriptors. The caller holds the MM's mutation authority (as for an
+    /// unmap). `Ok(false)`: the span no longer holds exactly this grant's
+    /// backing, because a later unmap already retired it (and the span's
+    /// deferred state with it); nothing is changed.
+    pub(crate) fn roll_back_el1_frame_grant(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, TrapError> {
+        let identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("EL1 frame-grant rollback has no mm identity".to_owned())
+        })?;
+        if identity.mm != grant.mm_key {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 frame-grant rollback for mm {} on mm {}",
+                grant.mm_key, identity.mm
+            )));
+        }
+        let len = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
+        let aliases = alias_registry().lock().overlapping_process_aliases(
+            grant.semantic_base,
+            len,
+            self.mm_root_slot,
+            self.container_root,
+        );
+        if !is_exactly_el1_frame_grant(&aliases, grant) {
+            return Ok(false);
+        }
+        self.unregister_process_alias(grant.semantic_base, len)?;
+        let deferred = self.deferred_anonymous_state().ok_or_else(|| {
+            TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
+        })?;
+        deferred
+            .restore_pristine(carrick_guest_mem::GuestVa(grant.semantic_base), len)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("restore EL1 frame-grant pristine span: {error:?}"))
+            })?;
+        Ok(true)
     }
 
     pub(crate) fn materialize_sparse_mmap_extent_inner(
