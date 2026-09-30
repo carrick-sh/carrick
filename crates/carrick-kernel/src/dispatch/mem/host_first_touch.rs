@@ -232,6 +232,7 @@ mod tests {
                     pages: 1,
                     resident: span,
                     tables_linked: 0,
+                    reclaimed: ReclaimedTables::NONE,
                     live_stores: 1,
                     flush_required: true,
                 }),
