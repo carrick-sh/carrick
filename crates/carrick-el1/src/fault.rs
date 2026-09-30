@@ -529,7 +529,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
     };
     match (outcome, action) {
         (DrainOutcome::Blocked, Action::Served | Action::ServedWithWork) if is_syscall(frame) => {
-            Action::ServedWithWork
+            task.leave_served_with_work()
         }
         (DrainOutcome::Blocked, Action::Served) => Action::Forward,
         _ => action,
@@ -1671,6 +1671,42 @@ mod tests {
                 Action::Idle
             );
             assert!(writable(&arena));
+        }
+
+        /// A syscall EL1 already served (its effect taken: bytes read,
+        /// written or consumed) that must leave through the host because
+        /// the drain is blocked keeps its result only if the host is told
+        /// it was served. Without `served_with_work` the host dispatches
+        /// the call again from the frame, whose `x0` is now the result:
+        /// the read's bytes are lost and the result is read as an fd.
+        #[test]
+        fn a_blocked_drain_marks_a_served_syscall_served_for_the_host() {
+            let (_arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(0, &txn));
+            let closed = AddressSpaces::new();
+            closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
+            let mut applier = ArenaApplier {
+                arena: &_arena,
+                invalidated: RefCell::new(Vec::new()),
+            };
+            let tasks = [task(77)];
+            assert_eq!(
+                drain_before_el0(
+                    &frame(SVC),
+                    Action::Served,
+                    &tasks,
+                    &closed,
+                    &slots,
+                    &mut applier
+                ),
+                Action::ServedWithWork
+            );
+            assert_eq!(
+                tasks[0].served_with_work.load(Ordering::Acquire),
+                1,
+                "the host must complete, not re-dispatch, the served call"
+            );
         }
 
         #[test]
