@@ -1446,6 +1446,7 @@ impl HvfVmState {
             self.frame_inventory.shared_ledger(),
             cow_armed,
             cow_deferred_publications,
+            custody.host_cow_ledger.admit_mm(),
         );
         // Exec replaces the MM owner as well as its tables. Bind the successor
         // before the engine adopts it, or its retained resolver still authenticates

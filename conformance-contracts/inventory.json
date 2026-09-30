@@ -2947,6 +2947,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.el1.anonymous-reservations",
         "kernel.mm.backing-maintenance-lookup"
       ],
       "claims": [],
@@ -2989,6 +2990,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.el1.anonymous-reservations",
         "kernel.mm.backing-maintenance-lookup"
       ],
       "claims": [],
@@ -3046,6 +3048,7 @@
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
         "kernel.el1.files.cross-process-readers",
+        "kernel.el1.fork-cow",
         "kernel.el1.guest-run-queue",
         "kernel.fork.filetable",
         "kernel.fork.mappings",
@@ -3090,6 +3093,7 @@
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
         "kernel.el1.anonymous-permissions",
+        "kernel.el1.anonymous-reservations",
         "kernel.el1.anonymous-retirement",
         "kernel.el1.fault-entry",
         "kernel.el1.zone-entry-at-open",

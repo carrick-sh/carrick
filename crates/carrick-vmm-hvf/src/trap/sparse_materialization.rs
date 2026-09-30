@@ -1631,6 +1631,7 @@ mod arena_pin_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         );
 
         let resolver = state.pinned_stage1_arenas(&custody, base).unwrap();
@@ -1949,6 +1950,7 @@ mod arena_pin_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         );
         state.install_structural_owner(owner.clone());
         (state, custody, owner)
@@ -1984,6 +1986,7 @@ mod arena_pin_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         );
         state.install_structural_owner(owner);
         let wrong_custody = std::sync::Arc::new(CarrierVmCustody::new());

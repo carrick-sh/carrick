@@ -480,6 +480,8 @@ pub(crate) struct CarrierVmCustodyState {
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) struct CarrierVmCustody {
     pub(crate) el1_frame_grants: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
+    /// Host COW accounting for every MM admitted to this carrier.
+    pub(crate) host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
@@ -537,6 +539,7 @@ impl CarrierVmCustody {
             el1_frame_grants: std::sync::Arc::new(parking_lot::Mutex::new(
                 El1FrameGrantLedger::default(),
             )),
+            host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger::default(),
             metadata_aperture: parking_lot::Mutex::new(
                 crate::metadata_grant::HostApertureState::new(),
             ),
@@ -3669,6 +3672,7 @@ mod carrier_vm_custody_tests {
             )),
             std::sync::Arc::new(parking_lot::Mutex::new(super::CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         );
         mm_access.install_structural_owner(std::sync::Arc::clone(&owner));
         drop(owner);
@@ -3813,6 +3817,7 @@ mod carrier_vm_custody_tests {
             )),
             std::sync::Arc::new(parking_lot::Mutex::new(super::CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         );
         mm_access.install_structural_owner(std::sync::Arc::clone(&owner));
         drop(owner);

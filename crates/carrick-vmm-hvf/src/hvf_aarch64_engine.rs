@@ -34,10 +34,87 @@ use std::sync::Arc;
 
 /// Retain this handle at MM admission to measure completed host COW work even
 /// after that MM exits. Siblings share it; a fork child gets a separate handle.
-/// Runtime/embed must retain all admitted handles to aggregate a workload.
+/// A handle admitted through a [`HostCowLedger`] also credits that ledger, so a
+/// carrier-scoped observer aggregates every MM the carrier admitted.
 #[derive(Clone, Debug, Default)]
 pub struct HostCowStats {
     host_cow_resolutions: Arc<std::sync::atomic::AtomicU64>,
+    ledger: Option<HostCowLedger>,
+}
+
+#[derive(Debug, Default)]
+struct HostCowLedgerInner {
+    host_cow_resolutions: std::sync::atomic::AtomicU64,
+    admitted_mms: std::sync::atomic::AtomicU64,
+}
+
+/// Carrier-owned host COW accounting. Each carrier custody owns exactly one;
+/// it is neither static nor process-global, so a different carrier (or a
+/// detached test MM) can never credit it. Cloning shares the same ledger and
+/// keeps its counters readable after every admitted MM has retired.
+#[derive(Clone, Debug, Default)]
+pub struct HostCowLedger {
+    inner: Arc<HostCowLedgerInner>,
+}
+
+impl PartialEq for HostCowLedger {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+impl Eq for HostCowLedger {}
+
+/// One reading of a [`HostCowLedger`]. `complete == false` (no carrier) must
+/// be rejected by consumers, never read as zero.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostCowSnapshot {
+    pub scope: Option<HostCowLedger>,
+    pub complete: bool,
+    /// Completed host COW transactions credited by every admitted MM.
+    pub host_cow_resolutions: u64,
+    /// MMs admitted to the carrier; a delta of zero means the workload never
+    /// created an MM, so a zero resolution delta would prove nothing.
+    pub admitted_mms: u64,
+}
+
+impl HostCowSnapshot {
+    /// Difference two complete readings of the same carrier ledger.
+    pub fn checked_delta(&self, before: &Self) -> Option<Self> {
+        if !self.complete || !before.complete || self.scope.is_none() || self.scope != before.scope
+        {
+            return None;
+        }
+        Some(Self {
+            scope: self.scope.clone(),
+            complete: true,
+            host_cow_resolutions: self
+                .host_cow_resolutions
+                .checked_sub(before.host_cow_resolutions)?,
+            admitted_mms: self.admitted_mms.checked_sub(before.admitted_mms)?,
+        })
+    }
+}
+
+impl HostCowLedger {
+    pub fn snapshot(&self) -> HostCowSnapshot {
+        use std::sync::atomic::Ordering;
+        HostCowSnapshot {
+            scope: Some(self.clone()),
+            complete: true,
+            host_cow_resolutions: self.inner.host_cow_resolutions.load(Ordering::Relaxed),
+            admitted_mms: self.inner.admitted_mms.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Admit one MM: the returned handle credits this ledger.
+    pub(crate) fn admit_mm(&self) -> HostCowStats {
+        use std::sync::atomic::Ordering;
+        self.inner.admitted_mms.fetch_add(1, Ordering::Relaxed);
+        HostCowStats {
+            host_cow_resolutions: Arc::default(),
+            ledger: Some(self.clone()),
+        }
+    }
 }
 
 impl HostCowStats {
@@ -50,11 +127,18 @@ impl HostCowStats {
 
     pub(crate) fn record_host_cow_resolution(&self) {
         use std::sync::atomic::Ordering;
-        if self
-            .host_cow_resolutions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .is_err()
-        {
+        let bump = |n: u64| n.checked_add(1);
+        let own =
+            self.host_cow_resolutions
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, bump);
+        let ledger = self.ledger.as_ref().map_or(Ok(0), |ledger| {
+            ledger.inner.host_cow_resolutions.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                bump,
+            )
+        });
+        if own.is_err() || ledger.is_err() {
             carrick_fatal!(
                 "hvpatch::cow_accounting",
                 "host COW resolution counter overflow"

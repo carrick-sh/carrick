@@ -226,9 +226,10 @@ pub use prepare::{
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrick_vmm_hvf::{
-    El1FrameGrantStats, MetadataGrantStats, arm_deny_next_metadata_grant, el1_frame_grant_stats,
-    metadata_grant_stats, read_el1_counters, read_el1_region_host_ptr, reset_el1_counters,
-    reset_metadata_grant_state,
+    El1FrameGrantStats, HostCowLedger, HostCowSnapshot, MetadataGrantStats,
+    arm_deny_next_metadata_grant, el1_frame_grant_stats, host_cow_observe_current,
+    host_cow_snapshot, metadata_grant_stats, read_el1_counters, read_el1_region_host_ptr,
+    reset_el1_counters, reset_metadata_grant_state,
 };
 
 /// Carrier-wide count of vCPU exits to the host (every `hv_vcpu_run` return).
@@ -269,6 +270,28 @@ pub struct El1FrameGrantStats {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
     El1FrameGrantStats::default()
+}
+
+/// Non-HVF hosts have no carrier host-COW ledger; every reading is incomplete.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HostCowSnapshot {
+    pub complete: bool,
+    pub host_cow_resolutions: u64,
+    pub admitted_mms: u64,
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+impl HostCowSnapshot {
+    /// No ledger exists on this host, so no reading can be differenced.
+    pub fn checked_delta(&self, _before: &Self) -> Option<Self> {
+        None
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn host_cow_snapshot() -> HostCowSnapshot {
+    HostCowSnapshot::default()
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
