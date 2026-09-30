@@ -1,0 +1,30 @@
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.18s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-e6b6b13f4777ae65)
+
+running 10 tests
+test vcpu_loop::signal::guest_descriptor_lane_tests::the_lane_stays_unselected_until_every_writer_is_converted ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::fork_commit_and_syscall_entry_order_guest_descriptor_work ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::mm_bind_and_retirement_sites_select_and_withdraw_the_guest_lane ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::refused_or_indeterminate_guest_grants_never_commit_residency ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::the_fork_arm_lands_in_order_and_settles_before_the_fork_commits ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::prepared_copyout_publishes_only_its_page_through_the_guest_executor ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::guest_grant_retries_until_its_receipt_then_commits_exact_residency_once ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::a_fork_arm_on_the_wrong_vcpu_or_blocked_is_an_error_and_leaves_no_slot ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::a_retiring_mm_releases_exactly_its_slots_and_ledger_entries ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::prepared_copyout_refusal_preserves_the_leaf_and_releases_the_slot ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 639 filtered out; finished in 0.09s
+

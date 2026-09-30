@@ -440,6 +440,65 @@ impl<V: Aarch64Vmm> Aarch64TaskEngineState<V> {
     }
 }
 
+struct EngineStage1Services<'a, V: Aarch64Vmm> {
+    vcpu: &'a mut V::Vcpu,
+    tables: Stage1Authority,
+    slot: Option<usize>,
+    process_asid: Option<u16>,
+    carrier_root: Option<carrick_mem::memory::CarrierMaintenanceRoot>,
+}
+impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Services<'_, V> {
+    fn slot(&self) -> Option<usize> {
+        self.slot
+    }
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+        self.vcpu
+            .get_sys_reg(SysReg::Ttbr0)
+            .map_err(|error| TrapError::Hypervisor(format!("read COW TTBR0: {error}")))
+    }
+    fn drain_call(
+        &mut self,
+        frame: carrick_el1_abi::TrapFrame,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        crate::descriptor_drain::run_drain_call(frame, |entry, frame_va| {
+            run_el1_service_call_on::<V>(self.vcpu, entry, frame_va)
+        })
+    }
+    fn settle(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        self.tables
+            .settle_guest_descriptor_receipt(txn, receipt)
+            .map_err(|error| TrapError::Hypervisor(format!("settle COW descriptor: {error:?}")))
+    }
+}
+impl<V: Aarch64Vmm> crate::vmm::Stage1Services for EngineStage1Services<'_, V> {
+    fn flush(&mut self) -> Result<(), TrapError> {
+        Aarch64EngineCore::<V>::run_stage1_maintenance_on(
+            self.vcpu,
+            self.process_asid,
+            self.carrier_root,
+        )
+    }
+    fn guest_publication_available(&self) -> bool {
+        self.slot.is_some()
+    }
+    fn publish(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        let slots = carrick_el1_abi::descriptor_txn_slots_host()
+            .ok_or_else(|| TrapError::Hypervisor("COW descriptor slots absent".to_owned()))?;
+        crate::descriptor_drain::apply_guest_descriptor_txns_now(self, slots, &[*txn])?
+            .pop()
+            .ok_or_else(|| TrapError::Hypervisor("COW descriptor receipt absent".to_owned()))
+    }
+}
+
 impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// Borrow the VM-bearing backend while preparing a persistent executor
     /// factory. Task state extraction below remains the only consuming split.
@@ -1869,11 +1928,19 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         intent: FrameCowWriteIntent,
     ) -> Result<(), MemoryError> {
         self.ensure_sparse_mmap_backing(va, len)?;
+        let slot = self.mailbox_slot();
+        let tables = self.page_tables.clone();
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
+        let mut flush = EngineStage1Services::<V> {
+            vcpu,
+            tables,
+            slot,
+            process_asid,
+            carrier_root,
+        };
         vm.ensure_frame_cow_write(va, len, intent, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
     }
@@ -3766,12 +3833,21 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
+        let slot = self.mailbox_slot();
+        let tables = self.page_tables.clone();
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
+        let mut flush = EngineStage1Services::<V> {
+            vcpu,
+            tables,
+            slot,
+            process_asid,
+            carrier_root,
+        };
         vm.refresh_fork_process_state(&mut flush)?;
+        drop(flush);
         vm.refresh_vcpu_after_frame_cow(vcpu)
     }
 
@@ -3805,13 +3881,22 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             );
             carrick_observability::probes::pt_fault_ttbr(far, ttbr);
         }
+        let slot = self.mailbox_slot();
+        let tables = self.page_tables.clone();
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
+        let mut flush = EngineStage1Services::<V> {
+            vcpu,
+            tables,
+            slot,
+            process_asid,
+            carrier_root,
+        };
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
         let resolution = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
+        drop(flush);
         if matches!(resolution, carrick_hal::CowFaultResolution::Resolved { .. }) {
             vm.refresh_vcpu_after_frame_cow(vcpu)?;
             self.last_fault_esr = 0;

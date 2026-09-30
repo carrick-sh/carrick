@@ -174,6 +174,29 @@ pub struct Aarch64VcpuSnapshot {
     pub fpcr: u32,
 }
 
+/// The driving vCPU's maintenance and guest publication venue. Backing
+/// transactions retain their owners while invoking these synchronous steps.
+pub trait Stage1Services {
+    fn flush(&mut self) -> Result<(), TrapError>;
+    fn guest_publication_available(&self) -> bool {
+        false
+    }
+    fn publish(
+        &mut self,
+        _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        Err(TrapError::Hypervisor(
+            "guest descriptor publication has no driving vCPU".to_owned(),
+        ))
+    }
+}
+impl<F: FnMut() -> Result<(), TrapError>> Stage1Services for F {
+    fn flush(&mut self) -> Result<(), TrapError> {
+        self()
+    }
+}
+
 /// Per-vCPU register/run surface. The ONLY thing genuinely per-VMM on the vCPU
 /// side. HVF wraps `applevisor::Vcpu`; KVM wraps its `KvmVcpu` (which already
 /// provides every method body). Supersedes the bare
@@ -590,7 +613,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         &mut self,
         _va: u64,
         _len: usize,
-        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        _flush_stage1: &mut dyn Stage1Services,
     ) -> Result<(), TrapError> {
         Ok(())
     }
@@ -609,7 +632,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _fd: std::os::fd::BorrowedFd<'_>,
         _offset: u64,
         _source: carrick_guest_mem::PrivateFileSource,
-        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        _flush_stage1: &mut dyn Stage1Services,
     ) -> Result<bool, TrapError> {
         Ok(false)
     }
@@ -853,7 +876,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// exact MM/COW authority are live, but before the child enters guest code.
     fn refresh_fork_process_state(
         &mut self,
-        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        _flush_stage1: &mut dyn Stage1Services,
     ) -> Result<(), TrapError> {
         Ok(())
     }
@@ -863,7 +886,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _syndrome: u64,
         _far: u64,
         _ttbr0: u64,
-        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        _flush_stage1: &mut dyn Stage1Services,
     ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
         Ok(carrick_hal::CowFaultResolution::NotCow)
     }
@@ -880,7 +903,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _va: u64,
         _len: usize,
         _intent: FrameCowWriteIntent,
-        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        _flush_stage1: &mut dyn Stage1Services,
     ) -> Result<(), TrapError> {
         Ok(())
     }

@@ -248,26 +248,39 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
                 // the caller's exact-MM editor. Host custody retains both
                 // backing owners until this transaction's receipt settles.
                 let copied = if let DescriptorOp::CowRepoint {
-                    old_ipa, new_ipa, ..
+                    old_ipa,
+                    new_ipa,
+                    len,
+                    ..
                 } = txn.op
                 {
                     plan_descriptor_op(&words, root, txn.op)
                         .map_err(DescriptorOutcome::Refused)
                         .and_then(|_| {
-                            carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_copy_aliases(
-                                &words, root, carrick_el1_abi::EL1_COW_COPY_BASE,
-                                old_ipa, new_ipa, |source, destination| {
-                                    // SAFETY: the aliases expose exactly the pinned
-                                    // distinct source/destination pages, source RO,
-                                    // destination RW, both kernel-only. They are
-                                    // revoked before the copy result escapes.
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            source as *const u8, destination as *mut u8, 4096,
-                                        );
-                                    }
-                                },
-                            )
+                            use carrick_mmu_core::aarch64::SubstrateGpa;
+                            use carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_copy_aliases;
+                            for offset in (0..len).step_by(4096) {
+                                with_cow_copy_aliases(
+                                    &words,
+                                    root,
+                                    carrick_el1_abi::EL1_COW_COPY_BASE,
+                                    SubstrateGpa(old_ipa.raw() + offset),
+                                    SubstrateGpa(new_ipa.raw() + offset),
+                                    |source, destination| {
+                                        // SAFETY: aliases expose pinned, distinct
+                                        // pages: source RO, destination RW, both
+                                        // kernel-only; revoked before returning.
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(
+                                                source as *const u8,
+                                                destination as *mut u8,
+                                                4096,
+                                            );
+                                        }
+                                    },
+                                )?;
+                            }
+                            Ok(())
                         })
                 } else {
                     Ok(())
