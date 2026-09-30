@@ -1635,7 +1635,7 @@ impl<'a> FsView<'a> {
                 auxv: std::borrow::Cow::Owned(mem.linux_auxv_image.clone()),
                 address_space_regions: address_space_regions.map(std::borrow::Cow::Owned),
                 locked_memory: std::borrow::Cow::Owned(mem.locked_ranges.clone()),
-                brk_current: mem.brk_current(),
+                brk_current: mem.program_break(),
                 mmap_next: mem.mmap_next,
                 heap_base: mem.layout.heap_base,
             }

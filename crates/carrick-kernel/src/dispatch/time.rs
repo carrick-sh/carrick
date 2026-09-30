@@ -1105,6 +1105,15 @@ impl SyscallDispatcher {
                 let limit = LinuxRlimit::new(soft, rlim_max);
                 // Published on the TARGET task, which is the whole point.
                 let _ = target.replace_rlimit(resource, |_current| Ok::<_, ()>(limit));
+                if matches!(
+                    resource,
+                    carrick_abi::LinuxResource::As | carrick_abi::LinuxResource::Data
+                ) && Arc::ptr_eq(&target, cx.kernel.task())
+                {
+                    // The caller's own MM: a delegated break root decides
+                    // growth against these limits on either venue.
+                    this.mem_view().push_break_limits()?;
+                }
                 if resource == carrick_abi::LinuxResource::Fsize {
                     crate::el1_delegation::recall_all_delegated();
                 }

@@ -1678,7 +1678,7 @@ impl SyscallDispatcher {
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
         let layout = mem.layout;
-        let brk_current = mem.brk_current();
+        let brk_current = mem.program_break();
         let file_mappings = mem.core_file_mappings.clone();
         mem.seed_semantic_vmas(mem::semantic_vmas_from_boot_regions(
             &regions,
@@ -1693,7 +1693,7 @@ impl SyscallDispatcher {
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
         let layout = mem.layout;
-        let brk_current = mem.brk_current();
+        let brk_current = mem.program_break();
         if let Some(regions) = &mem.address_space_regions {
             let vmas =
                 mem::semantic_vmas_from_boot_regions(regions, &mappings, layout, brk_current);
@@ -1743,7 +1743,7 @@ impl SyscallDispatcher {
         let mut mem = authority.mem.lock();
         mem.reset_for_execve();
         let layout = mem.layout;
-        let brk_current = mem.brk_current();
+        let brk_current = mem.program_break();
         mem.seed_semantic_vmas(mem::semantic_vmas_from_boot_regions(
             &regions,
             &file_mappings,
@@ -3027,7 +3027,7 @@ impl SyscallDispatcher {
         let network_model = context.task().net_ns().view().as_ref().clone();
         after_proc_snapshot();
         let mem = self.mem_snapshot();
-        let brk_current = mem.brk_current();
+        let brk_current = mem.program_break();
         let mut address_space_regions = mem.address_space_regions;
         if !mem.dynamic_maps.is_empty() {
             match &mut address_space_regions {
