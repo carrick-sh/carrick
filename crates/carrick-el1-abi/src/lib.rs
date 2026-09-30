@@ -407,6 +407,32 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<FrameGrantResidencyTable>() as u64,
         core::mem::offset_of!(FrameGrantResidencyRecord, committed) as u64,
         EL1_ZONE_OFFSET,
+        carrick_sched_core::HOST_REQUEST_PROTOCOL,
+        carrick_sched_core::Claim::OnCpuRequested {
+            slot: SlotId::new(0),
+            seq: 0,
+        }
+        .encode(),
+        // Claim protocol semantics participate even when record layout is
+        // unchanged: older images must not decode a transfer as Free.
+        carrick_sched_core::Claim::Transferring {
+            seq: 0,
+            cancelled: false,
+            host_requested: false,
+        }
+        .encode(),
+        carrick_sched_core::Claim::Transferring {
+            seq: 0,
+            cancelled: false,
+            host_requested: true,
+        }
+        .encode(),
+        carrick_sched_core::Claim::Transferring {
+            seq: 0,
+            cancelled: true,
+            host_requested: false,
+        }
+        .encode(),
         core::mem::size_of::<ZoneTables>() as u64,
         core::mem::align_of::<ZoneTables>() as u64,
         core::mem::size_of::<ZoneRecord>() as u64,
@@ -2344,9 +2370,10 @@ pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
 pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 
 pub use carrick_sched_core::{
-    BoundedSpin, Claim, CurrentHandback, Exhausted, Handback, HostClaim, HostPlacement, LockWait,
-    ParkedContextRead, RecordId, RecordRef, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx,
-    ThreadIdentity, WakeEffects, WakeRefusal, Waker, ZONE_SLOTS, ZoneRecord, ZoneTables,
+    BoundedSpin, Claim, CurrentHandback, Exhausted, Handback, HostClaim, HostPlacement,
+    HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef, SlotDrain, SlotId, SlotState,
+    SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord, WakeRefusal, Waker, ZONE_SLOTS,
+    ZoneRecord, ZoneTables,
 };
 
 /// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex

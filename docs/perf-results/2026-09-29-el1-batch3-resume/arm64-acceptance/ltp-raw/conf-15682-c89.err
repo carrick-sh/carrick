@@ -1,0 +1,28 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_lseBXNof1 as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+lseek11.c:162: TINFO: The block size is 4096
+lseek11.c:210: TPASS: The 0th test passed: SEEK_DATA from startblock 0 offset 0
+lseek11.c:210: TPASS: The 1th test passed: SEEK_DATA from startblock 0 offset 4
+lseek11.c:210: TPASS: The 2th test passed: SEEK_HOLE from startblock 0 offset 0
+lseek11.c:210: TPASS: The 3th test passed: SEEK_HOLE from startblock 0 offset 4
+lseek11.c:210: TPASS: The 4th test passed: SEEK_HOLE from startblock 1 offset 0
+lseek11.c:210: TPASS: The 5th test passed: SEEK_HOLE from startblock 1 offset 128
+lseek11.c:210: TPASS: The 6th test passed: SEEK_DATA from startblock 1 offset 0
+lseek11.c:210: TPASS: The 7th test passed: SEEK_DATA from startblock 10 offset -1
+lseek11.c:210: TPASS: The 8th test passed: SEEK_DATA from startblock 10 offset 0
+lseek11.c:210: TPASS: The 9th test passed: SEEK_DATA from startblock 10 offset 4
+lseek11.c:210: TPASS: The 10th test passed: SEEK_HOLE from startblock 10 offset 0
+lseek11.c:210: TPASS: The 11th test passed: SEEK_HOLE from startblock 10 offset 4
+lseek11.c:210: TPASS: The 12th test passed: SEEK_HOLE from startblock 11 offset 128
+lseek11.c:210: TPASS: The 13th test passed: SEEK_DATA from startblock 11 offset 128
+lseek11.c:210: TPASS: The 14th test passed: SEEK_HOLE from startblock 30 offset -128
+
+Summary:
+passed   15
+failed   0
+broken   0
+skipped  0
+warnings 0

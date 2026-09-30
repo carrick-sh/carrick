@@ -1,0 +1,2 @@
+writev05    0  TINFO  :  Using /tmp/LTP_wriGtIKMw as tmpdir (overlayfs filesystem)
+writev05    1  TPASS  :  Received EFAULT as expected

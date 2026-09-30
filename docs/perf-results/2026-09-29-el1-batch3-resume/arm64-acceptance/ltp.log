@@ -1,0 +1,442 @@
+image-guard: localhost:5050/ltp:arm64 registry digest moved -> re-pulling carrick's copy
+image-guard: re-pulled 1 stale image(s)
+fail-fast: abort after more than 50 gating verdict(s) (use --force for exhaustive)
+phase 1/4: 216 carrick runs (workers=8, cpython-workers=4, fast-timeout=5s; cached slow rows get 2x oracle + 2s; hard-cap=None)
+  [carrick] ltp-creat01
+  [carrick] ltp-creat03
+  [carrick] ltp-close02
+  [carrick] ltp-close01
+  [carrick] ltp-creat04
+  [carrick] ltp-close_range01
+  [carrick] ltp-close_range02
+  [carrick] ltp-creat07
+  [carrick] ltp-creat06
+  [carrick] ltp-dup01
+  [carrick] ltp-creat08
+  [carrick] ltp-dup02
+  [carrick] ltp-creat09
+  [carrick] ltp-dup03
+  [carrick] ltp-dup05
+  [carrick] ltp-dup04
+  [carrick] ltp-dup202
+  [carrick] ltp-dup07
+  [carrick] ltp-dup201
+  [carrick] ltp-dup06
+  [carrick] ltp-dup203
+  [carrick] ltp-creat05
+  [carrick] ltp-dup204
+  [carrick] ltp-dup205
+  [carrick] ltp-dup3_01
+  [carrick] ltp-dup207
+  [carrick] ltp-dup206
+  [carrick] ltp-dup3_02
+  [carrick] ltp-fanotify01
+  [carrick] ltp-fanotify02
+  [carrick] ltp-fanotify03
+  [carrick] ltp-fanotify04
+  [carrick] ltp-fanotify06
+  [carrick] ltp-fanotify07
+  [carrick] ltp-fanotify08
+  [carrick] ltp-fanotify05
+  [carrick] ltp-fanotify09
+  [carrick] ltp-fanotify10
+  [carrick] ltp-fanotify11
+  [carrick] ltp-fanotify12
+  [carrick] ltp-fanotify13
+  [carrick] ltp-fanotify14
+  [carrick] ltp-fanotify15
+  [carrick] ltp-fanotify16
+  [carrick] ltp-fanotify17
+  [carrick] ltp-fanotify18
+  [carrick] ltp-fanotify19
+  [carrick] ltp-fanotify20
+  [carrick] ltp-fanotify21
+  [carrick] ltp-fanotify23
+  [carrick] ltp-fanotify22
+  [carrick] ltp-fanotify25
+  [carrick] ltp-fanotify24
+  [carrick] ltp-fstat02
+  [carrick] ltp-fstat02_64
+  [carrick] ltp-fstat03
+  [carrick] ltp-fstat03_64
+  [carrick] ltp-fstatat01
+  [carrick] ltp-fstatfs01
+  [carrick] ltp-fstatfs01_64
+  [carrick] ltp-fstatfs02
+  [carrick] ltp-fstatfs02_64
+  [carrick] ltp-fsync01
+  [carrick] ltp-fsync03
+  [carrick] ltp-ftruncate01
+  [carrick] ltp-fsync04
+  [carrick] ltp-ftruncate03
+  [carrick] ltp-ftruncate01_64
+  [carrick] ltp-ftruncate03_64
+  [carrick] ltp-fsync02
+  [carrick] ltp-ftruncate04
+  [carrick] ltp-ftruncate04_64
+  [carrick] ltp-inotify02
+  [carrick] ltp-inotify01
+  [carrick] ltp-inotify03
+  [carrick] ltp-inotify04
+  [carrick] ltp-inotify06
+  [carrick] ltp-inotify07
+  [carrick] ltp-inotify08
+  [carrick] ltp-inotify05
+  [carrick] ltp-inotify09
+  [carrick] ltp-inotify_init1_01
+  [carrick] ltp-lseek07
+  [carrick] ltp-lseek01
+  [carrick] ltp-inotify12
+  [carrick] ltp-lseek02
+  [carrick] ltp-inotify_init1_02
+  [carrick] ltp-inotify10
+  [carrick] ltp-open06
+  [carrick] ltp-lseek11
+  [carrick] ltp-open01
+  [carrick] ltp-open02
+  [carrick] ltp-open03
+  [carrick] ltp-open07
+  [carrick] ltp-open09
+  [carrick] ltp-open08
+  [carrick] ltp-open10
+  [carrick] ltp-open12
+  [carrick] ltp-open11
+  [carrick] ltp-open13
+  [carrick] ltp-open14
+  [carrick] ltp-open15
+  [carrick] ltp-open_by_handle_at01
+  [carrick] ltp-open_by_handle_at02
+  [carrick] ltp-open04
+  [carrick] ltp-open_tree01
+  [carrick] ltp-open_tree02
+  [carrick] ltp-openat01
+  [carrick] ltp-openat02
+  [carrick] ltp-inotify11
+  [carrick] ltp-openat03
+  [carrick] ltp-pread02
+  [carrick] ltp-pread01_64
+  [carrick] ltp-openat04
+  [carrick] ltp-openat202
+  [carrick] ltp-openat201
+  [carrick] ltp-openat203
+  [carrick] ltp-pread01
+  [carrick] ltp-pread02_64
+  [carrick] ltp-preadv01
+  [carrick] ltp-preadv02_64
+  [carrick] ltp-preadv03_64
+  [carrick] ltp-preadv03
+  [carrick] ltp-preadv01_64
+  [carrick] ltp-preadv201
+  [carrick] ltp-preadv201_64
+  [carrick] ltp-preadv02
+  [carrick] ltp-preadv202
+  [carrick] ltp-preadv203
+  [carrick] ltp-preadv202_64
+  [carrick] ltp-preadv203_64
+  [carrick] ltp-pwrite01
+  [carrick] ltp-pwrite01_64
+  [carrick] ltp-pwrite02
+  [carrick] ltp-pwrite02_64
+  [carrick] ltp-pwrite03
+  [carrick] ltp-pwrite03_64
+  [carrick] ltp-pwrite04
+  [carrick] ltp-pwrite04_64
+  [carrick] ltp-pwritev01
+  [carrick] ltp-pwritev02
+  [carrick] ltp-pwritev01_64
+  [carrick] ltp-pwritev02_64
+  [carrick] ltp-pwritev03
+  [carrick] ltp-pwritev201
+  [carrick] ltp-pwritev03_64
+  [carrick] ltp-pwritev201_64
+  [carrick] ltp-pwritev202_64
+  [carrick] ltp-read01
+  [carrick] ltp-pwritev202
+  [carrick] ltp-read02
+  [carrick] ltp-read03
+  [carrick] ltp-readahead01
+  [carrick] ltp-read04
+  [carrick] ltp-readahead02
+  [carrick] ltp-readlink01
+  [carrick] ltp-readdir21
+  [carrick] ltp-readdir01
+  [carrick] ltp-readlink03
+  [carrick] ltp-readlinkat01
+  [carrick] ltp-readlinkat02
+  [carrick] ltp-readv02
+  [carrick] ltp-stat02
+  [carrick] ltp-stat01_64
+  [carrick] ltp-readv01
+  [carrick] ltp-stat01
+  [carrick] ltp-stat02_64
+  [carrick] ltp-stat03
+  [carrick] ltp-stat03_64
+  [carrick] ltp-statfs01
+  [carrick] ltp-statfs02
+  [carrick] ltp-stat04_64
+  [carrick] ltp-stat04
+  [carrick] ltp-statfs01_64
+  [carrick] ltp-statfs02_64
+  [carrick] ltp-statfs03
+  [carrick] ltp-statfs03_64
+  [carrick] ltp-statmount01
+  [carrick] ltp-statmount04
+  [carrick] ltp-statmount02
+  [carrick] ltp-statmount03
+  [carrick] ltp-statmount05
+  [carrick] ltp-statmount06
+  [carrick] ltp-statmount07
+  [carrick] ltp-statmount08
+  [carrick] ltp-statmount09
+  [carrick] ltp-statvfs01
+  [carrick] ltp-statvfs02
+  [carrick] ltp-statx02
+  [carrick] ltp-statx01
+  [carrick] ltp-statx03
+  [carrick] ltp-statx04
+  [carrick] ltp-statx05
+  [carrick] ltp-statx06
+  [carrick] ltp-statx07
+  [carrick] ltp-statx08
+  [carrick] ltp-statx09
+  [carrick] ltp-statx10
+  [carrick] ltp-statx11
+  [carrick] ltp-statx12
+  [carrick] ltp-truncate02
+  [carrick] ltp-truncate02_64
+  [carrick] ltp-truncate03
+  [carrick] ltp-truncate03_64
+  [carrick] ltp-write02
+  [carrick] ltp-write01
+  [carrick] ltp-write03
+  [carrick] ltp-write04
+  [carrick] ltp-write05
+  [carrick] ltp-write06
+  [carrick] ltp-writev01
+  [carrick] ltp-writev02
+  [carrick] ltp-writev03
+  [carrick] ltp-writev05
+  [carrick] ltp-writev06
+  [carrick] ltp-writev07
+phase 2/4: 0 docker run(s), 216 cached oracle(s) (workers=8, cpython-workers=4)
+phase 3/4: classify
+
+=== summary ===
+  ok   MATCH          ltp-close01                              carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-close02                              carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-close_range01                        carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-close_range02                        carrick[11/11] oracle[11/11]
+  ok   MATCH          ltp-creat01                              carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-creat03                              carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-creat04                              carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-creat05                              carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-creat06                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-creat07                              carrick[Success] oracle[Success]
+  ok   MATCH          ltp-creat08                              carrick[9/9] oracle[9/9]
+  ok   MATCH          ltp-creat09                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-dup01                                carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-dup02                                carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-dup03                                carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-dup04                                carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-dup05                                carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-dup06                                carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-dup07                                carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-dup201                               carrick[4/4] oracle[4/4]
+  ok   MATCH          ltp-dup202                               carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-dup203                               carrick[4/4] oracle[4/4]
+  ok   MATCH          ltp-dup204                               carrick[4/4] oracle[4/4]
+  ok   MATCH          ltp-dup205                               carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-dup206                               carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-dup207                               carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-dup3_01                              carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-dup3_02                              carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-fanotify01                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify02                           carrick[8/8] oracle[8/8]
+  ok   MATCH          ltp-fanotify03                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify04                           carrick[9/9] oracle[9/9]
+  ok   MATCH          ltp-fanotify05                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify06                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify07                           carrick[Success] oracle[Success]
+  ok   MATCH          ltp-fanotify08                           carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-fanotify09                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify10                           carrick[Success] oracle[Success]
+  ok   MATCH          ltp-fanotify11                           carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-fanotify12                           carrick[10/10] oracle[10/10]
+  ok   MATCH          ltp-fanotify13                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify14                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify15                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify16                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify17                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify18                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify19                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify20                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify21                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify22                           carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fanotify23                           carrick[Success] oracle[Success]
+  ok   MATCH          ltp-fanotify24                           carrick[0/1] oracle[0/1]
+  ok   DIFF           ltp-fanotify25                           carrick[Success] oracle[1/1]
+  ok   MATCH          ltp-fstat02                              carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-fstat02_64                           carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-fstat03                              carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-fstat03_64                           carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-fstatat01                            carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-fstatfs01                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fstatfs01_64                         carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fstatfs02                            carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-fstatfs02_64                         carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-fsync01                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-fsync02                              carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-fsync03                              carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-fsync04                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-ftruncate01                          carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-ftruncate01_64                       carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-ftruncate03                          carrick[4/4] oracle[4/4]
+  ok   MATCH          ltp-ftruncate03_64                       carrick[4/4] oracle[4/4]
+  ok   MATCH          ltp-ftruncate04                          carrick[Success] oracle[Success]
+  ok   MATCH          ltp-ftruncate04_64                       carrick[Success] oracle[Success]
+  ok   MATCH          ltp-inotify01                            carrick[7/7] oracle[7/7]
+  ok   MATCH          ltp-inotify02                            carrick[9/9] oracle[9/9]
+  ok   MATCH          ltp-inotify03                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-inotify04                            carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-inotify05                            carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-inotify06                            carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-inotify07                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-inotify08                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-inotify09                            carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-inotify10                            carrick[10/10] oracle[10/10]
+  ok   MATCH          ltp-inotify11                            carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-inotify12                            carrick[9/9] oracle[9/9]
+  ok   MATCH          ltp-inotify_init1_01                     carrick[4/4] oracle[4/4]
+  ok   MATCH          ltp-inotify_init1_02                     carrick[4/4] oracle[4/4]
+  ok   MATCH          ltp-lseek01                              carrick[4/4] oracle[4/4]
+  ok   MATCH          ltp-lseek02                              carrick[15/15] oracle[15/15]
+  ok   MATCH          ltp-lseek07                              carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-lseek11                              carrick[15/15] oracle[15/15]
+  ok   MATCH          ltp-open01                               carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-open02                               carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-open03                               carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-open04                               carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-open06                               carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-open07                               carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-open08                               carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-open09                               carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-open10                               carrick[9/9] oracle[9/9]
+  ok   MATCH          ltp-open11                               carrick[28/28] oracle[28/28]
+  ok   MATCH          ltp-open12                               carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-open13                               carrick[14/14] oracle[14/14]
+  ok   MATCH          ltp-open14                               carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-open15                               carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-open_by_handle_at01                  carrick[0/13] oracle[0/13]
+  ok   MATCH          ltp-open_by_handle_at02                  carrick[0/6] oracle[0/6]
+  ok   MATCH          ltp-open_tree01                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-open_tree02                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-openat01                             carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-openat02                             carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-openat03                             carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-openat04                             carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-openat201                            carrick[16/16] oracle[16/16]
+  ok   MATCH          ltp-openat202                            carrick[9/9] oracle[9/9]
+  ok   MATCH          ltp-openat203                            carrick[9/9] oracle[9/9]
+  ok   MATCH          ltp-pread01                              carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-pread01_64                           carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-pread02                              carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-pread02_64                           carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-preadv01                             carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-preadv01_64                          carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-preadv02                             carrick[3/3] oracle[8/8]
+  ok   MATCH          ltp-preadv02_64                          carrick[3/3] oracle[8/8]
+  ok   MATCH          ltp-preadv03                             carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-preadv03_64                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-preadv201                            carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-preadv201_64                         carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-preadv202                            carrick[8/8] oracle[8/8]
+  ok   MATCH          ltp-preadv202_64                         carrick[8/8] oracle[8/8]
+  ok   MATCH          ltp-preadv203                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-preadv203_64                         carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-pwrite01                             carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-pwrite01_64                          carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-pwrite02                             carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-pwrite02_64                          carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-pwrite03                             carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-pwrite03_64                          carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-pwrite04                             carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-pwrite04_64                          carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-pwritev01                            carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-pwritev01_64                         carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-pwritev02                            carrick[7/7] oracle[7/7]
+  ok   MATCH          ltp-pwritev02_64                         carrick[7/7] oracle[7/7]
+  ok   MATCH          ltp-pwritev03                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-pwritev03_64                         carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-pwritev201                           carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-pwritev201_64                        carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-pwritev202                           carrick[7/7] oracle[7/7]
+  ok   MATCH          ltp-pwritev202_64                        carrick[7/7] oracle[7/7]
+  ok   MATCH          ltp-read01                               carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-read02                               carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-read03                               carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-read04                               carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-readahead01                          carrick[14/14] oracle[14/14]
+  ok   MATCH          ltp-readahead02                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-readdir01                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-readdir21                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-readlink01                           carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-readlink03                           carrick[8/8] oracle[8/8]
+  ok   MATCH          ltp-readlinkat01                         carrick[12/12] oracle[12/12]
+  ok   MATCH          ltp-readlinkat02                         carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-readv01                              carrick[10/10] oracle[10/10]
+  ok   MATCH          ltp-readv02                              carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-stat01                               carrick[12/12] oracle[12/12]
+  ok   MATCH          ltp-stat01_64                            carrick[12/12] oracle[12/12]
+  ok   MATCH          ltp-stat02                               carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-stat02_64                            carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-stat03                               carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-stat03_64                            carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-stat04                               carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-stat04_64                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statfs01                             carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statfs01_64                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statfs02                             carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-statfs02_64                          carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-statfs03                             carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-statfs03_64                          carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-statmount01                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statmount02                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statmount03                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statmount04                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statmount05                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statmount06                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statmount07                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statmount08                          carrick[Success] oracle[Success]
+  ok   MATCH          ltp-statmount09                          carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statvfs01                            carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statvfs02                            carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-statx01                              carrick[10/10] oracle[12/12]
+  ok   MATCH          ltp-statx02                              carrick[5/5] oracle[5/5]
+  ok   MATCH          ltp-statx03                              carrick[7/7] oracle[7/7]
+  ok   MATCH          ltp-statx04                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statx05                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statx06                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statx07                              carrick[Success] oracle[Success]
+  ok   MATCH          ltp-statx08                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statx09                              carrick[Success] oracle[Success]
+  ok   MATCH          ltp-statx10                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statx11                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-statx12                              carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-truncate02                           carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-truncate02_64                        carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-truncate03                           carrick[8/8] oracle[8/8]
+  ok   MATCH          ltp-truncate03_64                        carrick[8/8] oracle[8/8]
+  ok   MATCH          ltp-write01                              carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-write02                              carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-write03                              carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-write04                              carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-write05                              carrick[3/3] oracle[3/3]
+  ok   MATCH          ltp-write06                              carrick[2/2] oracle[2/2]
+  ok   MATCH          ltp-writev01                             carrick[6/6] oracle[6/6]
+  ok   MATCH          ltp-writev02                             carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-writev03                             carrick[0/1] oracle[0/1]
+  ok   MATCH          ltp-writev05                             carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-writev06                             carrick[1/1] oracle[1/1]
+  ok   MATCH          ltp-writev07                             carrick[8/8] oracle[8/8]
+
+OK: no regressions

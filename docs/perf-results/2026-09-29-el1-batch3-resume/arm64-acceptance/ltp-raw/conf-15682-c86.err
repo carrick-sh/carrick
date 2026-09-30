@@ -1,0 +1,16 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_lseE9RTJx as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+lseek01.c:67: TPASS: lseek(tfile, 4, SEEK_SET) read correct data
+lseek01.c:67: TPASS: lseek(tfile, -2, SEEK_CUR) read correct data
+lseek01.c:67: TPASS: lseek(tfile, -4, SEEK_END) read correct data
+lseek01.c:67: TPASS: lseek(tfile, 0, SEEK_END) read correct data
+
+Summary:
+passed   4
+failed   0
+broken   0
+skipped  0
+warnings 0

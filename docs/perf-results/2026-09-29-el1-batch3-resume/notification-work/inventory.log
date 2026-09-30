@@ -1,0 +1,5 @@
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-observability)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-conformance-contract)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.22s
+     Running `target/debug/generate-inventory --root .`
+inventory generated at ./conformance-contracts/inventory.json: 338 syscalls (246 bring-up, 90 deferred, 2 planned; 14 with claims, 324 without claims)

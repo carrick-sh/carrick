@@ -1,0 +1,28 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_fan36mhKp as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+fanotify12.c:140: TINFO: Test #0: inode mark, FAN_OPEN events
+fanotify12.c:205: TPASS: Received event: mask=20, pid=8, fd=4
+fanotify12.c:205: TPASS: Received event: mask=20, pid=8, fd=5
+fanotify12.c:140: TINFO: Test #1: inode mark, FAN_OPEN_EXEC events
+fanotify12.c:205: TPASS: Received event: mask=1000, pid=9, fd=4
+fanotify12.c:140: TINFO: Test #2: inode mark, FAN_OPEN | FAN_OPEN_EXEC events
+fanotify12.c:205: TPASS: Received event: mask=20, pid=10, fd=4
+fanotify12.c:205: TPASS: Received event: mask=1020, pid=10, fd=5
+fanotify12.c:140: TINFO: Test #3: inode mark, FAN_OPEN events, ignore FAN_OPEN_EXEC
+fanotify12.c:205: TPASS: Received event: mask=20, pid=11, fd=4
+fanotify12.c:205: TPASS: Received event: mask=20, pid=11, fd=5
+fanotify12.c:140: TINFO: Test #4: inode mark, FAN_OPEN_EXEC events, ignore FAN_OPEN
+fanotify12.c:205: TPASS: Received event: mask=1000, pid=12, fd=4
+fanotify12.c:140: TINFO: Test #5: inode mark, FAN_OPEN | FAN_OPEN_EXEC events, ignore FAN_OPEN_EXEC
+fanotify12.c:205: TPASS: Received event: mask=20, pid=13, fd=4
+fanotify12.c:205: TPASS: Received event: mask=20, pid=13, fd=5
+
+Summary:
+passed   10
+failed   0
+broken   0
+skipped  0
+warnings 0

@@ -1,0 +1,18 @@
+fail-fast: abort after more than 50 gating verdict(s) (use --force for exhaustive)
+phase 1/4: 8 carrick runs (workers=8, cpython-workers=4, fast-timeout=5s; cached slow rows get 2x oracle + 2s; hard-cap=None)
+  [carrick] cpython-mmap
+  [deadline] conf-18491-c01 cut off at 5s (diagnostic, origin=Fast, declared=300s);          stdout=894B stderr=0B last-growth=2031ms
+  [deadline] conf-18491-c00 cut off at 5s (diagnostic, origin=Fast, declared=600s);          stdout=10883B stderr=0B last-growth=0ms
+  [deadline] conf-18491-c03 cut off at 5s (diagnostic, origin=Fast, declared=600s);          stdout=3089B stderr=0B last-growth=202ms
+  [carrick] cpython-fork1
+  [carrick] cpython-concurrent_futures
+  [carrick] cpython-multiprocessing_fork
+  [deadline] conf-18491-c04 cut off at 5s (diagnostic, origin=Fast, declared=300s);          stdout=6237B stderr=0B last-growth=210ms
+  [carrick] cpython-subprocess
+  [deadline] conf-18491-c05 cut off at 5s (diagnostic, origin=Fast, declared=300s);          stdout=6469B stderr=0B last-growth=0ms
+  [deadline] conf-18491-c06 cut off at 5s (diagnostic, origin=Fast, declared=300s);          stdout=561B stderr=0B last-growth=2276ms
+  [deadline] conf-18491-c07 cut off at 5s (diagnostic, origin=Fast, declared=300s);          stdout=561B stderr=0B last-growth=2295ms
+  [carrick] cpython-wait4
+  [carrick] cpython-threading
+  [carrick] cpython-wait3
+phase 1b/4: serial confirmation — 7 row(s), pool 900s (workers=1, declared budgets)

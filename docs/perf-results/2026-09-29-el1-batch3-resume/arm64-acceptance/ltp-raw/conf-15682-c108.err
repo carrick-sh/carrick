@@ -1,0 +1,17 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_opeTYtSI3 as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+openat01.c:69: TPASS: openat(*tc->dir_fd, tc->pathname, O_RDWR, 0600) returned fd 5
+openat01.c:69: TPASS: openat(*tc->dir_fd, tc->pathname, O_RDWR, 0600) returned fd 5
+openat01.c:62: TPASS: openat with a filefd instead of dirfd : ENOTDIR (20)
+openat01.c:65: TPASS: openat with invalid fd : EBADF (9)
+openat01.c:69: TPASS: openat(*tc->dir_fd, tc->pathname, O_RDWR, 0600) returned fd 5
+
+Summary:
+passed   5
+failed   0
+broken   0
+skipped  0
+warnings 0

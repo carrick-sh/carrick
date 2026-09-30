@@ -59,6 +59,37 @@ class CheckContractChangeTest(unittest.TestCase):
         cmd = [sys.executable, str(SCRIPT_PATH), "--root", str(self.repo), "--base", base, "--head", head]
         return subprocess.run(cmd, cwd=self.repo, capture_output=True, text=True)
 
+    def use_single_contract_surface(self):
+        (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
+            '[[surfaces]]\n'
+            'path = "crates/carrick-kernel/src/dispatch/futex.rs"\n'
+            'contracts = ["kernel.futex.contention"]\n'
+        )
+
+    def test_descriptor_with_unrelated_filename_is_evidence(self):
+        self.use_single_contract_surface()
+        directory = self.repo / "conformance-contracts" / "contracts"
+        descriptor = directory / "reviewed-contract.toml"
+        (directory / "futex-contention.toml").rename(descriptor)
+        descriptor.write_text(descriptor.read_text() + "\n# reviewed evidence update\n")
+        self.guest_file.write_text("// changed futex implementation\n")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "update declared contract"], cwd=self.repo, check=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_lookalike_filename_is_not_contract_evidence(self):
+        self.use_single_contract_surface()
+        self.guest_file.write_text("// changed futex implementation\n")
+        lookalike = self.repo / "docs" / "contention.toml"
+        lookalike.parent.mkdir()
+        lookalike.write_text("# unrelated document\n")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "unrelated lookalike"], cwd=self.repo, check=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("kernel.futex.contention", result.stderr)
+
     def test_1_modified_guest_file_without_evidence_exits_1(self):
         self.guest_file.write_text("// modified futex implementation\n", encoding="utf-8")
         subprocess.run(["git", "commit", "-am", "modify guest file"], cwd=self.repo, check=True)

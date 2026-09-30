@@ -10,7 +10,7 @@ scale_points = [1, 8, 32, 128]
 rationale = "No idle periodic work or uncontended fairness exits; deadlines and notifications scale with active demand, not parked population."
 
 [bindings]
-vm_free = "carrick-kernel-example::scheduler_cost_contract"
+vm_free = "carrick-kernel-example::scheduler_cost_contract; carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation,zone_handback_before_registration_kicks_the_running_owner_once} (zone delivery target authentication, retired no-op, and one kick/zero queue rows before enrollment; no new preemption-policy or runtime-cost acceptance); carrick-kernel::kernel::scheduler::tests::serial_host::failed_zone_load_settlement_retires_only_its_owned_continuation (test-only extension: exact continuation transfer and failed-load retirement, zero queued rows after failure/stale delivery; no new preemption, scaling or runtime-ratio acceptance)"
 embed = "carrick-embed::scheduler_cost_contract"
 docker = "fixture:scheduler_preemption"
 ecosystem = ["go:runtime"]

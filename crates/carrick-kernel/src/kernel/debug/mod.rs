@@ -693,6 +693,7 @@ mod tests {
             snapshot_schema_version: crate::kernel::snapshot::KERNEL_SNAPSHOT_V1_SCHEMA,
             registry_epoch: 0,
             provider_absent: None,
+            findings: Vec::new(),
             tasks: None,
             zombies: None,
             threads: None,

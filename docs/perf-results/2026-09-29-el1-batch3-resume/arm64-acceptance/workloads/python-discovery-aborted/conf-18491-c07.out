@@ -1,0 +1,13 @@
+== CPython 3.12.13 (main, Aug 5 2026, 03:49:12) [GCC 14.2.0]
+== Linux-6.12.0-carrick-aarch64-with-glibc2.41 little-endian
+== Python build: release shared LTO+PGO
+== cwd: /tmp/test_python_worker_1æ
+== CPU count: 4
+== encodings: locale=UTF-8 FS=utf-8
+== resources: all test resources are disabled, use -u option to unskip tests
+
+Using random seed: 0
+0:00:00 load avg: 0.00 Run 1 test sequentially in a single process
+0:00:00 load avg: 0.00 [1/1] test_wait4
+test_wait (test.fork_wait.ForkWait.test_wait) ... ok
+test_wait (test.test_wait4.Wait4Test.test_wait) ... 

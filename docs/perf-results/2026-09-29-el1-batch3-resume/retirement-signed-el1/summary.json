@@ -1,0 +1,15 @@
+{
+  "source_head": "a49b7e6bf044974ef88cea8c1f6cadebb06438be",
+  "executables_verified_and_preserved": 9,
+  "unique_passed_executions": 50,
+  "crash_register_witness": {
+    "schema": "carrick.signed-embed-test.v1",
+    "record_type": "execution",
+    "executable_id": "43d6feb86c0b1f5b12a440d2d38873a88d908fe6e0ffe6f10f1d0e9c28a46c16:/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/crash_parked_thread-ac4b8d7e5234f849",
+    "test_name": "crash_core_attributes_the_el1_parked_sibling_registers",
+    "requested_test_filter": "el1_",
+    "terminal_status": "passed"
+  },
+  "cli_sha256_unchanged": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f",
+  "remaining_processes": 0
+}

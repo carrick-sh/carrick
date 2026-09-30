@@ -1,0 +1,88 @@
+== CPython 3.12.13 (main, Aug 5 2026, 03:49:12) [GCC 14.2.0]
+== Linux-6.12.0-carrick-aarch64-with-glibc2.41 little-endian
+== Python build: release shared LTO+PGO
+== cwd: /tmp/test_python_worker_1æ
+== CPU count: 4
+== encodings: locale=UTF-8 FS=utf-8
+== resources: all test resources are disabled, use -u option to unskip tests
+
+Using random seed: 0
+0:00:00 load avg: 0.00 Run 1 test sequentially in a single process
+0:00:00 load avg: 0.00 [1/1] test_threading
+test_atexit_after_shutdown (test.test_threading.AtexitTests.test_atexit_after_shutdown) ... ok
+test_atexit_called_once (test.test_threading.AtexitTests.test_atexit_called_once) ... ok
+test_atexit_output (test.test_threading.AtexitTests.test_atexit_output) ... ok
+test_abort (test.test_threading.BarrierTests.test_abort)
+Test that an abort will put the barrier in a broken state ... ok
+test_abort_and_reset (test.test_threading.BarrierTests.test_abort_and_reset)
+Test that a barrier can be reset after being broken. ... ok
+test_action (test.test_threading.BarrierTests.test_action)
+Test the 'action' callback ... ok
+test_barrier (test.test_threading.BarrierTests.test_barrier)
+Test that a barrier is passed in lockstep ... ok
+test_barrier_10 (test.test_threading.BarrierTests.test_barrier_10)
+Test that a barrier works for 10 consecutive runs ... ok
+test_constructor (test.test_threading.BarrierTests.test_constructor) ... ok
+test_default_timeout (test.test_threading.BarrierTests.test_default_timeout)
+Test the barrier's default timeout ... ok
+test_repr (test.test_threading.BarrierTests.test_repr) ... ok
+test_reset (test.test_threading.BarrierTests.test_reset)
+Test that a 'reset' on a barrier frees the waiting threads ... ok
+test_single_thread (test.test_threading.BarrierTests.test_single_thread) ... ok
+test_timeout (test.test_threading.BarrierTests.test_timeout)
+Test wait(timeout) ... ok
+test_wait_return (test.test_threading.BarrierTests.test_wait_return)
+test the return value from barrier.wait ... ok
+test_acquire (test.test_threading.BoundedSemaphoreTests.test_acquire) ... ok
+test_acquire_contended (test.test_threading.BoundedSemaphoreTests.test_acquire_contended) ... ok
+test_acquire_destroy (test.test_threading.BoundedSemaphoreTests.test_acquire_destroy) ... ok
+test_acquire_timeout (test.test_threading.BoundedSemaphoreTests.test_acquire_timeout) ... ok
+test_constructor (test.test_threading.BoundedSemaphoreTests.test_constructor) ... ok
+test_default_value (test.test_threading.BoundedSemaphoreTests.test_default_value) ... ok
+test_multirelease (test.test_threading.BoundedSemaphoreTests.test_multirelease) ... ok
+test_release_unacquired (test.test_threading.BoundedSemaphoreTests.test_release_unacquired) ... ok
+test_repr (test.test_threading.BoundedSemaphoreTests.test_repr) ... ok
+test_try_acquire (test.test_threading.BoundedSemaphoreTests.test_try_acquire) ... ok
+test_try_acquire_contended (test.test_threading.BoundedSemaphoreTests.test_try_acquire_contended) ... ok
+test_with (test.test_threading.BoundedSemaphoreTests.test_with) ... ok
+test__is_owned (test.test_threading.CRLockTests.test__is_owned) ... ok
+test_acquire_contended (test.test_threading.CRLockTests.test_acquire_contended) ... ok
+test_acquire_destroy (test.test_threading.CRLockTests.test_acquire_destroy) ... ok
+test_acquire_release (test.test_threading.CRLockTests.test_acquire_release) ... ok
+test_constructor (test.test_threading.CRLockTests.test_constructor) ... ok
+test_different_thread (test.test_threading.CRLockTests.test_different_thread) ... ok
+test_locked_repr (test.test_threading.CRLockTests.test_locked_repr) ... ok
+test_reacquire (test.test_threading.CRLockTests.test_reacquire) ... ok
+test_recursion_count (test.test_threading.CRLockTests.test_recursion_count) ... ok
+test_release_save_unacquired (test.test_threading.CRLockTests.test_release_save_unacquired) ... ok
+test_release_unacquired (test.test_threading.CRLockTests.test_release_unacquired) ... ok
+test_repr (test.test_threading.CRLockTests.test_repr) ... ok
+test_thread_leak (test.test_threading.CRLockTests.test_thread_leak) ... ok
+test_timeout (test.test_threading.CRLockTests.test_timeout) ... ok
+test_try_acquire (test.test_threading.CRLockTests.test_try_acquire) ... ok
+test_try_acquire_contended (test.test_threading.CRLockTests.test_try_acquire_contended) ... ok
+test_weakref_deleted (test.test_threading.CRLockTests.test_weakref_deleted) ... ok
+test_weakref_exists (test.test_threading.CRLockTests.test_weakref_exists) ... ok
+test_with (test.test_threading.CRLockTests.test_with) ... ok
+test__is_owned (test.test_threading.ConditionAsRLockTests.test__is_owned) ... ok
+test_acquire_contended (test.test_threading.ConditionAsRLockTests.test_acquire_contended) ... ok
+test_acquire_destroy (test.test_threading.ConditionAsRLockTests.test_acquire_destroy) ... ok
+test_acquire_release (test.test_threading.ConditionAsRLockTests.test_acquire_release) ... ok
+test_constructor (test.test_threading.ConditionAsRLockTests.test_constructor) ... ok
+test_different_thread (test.test_threading.ConditionAsRLockTests.test_different_thread) ... ok
+test_locked_repr (test.test_threading.ConditionAsRLockTests.test_locked_repr) ... ok
+test_reacquire (test.test_threading.ConditionAsRLockTests.test_reacquire) ... ok
+test_recursion_count (test.test_threading.ConditionAsRLockTests.test_recursion_count) ... skipped 'Condition does not expose _recursion_count()'
+test_release_save_unacquired (test.test_threading.ConditionAsRLockTests.test_release_save_unacquired) ... ok
+test_release_unacquired (test.test_threading.ConditionAsRLockTests.test_release_unacquired) ... ok
+test_repr (test.test_threading.ConditionAsRLockTests.test_repr) ... ok
+test_thread_leak (test.test_threading.ConditionAsRLockTests.test_thread_leak) ... ok
+test_timeout (test.test_threading.ConditionAsRLockTests.test_timeout) ... ok
+test_try_acquire (test.test_threading.ConditionAsRLockTests.test_try_acquire) ... ok
+test_try_acquire_contended (test.test_threading.ConditionAsRLockTests.test_try_acquire_contended) ... ok
+test_weakref_deleted (test.test_threading.ConditionAsRLockTests.test_weakref_deleted) ... ok
+test_weakref_exists (test.test_threading.ConditionAsRLockTests.test_weakref_exists) ... ok
+test_with (test.test_threading.ConditionAsRLockTests.test_with) ... ok
+test_acquire (test.test_threading.ConditionTests.test_acquire) ... ok
+test_notify (test.test_threading.ConditionTests.test_notify) ... ok
+test_timeout (test.test_threading.ConditionTests.test_timeout) ... 

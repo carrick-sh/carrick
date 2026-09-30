@@ -1,0 +1,17 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_reaxbnIxQ as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+readv02.c:72: TPASS: readv(3, 0x88000501b8, 1) : EINVAL (22)
+readv02.c:72: TPASS: readv(3, 0x8800050020, 3) : EFAULT (14)
+readv02.c:72: TPASS: readv(3, 0x8800050188, -1) : EINVAL (22)
+readv02.c:72: TPASS: readv(4, 0x8800050178, 1) : EISDIR (21)
+readv02.c:72: TPASS: readv(-1, 0x8800050178, 3) : EBADF (9)
+
+Summary:
+passed   5
+failed   0
+broken   0
+skipped  0
+warnings 0

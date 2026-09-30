@@ -1277,31 +1277,25 @@ impl HvpatchPersistentExecutor {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
-    /// The EL1 zone slot this executor thread drives now: the mailbox slot of
-    /// the vCPU it last loaded a task on or waits in the guest on. A slot
-    /// follows its mailbox lease, which a task can carry, so an executor may
-    /// drive different slots over its life (EL1 plan 1d).
-    static DRIVEN_ZONE_SLOT: std::cell::Cell<Option<carrick_el1_abi::SlotId>> =
+    /// The EL1 zone slot this executor thread drives now, with its driver
+    /// identity: the mailbox slot of the vCPU it last loaded a task on or
+    /// waits in the guest on. A slot follows its mailbox lease, so an
+    /// executor may drive different slots over its life (EL1 plan 1d). The
+    /// zone's drive word is the authority; this is the executor's own
+    /// record of which one it must give up.
+    static DRIVEN_ZONE_SLOT: std::cell::Cell<Option<(carrick_el1_abi::SlotId, u64)>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// The EL1 zone slot the calling executor thread drives, if any.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn driven_zone_slot() -> Option<carrick_el1_abi::SlotId> {
+/// The EL1 zone slot the calling executor thread drives, if any, with its
+/// driver identity.
+pub(crate) fn driven_zone_slot() -> Option<(carrick_el1_abi::SlotId, u64)> {
     DRIVEN_ZONE_SLOT.with(std::cell::Cell::get)
 }
 
-/// No backend drives EL1 zone slots here.
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub(crate) fn driven_zone_slot() -> Option<carrick_el1_abi::SlotId> {
-    None
-}
-
 /// The zone's driver identity of an executor (never 0, which means none).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn zone_driver(executor: ExecutorId) -> u64 {
+pub(crate) fn zone_driver(executor: ExecutorId) -> u64 {
     u64::from(executor.raw()) + 1
 }
 
@@ -1309,14 +1303,21 @@ fn zone_driver(executor: ExecutorId) -> u64 {
 /// before and left (its lease went with the task it unloaded) is vacated,
 /// unless another executor took it over, so nothing waits on a vCPU nobody
 /// runs.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) {
-    let previous = DRIVEN_ZONE_SLOT.with(|cell| cell.replace(Some(slot)));
-    if let Some(previous) = previous.filter(|previous| *previous != slot) {
-        carrick_kernel::el1_zone::leave_slot(previous, driver, slot);
+pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) {
+    let previous = DRIVEN_ZONE_SLOT.with(|cell| cell.replace(Some((slot, driver))));
+    if let Some((previous, previous_driver)) = previous.filter(|(previous, _)| *previous != slot) {
+        carrick_kernel::el1_zone::leave_slot(previous, previous_driver, Some(slot));
     }
     if let Some(zone) = carrick_kernel::el1_zone::zone() {
-        zone.set_driver(slot, driver);
+        zone.drive(slot, driver);
+    }
+}
+
+/// The calling executor stops driving any slot: it parks with no guest CPU,
+/// or its loop ends. Whatever waits on its slot goes elsewhere.
+pub(crate) fn leave_driven_zone_slot() {
+    if let Some((slot, driver)) = DRIVEN_ZONE_SLOT.with(std::cell::Cell::take) {
+        carrick_kernel::el1_zone::leave_slot(slot, driver, None);
     }
 }
 

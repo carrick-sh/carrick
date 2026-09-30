@@ -4108,7 +4108,19 @@ fn demand_preemption_and_exact_signal_kick_advance_two_compute_tasks_without_sta
     let first_authority = enqueue_root(&scheduler, &first, publish(&first, 40));
     first_gate.wait();
     let second_authority = enqueue_root(&scheduler, &second, publish(&second, 50));
-    assert!(scheduler.need_resched());
+    // The enqueue demands the CPU: the running task is kicked. `need_resched`
+    // is a transient the lone worker consumes as soon as it switches tasks,
+    // so observe the delivered kick instead of sampling the flag.
+    pool.wait_for_event(
+        |event| {
+            matches!(
+                event,
+                ExecutorPoolEvent::KickDelivered { thread, .. } if *thread == first.thread().key()
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .expect("enqueueing a second task kicks the running one");
     second_gate.wait();
     assert!(matches!(
         scheduler.wake(second.thread().key()),
@@ -6914,12 +6926,15 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
     )
     .expect("start executor pool");
 
+    // A preemption before the failing exec (a loaded host can expire the
+    // quantum between claim and load) settles the root runnable and runs it
+    // again at a later generation; the exit it reaches is the same.
     pool.wait_for_event(
         |event| {
             matches!(
                 event,
                 ExecutorPoolEvent::SettledExited { thread, generation: g }
-                    if *thread == context.thread().key() && *g == generation
+                    if *thread == context.thread().key() && *g >= generation
             )
         },
         Duration::from_secs(5),
@@ -6976,7 +6991,7 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
             matches!(
                 r.event,
                 ExecutorPoolEvent::SettledExited { thread, generation: g }
-                    if thread == context.thread().key() && g == generation
+                    if thread == context.thread().key() && g >= generation
             )
         })
         .count();

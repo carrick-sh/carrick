@@ -1,0 +1,27 @@
+Executable=/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/carrick
+Identifier=carrick.tmp.37096
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=71402 flags=0x2(adhoc) hashes=2221+7 location=embedded
+VersionPlatform=1
+VersionMin=720896
+VersionSDK=786432
+Hash type=sha256 size=32
+CandidateCDHash sha256=3a0d1ae17ac52f9bd4a01c87f82bbcc5caf0c140
+CandidateCDHashFull sha256=3a0d1ae17ac52f9bd4a01c87f82bbcc5caf0c140cc0ed51a6880dd72b72e13ce
+Hash choices=sha256
+CMSDigest=3a0d1ae17ac52f9bd4a01c87f82bbcc5caf0c140cc0ed51a6880dd72b72e13ce
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=25165824
+Executable Segment flags=0x1
+Page size=16384
+CDHash=3a0d1ae17ac52f9bd4a01c87f82bbcc5caf0c140
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+warning: Specifying ':' in the path is deprecated and will not work in a future release
+Total signatures=1
+Chosen signature=1
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>

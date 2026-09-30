@@ -1,6 +1,10 @@
 schema_version = 1
 
 [[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs"
+contracts = ["kernel.wait.child-exit-notification-lifecycle"]
+
+[[surfaces]]
 path = "crates/carrick-observability/src/work_meter.rs"
 contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density"]
 
@@ -545,7 +549,7 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/lib.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/tests.rs"
@@ -565,7 +569,7 @@ contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/el1_zone.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"
@@ -610,3 +614,11 @@ contracts = ["kernel.mm.current-read-reuse"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs"
 contracts = ["kernel.mm.current-read-reuse", "kernel.mm.native-syscall-buffers", "kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects/thread.rs"
+contracts = ["kernel.el1.deferred-handback-identity", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation/wait_service.rs"
+contracts = ["kernel.el1.deferred-handback-identity", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]

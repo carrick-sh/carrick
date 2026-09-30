@@ -1,0 +1,21 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_fanh1F9Bf as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+fanotify04.c:62: TPASS: fanotify_mark (3, FAN_MARK_ADD | FAN_MARK_ONLYDIR, FAN_OPEN, AT_FDCWD, '.') succeeded
+fanotify04.c:62: TPASS: fanotify_mark (3, FAN_MARK_ADD | FAN_MARK_ONLYDIR, FAN_OPEN, AT_FDCWD, 'fname_5') failed
+fanotify04.c:62: TPASS: fanotify_mark (3, FAN_MARK_ADD | FAN_MARK_DONT_FOLLOW, FAN_OPEN, AT_FDCWD, 'symlink_5') succeeded
+fanotify04.c:153: TPASS: No event as expected
+fanotify04.c:62: TPASS: fanotify_mark (3, FAN_MARK_ADD | 0, FAN_OPEN, AT_FDCWD, 'symlink_5') succeeded
+fanotify04.c:117: TPASS: event generated properly for type 100000
+fanotify04.c:117: TPASS: event generated properly for type 100000
+fanotify04.c:117: TPASS: event generated properly for type 40000
+fanotify04.c:153: TPASS: No event as expected
+
+Summary:
+passed   9
+failed   0
+broken   0
+skipped  0
+warnings 0

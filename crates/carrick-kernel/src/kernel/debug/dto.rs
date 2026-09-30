@@ -17,7 +17,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::super::objects::FileDescriptionBackingSnapshot;
-use super::super::snapshot::{FileDescriptionSnapshotKind, KernelSnapshotV1, ObjectSnapshotClass};
+use super::super::snapshot::{
+    FileDescriptionSnapshotKind, KernelSnapshotV1, ObjectSnapshotClass, SnapshotFinding,
+};
 
 /// Request schema tag. A client that sends anything else is refused.
 pub const KERNEL_DEBUG_REQUEST_SCHEMA: &str = "carrick.kernel-debug-request.v1";
@@ -740,6 +742,16 @@ pub struct KernelDebugSnapshot {
     pub registry_epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_absent: Option<bool>,
+    /// What is WRONG with this graph, projected from a
+    /// [`SnapshotFinding`] capture
+    /// instead of the served strict path. Empty for an ordinary coherent
+    /// snapshot; non-empty means the runtime already knew this graph violates
+    /// an invariant and is reporting it rather than refusing the whole
+    /// capture — the exact case a wedged carrier's `carrick debug
+    /// hvpatch-kernel` must never turn into an opaque error with no graph at
+    /// all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<String>,
     pub tasks: Option<Vec<DebugTaskRow>>,
     pub zombies: Option<Vec<DebugZombieRow>>,
     pub threads: Option<Vec<DebugThreadRow>>,
@@ -797,17 +809,28 @@ pub enum KernelDebugDtoError {
 
 impl KernelDebugSnapshot {
     /// Project a coherent kernel snapshot onto the wire, keeping only the
-    /// requested tables.
+    /// requested tables. There are no findings: a coherent snapshot is the
+    /// strict, served projection with nothing to report.
     pub fn project(snapshot: &KernelSnapshotV1, selected: &BTreeSet<KernelDebugTable>) -> Self {
-        Self::project_with_aux(snapshot, selected, None)
+        Self::project_with_aux(snapshot, selected, None, &[])
     }
 
     /// Project a coherent kernel snapshot and auxiliary scheduler/executor
     /// tables onto the wire, keeping only the requested tables.
+    ///
+    /// `findings` carries what a FORENSIC capture already knows is wrong with
+    /// this exact graph (see [`Kernel::forensic_snapshot`]); pass `&[]` for an
+    /// ordinary strict snapshot. A non-empty list must never be dropped on
+    /// the floor — it is the only way a caller downstream of the strict path
+    /// learns the graph it received is a post-mortem best-effort view, not a
+    /// validated one.
+    ///
+    /// [`Kernel::forensic_snapshot`]: super::super::core::Kernel::forensic_snapshot
     pub fn project_with_aux(
         snapshot: &KernelSnapshotV1,
         selected: &BTreeSet<KernelDebugTable>,
         aux: Option<&dyn KernelDebugAuxProvider>,
+        findings: &[SnapshotFinding],
     ) -> Self {
         let want = |table: KernelDebugTable| selected.contains(&table);
         let has_aux_table = want(KernelDebugTable::Scheduler)
@@ -838,6 +861,7 @@ impl KernelDebugSnapshot {
             snapshot_schema_version: snapshot.schema_version,
             registry_epoch: snapshot.registry_epoch,
             provider_absent,
+            findings: findings.iter().map(ToString::to_string).collect(),
             tasks: want(KernelDebugTable::Task).then(|| {
                 snapshot
                     .tasks

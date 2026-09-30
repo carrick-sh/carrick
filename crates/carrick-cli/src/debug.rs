@@ -1071,6 +1071,18 @@ fn run_hvpatch_kernel_snapshot(
     match carrick_kernel::kernel::kernel_debug_fetch(run_id, selected) {
         Ok(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            // A non-empty `findings` list means the strict, served path
+            // refused this exact graph and the runtime fell back to a
+            // forensic (never-refusing) capture instead — the graph is
+            // printed above in full, but callers must not mistake it for a
+            // validated snapshot.
+            if !snapshot.findings.is_empty() {
+                bail!(
+                    "kernel snapshot reported {} finding(s); printed the forensic view: {}",
+                    snapshot.findings.len(),
+                    snapshot.findings.join("; ")
+                )
+            }
             Ok(())
         }
         // A wedged carrier cannot give a coherent graph; print what it could

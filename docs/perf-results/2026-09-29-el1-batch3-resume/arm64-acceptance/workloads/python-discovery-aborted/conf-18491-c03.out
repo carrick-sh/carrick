@@ -1,0 +1,40 @@
+== CPython 3.12.13 (main, Aug 5 2026, 03:49:12) [GCC 14.2.0]
+== Linux-6.12.0-carrick-aarch64-with-glibc2.41 little-endian
+== Python build: release shared LTO+PGO
+== cwd: /tmp/test_python_worker_1æ
+== CPU count: 4
+== encodings: locale=UTF-8 FS=utf-8
+== resources: all test resources are disabled, use -u option to unskip tests
+
+Using random seed: 0
+0:00:00 load avg: 0.00 Run 4 tests sequentially in a single process
+0:00:00 load avg: 0.00 [1/4] test_multiprocessing_fork.test_processes
+test_array (test.test_multiprocessing_fork.test_processes.WithProcessesTestArray.test_array) ... ok
+test_array_from_size (test.test_multiprocessing_fork.test_processes.WithProcessesTestArray.test_array_from_size) ... ok
+test_getobj_getlock_obj (test.test_multiprocessing_fork.test_processes.WithProcessesTestArray.test_getobj_getlock_obj) ... ok
+test_rawarray (test.test_multiprocessing_fork.test_processes.WithProcessesTestArray.test_rawarray) ... ok
+test_abort (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_abort)
+Test that an abort will put the barrier in a broken state ... ok
+test_abort_and_reset (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_abort_and_reset)
+Test that a barrier can be reset after being broken. ... ok
+test_action (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_action)
+Test the 'action' callback ... ok
+test_barrier (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_barrier)
+Test that a barrier is passed in lockstep ... ok
+test_barrier_10 (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_barrier_10)
+Test that a barrier works for 10 consecutive runs ... ok
+test_default_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_default_timeout)
+Test the barrier's default timeout ... ok
+test_reset (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_reset)
+Test that a 'reset' on a barrier frees the waiting threads ... ok
+test_single_thread (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_single_thread) ... ok
+test_thousand (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_thousand) ... ok
+test_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_timeout)
+Test wait(timeout) ... ok
+test_wait_return (test.test_multiprocessing_fork.test_processes.WithProcessesTestBarrier.test_wait_return)
+test the return value from barrier.wait ... ok
+test_notify (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_notify) ... ok
+test_notify_all (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_notify_all) ... ok
+test_notify_n (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_notify_n) ... ok
+test_timeout (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_timeout) ... ok
+test_wait_result (test.test_multiprocessing_fork.test_processes.WithProcessesTestCondition.test_wait_result) ... 

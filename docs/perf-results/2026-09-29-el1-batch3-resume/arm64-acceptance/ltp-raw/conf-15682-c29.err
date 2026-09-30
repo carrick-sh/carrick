@@ -1,0 +1,20 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_fanwMTCKV as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+fanotify02.c:158: TPASS: got event: mask=20 pid=5 fd=4
+fanotify02.c:158: TPASS: got event: mask=2 pid=5 fd=5
+fanotify02.c:158: TPASS: got event: mask=8 pid=5 fd=6
+fanotify02.c:158: TPASS: got event: mask=20 pid=5 fd=7
+fanotify02.c:158: TPASS: got event: mask=1 pid=5 fd=8
+fanotify02.c:158: TPASS: got event: mask=10 pid=5 fd=9
+fanotify02.c:158: TPASS: got event: mask=20 pid=5 fd=10
+fanotify02.c:158: TPASS: got event: mask=10 pid=5 fd=11
+
+Summary:
+passed   8
+failed   0
+broken   0
+skipped  0
+warnings 0

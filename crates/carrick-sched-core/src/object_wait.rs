@@ -168,7 +168,7 @@ impl ObjectWaitGuard<'_> {
     /// detached record and pending operation, which must be resumed or settled.
     pub fn notify_object_host(
         &self,
-        handed: &mut impl FnMut(RecordId),
+        handed: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
     ) -> Result<HostObjectWakeReport, ObjectWaitError> {
         let epoch = self.queue().epoch.load(Ordering::Relaxed);
@@ -180,7 +180,7 @@ impl ObjectWaitGuard<'_> {
             let rec = self.zone.record(record);
             cursor = rec.object.next.load(Ordering::Relaxed);
             report.visited += 1;
-            let from @ Claim::Parked { seq } = rec.claim() else {
+            let from @ Claim::Parked { .. } = rec.claim() else {
                 continue;
             };
             match self.zone.place_in_guest(record, from, None, |rec| {
@@ -192,15 +192,20 @@ impl ObjectWaitGuard<'_> {
                     placed(placement);
                 }
                 Placement::NoSlot => {
-                    if rec.cas(from, Claim::Host { seq }) {
+                    if let Some(transfer) = self
+                        .zone
+                        .begin_host_transfer(self.zone.record_ref(record), from)
+                    {
                         self.unlink(record);
                         self.zone.mark_woken(rec, 0);
                         self.zone
                             .counters
                             .host_wakes
                             .fetch_add(1, Ordering::Relaxed);
-                        report.handed += 1;
-                        handed(record);
+                        if let Some(ready) = transfer.publish() {
+                            report.handed += 1;
+                            handed(ready);
+                        }
                     }
                 }
                 Placement::Lost => {}
@@ -310,7 +315,7 @@ impl ObjectWaitGuard<'_> {
                 // A generic pending-host flag alone cannot find this waiter.
                 if self
                     .zone
-                    .claim_for_el1_with(record, seq, 0, waker, effects, || self.unlink(record))
+                    .claim_for_el1(record, seq, 0, waker, effects, || self.unlink(record))
                 {
                     report.queued += 1;
                 }
@@ -444,6 +449,7 @@ mod host_tests {
             Box::from_raw(ptr.cast::<ZoneTables>())
         };
         if running {
+            zone.drive(SLOT, u64::from(SLOT.raw()) + 1);
             zone.publish_slot(SLOT, MM, None, 0);
             assert!(zone.occupancy.replace(ExecutionSlot::zone(SLOT), 0, MM));
             zone.enter_guest(SLOT);
@@ -486,7 +492,7 @@ mod host_tests {
         let mut handed = Vec::with_capacity(64);
         let guard = zone.object_wait(key(index), &SpinForever).unwrap();
         let report = guard
-            .notify_object_host(&mut |r| handed.push(r), &mut |_| {})
+            .notify_object_host(&mut |r| handed.push(r.id), &mut |_| {})
             .unwrap();
         (report, handed)
     }

@@ -1,0 +1,13 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.17s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 2 tests
+test el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record ... {"contract_id":"kernel.el1.deferred-handback-identity","layer":"vm-free","implementation_revision":"sha256:1fd3beb5c0e0fddb72c7ac8895cd20e273390e55e5088f0ca5de08709dffe55f","fixture_identity":"unit:deferred_slot_handback_does_not_wake_a_reused_record","scale":1,"semantic_assertions":[{"name":"replacement_remains_parked","passed":true,"detail":null}],"work":{"values":{"wake_publications":0},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}
+{"contract_id":"kernel.el1.deferred-handback-identity","layer":"vm-free","implementation_revision":"sha256:1fd3beb5c0e0fddb72c7ac8895cd20e273390e55e5088f0ca5de08709dffe55f","fixture_identity":"unit:deferred_slot_handback_does_not_wake_a_reused_record","scale":8,"semantic_assertions":[{"name":"replacement_remains_parked","passed":true,"detail":null}],"work":{"values":{"wake_publications":0},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}
+{"contract_id":"kernel.el1.deferred-handback-identity","layer":"vm-free","implementation_revision":"sha256:1fd3beb5c0e0fddb72c7ac8895cd20e273390e55e5088f0ca5de08709dffe55f","fixture_identity":"unit:deferred_slot_handback_does_not_wake_a_reused_record","scale":32,"semantic_assertions":[{"name":"replacement_remains_parked","passed":true,"detail":null}],"work":{"values":{"wake_publications":0},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}
+ok
+test el1_zone::tests::deferred_slot_handback_preserves_live_records ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2311 filtered out; finished in 0.09s
+

@@ -16,11 +16,14 @@
 //! - [`Claim::Parked`]: queued on one or more futex wait queues. Nobody runs
 //!   it. Any waker (EL1 or host) may claim it, as may the host for a signal,
 //!   a timeout or a teardown; exactly one CAS wins.
-//! - [`Claim::Queued`] / [`Claim::OnCpu`]: an EL1 waker on vCPU slot `s`
+//! - [`Claim::Queued`] / [`Claim::OnCpu`] / [`Claim::OnCpuRequested`]: an EL1 waker on vCPU slot `s`
 //!   claimed it; it waits on, or runs from, `s`'s run queue. Only `s` may
 //!   touch it: EL1 while `s`'s vCPU runs, the executor holding `s` while it is
-//!   stopped at an exit. The host reaches it by kicking `s` (an exit), never
-//!   by writing it.
+//!   stopped at an exit. A host request closes new park admission atomically
+//!   with OnCpuRequested, then kicks `s`; it never writes the live context.
+//! - [`Claim::Transferring`]: a producer owns cleanup and payload publication.
+//!   Host requests/cancellation are recorded atomically; nobody may load or
+//!   free it until the producer publishes readiness or retires it.
 //! - [`Claim::Host`]: the host claimed it (a wake, a signal, a timeout, a
 //!   teardown, or `s`'s executor handing it back at an exit). The context is
 //!   frozen until the host loads the thread and frees the record.
@@ -226,6 +229,15 @@ pub enum Claim {
     Queued { slot: SlotId, seq: u32 },
     /// Running on `slot` (EL1 switched it in); the record's context is stale.
     OnCpu { slot: SlotId, seq: u32 },
+    /// Still running, but a host request has atomically closed park admission.
+    OnCpuRequested { slot: SlotId, seq: u32 },
+    /// An exclusive producer is finishing a host handback. Cancellation
+    /// delegates retirement to that producer; this is never readiness.
+    Transferring {
+        seq: u32,
+        cancelled: bool,
+        host_requested: bool,
+    },
     /// Owned by the host; the context is frozen until the thread is loaded.
     Host { seq: u32 },
 }
@@ -235,6 +247,10 @@ const STATE_PARKED: u64 = 1;
 const STATE_QUEUED: u64 = 2;
 const STATE_ONCPU: u64 = 3;
 const STATE_HOST: u64 = 4;
+const STATE_TRANSFERRING: u64 = 5;
+const STATE_TRANSFER_CANCELLED: u64 = 6;
+const STATE_TRANSFER_REQUESTED: u64 = 7;
+const STATE_ONCPU_REQUESTED: u64 = 8;
 
 impl Claim {
     pub const fn encode(self) -> u64 {
@@ -247,7 +263,23 @@ impl Claim {
             Self::OnCpu { slot, seq } => {
                 STATE_ONCPU | ((slot.0 as u64) << 8) | ((seq as u64) << 16)
             }
+            Self::OnCpuRequested { slot, seq } => {
+                STATE_ONCPU_REQUESTED | ((slot.0 as u64) << 8) | ((seq as u64) << 16)
+            }
             Self::Host { seq } => STATE_HOST | ((seq as u64) << 16),
+            Self::Transferring {
+                seq,
+                cancelled,
+                host_requested,
+            } => {
+                (if cancelled {
+                    STATE_TRANSFER_CANCELLED
+                } else if host_requested {
+                    STATE_TRANSFER_REQUESTED
+                } else {
+                    STATE_TRANSFERRING
+                }) | ((seq as u64) << 16)
+            }
         }
     }
 
@@ -258,7 +290,23 @@ impl Claim {
             STATE_PARKED => Self::Parked { seq },
             STATE_QUEUED => Self::Queued { slot, seq },
             STATE_ONCPU => Self::OnCpu { slot, seq },
+            STATE_ONCPU_REQUESTED => Self::OnCpuRequested { slot, seq },
             STATE_HOST => Self::Host { seq },
+            STATE_TRANSFERRING => Self::Transferring {
+                seq,
+                cancelled: false,
+                host_requested: false,
+            },
+            STATE_TRANSFER_REQUESTED => Self::Transferring {
+                seq,
+                cancelled: false,
+                host_requested: true,
+            },
+            STATE_TRANSFER_CANCELLED => Self::Transferring {
+                seq,
+                cancelled: true,
+                host_requested: false,
+            },
             _ => Self::Free,
         }
     }
@@ -270,7 +318,9 @@ impl Claim {
             Self::Parked { seq }
             | Self::Queued { seq, .. }
             | Self::OnCpu { seq, .. }
-            | Self::Host { seq } => seq,
+            | Self::OnCpuRequested { seq, .. }
+            | Self::Host { seq }
+            | Self::Transferring { seq, .. } => seq,
         }
     }
 }
@@ -409,6 +459,29 @@ pub struct ThreadIdentity {
     pub affinity: u64,
 }
 
+/// A deferred request belongs to one non-wrapping record incarnation.
+/// Old publishers may finish after reuse, but cannot set or erase a newer
+/// incarnation's request. Only the record owner clears a request.
+#[repr(transparent)]
+struct IncarnationRequest(AtomicU64);
+
+impl IncarnationRequest {
+    fn publish(&self, incarnation: u64) {
+        self.0.fetch_max(incarnation, Ordering::SeqCst);
+    }
+
+    fn is_for(&self, incarnation: u64) -> bool {
+        incarnation != 0 && self.0.load(Ordering::SeqCst) == incarnation
+    }
+
+    fn clear(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Incarnation-tagged host request encoding; included in the shared ABI hash.
+pub const HOST_REQUEST_PROTOCOL: u64 = 1;
+
 /// One parked thread. See the crate docs for the ownership protocol.
 #[repr(C, align(64))]
 pub struct ZoneRecord {
@@ -430,7 +503,7 @@ pub struct ZoneRecord {
     last_seq: AtomicU32,
     /// The host retired the thread while EL1 held its record: whoever next
     /// owns the record discards it instead of running or handing it back.
-    cancelled: AtomicU32,
+    cancelled: IncarnationRequest,
     /// `slot + 1` while this is that slot's home record (the host-loaded
     /// thread's own record): it may run on that slot only. 0: not homed.
     home: AtomicU32,
@@ -443,7 +516,7 @@ pub struct ZoneRecord {
     /// while EL1 held its record: the slot's executor hands it back at its
     /// next exit ([`ZoneTables::take_host_wanted`]) instead of leaving it
     /// queued.
-    host_wanted: AtomicU32,
+    host_wanted: IncarnationRequest,
     /// CNTVCT deadline of the current park (0: untimed).
     deadline: AtomicU64,
     affinity: AtomicU64,
@@ -522,7 +595,7 @@ impl ZoneRecord {
 
     /// The host asked for the thread back while EL1 held its record.
     pub fn host_wanted(&self) -> bool {
-        self.host_wanted.load(Ordering::SeqCst) != 0
+        self.host_wanted.is_for(self.incarnation())
     }
 
     pub fn entry_count(&self) -> u32 {
@@ -531,13 +604,21 @@ impl ZoneRecord {
 
     /// Whether the host retired the thread while EL1 held this record.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) != 0
+        self.cancelled.is_for(self.incarnation())
     }
 
     /// The host retires the thread while EL1 holds the record (a claim
     /// returned [`HostClaim::El1Held`]); the slot's executor discards it.
-    pub fn request_cancel(&self) {
-        self.cancelled.store(1, Ordering::Release);
+    fn request_cancel(&self, incarnation: u64) {
+        self.cancelled.publish(incarnation);
+    }
+
+    fn advance_incarnation(&self) -> bool {
+        self.incarnation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .is_ok()
     }
 
     /// The context.
@@ -649,16 +730,37 @@ pub struct ZoneSlot {
     /// The host queued a thread here and forced the vCPU out: its run loop
     /// owes it a reschedule SGI before the vCPU runs on ([`ZoneTables::take_resched`]).
     resched_owed: AtomicU32,
-    /// An executor drives this slot's vCPU (set when the host first loads or
-    /// enters it): the host may queue a thread that needs its executor here.
-    live: AtomicU32,
-    /// Host only: the executor that last published this slot (0: none). A
-    /// slot follows its mailbox lease, which a task can carry from one
-    /// executor to another; only the executor still driving it may vacate it.
-    driver: AtomicU64,
+    /// Who drives this slot's vCPU: 0 nobody, else the driving executor's
+    /// identity, with [`SLOT_AWAY`] set while it waits on the host with its
+    /// guest CPU lent. The slot's only liveness authority, written under
+    /// `lock` ([`ZoneTables::drive`], [`ZoneTables::leave_slot`],
+    /// [`ZoneTables::step_away`], [`ZoneTables::step_back`]): the host queues
+    /// a thread that needs an executor on a slot only while an executor
+    /// drives it and is not away, because only that executor comes back to
+    /// the slot to serve it.
+    drive: AtomicU64,
 }
 
+/// The bit of [`ZoneSlot`]'s drive word set while its driver waits on the
+/// host ([`ZoneTables::step_away`]); driver identities never use it.
+pub const SLOT_AWAY: u64 = 1 << 63;
+
 impl ZoneSlot {
+    /// The executor driving this slot, whether or not it is away.
+    pub fn driver(&self) -> Option<u64> {
+        match self.drive.load(Ordering::Acquire) & !SLOT_AWAY {
+            0 => None,
+            driver => Some(driver),
+        }
+    }
+
+    /// Whether an executor drives this slot and is not away on the host: the
+    /// host may queue a thread that needs an executor here.
+    pub fn is_live(&self) -> bool {
+        let drive = self.drive.load(Ordering::Acquire);
+        drive != 0 && drive & SLOT_AWAY == 0
+    }
+
     /// The record EL1 switched in, if any.
     pub fn current(&self) -> Option<RecordId> {
         RecordId::from_raw(self.current.load(Ordering::Acquire))
@@ -963,11 +1065,110 @@ pub enum HostClaim {
     Claimed,
     /// EL1 on `slot` holds it; kick the slot, and its executor hands it back.
     El1Held { slot: SlotId },
+    /// A producer owns the transfer and will publish readiness or retire
+    /// the record. The caller must not resume or free it in the meantime.
+    Deferred,
     /// Another party already made it host-owned.
     AlreadyHost,
     /// The park named by the caller is over (`seq` mismatch), or the record
     /// is free or reused.
     Stale,
+}
+
+/// Exclusive mutation authority between claiming a record and publishing
+/// host readiness. A deferred wake carries this token, never a bare index.
+#[must_use = "a host transfer must finish cleanup and publish or retire"]
+pub struct HostTransfer<'a> {
+    zone: &'a ZoneTables,
+    record: RecordRef,
+    seq: u32,
+}
+
+impl HostTransfer<'_> {
+    fn retire(self) {
+        self.zone.free_record(self.record.id);
+    }
+
+    /// Complete remaining waitv cleanup after releasing all bucket locks,
+    /// then publish a ready reference (or retire a cancelled transfer).
+    pub fn finish(self, wait: &impl LockWait) -> Option<RecordRef> {
+        self.zone.unlink_all(self.record.id, wait);
+        self.publish()
+    }
+
+    fn publish(self) -> Option<RecordRef> {
+        let rec = self.zone.record(self.record.id);
+        rec.host_wanted.clear();
+        // Requests can only advance to host-requested and then cancelled;
+        // each failed CAS therefore consumes one of those finite transitions.
+        loop {
+            let claim = rec.claim();
+            match claim {
+                Claim::Transferring {
+                    seq,
+                    cancelled: true,
+                    ..
+                } if seq == self.seq => {
+                    if rec.has_object_operation() {
+                        // Cancellation must reach the adapter while its exact
+                        // endpoint token is still retained by this incarnation.
+                        rec.handback
+                            .store(Handback::Cancelled as u32, Ordering::Release);
+                        if rec.cas(claim, Claim::Host { seq }) {
+                            return Some(self.record);
+                        }
+                    } else {
+                        self.retire();
+                        return None;
+                    }
+                }
+                Claim::Transferring {
+                    seq,
+                    cancelled: false,
+                    ..
+                } if seq == self.seq => {
+                    if rec.cas(claim, Claim::Host { seq }) {
+                        return Some(self.record);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn place_in_guest(self, except: SlotId) -> Result<HostPlacement, Self> {
+        let from = Claim::Transferring {
+            seq: self.seq,
+            cancelled: false,
+            host_requested: false,
+        };
+        match self
+            .zone
+            .place_in_guest(self.record.id, from, Some(except), |_| {})
+        {
+            Placement::Placed(placement) => Ok(placement),
+            Placement::NoSlot | Placement::Lost => Err(self),
+        }
+    }
+}
+
+/// A wake batch owns deferred host cleanup; guest-queued records carry
+/// only their notification identity because their publication is complete.
+pub enum WakeRecord<'a> {
+    Empty,
+    Guest(RecordRef),
+    Host(HostTransfer<'a>),
+}
+
+impl WakeRecord<'_> {
+    /// Consume a batch entry after dropping its futex bucket locks.
+    pub fn take_ready(&mut self, wait: &impl LockWait) -> Option<RecordRef> {
+        match core::mem::replace(self, Self::Empty) {
+            Self::Empty => None,
+            Self::Guest(record) => Some(record),
+            Self::Host(transfer) => transfer.finish(wait),
+        }
+    }
 }
 
 /// What [`ZoneTables::drain_slot`] found on a slot.
@@ -1007,8 +1208,8 @@ pub enum CurrentHandback {
     /// Host-owned: publish it to its thread. Usually [`Handback::Resumed`];
     /// a cancelled pending object operation requires adapter cleanup first.
     HandedBack,
-    /// Its thread was retired: host-owned, for the caller to free.
-    Discard,
+    /// Its thread was retired and the producer already freed its record.
+    Retired,
     /// It was not the slot's switched-in record (a protocol violation).
     Lost,
 }
@@ -1018,6 +1219,14 @@ pub enum CurrentHandback {
 pub struct RecordRef {
     pub id: RecordId,
     pub incarnation: u64,
+}
+
+impl RecordRef {
+    /// Filler for result arrays; never read before the producer writes it.
+    pub const PLACEHOLDER: Self = Self {
+        id: RecordId::PLACEHOLDER,
+        incarnation: 0,
+    };
 }
 
 /// Allocation of a table index failed.
@@ -1126,17 +1335,21 @@ impl ZoneTables {
             return Err(Exhausted);
         };
         let record = self.record(id);
-        record.incarnation.fetch_add(1, Ordering::AcqRel);
+        if !record.advance_incarnation() {
+            // Never release an exhausted index for another incarnation.
+            self.counters.exhausted.fetch_add(1, Ordering::Relaxed);
+            return Err(Exhausted);
+        }
         record.set_identity(identity);
         record.result.store(0, Ordering::Relaxed);
         record.handback.store(0, Ordering::Relaxed);
         record.first_entry.store(NIL, Ordering::Relaxed);
         record.entry_count.store(0, Ordering::Relaxed);
-        record.cancelled.store(0, Ordering::Relaxed);
+        record.cancelled.clear();
         record.home.store(0, Ordering::Relaxed);
         record.last_slot.store(0, Ordering::Relaxed);
         record.next.store(NIL, Ordering::Relaxed);
-        record.host_wanted.store(0, Ordering::Relaxed);
+        record.host_wanted.clear();
         record.deadline.store(0, Ordering::Relaxed);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         Ok(id)
@@ -1159,7 +1372,7 @@ impl ZoneTables {
     /// The executor of `slot`, stopped at an exit, takes the thread that
     /// needs it from the head of its run queue (host-owned from here): a
     /// service thread, or a thread ready at EL0 in another address space.
-    pub fn take_service_head(&self, slot: SlotId) -> Option<RecordId> {
+    pub fn take_service_head(&self, slot: SlotId) -> Option<RecordRef> {
         let guard = self.slot_lock(slot, &SpinForever)?;
         let s = self.slot(slot);
         let record = RecordId::from_raw(s.head.load(Ordering::Acquire))?;
@@ -1170,9 +1383,8 @@ impl ZoneTables {
         if owner != slot || !self.needs_executor(slot, rec) {
             return None;
         }
-        if !rec.cas(Claim::Queued { slot, seq }, Claim::Host { seq }) {
-            return None;
-        }
+        let identity = self.record_ref(record);
+        let transfer = self.begin_host_transfer(identity, Claim::Queued { slot, seq })?;
         self.remove_locked(&guard, record);
         if rec.is_cancelled() && rec.has_object_operation() {
             rec.handback
@@ -1188,20 +1400,12 @@ impl ZoneTables {
                 .foreign_adoptions
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Some(record)
-    }
-
-    /// The executor of `slot` is back from a blocking host wait: placements
-    /// may choose its slot again.
-    pub fn revive_slot(&self, slot: SlotId) {
-        if let Some(_guard) = self.slot_lock(slot, &SpinForever) {
-            self.slot(slot).live.store(1, Ordering::Release);
-        }
+        transfer.publish()
     }
 
     /// Queue the host-owned `record` back on `slot`, whether or not the slot
     /// is live: a service thread no other slot will take waits for this
-    /// slot's executor.
+    /// slot's driver, which is away on the host or about to drive it.
     pub fn requeue_on(&self, slot: SlotId, record: RecordId) -> bool {
         let rec = self.record(record);
         let Claim::Host { seq } = rec.claim() else {
@@ -1217,40 +1421,29 @@ impl ZoneTables {
         true
     }
 
-    /// The executor of `slot` is about to wait on the host with its vCPU
-    /// stopped (a spare with no guest CPU to run): it stops taking threads
-    /// (no placement chooses it), and every thread queued there leaves:
-    /// threads ready at EL0 straight to other slots (their reschedules to
-    /// `placed`), the rest host-owned, passed to `take` for the caller to
-    /// place or hand back.
-    pub fn retire_slot(
-        &self,
-        slot: SlotId,
-        take: &mut impl FnMut(RecordId),
-        placed: &mut impl FnMut(HostPlacement),
-    ) {
-        let s = self.slot(slot);
+    /// Executor `driver` (never 0, never with [`SLOT_AWAY`]) drives `slot`
+    /// from now on: it loaded a thread there, or waits in the guest on it,
+    /// and comes back to the slot at every exit. This is the only way a slot
+    /// becomes live; another executor that drove it before has lost it.
+    pub fn drive(&self, slot: SlotId, driver: u64) {
+        debug_assert!(driver != 0 && driver & SLOT_AWAY == 0);
         if let Some(_guard) = self.slot_lock(slot, &SpinForever) {
-            s.live.store(0, Ordering::Release);
+            self.slot(slot).drive.store(driver, Ordering::Release);
         }
-        self.vacate(slot, take, placed);
     }
 
-    /// Record that executor `driver` publishes `slot` (it loaded a thread
-    /// there, or waits in the guest on it).
-    pub fn set_driver(&self, slot: SlotId, driver: u64) {
-        self.slot(slot).driver.store(driver, Ordering::Release);
-    }
-
-    /// Executor `driver` stopped driving `slot` (the mailbox lease went with
-    /// the task it unloaded): if nobody took the slot over since, it stops
-    /// taking threads and its queue leaves as for [`Self::retire_slot`].
-    /// False if another executor drives it now.
-    pub fn leave_slot(
+    /// Executor `driver` is about to wait on the host with `slot`'s vCPU
+    /// stopped and its guest CPU lent (a blocking host wait): until
+    /// [`Self::step_back`] no placement chooses the slot, and every thread
+    /// queued there leaves as for [`Self::leave_slot`]. The slot stays
+    /// `driver`'s: a service thread no live slot takes may wait here for it
+    /// ([`Self::requeue_on`]). False (nothing done) if `driver` does not
+    /// drive the slot.
+    pub fn step_away(
         &self,
         slot: SlotId,
         driver: u64,
-        take: &mut impl FnMut(RecordId),
+        take: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
     ) -> bool {
         let s = self.slot(slot);
@@ -1258,11 +1451,51 @@ impl ZoneTables {
             let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
                 return false;
             };
-            if s.driver.load(Ordering::Acquire) != driver || s.state().in_guest() {
+            if s.driver() != Some(driver) {
                 return false;
             }
-            s.live.store(0, Ordering::Release);
-            s.driver.store(0, Ordering::Release);
+            s.drive.store(driver | SLOT_AWAY, Ordering::Release);
+        }
+        self.vacate(slot, take, placed);
+        true
+    }
+
+    /// Executor `driver` is back from the host wait [`Self::step_away`]
+    /// began, with its guest CPU: placements may choose `slot` again, if it
+    /// still drives it.
+    pub fn step_back(&self, slot: SlotId, driver: u64) {
+        let s = self.slot(slot);
+        if let Some(_guard) = self.slot_lock(slot, &SpinForever)
+            && s.driver() == Some(driver)
+        {
+            s.drive.store(driver, Ordering::Release);
+        }
+    }
+
+    /// Executor `driver` stops driving `slot`: its vCPU's mailbox lease moved
+    /// on, or it parks with no guest CPU (a spare) and will not come back to
+    /// the vCPU. If it still drives the slot (nobody took it over since) and
+    /// the vCPU is stopped, the slot stops taking threads and every thread
+    /// queued there leaves: threads ready at EL0 straight to other slots
+    /// (their reschedules to `placed`), the rest host-owned, passed to `take`
+    /// for the caller to place or hand back. False if another executor
+    /// drives it now.
+    pub fn leave_slot(
+        &self,
+        slot: SlotId,
+        driver: u64,
+        take: &mut impl FnMut(RecordRef),
+        placed: &mut impl FnMut(HostPlacement),
+    ) -> bool {
+        let s = self.slot(slot);
+        {
+            let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
+                return false;
+            };
+            if s.driver() != Some(driver) || s.state().in_guest() {
+                return false;
+            }
+            s.drive.store(0, Ordering::Release);
         }
         self.vacate(slot, take, placed);
         true
@@ -1271,7 +1504,7 @@ impl ZoneTables {
     fn vacate(
         &self,
         slot: SlotId,
-        take: &mut impl FnMut(RecordId),
+        take: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
     ) {
         // Threads ready at EL0 move straight to other slots; what stays needs
@@ -1281,7 +1514,7 @@ impl ZoneTables {
             None,
             &mut |record, discard| {
                 if discard {
-                    self.free_record(record);
+                    self.free_record(record.id);
                 } else {
                     take(record);
                 }
@@ -1290,7 +1523,7 @@ impl ZoneTables {
         );
         let _ = self.drain_slot(slot, &mut |record, discard| {
             if discard {
-                self.free_record(record);
+                self.free_record(record.id);
             } else {
                 take(record);
             }
@@ -1301,7 +1534,7 @@ impl ZoneTables {
     /// thread the host asked for while EL1 held it (its claim was refused
     /// and the slot kicked): host-owned, passed to `take` for the caller to
     /// hand to its thread's host continuation, where the host acts on it.
-    pub fn take_host_wanted(&self, slot: SlotId, take: &mut impl FnMut(RecordId)) -> usize {
+    pub fn take_host_wanted(&self, slot: SlotId, take: &mut impl FnMut(RecordRef)) -> usize {
         let Some(guard) = self.slot_lock(slot, &SpinForever) else {
             return 0;
         };
@@ -1311,8 +1544,7 @@ impl ZoneTables {
             let record = RecordId(cursor);
             let rec = self.record(record);
             cursor = rec.next.load(Ordering::Relaxed);
-            if (rec.host_wanted.load(Ordering::Acquire) == 0
-                && !(rec.is_cancelled() && rec.has_object_operation()))
+            if !(rec.host_wanted() || rec.is_cancelled() && rec.has_object_operation())
                 || (rec.is_cancelled() && !rec.has_object_operation())
             {
                 continue;
@@ -1320,9 +1552,13 @@ impl ZoneTables {
             let Claim::Queued { slot: owner, seq } = rec.claim() else {
                 continue;
             };
-            if owner == slot && rec.cas(Claim::Queued { slot, seq }, Claim::Host { seq }) {
+            let identity = self.record_ref(record);
+            if owner == slot
+                && let Some(transfer) =
+                    self.begin_host_transfer(identity, Claim::Queued { slot, seq })
+            {
                 self.remove_locked(&guard, record);
-                rec.host_wanted.store(0, Ordering::Release);
+                rec.host_wanted.clear();
                 if rec.is_cancelled() {
                     rec.handback
                         .store(Handback::Cancelled as u32, Ordering::Release);
@@ -1331,7 +1567,9 @@ impl ZoneTables {
                         .store(Handback::Woken as u32, Ordering::Release);
                 }
                 taken += 1;
-                take(record);
+                if let Some(ready) = transfer.publish() {
+                    take(ready);
+                }
             }
         }
         taken
@@ -1355,11 +1593,14 @@ impl ZoneTables {
             let Claim::Queued { slot: owner, seq } = rec.claim() else {
                 continue;
             };
-            if owner == slot && rec.cas(Claim::Queued { slot, seq }, Claim::Host { seq }) {
+            if owner == slot
+                && let Some(transfer) =
+                    self.begin_host_transfer(self.record_ref(record), Claim::Queued { slot, seq })
+            {
                 self.remove_locked(&guard, record);
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
-                self.free_record(record);
+                transfer.retire();
                 freed += 1;
             }
         }
@@ -1377,8 +1618,9 @@ impl ZoneTables {
             return;
         }
         record.claim.store(Claim::Free.encode(), Ordering::Release);
-        record.incarnation.fetch_add(1, Ordering::AcqRel);
-        Self::free_bit(&self.record_map, id.raw());
+        if record.advance_incarnation() {
+            Self::free_bit(&self.record_map, id.raw());
+        }
     }
 
     fn entry(&self, id: u32) -> &ZoneEntry {
@@ -1467,17 +1709,56 @@ impl ZoneTables {
         if seq == 0 { 1 } else { seq }
     }
 
-    /// Publish `record` as parked (claimable) under park `seq`. The caller
-    /// wrote the context and queued every entry, and still holds the lock of
-    /// every bucket it queued on.
+    /// Publish a privately allocated `record` as parked under `seq`. The
+    /// caller wrote the context and queued every entry, and still holds the
+    /// lock of every bucket it queued on. A switched-in running record must
+    /// use [`Self::publish_guest_park`] to arbitrate with host requests.
     pub fn publish_park(&self, record: RecordId, seq: u32) {
         let rec = self.record(record);
-        // A host claim refused while EL1 held it is retried on this park.
-        rec.host_wanted.store(0, Ordering::Relaxed);
+        // This allocation has not been exposed to a host requester.
+        rec.host_wanted.clear();
         rec.last_seq.store(seq, Ordering::Relaxed);
         rec.handback.store(0, Ordering::Relaxed);
         rec.claim
             .store(Claim::Parked { seq }.encode(), Ordering::Release);
+    }
+
+    /// Publish a single-entry guest park, or undo its enrollment when a
+    /// host request won OnCpu first. The caller owns the running context
+    /// and the entry's bucket lock. No record access follows a successful CAS.
+    #[must_use]
+    pub fn publish_guest_park(
+        &self,
+        guard: &BucketGuard<'_>,
+        slot: SlotId,
+        record: RecordId,
+        seq: u32,
+    ) -> bool {
+        let rec = self.record(record);
+        let from = rec.claim();
+        let previous_seq = rec.last_seq.load(Ordering::Relaxed);
+        let previous_handback = rec.handback.load(Ordering::Relaxed);
+        rec.last_seq.store(seq, Ordering::Relaxed);
+        rec.handback.store(0, Ordering::Relaxed);
+        if matches!(from, Claim::Free | Claim::OnCpu { .. }) && rec.cas(from, Claim::Parked { seq })
+        {
+            return true;
+        }
+        // Only the running owner can leave OnCpuRequested. The host waits
+        // for this slot's exit; it cannot consume this unpublished entry.
+        let entry = rec.first_entry.load(Ordering::Relaxed);
+        if entry != NIL {
+            self.unlink(guard, entry);
+            self.drop_entry(rec, entry);
+        }
+        rec.last_seq.store(previous_seq, Ordering::Relaxed);
+        rec.handback.store(previous_handback, Ordering::Relaxed);
+        rec.deadline.store(0, Ordering::Relaxed);
+        let s = self.slot(slot);
+        if s.timer_record.load(Ordering::Relaxed) == record.raw() {
+            s.timer_record.store(NIL, Ordering::Release);
+        }
+        false
     }
 
     /// Set the CNTVCT deadline of `record`'s next park (0: untimed). The
@@ -1499,15 +1780,15 @@ impl ZoneTables {
     /// `futex_waitv` park too: it must call [`Self::unlink_all`] for each
     /// woken record after releasing `guard`.
     #[allow(clippy::too_many_arguments)]
-    pub fn wake(
-        &self,
+    pub fn wake<'a>(
+        &'a self,
         guard: &BucketGuard<'_>,
         mm: u64,
         uaddr: u64,
         bitset: u32,
         count: u32,
         waker: Waker,
-        woken: &mut [RecordId],
+        woken: &mut [WakeRecord<'a>],
     ) -> Result<u32, WakeRefusal> {
         let mut effects = WakeEffects::default();
         self.wake_placed(guard, mm, uaddr, bitset, count, waker, woken, &mut effects)
@@ -1522,15 +1803,15 @@ impl ZoneTables {
     /// the slot is in the guest, and falls back to its own run queue (which
     /// is unbounded) when the slot it planned changed meanwhile.
     #[allow(clippy::too_many_arguments)]
-    pub fn wake_placed(
-        &self,
+    pub fn wake_placed<'a>(
+        &'a self,
         guard: &BucketGuard<'_>,
         mm: u64,
         uaddr: u64,
         bitset: u32,
         count: u32,
         waker: Waker,
-        woken: &mut [RecordId],
+        woken: &mut [WakeRecord<'a>],
         effects: &mut WakeEffects,
     ) -> Result<u32, WakeRefusal> {
         let bucket = &self.buckets[guard.bucket];
@@ -1571,25 +1852,36 @@ impl ZoneTables {
             if let Some(record) = self.eligible(entry, mm, uaddr, bitset) {
                 let seq = entry.seq.load(Ordering::Relaxed);
                 let index = u64::from(entry.index.load(Ordering::Relaxed));
+                let identity = self.record_ref(record);
+                let mut pending = WakeRecord::Guest(identity);
                 let claimed = match waker {
-                    Waker::El1 { slot } => self.claim_for_el1(record, seq, index, slot, effects),
+                    Waker::El1 { slot } => {
+                        self.claim_for_el1(record, seq, index, slot, effects, || {
+                            self.unlink(guard, cursor);
+                            self.drop_entry(self.record(record), cursor);
+                        })
+                    }
                     Waker::Host => {
                         let rec = self.record(record);
-                        let won = rec.cas(Claim::Parked { seq }, Claim::Host { seq });
-                        if won {
+                        let transfer = self.begin_host_transfer(identity, Claim::Parked { seq });
+                        let won = transfer.is_some();
+                        if let Some(transfer) = transfer {
                             rec.result.store(index, Ordering::Relaxed);
                             rec.handback
                                 .store(Handback::Woken as u32, Ordering::Release);
                             self.counters.host_wakes.fetch_add(1, Ordering::Relaxed);
+                            pending = WakeRecord::Host(transfer);
                         }
                         won
                     }
                 };
                 if claimed {
-                    self.unlink(guard, cursor);
-                    self.drop_entry(self.record(record), cursor);
+                    if matches!(waker, Waker::Host) {
+                        self.unlink(guard, cursor);
+                        self.drop_entry(self.record(record), cursor);
+                    }
                     if let Some(slot) = woken.get_mut(done) {
-                        *slot = record;
+                        *slot = pending;
                     }
                     done += 1;
                 }
@@ -1684,7 +1976,9 @@ impl ZoneTables {
 
     /// EL1 claims the parked `record` (park `seq`, waitv `index`) for the
     /// slot [`Self::placement`] chooses, falling back to the waker's own run
-    /// queue. The caller holds the record's bucket lock.
+    /// queue. The caller holds the record's bucket lock. `unlink_wait`
+    /// removes the old wait entry after winning ownership and before the
+    /// target's queue lock is released; no consumer may run it earlier.
     fn claim_for_el1(
         &self,
         record: RecordId,
@@ -1692,18 +1986,7 @@ impl ZoneTables {
         index: u64,
         waker: SlotId,
         effects: &mut WakeEffects,
-    ) -> bool {
-        self.claim_for_el1_with(record, seq, index, waker, effects, || {})
-    }
-
-    fn claim_for_el1_with(
-        &self,
-        record: RecordId,
-        seq: u32,
-        index: u64,
-        waker: SlotId,
-        effects: &mut WakeEffects,
-        detach: impl FnOnce(),
+        unlink_wait: impl FnOnce(),
     ) -> bool {
         let rec = self.record(record);
         let home = rec.home();
@@ -1721,8 +2004,8 @@ impl ZoneTables {
                 if !rec.cas(Claim::Parked { seq }, Claim::Queued { slot: target, seq }) {
                     return false;
                 }
-                detach();
                 self.mark_woken(rec, index);
+                unlink_wait();
                 let state = self.slot(target).state();
                 self.push_locked(&slot_guard, record, None);
                 drop(slot_guard);
@@ -1744,15 +2027,15 @@ impl ZoneTables {
         if !rec.cas(Claim::Parked { seq }, Claim::Queued { slot: waker, seq }) {
             return false;
         }
-        detach();
         self.mark_woken(rec, index);
+        unlink_wait();
+        let misplaced = (home.is_some() && home != Some(waker))
+            || !self.runs_mm_of(waker, rec)
+            || !rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed));
         self.push_locked(&slot_guard, record, None);
         drop(slot_guard);
         effects.queued_own = true;
-        if (home.is_some() && home != Some(waker))
-            || !self.runs_mm_of(waker, rec)
-            || !rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed))
-        {
+        if misplaced {
             effects.misplaced = true;
             self.counters.el1_misplaced.fetch_add(1, Ordering::Relaxed);
         }
@@ -2035,7 +2318,9 @@ impl ZoneTables {
     /// ([`Self::take_service_head`]).
     pub fn unswitch(&self, slot: SlotId, record: RecordId) {
         let rec = self.record(record);
-        let Claim::OnCpu { slot: owner, seq } = rec.claim() else {
+        let from = rec.claim();
+        let (Claim::OnCpu { slot: owner, seq } | Claim::OnCpuRequested { slot: owner, seq }) = from
+        else {
             return;
         };
         if owner != slot {
@@ -2044,7 +2329,12 @@ impl ZoneTables {
         let Some(guard) = self.slot_lock(slot, &SpinForever) else {
             return;
         };
-        if !rec.cas(Claim::OnCpu { slot, seq }, Claim::Queued { slot, seq }) {
+        if !rec.cas(from, Claim::Queued { slot, seq })
+            && !rec.cas(
+                Claim::OnCpuRequested { slot, seq },
+                Claim::Queued { slot, seq },
+            )
+        {
             return;
         }
         let s = self.slot(slot);
@@ -2171,10 +2461,22 @@ impl ZoneTables {
     /// registers as they were. Room was made by the switch that follows (the
     /// caller switched the head in first).
     pub fn requeue_preempted(&self, slot: SlotId, record: RecordId) {
+        // The claim and queue membership become visible together to a host
+        // requester. It must not observe Queued before push_locked.
+        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+            return;
+        };
         let rec = self.record(record);
         let queued = match rec.claim() {
-            Claim::OnCpu { slot: owner, seq } if owner == slot => {
-                rec.cas(Claim::OnCpu { slot, seq }, Claim::Queued { slot, seq })
+            from @ (Claim::OnCpu { slot: owner, seq }
+            | Claim::OnCpuRequested { slot: owner, seq })
+                if owner == slot =>
+            {
+                rec.cas(from, Claim::Queued { slot, seq })
+                    || rec.cas(
+                        Claim::OnCpuRequested { slot, seq },
+                        Claim::Queued { slot, seq },
+                    )
             }
             Claim::Free => {
                 // A new home record: it was never parked, so it goes straight
@@ -2197,9 +2499,7 @@ impl ZoneTables {
         if s.current.load(Ordering::Acquire) == record.raw() {
             s.current.store(NIL, Ordering::Release);
         }
-        if let Some(guard) = self.slot_lock(slot, &SpinForever) {
-            self.push_locked(&guard, record, None);
-        }
+        self.push_locked(&guard, record, None);
         self.counters
             .el1_preemptions
             .fetch_add(1, Ordering::Relaxed);
@@ -2359,10 +2659,10 @@ impl ZoneTables {
     }
 
     /// The executor is about to run `slot`'s vCPU: other vCPUs may queue on
-    /// it again.
+    /// it again. (Whether the host may queue work that needs an executor here
+    /// is the slot's drive, not its state: [`Self::drive`].)
     pub fn enter_guest(&self, slot: SlotId) {
         let s = self.slot(slot);
-        s.live.store(1, Ordering::Relaxed);
         s.state.store(SlotState::Running as u32, Ordering::Release);
     }
 
@@ -2384,8 +2684,10 @@ impl ZoneTables {
     /// host-runnable one keeps [`Handback::Service`] (all passed to `take`
     /// with `false`), or, if the host retired its thread meanwhile,
     /// [`Handback::Cancelled`] (passed with `true`, for the caller to free).
+    /// Each callback receives the incarnation captured before host ownership
+    /// was published, so cancellation/reuse cannot retarget its delivery.
     /// The switched-in record, if any, is left for the caller.
-    pub fn drain_slot(&self, slot: SlotId, take: &mut impl FnMut(RecordId, bool)) -> SlotDrain {
+    pub fn drain_slot(&self, slot: SlotId, take: &mut impl FnMut(RecordRef, bool)) -> SlotDrain {
         let guard = self.slot_lock(slot, &SpinForever);
         let s = self.slot(slot);
         let mut drain = SlotDrain {
@@ -2406,9 +2708,14 @@ impl ZoneTables {
             let Claim::Queued { slot: owner, seq } = rec.claim() else {
                 continue;
             };
-            if owner != slot || !rec.cas(Claim::Queued { slot, seq }, Claim::Host { seq }) {
+            let identity = self.record_ref(record);
+            if owner != slot {
                 continue;
             }
+            let Some(transfer) = self.begin_host_transfer(identity, Claim::Queued { slot, seq })
+            else {
+                continue;
+            };
             if rec.is_cancelled() {
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
@@ -2418,7 +2725,9 @@ impl ZoneTables {
                 } else {
                     drain.woken += 1;
                 }
-                take(record, discard);
+                if let Some(ready) = transfer.publish() {
+                    take(ready, discard);
+                }
                 continue;
             }
             if !matches!(rec.handback(), Some(Handback::Resumed | Handback::Service)) {
@@ -2429,7 +2738,9 @@ impl ZoneTables {
                 .reconcile_woken
                 .fetch_add(1, Ordering::Relaxed);
             drain.woken += 1;
-            take(record, false);
+            if let Some(ready) = transfer.publish() {
+                take(ready, false);
+            }
         }
         s.head.store(NIL, Ordering::Release);
         s.tail.store(NIL, Ordering::Release);
@@ -2445,19 +2756,36 @@ impl ZoneTables {
         let rec = self.record(record);
         let s = self.slot(slot);
         s.current.store(NIL, Ordering::Release);
-        let Claim::OnCpu { slot: owner, seq } = rec.claim() else {
+        let from = rec.claim();
+        let (Claim::OnCpu { slot: owner, seq } | Claim::OnCpuRequested { slot: owner, seq }) = from
+        else {
             return CurrentHandback::Lost;
         };
-        if owner != slot || !rec.cas(Claim::OnCpu { slot, seq }, Claim::Host { seq }) {
+        if owner != slot {
             return CurrentHandback::Lost;
         }
+        let Some(transfer) = self
+            .begin_host_transfer(self.record_ref(record), from)
+            .or_else(|| {
+                self.begin_host_transfer(
+                    self.record_ref(record),
+                    Claim::OnCpuRequested { slot, seq },
+                )
+            })
+        else {
+            return CurrentHandback::Lost;
+        };
         if rec.is_cancelled() {
             rec.handback
                 .store(Handback::Cancelled as u32, Ordering::Release);
-            return if rec.has_object_operation() {
+            if !rec.has_object_operation() {
+                transfer.retire();
+                return CurrentHandback::Retired;
+            }
+            return if transfer.publish().is_some() {
                 CurrentHandback::HandedBack
             } else {
-                CurrentHandback::Discard
+                CurrentHandback::Retired
             };
         }
         rec.handback
@@ -2465,7 +2793,11 @@ impl ZoneTables {
         self.counters
             .reconcile_resumed
             .fetch_add(1, Ordering::Relaxed);
-        CurrentHandback::HandedBack
+        if transfer.publish().is_some() {
+            CurrentHandback::HandedBack
+        } else {
+            CurrentHandback::Retired
+        }
     }
 
     /// The switched-in record of `slot` is the thread the executor loaded:
@@ -2479,7 +2811,7 @@ impl ZoneTables {
         if s.host_record.load(Ordering::Acquire) == record.raw() {
             s.host_record.store(NIL, Ordering::Release);
         }
-        if matches!(self.record(record).claim(), Claim::OnCpu { slot: owner, .. } if owner == slot)
+        if matches!(self.record(record).claim(), Claim::OnCpu { slot: owner, .. } | Claim::OnCpuRequested { slot: owner, .. } if owner == slot)
         {
             self.free_record(record);
         }
@@ -2536,7 +2868,6 @@ impl ZoneTables {
     /// (`None`: any) and the loaded thread's affinity mask (0: any).
     pub fn publish_slot(&self, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
         let s = self.slot(slot);
-        s.live.store(1, Ordering::Relaxed);
         s.mm.store(mm, Ordering::Release);
         s.cpu.store(
             cpu.map_or(0, |cpu| cpu.saturating_add(1)),
@@ -2574,9 +2905,9 @@ impl ZoneTables {
         let cpu = self.slot(thief).cpu.load(Ordering::Relaxed);
         // A victim in the guest reaches its own run queue (it polls it, or
         // owes a reschedule), so work only its executor can serve stays
-        // there. A stopped victim's executor is on the host and may not
-        // return to this vCPU (a spare, a blocking host call): what waits
-        // on it is stranded unless an idle vCPU takes it.
+        // there. A stopped victim's driver comes back to it, but only when
+        // its host work ends (a long host call, a host wait it stepped away
+        // for): an idle vCPU takes what waits there sooner.
         let victim_stopped = !s.state().in_guest();
         let mut cursor = s.head.load(Ordering::Acquire);
         while cursor != NIL {
@@ -2705,9 +3036,10 @@ impl ZoneTables {
             };
             let state = self.slot(slot).state();
             let fits = if service {
-                // A retired slot (its executor waits on the host) takes
-                // nothing: checked under the lock `retire_slot` holds.
-                self.slot(slot).live.load(Ordering::Acquire) != 0
+                // Only a slot whose driver comes back to it takes a thread
+                // that needs an executor: checked under the lock every drive
+                // change holds.
+                self.slot(slot).is_live()
                     && rec.allows_cpu(self.slot(slot).cpu.load(Ordering::Relaxed))
             } else {
                 state.in_guest() && self.accepts_running(slot, rec)
@@ -2757,7 +3089,15 @@ impl ZoneTables {
         claimed: impl FnOnce(&ZoneRecord),
     ) -> Placement {
         let rec = self.record(record);
-        let (Claim::Parked { seq } | Claim::Queued { seq, .. } | Claim::Host { seq }) = from else {
+        let (Claim::Parked { seq }
+        | Claim::Queued { seq, .. }
+        | Claim::Host { seq }
+        | Claim::Transferring {
+            seq,
+            cancelled: false,
+            host_requested: false,
+        }) = from
+        else {
             return Placement::Lost;
         };
         let home = rec.home();
@@ -2810,15 +3150,15 @@ impl ZoneTables {
         &self,
         slot: SlotId,
         mm: Option<u64>,
-        handed: &mut impl FnMut(RecordId, bool),
+        handed: &mut impl FnMut(RecordRef, bool),
         placed: &mut impl FnMut(HostPlacement),
     ) -> usize {
         let mut moved = 0;
         loop {
-            // Off the run queue under its lock, in bounded batches; each stays
-            // `Queued` here until it is queued elsewhere or handed back, so a
-            // host claimant retries until it sees where it went.
-            let mut batch = [(RecordId::PLACEHOLDER, 0u32); 32];
+            // Off the run queue under its lock, in bounded batches. The
+            // transfer owns each detached record until placement/handback;
+            // a host claimant records its request without polling.
+            let mut batch = [const { None }; 32];
             let mut taken = 0;
             {
                 let Some(guard) = self.slot_lock(slot, &SpinForever) else {
@@ -2836,26 +3176,35 @@ impl ZoneTables {
                     let Claim::Queued { slot: owner, seq } = rec.claim() else {
                         continue;
                     };
-                    if owner == slot && self.remove_locked(&guard, record) {
-                        batch[taken] = (record, seq);
+                    if owner == slot
+                        && let Some(transfer) = self.begin_host_transfer(
+                            self.record_ref(record),
+                            Claim::Queued { slot, seq },
+                        )
+                    {
+                        self.remove_locked(&guard, record);
+                        batch[taken] = Some(transfer);
                         taken += 1;
                     }
                 }
             }
-            for &(record, seq) in &batch[..taken] {
-                let rec = self.record(record);
-                let from = Claim::Queued { slot, seq };
-                if !rec.is_cancelled()
-                    && let Placement::Placed(placement) =
-                        self.place_in_guest(record, from, Some(slot), |_| {})
-                {
-                    placed(placement);
-                    moved += 1;
+            for pending in batch.iter_mut().take(taken) {
+                let Some(transfer) = pending.take() else {
                     continue;
-                }
-                if !rec.cas(from, Claim::Host { seq }) {
-                    continue;
-                }
+                };
+                let rec = self.record(transfer.record.id);
+                let transfer = if rec.is_cancelled() {
+                    transfer
+                } else {
+                    match transfer.place_in_guest(slot) {
+                        Ok(placement) => {
+                            placed(placement);
+                            moved += 1;
+                            continue;
+                        }
+                        Err(transfer) => transfer,
+                    }
+                };
                 let discard = rec.is_cancelled();
                 if discard {
                     rec.handback
@@ -2865,7 +3214,9 @@ impl ZoneTables {
                         .store(Handback::Woken as u32, Ordering::Release);
                 }
                 moved += 1;
-                handed(record, discard);
+                if let Some(ready) = transfer.publish() {
+                    handed(ready, discard);
+                }
             }
             if taken < batch.len() {
                 return moved;
@@ -2879,17 +3230,20 @@ impl ZoneTables {
     /// address space runs it (`place_in_guest`) and its reschedule
     /// goes to `placed`; every other woken thread becomes [`Claim::Host`]
     /// with [`Handback::Woken`] and goes to `handed`, for the caller to hand
-    /// back (and unlink from its other buckets). Returns the number woken.
+    /// back (and unlink from its other buckets). The callback's reference is
+    /// retained by an owned transfer; the consumer finishes its remaining
+    /// cleanup after dropping bucket locks, then publishes readiness.
+    /// Returns the number woken.
     #[allow(clippy::too_many_arguments)]
-    pub fn wake_host(
-        &self,
+    pub fn wake_host<'a>(
+        &'a self,
         guard: &BucketGuard<'_>,
         mm: u64,
         uaddr: u64,
         bitset: u32,
         count: u32,
         place: bool,
-        handed: &mut impl FnMut(RecordId),
+        handed: &mut impl FnMut(HostTransfer<'a>),
         placed: &mut impl FnMut(HostPlacement),
     ) -> u32 {
         let bucket = &self.buckets[guard.bucket];
@@ -2904,22 +3258,35 @@ impl ZoneTables {
                 let rec = self.record(record);
                 let from = Claim::Parked { seq };
                 let outcome = if place && rec.entry_count() == 1 {
-                    self.place_in_guest(record, from, None, |rec| self.mark_woken(rec, index))
+                    self.place_in_guest(record, from, None, |rec| {
+                        self.mark_woken(rec, index);
+                        self.unlink(guard, cursor);
+                        self.drop_entry(rec, cursor);
+                    })
                 } else {
                     Placement::NoSlot
                 };
+                let mut pending = None;
                 let claimed = match outcome {
                     Placement::Placed(placement) => {
+                        // The queue entry was removed under the target's
+                        // slot lock, before any consumer could take it.
                         placed(placement);
-                        true
+                        done += 1;
+                        cursor = next;
+                        continue;
                     }
                     Placement::Lost => false,
                     Placement::NoSlot => {
-                        let won = rec.cas(from, Claim::Host { seq });
-                        if won {
+                        let identity = self.record_ref(record);
+                        let transfer = self.begin_host_transfer(identity, from);
+                        let won = transfer.is_some();
+                        if let Some(transfer) = transfer {
                             self.mark_woken(rec, index);
                             self.counters.host_wakes.fetch_add(1, Ordering::Relaxed);
-                            handed(record);
+                            // The callback retains ownership until all bucket
+                            // locks are released and waitv cleanup finishes.
+                            pending = Some(transfer);
                         }
                         won
                     }
@@ -2928,6 +3295,9 @@ impl ZoneTables {
                     self.unlink(guard, cursor);
                     self.drop_entry(rec, cursor);
                     done += 1;
+                    if let Some(transfer) = pending {
+                        handed(transfer);
+                    }
                 }
             }
             cursor = next;
@@ -2962,7 +3332,7 @@ impl ZoneTables {
                 continue;
             }
             let s = self.slot(slot);
-            if s.live.load(Ordering::Relaxed) == 0 {
+            if !s.is_live() {
                 continue;
             }
             if in_guest && !s.state().in_guest() {
@@ -2985,6 +3355,27 @@ impl ZoneTables {
         self.slot(slot).resched_owed.swap(0, Ordering::AcqRel) != 0
     }
 
+    fn begin_host_transfer(&self, record: RecordRef, from: Claim) -> Option<HostTransfer<'_>> {
+        let rec = self.record(record.id);
+        if rec.incarnation() != record.incarnation
+            || !rec.cas(
+                from,
+                Claim::Transferring {
+                    seq: from.seq(),
+                    cancelled: false,
+                    host_requested: false,
+                },
+            )
+        {
+            return None;
+        }
+        Some(HostTransfer {
+            zone: self,
+            record,
+            seq: from.seq(),
+        })
+    }
+
     /// The host takes `r` for `kind` (a signal, a timeout, a control wake or
     /// a cancellation). With `seq`, only that park may be claimed (a timeout
     /// belongs to the park that armed it). On success every queue entry is
@@ -2996,18 +3387,14 @@ impl ZoneTables {
         kind: Handback,
         wait: &impl LockWait,
     ) -> HostClaim {
-        let Some(rec) = self.live(r) else {
-            return HostClaim::Stale;
-        };
-        // Wanted BEFORE the claim is read (sequentially consistent, paired
-        // with `steal_from`): a thief that moves the record after this read
-        // sees the flag and leaves it to the host instead of running it.
-        rec.host_wanted.store(1, Ordering::SeqCst);
-        let outcome = self.claim_for_host_inner(r, rec, seq, kind, wait);
-        if !matches!(outcome, HostClaim::El1Held { .. }) {
-            rec.host_wanted.store(0, Ordering::SeqCst);
+        let rec = self.record(r.id);
+        if kind == Handback::Cancelled {
+            // Publish intent before observing ownership: a handback that
+            // wins immediately after El1Held must already see cancellation.
+            // This tagged write is harmless even if r was retired/reused.
+            rec.request_cancel(r.incarnation);
         }
-        outcome
+        self.claim_for_host_inner(r, rec, seq, kind, wait)
     }
 
     fn claim_for_host_inner(
@@ -3020,18 +3407,25 @@ impl ZoneTables {
     ) -> HostClaim {
         loop {
             let claim = rec.claim();
+            if rec.incarnation() != r.incarnation {
+                return HostClaim::Stale;
+            }
             match claim {
                 Claim::Parked { seq: current } => {
                     if seq.is_some_and(|wanted| wanted != current) {
                         return HostClaim::Stale;
                     }
-                    if rec.cas(claim, Claim::Host { seq: current }) {
+                    if let Some(transfer) = self.begin_host_transfer(r, claim) {
                         rec.handback.store(kind as u32, Ordering::Release);
                         self.unlink_all(r.id, wait);
                         if let Some(counter) = self.counters.host_claims.get(kind as usize) {
                             counter.fetch_add(1, Ordering::Relaxed);
                         }
-                        return HostClaim::Claimed;
+                        return if transfer.publish().is_some() {
+                            HostClaim::Claimed
+                        } else {
+                            HostClaim::Stale
+                        };
                     }
                 }
                 Claim::Queued { slot, seq: current } => {
@@ -3053,12 +3447,12 @@ impl ZoneTables {
                         core::hint::spin_loop();
                         continue;
                     }
-                    if !rec.cas(claim, Claim::Host { seq: current }) {
+                    let Some(transfer) = self.begin_host_transfer(r, claim) else {
                         // Only a holder of this lock moves a record queued
                         // here, and it is off the queue: unreachable.
                         self.push_locked(&guard, r.id, None);
                         continue;
-                    }
+                    };
                     drop(guard);
                     // A thread woken or preempted keeps what it resumes with
                     // (its wake's result, or its registers); the claimant's
@@ -3075,13 +3469,42 @@ impl ZoneTables {
                     self.counters
                         .host_queue_takes
                         .fetch_add(1, Ordering::Relaxed);
-                    return HostClaim::Claimed;
+                    return if transfer.publish().is_some() {
+                        HostClaim::Claimed
+                    } else {
+                        HostClaim::Stale
+                    };
                 }
-                Claim::OnCpu { slot, .. } => {
+                Claim::OnCpu { slot, seq } | Claim::OnCpuRequested { slot, seq } => {
+                    rec.host_wanted.publish(r.incarnation);
+                    if !rec.cas(claim, Claim::OnCpuRequested { slot, seq }) {
+                        continue;
+                    }
                     self.counters
                         .el1_held_refusals
                         .fetch_add(1, Ordering::Relaxed);
                     return HostClaim::El1Held { slot };
+                }
+                Claim::Transferring {
+                    seq: current,
+                    cancelled,
+                    host_requested,
+                } => {
+                    if seq.is_some_and(|wanted| wanted != current) {
+                        return HostClaim::Stale;
+                    }
+                    let requested = Claim::Transferring {
+                        seq: current,
+                        cancelled: cancelled || kind == Handback::Cancelled,
+                        host_requested: !cancelled && kind != Handback::Cancelled,
+                    };
+                    if !cancelled
+                        && (!host_requested || kind == Handback::Cancelled)
+                        && !rec.cas(claim, requested)
+                    {
+                        continue;
+                    }
+                    return HostClaim::Deferred;
                 }
                 Claim::Host { .. } => return HostClaim::AlreadyHost,
                 Claim::Free => return HostClaim::Stale,
@@ -3159,7 +3582,8 @@ impl ZoneTables {
     pub fn write_census(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
         for index in 0..ZONE_SLOTS {
             let s = &self.slots[index];
-            if s.live.load(Ordering::Relaxed) == 0 {
+            let drive = s.drive.load(Ordering::Relaxed);
+            if drive == 0 && s.len.load(Ordering::Relaxed) == 0 {
                 continue;
             }
             let mut queue = [0u32; 16];
@@ -3172,8 +3596,10 @@ impl ZoneTables {
             }
             writeln!(
                 out,
-                "zone slot {index}: state={:?} mm={} installed={} cpu+1={} current={} host_record={} len={} queue={:?} resched={} timer_cval={}",
+                "zone slot {index}: state={:?} driver={} away={} mm={} installed={} cpu+1={} current={} host_record={} len={} queue={:?} resched={} timer_cval={}",
                 s.state(),
+                drive & !SLOT_AWAY,
+                drive & SLOT_AWAY != 0,
                 s.mm(),
                 self.occupancy
                     .running_raw(ExecutionSlot::zone(SlotId::new(index as u8))),

@@ -1,0 +1,8 @@
+tst_cmd.c:270: TCONF: Couldn't find 'exportfs' in $PATH
+
+Summary:
+passed   0
+failed   0
+broken   0
+skipped  1
+warnings 0

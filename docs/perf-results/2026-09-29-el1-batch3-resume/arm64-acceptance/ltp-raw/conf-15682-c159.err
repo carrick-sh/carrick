@@ -1,0 +1,25 @@
+tst_buffers.c:57: TINFO: Test is using guarded buffers
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_reaQd8c4g as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+readlinkat01.c:55: TPASS: readlinkat(4, readlink_symlink, readlink_file, 1024) returned 13
+readlinkat01.c:60: TPASS: The filename in buffer is correct
+readlinkat01.c:55: TPASS: readlinkat(4, /tmp/LTP_reaQd8c4g/readlink_symlink, readlink_file, 1024) returned 13
+readlinkat01.c:60: TPASS: The filename in buffer is correct
+readlinkat01.c:55: TPASS: readlinkat(3, /tmp/LTP_reaQd8c4g/readlink_symlink, readlink_file, 1024) returned 13
+readlinkat01.c:60: TPASS: The filename in buffer is correct
+readlinkat01.c:55: TPASS: readlinkat(-100, /tmp/LTP_reaQd8c4g/readlink_symlink, readlink_file, 1024) returned 13
+readlinkat01.c:60: TPASS: The filename in buffer is correct
+readlinkat01.c:55: TPASS: readlinkat(-100, readlink_symlink, readlink_file, 1024) returned 13
+readlinkat01.c:60: TPASS: The filename in buffer is correct
+readlinkat01.c:55: TPASS: readlinkat(5, , readlink_file, 1024) returned 13
+readlinkat01.c:60: TPASS: The filename in buffer is correct
+
+Summary:
+passed   12
+failed   0
+broken   0
+skipped  0
+warnings 0

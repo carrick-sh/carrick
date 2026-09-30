@@ -201,6 +201,13 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     /// The executor's blocking inline host wait ended and it has its guest
     /// CPU back.
     fn host_wait_ended(&self) {}
+
+    /// The executor, on its own thread and holding no scheduler lock, is
+    /// about to park with no guest CPU (a spare that never had one, or gave
+    /// a lent one back): it will not come back to the vCPU it drove until it
+    /// borrows a CPU again, so it stops driving that vCPU's slot and nothing
+    /// waits there for it.
+    fn parking_spare(&self) {}
 }
 
 pub trait DiscardRecorder: Send + Sync {
@@ -466,6 +473,7 @@ impl Default for AtomicResidencyFlushRequest {
 #[derive(Clone, Debug)]
 pub struct ExecutorRegistration {
     id: ExecutorId,
+    kick: Arc<dyn ExecutorKick>,
     placement: Arc<Mutex<ExecutorPlacement>>,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
@@ -571,7 +579,7 @@ impl ExecutorDirectory {
         state.entries.insert(
             id,
             ExecutorEntry {
-                kick,
+                kick: Arc::clone(&kick),
                 placement: Arc::clone(&placement),
                 close_observation_epoch: Arc::clone(&close_observation_epoch),
                 control_observation_epoch: Arc::clone(&control_observation_epoch),
@@ -580,6 +588,7 @@ impl ExecutorDirectory {
         );
         Ok(ExecutorRegistration {
             id,
+            kick,
             placement,
             close_observation_epoch,
             control_observation_epoch,
@@ -2756,8 +2765,13 @@ impl RunQueue {
 
     /// An unbound `M` parks until it can acquire a relinquished slot, or until
     /// a control, residency-flush, or close request needs servicing.
+    ///
+    /// Before it first sleeps it gives up the zone slot its vCPU drove
+    /// ([`ExecutorKick::parking_spare`], outside the lock: settling what was
+    /// queued there may publish rows), then rechecks everything.
     fn park_spare(&self, executor: &ExecutorRegistration) -> Result<(), RunQueueError> {
         let mut state = self.inner.state.lock();
+        let mut slot_released = false;
         loop {
             if executor.flush_requested() {
                 return Err(RunQueueError::FlushRequested);
@@ -2791,6 +2805,11 @@ impl RunQueue {
                     self.inner.maybe_finish_close(&mut state);
                 }
                 return Err(RunQueueError::Closed);
+            }
+            if !slot_released {
+                slot_released = true;
+                parking_lot::MutexGuard::unlocked(&mut state, || executor.kick.parking_spare());
+                continue;
             }
             state.spare_waiters = state.spare_waiters.checked_add(1).unwrap_or_else(|| {
                 carrick_fatal!("kernel::run_queue", "spare_waiters overflow in park_spare");
@@ -3717,12 +3736,19 @@ impl Scheduler {
         let Some(key) = crate::el1_zone::thread_key_of(record) else {
             return;
         };
-        if let Some(thread) = self.kernel.exact_thread_for_scheduler(key) {
-            let _ = thread.publish_zone_ready(record);
-        }
-        // A rejected wake names a generation that has already retired (exit
-        // or exec won the record); `wake` audits it and nothing is owed.
-        let _ = self.wake(key);
+        self.publish_zone_thread_handback(record, key);
+    }
+
+    fn publish_zone_thread_handback(&self, record: carrick_el1_abi::RecordRef, key: ThreadKey) {
+        let Some(thread) = self.kernel.exact_thread_for_scheduler(key) else {
+            return;
+        };
+        let Some(target) = thread.prepare_zone_handback(record) else {
+            return;
+        };
+        // A delayed handback can outlive its task or continuation. The exact
+        // target drops that retired notification without weakening auditors.
+        let _ = self.wake_exact(target);
     }
 
     pub fn wake(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
@@ -4375,8 +4401,11 @@ impl Scheduler {
             return Ok(None);
         };
         self.queue.inner.zone_adopt.lock().insert(key);
-        let _ = thread.publish_zone_ready(record);
-        let _ = self.wake(key);
+        let Some(target) = thread.prepare_zone_handback(record) else {
+            self.queue.inner.zone_adopt.lock().remove(&key);
+            return Ok(None);
+        };
+        let _ = self.wake_exact(target);
         let held = self.queue.inner.zone_adopt.lock().remove(&key);
         if held {
             // The wake did not queue a row (it coalesced or was refused):
@@ -5776,6 +5805,137 @@ mod tests {
             .wake_exact(target)
             .expect("wake_exact should succeed");
         assert_eq!(disposition, WakeDisposition::Queued);
+    }
+
+    /// The zone publisher has captured the exact thread key, but the task
+    /// is reaped before it can publish readiness and issue its scheduler wake.
+    #[test]
+    fn a_deferred_zone_handback_does_not_audit_a_reaped_target() {
+        let (kernel, root) = bootstrap(12_465);
+        let child = process_child(&kernel, &root, 9_465, "zone-handback-reaped");
+        let captured_key = child.thread().key();
+        let child_task = child.task().key();
+        let zone = HeapZone::new();
+        let id = zone
+            .alloc_record(carrick_el1_abi::ThreadIdentity {
+                tid: captured_key.tid.raw() as u64,
+                serial: captured_key.serial.raw(),
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let captured_record = zone.record_ref(id);
+        let recorder = Arc::new(RecordingWakeAuditor::default());
+        kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![
+            Arc::clone(&recorder) as Arc<dyn crate::observe::KernelAuditor>,
+        ])));
+        drop(child);
+        kernel
+            .exit_task_key_eventually(child_task, LinuxWaitStatus::from_wait_encoding(0))
+            .unwrap();
+        kernel
+            .wait_child(
+                root.task().key().id,
+                Some(child_task.id),
+                crate::kernel::WaitMode::Consume,
+            )
+            .unwrap();
+        assert!(!kernel.task_exists(child_task.id));
+        // The real continuation may have retired/reused its record while
+        // this already-captured thread key was waiting for publication.
+        zone.free_record(id);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        scheduler.publish_zone_thread_handback(captured_record, captured_key);
+        assert!(
+            recorder.rejections.lock().is_empty(),
+            "late zone handback must not issue an untyped wake: {:?}",
+            *recorder.rejections.lock()
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+    }
+
+    #[test]
+    fn zone_handback_authenticates_the_registered_continuation() {
+        let (kernel, root) = bootstrap(12_466);
+        publish(&root, 31);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(Arc::clone(&scheduler));
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        let record = carrick_el1_abi::RecordRef {
+            id: carrick_el1_abi::RecordId::from_raw(1).unwrap(),
+            incarnation: 7,
+        };
+        let current = root
+            .task_binding()
+            .capture(root.thread().key().tid)
+            .unwrap();
+        let continuation = BlockedContinuation::from_zone_park(
+            ContinuationCapture::from_lease(
+                &current,
+                running.lease(),
+                SyscallRequest::new(98, SyscallArgs([0; 6])),
+                RestartClass::Never,
+            )
+            .unwrap(),
+            crate::kernel::continuation::ZoneWait::new(record, 1),
+            None,
+        );
+        let id = continuation.id();
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).unwrap();
+        scheduler
+            .settle_blocked_continuation(running, continuation, registration)
+            .unwrap();
+        let generation = root.thread().execution_state().generation().unwrap();
+        let other = carrick_el1_abi::RecordRef {
+            incarnation: 8,
+            ..record
+        };
+        assert!(root.thread().prepare_zone_handback(other).is_none());
+        assert_eq!(scheduler.queued_len(), 0);
+        let target = root.thread().prepare_zone_handback(record).unwrap();
+        assert_eq!(
+            target,
+            ExactWakeTarget::new(root.task().key(), root.thread().key(), generation)
+                .for_continuation(id)
+        );
+        assert_eq!(
+            scheduler.wake_exact(target).unwrap(),
+            WakeDisposition::Queued
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+    }
+
+    #[test]
+    fn zone_handback_before_registration_kicks_the_running_owner_once() {
+        let (kernel, root) = bootstrap(12_467);
+        publish(&root, 32);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let executor = scheduler.register_executor(kick.clone()).unwrap();
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        let record = carrick_el1_abi::RecordRef {
+            id: carrick_el1_abi::RecordId::from_raw(1).unwrap(),
+            incarnation: 9,
+        };
+        scheduler.publish_zone_thread_handback(record, root.thread().key());
+        assert_eq!(kick.tokens.lock().len(), 1);
+        assert_eq!(scheduler.queued_len(), 0);
+        assert!(matches!(
+            root.thread().execution_state(),
+            ThreadExecutionState::Running {
+                wake_pending: true,
+                ..
+            }
+        ));
+        scheduler.settle_exited(running).unwrap();
     }
 
     #[derive(Debug, Default)]
@@ -8100,6 +8260,202 @@ mod tests {
         scheduler.settle_exited(running).unwrap();
     }
 
+    /// Zone tables on the heap for a host-only test: all-zero is the valid
+    /// empty state, exactly as the carrier maps them in the EL1 region.
+    struct HeapZone(std::ptr::NonNull<carrick_el1_abi::ZoneTables>);
+
+    // SAFETY: ZoneTables is atomics plus claim-protected context, shared by
+    // design between host threads and vCPUs.
+    unsafe impl Send for HeapZone {}
+    // SAFETY: as above.
+    unsafe impl Sync for HeapZone {}
+
+    impl HeapZone {
+        fn new() -> Self {
+            let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+            // SAFETY: a non-zero-sized layout; all-zero is a valid ZoneTables.
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            Self(std::ptr::NonNull::new(ptr.cast()).expect("zone allocation"))
+        }
+    }
+
+    impl std::ops::Deref for HeapZone {
+        type Target = carrick_el1_abi::ZoneTables;
+
+        fn deref(&self) -> &Self::Target {
+            // SAFETY: allocated in `new`, freed only in `drop`.
+            unsafe { self.0.as_ref() }
+        }
+    }
+
+    impl Drop for HeapZone {
+        fn drop(&mut self) {
+            let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+            // SAFETY: allocated in `new` with this layout.
+            unsafe { std::alloc::dealloc(self.0.as_ptr().cast(), layout) };
+        }
+    }
+
+    /// The executor side of one zone vCPU slot: the runtime's executor kick
+    /// gives up the slot it drives when the run queue parks it as a spare.
+    #[derive(Debug)]
+    struct SlotDrivingKick {
+        inner: RecordingKick,
+        zone: Arc<HeapZone>,
+        slot: carrick_el1_abi::SlotId,
+        driver: u64,
+    }
+
+    impl std::fmt::Debug for HeapZone {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("HeapZone")
+        }
+    }
+
+    impl ExecutorKick for SlotDrivingKick {
+        fn try_bind(&self, binding: super::ExecutorBinding) -> bool {
+            self.inner.try_bind(binding)
+        }
+
+        fn unbind(&self, binding: super::ExecutorBinding) {
+            self.inner.unbind(binding);
+        }
+
+        fn rebind_exact_with(
+            &self,
+            predecessor: super::ExecutorBinding,
+            successor: super::ExecutorBinding,
+            publish: &mut dyn FnMut() -> bool,
+        ) -> bool {
+            self.inner
+                .rebind_exact_with(predecessor, successor, publish)
+        }
+
+        fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
+            self.inner.deliver_exact(token)
+        }
+
+        fn current_binding(&self) -> Option<super::ExecutorBinding> {
+            self.inner.current_binding()
+        }
+
+        fn parking_spare(&self) {
+            crate::el1_zone::leave_slot_in(&self.zone, self.slot, self.driver, None);
+        }
+    }
+
+    /// Contract kernel.el1.slot-liveness: a zone slot takes work that needs
+    /// an executor only while an executor that will come back to it drives
+    /// it. A spare borrowing a host waiter's CPU drives a slot while it
+    /// waits in the guest; when the owner is ready to return and the spare
+    /// rescans, the run queue takes the CPU back inside `try_take` and parks
+    /// the spare. Before this, the slot stayed live: the host, finding no
+    /// vCPU in the guest, placed a service thread on that stopped slot, and
+    /// no executor ever came back to serve it (cpython `concurrent_futures`
+    /// wedged with the record on a `state=Host live=1` slot whose executor
+    /// sat in `park_spare`). No vCPU enters the guest here, so no idle vCPU
+    /// can rescue the record: the placement itself must refuse the slot.
+    #[test]
+    fn a_spare_gives_up_its_zone_slot_before_it_parks() {
+        let (kernel, context) = bootstrap(12_408);
+        publish(&context, 51);
+        let scheduler = scheduler_with_cpus(kernel, 1);
+        let zone = Arc::new(HeapZone::new());
+        let slot = carrick_el1_abi::SlotId::new(8);
+        let owner = scheduler
+            .register_executor_bound(
+                Arc::new(RecordingKick::default()),
+                Some(GuestCpuId::new(0)),
+                false,
+            )
+            .unwrap();
+        let borrower = scheduler
+            .register_executor_bound(
+                Arc::new(SlotDrivingKick {
+                    inner: RecordingKick::default(),
+                    zone: Arc::clone(&zone),
+                    slot,
+                    driver: 2,
+                }),
+                None,
+                true,
+            )
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&owner).unwrap();
+        let token = scheduler.begin_host_wait(&running, &owner).unwrap();
+        assert!(scheduler.try_take(&borrower).unwrap().is_none());
+        assert!(
+            borrower.bound_cpu().is_some(),
+            "the spare holds the lent CPU"
+        );
+        // The spare waits in the guest on its slot, as its executor does,
+        // then its vCPU leaves for the host.
+        zone.drive(slot, 2);
+        zone.publish_slot(slot, 0, Some(0), 0);
+        zone.enter_guest(slot);
+        zone.leave_guest(slot, &crate::el1_zone::HostLockWait);
+        assert!(zone.slot(slot).is_live());
+
+        // The spare rescans only once its lent CPU is wanted back, so the
+        // run queue (not the caller's own check) takes the CPU back inside
+        // `try_take` and parks it as a spare until the queue closes.
+        let borrower_side = {
+            let scheduler = Arc::clone(&scheduler);
+            let borrower = borrower.clone();
+            thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !scheduler.queue.inner.lent_cpu_wanted_back(borrower.id())
+                    && std::time::Instant::now() < deadline
+                {
+                    thread::yield_now();
+                }
+                scheduler.try_take(&borrower).map(|taken| taken.is_some())
+            })
+        };
+        // The owner returns from its host wait; it gets its CPU back once the
+        // spare gives it up.
+        drop(token);
+        assert_eq!(owner.bound_cpu(), Some(GuestCpuId::new(0)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scheduler.queue.inner.state.lock().spare_waiters == 0
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(borrower.bound_cpu(), None, "the spare gave the CPU back");
+        assert_eq!(
+            scheduler.queue.inner.state.lock().spare_waiters,
+            1,
+            "the spare parks"
+        );
+
+        // Every vCPU is out of the guest: the host places a service thread.
+        let service = zone
+            .alloc_host_runnable(carrick_el1_abi::ThreadIdentity {
+                tid: 77,
+                serial: 770,
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let placed = zone
+            .place_from_host(service)
+            .map(|placement| placement.slot);
+        assert_eq!(
+            placed, None,
+            "the service thread was stranded on the slot of a parked spare"
+        );
+        assert!(!zone.slot(slot).is_live());
+
+        scheduler.settle_exited(running).unwrap();
+        scheduler.close();
+        let rescan = borrower_side.join().unwrap();
+        assert!(matches!(rescan, Err(RunQueueError::Closed)), "{rescan:?}");
+    }
+
     #[test]
     fn close_drains_with_spare_executors_parked() {
         let (kernel, root) = bootstrap(12_407);
@@ -9036,6 +9392,153 @@ mod tests {
     }
     mod serial_host {
         use super::*;
+
+        struct ZoneRegion {
+            pointer: std::ptr::NonNull<u8>,
+            layout: std::alloc::Layout,
+        }
+
+        impl ZoneRegion {
+            fn new() -> Self {
+                assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), 0);
+                let size = carrick_el1_abi::EL1_REGION_SIZE as usize;
+                let layout = std::alloc::Layout::from_size_align(size, size).unwrap();
+                // SAFETY: the layout is nonzero and every zone field admits zero.
+                let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+                    .expect("allocate synthetic EL1 region");
+                carrick_el1_abi::record_el1_region_host_ptr(pointer.as_ptr() as usize);
+                Self { pointer, layout }
+            }
+        }
+
+        impl Drop for ZoneRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+                // SAFETY: all test users have been dropped and the global view cleared.
+                unsafe { std::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+            }
+        }
+
+        #[test]
+        fn failed_zone_load_settlement_retires_only_its_owned_continuation() {
+            let _region = ZoneRegion::new();
+            let zone = carrick_el1_abi::zone_tables().unwrap();
+            let (kernel, root) = bootstrap(12_468);
+            publish(&root, 33);
+            let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+            let service = CarrierWaitService::new(Arc::clone(&scheduler));
+            let executor = scheduler
+                .register_executor(Arc::new(RecordingKick::default()))
+                .unwrap();
+            scheduler.make_runnable(root.thread().key()).unwrap();
+            let running = scheduler.take(&executor).unwrap();
+            let identity = carrick_el1_abi::ThreadIdentity {
+                tid: root.thread().key().tid.raw() as u64,
+                serial: root.thread().key().serial.raw(),
+                mm: root.shared().mm().id().raw(),
+                file_table: 0,
+                generation: running.generation().raw(),
+                affinity: 0,
+            };
+            let record_id = zone.alloc_record(identity).unwrap();
+            let seq = zone.next_seq(record_id);
+            zone.publish_park(record_id, seq);
+            let record = zone.record_ref(record_id);
+            let current = root
+                .task_binding()
+                .capture(root.thread().key().tid)
+                .unwrap();
+            let continuation = BlockedContinuation::from_zone_park(
+                ContinuationCapture::from_lease(
+                    &current,
+                    running.lease(),
+                    SyscallRequest::new(98, SyscallArgs([0; 6])),
+                    RestartClass::Never,
+                )
+                .unwrap(),
+                crate::kernel::continuation::ZoneWait::new(record, seq),
+                None,
+            );
+            let continuation_id = continuation.id();
+            let mut registration = service.prepare_registration(&continuation);
+            service.enroll(&mut registration).unwrap();
+            scheduler
+                .settle_blocked_continuation(running, continuation, registration)
+                .unwrap();
+            assert!(matches!(
+                zone.live(record).unwrap().claim(),
+                carrick_el1_abi::Claim::Parked { .. }
+            ));
+
+            // A notification is not ownership of the parked EL1 context.
+            // Exercise both scheduler entry points before the control owner
+            // claims the record; neither may admit a host restore.
+            let blocked = root.thread().execution_state();
+            let target = ExactWakeTarget::new(
+                root.task().key(),
+                root.thread().key(),
+                blocked.generation().unwrap(),
+            )
+            .for_continuation(continuation_id);
+            for exact in [false, true] {
+                if exact {
+                    scheduler.wake_exact(target).unwrap();
+                } else {
+                    scheduler.wake(root.thread().key()).unwrap();
+                }
+                assert_eq!(root.thread().execution_state(), blocked);
+                assert_eq!(scheduler.queued_len(), 0);
+                assert!(matches!(
+                    zone.live(record).unwrap().claim(),
+                    carrick_el1_abi::Claim::Parked { seq: parked } if parked == seq
+                ));
+            }
+
+            scheduler.wake_control(root.thread().key()).unwrap();
+            assert!(matches!(
+                zone.live(record).unwrap().claim(),
+                carrick_el1_abi::Claim::Host { .. }
+            ));
+            let running = scheduler.take(&executor).unwrap();
+            let owned = running.lease().blocked_continuation().unwrap();
+            assert_eq!(owned.id(), continuation_id);
+            assert_eq!(owned.zone_wait().unwrap().record, record);
+
+            // This is the scheduler settlement used after a backend refuses load.
+            scheduler
+                .settle_failed(
+                    running,
+                    crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+                )
+                .unwrap();
+            assert!(
+                zone.live(record).is_none(),
+                "failed load retained its zone allocation"
+            );
+            assert_eq!(
+                zone.record(record_id).incarnation(),
+                record.incarnation + 1,
+                "failed-load settlement must retire the record exactly once"
+            );
+            assert!(matches!(
+                root.thread().execution_state(),
+                ThreadExecutionState::Failed { .. }
+            ));
+            assert_eq!(scheduler.queued_len(), 0);
+            let replacement = zone.alloc_host_runnable(identity).unwrap();
+            assert_eq!(replacement, record_id);
+            let replacement_ref = zone.record_ref(replacement);
+            assert_ne!(replacement_ref, record);
+            assert!(zone.live(replacement_ref).is_some());
+            scheduler.publish_zone_handback(record);
+            assert!(
+                zone.live(replacement_ref).is_some(),
+                "late handback retired replacement"
+            );
+            assert_eq!(scheduler.queued_len(), 0);
+            zone.free_record(replacement);
+        }
+
         /// A thread that is merely ABSENT from the exact scheduler registry is not
         /// a reaped thread: the kernel graph has no zombie and no retirement for
         /// it, so nothing proves that generation will never run again. Round 4

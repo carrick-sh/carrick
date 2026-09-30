@@ -1,0 +1,7 @@
+    Checking carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-mem)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+    Checking carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-hal)
+    Checking carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-host-bsd)
+    Checking carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-thread)
+    Checking carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-vfs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.79s

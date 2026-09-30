@@ -968,6 +968,28 @@ impl InZoneRegistry {
             .iter()
             .any(|(k, list)| k.scope == *scope && k.addr.0.port() == port && !list.is_empty())
     }
+
+    /// Test-only seam: force the scope's next ephemeral candidate to an exact
+    /// port. A test that wants to prove the "host already holds the picked
+    /// candidate" skip path needs a port it can guarantee is genuinely
+    /// occupied on the real host without colliding with any other
+    /// concurrently running test. Hardcoding a literal (e.g. `32768`, which
+    /// is also `EPHEMERAL_PORT_START` -- the deterministic first candidate a
+    /// fresh registry always tries) is not that guarantee: any other test in
+    /// the same binary (or a concurrently run copy of the same test) that
+    /// also binds an OS-assigned ephemeral port can win the real host race
+    /// for that literal first. Bind an OS-chosen ephemeral port instead (read
+    /// back via `getsockname`, which the kernel guarantees is exclusively
+    /// this process's for as long as the socket stays open) and seed the
+    /// allocator to try exactly that port first.
+    #[cfg(test)]
+    pub(crate) fn set_next_ephemeral_candidate_for_test(&self, scope: &InZoneScope, port: u16) {
+        self.ephemeral
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .next_port
+            .insert(scope.clone(), port);
+    }
 }
 
 #[cfg(test)]

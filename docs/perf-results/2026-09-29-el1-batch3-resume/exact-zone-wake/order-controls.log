@@ -1,0 +1,11 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.64s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 3 tests
+test kernel::scheduler::tests::zone_handback_authenticates_the_registered_continuation ... ok
+test kernel::scheduler::tests::zone_handback_before_registration_kicks_the_running_owner_once ... ok
+test kernel::scheduler::tests::a_deferred_zone_handback_does_not_audit_a_reaped_target ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2309 filtered out; finished in 0.02s
+

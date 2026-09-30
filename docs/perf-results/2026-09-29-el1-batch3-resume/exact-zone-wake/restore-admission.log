@@ -1,0 +1,15 @@
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-observability)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-hal)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-conformance-contract)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-vfs)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 44.98s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 1 test
+test kernel::scheduler::tests::serial_host::failed_zone_load_settlement_retires_only_its_owned_continuation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2312 filtered out; finished in 0.02s
+

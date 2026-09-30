@@ -1,0 +1,26 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_opemb0DrS as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+open13.c:76: TPASS: read() on original FD : EBADF (9)
+open13.c:78: TPASS: read() on duplicated FD : EBADF (9)
+open13.c:76: TPASS: write() on original FD : EBADF (9)
+open13.c:78: TPASS: write() on duplicated FD : EBADF (9)
+open13.c:76: TPASS: fchmod() on original FD : EBADF (9)
+open13.c:78: TPASS: fchmod() on duplicated FD : EBADF (9)
+open13.c:76: TPASS: fchown() on original FD : EBADF (9)
+open13.c:78: TPASS: fchown() on duplicated FD : EBADF (9)
+open13.c:76: TPASS: ioctl() on original FD : EBADF (9)
+open13.c:78: TPASS: ioctl() on duplicated FD : EBADF (9)
+open13.c:76: TPASS: mmap() on original FD : EBADF (9)
+open13.c:78: TPASS: mmap() on duplicated FD : EBADF (9)
+open13.c:76: TPASS: fgetxattr() on original FD : EBADF (9)
+open13.c:78: TPASS: fgetxattr() on duplicated FD : EBADF (9)
+
+Summary:
+passed   14
+failed   0
+broken   0
+skipped  0
+warnings 0

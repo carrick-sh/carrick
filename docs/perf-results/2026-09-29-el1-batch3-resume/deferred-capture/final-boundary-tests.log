@@ -1,0 +1,12 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 43.25s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 4 tests
+test el1_zone::tests::deferred_capture_precedes_filter_and_releases_queue_authority ... ok
+test el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record ... ok
+test el1_zone::tests::deferred_slot_handback_preserves_live_records ... ok
+test el1_zone::tests::serial_host::deferred_capture_does_not_hold_publisher_registration ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2311 filtered out; finished in 0.08s
+

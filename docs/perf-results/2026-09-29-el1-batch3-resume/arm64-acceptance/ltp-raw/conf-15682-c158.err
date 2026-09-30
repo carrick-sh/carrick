@@ -1,0 +1,20 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_reaDdbN6q as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+readlink03.c:81: TPASS: readlink() failed as expected: EACCES (13)
+readlink03.c:81: TPASS: readlink() failed as expected: EINVAL (22)
+readlink03.c:81: TPASS: readlink() failed as expected: EINVAL (22)
+readlink03.c:81: TPASS: readlink() failed as expected: ENAMETOOLONG (36)
+readlink03.c:81: TPASS: readlink() failed as expected: ENOENT (2)
+readlink03.c:81: TPASS: readlink() failed as expected: ENOTDIR (20)
+readlink03.c:81: TPASS: readlink() failed as expected: ELOOP (40)
+readlink03.c:81: TPASS: readlink() failed as expected: EFAULT (14)
+
+Summary:
+passed   8
+failed   0
+broken   0
+skipped  0
+warnings 0

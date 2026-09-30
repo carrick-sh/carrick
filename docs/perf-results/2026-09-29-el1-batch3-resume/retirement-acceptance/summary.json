@@ -1,0 +1,33 @@
+{
+  "rows": 20,
+  "match": 20,
+  "unique_run_ids": 20,
+  "carrick_ms_min": 1681,
+  "carrick_ms_max": 2092,
+  "oracle_ms": [
+    1228
+  ],
+  "controlled_performance_acceptance": false,
+  "run_ids": [
+    "conf-37337-c00",
+    "conf-37373-c00",
+    "conf-37403-c00",
+    "conf-37435-c00",
+    "conf-37463-c00",
+    "conf-37516-c00",
+    "conf-37550-c00",
+    "conf-37584-c00",
+    "conf-37613-c00",
+    "conf-37644-c00",
+    "conf-37697-c00",
+    "conf-37727-c00",
+    "conf-37756-c00",
+    "conf-37787-c00",
+    "conf-37840-c00",
+    "conf-37871-c00",
+    "conf-37901-c00",
+    "conf-37931-c00",
+    "conf-37960-c00",
+    "conf-38006-c00"
+  ]
+}

@@ -1,0 +1,8 @@
+python3 scripts/conformance/check-contract-change.py --root . --base afcf8676e --head HEAD
+error: uncovered guest surface: crates/carrick-sched-core/src/lib.rs (contract: kernel.el1.deferred-handback-identity) requires contract/test evidence
+error: uncovered guest surface: crates/carrick-el1-abi/src/lib.rs (contract: kernel.el1.gic) requires contract/test evidence
+error: uncovered guest surface: crates/carrick-el1-abi/src/lib.rs (contract: kernel.el1.fault-entry) requires contract/test evidence
+error: uncovered guest surface: crates/carrick-el1-abi/src/lib.rs (contract: kernel.el1.metadata-allocation) requires contract/test evidence
+error: uncovered guest surface: crates/carrick-el1-abi/src/lib.rs (contract: kernel.el1.stage1-publication) requires contract/test evidence
+error: uncovered guest surface: crates/carrick-kernel/src/el1_zone.rs (contract: kernel.el1.deferred-handback-identity) requires contract/test evidence
+error: recipe `check-contract-change` failed on line 936 with exit code 1

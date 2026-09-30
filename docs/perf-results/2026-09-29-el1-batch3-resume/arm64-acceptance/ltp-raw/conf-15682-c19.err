@@ -1,0 +1,15 @@
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+dup201.c:45: TPASS: dup2(-1, 5) : EBADF (9)
+dup201.c:45: TPASS: dup2(1048576, 5) : EBADF (9)
+dup201.c:45: TPASS: dup2(0, -1) : EBADF (9)
+dup201.c:45: TPASS: dup2(0, 1048576) : EBADF (9)
+
+Summary:
+passed   4
+failed   0
+broken   0
+skipped  0
+warnings 0

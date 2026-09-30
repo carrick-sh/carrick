@@ -1,0 +1,23 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_staH1EqwL as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+statx01.c:103: TPASS: statx(AT_FDCWD, test_file, 0, 0, &buff)
+statx01.c:110: TPASS: stx_uid(0) is correct
+statx01.c:116: TPASS: stx_gid(0) is correct
+statx01.c:122: TPASS: stx_size(256) is correct
+statx01.c:130: TPASS: stx_mode(33188) is correct
+statx01.c:136: TPASS: stx_blocks(8) is valid
+statx01.c:143: TPASS: stx_nlink(1) is correct
+statx01.c:60: TCONF: stx_mnt_id is not supported until linux 5.8
+statx01.c:161: TPASS: statx(AT_FDCWD, mntpoint/blk_dev, 0, 0, &buff)
+statx01.c:168: TPASS: stx_rdev_major(8) is correct
+statx01.c:176: TPASS: stx_rdev_minor(1) is correct
+
+Summary:
+passed   10
+failed   0
+broken   0
+skipped  1
+warnings 0

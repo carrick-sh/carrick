@@ -1,0 +1,10 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.67s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 2 tests
+test el1_zone::tests::deferred_slot_handback_preserves_live_records ... ok
+test el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2307 filtered out; finished in 0.00s
+

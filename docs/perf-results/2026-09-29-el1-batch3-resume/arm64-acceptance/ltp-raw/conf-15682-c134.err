@@ -1,0 +1,17 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_pwrGmfL2S as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+pwrite02.c:71: TPASS: pwrite(4, 1024, 0) : ESPIPE (29)
+pwrite02.c:71: TPASS: pwrite(5, 1024, -1) : EINVAL (22)
+pwrite02.c:71: TPASS: pwrite(-1, 1024, 0) : EBADF (9)
+pwrite02.c:71: TPASS: pwrite(6, 1024, 0) : EBADF (9)
+pwrite02.c:71: TPASS: pwrite(5, 1024, 0) : EFAULT (14)
+
+Summary:
+passed   5
+failed   0
+broken   0
+skipped  0
+warnings 0

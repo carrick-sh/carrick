@@ -1,0 +1,83 @@
+== CPython 3.12.13 (main, Aug 5 2026, 03:49:12) [GCC 14.2.0]
+== Linux-6.12.0-carrick-aarch64-with-glibc2.41 little-endian
+== Python build: release shared LTO+PGO
+== cwd: /tmp/test_python_worker_1æ
+== CPU count: 4
+== encodings: locale=UTF-8 FS=utf-8
+== resources: all test resources are disabled, use -u option to unskip tests
+
+Using random seed: 0
+0:00:00 load avg: 0.00 Run 8 tests sequentially in a single process
+0:00:00 load avg: 0.00 [1/8] test_concurrent_futures.test_process_pool
+test_free_reference (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_free_reference) ... 0.09s ok
+test_idle_process_reuse_multiple (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_idle_process_reuse_multiple) ... skipped 'Incompatible with the fork start method.'
+0.00s test_idle_process_reuse_one (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_idle_process_reuse_one) ... skipped 'Incompatible with the fork start method.'
+0.00s test_killed_child (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_killed_child) ... 0.07s ok
+test_map (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_map) ... 0.09s ok
+test_map_chunksize (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_map_chunksize) ... 0.09s ok
+test_map_exception (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_map_exception) ... 0.10s ok
+test_map_timeout (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_map_timeout) ... skipped "resource 'walltime' is not enabled"
+test_max_tasks_early_shutdown (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_max_tasks_early_shutdown) ... skipped 'Incompatible with the fork start method.'
+0.01s test_max_tasks_per_child (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_max_tasks_per_child) ... 0.01s ok
+test_max_tasks_per_child_defaults_to_spawn_context (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_max_tasks_per_child_defaults_to_spawn_context) ... 0.02s ok
+test_max_workers_negative (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_max_workers_negative) ... 0.01s ok
+test_max_workers_too_large (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_max_workers_too_large) ... skipped 'Windows-only process limit'
+test_no_stale_references (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_no_stale_references) ... 0.10s ok
+test_python_finalization_error (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_python_finalization_error) ... 0.05s ok
+test_ressources_gced_in_workers (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_ressources_gced_in_workers) ... 0.20s ok
+test_saturation (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_saturation) ... 0.12s ok
+test_shutdown_race_issue12456 (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_shutdown_race_issue12456) ... 0.11s ok
+test_submit (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_submit) ... 0.10s ok
+test_submit_keyword (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_submit_keyword) ... 0.10s ok
+test_traceback (test.test_concurrent_futures.test_process_pool.ProcessPoolForkProcessPoolExecutorTest.test_traceback) ... 0.11s ok
+test_free_reference (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_free_reference) ... 0.17s ok
+test_idle_process_reuse_multiple (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_idle_process_reuse_multiple) ... 0.06s ok
+test_idle_process_reuse_one (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_idle_process_reuse_one) ... 0.05s ok
+test_killed_child (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_killed_child) ... 0.01s ok
+test_map (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_map) ... 0.07s ok
+test_map_chunksize (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_map_chunksize) ... 0.09s ok
+test_map_exception (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_map_exception) ... 0.07s ok
+test_map_timeout (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_map_timeout) ... skipped "resource 'walltime' is not enabled"
+test_max_tasks_early_shutdown (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_max_tasks_early_shutdown) ... 0.23s ok
+test_max_tasks_per_child (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_max_tasks_per_child) ... 0.06s ok
+test_max_tasks_per_child_defaults_to_spawn_context (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_max_tasks_per_child_defaults_to_spawn_context) ... 0.01s ok
+test_max_workers_negative (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_max_workers_negative) ... 0.01s ok
+test_max_workers_too_large (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_max_workers_too_large) ... skipped 'Windows-only process limit'
+test_no_stale_references (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_no_stale_references) ... 0.05s ok
+test_python_finalization_error (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_python_finalization_error) ... 0.03s ok
+test_ressources_gced_in_workers (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_ressources_gced_in_workers) ... 0.11s ok
+test_saturation (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_saturation) ... 0.11s ok
+test_shutdown_race_issue12456 (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_shutdown_race_issue12456) ... 0.09s ok
+test_submit (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_submit) ... 0.03s ok
+test_submit_keyword (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_submit_keyword) ... 0.04s ok
+test_traceback (test.test_concurrent_futures.test_process_pool.ProcessPoolForkserverProcessPoolExecutorTest.test_traceback) ... 0.05s ok
+test_free_reference (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_free_reference) ... 0.14s ok
+test_idle_process_reuse_multiple (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_idle_process_reuse_multiple) ... 0.13s ok
+test_idle_process_reuse_one (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_idle_process_reuse_one) ... 0.08s ok
+test_killed_child (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_killed_child) ... 0.01s ok
+test_map (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_map) ... 0.11s ok
+test_map_chunksize (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_map_chunksize) ... 0.10s ok
+test_map_exception (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_map_exception) ... 0.08s ok
+test_map_timeout (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_map_timeout) ... skipped "resource 'walltime' is not enabled"
+test_max_tasks_early_shutdown (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_max_tasks_early_shutdown) ... 0.23s ok
+test_max_tasks_per_child (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_max_tasks_per_child) ... 0.12s ok
+test_max_tasks_per_child_defaults_to_spawn_context (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_max_tasks_per_child_defaults_to_spawn_context) ... 0.01s ok
+test_max_workers_negative (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_max_workers_negative) ... 0.01s ok
+test_max_workers_too_large (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_max_workers_too_large) ... skipped 'Windows-only process limit'
+test_no_stale_references (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_no_stale_references) ... 0.08s ok
+test_python_finalization_error (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_python_finalization_error) ... 0.02s ok
+test_ressources_gced_in_workers (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_ressources_gced_in_workers) ... 0.16s ok
+test_saturation (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_saturation) ... 0.10s ok
+test_shutdown_race_issue12456 (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_shutdown_race_issue12456) ... 0.12s ok
+test_submit (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_submit) ... 0.06s ok
+test_submit_keyword (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_submit_keyword) ... 0.08s ok
+test_traceback (test.test_concurrent_futures.test_process_pool.ProcessPoolSpawnProcessPoolExecutorTest.test_traceback) ... 0.08s ok
+
+----------------------------------------------------------------------
+Ran 63 tests in 4.485s
+
+OK (skipped=9)
+0:00:04 load avg: 0.00 [1/8] test_concurrent_futures.test_process_pool passed
+0:00:04 load avg: 0.00 [2/8] test_concurrent_futures.test_deadlock
+test_crash_at_task_unpickle (test.test_concurrent_futures.test_deadlock.ProcessPoolForkExecutorDeadlockTest.test_crash_at_task_unpickle) ... 0.06s ok
+test_crash_big_data (test.test_concurrent_futures.test_deadlock.ProcessPoolForkExecutorDeadlockTest.test_crash_big_data) ... 
