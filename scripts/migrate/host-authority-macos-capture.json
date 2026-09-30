@@ -9007,15 +9007,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 36608,
-        "byte_start": 36592,
+        "byte_end": 38815,
+        "byte_start": 38799,
         "column": 48,
         "column_end": 64,
         "column_start": 48,
         "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-        "line": 1008,
-        "line_end": 1008,
-        "line_start": 1008
+        "line": 1061,
+        "line_end": 1061,
+        "line_start": 1061
       }
     },
     {
@@ -11937,9 +11937,9 @@
       }
     }
   ],
-  "rows_sha256": "3f580b11a22786019757c74ddfb2b2bc5296ff09fc9ca86779f0c1e33cd7c1f7",
+  "rows_sha256": "08765e5c52060969bdbfeba39363e03f266b6dad818e6247024e03c42b42f0b5",
   "schema": 1,
-  "source_head": "74157affad6f0f9aacfa99b240fc7077a41fd9eb",
+  "source_head": "413ce632918dd4563cdd14250a0f7c76e3c2637a",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
