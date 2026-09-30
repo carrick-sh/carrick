@@ -2336,7 +2336,7 @@ fn a_stale_alias_row_never_retires_the_recycled_lease_successor() {
         frames.stage2_references.insert(lease, 1);
     }
     let row = |owner_generation| AliasBacking {
-        start: 0x6000_126c_000,
+        start: 0x0060_0126_c000,
         ipa: lease.0,
         host_addr: 0x7000_0000,
         size: 0x4000,
