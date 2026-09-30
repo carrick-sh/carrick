@@ -340,10 +340,10 @@
       "file": "crates/carrick-kernel/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 1,
-      "fingerprint": "8636a36a84f09430ca670e5061b2e520d72edfaf6b0ff161603dc759b285d880",
+      "fingerprint": "d5ed85b1f7aff9fa0122b44414fae20df438f273bfd90d0e810f11e18c414f02",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::brk",
-      "rationale": "protect_range failed during brk heap expansion; leaves heap in invalid memory protection state. Re-reviewed 2026-09-29: unchanged abort; the fatal message now carries the range and the protect error.",
+      "rationale": "protect_range failed during brk heap expansion; leaves heap in invalid memory protection state. Re-reviewed 2026-09-29: unchanged abort; the fatal message now carries the range and the protect error. Re-reviewed 2026-09-30: unchanged abort; brk now reads its break through BreakAuthority, moving the fingerprint.",
       "sink": "fatal",
       "domain": "dispatch::brk"
     },
@@ -351,10 +351,10 @@
       "file": "crates/carrick-kernel/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 2,
-      "fingerprint": "8636a36a84f09430ca670e5061b2e520d72edfaf6b0ff161603dc759b285d880",
+      "fingerprint": "2a6d73c1f4ceb88e6bb9bccaf5f11effff8e424215fa2ba2e830946d7fc8e79c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::brk",
-      "rationale": "protect_range failed during brk heap contraction; leaves contracted heap in invalid memory protection state. Re-reviewed 2026-09-29: unchanged abort; the fatal message now carries the range and the protect error.",
+      "rationale": "protect_range failed during brk heap contraction; leaves contracted heap in invalid memory protection state. Re-reviewed 2026-09-29: unchanged abort; the fatal message now carries the range and the protect error. Re-reviewed 2026-09-30: unchanged abort; brk now reads its break through BreakAuthority, moving the fingerprint.",
       "sink": "fatal",
       "domain": "dispatch::brk"
     },
@@ -362,10 +362,10 @@
       "file": "crates/carrick-kernel/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 3,
-      "fingerprint": "8636a36a84f09430ca670e5061b2e520d72edfaf6b0ff161603dc759b285d880",
+      "fingerprint": "2a6d73c1f4ceb88e6bb9bccaf5f11effff8e424215fa2ba2e830946d7fc8e79c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::brk",
-      "rationale": "zero_backing failed during brk heap contraction; cannot safely scrub contracted heap backing for reuse. Re-reviewed 2026-09-29: unchanged abort; the fatal message now carries the range and the protect error.",
+      "rationale": "zero_backing failed during brk heap contraction; cannot safely scrub contracted heap backing for reuse. Re-reviewed 2026-09-29: unchanged abort; the fatal message now carries the range and the protect error. Re-reviewed 2026-09-30: unchanged abort; brk now reads its break through BreakAuthority, moving the fingerprint.",
       "sink": "fatal",
       "domain": "dispatch::brk"
     },
@@ -2966,6 +2966,17 @@
       "rationale": "An armed borrowed-TTBR0 admission must record residency on release; failure means the target ASID's retirement could skip the broadcast invalidation owed for the caller vCPU's cached translations.",
       "sink": "fatal",
       "domain": "hvpatch::stage1_mm"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/brk.rs",
+      "function": "BreakAuthority::observe",
+      "ordinal_in_function": 1,
+      "fingerprint": "221fa0a2a5906589440840f76017dd348e6629ec8e9a5fd089ff352d8dbaf864",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::brk",
+      "rationale": "A delegated break is read from the MM's own admitted reservation root under the MM's host lock; the root refusing or missing for that exact MM means the break has no owner, and returning a guessed value would split brk(2) authority.",
+      "sink": "fatal",
+      "domain": "dispatch::brk"
     }
   ]
 }
