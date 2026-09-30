@@ -17,7 +17,7 @@ const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
-const VERSION: u64 = 2;
+const VERSION: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -37,6 +37,9 @@ pub struct Mapping {
     pub protection: ReservationProtection,
     /// Non-anonymous mappings participate in placement but cannot be edited.
     pub anonymous: bool,
+    /// Insertion-time attributes; anything but plain private anonymous is
+    /// host-owned and every EL1 edit touching it forwards.
+    pub flags: ReservationNodeFlags,
     pub generation: ReservationGeneration,
 }
 
@@ -59,6 +62,19 @@ pub enum Placement {
     Hint(u64),
     Fixed(u64),
     NoReplace(u64),
+}
+
+/// `mremap(2)` destination policy for [`Reservations::mremap`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTarget {
+    /// No `MREMAP_MAYMOVE`: resize in place or fail with ENOMEM.
+    InPlace,
+    /// `MREMAP_MAYMOVE`: resize in place when the following range is free,
+    /// otherwise relocate to a first-fit arena range.
+    MayMove,
+    /// `MREMAP_MAYMOVE | MREMAP_FIXED`: relocate to exactly this address,
+    /// replacing root-editable anonymous nodes there.
+    Fixed(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +100,9 @@ struct Pending {
     request: ReservationRequest,
     result: u64,
     new_brk: u64,
-    nodes: [u32; 3],
+    /// Spare nodes: split at each edited range boundary (two for `range`,
+    /// two more for a `Move` source) plus the new node.
+    nodes: [u32; 5],
 }
 
 #[repr(C)]
@@ -122,7 +140,43 @@ struct NodeData {
     left: u32,
     right: u32,
     height: u32,
-    anonymous: u32,
+    flags: u32,
+}
+impl NodeData {
+    fn flags(&self) -> ReservationNodeFlags {
+        // Nodes are only written from validated flags.
+        ReservationNodeFlags::from_bits(self.flags).unwrap_or(ReservationNodeFlags::EMPTY)
+    }
+    fn protection(&self) -> ReservationProtection {
+        ReservationProtection::from_bits(self.prot).unwrap_or(ReservationProtection::NONE)
+    }
+    fn charged_data(&self) -> u64 {
+        if self.flags().charges_data(self.protection()) {
+            self.end - self.start
+        } else {
+            0
+        }
+    }
+}
+
+#[derive(Default)]
+struct CopyList {
+    head: u32,
+    tail: u32,
+    len: usize,
+}
+
+/// Pre-allocated nodes for one committed edit. Every split consumes at most
+/// one; the caller proves sufficiency before the first mutation.
+struct Spares([u32; 5]);
+impl Spares {
+    fn available(&self) -> usize {
+        self.0.iter().filter(|id| **id != 0).count()
+    }
+    fn take(&mut self) -> u32 {
+        let slot = self.0.iter_mut().find(|id| **id != 0);
+        core::mem::take(slot.expect("spare sufficiency proven before mutation"))
+    }
 }
 #[repr(C)]
 struct Node {
@@ -392,7 +446,8 @@ impl Reservations<'_> {
                 return Some(Mapping {
                     range: ReservationRange::new(n.start, n.end)?,
                     protection: ReservationProtection::from_bits(n.prot)?,
-                    anonymous: n.anonymous != 0,
+                    anonymous: n.flags().contains(ReservationNodeFlags::ANONYMOUS),
+                    flags: n.flags(),
                     generation: self.generation(),
                 });
             }
@@ -421,7 +476,8 @@ impl Reservations<'_> {
             range: ReservationRange::new(node.start, node.end).expect("reservation range"),
             protection: ReservationProtection::from_bits(node.prot)
                 .expect("reservation protection"),
-            anonymous: node.anonymous != 0,
+            anonymous: node.flags().contains(ReservationNodeFlags::ANONYMOUS),
+            flags: node.flags(),
             generation: self.generation(),
         });
         self.observe_tree(node.right, visit);
@@ -492,13 +548,7 @@ impl Reservations<'_> {
             .max(if n.left == 0 { 0 } else { n.start - l.last })
             .max(if n.right == 0 { 0 } else { r.first - n.end });
         n.bytes = l.bytes + r.bytes + n.end - n.start;
-        n.data = l.data
-            + r.data
-            + if n.anonymous != 0 && n.prot & 2 != 0 {
-                n.end - n.start
-            } else {
-                0
-            };
+        n.data = l.data + r.data + n.charged_data();
         self.write(id, n);
         id
     }
@@ -582,7 +632,7 @@ impl Reservations<'_> {
             n.start = successor.start;
             n.end = successor.end;
             n.prot = successor.prot;
-            n.anonymous = successor.anonymous;
+            n.flags = successor.flags;
             (n.right, freed) = self.erase(n.right, successor.start);
         }
         self.write(root, n);
@@ -641,6 +691,13 @@ impl Reservations<'_> {
             .iter()
             .any(|r| r.start() <= range.start() && range.end() <= r.end())
     }
+    /// Whether one node straddles `address` (so an edit boundary there splits it).
+    fn straddles(&mut self, address: u64) -> bool {
+        self.next(address).is_some_and(|n| n.start < address)
+    }
+    fn splits_needed(&mut self, range: ReservationRange) -> usize {
+        usize::from(self.straddles(range.start())) + usize::from(self.straddles(range.end()))
+    }
     #[allow(clippy::too_many_arguments)]
     fn proposal(
         &mut self,
@@ -650,6 +707,7 @@ impl Reservations<'_> {
         result: u64,
         new_brk: u64,
         require_coverage: bool,
+        source: Option<ReservationRange>,
     ) -> Result<Decision, Refusal> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
@@ -667,7 +725,8 @@ impl Reservations<'_> {
             if n.start >= range.end() {
                 break;
             }
-            if n.anonymous == 0 {
+            // Opaque and attributed nodes are host-owned: forward the edit.
+            if !n.flags().root_editable() {
                 return Err(Refusal::ForeignMapping);
             }
             if require_coverage && n.start > cursor {
@@ -675,7 +734,7 @@ impl Reservations<'_> {
             }
             let overlap = n.end.min(range.end()) - n.start.max(cursor);
             bytes += overlap;
-            if n.prot & 2 != 0 {
+            if n.flags().charges_data(n.protection()) {
                 data += overlap;
             }
             cursor = n.end.min(range.end());
@@ -686,12 +745,24 @@ impl Reservations<'_> {
         if require_coverage && cursor != range.end() {
             return Err(Refusal::Hole);
         }
+        // A move retires its whole source (one root-editable node, checked
+        // by the caller) in the same proposal.
+        if let Some(source) = source {
+            bytes += source.len();
+            if ReservationNodeFlags::ANONYMOUS_PRIVATE.charges_data(prot) {
+                data += source.len();
+            }
+        }
         let added = if operation == ReservationOperation::Retire {
             0
         } else {
             range.len()
         };
-        let added_data = if prot.bits() & 2 != 0 { added } else { 0 };
+        let added_data = if ReservationNodeFlags::ANONYMOUS_PRIVATE.charges_data(prot) {
+            added
+        } else {
+            0
+        };
         let tree = self.read(self.state().tree);
         let layout = self.state().layout;
         let total = tree.bytes - bytes;
@@ -715,29 +786,14 @@ impl Reservations<'_> {
             .generation
             .checked_add(1)
             .ok_or(Refusal::Stale)?;
-        let mut nodes = [0; 3];
-        let needed = [
-            self.next(range.start())
-                .is_some_and(|n| n.start < range.start() && n.end > range.start()),
-            self.next(range.end() - 1)
-                .is_some_and(|n| n.start < range.end() && n.end > range.end()),
-            operation != ReservationOperation::Retire,
-        ];
-        for slot in 0..nodes.len() {
-            if !needed[slot] {
-                continue;
-            }
-            let node = match self.table.allocate(self.banks, self.node_capacity) {
-                Ok(node) => node,
-                Err(reason) => {
-                    for node in nodes {
-                        self.table.release(node, self.banks);
-                    }
-                    return Err(reason);
-                }
-            };
-            nodes[slot] = node;
-        }
+        let needed = if source.is_some() {
+            // Four boundaries plus the destination node; a shared straddler
+            // between source and destination may need a split at each.
+            5
+        } else {
+            self.splits_needed(range) + usize::from(operation != ReservationOperation::Retire)
+        };
+        let nodes = self.allocate_spares(needed)?;
         let request = ReservationRequest {
             mm: self.mm,
             generation: self.generation(),
@@ -745,6 +801,7 @@ impl Reservations<'_> {
             range,
             protection: prot,
             operation,
+            source,
         };
         self.state_mut().sequence = sequence;
         self.state_mut().pending = Some(Pending {
@@ -754,6 +811,25 @@ impl Reservations<'_> {
             nodes,
         });
         Ok(Decision::Work(request))
+    }
+    /// One bounded allocation attempt per spare; failure returns every node.
+    fn allocate_spares(&mut self, needed: usize) -> Result<[u32; 5], Refusal> {
+        let mut nodes = [0; 5];
+        for slot in nodes.iter_mut().take(needed) {
+            match self.table.allocate(self.banks, self.node_capacity) {
+                Ok(node) => *slot = node,
+                Err(reason) => {
+                    self.release_spares(nodes);
+                    return Err(reason);
+                }
+            }
+        }
+        Ok(nodes)
+    }
+    fn release_spares(&mut self, nodes: [u32; 5]) {
+        for node in nodes {
+            self.table.release(node, self.banks);
+        }
     }
     pub fn mmap(
         &mut self,
@@ -778,15 +854,21 @@ impl Reservations<'_> {
             Placement::Anywhere => self.first_fit(len).ok_or(Refusal::Limit)?,
             Placement::Hint(addr) => {
                 let addr = addr & !4095;
-                let hinted = addr
+                match addr
                     .checked_add(len)
-                    .and_then(|end| ReservationRange::new(addr, end));
-                if hinted.is_some_and(|r| {
-                    self.in_layout(r) && self.next(addr).is_none_or(|n| n.start >= r.end())
-                }) {
-                    addr
-                } else {
-                    self.first_fit(len).ok_or(Refusal::Limit)?
+                    .and_then(|end| ReservationRange::new(addr, end))
+                {
+                    Some(r) if self.in_layout(r) => {
+                        if self.next(addr).is_none_or(|n| n.start >= r.end()) {
+                            addr
+                        } else {
+                            self.first_fit(len).ok_or(Refusal::Limit)?
+                        }
+                    }
+                    // Linux honours a free hint anywhere; the host serves
+                    // out-of-arena hints (Go's 0xc000000000 probe) with alias
+                    // VAs. Relocating here would give a second answer.
+                    _ => return Err(Refusal::ForeignMapping),
                 }
             }
         };
@@ -804,6 +886,7 @@ impl Reservations<'_> {
             address,
             self.brk_current(),
             false,
+            None,
         )
     }
     pub fn munmap(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
@@ -814,6 +897,7 @@ impl Reservations<'_> {
             0,
             self.brk_current(),
             false,
+            None,
         )
     }
     pub fn mprotect(
@@ -828,6 +912,110 @@ impl Reservations<'_> {
             0,
             self.brk_current(),
             true,
+            None,
+        )
+    }
+    /// `mremap(2)` of an anonymous range as one proposal. `source` must lie in
+    /// one root-editable node (`Hole` otherwise: the decoder's EFAULT);
+    /// host-owned sources and out-of-layout growth are `ForeignMapping`.
+    /// Shrink retires the tail, in-place growth prepares the extension, and a
+    /// relocation is one `Move` whose completion retires the source and
+    /// prepares the destination atomically.
+    pub fn mremap(
+        &mut self,
+        source: ReservationRange,
+        new_len: u64,
+        target: MoveTarget,
+    ) -> Result<Decision, Refusal> {
+        if !self.state().admitted {
+            return Err(Refusal::Stale);
+        }
+        if self.pending().is_some() {
+            return Err(Refusal::Busy);
+        }
+        if new_len == 0 || matches!(target, MoveTarget::Fixed(addr) if !addr.is_multiple_of(4096)) {
+            return Err(Refusal::Invalid);
+        }
+        let new_len = new_len
+            .checked_add(4095)
+            .map(|v| v & !4095)
+            .ok_or(Refusal::Limit)?;
+        let node = self
+            .next(source.start())
+            .filter(|n| n.start <= source.start() && n.end >= source.end())
+            .ok_or(Refusal::Hole)?;
+        if !node.flags().root_editable() {
+            return Err(Refusal::ForeignMapping);
+        }
+        let prot = node.protection();
+        let brk = self.brk_current();
+        if let MoveTarget::Fixed(address) = target {
+            let range = address
+                .checked_add(new_len)
+                .and_then(|end| ReservationRange::new(address, end))
+                .ok_or(Refusal::Invalid)?;
+            if range.start() < source.end() && source.start() < range.end() {
+                return Err(Refusal::Invalid);
+            }
+            return self.proposal(
+                range,
+                prot,
+                ReservationOperation::Move,
+                address,
+                brk,
+                false,
+                Some(source),
+            );
+        }
+        if new_len <= source.len() {
+            if new_len == source.len() {
+                return Ok(Decision::Complete(source.start()));
+            }
+            let tail = ReservationRange::new(source.start() + new_len, source.end())
+                .ok_or(Refusal::Invalid)?;
+            return self.proposal(
+                tail,
+                ReservationProtection::NONE,
+                ReservationOperation::Retire,
+                source.start(),
+                brk,
+                false,
+                None,
+            );
+        }
+        let extension = source
+            .start()
+            .checked_add(new_len)
+            .and_then(|end| ReservationRange::new(source.end(), end));
+        let free =
+            extension.is_some_and(|r| self.next(r.start()).is_none_or(|n| n.start >= r.end()));
+        if let Some(extension) = extension.filter(|_| free) {
+            if !self.in_layout(extension) {
+                return Err(Refusal::ForeignMapping);
+            }
+            return self.proposal(
+                extension,
+                prot,
+                ReservationOperation::Prepare,
+                source.start(),
+                brk,
+                false,
+                None,
+            );
+        }
+        if target == MoveTarget::InPlace {
+            return Err(Refusal::Limit);
+        }
+        let address = self.first_fit(new_len).ok_or(Refusal::Limit)?;
+        let range = ReservationRange::new(address, address + new_len).ok_or(Refusal::Invalid)?;
+        self.proposal(
+            range,
+            prot,
+            ReservationOperation::Move,
+            address,
+            brk,
+            false,
+            Some(source),
         )
     }
     pub fn brk(&mut self, requested: u64) -> Result<Decision, Refusal> {
@@ -869,9 +1057,44 @@ impl Reservations<'_> {
         } else {
             (ReservationProtection::NONE, ReservationOperation::Retire)
         };
-        match self.proposal(range, prot, op, requested, requested, false) {
+        match self.proposal(range, prot, op, requested, requested, false, None) {
             Err(Refusal::Limit | Refusal::ForeignMapping) => Ok(Decision::Complete(old)),
             result => result,
+        }
+    }
+    /// Split the node straddling `address`, both halves keeping its attributes.
+    fn split_at(&mut self, address: u64, spares: &mut Spares) {
+        let Some(n) = self.next(address).filter(|n| n.start < address) else {
+            return;
+        };
+        let (tree, freed) = self.erase(self.state().tree, n.start);
+        self.state_mut().tree = tree;
+        let mut low = n;
+        low.end = address;
+        low.left = 0;
+        low.right = 0;
+        let mut high = low;
+        high.start = address;
+        high.end = n.end;
+        self.write(freed, low);
+        let tree = self.insert(self.state().tree, freed);
+        self.state_mut().tree = tree;
+        let id = spares.take();
+        self.write(id, high);
+        let tree = self.insert(self.state().tree, id);
+        self.state_mut().tree = tree;
+    }
+    /// Remove every node inside `range`, keeping straddlers' outside pieces.
+    fn remove_range(&mut self, range: ReservationRange, spares: &mut Spares) {
+        self.split_at(range.start(), spares);
+        self.split_at(range.end(), spares);
+        while let Some(n) = self.next(range.start()) {
+            if n.start >= range.end() {
+                break;
+            }
+            let (tree, freed) = self.erase(self.state().tree, n.start);
+            self.state_mut().tree = tree;
+            self.table.release(freed, self.banks);
         }
     }
     pub fn complete(&mut self, completion: ReservationCompletion) -> Result<u64, Refusal> {
@@ -883,48 +1106,35 @@ impl Reservations<'_> {
             return Err(Refusal::Stale);
         }
         let range = pending.request.range;
-        let first = self
-            .next(range.start())
-            .filter(|n| n.start < range.start() && n.end > range.start());
-        let last = self
-            .next(range.end() - 1)
-            .filter(|n| n.start < range.end() && n.end > range.end());
-        while let Some(n) = self.next(range.start()) {
-            if n.start >= range.end() {
-                break;
-            }
-            let (tree, freed) = self.erase(self.state().tree, n.start);
-            self.state_mut().tree = tree;
-            self.table.release(freed, self.banks);
+        let creates = pending.request.operation != ReservationOperation::Retire;
+        let mut spares = Spares(pending.nodes);
+        // The pending proposal excluded every other edit, so these are the
+        // splits counted at proposal time; prove it before mutating.
+        let required = pending.request.source.map_or(0, |s| self.splits_needed(s))
+            + self.splits_needed(range)
+            + usize::from(creates);
+        if spares.available() < required {
+            return Err(Refusal::Stale);
         }
-        let mut pieces = [None; 3];
-        pieces[0] = first.map(|mut n| {
-            n.end = range.start();
-            n
-        });
-        pieces[1] = last.map(|mut n| {
-            n.start = range.end();
-            n
-        });
-        if pending.request.operation != ReservationOperation::Retire {
-            pieces[2] = Some(NodeData {
-                start: range.start(),
-                end: range.end(),
-                prot: pending.request.protection.bits(),
-                anonymous: 1,
-                ..NodeData::default()
-            });
+        if let Some(source) = pending.request.source {
+            self.remove_range(source, &mut spares);
         }
-        for (id, piece) in pending.nodes.into_iter().zip(pieces) {
-            if let Some(mut n) = piece {
-                n.left = 0;
-                n.right = 0;
-                self.write(id, n);
-                self.insert_coalescing(id);
-            } else {
-                self.table.release(id, self.banks);
-            }
+        self.remove_range(range, &mut spares);
+        if creates {
+            let id = spares.take();
+            self.write(
+                id,
+                NodeData {
+                    start: range.start(),
+                    end: range.end(),
+                    prot: pending.request.protection.bits(),
+                    flags: ReservationNodeFlags::ANONYMOUS_PRIVATE.bits(),
+                    ..NodeData::default()
+                },
+            );
+            self.insert_coalescing(id);
         }
+        self.release_spares(spares.0);
         self.state_mut().layout.brk = pending.new_brk;
         self.state_mut().generation += 1;
         self.state_mut().pending = None;
@@ -935,11 +1145,18 @@ impl Reservations<'_> {
         if pending.request != request {
             return Err(Refusal::Stale);
         }
-        for node in pending.nodes {
-            self.table.release(node, self.banks);
-        }
+        self.release_spares(pending.nodes);
         self.state_mut().pending = None;
         Ok(())
+    }
+    /// Push the host's current `RLIMIT_AS`/`RLIMIT_DATA` (bytes; `u64::MAX`
+    /// for infinity). Later proposals that grow past them refuse with
+    /// `Limit` (ENOMEM; brk keeps the old break); shrinking stays possible.
+    /// Existing mappings and fault grants are unaffected, so no new generation.
+    pub fn set_limits(&mut self, address_limit: u64, data_limit: u64) {
+        let layout = &mut self.state_mut().layout;
+        layout.address_limit = address_limit;
+        layout.data_limit = data_limit;
     }
     /// Host admission of an existing mapping, before the guest lane is opened.
     /// The caller supplies the complete current snapshot and exact limits.
@@ -951,9 +1168,34 @@ impl Reservations<'_> {
         prot: ReservationProtection,
         anonymous: bool,
     ) -> Result<(), Refusal> {
+        self.import_with(
+            range,
+            prot,
+            if anonymous {
+                ReservationNodeFlags::ANONYMOUS_PRIVATE
+            } else {
+                ReservationNodeFlags::EMPTY
+            },
+        )
+    }
+    /// [`Self::import`] with exact insertion-time attributes.
+    pub fn import_with(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+        flags: ReservationNodeFlags,
+    ) -> Result<(), Refusal> {
         if self.state().admitted {
             return Err(Refusal::Stale);
         }
+        self.insert_node(range, prot, flags)
+    }
+    fn insert_node(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+        flags: ReservationNodeFlags,
+    ) -> Result<(), Refusal> {
         if self.pending().is_some() {
             return Err(Refusal::Busy);
         }
@@ -970,19 +1212,196 @@ impl Reservations<'_> {
                 start: range.start(),
                 end: range.end(),
                 prot: prot.bits(),
-                anonymous: u32::from(anonymous),
+                flags: flags.bits(),
                 ..NodeData::default()
             },
         );
         self.insert_coalescing(id);
         Ok(())
     }
+    fn host_edit_admitted(&mut self) -> Result<u64, Refusal> {
+        if !self.state().admitted {
+            return Err(Refusal::Stale);
+        }
+        if self.pending().is_some() {
+            return Err(Refusal::Busy);
+        }
+        self.state().generation.checked_add(1).ok_or(Refusal::Stale)
+    }
+    /// Host commit of a mapping it served itself (file, shared, stack, device,
+    /// out-of-arena alias): an opaque placement obstacle that EL1 never edits.
+    /// `ANONYMOUS` is stripped; `flags` carry `PRIVATE`/attributes for
+    /// `RLIMIT_DATA` and fork. The range must be free: the host retires what
+    /// its edit replaced first (`retire_opaque`).
+    pub fn insert_opaque(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+        flags: ReservationNodeFlags,
+    ) -> Result<(), Refusal> {
+        let generation = self.host_edit_admitted()?;
+        self.insert_node(
+            range,
+            prot,
+            flags.difference(ReservationNodeFlags::ANONYMOUS),
+        )?;
+        self.state_mut().generation = generation;
+        Ok(())
+    }
+    /// Host commit of a retirement it served itself: removes every node in
+    /// `range`, whatever its kind, keeping straddlers' outside pieces.
+    pub fn retire_opaque(&mut self, range: ReservationRange) -> Result<(), Refusal> {
+        let generation = self.host_edit_admitted()?;
+        let needed = self.splits_needed(range);
+        let mut spares = Spares(self.allocate_spares(needed)?);
+        self.remove_range(range, &mut spares);
+        self.release_spares(spares.0);
+        self.state_mut().generation = generation;
+        Ok(())
+    }
+    /// Host commit of an attribute edit (`mlock`, `MADV_DONTFORK`,
+    /// `MADV_WIPEONFORK`, `MADV_DONTDUMP` and their inverses) over a fully
+    /// mapped range. Only [`ReservationNodeFlags::ATTRIBUTES`] may change.
+    pub fn set_flags(
+        &mut self,
+        range: ReservationRange,
+        set: ReservationNodeFlags,
+        clear: ReservationNodeFlags,
+    ) -> Result<(), Refusal> {
+        let attributes = ReservationNodeFlags::ATTRIBUTES;
+        if !attributes.contains(set) || !attributes.contains(clear) || set.intersects(clear) {
+            return Err(Refusal::Invalid);
+        }
+        let generation = self.host_edit_admitted()?;
+        let mut cursor = range.start();
+        while let Some(n) = self.next(cursor).filter(|n| n.start < range.end()) {
+            if n.start > cursor {
+                return Err(Refusal::Hole);
+            }
+            cursor = n.end.min(range.end());
+            if cursor == range.end() {
+                break;
+            }
+        }
+        if cursor != range.end() {
+            return Err(Refusal::Hole);
+        }
+        let needed = self.splits_needed(range);
+        let mut spares = Spares(self.allocate_spares(needed)?);
+        self.split_at(range.start(), &mut spares);
+        self.split_at(range.end(), &mut spares);
+        self.release_spares(spares.0);
+        let mut cursor = range.start();
+        while cursor < range.end() {
+            let Some(n) = self.next(cursor) else {
+                break;
+            };
+            let flags = n.flags().union(set).difference(clear);
+            if flags != n.flags() {
+                let (tree, freed) = self.erase(self.state().tree, n.start);
+                self.state_mut().tree = tree;
+                let mut edited = n;
+                edited.flags = flags.bits();
+                edited.left = 0;
+                edited.right = 0;
+                self.write(freed, edited);
+                self.insert_coalescing(freed);
+            }
+            cursor = n.end.min(range.end());
+        }
+        self.state_mut().generation = generation;
+        Ok(())
+    }
+    /// Fork: populate the unadmitted, empty `child` root of the same table
+    /// with this committed generation. `DONTFORK` nodes are skipped;
+    /// `WIPEONFORK` nodes are copied with their flag so T2 installs no
+    /// residency for them. Linear in parent nodes: one in-order read each,
+    /// then a balanced build from the copied sequence. The child keeps its own
+    /// generation; later edits of either MM never change the other.
+    pub fn clone_into(&mut self, child: &mut Reservations<'_>) -> Result<(), Refusal> {
+        if !core::ptr::eq(self.table, child.table) || core::ptr::eq(self.root, child.root) {
+            return Err(Refusal::Invalid);
+        }
+        if !self.state().admitted {
+            return Err(Refusal::Stale);
+        }
+        if self.pending().is_some() {
+            return Err(Refusal::Busy);
+        }
+        if child.state().admitted || child.state().tree != 0 || child.pending().is_some() {
+            return Err(Refusal::Stale);
+        }
+        child
+            .state()
+            .generation
+            .checked_add(1)
+            .ok_or(Refusal::Stale)?;
+        let mut list = CopyList::default();
+        if let Err(reason) = self.copy_in_order(self.state().tree, &mut list) {
+            let mut id = list.head;
+            while id != 0 {
+                let next = self.read(id).right;
+                self.table.release(id, self.banks);
+                id = next;
+            }
+            return Err(reason);
+        }
+        let mut cursor = list.head;
+        let tree = self.build_balanced(list.len, &mut cursor);
+        let layout = self.state().layout;
+        let state = child.state_mut();
+        state.tree = tree;
+        state.layout = layout;
+        state.admitted = true;
+        state.generation += 1;
+        Ok(())
+    }
+    fn copy_in_order(&mut self, id: u32, list: &mut CopyList) -> Result<(), Refusal> {
+        if id == 0 {
+            return Ok(());
+        }
+        let n = self.read(id);
+        self.copy_in_order(n.left, list)?;
+        if !n.flags().contains(ReservationNodeFlags::DONTFORK) {
+            let copy = self.table.allocate(self.banks, self.node_capacity)?;
+            let mut data = n;
+            data.left = 0;
+            data.right = 0;
+            self.write(copy, data);
+            if list.tail == 0 {
+                list.head = copy;
+            } else {
+                let mut tail = self.read(list.tail);
+                tail.right = copy;
+                self.write(list.tail, tail);
+            }
+            list.tail = copy;
+            list.len += 1;
+        }
+        self.copy_in_order(n.right, list)
+    }
+    /// Consume `len` nodes of a `right`-linked sorted list into a perfectly
+    /// balanced subtree (a valid AVL tree), constant work per node.
+    fn build_balanced(&mut self, len: usize, cursor: &mut u32) -> u32 {
+        if len == 0 {
+            return 0;
+        }
+        let left = self.build_balanced(len / 2, cursor);
+        let id = *cursor;
+        let mut n = self.read(id);
+        *cursor = n.right;
+        let right = self.build_balanced(len - len / 2 - 1, cursor);
+        n.left = left;
+        n.right = right;
+        self.write(id, n);
+        self.fix(id)
+    }
     fn insert_coalescing(&mut self, id: u32) {
         let mut n = self.read(id);
         if let Some(left) = n.start.checked_sub(1).and_then(|va| self.next(va))
             && left.end == n.start
             && left.prot == n.prot
-            && left.anonymous == n.anonymous
+            && left.flags == n.flags
         {
             let (tree, freed) = self.erase(self.state().tree, left.start);
             self.state_mut().tree = tree;
@@ -992,7 +1411,7 @@ impl Reservations<'_> {
         if let Some(right) = self.next(n.end)
             && right.start == n.end
             && right.prot == n.prot
-            && right.anonymous == n.anonymous
+            && right.flags == n.flags
         {
             let (tree, freed) = self.erase(self.state().tree, right.start);
             self.state_mut().tree = tree;
@@ -1694,6 +2113,531 @@ mod tests {
             !model.authenticate_fault(old),
             "reused MM key and slot cannot revive a grant"
         );
+    }
+
+    fn admitted(table: &SharedReservations, index: usize, raw: u64) -> Reservations<'_> {
+        let mm = ReservationMm::new(raw).unwrap();
+        table.publish(index, mm, layout()).unwrap();
+        let mut g = table.lock(index, mm).unwrap();
+        g.finish_import().unwrap();
+        g
+    }
+    fn range(start: u64, end: u64) -> ReservationRange {
+        ReservationRange::new(start, end).unwrap()
+    }
+    fn decide(model: &mut Reservations<'_>, nr: u64, args: [u64; 6]) -> AnonymousRouteKind {
+        use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+        let current = CurrentTask::new();
+        current.task_id.store(1, Ordering::Relaxed);
+        current.thread_serial.store(11, Ordering::Relaxed);
+        current.zone_mm.store(model.mm().raw(), Ordering::Relaxed);
+        let counters = Counters::default();
+        let mut frame = TrapFrame::default();
+        frame.x[8] = nr;
+        frame.x[..6].copy_from_slice(&args);
+        match dispatch_anonymous_with_reservations(&mut frame, &counters, &current, model) {
+            AnonymousReservationRoute::Action(Action::Forward) => AnonymousRouteKind::Forward,
+            AnonymousReservationRoute::Action(Action::Served) => {
+                AnonymousRouteKind::Return(frame.x[0] as i64)
+            }
+            AnonymousReservationRoute::Work(mut pending) => {
+                pending
+                    .refuse(&mut frame, &current, &counters, model)
+                    .unwrap();
+                AnonymousRouteKind::Work
+            }
+            _ => AnonymousRouteKind::Other,
+        }
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    enum AnonymousRouteKind {
+        Forward,
+        Return(i64),
+        Work,
+        Other,
+    }
+
+    #[test]
+    fn reservation_decoder_forwards_out_of_layout_hint() {
+        let table = table();
+        let mut g = admitted(&table, 0, 17);
+        // mmap(0xc000000000, 64 KiB, RW, MAP_PRIVATE|MAP_ANONYMOUS)
+        assert_eq!(
+            decide(&mut g, 222, [0xc0_0000_0000, 0x10000, 3, 0x22, u64::MAX, 0]),
+            AnonymousRouteKind::Forward
+        );
+        assert!(g.pending().is_none());
+        assert_eq!(
+            decide(&mut g, 222, [0x200000, 0x10000, 3, 0x22, u64::MAX, 0]),
+            AnonymousRouteKind::Work
+        );
+    }
+
+    /// Documents (does not bless) decoder behavior that differs from the host
+    /// dispatcher: unknown PROT bits on mmap and a misaligned offset on an
+    /// anonymous mmap are EINVAL here, while host `mmap.rs` ignores both. The
+    /// Docker oracle decides which answer is Linux before either changes.
+    #[test]
+    fn reservation_decoder_prot_and_anonymous_offset_current_behavior() {
+        let table = table();
+        let mut g = admitted(&table, 0, 17);
+        assert_eq!(
+            decide(&mut g, 222, [0, 4096, 3 | (1 << 28), 0x22, u64::MAX, 0]),
+            AnonymousRouteKind::Return(-22),
+            "unknown mmap prot bit"
+        );
+        assert_eq!(
+            decide(&mut g, 222, [0, 4096, 3, 0x22, u64::MAX, 0x800]),
+            AnonymousRouteKind::Return(-22),
+            "misaligned offset on MAP_ANONYMOUS"
+        );
+        assert_eq!(
+            decide(&mut g, 226, [0x100000, 4096, 1 << 28, 0, 0, 0]),
+            AnonymousRouteKind::Return(-22),
+            "unknown mprotect prot bit"
+        );
+        assert!(g.pending().is_none());
+    }
+
+    #[test]
+    fn reservation_data_limit_charges_only_private_writable_non_stack_nodes() {
+        let table = table();
+        let mm = ReservationMm::new(5).unwrap();
+        let mut config = layout();
+        config.data_limit = 0x4000;
+        table.publish(0, mm, config).unwrap();
+        let mut g = table.lock(0, mm).unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        // Shared writable opaque, anonymous stack and read-only private: none
+        // is RLIMIT_DATA, so none consumes the 16 KiB budget.
+        g.import_with(range(0x100000, 0x110000), rw, ReservationNodeFlags::EMPTY)
+            .unwrap();
+        g.import_with(
+            range(0x110000, 0x120000),
+            rw,
+            ReservationNodeFlags::ANONYMOUS_PRIVATE.union(ReservationNodeFlags::GROWSDOWN),
+        )
+        .unwrap();
+        g.import_with(
+            range(0x120000, 0x130000),
+            ReservationProtection::from_bits(1).unwrap(),
+            ReservationNodeFlags::PRIVATE,
+        )
+        .unwrap();
+        g.finish_import().unwrap();
+        let d = g.mmap(Placement::Anywhere, 0x4000, rw).unwrap();
+        assert_eq!(complete(&mut g, d), 0x130000);
+        assert_eq!(g.mmap(Placement::Anywhere, 0x1000, rw), Err(Refusal::Limit));
+        // Read-only anonymous growth is not data either.
+        let d = g
+            .mmap(Placement::Anywhere, 0x1000, ReservationProtection::NONE)
+            .unwrap();
+        complete(&mut g, d);
+        // A host-placed private writable file mapping IS charged.
+        let d = g.munmap(range(0x130000, 0x134000)).unwrap();
+        complete(&mut g, d);
+        g.insert_opaque(range(0x200000, 0x204000), rw, ReservationNodeFlags::PRIVATE)
+            .unwrap();
+        assert_eq!(g.mmap(Placement::Anywhere, 0x1000, rw), Err(Refusal::Limit));
+        g.retire_opaque(range(0x200000, 0x204000)).unwrap();
+        let d = g.mmap(Placement::Anywhere, 0x1000, rw).unwrap();
+        complete(&mut g, d);
+    }
+
+    #[test]
+    fn reservation_set_limits_refuses_growth_and_keeps_shrink() {
+        let table = table();
+        let mut g = admitted(&table, 0, 6);
+        let rw = ReservationProtection::READ_WRITE;
+        let d = g.mmap(Placement::Anywhere, 0x8000, rw).unwrap();
+        complete(&mut g, d);
+        let generation = g.generation();
+        g.set_limits(0x8000, u64::MAX);
+        assert_eq!(g.generation(), generation, "limits do not revoke grants");
+        assert_eq!(
+            g.mmap(Placement::Anywhere, 0x1000, ReservationProtection::NONE),
+            Err(Refusal::Limit),
+            "RLIMIT_AS"
+        );
+        // brk growth under the limit keeps the old break (Linux brk(2)).
+        assert_eq!(g.brk(0x3000), Ok(Decision::Complete(0x1000)));
+        g.set_limits(u64::MAX, 0x4000);
+        assert_eq!(
+            g.mmap(Placement::Anywhere, 0x1000, rw),
+            Err(Refusal::Limit),
+            "RLIMIT_DATA"
+        );
+        assert_eq!(
+            decide(&mut g, 222, [0, 4096, 3, 0x22, u64::MAX, 0]),
+            AnonymousRouteKind::Return(-12)
+        );
+        assert_eq!(
+            decide(&mut g, 214, [0x3000, 0, 0, 0, 0, 0]),
+            AnonymousRouteKind::Return(0x1000)
+        );
+        // Shrinking below a lowered limit stays possible.
+        let d = g.munmap(range(0x100000, 0x102000)).unwrap();
+        complete(&mut g, d);
+        let d = g
+            .mprotect(range(0x102000, 0x108000), ReservationProtection::NONE)
+            .unwrap();
+        complete(&mut g, d);
+        let d = g.mmap(Placement::Anywhere, 0x4000, rw).unwrap();
+        complete(&mut g, d);
+    }
+
+    #[test]
+    fn reservation_flagged_and_opaque_nodes_force_forward() {
+        let table = table();
+        let mut g = admitted(&table, 0, 7);
+        let rw = ReservationProtection::READ_WRITE;
+        let d = g.mmap(Placement::Fixed(0x100000), 0x4000, rw).unwrap();
+        complete(&mut g, d);
+        for flag in [
+            ReservationNodeFlags::LOCKED,
+            ReservationNodeFlags::DONTFORK,
+            ReservationNodeFlags::WIPEONFORK,
+            ReservationNodeFlags::DONTDUMP,
+            ReservationNodeFlags::GROWSDOWN,
+        ] {
+            let before = g.generation();
+            g.set_flags(range(0x101000, 0x102000), flag, ReservationNodeFlags::EMPTY)
+                .unwrap();
+            assert!(g.generation().raw() > before.raw());
+            assert!(g.mapping(0x101000).unwrap().flags.contains(flag));
+            assert!(g.mapping(0x100000).unwrap().flags.root_editable());
+            assert!(g.mapping(0x102000).unwrap().flags.root_editable());
+            let generation = g.generation();
+            assert_eq!(
+                g.munmap(range(0x100000, 0x104000)),
+                Err(Refusal::ForeignMapping)
+            );
+            assert_eq!(
+                g.mprotect(range(0x101000, 0x102000), ReservationProtection::NONE),
+                Err(Refusal::ForeignMapping)
+            );
+            assert_eq!(
+                g.mmap(Placement::Fixed(0x101000), 0x1000, rw),
+                Err(Refusal::ForeignMapping)
+            );
+            assert_eq!(
+                g.mremap(range(0x101000, 0x102000), 0x2000, MoveTarget::MayMove),
+                Err(Refusal::ForeignMapping)
+            );
+            assert_eq!(
+                decide(&mut g, 215, [0x100000, 0x4000, 0, 0, 0, 0]),
+                AnonymousRouteKind::Forward
+            );
+            assert_eq!(
+                decide(&mut g, 226, [0x101000, 0x1000, 1, 0, 0, 0]),
+                AnonymousRouteKind::Forward
+            );
+            assert_eq!(g.generation(), generation);
+            assert!(g.pending().is_none());
+            // Edits not touching the flagged node remain EL1's.
+            let d = g
+                .mprotect(range(0x103000, 0x104000), ReservationProtection::NONE)
+                .unwrap();
+            complete(&mut g, d);
+            let d = g.mprotect(range(0x103000, 0x104000), rw).unwrap();
+            complete(&mut g, d);
+            g.set_flags(range(0x101000, 0x102000), ReservationNodeFlags::EMPTY, flag)
+                .unwrap();
+            let mut nodes = 0;
+            g.observe_mappings(&mut |_| nodes += 1).unwrap();
+            assert_eq!(nodes, 1, "clearing the attribute coalesces again");
+        }
+        // Opaque host obstacle: placement skips it and every edit forwards.
+        g.insert_opaque(
+            range(0x104000, 0x106000),
+            rw,
+            ReservationNodeFlags::ANONYMOUS,
+        )
+        .unwrap();
+        assert!(!g.mapping(0x104000).unwrap().anonymous);
+        assert_eq!(
+            g.fault_plan(0x104000, 4096, rw),
+            Err(Refusal::ForeignMapping)
+        );
+        assert_eq!(
+            g.insert_opaque(range(0x105000, 0x107000), rw, ReservationNodeFlags::EMPTY),
+            Err(Refusal::Collision)
+        );
+        let d = g.mmap(Placement::Anywhere, 0x1000, rw).unwrap();
+        assert_eq!(complete(&mut g, d), 0x106000);
+        assert_eq!(
+            decide(&mut g, 215, [0x104000, 0x1000, 0, 0, 0, 0]),
+            AnonymousRouteKind::Forward
+        );
+        assert_eq!(
+            g.set_flags(
+                range(0x100000, 0x108000),
+                ReservationNodeFlags::LOCKED,
+                ReservationNodeFlags::EMPTY
+            ),
+            Err(Refusal::Hole)
+        );
+        assert_eq!(
+            g.set_flags(
+                range(0x100000, 0x101000),
+                ReservationNodeFlags::PRIVATE,
+                ReservationNodeFlags::EMPTY
+            ),
+            Err(Refusal::Invalid)
+        );
+        // The host retires across both kinds after serving the munmap itself.
+        g.retire_opaque(range(0x103000, 0x105000)).unwrap();
+        assert!(g.mapping(0x103000).is_none());
+        assert!(g.mapping(0x104000).is_none());
+        assert!(!g.mapping(0x105000).unwrap().anonymous);
+        assert!(g.mapping(0x102000).unwrap().anonymous);
+    }
+
+    #[test]
+    fn reservation_mremap_is_one_proposal_per_shape() {
+        let table = table();
+        let mut g = admitted(&table, 0, 8);
+        let rw = ReservationProtection::READ_WRITE;
+        let d = g.mmap(Placement::Fixed(0x100000), 0x4000, rw).unwrap();
+        complete(&mut g, d);
+        // Same size: no transaction.
+        assert_eq!(
+            g.mremap(range(0x100000, 0x104000), 0x4000, MoveTarget::InPlace),
+            Ok(Decision::Complete(0x100000))
+        );
+        // Shrink: retire the tail.
+        let d = g
+            .mremap(range(0x100000, 0x104000), 0x2000, MoveTarget::InPlace)
+            .unwrap();
+        let Decision::Work(request) = d else { panic!() };
+        assert_eq!(request.operation, ReservationOperation::Retire);
+        assert_eq!(request.range, range(0x102000, 0x104000));
+        assert_eq!(complete(&mut g, d), 0x100000);
+        // Grow in place into free space: prepare the extension, one node.
+        let d = g
+            .mremap(range(0x100000, 0x102000), 0x6000, MoveTarget::InPlace)
+            .unwrap();
+        assert_eq!(complete(&mut g, d), 0x100000);
+        assert_eq!(
+            g.mapping(0x105000).unwrap().range,
+            range(0x100000, 0x106000)
+        );
+        // Blocked growth: InPlace is ENOMEM, MayMove relocates as one Move.
+        let d = g
+            .mmap(
+                Placement::Fixed(0x106000),
+                0x1000,
+                ReservationProtection::NONE,
+            )
+            .unwrap();
+        complete(&mut g, d);
+        assert_eq!(
+            g.mremap(range(0x100000, 0x106000), 0x8000, MoveTarget::InPlace),
+            Err(Refusal::Limit)
+        );
+        let d = g
+            .mremap(range(0x100000, 0x106000), 0x8000, MoveTarget::MayMove)
+            .unwrap();
+        let Decision::Work(request) = d else { panic!() };
+        assert_eq!(request.operation, ReservationOperation::Move);
+        assert_eq!(request.source, Some(range(0x100000, 0x106000)));
+        assert_eq!(request.range, range(0x107000, 0x10f000));
+        assert!(
+            g.mapping(0x100000).is_some(),
+            "uncommitted until completion"
+        );
+        assert_eq!(complete(&mut g, d), 0x107000);
+        assert!(g.mapping(0x100000).is_none());
+        assert_eq!(g.mapping(0x107000).unwrap().protection, rw);
+        // Fixed move of the middle of a node over part of another node.
+        let d = g
+            .mremap(
+                range(0x109000, 0x10b000),
+                0x3000,
+                MoveTarget::Fixed(0x105000),
+            )
+            .unwrap();
+        assert_eq!(complete(&mut g, d), 0x105000);
+        let mut seen = std::vec::Vec::new();
+        g.observe_mappings(&mut |m| seen.push((m.range.start(), m.range.end(), m.protection)))
+            .unwrap();
+        // The destination coalesces with the source node's surviving piece.
+        assert_eq!(seen, [(0x105000, 0x109000, rw), (0x10b000, 0x10f000, rw)]);
+        // Overlapping fixed target, cross-node source and a hole are refused.
+        assert_eq!(
+            g.mremap(
+                range(0x105000, 0x106000),
+                0x1000,
+                MoveTarget::Fixed(0x105000)
+            ),
+            Err(Refusal::Invalid)
+        );
+        assert_eq!(
+            g.mremap(range(0x108000, 0x10c000), 0x1000, MoveTarget::MayMove),
+            Err(Refusal::Hole)
+        );
+        let generation = g.generation();
+        assert!(g.pending().is_none());
+        assert_eq!(g.generation(), generation);
+    }
+
+    #[test]
+    fn reservation_clone_is_linear_skips_dontfork_and_keeps_generations_independent() {
+        #[derive(Clone, Copy, Debug)]
+        enum Row {
+            Plain,
+            AllDontfork,
+            AlternatingDontforkWipeonfork,
+            OpaqueMix,
+        }
+        let rw = ReservationProtection::READ_WRITE;
+        for count in [1u64, 64, 1024] {
+            for row in [
+                Row::Plain,
+                Row::AllDontfork,
+                Row::AlternatingDontforkWipeonfork,
+                Row::OpaqueMix,
+            ] {
+                let table = table();
+                let a = ReservationMm::new(40).unwrap();
+                let b = ReservationMm::new(41).unwrap();
+                table.publish(0, a, layout()).unwrap();
+                table.publish(1, b, layout()).unwrap();
+                // Parent + child exceed the bootstrap pool at 1024 nodes.
+                let mut backing = vec![0u8; 2 * 1024 * 1024];
+                let allocator = crate::alloc::MetadataStorage::new();
+                allocator
+                    .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
+                    .unwrap();
+                table
+                    .lock(0, a)
+                    .unwrap()
+                    .provision_metadata(&allocator)
+                    .unwrap();
+                let mut parent = table.lock_identity_for_test(0, a).unwrap();
+                let flags_for = |i: u64| match row {
+                    Row::Plain => ReservationNodeFlags::ANONYMOUS_PRIVATE,
+                    Row::AllDontfork => ReservationNodeFlags::ANONYMOUS_PRIVATE
+                        .union(ReservationNodeFlags::DONTFORK),
+                    Row::AlternatingDontforkWipeonfork => ReservationNodeFlags::ANONYMOUS_PRIVATE
+                        .union(if i.is_multiple_of(2) {
+                            ReservationNodeFlags::DONTFORK
+                        } else {
+                            ReservationNodeFlags::WIPEONFORK
+                        }),
+                    Row::OpaqueMix if i.is_multiple_of(3) => ReservationNodeFlags::EMPTY,
+                    Row::OpaqueMix => ReservationNodeFlags::ANONYMOUS_PRIVATE,
+                };
+                for i in 0..count {
+                    let start = 0x100000 + i * 0x2000;
+                    parent
+                        .import_with(range(start, start + 0x1000), rw, flags_for(i))
+                        .unwrap();
+                }
+                parent.finish_import().unwrap();
+                let parent_generation = parent.generation();
+                let mut child = table.lock_identity_for_test(1, b).unwrap();
+                let child_generation = child.generation();
+                parent.work = 0;
+                parent.clone_into(&mut child).unwrap();
+                let work = parent.work;
+                assert!(
+                    work <= 12 * count as usize + 4,
+                    "{row:?}: {work} visits for {count} parent nodes"
+                );
+                assert_eq!(parent.generation(), parent_generation);
+                assert!(child.is_admitted());
+                let kept: std::vec::Vec<u64> = (0..count)
+                    .filter(|i| !flags_for(*i).contains(ReservationNodeFlags::DONTFORK))
+                    .collect();
+                let mut seen = std::vec::Vec::new();
+                child
+                    .observe_mappings(&mut |m| seen.push((m.range.start(), m.flags)))
+                    .unwrap();
+                assert_eq!(
+                    seen,
+                    kept.iter()
+                        .map(|i| (0x100000 + i * 0x2000, flags_for(*i)))
+                        .collect::<std::vec::Vec<_>>(),
+                    "{row:?}"
+                );
+                let root = child.read(child.state().tree);
+                assert!(root.height as u64 <= (kept.len() as u64 + 1).ilog2() as u64 + 1);
+                assert_eq!(root.bytes, kept.len() as u64 * 0x1000);
+                let child_generation = {
+                    assert_ne!(child.generation(), child_generation);
+                    child.generation()
+                };
+                // Independent generations: a parent edit is invisible to the
+                // child and vice versa.
+                parent
+                    .retire_opaque(range(0x100000, 0x100000 + count * 0x2000))
+                    .unwrap();
+                assert!(parent.mapping(0x100000).is_none());
+                assert_eq!(child.generation(), child_generation);
+                if let Some(first) = kept.first() {
+                    let va = 0x100000 + first * 0x2000;
+                    assert!(child.mapping(va).is_some());
+                    child.retire_opaque(range(va, va + 0x1000)).unwrap();
+                    assert!(child.mapping(va).is_none());
+                }
+                assert!(parent.observe_mappings(&mut |_| panic!()).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn reservation_clone_refuses_busy_parent_or_populated_child() {
+        let table = table();
+        let mut parent = admitted(&table, 0, 50);
+        let mut child = admitted(&table, 1, 51);
+        assert_eq!(parent.clone_into(&mut child), Err(Refusal::Stale));
+        drop(child);
+        let mm = ReservationMm::new(52).unwrap();
+        table.publish(2, mm, layout()).unwrap();
+        let mut child = table.lock(2, mm).unwrap();
+        let d = parent
+            .mmap(
+                Placement::Anywhere,
+                0x1000,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap();
+        assert_eq!(parent.clone_into(&mut child), Err(Refusal::Busy));
+        complete(&mut parent, d);
+        parent.clone_into(&mut child).unwrap();
+        assert!(child.mapping(0x100000).is_some());
+    }
+    #[test]
+    fn reservation_out_of_layout_hint_forwards_instead_of_relocating() {
+        let table = table();
+        let mm = ReservationMm::new(1).unwrap();
+        table.publish(1, mm, layout()).unwrap();
+        let mut g = table.lock(1, mm).unwrap();
+        g.finish_import().unwrap();
+        // Go's arena probe: the host honours free hints outside Carrick's
+        // arenas with alias VAs, so the root must not pick a first-fit VA.
+        for hint in [0xc0_0000_0000u64, 0x0fff_f000, !4095u64] {
+            assert_eq!(
+                g.mmap(
+                    Placement::Hint(hint),
+                    0x4000,
+                    ReservationProtection::READ_WRITE
+                ),
+                Err(Refusal::ForeignMapping),
+                "hint {hint:#x}"
+            );
+            assert!(g.pending().is_none());
+        }
+        // A free in-layout hint is still honoured exactly.
+        let d = g
+            .mmap(
+                Placement::Hint(0x200000),
+                0x4000,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap();
+        assert_eq!(complete(&mut g, d), 0x200000);
     }
 
     #[test]
