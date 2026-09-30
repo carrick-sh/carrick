@@ -12044,6 +12044,18 @@ mod guest_cow {
         root: u64,
         data: u64,
     ) -> (InstalledMm, &'static CowGrantPool) {
+        forked_guest_child_with(ordinal, root, data, false)
+    }
+
+    /// `host_published`: the span's leaves are plain host-published writable
+    /// pages with no source alias in the process registry (a stack or image
+    /// leaf), armed by the adopting fork arm instead of pre-tagged.
+    fn forked_guest_child_with(
+        ordinal: u64,
+        root: u64,
+        data: u64,
+        host_published: bool,
+    ) -> (InstalledMm, &'static CowGrantPool) {
         let child = install_mm(
             &CarrierForeignMmTransport::new(),
             ordinal,
@@ -12064,7 +12076,37 @@ mod guest_cow {
                 },
             )
             .expect("provision the copy window");
+        if host_published {
+            for page in 0..4 {
+                let word = leaf_word(root, TEST_VA + page * 4096);
+                // SAFETY: the table owner is live for the fixture's lifetime.
+                unsafe {
+                    let leaf = word.read_volatile();
+                    word.write_volatile(
+                        (leaf & !(AP | COW | PRIVATE | MAY_WRITE)) | AP_RW_EL0 | NG,
+                    );
+                }
+            }
+            let resolver = child.state.live_resolver.read().clone().unwrap();
+            child
+                .state
+                .page_tables_authority()
+                .edit(
+                    || panic!("fixture manager"),
+                    |editor| {
+                        editor
+                            .manager
+                            .set_fork_readonly_adopting(TEST_VA, 4 * 4096, None)?;
+                        // SAFETY: the fixture resolver maps the fixture arena.
+                        unsafe { editor.sync_to_host(&resolver) }
+                    },
+                )
+                .expect("adopting fork arm");
+        }
         for page in 0..4 {
+            if host_published {
+                break;
+            }
             let word = leaf_word(root, TEST_VA + page * 4096);
             // SAFETY: the table owner is live for the fixture's lifetime.
             unsafe {
@@ -12075,6 +12117,11 @@ mod guest_cow {
         }
         let (authority, _lease, _invalidator) = prepare_foreign_cow(&child);
         drop(authority);
+        if host_published {
+            alias_registry().lock().retain(|alias| {
+                !(alias.start <= TEST_VA && TEST_VA < alias.start + alias.size as u64)
+            });
+        }
         child
             .state
             .page_tables_authority()
@@ -12426,6 +12473,49 @@ mod guest_cow {
             LiveDescriptorOwner::Guest,
             "binding the selected authority completes its pending selection"
         );
+    }
+
+    /// A leaf the host published itself (stack, image) has no source alias in
+    /// the process registry: its Linux write intent lives in the leaf's own
+    /// tags. Settlement of EL1's COW on such a leaf used to demand an alias
+    /// the host arming of an EL1 grant page creates, and failed closed.
+    #[test]
+    fn a_host_published_leaf_adopted_at_fork_settles_without_a_source_alias() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (mut child, pool) =
+            forked_guest_child_with(751, 0x9a01_3700_0000, 0x9b01_3700_0000, true);
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let mm = child.snapshot.mm.get();
+        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        let grant = pool.ready(mm).next().unwrap();
+        child
+            .owners
+            .0
+            .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+        assert!(matches!(
+            el1_write_fault(&child, pool, TEST_VA + 8),
+            GuestCowOutcome::Resolved(_)
+        ));
+        custody.register_guest_cow_state(mm, &child.state);
+        let spaces = AddressSpaces::new();
+        let excluded = spaces.unpublished(mm).unwrap();
+        let completion = pool.completions(&excluded).next().unwrap();
+        let runtime = child.state.cow_runtime.read().clone().unwrap();
+        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
+            .expect("settlement derives the source's write intent from the leaf");
+        assert!(child.state.cow_armed.lock().span_for(TEST_VA).is_none());
+        let replacement = alias_registry()
+            .lock()
+            .newest_matching_for_process(
+                Some(old_key_root(&child)),
+                ContainerRootToken::ROOT,
+                |alias| alias.start == TEST_VA,
+            )
+            .expect("replacement alias");
+        assert!(replacement.guest_writable, "the leaf recorded write intent");
+        assert!(pool.finish(&excluded, &completion.grant));
     }
 
     #[test]
