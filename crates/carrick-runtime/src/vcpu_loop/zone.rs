@@ -94,6 +94,40 @@ pub(super) fn zone_ctx_from_state(
     Ok(ctx)
 }
 
+/// `state` with argument 0 restored to `x0`, so re-issuing its syscall runs
+/// the ORIGINAL call (EL1 overwrote x0 with the result it served).
+pub(super) fn with_original_arg0(state: GuestCpuState, x0: u64) -> GuestCpuState {
+    let GuestCpuState::Aarch64V1(cpu) = &state else {
+        return state;
+    };
+    let mut cpu = (**cpu).clone();
+    cpu.gprs[0] = x0;
+    GuestCpuState::from_aarch64_v1(cpu)
+}
+
+/// How a thread taken off its vCPU resumes after EL1 served its syscall
+/// (`served`): `(state, completed)`. A call whose host commit is still owed
+/// re-issues with its original arguments; any other served call is complete.
+pub(super) fn settle_served_state(
+    state: GuestCpuState,
+    served: bool,
+    orig_arg0: u64,
+) -> (GuestCpuState, bool) {
+    if !served {
+        return (state, false);
+    }
+    let nr = match &state {
+        GuestCpuState::Aarch64V1(cpu) => cpu.gprs[8],
+        _ => return (state, true),
+    };
+    match carrick_el1_abi::served_boundary(nr, orig_arg0) {
+        carrick_el1_abi::ServedBoundary::Completed => (state, true),
+        carrick_el1_abi::ServedBoundary::ReplayOriginal { x0 } => {
+            (with_original_arg0(state, x0), false)
+        }
+    }
+}
+
 /// The resume point of a thread taken off a vCPU at `exit`: after (or at,
 /// to re-issue it) a forwarded syscall, from the mailbox continuation; at
 /// the EL0 instruction the vCPU stopped at (`trap`), or the EL0 state the
@@ -223,12 +257,15 @@ where
                     &self.kernel.dispatcher,
                 );
                 let state = engine.snapshot_guest_state_for_publication()?;
+                let (ctx_state, completed) = settle_served_state(
+                    state.clone(),
+                    served_with_work,
+                    carrick_el1_abi::get_orig_arg0(slot.raw().into()),
+                );
                 let ctx = zone_ctx_from_state(
-                    &state,
+                    &ctx_state,
                     match exit {
-                        ZoneExit::Syscall { .. } => ZoneExit::Syscall {
-                            completed: served_with_work,
-                        },
+                        ZoneExit::Syscall { .. } => ZoneExit::Syscall { completed },
                         ZoneExit::El0 => ZoneExit::El0,
                     },
                 )?;
@@ -259,11 +296,23 @@ where
                 // The vCPU left EL1 with no thread on it (the idle exit)
                 // with this job's thread parked or preempted: host work, or
                 // a queued thread that needs this executor.
-                let _ = carrick_kernel::el1_delegation::settle_el1_boundary_for(
+                let served = carrick_kernel::el1_delegation::settle_el1_boundary_for(
                     slot.raw().into(),
                     &self.kernel.dispatcher,
                 );
-                engine.snapshot_guest_state_for_publication()?
+                let state = engine.snapshot_guest_state_for_publication()?;
+                // The thread re-issues its syscall when it resumes. A call EL1
+                // served whose host commit is owed must re-issue with its
+                // ORIGINAL x0, not the result EL1 wrote there (a re-issued
+                // `mprotect(0, len)` answered ENOMEM).
+                match settle_served_state(
+                    state.clone(),
+                    served,
+                    carrick_el1_abi::get_orig_arg0(slot.raw().into()),
+                ) {
+                    (replayed, false) => replayed,
+                    (_, true) => state,
+                }
             }
         };
         let own = own.ok_or_else(|| {
@@ -1205,5 +1254,48 @@ mod ipc_tests {
         // Without a wait queue, a blocked operation fails closed.
         let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
         assert!(ipc_route(&dispatcher, &context, tid, blocked(token), None).is_err());
+    }
+
+    fn syscall_state(nr: u64, x0: u64) -> GuestCpuState {
+        let GuestCpuState::Aarch64V1(cpu) =
+            crate::vcpu_loop::executor::tests::test_guest_cpu_state(0x100)
+        else {
+            unreachable!()
+        };
+        let mut cpu = (*cpu).clone();
+        cpu.gprs[8] = nr;
+        cpu.gprs[0] = x0;
+        cpu.gprs[1] = 0x20000;
+        GuestCpuState::from_aarch64_v1(cpu)
+    }
+
+    fn x0_x1(state: &GuestCpuState) -> (u64, u64) {
+        match state {
+            GuestCpuState::Aarch64V1(cpu) => (cpu.gprs[0], cpu.gprs[1]),
+            _ => unreachable!(),
+        }
+    }
+
+    /// A full VMA journal leaves `mprotect` with work owed, and EL1 has
+    /// already written the result 0 into x0. The re-issued call must carry
+    /// the original address, not 0.
+    #[test]
+    fn a_served_mprotect_with_work_replays_with_its_original_address() {
+        let (state, completed) = settle_served_state(syscall_state(226, 0), true, 0x60_0000_5000);
+        assert!(!completed, "the host commit is still owed");
+        assert_eq!(x0_x1(&state), (0x60_0000_5000, 0x20000));
+        let (state, completed) = settle_served_state(syscall_state(215, 0), true, 0x1000);
+        assert!(!completed);
+        assert_eq!(x0_x1(&state).0, 0x1000);
+    }
+
+    #[test]
+    fn other_served_calls_complete_and_unserved_calls_are_untouched() {
+        let (state, completed) = settle_served_state(syscall_state(64, 7), true, 0x1234);
+        assert!(completed);
+        assert_eq!(x0_x1(&state).0, 7, "an owed wake does not rewrite x0");
+        let (state, completed) = settle_served_state(syscall_state(226, 0x5000), false, 0x1234);
+        assert!(!completed);
+        assert_eq!(x0_x1(&state).0, 0x5000, "a forwarded call keeps its frame");
     }
 }
