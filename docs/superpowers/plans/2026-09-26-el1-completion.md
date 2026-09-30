@@ -38,7 +38,64 @@ historical campaign verbatim. The local handoff is
 `.worktrees/EL1-HANDOFF-2026-09-29.md`; this controller supersedes its stale
 status/order statements where explicitly corrected below.
 
-## Current state and evidence rules
+## Current execution decision — impact reset, 2026-09-29
+
+This section is the current work order. The chronological observations below
+preserve evidence; their older “next” statements are not competing work orders.
+
+**Diagnosis:** development has accumulated useful foundations and regression
+receipts faster than it has activated production ownership. On adapter source
+`cb285ae30` plus the current copyout WIP, guest descriptor admission still has
+`host_copyout=false` and `backend_writers=false`; anonymous reservation dispatch
+has only test callers. A passing helper or ordinary boot test cannot demonstrate
+that either disabled path executes. The controller itself compounded drift by
+retaining mutually inconsistent immediate priorities.
+
+**Next capability milestone:** make the production ARM64 anonymous-memory path
+use one reservation authority and EL1 descriptor publication, then demonstrate
+allocation, host copyout, fork/COW, protection and retirement on that path.
+Deliver this as one connected ownership change with focused development checks;
+do not turn each adapter into a separate broad qualification campaign.
+
+| Order | Required work | Evidence that advances the milestone |
+|---|---|---|
+| 1 | Finish the existing prepared-copyout transaction, including refusal and exact-MM commit; retain exclusion | Real runtime caller consumes the verified EL1 publication receipt before committing residency. The current one-test green is model evidence only |
+| 2 | Convert remaining COW, sparse/foreign materialization and exec descriptor writers using existing transaction/copy machinery | Explicit caller-to-writer checklist; every live writer has an owned submission/completion path, including failure and cancellation |
+| 3 | Join anonymous facts and lifecycle to SharedReservations; connect production anonymous syscall dispatch | MemState no longer independently decides the migrated anonymous facts; brk/mmap/protection/retirement and fork/exec/exit share the same authority |
+| 4 | Enable the complete production path and run a signed ownership witness | Actual guest-owned lane observed; allocation, copyout, two-live-MM fork/COW and retirement verified. Ordinary boot or test-only owner selection is insufficient |
+| 5 | Remove the host page-table pause only after the writer census closes; qualify checkpoint 2 | Pause-free two-MM progress, scoped frame return, real host-COW observations, full applicable correctness and cost gates |
+
+Steps 2 and 3 may interleave where an exact dependency requires it. Do not flip
+admission booleans to bypass an unconverted writer. File/shared mapping and
+host-boundary semantics remain part of the conversion review.
+
+**Work already in progress:** copyout WIP is preserved in `wt-cp3-adapter`.
+The focused model test `prepared_copyout_publishes_only_its_page_through_the_guest_executor`
+passed after its retained red. It does not close copyout validation, activate
+production ownership or accept any checkpoint. Finish this bounded dependency;
+do not restart its implementation or expand it into a diagnostics project.
+
+**Priority rules:** before each implementation task, name the production caller,
+the authority or host operation being replaced, and the decisive observable
+result. Classify disabled-lane plumbing as prerequisite work, even when connected
+to a runtime caller. It is progress toward activation, not capability delivered.
+At each update report remaining activation dependencies, not just passing tests.
+Two support/prerequisite-only intervals require a concrete course correction or
+a bounded explanation of why the named dependency must finish; rewriting the
+plan or accumulating helper greens does not reset the count. Consolidate signed
+builds/full CI/inventories at the connected milestone, retaining focused red/green
+checks during implementation and all final acceptance gates.
+
+**Then:** finish the open IPC/lifecycle acceptance blockers, host namespace cost,
+remaining descriptors/IPC/signals, names/page cache, and process lifecycle,
+followed by final ARM64 qualification. Earlier IPC/lifecycle failures stay open;
+resume their investigation only for a new discriminating test or a concrete
+dependency. No new broad capture campaign. x86 remains deferred.
+
+Current accepted base remains local main `f304f8415`; development integration is
+adapter `cb285ae30` plus WIP. No checkpoint has been accepted by this reset.
+
+## Historical state and evidence rules
 
 At refresh, the implementation baseline on local `main` and local
 remote-tracking `origin/main` is `a70b40466`. The documentation commit for
@@ -189,14 +246,14 @@ and saving recoverable state. Never sweep shared probe/build storage.
 
 ## Execution order and review focus
 
-### Immediate deliverable and drift check
+### Historical IPC deliverable and drift check
 
 The first production-routing deliverable is demonstrated, including real
 blocking pipe/eventfd populations at 1/8/64 pairs. The next deliverable is
 correct descriptor close/reuse while an operation is blocked, plus two-live-
 process IPC. No checkpoint has been accepted by these focused results.
 
-Development sequence (steps 1 and 2 demonstrated; step 3 active):
+Earlier development sequence (superseded by the current execution decision):
 1. Connect HostTable to the real FileTable: complete initial namespace,
    implicit stdio, incremental mutation, fork/exec and functional retirement.
    A partially published namespace is invalid because missing slots become
@@ -559,7 +616,7 @@ Protect/Retire/CowRepoint/ForkArm machinery is not full production ownership.
 
 ### C. Complete the pipe/eventfd vertical
 
-**Current implementation priority after the user-requested reset.**
+**Open vertical; current implementation priority is memory, as specified above.**
 Consumes reviewed adapter, host and fixture branches; produces live in-guest
 pipe/eventfd service with exact descriptor/operation lifetime. Checkpoint 3
 still includes the broader work in E.
