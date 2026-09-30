@@ -653,3 +653,27 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
     );
     assert!(!ScopedStage2MapTestStub::is_mapped(gpa, length as usize));
 }
+
+#[test]
+fn guest_lane_declines_frame_grant_replacement_before_any_transition() {
+    // The replacement branch retires a predecessor; on the guest lane that
+    // must go through `publish_replacing` (retirement after the verified
+    // receipt), so the bulk grant declines before beginning a transition.
+    let source = include_str!("../cow_engine.rs");
+    let body = source
+        .split_once("fn prepare_el1_frame_grant(")
+        .unwrap()
+        .1
+        .split("\n    pub(crate) fn ")
+        .next()
+        .unwrap();
+    let decline = body
+        .find("LiveDescriptorOwner::Guest")
+        .expect("guest lane declines replacement");
+    let transition = body
+        .find("begin_pristine_materialization(")
+        .expect("pristine transition");
+    assert!(decline < transition);
+    let fresh_only = &body[decline..];
+    assert!(fresh_only[..200].contains("return Ok(None)"));
+}
