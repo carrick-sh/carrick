@@ -1275,7 +1275,7 @@ impl ZoneTables {
     /// Take the lock of `bucket`, waiting per `wait`.
     pub fn lock(&self, bucket: usize, wait: &impl LockWait) -> Option<BucketGuard<'_>> {
         let lock = &self.buckets[bucket % ZONE_BUCKETS].lock;
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
         loop {
             if lock
                 .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -1286,7 +1286,7 @@ impl ZoneTables {
                     bucket: bucket % ZONE_BUCKETS,
                 });
             }
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             if !wait.wait(attempt) {
                 return None;
             }
@@ -2154,7 +2154,7 @@ impl ZoneTables {
     /// Take `slot`'s run-queue lock, waiting per `wait`.
     pub fn slot_lock(&self, slot: SlotId, wait: &impl LockWait) -> Option<SlotGuard<'_>> {
         let lock = &self.slot(slot).lock;
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
         loop {
             if lock
                 .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -2162,7 +2162,7 @@ impl ZoneTables {
             {
                 return Some(SlotGuard { zone: self, slot });
             }
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             if !wait.wait(attempt) {
                 return None;
             }
