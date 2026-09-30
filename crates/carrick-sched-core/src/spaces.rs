@@ -47,6 +47,32 @@ pub const GATE_CLOSED: u64 = 1 << 63;
 /// A freed entry (skipped by lookups, reused by publications).
 const FREED: u64 = u64::MAX;
 
+/// Served VMA edits one space's journal holds before EL1 must hand the next
+/// one to the host instead ([`JournalFull`]).
+pub const VMA_JOURNAL_ENTRIES: usize = 16;
+
+/// One served protection edit as EL1 recorded it: `[start, end)` now has
+/// `prot` (`PROT_READ`=1, `PROT_WRITE`=2, `PROT_EXEC`=4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmaEdit {
+    pub start: u64,
+    pub end: u64,
+    pub prot: u8,
+}
+
+/// The journal has no room: the caller leaves the edit to the host (with
+/// work owed) instead of recording it. An edit is never dropped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalFull;
+
+#[repr(C)]
+struct JournalSlot {
+    start: AtomicU64,
+    /// `end | prot`: both bounds are page aligned, so `prot` (three bits)
+    /// rides in the low bits of `end`.
+    end_prot: AtomicU64,
+}
+
 /// One published address space.
 #[repr(C, align(64))]
 pub struct SpaceEntry {
@@ -66,6 +92,12 @@ pub struct SpaceEntry {
     pub mmap_next: AtomicU64,
     /// Current program break for heap allocations.
     pub brk_current: AtomicU64,
+    /// Edits EL1 has journaled for the space (single producer: the entry's
+    /// page-table editor; its release store publishes the slot writes).
+    journal_head: AtomicU64,
+    /// Edits the host has applied. `head - tail` are pending.
+    journal_tail: AtomicU64,
+    journal: [JournalSlot; VMA_JOURNAL_ENTRIES],
 }
 
 /// The table, in the shared EL1 region inside the zone.
@@ -151,6 +183,32 @@ impl<'a> SpaceEditor<'a> {
     pub fn set_brk_current(&self, val: u64) {
         self.entry.brk_current.store(val, Ordering::Release);
     }
+
+    /// Whether [`Self::journal_protect`] will succeed. The editor is the only
+    /// producer and the host only frees room, so `true` stays true until this
+    /// editor records: decide before editing the tables.
+    pub fn journal_has_room(&self) -> bool {
+        let head = self.entry.journal_head.load(Ordering::Relaxed);
+        let tail = self.entry.journal_tail.load(Ordering::Acquire);
+        head.wrapping_sub(tail) < VMA_JOURNAL_ENTRIES as u64
+    }
+
+    /// Record that `[start, end)` now has `prot`, for the host to apply in
+    /// order before it next reads the space's VMA rows.
+    pub fn journal_protect(&self, start: u64, end: u64, prot: u8) -> Result<(), JournalFull> {
+        if !self.journal_has_room() {
+            return Err(JournalFull);
+        }
+        let head = self.entry.journal_head.load(Ordering::Relaxed);
+        let slot = &self.entry.journal[(head % VMA_JOURNAL_ENTRIES as u64) as usize];
+        slot.start.store(start, Ordering::Relaxed);
+        slot.end_prot
+            .store(end | u64::from(prot & 7), Ordering::Relaxed);
+        self.entry
+            .journal_head
+            .store(head.wrapping_add(1), Ordering::Release);
+        Ok(())
+    }
 }
 
 impl Drop for SpaceEditor<'_> {
@@ -186,6 +244,14 @@ impl AddressSpaces {
                     active_editor: AtomicU64::new(0),
                     mmap_next: AtomicU64::new(0),
                     brk_current: AtomicU64::new(0),
+                    journal_head: AtomicU64::new(0),
+                    journal_tail: AtomicU64::new(0),
+                    journal: [const {
+                        JournalSlot {
+                            start: AtomicU64::new(0),
+                            end_prot: AtomicU64::new(0),
+                        }
+                    }; VMA_JOURNAL_ENTRIES],
                 }
             }; ADDRESS_SPACES],
         }
@@ -264,6 +330,8 @@ impl AddressSpaces {
             entry.active_editor.store(0, Ordering::Relaxed);
             entry.mmap_next.store(mmap_next, Ordering::Relaxed);
             entry.brk_current.store(brk_current, Ordering::Relaxed);
+            entry.journal_head.store(0, Ordering::Relaxed);
+            entry.journal_tail.store(0, Ordering::Relaxed);
             // The key last: a reader that finds it sees the rest.
             entry.key.store(key, Ordering::SeqCst);
             return SpaceIndex::from_index(index);
@@ -472,6 +540,48 @@ impl AddressSpaces {
         None
     }
 
+    /// Host: apply the pending journaled edits of `key`'s space, oldest
+    /// first, through `apply`. Each edit is released only after `apply`
+    /// returned, so a slot is never reused while it is being read. The caller
+    /// serializes drains of one space (the MM's `MemState` lock). Returns the
+    /// number applied; 0 when `key` is not published.
+    pub fn drain_vma_journal(&self, key: u64, mut apply: impl FnMut(VmaEdit)) -> usize {
+        let Some(index) = self.find(key) else {
+            return 0;
+        };
+        let entry = self.entry(index);
+        let mut tail = entry.journal_tail.load(Ordering::Relaxed);
+        let mut applied = 0;
+        loop {
+            let head = entry.journal_head.load(Ordering::Acquire);
+            if tail == head {
+                return applied;
+            }
+            let slot = &entry.journal[(tail % VMA_JOURNAL_ENTRIES as u64) as usize];
+            let end_prot = slot.end_prot.load(Ordering::Relaxed);
+            apply(VmaEdit {
+                start: slot.start.load(Ordering::Relaxed),
+                end: end_prot & !7,
+                prot: (end_prot & 7) as u8,
+            });
+            tail = tail.wrapping_add(1);
+            entry.journal_tail.store(tail, Ordering::Release);
+            applied += 1;
+        }
+    }
+
+    /// Journaled edits of `key`'s space the host has not applied
+    /// (tests and diagnostics).
+    pub fn pending_vma_edits(&self, key: u64) -> u64 {
+        self.find(key).map_or(0, |index| {
+            let entry = self.entry(index);
+            entry
+                .journal_head
+                .load(Ordering::Acquire)
+                .wrapping_sub(entry.journal_tail.load(Ordering::Acquire))
+        })
+    }
+
     /// Exact active guest editor (tests and diagnostics).
     pub fn active_editor(&self, index: SpaceIndex) -> Option<NonZeroU64> {
         NonZeroU64::new(self.entry(index).active_editor.load(Ordering::SeqCst))
@@ -483,6 +593,7 @@ mod tests {
     use super::*;
     use core::num::NonZeroU64;
     use std::sync::{Arc, mpsc};
+    use std::vec::Vec;
 
     #[test]
     fn a_bounded_edit_waits_for_a_guest_editor_but_never_for_the_host() {
@@ -513,6 +624,49 @@ mod tests {
                 .try_begin_edit_bounded(index, 7, nz(3), u32::MAX)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn the_journal_applies_in_order_and_backpressures_when_full() {
+        let spaces = AddressSpaces::new();
+        let index = spaces.publish_closed(9, 0x1_0000, 0x1_0000).unwrap();
+        spaces.open(index);
+        let editor = spaces
+            .try_begin_edit(index, 9, NonZeroU64::new(1).unwrap())
+            .unwrap();
+        for n in 0..VMA_JOURNAL_ENTRIES as u64 {
+            assert!(editor.journal_has_room());
+            editor
+                .journal_protect(n * 0x1000, n * 0x1000 + 0x1000, (n % 8) as u8)
+                .unwrap();
+        }
+        assert!(!editor.journal_has_room());
+        assert_eq!(editor.journal_protect(0, 0x1000, 1), Err(JournalFull));
+        assert_eq!(spaces.pending_vma_edits(9), VMA_JOURNAL_ENTRIES as u64);
+        let mut seen = Vec::new();
+        let applied = spaces.drain_vma_journal(9, |edit| seen.push(edit));
+        assert_eq!(applied, VMA_JOURNAL_ENTRIES);
+        assert!(
+            seen.iter()
+                .enumerate()
+                .all(|(n, e)| e.start == n as u64 * 0x1000 && u64::from(e.prot) == n as u64 % 8),
+            "oldest first, nothing lost or reordered"
+        );
+        assert_eq!(spaces.pending_vma_edits(9), 0);
+        // Room again, and the ring wraps.
+        editor.journal_protect(0x9000, 0xa000, 3).unwrap();
+        let mut again = Vec::new();
+        assert_eq!(spaces.drain_vma_journal(9, |e| again.push(e)), 1);
+        assert_eq!(
+            again[0],
+            VmaEdit {
+                start: 0x9000,
+                end: 0xa000,
+                prot: 3
+            }
+        );
+        // An unpublished key drains nothing.
+        assert_eq!(spaces.drain_vma_journal(77, |_| panic!()), 0);
     }
 
     #[test]

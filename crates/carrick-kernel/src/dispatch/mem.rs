@@ -62,6 +62,7 @@ pub(crate) mod madvise;
 pub(crate) mod vma;
 pub use self::vma::*;
 pub(crate) mod anonymous;
+mod settled;
 pub(crate) use self::anonymous::RootAliasProposal;
 pub mod el1_reservations;
 mod host_first_touch;
@@ -152,7 +153,7 @@ mutation_syscall_table! {
 /// authority. Ordinary syscall and `/proc` access keeps using this same
 /// `MemState` mutex; the K1 observer only derives owned occupancy rows from it.
 pub struct MemAuthority {
-    state: parking_lot::Mutex<MemState>,
+    state: settled::SettledMem,
     revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -176,14 +177,20 @@ impl MemAuthority {
     }
 
     pub(super) fn with_revision(state: MemState, revision: crate::kernel::VmaRevision) -> Self {
+        let revision = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision.raw()));
         Self {
-            state: parking_lot::Mutex::new(state),
-            revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision.raw())),
+            state: settled::SettledMem::new(state, std::sync::Arc::clone(&revision)),
+            revision,
         }
     }
 
     pub(super) fn lock(&self) -> parking_lot::MutexGuard<'_, MemState> {
         self.state.lock()
+    }
+
+    /// Key this MM's EL1 VMA journal: the MM id of its address-space entry.
+    pub(super) fn bind_journal(&self, mm: crate::kernel::MmId) {
+        self.state.bind(mm.raw());
     }
 
     pub(super) fn revision_publisher(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {

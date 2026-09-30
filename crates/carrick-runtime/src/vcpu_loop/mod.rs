@@ -1522,7 +1522,8 @@ where
                 request,
             };
             // EL1 has already made the resident private-anonymous munmap
-            // (or the permission narrowing of an mprotect) guest-visible by
+            // (or, when the VMA journal was full, the permission narrowing of an
+            // mprotect) guest-visible by
             // editing its exact live terminals. The syscall
             // still crosses this one typed boundary so the ordinary
             // exact-context mutation route authenticates the original request,

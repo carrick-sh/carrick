@@ -262,6 +262,11 @@ pub fn decide_anonymous_syscall(
 pub enum MprotectDisposition {
     Forward,
     Return(i64),
+    /// Served, but the space's VMA journal was full, so the edit is not
+    /// recorded: the original syscall must cross once (back-pressure) so the
+    /// host commits the metadata after applying the journal. Only this case
+    /// costs a host exit; an edit is never dropped.
+    ReturnWithWork,
 }
 
 /// Result of attempting the bounded EL1 `munmap` vertical.
@@ -763,9 +768,12 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
         return MprotectDisposition::Forward;
     };
-    let Some(_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
+    let Some(guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return MprotectDisposition::Forward;
     };
+    // Decided before the tables change: this editor is the only producer, so
+    // room now is room when the edit is recorded.
+    let journal_room = guard.journal_has_room();
     let edit = GuestPermissionEdit {
         va: address,
         len,
@@ -774,7 +782,14 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         executable: prot & PROT_EXEC != 0,
     };
     match editor.protect_and_invalidate(grant.ttbr0, edit) {
-        Ok(()) => MprotectDisposition::Return(0),
+        Ok(()) if journal_room => {
+            // The host applies this, in order, before it next reads the
+            // MM's VMA rows; no exit now.
+            let recorded = guard.journal_protect(address, address + len, (prot & 7) as u8);
+            debug_assert!(recorded.is_ok());
+            MprotectDisposition::Return(0)
+        }
+        Ok(()) => MprotectDisposition::ReturnWithWork,
         Err(GuestPermissionEditError::BadRange) => MprotectDisposition::Return(-EINVAL),
         Err(GuestPermissionEditError::PermissionWidening) => MprotectDisposition::Forward,
         Err(
@@ -848,6 +863,72 @@ mod tests {
             )]
         );
         assert_eq!(spaces.active_editor(spaces.find(17).unwrap()), None);
+        // The host learns of the edit from the journal, not from an exit.
+        let mut seen = Vec::new();
+        assert_eq!(spaces.drain_vma_journal(17, |edit| seen.push(edit)), 1);
+        assert_eq!(
+            seen,
+            vec![carrick_sched_core::VmaEdit {
+                start: frame.x[0],
+                end: frame.x[0] + 0x3000,
+                prot: PROT_READ as u8,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_full_journal_leaves_with_work_and_never_loses_an_edit() {
+        let (frame, tasks, spaces, _) = fixture(PROT_READ);
+        for _ in 0..carrick_sched_core::VMA_JOURNAL_ENTRIES {
+            let mut editor = RecordingEditor::default();
+            assert_eq!(
+                try_serve_mprotect(&frame, &tasks, &spaces, &mut editor),
+                MprotectDisposition::Return(0)
+            );
+        }
+        // Full: the hardware edit still happens, but the host must cross.
+        let mut editor = RecordingEditor::default();
+        assert_eq!(
+            try_serve_mprotect(&frame, &tasks, &spaces, &mut editor),
+            MprotectDisposition::ReturnWithWork
+        );
+        assert_eq!(editor.calls.len(), 1);
+        assert_eq!(
+            spaces.pending_vma_edits(17),
+            carrick_sched_core::VMA_JOURNAL_ENTRIES as u64
+        );
+        // The host drains, and EL1 journals again.
+        assert_eq!(
+            spaces.drain_vma_journal(17, |_| {}),
+            carrick_sched_core::VMA_JOURNAL_ENTRIES
+        );
+        let mut editor = RecordingEditor::default();
+        assert_eq!(
+            try_serve_mprotect(&frame, &tasks, &spaces, &mut editor),
+            MprotectDisposition::Return(0)
+        );
+    }
+
+    #[test]
+    fn a_refused_or_forwarded_mprotect_journals_nothing() {
+        let (frame, tasks, spaces, _) = fixture(PROT_READ);
+        let mut refused = RecordingEditor {
+            result: Some(GuestPermissionEditError::BadRange),
+            ..RecordingEditor::default()
+        };
+        assert_eq!(
+            try_serve_mprotect(&frame, &tasks, &spaces, &mut refused),
+            MprotectDisposition::Return(-EINVAL)
+        );
+        let mut widening = RecordingEditor {
+            result: Some(GuestPermissionEditError::PermissionWidening),
+            ..RecordingEditor::default()
+        };
+        assert_eq!(
+            try_serve_mprotect(&frame, &tasks, &spaces, &mut widening),
+            MprotectDisposition::Forward
+        );
+        assert_eq!(spaces.pending_vma_edits(17), 0);
     }
 
     #[test]

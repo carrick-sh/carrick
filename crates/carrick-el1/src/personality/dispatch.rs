@@ -344,18 +344,21 @@ where
         let mut editor = memory::HardwareAnonymousPermissionEditor;
         match memory::try_serve_mprotect(frame, current_tasks, &zone.tables.spaces, &mut editor) {
             memory::MprotectDisposition::Forward => {}
+            // The edit is in the guest tables and in the space's VMA journal
+            // (or refused): the host applies the journal before it next reads
+            // the MM's rows, so nothing is owed now.
             memory::MprotectDisposition::Return(result) => {
                 frame.x[0] = result as u64;
                 counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                // A successful narrowing changed the guest's page tables
-                // only. The host's VMA rows (`/proc/self/maps`, fork,
-                // core) must learn it too, exactly as for a retired
-                // `munmap`: hand the call back so the ordinary mutation
-                // route commits the metadata (the hardware edit is
-                // idempotent there). Errors change nothing.
-                if result == 0
-                    && let Some(task) = cur_task
-                {
+                return Action::Served;
+            }
+            // Journal full: back-pressure. The tables changed but the edit is
+            // not recorded; hand the call to the host, which drains the
+            // journal and commits this edit through the ordinary route.
+            memory::MprotectDisposition::ReturnWithWork => {
+                frame.x[0] = 0;
+                counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                if let Some(task) = cur_task {
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
                     return task.leave_served_with_work();
                 }
