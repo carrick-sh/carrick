@@ -549,6 +549,28 @@ pub struct DebugSchedulerRow {
     /// not an empty residency population.
     #[serde(default)]
     pub residencies: Option<Vec<DebugResidencyRow>>,
+    /// Rows on host CPU run queues. None: unavailable (older producers).
+    #[serde(default)]
+    pub host_queued: Option<usize>,
+    /// Runnable rows held for a thread the guest schedules (on no host CPU
+    /// queue). None: a shard lock was contended, or an older producer.
+    #[serde(default)]
+    pub zone_held: Option<Vec<DebugZoneHeldRow>>,
+}
+
+/// One zone-held runnable row and who is expected to run it. A row whose
+/// owner is `el1-service` while every EL1 run queue in the zone census is
+/// empty has no owner: it is stranded.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugZoneHeldRow {
+    pub thread: DebugThreadKey,
+    pub generation: u64,
+    /// `adopter`: handed to an executor inside its adoption window;
+    /// `el1-service`: a service record in an EL1 run queue should name it.
+    pub owner: String,
+    /// The thread's execution state, or None if its lock was held.
+    pub state: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

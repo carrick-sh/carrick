@@ -24,7 +24,7 @@ pub use dto::{
     DebugMappingRow, DebugMmRow, DebugProcessGroupRow, DebugResidencyRow, DebugRunQueueRow,
     DebugSchedulerRow, DebugSessionRow, DebugSighandRow, DebugTaskRow, DebugTaskSharedRow,
     DebugTaskSignalRow, DebugThreadResourcesRow, DebugThreadRow, DebugThreadSignalRow, DebugVmaRow,
-    DebugZombieRow, DegradedMmCoordinatorDto, DegradedTaskDto, DegradedThreadDto,
+    DebugZombieRow, DebugZoneHeldRow, DegradedMmCoordinatorDto, DegradedTaskDto, DegradedThreadDto,
     KERNEL_DEBUG_DEGRADED_SCHEMA, KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA,
     KernelDebugAction, KernelDebugAuxProvider, KernelDebugDegraded, KernelDebugDtoError,
     KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable, UnknownTable,
@@ -505,6 +505,8 @@ mod tests {
                     need_resched: false,
                     snapshot_count: 0,
                     residencies: None,
+                    host_queued: None,
+                    zone_held: None,
                 })
                 .into_iter()
                 .collect()
