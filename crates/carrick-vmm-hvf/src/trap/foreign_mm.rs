@@ -579,9 +579,10 @@ impl MmAccessState {
         cow_deferred_publications: std::sync::Arc<
             parking_lot::Mutex<Vec<PendingFrameCowPublication>>,
         >,
+        host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            host_cow_stats: crate::hvf_aarch64_engine::HostCowStats::default(),
+            host_cow_stats,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             native_activation_leaf_checks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -629,6 +630,7 @@ impl MmAccessState {
             frame_inventory,
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         );
         let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
         state.install_identity(snapshot.mm, snapshot.binding);
@@ -3666,6 +3668,7 @@ pub mod foreign_cow_test_support {
                 std::sync::Arc::new(parking_lot::Mutex::new(ledger)),
                 std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                 std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+                crate::hvf_aarch64_engine::HostCowStats::default(),
             );
             let resolver =
                 MmAccessLiveResolver::new(&state, std::sync::Arc::clone(&custody.custody));

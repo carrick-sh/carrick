@@ -83,12 +83,14 @@ pub use gic::{
     el1_irq_mode, el1_vtimer_probe_arm_after_syscall, el1_vtimer_probe_report, interrupt_model,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use hvf_aarch64_engine::{HostCowLedger, HostCowSnapshot, HostCowStats};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use trap::{
     El1FrameGrantMm, El1FrameGrantObserver, El1FrameGrantScope, El1FrameGrantStats,
-    IpcWindowBacking, VcpuLifecycleTotals, el1_frame_grant_stats, read_el1_counters,
-    read_el1_region_host_ptr, register_ipc_window_backing, reset_el1_counters,
-    vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total, vcpu_lifecycle_totals, vcpu_run_exit_classes,
-    vcpu_run_exits_total,
+    IpcWindowBacking, VcpuLifecycleTotals, el1_frame_grant_stats, host_cow_observe_current,
+    host_cow_snapshot, read_el1_counters, read_el1_region_host_ptr, register_ipc_window_backing,
+    reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total, vcpu_lifecycle_totals,
+    vcpu_run_exit_classes, vcpu_run_exits_total,
 };
 /// Serializes tests that fork REAL child processes. The test binary is one
 /// process, so any-child wait paths under test (`wait4(-1)`,

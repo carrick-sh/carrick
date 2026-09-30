@@ -18,6 +18,53 @@ fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
 }
 
 #[test]
+fn carrier_host_cow_ledger_aggregates_admitted_mms_and_survives_retirement() {
+    use crate::hvf_aarch64_engine::{HostCowLedger, HostCowStats};
+    let carrier = HostCowLedger::default();
+    let other_carrier = HostCowLedger::default();
+    let before = carrier.snapshot();
+    let parent = carrier.admit_mm();
+    let child = carrier.admit_mm();
+    let foreign = other_carrier.admit_mm();
+    let detached = HostCowStats::default();
+    parent.record_host_cow_resolution();
+    child.record_host_cow_resolution();
+    child.record_host_cow_resolution();
+    foreign.record_host_cow_resolution();
+    detached.record_host_cow_resolution();
+    drop((parent, child));
+    let delta = carrier.snapshot().checked_delta(&before).unwrap();
+    assert_eq!(delta.host_cow_resolutions, 3, "only this carrier's MMs");
+    assert_eq!(delta.admitted_mms, 2);
+    assert_eq!(other_carrier.snapshot().host_cow_resolutions, 1);
+    assert_eq!(detached.host_cow_resolutions(), 1);
+}
+
+#[test]
+fn host_cow_snapshot_delta_rejects_incomplete_or_cross_carrier_readings() {
+    use crate::hvf_aarch64_engine::{HostCowLedger, HostCowSnapshot};
+    let a = HostCowLedger::default();
+    let b = HostCowLedger::default();
+    let absent = HostCowSnapshot::default();
+    assert!(
+        !absent.complete,
+        "absent carrier must read incomplete, not 0"
+    );
+    assert!(a.snapshot().checked_delta(&absent).is_none());
+    assert!(absent.checked_delta(&a.snapshot()).is_none());
+    assert!(a.snapshot().checked_delta(&b.snapshot()).is_none());
+    a.admit_mm().record_host_cow_resolution();
+    let later = a.snapshot();
+    assert!(
+        HostCowLedger::default()
+            .snapshot()
+            .checked_delta(&later)
+            .is_none(),
+        "a counter that went backwards is not a measurement"
+    );
+}
+
+#[test]
 fn guest_lane_refuses_host_cow_before_copy_or_publication() {
     // Converted writers publish through EL1 and must refuse a missing
     // driving vCPU before any allocation or inventory staging.
