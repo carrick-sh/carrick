@@ -5951,6 +5951,43 @@ mod tests {
         );
     }
 
+    /// On the guest-owned lane the backend applies the alias inventory
+    /// itself, before its EL1 `MapAlias` names the applied revision, so the
+    /// install arm must accept an absent commit there — and only there — and
+    /// must refuse a guest-lane commit the backend left unapplied.
+    #[test]
+    fn alias_install_accepts_a_backend_applied_commit_only_on_the_guest_lane() {
+        let source = include_str!("mod.rs");
+        let arm = source
+            .split("DispatchOutcome::MapHostAlias {")
+            .nth(1)
+            .and_then(|arm| arm.split("break 'service installed;").next())
+            .expect("the alias-install arm");
+        let lane = arm
+            .find("let guest_lane = engine.live_descriptor_owner()")
+            .expect("the arm reads the MM's descriptor lane");
+        let install = arm
+            .find("engine.map_host_alias(")
+            .expect("the arm installs the alias");
+        assert!(lane < install, "the lane is fixed before the backend runs");
+        let take = arm
+            .split("match (engine.take_alias_inventory(), guest_lane)")
+            .nth(1)
+            .expect("commit handling is keyed by the lane");
+        assert!(take.contains("(Some(commit), false) => Some(commit)"));
+        assert!(take.contains("(None, true) => None"));
+        let missing = take
+            .split("(None, false) =>")
+            .nth(1)
+            .expect("a host-lane missing commit is refused");
+        assert!(missing.contains("Site::InventoryCommitMissing"));
+        let unapplied = take
+            .split("(Some(_), true) =>")
+            .nth(1)
+            .expect("a guest-lane unapplied commit is refused");
+        assert!(unapplied.contains("return Err(refuse("));
+    }
+
     #[test]
     fn alias_inventory_applies_to_the_syscall_context_mm() {
         let context = alias_context(67_103);

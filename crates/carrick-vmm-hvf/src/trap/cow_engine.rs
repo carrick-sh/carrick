@@ -470,105 +470,35 @@ impl HvfVmState {
         content: Option<&[u8]>,
         services: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
-        use carrick_mmu_core::aarch64::descriptor_txn::{BackingIdentity, DescriptorOp, PageSpan};
-        use carrick_mmu_core::aarch64::{LiveDescriptorOwner, SubstrateGpa};
+        use super::guest_alias::AliasPublishFailure;
+        use carrick_mmu_core::aarch64::descriptor_txn::PageSpan;
         let error = |message: &str| TrapError::Hypervisor(message.to_owned());
         let tables = self.page_tables_authority();
-        if tables.live_descriptor_owner() != LiveDescriptorOwner::Guest
-            || !services.guest_publication_available()
-        {
-            return Err(error(
-                "guest alias requires its driving vCPU and descriptor owner",
-            ));
-        }
+        let identity = self.cow_identity;
+        let authority = self.cow_authority.clone();
+        let Some(context) = self.guest_alias_context(&tables, identity, authority.as_deref())
+        else {
+            return Err(error("alias has no bound MM or inventory authority"));
+        };
+        context.require_lane(services)?;
         if len == 0 {
             return Ok(());
         }
         let span = PageSpan::new(va, len as u64);
-        let end = target_ipa
-            .checked_add(len as u64)
-            .ok_or_else(|| error("alias IPA overflow"))?;
         if !span.is_well_formed()
             || !target_ipa.is_multiple_of(4096)
+            || target_ipa.checked_add(len as u64).is_none()
             || content.is_some_and(|bytes| bytes.len() != len)
         {
             return Err(error("invalid alias publication span"));
         }
-        let identity = self
-            .cow_identity
-            .ok_or_else(|| error("alias has no bound MM"))?;
-        let authority = self
-            .cow_authority
-            .clone()
-            .ok_or_else(|| error("alias has no inventory authority"))?;
-        let _quiesce = authority
+        let _quiesce = context
+            .authority
             .quiesce()
             .map_err(|e| error(&format!("quiesce alias MM: {e}")))?;
-        let mm = std::num::NonZeroU64::new(identity.mm).ok_or_else(|| error("zero alias MM"))?;
-        struct RetainedAlias {
-            start: u64,
-            end: u64,
-            physical_base: u64,
-            backing: BackingIdentity,
-            pin: GlobalFrameOwnerPin,
-        }
         // Authenticate the complete range before copying or publishing any
-        // part. The logical inventory and containing physical owner can have
-        // different extents after COW; retain both exact identities.
-        let mut retained = Vec::new();
-        let mut current = target_ipa;
-        while current < end {
-            let (key, extent) = self
-                .frame_inventory
-                .lock()
-                .extents
-                .containing(current)
-                .map(|(key, extent)| (*key, *extent))
-                .ok_or_else(|| error("alias target has no live inventory mapping"))?;
-            let limit = key
-                .0
-                .checked_add(key.1)
-                .ok_or_else(|| error("alias inventory overflow"))?
-                .min(end);
-            let pin = pin_exact_live_global_frame_owner_in(
-                self.custody(),
-                extent.stage2_base,
-                extent.stage2_length,
-                extent.stage2_owner.host_addr,
-                extent.stage2_owner.generation,
-            )
-            .ok_or_else(|| error("alias physical owner is not current"))?;
-            let length = |raw| {
-                std::num::NonZeroU64::new(raw)
-                    .map(carrick_hal::FrameLength::from_mapping_extent)
-                    .ok_or_else(|| error("empty alias backing extent"))
-            };
-            let (authenticated_mm, backing) = authority
-                .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
-                    mapping: extent.mapping,
-                    frame: extent.frame,
-                    gpa: carrick_guest_mem::Gpa(key.0),
-                    length: length(key.1)?,
-                    owner_gpa: carrick_guest_mem::Gpa(extent.stage2_base),
-                    owner_length: length(extent.stage2_length)?,
-                })
-                .map_err(|e| error(&format!("authenticate alias backing: {e}")))?;
-            if authenticated_mm != mm
-                || backing.mapping_id.get() != extent.mapping.raw()
-                || backing.frame_id.get() != extent.frame.raw()
-                || backing.owner_generation.get() != extent.stage2_owner.generation
-            {
-                return Err(error("alias backing identity mismatch"));
-            }
-            retained.push(RetainedAlias {
-                start: current,
-                end: limit,
-                physical_base: extent.stage2_base,
-                backing,
-                pin,
-            });
-            current = limit;
-        }
+        // part.
+        let retained = context.authenticate(target_ipa, len as u64)?;
         if let Some(bytes) = content {
             for region in &retained {
                 let offset = (region.start - target_ipa) as usize;
@@ -588,38 +518,18 @@ impl HvfVmState {
                 }
             }
         }
-        let mut published = false;
-        for region in &retained {
-            let mut current = region.start;
-            while current < region.end {
-                // Keep each request within the existing bounded table-grant
-                // capacity, independently of a file mapping's total length.
-                let count = (region.end - current).min(2 * 1024 * 1024);
-                let op = DescriptorOp::MapAlias {
-                    access: carrick_mmu_core::aarch64::descriptor_txn::AliasAccess::User {
-                        writable: true,
-                        executable: true,
-                    },
-                    span: PageSpan::new(va + (current - target_ipa), count),
-                    target_ipa: SubstrateGpa(current),
-                    backing: region.backing,
-                };
-                let txn = match tables.prepare_guest_descriptor_txn(mm, op) {
-                    Ok(txn) => txn,
-                    Err(e) if !published => return Err(error(&format!("prepare alias: {e:?}"))),
-                    Err(e) => carrick_fatal!("hvpatch::alias", "alias partially published: {e:?}"),
-                };
-                let receipt = services.publish(&txn).unwrap_or_else(|e| {
-                    carrick_fatal!(
-                        "hvpatch::alias",
-                        "alias publication lacks verified completion: {e}"
-                    );
-                });
-                if *receipt.txn() != txn {
-                    carrick_fatal!("hvpatch::alias", "alias receipt names another transaction");
-                }
-                published = true;
-                current += count;
+        match context.publish(va, target_ipa, true, &retained, services) {
+            Ok(()) => {}
+            Err(AliasPublishFailure::Unsubmitted(e)) => return Err(e),
+            Err(AliasPublishFailure::PartiallyPublished(e)) => {
+                carrick_fatal!("hvpatch::alias", "alias partially published: {e}")
+            }
+            Err(AliasPublishFailure::Unverified(e)) => carrick_fatal!(
+                "hvpatch::alias",
+                "alias publication lacks verified completion: {e}"
+            ),
+            Err(AliasPublishFailure::CrossedReceipt) => {
+                carrick_fatal!("hvpatch::alias", "alias receipt names another transaction")
             }
         }
         let result = if content.is_some() {
@@ -636,6 +546,63 @@ impl HvfVmState {
         // Keep every owner pin and exact-MM exclusion until metadata commits.
         drop(retained);
         Ok(())
+    }
+
+    /// The shared guest-lane alias inputs of this MM, or `None` when no MM
+    /// identity or inventory authority is bound.
+    fn guest_alias_context<'a>(
+        &'a self,
+        tables: &'a carrick_aarch64::Stage1Authority,
+        identity: Option<carrick_hal::FrameCowIdentity>,
+        authority: Option<&'a dyn carrick_hal::FrameCowAuthority>,
+    ) -> Option<super::guest_alias::GuestAliasContext<'a>> {
+        Some(super::guest_alias::GuestAliasContext {
+            custody: self.custody(),
+            ledger: &self.frame_inventory.ledger,
+            authority: authority?,
+            tables,
+            mm: std::num::NonZeroU64::new(identity?.mm)?,
+        })
+    }
+
+    /// Guest-lane `restore_shared_identity`: see
+    /// [`carrick_aarch64::vmm::Aarch64Vmm::restore_guest_shared_identity`].
+    pub(crate) fn restore_guest_shared_identity(
+        &mut self,
+        va: u64,
+        len: usize,
+        services: &mut dyn carrick_aarch64::vmm::Stage1Services,
+    ) -> Result<(), TrapError> {
+        let tables = self.page_tables_authority();
+        let identity = self.cow_identity;
+        let authority = self.cow_authority.clone();
+        self.guest_alias_context(&tables, identity, authority.as_deref())
+            .ok_or_else(|| {
+                TrapError::Hypervisor("identity restore has no bound MM or authority".to_owned())
+            })?
+            .restore_identity(va, len as u64, services)
+    }
+
+    /// Guest-lane host alias publication: see
+    /// [`carrick_aarch64::vmm::Aarch64Vmm::publish_guest_host_alias`].
+    pub(crate) fn publish_guest_host_alias(
+        &mut self,
+        va: u64,
+        gpa: u64,
+        len: u64,
+        writable: bool,
+        services: &mut dyn carrick_aarch64::vmm::Stage1Services,
+    ) -> Result<(), carrick_aarch64::vmm::GuestAliasRefusal> {
+        let tables = self.page_tables_authority();
+        let identity = self.cow_identity;
+        let authority = self.cow_authority.clone();
+        self.guest_alias_context(&tables, identity, authority.as_deref())
+            .ok_or_else(|| {
+                carrick_aarch64::vmm::GuestAliasRefusal::BeforeInventory(TrapError::Hypervisor(
+                    "guest alias has no bound MM or authority".to_owned(),
+                ))
+            })?
+            .publish_host_alias(va, gpa, len, writable, services)
     }
 
     pub(crate) fn publish_private_repoint(

@@ -2161,6 +2161,27 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .repoint_guest_alias(va, target_ipa, len, content, services)
     }
 
+    fn publish_guest_host_alias(
+        &mut self,
+        va: u64,
+        gpa: u64,
+        len: u64,
+        writable: bool,
+        services: &mut dyn carrick_aarch64::vmm::Stage1Services,
+    ) -> Result<(), carrick_aarch64::vmm::GuestAliasRefusal> {
+        self.state
+            .publish_guest_host_alias(va, gpa, len, writable, services)
+    }
+
+    fn restore_guest_shared_identity(
+        &mut self,
+        va: u64,
+        len: usize,
+        services: &mut dyn carrick_aarch64::vmm::Stage1Services,
+    ) -> Result<(), TrapError> {
+        self.state.restore_guest_shared_identity(va, len, services)
+    }
+
     fn publish_private_repoint(
         &mut self,
         va: u64,
