@@ -229,6 +229,36 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
 }
 
 impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
+    fn commit_guest_host_first_touch(
+        &self,
+        address: u64,
+        publish: &mut dyn FnMut(
+            std::num::NonZeroU64,
+            u64,
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            String,
+        >,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = self.runtime.upgrade().ok_or_else(|| {
+            std::io::Error::other("guest host first touch lost its exact runtime")
+        })?;
+        let dispatcher = &runtime.dispatcher;
+        let mut guard = carrick_kernel::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
+            &self.pt_quiesce,
+            self.mm,
+            dispatcher.mm_mutation_coordinator(),
+            self.tid,
+            carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+        )
+        .map_err(|error| {
+            std::io::Error::other(format!("guest host first-touch quiesce: {error:?}"))
+        })?;
+        dispatcher
+            .commit_guest_host_first_touch(&mut guard, address, publish)
+            .map_err(|error| Box::new(std::io::Error::other(error)) as _)
+    }
+
     fn commit_host_first_touch(
         &self,
         address: u64,

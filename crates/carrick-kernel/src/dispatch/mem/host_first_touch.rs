@@ -14,8 +14,8 @@ pub struct HostFirstTouchIntent {
     pub arming_revision: u64,
 }
 
-/// T2 implements this on VerifiedDescriptorReceipt at integration. That type
-/// is not present on this branch; the trait avoids inventing a second receipt.
+/// Exact publication evidence consumed by the deferred first-touch commit.
+/// The runtime adapter below binds a verified descriptor receipt to its intent.
 ///
 /// # Safety
 /// Values must come from authenticated successful descriptor publication in
@@ -27,7 +27,70 @@ pub unsafe trait HostFirstTouchDescriptorReceipt {
     fn protection(&self) -> u64;
 }
 
+struct PublishedHostFirstTouch {
+    resident: ReservationRange,
+    intent: HostFirstTouchIntent,
+    receipt: carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+}
+
+// SAFETY: construction requires a verified Publish/Write transaction. The
+// existing commit validates its exact MM/span and unchanged arming revision;
+// Publish preserves the prepared leaf's permissions rather than changing them.
+unsafe impl HostFirstTouchDescriptorReceipt for PublishedHostFirstTouch {
+    fn mm(&self) -> MmId {
+        MmId::from_registry_allocation(self.receipt.id().mm_key)
+    }
+    fn resident(&self) -> ReservationRange {
+        self.resident
+    }
+    fn protection(&self) -> u64 {
+        self.intent.prot
+    }
+}
+
 impl SyscallDispatcher {
+    pub fn commit_guest_host_first_touch(
+        &self,
+        authority: &mut FrameCowExactMmGuard,
+        address: u64,
+        publish: &mut dyn FnMut(
+            std::num::NonZeroU64,
+            u64,
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            String,
+        >,
+    ) -> Result<bool, String> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp;
+        let Some(intent) = self.plan_host_first_touch(authority, address)? else {
+            return Ok(false);
+        };
+        let receipt = publish(intent.mm.nonzero(), intent.page)?;
+        if !matches!(
+            receipt.txn().op,
+            DescriptorOp::Publish {
+                access: carrick_mmu_core::aarch64::LeafAccess::Write,
+                ..
+            }
+        ) {
+            return Err("host copyout requires a guest write-publication receipt".to_owned());
+        }
+        let span = receipt.resident();
+        let resident = span
+            .va
+            .checked_add(span.len)
+            .and_then(|end| ReservationRange::new(span.va, end))
+            .ok_or_else(|| "host copyout publication has an invalid resident span".to_owned())?;
+        let proof = PublishedHostFirstTouch {
+            intent,
+            receipt,
+            resident,
+        };
+        let mutation = super::super::mm_mutation::from_frame_cow(authority);
+        self.commit_host_first_touch_after_guest_publish(&mutation, intent, &proof)?;
+        Ok(true)
+    }
+
     fn first_touch_plan<'permit>(
         &self,
         permit: &'permit HostAliasPermit<'_>,
@@ -127,6 +190,98 @@ impl SyscallDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_host_first_touch_commits_only_an_exact_write_publication() {
+        use carrick_mmu_core::aarch64::descriptor_txn::*;
+        use carrick_mmu_core::aarch64::{LeafAccess, SubstrateGpa};
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mm = context.shared().mm().id();
+        let page = crate::memory::LINUX_MMAP_BASE;
+        dispatcher.seed_resident_fault_for_test(page, 3);
+        let mut guard = crate::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
+            &dispatcher.pt_quiesce(),
+            mm,
+            dispatcher.mm_mutation_coordinator(),
+            crate::thread::ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
+            crate::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+        )
+        .unwrap();
+        // Model authenticated descriptor outcomes here; runtime's executor
+        // test separately proves the actual page-table mutation and receipt.
+        let receipt = |mm_key, va, access| {
+            let span = PageSpan::new(va, 4096);
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key,
+                    generation: std::num::NonZeroU64::new(1).unwrap(),
+                },
+                root: SubstrateGpa(0x1000),
+                op: DescriptorOp::Publish {
+                    span,
+                    expected_ipa: SubstrateGpa(0x2000),
+                    access,
+                },
+                tables: TableGrants::NONE,
+            };
+            txn.verify_receipt(&DescriptorReceipt {
+                id: txn.id,
+                digest: txn.digest(),
+                outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                    pages: 1,
+                    resident: span,
+                    tables_linked: 0,
+                    live_stores: 1,
+                    flush_required: true,
+                }),
+            })
+            .unwrap()
+        };
+        assert!(
+            dispatcher
+                .commit_guest_host_first_touch(&mut guard, page, &mut |_, _| {
+                    Err("publication refused".to_owned())
+                })
+                .is_err()
+        );
+        for invalid in [
+            receipt(
+                std::num::NonZeroU64::new(mm.raw() + 1).unwrap(),
+                page,
+                LeafAccess::Write,
+            ),
+            receipt(mm.nonzero(), page + 4096, LeafAccess::Write),
+            receipt(mm.nonzero(), page, LeafAccess::Read),
+        ] {
+            assert!(
+                dispatcher
+                    .commit_guest_host_first_touch(&mut guard, page, &mut |_, _| Ok(invalid))
+                    .is_err()
+            );
+            assert!(
+                dispatcher
+                    .plan_host_first_touch(&mut guard, page)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            dispatcher.commit_guest_host_first_touch(&mut guard, page + 8, &mut |key, address| {
+                assert_eq!(key, mm.nonzero());
+                assert_eq!(address, page);
+                Ok(receipt(key, address, LeafAccess::Write))
+            }),
+            Ok(true)
+        );
+        assert_eq!(
+            dispatcher.commit_guest_host_first_touch(&mut guard, page, &mut |_, _| {
+                panic!("an already resident page must not republish")
+            }),
+            Ok(false)
+        );
+    }
+
     struct Receipt {
         mm: MmId,
         range: ReservationRange,

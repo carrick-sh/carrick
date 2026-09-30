@@ -2384,6 +2384,24 @@ pub trait FrameCowQuiesce {}
 impl<T> FrameCowQuiesce for T {}
 
 pub trait FrameCowAuthority: Send + Sync {
+    /// Publish a prepared host-write page in EL1 while exact-MM exclusion is
+    /// retained. Only the authenticated guest receipt permits residency commit.
+    fn commit_guest_host_first_touch(
+        &self,
+        _address: u64,
+        _publish: &mut dyn FnMut(
+            std::num::NonZeroU64,
+            u64,
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            String,
+        >,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::other(
+            "guest host first touch has no exact-MM authority",
+        )))
+    }
+
     /// Commit an armed page before the host writes guest memory without an
     /// EL0 first-touch exit. `protect` publishes the live stage-1 leaf; the
     /// authority publishes residency only after that edit succeeds.
