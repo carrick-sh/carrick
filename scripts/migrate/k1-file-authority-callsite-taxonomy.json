@@ -3176,7 +3176,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 1833,
+      "line": 1869,
       "categories": [
         "description_guard"
       ],
