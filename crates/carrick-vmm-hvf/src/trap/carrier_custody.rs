@@ -504,6 +504,11 @@ pub(crate) struct CarrierVmCustody {
         parking_lot::Mutex<PendingGlobalFrameRetirementQueue<CarrierStage2RecordId>>,
     pub(crate) frame_pool: parking_lot::Mutex<CarrierFramePoolState>,
     pub(crate) root_slot_pool: parking_lot::Mutex<CarrierRootSlotPoolState>,
+    /// The exact backend state of every MM whose COW runtime this carrier
+    /// bound, by MM id: guest COW settlement must fold an MM's completions
+    /// into the state its executors use, never a stale copy found by scan.
+    pub(crate) guest_cow_states:
+        parking_lot::Mutex<std::collections::HashMap<u64, std::sync::Weak<MmAccessState>>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -567,6 +572,7 @@ impl CarrierVmCustody {
             ),
             frame_pool: parking_lot::Mutex::new(CarrierFramePoolState::Uninitialized),
             root_slot_pool: parking_lot::Mutex::new(CarrierRootSlotPoolState::Uninitialized),
+            guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

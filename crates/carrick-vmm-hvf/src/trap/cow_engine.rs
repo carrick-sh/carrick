@@ -381,6 +381,9 @@ impl HvfVmState {
     /// silently sharing the parent's frame. The alias registry supplies mappings
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
     pub(crate) fn fork_cow_ranges(&mut self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        if let Some(identity) = self.cow_identity {
+            super::guest_cow::require_guest_cow_settled(identity.mm, "fork of the parent");
+        }
         // Retire the rows (and their registry aliases) that earlier COW splits
         // superseded, so the projection below scans this process's mappings,
         // never its fork history.
@@ -3015,6 +3018,7 @@ impl HvfTaskState {
         let _quiesce = authority.quiesce().map_err(|error| {
             TrapError::Hypervisor(format!("quiesce HVPatch frame COW: {error}"))
         })?;
+        super::guest_cow::require_guest_cow_settled(identity.mm, "host frame COW");
 
         // Another vCPU of this mm may have won while we waited for topology.
         // Take only what the fault path needs. This used to CLONE the whole
