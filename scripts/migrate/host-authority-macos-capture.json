@@ -10761,15 +10761,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 199251,
-        "byte_start": 199226,
+        "byte_end": 200072,
+        "byte_start": 200047,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
         "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-        "line": 4652,
-        "line_end": 4652,
-        "line_start": 4652
+        "line": 4667,
+        "line_end": 4667,
+        "line_start": 4667
       }
     },
     {
@@ -11937,9 +11937,9 @@
       }
     }
   ],
-  "rows_sha256": "6588d76f4a4da65e405e2b38876f973a952c4da15fba265004b2c66489818bfd",
+  "rows_sha256": "57a0714d41bf3e5eea0a712b8accdeb3d05d5106929b5ada75633614edf6a813",
   "schema": 1,
-  "source_head": "75f0a597c9bc0cdd9616d69c26b80a8ce2c4c0c7",
+  "source_head": "7249199ca8445df5ed46ca01566febb9f7eaab86",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
