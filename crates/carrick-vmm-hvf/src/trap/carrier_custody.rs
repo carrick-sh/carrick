@@ -1608,6 +1608,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn global_frame_owner_directory_is_isolated_per_carrier_custody() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (first, _) = live_custody();
         let (second, _) = live_custody();
         let key = (0xa081_0000_0000, 0x4000);
@@ -1632,6 +1633,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn production_global_frame_owner_operations_require_carrier_custody_static_audit() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = concat!(include_str!("../trap.rs"), include_str!("global_frame.rs"));
         let legacy_directory = concat!(
             "#[cfg(all(test, target_os = \"macos\", target_arch = \"aarch64\"))]\n",
@@ -1670,6 +1672,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn executor_cleanup_funnels_guarantee_a_post_drop_idle_maintenance_turn_static_audit() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = include_str!("../../../carrick-runtime/src/vcpu_loop/executor.rs");
         let exec_cleanup = source
             .split("let exec_cleanup_ran =")
@@ -1705,6 +1708,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn vm_rebuild_funnels_reconcile_owner_generation_before_guest_entry_static_audit() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = concat!(
             include_str!("../trap.rs"),
             include_str!("mapping_plan.rs"),
@@ -1760,7 +1764,9 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn global_owner_late_final_pin_defers_persistent_failure_without_abort_then_retries() {
+    fn serial_host_global_owner_late_final_pin_defers_persistent_failure_without_abort_then_retries()
+     {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_1000_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -1890,6 +1896,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn global_owner_retirement_publishes_pending_before_backend_unmap_without_holding_directory() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_1800_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2012,7 +2019,8 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn later_exact_retirement_retries_a_transient_backend_failure_once() {
+    fn serial_host_later_exact_retirement_retries_a_transient_backend_failure_once() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_1a00_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2067,6 +2075,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn foreign_mm_drop_release_only_enqueues_until_the_executor_idle_safe_point() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_1b00_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2135,6 +2144,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn executor_idle_safe_point_requeues_one_transient_backend_failure() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_1b80_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2194,6 +2204,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn synchronous_retirement_removes_queued_storage_before_key_reuse() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let make_pending = |key: (u64, u64)| {
             let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2275,6 +2286,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn executor_idle_safe_point_never_duplicates_an_in_flight_turn() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_1bc0_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2340,7 +2352,8 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn retirement_retains_backing_if_the_claimed_directory_slot_disappears() {
+    fn serial_host_retirement_retains_backing_if_the_claimed_directory_slot_disappears() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_1c00_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2397,7 +2410,8 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn global_owner_collision_retains_failed_rollback_candidate_until_safe_point() {
+    fn serial_host_global_owner_collision_retains_failed_rollback_candidate_until_safe_point() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_2000_0000, 0x4000);
         let incumbent_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2473,6 +2487,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn bounded_idle_retry_rotates_past_persistent_prefix_and_services_detached_work() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let mut live = Vec::new();
         for index in 0..128_u64 {
@@ -2647,6 +2662,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn reconcile_deferred_owner_enqueues_for_idle_retry_after_pin_drop() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa084_0000_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2704,6 +2720,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn global_owner_stale_same_key_generation_never_retires_successor() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_3000_0000, 0x4000);
         let install = || {
@@ -2763,6 +2780,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn vm_rebuild_rebinds_live_owner_to_g2_and_transfers_release_authority_once() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
         let key = (0xa081_4000_0000_u64, 0x4000_u64);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2943,7 +2961,8 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn vm_destroy_success_terminalizes_pending_owner_but_failure_preserves_exact_g1() {
+    fn serial_host_vm_destroy_success_terminalizes_pending_owner_but_failure_preserves_exact_g1() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             0x4000,
@@ -3028,6 +3047,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn carrier_exit_propagates_terminal_owner_cleanup_failure_after_destroy_success() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             0x4000,
@@ -3080,6 +3100,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn terminal_release_claim_aborts_for_retry_and_commits_removal_exactly_once() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             0x4000,
@@ -3150,6 +3171,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn post_raw_create_failures_never_publish_live_and_terminalize_exact_setup_generation() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         for stage in ["initial-vcpu", "shared-wait-map", "exec-reconcile"] {
             let custody = CarrierVmCustody::new();
             let generation = custody.begin_create().expect("begin injected create");
@@ -3182,6 +3204,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn frame_pool_and_commit_destroy_concurrent_lock_order() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
@@ -3211,6 +3234,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn late_g1_carrier_mm_retirement_request_cannot_mutate_same_key_g2_record() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
         let key = (0xa081_9000_0000, 0x4000);
         let mut g1_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
@@ -3256,6 +3280,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn terminal_release_claim_blocks_generation_rebind_until_abort() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let identity = custody
             .register_stage2_record(stage2_spec(custody.live_generation().expect("G1 live"), 91))
@@ -3290,6 +3315,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn create_cleanup_retains_failed_vcpu_then_retries_terminal_finalization_only() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().expect("begin Creating VM");
         let identity = custody
@@ -3380,6 +3406,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn initial_fallible_input_failure_precedes_vm_and_admission_permit_acquisition() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let admission_attempted = std::cell::Cell::new(false);
         let result = super::prepare_initial_carrier_before_admission(
             || {
@@ -3401,6 +3428,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn pending_vcpu_wrapper_never_runs_raii_destroy_before_exact_cleanup() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for DropProbe {
             fn drop(&mut self) {
@@ -3421,6 +3449,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn fresh_vm_vcpu_and_permit_wrappers_remain_guarded_until_commit_static_audit() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = concat!(
             include_str!("../trap.rs"),
             include_str!("persistent_executor.rs")
@@ -3462,6 +3491,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn carrier_mm_logical_authority_follows_g1_record_rebind_and_retires_g2_once() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
         let key = (0xa081_a000_0000, 0x4000);
         let old_identity = custody
@@ -3528,6 +3558,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn concurrent_exact_owner_finalization_cannot_republish_removed_owner() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_b000_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -3592,7 +3623,8 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn structural_owner_drop_requests_then_safe_point_retires_with_backing_intact() {
+    fn serial_host_structural_owner_drop_requests_then_safe_point_retires_with_backing_intact() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0x7d00_1000_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -3634,6 +3666,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn explicit_offset_structural_retirement_unmaps_with_physical_sized_projection() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stage2_stub = super::ScopedStage2MapTestStub::enable();
         let (custody, _) = live_custody();
         let ipa = 0x7d00_1800_0000;
@@ -3778,6 +3811,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn pinned_structural_retirement_refuses_root_slot_reuse_until_terminal() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stage2_stub = super::ScopedStage2MapTestStub::enable();
         let (custody, _) = live_custody();
         let ipa = 0x7d00_1c00_0000;
@@ -3873,6 +3907,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn live_structural_owner_rebinds_exactly_to_g2_before_late_drop() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
         let key = (0x7d00_2000_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -3934,6 +3969,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn creation_funnels_hold_transaction_through_setup_and_prepared_writes_hold_pin_static_audit() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = concat!(
             include_str!("../trap.rs"),
             include_str!("mapping_plan.rs"),
@@ -3987,6 +4023,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn abort_destroy_preserves_the_exact_live_generation_for_retry() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().expect("begin first VM create");
         custody
@@ -4008,6 +4045,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn committed_destroy_prevents_a_stale_generation_from_mutating_its_successor() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new();
         let first = custody.begin_create().expect("begin first VM create");
         custody
@@ -4038,6 +4076,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn aborted_create_returns_custody_to_vacant_without_reusing_the_generation() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new();
         let failed = custody.begin_create().expect("begin failed VM create");
         custody
@@ -4054,6 +4093,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn backend_destroy_failure_preserves_live_custody_and_skips_release_publication() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().expect("begin VM create");
         custody
@@ -4080,6 +4120,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn backend_destroy_success_terminalizes_before_release_publication() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().expect("begin VM create");
         custody
@@ -4101,6 +4142,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn backend_create_failure_returns_custody_to_vacant_and_skips_publication() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new();
         let published = std::cell::Cell::new(false);
 
@@ -4125,6 +4167,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn backend_create_success_commits_generation_before_publication() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new();
         let published_generation = std::cell::Cell::new(None);
 
@@ -4143,6 +4186,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn persistent_unmap_failure_retains_the_exact_record_for_retry() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
         let identity = custody
             .register_stage2_record(stage2_spec(generation, 11))
@@ -4187,6 +4231,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn carrier_safe_point_failure_retains_directory_identity_until_exact_retry_finishes() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
         let identity = custody
             .register_stage2_record(stage2_spec(generation, 13))
@@ -4234,6 +4279,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn last_pin_drop_is_non_panicking_and_only_marks_retry_eligibility() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
         let identity = custody
             .register_stage2_record(stage2_spec(generation, 21))
@@ -4275,6 +4321,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn successful_vm_destroy_terminalizes_generation_without_post_destroy_unmap() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
         let first = custody
             .register_stage2_record(stage2_spec(generation, 31))
@@ -4304,6 +4351,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn failed_vm_destroy_preserves_records_and_live_generation() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
         let identity = custody
             .register_stage2_record(stage2_spec(generation, 41))
@@ -4335,6 +4383,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn cross_generation_same_key_rejects_old_vm_and_owner_identities() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, first_generation) = live_custody();
         let first = custody
             .register_stage2_record(stage2_spec(first_generation, 51))

@@ -40,6 +40,7 @@ const TASK_ROWS_BUDGET: u64 = 2;
 
 #[test]
 fn alias_unmap_visits_only_process_visible_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut observations = Vec::new();
     for unrelated in [32_u64, 2048] {
         let mut registry = AliasRegistry::default();
@@ -189,6 +190,7 @@ fn compound_source_predicate(alias: &AliasBacking) -> bool {
 
 #[test]
 fn physical_cow_source_candidates_are_bounded_by_the_window() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut observed = Vec::new();
     for n in SCALES {
         let (registry, answers) = adversarial_registry(n);
@@ -215,6 +217,7 @@ fn physical_cow_source_candidates_are_bounded_by_the_window() {
 
 #[test]
 fn containing_va_candidates_ignore_fork_siblings_at_the_same_va() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let probe = TARGET_VA + PAGE;
     let mut observed = Vec::new();
     for n in SCALES {
@@ -249,6 +252,7 @@ fn containing_va_candidates_ignore_fork_siblings_at_the_same_va() {
 
 #[test]
 fn retained_reuse_fragment_is_bounded_by_the_physical_extent() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // The scrubbed VA was carved out of the compound by a partial munmap:
     // no live row covers it, but its invalid leaf still names the compound's
     // physical page. Fork siblings hold rows AT that VA, and the process has
@@ -334,6 +338,7 @@ fn extent(stage2_base: u64, stage2_length: u64, serial: u64) -> InventoryExtent 
 
 #[test]
 fn exclusive_claim_extent_lookup_is_bounded_by_size_classes() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // `n` dense 16 KiB extents, one wide 2 MiB extent below them, and the
     // probed extent LAST in key order: a key-order walk visits everything.
     let base = 0x40_0000_0000_u64;
@@ -385,6 +390,7 @@ fn exclusive_claim_extent_lookup_is_bounded_by_size_classes() {
 
 #[test]
 fn scrub_target_row_is_bounded_by_the_overlapping_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // The scrubbed page is the LOWEST row; `n` distinct rows lie above it,
     // so a newest-first whole-table walk visits every one of them first.
     let mut observed = Vec::new();
@@ -452,6 +458,7 @@ impl Rng {
 /// by `upsert_by_key`, several scopes at the same VAs and nested windows.
 #[test]
 fn scoped_alias_queries_match_the_carrier_wide_oracle() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut seeds_with_split_ties = 0;
     let scopes = [
         own_scope(),

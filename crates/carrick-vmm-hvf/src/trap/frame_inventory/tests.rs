@@ -145,6 +145,7 @@ fn el1_partial_discard_peer_retention_three_scales() {
 
 #[test]
 fn lease_retirement_visits_only_the_selected_extents() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut observations = Vec::new();
     for unrelated in [32_u64, 2048] {
         let mut inventory = HvpatchFrameInventory::default();
@@ -202,6 +203,7 @@ fn lease_retirement_visits_only_the_selected_extents() {
 /// assertions below fail.
 #[test]
 fn private_alias_scopes_never_collide_across_carrier_containers() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let alpha = ContainerRootToken::next();
     let beta = ContainerRootToken::next();
     assert_ne!(alpha, beta, "each container root mints a distinct token");
@@ -256,6 +258,7 @@ fn predecessor_test_identity(task: &HvfTaskState) -> (carrick_hal::ExecPredecess
 
 #[test]
 fn bootstrap_exec_predecessor_uses_bound_kernel_identity_without_registration() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut task = hvpatch_task_state_test_fixture(31, 0x4000, 31);
     let (identity, _) = predecessor_test_identity(&task);
     assert!(task.registration.is_none());
@@ -283,6 +286,7 @@ fn bootstrap_exec_predecessor_uses_bound_kernel_identity_without_registration() 
 
 #[test]
 fn exec_predecessor_accepts_current_kernel_identity_over_stale_registration_birth_fields() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, current_kernel, current_cow) = exec_predecessor_authority_test_fixture();
     assert_eq!(
         task.take_exec_predecessor_identity(current_cow)
@@ -293,6 +297,7 @@ fn exec_predecessor_accepts_current_kernel_identity_over_stale_registration_birt
 
 #[test]
 fn exec_predecessor_rejects_registration_cow_backend_identity_mismatch() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _, current_cow) = exec_predecessor_authority_test_fixture();
     task.registration
         .as_mut()
@@ -314,6 +319,7 @@ fn exec_predecessor_rejects_registration_cow_backend_identity_mismatch() {
 
 #[test]
 fn exec_predecessor_rejects_each_retained_authority_anchor_mismatch() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const KERNEL_REGISTRATION: &str =
         "HVPatch exec predecessor Kernel/registration identity mismatch";
     const REGISTRATION_COW: &str = "HVPatch exec predecessor registration/COW identity mismatch";
@@ -580,6 +586,7 @@ fn inventory_pair(
 
 #[test]
 fn cancelled_process_inventory_does_not_poison_the_next_fork() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let state = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
 
@@ -605,6 +612,7 @@ fn cancelled_process_inventory_does_not_poison_the_next_fork() {
 /// succeeded).
 #[test]
 fn abandoned_alias_inventory_does_not_poison_the_next_guest_mmap() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let state = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
 
@@ -645,6 +653,7 @@ fn abandoned_alias_inventory_does_not_poison_the_next_guest_mmap() {
 
 #[test]
 fn parent_arm_rollback_restores_preexisting_overlapping_ranges_exactly() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let broad = carrick_aarch64::vmm::ForkCowRange {
         va: 0x4000_0000,
         len: 0x20_000,
@@ -676,6 +685,7 @@ fn parent_arm_rollback_restores_preexisting_overlapping_ranges_exactly() {
 
 #[test]
 fn global_frame_allocator_reuses_only_released_exact_extents() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut allocator = GlobalFrameIpaAllocator::new();
     let first = allocator.allocate(0x4000, 0x4000).unwrap();
     let second = allocator.allocate(0x4000, 0x4000).unwrap();
@@ -691,6 +701,7 @@ fn global_frame_allocator_reuses_only_released_exact_extents() {
 
 #[test]
 fn global_frame_allocator_coalesces_adjacent_retired_extents() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut allocator = GlobalFrameIpaAllocator::new();
     let first = allocator.allocate(0x4000, 0x4000).unwrap();
     let second = allocator.allocate(0x4000, 0x4000).unwrap();
@@ -706,6 +717,7 @@ fn global_frame_allocator_coalesces_adjacent_retired_extents() {
 
 #[test]
 fn global_frame_allocator_rejects_duplicate_or_partial_release() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut allocator = GlobalFrameIpaAllocator::new();
     let frame = allocator.allocate(0x8000, 0x4000).unwrap();
     assert!(allocator.release(frame, 0).is_err());
@@ -733,6 +745,7 @@ fn global_frame_allocator_rejects_duplicate_or_partial_release() {
 
 #[test]
 fn global_frame_allocator_honors_large_frame_alignment() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const TWO_MIB: u64 = 2 * 1024 * 1024;
     let mut allocator = GlobalFrameIpaAllocator::new();
     let _prefix = allocator.allocate(0x4000, 0x4000).unwrap();
@@ -742,6 +755,7 @@ fn global_frame_allocator_honors_large_frame_alignment() {
 
 #[test]
 fn global_frame_allocator_rejects_invalid_allocation_arithmetic() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut allocator = GlobalFrameIpaAllocator::new();
     assert!(allocator.allocate(0x4000, 0).is_err());
     assert!(allocator.allocate(u64::MAX, 0x4000).is_err());
@@ -757,11 +771,13 @@ fn global_frame_allocator_rejects_invalid_allocation_arithmetic() {
 
 #[test]
 fn fixed_identity_stage2_retirement_does_not_release_global_allocator() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     assert!(release_retired_stage2_ipa(0x1_0000_0000, 0x70_0000).is_ok());
 }
 
 #[test]
 fn global_frame_allocator_preserves_large_hole_for_large_request() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const LARGE: u64 = 32 * 1024 * 1024 * 1024;
     const SMALL: u64 = 0x4000;
     let arena_base = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
@@ -783,6 +799,7 @@ fn global_frame_allocator_preserves_large_hole_for_large_request() {
 
 #[test]
 fn global_frame_exec_omits_sparse_mmap_arena_and_reserves_large_extents_first() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mappings = vec![
         exec_mapping_for_order(0x10_0000, 0x4000),
         exec_mapping_for_order(crate::memory::LINUX_PAGE_TABLES_BASE, 0x20_0000),
@@ -834,6 +851,7 @@ fn root_exec_test_plan() -> GuestMappingPlan {
 
 #[test]
 fn root_exec_plan_owns_every_materialized_stage2_extent() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let plan = root_exec_test_plan();
     let GlobalExecPlan {
         plan: rebuilt,
@@ -863,6 +881,7 @@ fn root_exec_plan_owns_every_materialized_stage2_extent() {
 
 #[test]
 fn consecutive_root_exec_plans_reserve_disjoint_frame_generations() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let plan = root_exec_test_plan();
     let first = prepare_global_exec_plan(&plan, None).unwrap();
     let second = prepare_global_exec_plan(&plan, None).unwrap();
@@ -885,6 +904,7 @@ fn consecutive_root_exec_plans_reserve_disjoint_frame_generations() {
 /// with the right numeric slot but no exact root proof.
 #[test]
 fn exec_successor_root_publication_installs_exact_structural_authority() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
     let root_slot = (0x7ee0_0000_0000_u64, 0x20_0000_u64);
@@ -932,6 +952,7 @@ fn exec_successor_root_publication_installs_exact_structural_authority() {
 
 #[test]
 fn retire_initial_mmap_arena_is_idempotent_when_sparse_mapping_absent() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // The retirement flag is carrier-scoped, so it outlives any one test in
     // this process. Each of these tests owns it explicitly rather than
     // inheriting whatever a sibling left behind.
@@ -945,6 +966,7 @@ fn retire_initial_mmap_arena_is_idempotent_when_sparse_mapping_absent() {
 
 #[test]
 fn second_container_never_unmaps_the_carrier_arena_again() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // The unmap inside retirement is VM-wide, but retirement runs during
     // each CONTAINER's root bring-up. A second container reaching it must
     // not unmap again: a sibling container may already have faulted sparse
@@ -995,6 +1017,7 @@ fn second_container_never_unmaps_the_carrier_arena_again() {
 
 #[test]
 fn retire_initial_mmap_arena_rejects_corrupted_shape() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // Shape validation applies to the FIRST retirement only: it exists to
     // catch a carrier eager mapping that is present but malformed, and only
     // the first container ever sees that mapping. A later container's arena
@@ -1017,6 +1040,7 @@ fn retire_initial_mmap_arena_rejects_corrupted_shape() {
 
 #[test]
 fn exec_replacement_preserves_canonical_scoped_asid_and_load_barrier_code() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut input = root_exec_test_plan();
     let mut maintenance = exec_mapping_for_order(
         carrick_mem::memory::LINUX_EL1_MAINT_BASE,
@@ -1062,6 +1086,7 @@ fn exec_replacement_preserves_canonical_scoped_asid_and_load_barrier_code() {
 
 #[test]
 fn exec_reuses_carrier_control_stage2_without_allocating_task_leases() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut input = root_exec_test_plan();
     for (start, size) in [
         (
@@ -1117,7 +1142,8 @@ fn exec_reuses_carrier_control_stage2_without_allocating_task_leases() {
 }
 
 #[test]
-fn exec_predecessor_backing_stays_live_until_detached_cleanup() {
+fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         0x4000,
         crate::host_mapping::HostMappingKind::PrivateAnon,
@@ -1166,6 +1192,7 @@ fn exec_predecessor_backing_stays_live_until_detached_cleanup() {
 
 #[test]
 fn shared_exec_predecessor_cleanup_retains_and_emits_exact_classification() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let task = hvpatch_task_state_test_fixture(19, 0x4000, 23);
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
     let mut cleanup = PendingExecStage2Cleanup {
@@ -1204,6 +1231,7 @@ fn shared_exec_predecessor_cleanup_retains_and_emits_exact_classification() {
 
 #[test]
 fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         0x4000,
         crate::host_mapping::HostMappingKind::PrivateAnon,
@@ -1325,6 +1353,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
 
 #[test]
 fn exec_predecessor_cleanup_rejects_a_recycled_owner_generation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let lease_key = (0x123c_0000_u64, 0x4000_usize);
     let successor_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         lease_key.1,
@@ -1575,6 +1604,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
 
 #[test]
 fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut task = hvpatch_task_state_test_fixture(8, 0x8000, 8);
     task.shared_process_mm = true;
     let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
@@ -1628,6 +1658,7 @@ fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
 /// past its point of no return on the resulting zero-event commit.
 #[test]
 fn retained_old_mm_reports_no_exec_retirement_extents() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut task = hvpatch_task_state_test_fixture(9, 0x9000, 9);
     {
         let mut ledger = task.frame_inventory.lock();
@@ -1655,6 +1686,7 @@ fn retained_old_mm_reports_no_exec_retirement_extents() {
 
 #[test]
 fn exec_replacement_keeps_every_representative_leaf_asid_scoped() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const NON_GLOBAL: u64 = 1 << 11;
     let GlobalExecPlan { plan, .. } =
         prepare_global_exec_plan(&root_exec_test_plan(), None).expect("global exec plan");
@@ -1711,6 +1743,7 @@ fn exec_replacement_keeps_every_representative_leaf_asid_scoped() {
 
 #[test]
 fn root_exec_plan_does_not_collide_with_a_live_child_generation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let plan = root_exec_test_plan();
     let child = prepare_global_exec_plan(
         &plan,
@@ -1787,6 +1820,7 @@ fn exec_authority_fingerprint_fixture() -> ExecAuthorityFingerprint {
 
 #[test]
 fn exec_authority_rollback_rejects_drift_in_every_published_component() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let before = exec_authority_fingerprint_fixture();
     let assert_drift = |mut after: ExecAuthorityFingerprint,
                         mutate: fn(&mut ExecAuthorityFingerprint)| {
@@ -1902,16 +1936,19 @@ fn assert_exec_stage2_injected_failure_restores_old(fail_after_maps: usize) {
 
 #[test]
 fn exec_stage2_failure_after_teardown_restores_predecessor_exactly() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     assert_exec_stage2_injected_failure_restores_old(0);
 }
 
 #[test]
 fn exec_stage2_failure_after_one_map_removes_successor_and_restores_predecessor() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     assert_exec_stage2_injected_failure_restores_old(1);
 }
 
 #[test]
 fn exec_stage2_rollback_restores_predecessor_replay_registration() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut predecessor = ExecStage2Install::for_test(0x1000, 0x1000);
     predecessor.replay_registered = true;
     let replacement = ExecStage2Install::for_test(0x9000, 0x1000);
@@ -1958,6 +1995,7 @@ fn exec_stage2_rollback_restores_predecessor_replay_registration() {
 
 #[test]
 fn root_exec_rebuilds_tables_with_sparse_and_hvpatch_reservations() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let plan = root_exec_test_plan();
 
     let GlobalExecPlan {
@@ -2007,6 +2045,7 @@ fn root_exec_rebuilds_tables_with_sparse_and_hvpatch_reservations() {
 
 #[test]
 fn sparse_exec_omission_requires_exact_private_hidden_arena() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let exact = exec_mapping_for_order(
         crate::memory::LINUX_MMAP_BASE,
         crate::memory::mmap_arena_size(),
@@ -2051,6 +2090,7 @@ fn reserved_global_stage2_lease_rolls_back_before_map() {
 
 #[test]
 fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const RETIRED_IPA: u64 = 0x7e00_0000_0000;
     const LIVE_IPA: u64 = RETIRED_IPA + 0x4000;
     const LENGTH: u64 = 0x4000;
@@ -2145,6 +2185,7 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
 
 #[test]
 fn an_unowned_extent_authenticates_a_row_that_recorded_no_incarnation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // A forked child inherits kernel regions — its identity page among them
     // — as non-owning rows over an extent that no global-frame owner was
     // ever registered for. Such a row stamps generation 0 by definition
@@ -2175,6 +2216,7 @@ fn an_unowned_extent_authenticates_a_row_that_recorded_no_incarnation() {
 
 #[test]
 fn child_local_mapping_authenticates_through_its_own_raii_lease() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x7f00_0000;
     let size = 0x4000usize;
     let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2214,6 +2256,7 @@ fn child_local_mapping_authenticates_through_its_own_raii_lease() {
 
 #[test]
 fn lease_retirement_waits_for_the_last_global_stage2_reference() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(31));
     let mut inventory = HvpatchFrameInventory::default();
     let lease = (0xa000_0000_0000, 0x8000);
@@ -2403,6 +2446,7 @@ fn process_retirement_task(
 
 #[test]
 fn process_retirement_does_not_retire_a_frame_still_mapped_by_another_mm() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, frame, mapping, _key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(2));
 
@@ -2433,6 +2477,7 @@ fn process_retirement_does_not_retire_a_frame_still_mapped_by_another_mm() {
 
 #[test]
 fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reuse() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
     let root_slot = (0x7d20_0000_0000_u64, 0x20_0000_u64);
@@ -2610,6 +2655,7 @@ fn shared_inventory_root_fixture(
 
 #[test]
 fn shared_inventory_final_owner_retires_only_its_exact_structural_root() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let root_slot = (0x7d40_0000_0000_u64, 0x20_0000_u64);
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
@@ -2652,6 +2698,7 @@ fn shared_inventory_final_owner_retires_only_its_exact_structural_root() {
 
 #[test]
 fn root_retirement_refuses_mismatched_coordinates_and_active_pins() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let root_slot = (0x7d60_0000_0000_u64, 0x20_0000_u64);
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
@@ -2686,6 +2733,7 @@ fn root_retirement_refuses_mismatched_coordinates_and_active_pins() {
 
 #[test]
 fn exec_predecessor_returns_proof_for_a_root_omitted_from_retirement_candidates() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let root_slot = (0x7d80_0000_0000_u64, 0x20_0000_u64);
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
@@ -2715,6 +2763,7 @@ fn exec_predecessor_returns_proof_for_a_root_omitted_from_retirement_candidates(
 
 #[test]
 fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
     let key = (0x7e00_0000_0000_u64, 0x4000_u64);
@@ -2823,6 +2872,7 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
 /// one pass.
 #[test]
 fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const EXTENTS: usize = 600;
     const EXTENT_SIZE: u64 = 0x4000;
 
@@ -2944,6 +2994,7 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
 
 #[test]
 fn process_retirement_does_not_combine_counts_from_different_populations() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, frame, _, key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
     let frames = std::sync::Arc::clone(&task.frame_inventory.lock().frames);
@@ -2992,6 +3043,7 @@ fn process_retirement_does_not_combine_counts_from_different_populations() {
 
 #[test]
 fn process_retirement_retires_the_exact_last_authoritative_mapping() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, frame, _, _key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
 
@@ -3012,6 +3064,7 @@ fn process_retirement_retires_the_exact_last_authoritative_mapping() {
 
 #[test]
 fn process_retirement_fails_when_the_authoritative_mapping_count_is_unavailable() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _, _, _key, _guard) = process_retirement_task(TestFrameMappingCount::Error);
 
     let error = HvfVmState::retire_task_state_process_mappings(&mut task)
@@ -3028,6 +3081,7 @@ fn process_retirement_fails_when_the_authoritative_mapping_count_is_unavailable(
 
 #[test]
 fn process_retirement_rejects_a_recycled_owner_generation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _frame, _mapping, key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
     let stale_host = task.mappings[0].host_addr as usize;
@@ -3114,6 +3168,7 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
 
 #[test]
 fn process_retirement_uses_inventory_owner_identity_not_stale_mapping_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _frame, _mapping, key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
     let live_generation = task.mappings[0].owner_generation;
@@ -3152,6 +3207,7 @@ fn process_retirement_uses_inventory_owner_identity_not_stale_mapping_rows() {
 
 #[test]
 fn process_retirement_uses_inventory_owner_when_task_local_rows_are_absent() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, frame, mapping, key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
     let live = global_frame_host_owner_identity(key.0, key.1)
@@ -3195,6 +3251,7 @@ fn process_retirement_uses_inventory_owner_when_task_local_rows_are_absent() {
 
 #[test]
 fn process_retirement_rejects_rowless_inventory_not_owned_by_the_retiring_mm() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _frame, _mapping, key, _guard) =
         process_retirement_task(TestFrameMappingCount::ExactButMappingNotLive(1));
     let live =
@@ -3217,6 +3274,7 @@ fn process_retirement_rejects_rowless_inventory_not_owned_by_the_retiring_mm() {
 
 #[test]
 fn process_retirement_rejects_matching_generation_with_wrong_host_pointer() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _frame, _mapping, key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
     let live = global_frame_host_owner_identity(key.0, key.1).expect("test owner is published");
@@ -3245,6 +3303,7 @@ fn process_retirement_rejects_matching_generation_with_wrong_host_pointer() {
 
 #[test]
 fn global_frame_host_owner_rejects_an_unmapped_lease() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let key = next_test_physical_key(0x4000);
     let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         key.1 as usize,
@@ -3269,6 +3328,7 @@ fn global_frame_host_owner_rejects_an_unmapped_lease() {
 
 #[test]
 fn stage_mapping_owner_rejection_leaves_all_reference_maps_unchanged() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let key = next_test_physical_key(0x4000);
     let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         key.1 as usize,
@@ -3340,6 +3400,7 @@ fn stage_mapping_owner_rejection_leaves_all_reference_maps_unchanged() {
 
 #[test]
 fn retained_private_reuse_requires_and_preserves_exact_owner_generation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let key = next_test_physical_key(0x4000);
     let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         key.1 as usize,
@@ -3418,6 +3479,7 @@ fn retained_private_reuse_requires_and_preserves_exact_owner_generation() {
 
 #[test]
 fn partial_unmap_preserves_stale_generation_on_both_local_fragments() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let start = 0x6000_0000;
     let ipa = 0xa200_0000_0000;
     let mut mappings = vec![HvfMappedRegion {
@@ -3955,7 +4017,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
 }
 
 #[test]
-fn failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
+fn serial_host_failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let mut lease =
@@ -4107,7 +4169,7 @@ fn failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
 }
 
 #[test]
-fn shared_arc_global_frame_owner_transitions_to_pending_until_all_holders_drop() {
+fn serial_host_shared_arc_global_frame_owner_transitions_to_pending_until_all_holders_drop() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let mut lease =
@@ -4236,6 +4298,7 @@ fn explicit_live_vm_safe_point_retries_pending_retirements_or_reports_failure() 
 
 #[test]
 fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(51));
     let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(52));
     let new_frame = carrick_hal::FrameId::from_kernel_allocation(id(53));
@@ -4327,6 +4390,7 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
 
 #[test]
 fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(55));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(56));
     let key = (0xa094_0000_0000, 0x4000);
@@ -4385,6 +4449,7 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
 
 #[test]
 fn stale_stage2_retirement_candidate_rechecks_under_the_publication_lock() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let candidate = (0xa100_0000_0000, CowArmedRanges::COMPOUND_SIZE);
     frames.lock().stage2_references.insert(candidate, 1);
@@ -4475,6 +4540,7 @@ fn final_carrier_mm_drop_requests_then_safe_point_releases_stage2_once() {
 
 #[test]
 fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let key = next_test_physical_key(0x4000);
     let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
     let owners = std::collections::BTreeMap::from([(key, 0x1000)]);
@@ -4518,7 +4584,7 @@ fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
 }
 
 #[test]
-fn mapped_setup_failure_explicitly_unmaps_before_backing_drop_without_drop_hv() {
+fn serial_host_mapped_setup_failure_explicitly_unmaps_before_backing_drop_without_drop_hv() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
     let _stage2 = ScopedStage2MapTestStub::enable();
     let custody = std::sync::Arc::new(CarrierVmCustody::new());
@@ -4720,6 +4786,7 @@ fn directory_failpoint_rolls_back_inventory_before_final_carrier_drop() {
 
 #[test]
 fn cow_collision_is_rejected_before_backend_inventory_mutation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(81));
     let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(82));
     let existing_frame = carrick_hal::FrameId::from_kernel_allocation(id(83));
@@ -4800,6 +4867,7 @@ fn cow_collision_is_rejected_before_backend_inventory_mutation() {
 
 #[test]
 fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let compound = CowArmedRanges::COMPOUND_SIZE;
     let old_key = (0x7000_0000, compound * 3);
     let old_stage2 = (0xa280_0000_0000, compound * 3);
@@ -4892,6 +4960,7 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
 
 #[test]
 fn cow_stage2_recycle_holds_the_publication_lock() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(91));
     let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(92));
     let new_frame = carrick_hal::FrameId::from_kernel_allocation(id(93));
@@ -4963,6 +5032,7 @@ fn cow_stage2_recycle_holds_the_publication_lock() {
 /// Retirement must defer to the authority's count.
 #[test]
 fn lease_retirement_defers_to_a_sibling_mm_still_mapping_the_frame() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(71));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(72));
     let lease = (0xb000_0000_0000, 0x4000);
@@ -5026,6 +5096,7 @@ fn lease_retirement_defers_to_a_sibling_mm_still_mapping_the_frame() {
 
 #[test]
 fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_key = (0x9b00_000000, 0x4000);
     let new_key = (old_key.0 + 0x4000, 0x4000);
     let old = InventoryExtent {
@@ -5105,6 +5176,7 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
 
 #[test]
 fn cow_lane_reuse_requires_an_unpublished_exact_owner_lane() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let key = (0x9b00_000000, 0x4000);
     let scope = AliasOwnershipScope::MmRootSlot {
         base: 0x3100_0000,
@@ -5219,6 +5291,7 @@ fn cow_lane_reuse_requires_an_unpublished_exact_owner_lane() {
 
 #[test]
 fn partial_semantic_cow_retains_the_old_physical_compound() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
     let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
     let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
@@ -5262,6 +5335,7 @@ fn partial_semantic_cow_retains_the_old_physical_compound() {
 
 #[test]
 fn retained_sibling_detection_reads_exact_old_frame_leaves() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let va = 0x6000_004000;
     let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x24_0000;
     let one_page = CowArmedSpan {
@@ -5294,6 +5368,7 @@ fn retained_sibling_detection_reads_exact_old_frame_leaves() {
 
 #[test]
 fn distant_live_alias_retains_the_shared_physical_cow_inventory() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let source_va = 0x6000_040000;
     let distant_va = source_va + 0x10_0000;
     let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x28_0000;
@@ -5349,6 +5424,7 @@ fn distant_live_alias_retains_the_shared_physical_cow_inventory() {
 
 #[test]
 fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let source_va = 0x6000_080000;
     let distant_va = source_va + 0x20_0000;
     let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x2c_0000;
@@ -5494,6 +5570,7 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
 
 #[test]
 fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let owner = HvfTaskState::neutral();
     let sibling_mm_access = std::sync::Arc::clone(&owner.mm_access);
     let before = std::sync::Arc::as_ptr(&owner.mm_access);
@@ -5532,6 +5609,7 @@ fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
 
 #[test]
 fn bind_page_tables_authority_migrates_live_manager_when_new_authority_empty() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let owner = HvfTaskState::neutral();
     let bytes = carrick_mem::memory::stage1_identity_page_tables();
     let manager = carrick_mmu_core::aarch64::PageTableManager::new(
@@ -5570,6 +5648,7 @@ impl carrick_mmu_core::aarch64::TableArenaSource for BindTestArenaSource {
 
 #[test]
 fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let owner = HvfTaskState::neutral();
     let bytes = carrick_mem::memory::stage1_identity_page_tables();
     let old_mgr = carrick_mmu_core::aarch64::PageTableManager::new(
@@ -5609,6 +5688,7 @@ fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
 
 #[test]
 fn bind_page_tables_authority_preserves_shared_previous_authority() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let owner = HvfTaskState::neutral();
     let bytes = carrick_mem::memory::stage1_identity_page_tables();
     let old_mgr = carrick_mmu_core::aarch64::PageTableManager::new(
@@ -5654,6 +5734,7 @@ fn bind_page_tables_authority_preserves_shared_previous_authority() {
 
 #[test]
 fn foreign_mm_shared_state_keeps_exec_injection_executor_local() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut engine_a = HvfTaskState::neutral();
     let mut engine_b = HvfTaskState::neutral();
     engine_b.mm_access = std::sync::Arc::clone(&engine_a.mm_access);
@@ -5689,6 +5770,7 @@ fn foreign_mm_shared_state_keeps_exec_injection_executor_local() {
 
 #[test]
 fn exec_keeps_a_physical_extent_owned_by_another_mm() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let shared = carrick_hal::FrameId::from_kernel_allocation(id(1));
     let private = carrick_hal::FrameId::from_kernel_allocation(id(2));
     let mut inventory = HvpatchFrameInventory::default();
@@ -5805,6 +5887,7 @@ fn exec_keeps_a_physical_extent_owned_by_another_mm() {
 
 #[test]
 fn fork_inherits_private_and_shared_frames_before_any_write() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ipa = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x20_0000;
     let size = 0x4000;
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(11));
@@ -6245,6 +6328,7 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
 
 #[test]
 fn fork_inventory_inheritance_rejects_a_stale_owner_generation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let lease_ipa = next_test_physical_key(0x8000).0;
     let lease_length = 0x8000;
     let stale_generation = next_global_frame_owner_generation();
@@ -6333,6 +6417,7 @@ fn fork_inventory_inheritance_rejects_a_stale_owner_generation() {
 
 #[test]
 fn fork_receipts_cover_read_only_user_cow_but_not_independent_kernel_frames() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     use carrick_observability::probes::HvpatchForkFrameKind;
 
     assert_eq!(
@@ -6373,6 +6458,7 @@ fn fork_receipts_cover_read_only_user_cow_but_not_independent_kernel_frames() {
 
 #[test]
 fn cow_fault_classifier_accepts_only_el0_write_permission_aborts() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const DATA_ABORT_LOWER_EL: u64 = 0x24 << 26;
     const WRITE: u64 = 1 << 6;
     for permission_level in [0x0d_u64, 0x0e, 0x0f] {
@@ -6390,6 +6476,7 @@ fn cow_fault_classifier_accepts_only_el0_write_permission_aborts() {
 
 #[test]
 fn cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     use carrick_aarch64::vmm::FrameCowWriteIntent;
 
     assert!(frame_cow_write_is_denied(
@@ -6428,6 +6515,7 @@ fn cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it() 
 
 #[test]
 fn concurrent_cow_loser_retries_only_an_exact_live_writable_winner() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     assert_eq!(
         unarmed_permission_fault_route(true, false, true, true),
         UnarmedPermissionFaultRoute::RetryCommittedWinner,
@@ -6457,6 +6545,7 @@ fn concurrent_cow_loser_retries_only_an_exact_live_writable_winner() {
 
 #[test]
 fn el1_owned_live_leaf_overrides_stale_host_shadow_without_weakening_untagged_parity() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const VALID_PAGE: u64 = 0b11;
     const NON_GLOBAL: u64 = 1 << 11;
     const AP_USER_RW: u64 = 0b01 << 6;
@@ -6497,6 +6586,7 @@ fn el1_owned_live_leaf_overrides_stale_host_shadow_without_weakening_untagged_pa
 
 #[test]
 fn retired_invalid_output_materializes_before_a_stale_cow_arm() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     use carrick_aarch64::vmm::FrameCowWriteIntent;
 
     assert_eq!(
@@ -6619,6 +6709,7 @@ fn retired_invalid_output_materializes_before_a_stale_cow_arm() {
 
 #[test]
 fn cow_armed_ranges_split_one_compound_and_leave_peers_armed() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let base = 0x4000_0000;
     let mut armed = CowArmedRanges::default();
     armed.arm(&[carrick_aarch64::vmm::ForkCowRange {
@@ -6645,6 +6736,7 @@ fn cow_armed_ranges_split_one_compound_and_leave_peers_armed() {
 
 #[test]
 fn cow_armed_ranges_disjoint_overlap_query_is_empty() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let base = 0x4000_0000;
     let mut armed = CowArmedRanges::default();
     armed.arm(&[carrick_aarch64::vmm::ForkCowRange {
@@ -6664,6 +6756,7 @@ fn cow_armed_ranges_disjoint_overlap_query_is_empty() {
 
 #[test]
 fn cow_armed_ranges_prefer_exact_alias_fragment_over_broad_arena() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let arena = 0x0060_0000_0000;
     let alias = arena + 0xa8_000;
     let mut armed = CowArmedRanges::default();
@@ -6708,6 +6801,7 @@ fn cow_armed_ranges_prefer_exact_alias_fragment_over_broad_arena() {
 
 #[test]
 fn inherited_private_frame_skips_duplicate_stage2_install() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let inherited = carrick_hal::FrameId::from_kernel_allocation(id(99));
     assert!(!process_mapping_needs_stage2_install(Some(inherited)));
     assert!(process_mapping_needs_stage2_install(None));
@@ -6715,6 +6809,7 @@ fn inherited_private_frame_skips_duplicate_stage2_install() {
 
 #[test]
 fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mapping = |ipa, host| ProcessMappingDesc {
         start: 0x4000_0000,
         ipa,

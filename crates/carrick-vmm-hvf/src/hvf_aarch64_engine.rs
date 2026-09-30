@@ -2367,6 +2367,7 @@ mod persistent_worker_tests {
     /// Linux page, including for a range starting one page into a host frame.
     #[test]
     fn forked_el1_stack_grant_discards_64k_and_8m_without_edge_cow() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         use carrick_mmu_core::aarch64::{
             El1PrivateLeafState, GuestLeafPublication, PageTableManager, el1_private_leaf_state,
             terminal_descriptor,
@@ -2434,6 +2435,7 @@ mod persistent_worker_tests {
 
     #[test]
     fn persistent_hvf_workers_install_and_run_the_scoped_asid_trampoline() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = include_str!("hvf_aarch64_engine.rs");
         let create = source
             .split("pub fn persistent_executor_factory_authority")
@@ -2522,6 +2524,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn task_only_runtime_projection_clones_the_exact_mm_authorities() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root = 0x9a_0000_0000;
         let projection = runtime_projection(root, 2);
         let expected_page_tables = projection.page_tables.clone();
@@ -2550,6 +2553,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn task_only_runtime_projection_slot_republishes_exec_replacement_exactly_once() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let old_root = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
         let replacement_root = 0x9a_0000_0000;
         let slot = super::TaskOnlyRuntimeProjectionSlot::new(runtime_projection(old_root, 1));
@@ -2577,6 +2581,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn task_only_attach_and_detach_transfer_the_live_runtime_projection() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = include_str!("hvf_aarch64_engine.rs");
         let attach = source
             .split_once("pub fn attach_task_only_engine")
@@ -2605,6 +2610,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn task_only_child_activation_publishes_receipts_after_inventory_activation() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = include_str!("hvf_aarch64_engine.rs");
         let activate_child = source
             .split_once("pub fn activate_child(&mut self) -> Result<(), TrapError> {")
@@ -2642,6 +2648,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn task_only_projection_preflight_rejects_root_or_numeric_asid_drift() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root = 0x9a_0000_0000;
         let projection = runtime_projection(root, 2);
         let exact_ttbr = (2_u64 << 48) | root;
@@ -2678,6 +2685,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn parked_task_projection_mismatch_rejects_without_consuming_projection() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root = 0x9a_0000_0000;
         let slot = super::TaskOnlyRuntimeProjectionSlot::new(runtime_projection(root, 2));
         let parked = crate::trap::hvpatch_task_state_test_fixture(2, 0x7000, 702);
@@ -2697,6 +2705,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn executor_preflights_kernel_cpu_before_consuming_task_authority() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = include_str!("../../carrick-runtime/src/vcpu_loop/executor/backend.rs");
         let load = source
             .split_once("impl PersistentExecutor for HvpatchPersistentExecutor")
@@ -2725,6 +2734,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn hvpatch_task_only_materializers_are_structurally_vcpu_free() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = include_str!("hvf_aarch64_engine.rs");
         let sibling_name = concat!("materialize_hvpatch_sibling_", "without_vcpu");
         let process_name = concat!("materialize_hvpatch_process_", "without_vcpu");
@@ -3055,6 +3065,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn task_only_allocation_counters_are_thread_exact_and_zero_delta() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let vcpus = crate::trap::current_thread_vcpu_created_total();
         let mailboxes = crate::syscall_mailbox::current_thread_mailbox_slot_claims_total();
         drop(super::TaskOnlyNoExecutorAllocationGuard::capture());
@@ -3067,6 +3078,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn one_worker_swaps_every_distinct_task_mm_mapping_and_cow_authority() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mut worker = crate::trap::hvpatch_task_state_test_fixture(1, 0x1000, 101);
         let mut first = crate::trap::hvpatch_task_state_test_fixture(2, 0x2000, 202);
         let mut second = crate::trap::hvpatch_task_state_test_fixture(3, 0x3000, 303);
@@ -3108,6 +3120,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn factory_and_idle_worker_retain_no_root_task_authority_after_root_retire() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = include_str!("trap.rs");
         let factory_shape = source
             .split("struct PersistentExecutorSpec")
@@ -3143,6 +3156,7 @@ mod task_only_materializer_tests {
 mod clock_kick_policy_tests {
     #[test]
     fn only_raw_clock_svc_latches_before_handler_entry() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         assert!(super::needs_clock_entry_latch(
             113,
             (0x15 << 26) | (1 << 25)
