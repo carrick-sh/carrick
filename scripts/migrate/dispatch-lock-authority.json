@@ -499,7 +499,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::uname::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 2529,
+      "line": 2531,
       "item": "ProcView::uname",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -508,7 +508,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/proc.rs::ProcView::ptrace::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 2559,
+      "line": 2561,
       "item": "ProcView::ptrace",
       "category": "proc",
       "expression": ".proc.lock()",
