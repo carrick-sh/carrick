@@ -1496,21 +1496,11 @@ where
             }
         }
 
-        let served_with_work = if let Some(slot) = engine.mailbox_slot() {
-            let served = carrick_kernel::el1_delegation::take_served_with_work(slot);
-            carrick_kernel::el1_delegation::clear_pending_host_work(slot);
-            served
-        } else {
-            false
-        };
+        // Owed inotify and pipe/eventfd host wakes are delivered here.
+        let served_with_work = engine.mailbox_slot().is_some_and(|slot| {
+            carrick_kernel::el1_delegation::settle_el1_boundary(slot, kernel_context.kernel())
+        });
         if served_with_work {
-            // An in-guest enqueue may have forced this boundary to wake a
-            // host waiter it could not signal from EL1.
-            carrick_kernel::el1_inotify::deliver_owed_wakes();
-            // An EL1 pipe/eventfd change may owe host subscribers a wake.
-            carrick_kernel::kernel::continuation::ipc::deliver_owed_host_wakes(
-                kernel_context.kernel(),
-            );
             CENSUS_EL1_BOUNDARY.with(|flag| flag.set(true));
         }
 

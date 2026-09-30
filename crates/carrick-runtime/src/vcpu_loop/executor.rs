@@ -1533,7 +1533,10 @@ fn next_runnable<F: PersistentExecutor>(
     // Publish the wait, then look once more: a wake either sees the flag
     // and forces the vCPU out, or published its work before this scan.
     kick.set_guest_idle(true);
-    carrick_kernel::el1_delegation::clear_pending_host_work(usize::from(slot.raw()));
+    let _ = carrick_kernel::el1_delegation::settle_el1_boundary(
+        usize::from(slot.raw()),
+        scheduler.kernel(),
+    );
     match scheduler.try_take(registration) {
         Ok(Some(running)) => {
             kick.set_guest_idle(false);
