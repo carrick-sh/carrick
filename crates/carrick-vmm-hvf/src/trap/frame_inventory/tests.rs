@@ -919,6 +919,7 @@ fn exec_successor_root_publication_installs_exact_structural_authority() {
         std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
         std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     access
         .install_structural_mapping_authority(Some(root_slot), owner)
@@ -5523,6 +5524,7 @@ fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
         owner.frame_inventory.shared_ledger(),
         std::sync::Arc::clone(&owner.cow_armed),
         std::sync::Arc::clone(&owner.cow_deferred_publications),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     assert!(
         !owner.runtime_authorities_match(&distinct_state, &page_tables, &owner.protections,),

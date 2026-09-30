@@ -151,6 +151,13 @@ pub use carrick_runtime::compat::CompatReport;
 /// delayed returns to each granting MM. Require `complete` and matching `scope`
 /// before comparing snapshots; returned leases and released host storage differ.
 pub use carrick_runtime::{El1FrameGrantStats, el1_frame_grant_stats};
+/// Carrier-scoped host COW accounting: completed host COW transactions credited
+/// by every MM the carrier admitted (fork children, exec replacements), kept
+/// after those MMs retire. Difference two readings with `checked_delta` (it
+/// rejects incomplete or cross-carrier readings) and require `admitted_mms > 0`
+/// before treating a zero `host_cow_resolutions` delta as evidence. Host fault
+/// exits are a different quantity and must not be substituted.
+pub use carrick_runtime::{HostCowSnapshot, host_cow_snapshot};
 pub use carrick_runtime::{
     read_el1_counters, reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total,
     vcpu_run_exit_classes, vcpu_run_exits_total,
