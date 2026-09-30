@@ -43,7 +43,9 @@ pub(super) struct RetainedAliasTarget {
 /// needs to choose between refusal, rollback and fail-stop.
 #[derive(Debug)]
 pub(super) enum AliasPublishFailure {
-    /// Nothing was submitted to EL1 (GIC window, or the first chunk's plan).
+    /// Nothing from this publication is live: nothing was submitted (GIC
+    /// window, or the first chunk's plan), or EL1 cleanly refused the first
+    /// chunk (`GuestPublishError::NotApplied`).
     Unsubmitted(TrapError),
     /// A later chunk failed to prepare after earlier chunks were published.
     PartiallyPublished(TrapError),
@@ -243,9 +245,16 @@ impl GuestAliasContext<'_> {
                         });
                     }
                 };
-                let receipt = services
-                    .publish(&txn)
-                    .map_err(AliasPublishFailure::Unverified)?;
+                let receipt =
+                    services
+                        .publish(&txn)
+                        .map_err(|error| match error.into_clean_refusal() {
+                            Ok(refusal) if published => {
+                                AliasPublishFailure::PartiallyPublished(refusal)
+                            }
+                            Ok(refusal) => AliasPublishFailure::Unsubmitted(refusal),
+                            Err(error) => AliasPublishFailure::Unverified(error),
+                        })?;
                 if *receipt.txn() != txn {
                     return Err(AliasPublishFailure::CrossedReceipt);
                 }
@@ -273,7 +282,7 @@ impl GuestAliasContext<'_> {
             .tables
             .prepare_guest_descriptor_txn(self.mm, op)
             .map_err(|e| Self::error(format!("prepare alias retire: {e:?}")))?;
-        let receipt = services.publish(&txn)?;
+        let receipt = services.publish(&txn).map_err(TrapError::from)?;
         if *receipt.txn() != txn {
             return Err(Self::error(
                 "alias retire receipt names another transaction",

@@ -2766,12 +2766,20 @@ fn perform_foreign_guest_cow(
             },
         )
         .map_err(|_| Error::MutationFailed)?;
-    let verified = publisher.publish(&txn).unwrap_or_else(|error| {
-        carrick_fatal!(
-            "hvpatch::foreign_cow",
-            "guest foreign COW publication lacks a verified completion: {error}"
-        )
-    });
+    // A clean EL1 refusal left nothing live: returning drops `grant`, which
+    // rolls the kernel grant, ledger and owner back. Anything else is unknown.
+    let verified = match publisher.publish(&txn) {
+        Ok(verified) => verified,
+        Err(error) => {
+            let _refusal = error.into_clean_refusal().unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::foreign_cow",
+                    "guest foreign COW publication lacks a verified completion: {error}"
+                )
+            });
+            return Err(Error::MutationFailed);
+        }
+    };
     if *verified.txn() != txn || verified.cow_repoint().is_none() {
         carrick_fatal!(
             "hvpatch::foreign_cow",

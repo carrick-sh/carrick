@@ -2835,6 +2835,10 @@ mod guest_descriptor_lane_tests {
         ttbr0: u64,
         block: bool,
         max_in_flight: usize,
+        /// EL1 refuses (before any store) every submission from this
+        /// ordinal on; earlier ones apply.
+        refuse_from: Option<usize>,
+        answered: usize,
     }
 
     impl GuestDrainVenue for FakeVenue<'_> {
@@ -2862,7 +2866,17 @@ mod guest_descriptor_lane_tests {
                 .filter(|&i| self.slots.slot(i).unwrap().submitted_for(mm))
                 .collect();
             for index in indexes {
-                el1_apply_mm(self.resolver, self.slots, index, mm).unwrap();
+                if self.refuse_from.is_some_and(|from| self.answered >= from) {
+                    let claimed = self.slots.slot(index).unwrap().claim_for_mm(mm).unwrap();
+                    claimed.complete(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                            carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied,
+                        ),
+                    );
+                } else {
+                    el1_apply_mm(self.resolver, self.slots, index, mm).unwrap();
+                }
+                self.answered += 1;
                 applied += 1;
             }
             frame.x[0] = applied;
@@ -2872,11 +2886,18 @@ mod guest_descriptor_lane_tests {
             &mut self,
             txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
             receipt: &DescriptorReceipt,
-        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-        {
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            carrick_aarch64::descriptor_drain::GuestPublishError,
+        > {
             self.authority
                 .settle_guest_descriptor_receipt(txn, receipt)
-                .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+                .map_err(|error| {
+                    carrick_aarch64::descriptor_drain::GuestPublishError::from_settle(
+                        error,
+                        "fake venue settle",
+                    )
+                })
         }
     }
 
@@ -2970,6 +2991,8 @@ mod guest_descriptor_lane_tests {
                 ttbr0: LINUX_PAGE_TABLES_BASE + if failure == "wrong root" { 4096 } else { 0 },
                 block: failure == "blocked",
                 max_in_flight: 0,
+                refuse_from: None,
+                answered: 0,
             };
             assert!(
                 carrick_aarch64::descriptor_drain::publish_copyout(
@@ -3022,6 +3045,8 @@ mod guest_descriptor_lane_tests {
             ttbr0: LINUX_PAGE_TABLES_BASE,
             block: false,
             max_in_flight: 0,
+            refuse_from: None,
+            answered: 0,
         };
         let receipt = carrick_aarch64::descriptor_drain::publish_copyout(
             &mut venue,
@@ -3061,6 +3086,8 @@ mod guest_descriptor_lane_tests {
             ttbr0: LINUX_PAGE_TABLES_BASE | (7 << 48),
             block: false,
             max_in_flight: 0,
+            refuse_from: None,
+            answered: 0,
         };
         let receipts = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap();
         assert_eq!(receipts.len(), 2);
@@ -3091,6 +3118,8 @@ mod guest_descriptor_lane_tests {
             ttbr0: (LINUX_PAGE_TABLES_BASE + 0x1000) | (7 << 48),
             block: false,
             max_in_flight: 0,
+            refuse_from: None,
+            answered: 0,
         };
         assert!(apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).is_err());
         assert!(
@@ -3105,6 +3134,55 @@ mod guest_descriptor_lane_tests {
             slots.as_slice().iter().all(|slot| slot.state() == 0),
             "a failed drain withdraws its submission"
         );
+    }
+
+    /// Only an EL1 refusal of the FIRST transaction is a clean "nothing
+    /// live" answer a caller may roll back on; a refusal after an earlier
+    /// transaction applied leaves the publication partial.
+    #[test]
+    fn a_drain_classifies_a_first_refusal_clean_and_a_later_one_unsettled() {
+        use carrick_aarch64::descriptor_drain::GuestPublishError;
+        for (refuse_from, clean) in [(0, true), (1, false)] {
+            let (authority, resolver) = guest_lane();
+            resident_grant(&authority, &resolver);
+            let arm: Vec<_> = [(VA, 2 * 4096), (VA + 3 * 4096, 4096)]
+                .into_iter()
+                .map(|(va, len)| {
+                    let op = authority
+                        .with_manager(|manager| manager.fork_arm_op(va, len, false, false))
+                        .unwrap();
+                    authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap()
+                })
+                .collect();
+            let slots = Box::new(DescriptorTxnSlots::new());
+            let mut venue = FakeVenue {
+                resolver: &resolver,
+                slots: &slots,
+                authority: &authority,
+                ttbr0: LINUX_PAGE_TABLES_BASE | (7 << 48),
+                block: false,
+                max_in_flight: 0,
+                refuse_from: Some(refuse_from),
+                answered: 0,
+            };
+            let error = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap_err();
+            assert_eq!(
+                matches!(error, GuestPublishError::NotApplied { .. }),
+                clean,
+                "refuse_from={refuse_from}: {error}"
+            );
+            assert_eq!(error.into_clean_refusal().is_ok(), clean);
+            assert_eq!(
+                writable(&authority, VA),
+                clean,
+                "first arm applied iff not clean"
+            );
+            assert!(
+                writable(&authority, VA + 3 * 4096),
+                "refused arm stored nothing"
+            );
+            assert!(slots.as_slice().iter().all(|slot| slot.state() == 0));
+        }
     }
 
     /// The fork commits only after its guest arm is applied, and a

@@ -1058,12 +1058,22 @@ pub(super) fn publish_replacing(
                     "partially published guest sparse extent: {error:?}"
                 ),
             };
-            let receipt = flush_stage1.publish(&txn).unwrap_or_else(|error| {
-                carrick_fatal!(
-                    "hvpatch::sparse_materialization",
-                    "guest sparse publication lacks verified completion: {error}"
-                );
-            });
+            // Only a clean refusal of the FIRST chunk leaves nothing live;
+            // `prepared` then rolls back on return. A later chunk's refusal
+            // is a partial publication, and anything else is unknown.
+            let receipt = match flush_stage1.publish(&txn) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    let clean = error.into_clean_refusal();
+                    match clean {
+                        Ok(refusal) if current == start => return Err(refusal),
+                        Ok(error) | Err(error) => carrick_fatal!(
+                            "hvpatch::sparse_materialization",
+                            "guest sparse publication lacks verified completion: {error}"
+                        ),
+                    }
+                }
+            };
             if *receipt.txn() != txn {
                 carrick_fatal!(
                     "hvpatch::sparse_materialization",

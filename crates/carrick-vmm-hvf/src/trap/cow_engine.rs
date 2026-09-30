@@ -2060,12 +2060,19 @@ impl HvfTaskState {
                 .map_err(|error| {
                     TrapError::Hypervisor(format!("prepare guest retained reuse: {error:?}"))
                 })?;
-            let receipt = flush_stage1.publish(&txn).unwrap_or_else(|error| {
-                carrick_fatal!(
-                    "hvpatch::cow",
-                    "guest retained reuse lacks a verified completion: {error}"
-                );
-            });
+            // A clean EL1 refusal left nothing live: `prepared` drops and
+            // rolls the grant, ledger and owner back. Anything else is unknown.
+            let receipt = match flush_stage1.publish(&txn) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Err(error.into_clean_refusal().unwrap_or_else(|error| {
+                        carrick_fatal!(
+                            "hvpatch::cow",
+                            "guest retained reuse lacks a verified completion: {error}"
+                        )
+                    }));
+                }
+            };
             if *receipt.txn() != txn {
                 carrick_fatal!(
                     "hvpatch::cow",
@@ -3378,12 +3385,17 @@ impl HvfTaskState {
                     .map_err(|error| {
                         TrapError::Hypervisor(format!("prepare guest COW compound: {error:?}"))
                     })?;
-                let verified = flush_stage1.publish(&txn).unwrap_or_else(|error| {
-                    carrick_fatal!(
-                        "hvpatch::cow",
-                        "guest COW publication lacks a verified completion: {error}"
-                    );
-                });
+                // A clean EL1 refusal left nothing live: returning drops the
+                // prepared grant (kernel, ledger, owner rollback). Anything
+                // else is an unknown live state.
+                let verified = flush_stage1.publish(&txn).map_err(|error| {
+                    error.into_clean_refusal().unwrap_or_else(|error| {
+                        carrick_fatal!(
+                            "hvpatch::cow",
+                            "guest COW publication lacks a verified completion: {error}"
+                        )
+                    })
+                })?;
                 if *verified.txn() != txn || verified.cow_repoint().is_none() {
                     carrick_fatal!(
                         "hvpatch::cow",

@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+pub use crate::descriptor_drain::GuestPublishError;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
@@ -209,14 +210,18 @@ pub trait Stage1Services {
     fn guest_publication_available(&self) -> bool {
         false
     }
+    /// Publish one owned transaction through EL1. The error says whether
+    /// EL1 provably left nothing live ([`GuestPublishError::NotApplied`]).
     fn publish(
         &mut self,
         _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-    {
-        Err(TrapError::Hypervisor(
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        GuestPublishError,
+    > {
+        Err(GuestPublishError::Unsettled(TrapError::Hypervisor(
             "guest descriptor publication has no driving vCPU".to_owned(),
-        ))
+        )))
     }
 }
 impl<F: FnMut() -> Result<(), TrapError>> Stage1Services for F {
