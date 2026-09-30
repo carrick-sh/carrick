@@ -11,14 +11,36 @@ fn arena() -> &'static Mutex<Vec<Backing>> {
     static ARENA: OnceLock<Mutex<Vec<Backing>>> = OnceLock::new();
     ARENA.get_or_init(|| Mutex::new(Vec::new()))
 }
-pub(crate) struct TestArena;
+/// Descriptor extents from the process-wide arena, and a fixed set of OFD
+/// records (a venue that never grows past them).
+pub(crate) struct TestArena {
+    ofds: &'static [OfdRecord],
+}
+impl TestArena {
+    /// A leaked venue holding `ofds` zeroed OFD records.
+    pub(crate) fn with_ofds(ofds: usize) -> &'static Self {
+        let records: &'static [OfdRecord] = Box::leak(
+            (0..ofds)
+                .map(|_| OfdRecord::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        Box::leak(Box::new(Self { ofds: records }))
+    }
+}
+fn resolve_extent(extent: Extent) -> Option<Backing> {
+    let (slots, bitmap) = *arena()
+        .lock()
+        .unwrap()
+        .get(extent.token.checked_sub(1)? as usize)?;
+    (slots.len() as u64 == extent.capacity).then_some((slots, bitmap))
+}
 impl SlotBacking for TestArena {
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
-        let (slots, bitmap) = *arena()
-            .lock()
-            .unwrap()
-            .get(extent.token.checked_sub(1)? as usize)?;
-        (slots.len() as u64 == extent.capacity).then_some((slots, bitmap))
+        resolve_extent(extent)
+    }
+    fn ofd(&self, index: usize) -> Option<&OfdRecord> {
+        self.ofds.get(index)
     }
 }
 pub(crate) fn storage(capacity: usize) -> Extent {
@@ -48,10 +70,18 @@ impl LockWait for Spin {
         true
     }
 }
-pub(crate) type View<const T: usize, const O: usize> = Authority<'static, TestArena, Spin, T, O>;
-pub(crate) fn authority<const T: usize, const O: usize>() -> View<T, O> {
-    let core: &'static Core<T, O> = Box::leak(Box::new(Core::new().unwrap()));
-    core.bind(&TestArena, Spin)
+pub(crate) type View<const T: usize> = Authority<'static, TestArena, Spin, T>;
+/// A published core with `ofds` published OFD records, and its venue.
+pub(crate) fn core_with<const T: usize>(ofds: usize) -> (&'static Core<T>, &'static TestArena) {
+    let core: &'static Core<T> = Box::leak(Box::new(Core::new().unwrap()));
+    let arena = TestArena::with_ofds(ofds);
+    core.bind(arena, Spin).publish_ofds(ofds).unwrap();
+    (core, arena)
+}
+/// `T` table identities and `O` OFD records, never grown.
+pub(crate) fn authority<const T: usize, const O: usize>() -> View<T> {
+    let (core, arena) = core_with::<T>(O);
+    core.bind(arena, Spin)
 }
 
 #[test]
@@ -326,7 +356,7 @@ fn capacity_failures_are_transactional_and_reclaim_storage() {
     assert_eq!(c.refcount(t, a), Ok(1));
     assert_eq!(
         c.open(t, Fd(0), description(2), false),
-        Err(Error::NoMemory)
+        Err(Error::NeedsOfds)
     );
     assert_eq!(c.dup(t, a), Ok(Fd(1)));
     c.destroy_table(t, |_| {}).unwrap();
@@ -336,7 +366,7 @@ fn capacity_failures_are_transactional_and_reclaim_storage() {
     let t = empty.create_table(1, &mut storage(1)).unwrap();
     assert_eq!(
         empty.open(t, Fd(0), description(0), false),
-        Err(Error::NoMemory)
+        Err(Error::NeedsOfds)
     );
 }
 
@@ -524,14 +554,14 @@ fn empty_backing_and_fork_growth_refuse_without_side_effects() {
     let mut count = 0;
     let backing = c.destroy_table(parent, |_| count += 1).unwrap();
     assert_eq!(count, 1);
-    let (slots, bitmap) = TestArena.resolve(backing).unwrap();
+    let (slots, bitmap) = resolve_extent(backing).unwrap();
     assert_eq!(slots.len(), 65_536);
     assert_eq!(bitmap.len(), bitmap_words(65_536));
 }
 
 // ---- contract kernel.el1.ipc-fd-authority (VM-free bindings) ----
 
-fn table_with<const T: usize, const O: usize>(c: &View<T, O>, fds: i32) -> TableId {
+fn table_with<const T: usize>(c: &View<T>, fds: i32) -> TableId {
     let t = c.create_table(1024, &mut storage(64)).unwrap();
     for i in 0..fds {
         assert_eq!(
@@ -699,27 +729,35 @@ fn el1_ipc_stale_generations_are_rejected() {
 #[test]
 fn el1_ipc_unpublished_core_fails_closed_and_initializes_in_place() {
     // Shared memory starts zeroed: a valid but unpublished core.
-    let zeroed: Box<core::mem::MaybeUninit<Core<2, 4>>> = Box::new_zeroed();
+    let zeroed: Box<core::mem::MaybeUninit<Core<2>>> = Box::new_zeroed();
     // SAFETY: every field of Core is an atomic or integer; all-zero is valid.
-    let core: &'static Core<2, 4> = Box::leak(unsafe { zeroed.assume_init() });
-    let c = core.bind(&TestArena, Spin);
+    let core: &'static Core<2> = Box::leak(unsafe { zeroed.assume_init() });
+    let arena = TestArena::with_ofds(4);
+    let c = core.bind(arena, Spin);
     assert_eq!(c.create_table(4, &mut storage(4)), Err(Error::StaleTable));
+    assert_eq!(c.publish_ofds(4), Err(Error::StaleTable));
     assert_eq!(core.initialize(0), Err(Error::InvalidArgument));
     core.initialize(0xC0DE).unwrap();
     assert_eq!(core.initialize(0xC0DE), Err(Error::InvalidArgument));
     assert_eq!(core.identity(), 0xC0DE);
     let t = c.create_table(4, &mut storage(4)).unwrap();
+    assert_eq!(
+        c.open(t, Fd(0), description(1), false),
+        Err(Error::NeedsOfds),
+        "no description record is published yet"
+    );
+    c.publish_ofds(4).unwrap();
     assert_eq!(c.open(t, Fd(0), description(1), false), Ok(Fd(0)));
     // Two venues bound to one core share one authority, not copies.
-    let host_view = core.bind(&TestArena, BoundedSpin(64));
+    let host_view = core.bind(arena, BoundedSpin(64));
     assert_eq!(host_view.get(t, Fd(0)).unwrap().backing, BackingToken(1));
 }
 
 #[test]
 fn el1_ipc_contended_table_lock_refuses_before_effects() {
-    let core: &'static Core<1, 2> = Box::leak(Box::new(Core::new().unwrap()));
-    let host = core.bind(&TestArena, Spin);
-    let el1 = core.bind(&TestArena, BoundedSpin(16));
+    let (core, arena) = core_with::<1>(2);
+    let host = core.bind(arena, Spin);
+    let el1 = core.bind(arena, BoundedSpin(16));
     let t = host.create_table(4, &mut storage(4)).unwrap();
     host.open(t, Fd(0), description(1), false).unwrap();
     core.tables[0].lock.store(1, Ordering::Release); // another venue holds it
@@ -751,9 +789,9 @@ fn el1_ipc_direct_lookup_reads_one_slot_at_every_scale() {
 #[test]
 fn el1_ipc_concurrent_pins_and_closes_release_exactly_once() {
     use std::sync::atomic::AtomicUsize;
-    let core: &'static Core<2, 4> = Box::leak(Box::new(Core::new().unwrap()));
+    let (core, arena) = core_with::<2>(4);
     for round in 0..200u64 {
-        let c = core.bind(&TestArena, Spin);
+        let c = core.bind(arena, Spin);
         let parent = c.create_table(16, &mut storage(16)).unwrap();
         let fd = c.open(parent, Fd(0), description(round), false).unwrap();
         let child = c.fork(parent, &mut storage(16)).unwrap();
@@ -762,7 +800,7 @@ fn el1_ipc_concurrent_pins_and_closes_release_exactly_once() {
             for table in [parent, child] {
                 let releases = &releases;
                 s.spawn(move || {
-                    let c = core.bind(&TestArena, Spin);
+                    let c = core.bind(arena, Spin);
                     for _ in 0..8 {
                         match c.pin(table, fd) {
                             Ok((pin, d)) => {
@@ -903,4 +941,52 @@ fn el1_ipc_replace_pin_refusal_leaves_destination_and_holds_unchanged() {
         foreign.unpin(foreign_pin).unwrap().unwrap().backing,
         BackingToken(30)
     );
+}
+
+/// Open file descriptions are elastic venue records: the core hands out
+/// only published records, asks for more with `NeedsOfds` (never an errno
+/// by itself), and a later segment behaves exactly like the first.
+#[test]
+fn el1_ipc_ofd_records_grow_in_published_segments() {
+    let (core, arena) = core_with::<1>(0);
+    let c = core.bind(arena, Spin);
+    assert_eq!(core.ofd_count(), 0);
+    let t = c.create_table(64, &mut storage(64)).unwrap();
+    assert_eq!(
+        c.open(t, Fd(0), description(1), false),
+        Err(Error::NeedsOfds)
+    );
+    assert_eq!(c.get(t, Fd(0)), Err(Error::BadFd), "refusal has no effect");
+    // A venue cannot publish records it does not hold.
+    let tiny = TestArena::with_ofds(2);
+    let (other, _) = core_with::<1>(0);
+    assert_eq!(
+        other.bind(tiny, Spin).publish_ofds(3),
+        Err(Error::BadBacking)
+    );
+    assert_eq!(other.ofd_count(), 0);
+    let arena = TestArena::with_ofds(8);
+    let c = core.bind(arena, Spin);
+    for segment in 0..4 {
+        c.publish_ofds(2).unwrap();
+        assert_eq!(core.ofd_count(), 2 * (segment + 1));
+        for fd in [2 * segment, 2 * segment + 1] {
+            assert_eq!(
+                c.open(t, Fd(0), description(fd as u64), false),
+                Ok(Fd(fd as i32))
+            );
+        }
+        assert_eq!(
+            c.open(t, Fd(0), description(99), false),
+            Err(Error::NeedsOfds)
+        );
+    }
+    assert_eq!(c.publish_ofds(1), Err(Error::BadBacking), "venue is full");
+    // Records of every segment pin, close and recycle alike.
+    let (pin, d) = c.pin(t, Fd(7)).unwrap();
+    assert_eq!(d.backing, BackingToken(7));
+    assert_eq!(c.close(t, Fd(7)), Ok(None));
+    assert_eq!(c.unpin(pin).unwrap().unwrap().backing, BackingToken(7));
+    assert_eq!(c.open(t, Fd(0), description(70), false), Ok(Fd(7)));
+    assert_eq!(c.get(t, Fd(7)).unwrap().backing, BackingToken(70));
 }
