@@ -184,12 +184,23 @@ impl<'a> MemView<'a> {
         root: DelegatedRoot,
         requested: u64,
     ) -> Result<Result<BreakMove, BreakAnswer>, DispatchError> {
-        let (current, decision) = self
-            .with_charged_root(mem, &root, |model| {
-                let current = model.brk_current();
-                Ok((current, model.brk(requested)?))
-            })
-            .map_err(DispatchError::ReservationAuthority)?;
+        let (current, decision) = match self.with_charged_root(mem, &root, |model| {
+            let current = model.brk_current();
+            Ok((current, model.brk(requested)?))
+        }) {
+            Ok(answer) => answer,
+            // No root node left to record the move: brk(2) fails by
+            // returning the unchanged break.
+            Err(Refusal::MetadataRequired) => {
+                return Ok(Err(BreakAnswer {
+                    value: root
+                        .with_root(|model| Ok(model.brk_current()))
+                        .map_err(DispatchError::ReservationAuthority)?,
+                    changed: false,
+                }));
+            }
+            Err(refusal) => return Err(DispatchError::ReservationAuthority(refusal)),
+        };
         let request = match decision {
             Decision::Complete(value) => {
                 return Ok(Err(BreakAnswer {
