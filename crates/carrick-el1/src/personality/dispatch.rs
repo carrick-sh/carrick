@@ -281,7 +281,7 @@ where
 
     // Entry check: with host work pending (a kick, a signal, an owed
     // wake), forward without serving -- except the calls the IPC adapter
-    // takes, which never park while host work is pending:
+    // takes:
     // - the slot's switched-in record owns a pending object operation. Its
     //   thread is re-issuing the SVC to resume that operation, which only
     //   the adapter may take (before any fd lookup); forwarding would let
@@ -290,12 +290,12 @@ where
     // - a pipe or eventfd read/write that completes right now. Forwarding
     //   it only moves a transfer EL1 can finish to the host (one served
     //   read lost per fork in el1_ipc_two_processes_blocking).
-    // Either way the adapter completes the call and it leaves with the
-    // pending work (`ServedWithWork`), so the host delivers a signal after
-    // the call returns, as Linux does for one pending at entry; a call that
-    // would block is forwarded unchanged (no effect yet) or handed back
-    // (`IPC_HANDBACK_NR`), so the host delivers the signal before it can
-    // sleep. Nothing else is served past pending work.
+    // A call that completes leaves with the pending work (`ServedWithWork`),
+    // so the host delivers a signal after the call returns, as Linux does
+    // for one pending at entry; a call that would block parks in the zone
+    // and the vCPU leaves at once (`Idle`), so the host settles the parked
+    // thread and a pending signal interrupts it before it sleeps. Nothing
+    // else is served past pending work.
     let host_work = cur_task.is_some_and(CurrentTask::has_pending_host_work);
     let resumes_operation = zone.as_ref().is_some_and(|zone| {
         SlotId::from_index(slot)

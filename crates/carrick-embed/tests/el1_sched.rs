@@ -188,6 +188,8 @@ struct Measured {
     exit_classes: [u64; carrick_el1_abi::HostExitClass::COUNT],
     el1_exit_reasons: [u64; carrick_el1_abi::El1ExitReason::COUNT],
     forwarded_syscalls: Vec<(usize, u64)>,
+    /// Pipe/eventfd calls EL1 left for the host, by `IpcLeave` index.
+    ipc_leaves: [u64; carrick_el1_abi::IpcLeave::COUNT],
     host_work_publications: [u64; carrick_el1_abi::HostWorkPublishReason::COUNT],
     cpu_ns: u64,
     wall: Duration,
@@ -210,6 +212,10 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         std::array::from_fn(|i| c.forwarded[i].load(std::sync::atomic::Ordering::Relaxed))
     });
     let host_work_before = carrick_el1_abi::host_work_publication_counts();
+    let ipc_leaves_before = read_el1_counters()
+        .map_or([0; carrick_el1_abi::IpcLeave::COUNT], |c| {
+            std::array::from_fn(|i| c.ipc_leaves[i].load(std::sync::atomic::Ordering::Relaxed))
+        });
     let zone_before = ZoneCounts::read();
     let cpu_before = carrier_cpu_ns();
     let start = std::time::Instant::now();
@@ -264,6 +270,13 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
             })
             .collect()
     });
+    let ipc_leaves = read_el1_counters().map_or([0; carrick_el1_abi::IpcLeave::COUNT], |c| {
+        std::array::from_fn(|i| {
+            c.ipc_leaves[i]
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(ipc_leaves_before[i])
+        })
+    });
     let host_work_after = carrick_el1_abi::host_work_publication_counts();
     let host_work_publications = std::array::from_fn(|i| host_work_after[i] - host_work_before[i]);
     let zone = ZoneCounts::read().since(zone_before);
@@ -276,6 +289,7 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         exit_classes,
         el1_exit_reasons,
         forwarded_syscalls,
+        ipc_leaves,
         host_work_publications,
         cpu_ns,
         wall,
@@ -343,6 +357,36 @@ fn host_work_breakdown(measured: &Measured) -> String {
         counts[R::ExactTask as usize],
         counts[R::FileTable as usize],
     )
+}
+
+/// Nonzero `IpcLeave` counts, as `(reason, count)`.
+fn ipc_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
+    use carrick_el1_abi::IpcLeave as L;
+    [
+        (L::NoTable, "no_table"),
+        (L::TableContended, "table_contended"),
+        (L::TableRefused, "table_refused"),
+        (L::PinContended, "pin_contended"),
+        (L::PinRefused, "pin_refused"),
+        (L::NoOperationRecord, "no_operation_record"),
+        (L::CopyInFault, "copy_in_fault"),
+        (L::StaleOperation, "stale_operation"),
+        (L::ForeignOperation, "foreign_operation"),
+        (L::FlagsRefused, "flags_refused"),
+        (L::ObjectBusy, "object_busy"),
+        (L::TransferRefused, "transfer_refused"),
+        (L::ParkRefused, "park_refused"),
+        (L::BrokenFirst, "broken_first"),
+        (L::FaultFirst, "fault_first"),
+        (L::SigpipeHandback, "sigpipe_handback"),
+        (L::Restart, "restart"),
+    ]
+    .into_iter()
+    .filter_map(|(reason, name)| {
+        let count = measured.ipc_leaves[reason as usize];
+        (count != 0).then_some((name, count))
+    })
+    .collect()
 }
 
 fn el1_reason_breakdown(measured: &Measured) -> String {
@@ -888,9 +932,13 @@ fn ipc_blocking_population(mode: &str) {
                 Duration::from_secs(60),
             );
             println!(
-                "IPC pairs {kind} n={pairs}: zone={:?} forwarded={:?} {}",
+                "IPC pairs {kind} n={pairs}: zone={:?} forwarded={:?} ipc_leaves={:?} host_work={} exits={} el1_reasons={} {}",
                 measured.zone,
                 measured.forwarded_syscalls,
+                ipc_leaves_breakdown(&measured),
+                host_work_breakdown(&measured),
+                exit_breakdown(&measured),
+                el1_reason_breakdown(&measured),
                 describe(&measured)
             );
             assert!(measured.result.success(), "{}", describe(&measured));

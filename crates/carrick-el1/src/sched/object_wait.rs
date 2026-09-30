@@ -93,6 +93,19 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         })
     }
 
+    /// Consume the park ticket by leaving for the host at once, running
+    /// nothing else on this vCPU: host work is pending here, and the host
+    /// settles the parked thread at this boundary (its enrollment samples
+    /// pending signals). All caller locks must be released.
+    pub fn leave_after_object_park(&mut self, parked: ObjectParked<'_>) -> Option<Served> {
+        if parked.slot != self.slot || !core::ptr::eq(parked.zone, self.zone) {
+            return None;
+        }
+        self.counters.exit_reasons[carrick_el1_abi::El1ExitReason::IdleHostWork as usize]
+            .fetch_add(1, Ordering::Relaxed);
+        Some(Served::Idle)
+    }
+
     /// All caller locks must be released before consuming the park ticket.
     /// `timeout_result` belongs to any unrelated timed futex served by idle.
     pub fn resume_after_object_park(
