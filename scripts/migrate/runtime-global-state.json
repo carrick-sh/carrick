@@ -3052,14 +3052,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
-      "symbol": "el1_frame_grant_ledger::LEDGER",
-      "fingerprint": "2a10731eca66b1a77032d21ff0362b9d41b63f20f67aa31b74a6a998c5cf9d71",
-      "classification": "carrier_infra",
-      "rationale": "Process-wide ledger tracking active EL1 frame grants in the HVF carrier."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
       "symbol": "fork_debug_ipa::CELL",
       "fingerprint": "cc3f21d07848ecf292592d67a15c1705782e6f022e25f6936acd6d67fc592f23",
       "classification": "config_debug",
