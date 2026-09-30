@@ -883,3 +883,39 @@ fn delegated_stack_growth_stops_at_a_root_owned_mapping() {
         "the stack cannot grow over a root-owned mapping"
     );
 }
+
+#[test]
+fn delegated_exec_leaves_no_root_row_in_the_new_image() {
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.anonymous(base, 2 * PAGE, RW);
+    twin.file(base + 2 * PAGE);
+    twin.touch(base);
+    for (index, dispatcher) in [&twin.host, &twin.delegated].into_iter().enumerate() {
+        let replacement = crate::kernel::MmId::from_registry_allocation(
+            std::num::NonZeroU64::new(dispatcher.mm_authority().mm_id.raw() + 100 + index as u64)
+                .unwrap(),
+        );
+        dispatcher
+            .publish_exec_image_state(replacement, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .commit();
+        assert!(dispatcher.mem().lock().delegated_root().is_none());
+    }
+    let pages = [base, base + PAGE, base + 2 * PAGE];
+    twin.same("fault planning in the new image", |d, _| {
+        fault_answers(d, &pages)
+    });
+    twin.same("/proc/self/maps of the new image", |d, _| proc_rows(d));
+    twin.same("placement in the new image", |d, _| {
+        d.mem_view()
+            .next_mmap_address(
+                0,
+                PAGE,
+                RW,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                MmapGrantCongruence::Any,
+                true,
+            )
+            .unwrap()
+    });
+}

@@ -14,8 +14,11 @@
 //! root is admitted (today only by the conformance fixture), brk, mmap, munmap,
 //! mprotect placement and the anonymous-private rows have one owner, the root
 //! (`anonymous::AnonymousAuthority`); mremap and attribute-changing madvise
-//! are host-served over demoted rows, and fault planning, mincore and exec/exit
-//! still read host residency state. The snapshot importer below
+//! are host-served over demoted rows. Fault planning and mincore ask the root
+//! which anonymous pages exist and at which protection
+//! (`fault::FirstTouchOwner`); the host keeps only the residency its own
+//! venue committed, retired where the root hands a hole out again and handed
+//! over when a root row is demoted. The snapshot importer below
 //! is a host-only conformance fixture, not a second production authority or an
 //! activation mechanism.
 
