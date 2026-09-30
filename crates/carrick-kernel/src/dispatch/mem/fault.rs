@@ -3,7 +3,7 @@
 use super::anonymous::broken_root;
 use super::*;
 use carrick_el1::memory::reservations::{Mapping, Refusal, Reservations};
-use carrick_el1_abi::{ReservationProtection, ReservationRange};
+use carrick_el1_abi::{ReservationIncarnation, ReservationProtection, ReservationRange};
 use carrick_fatal::carrick_fatal;
 
 #[derive(Clone, Copy)]
@@ -200,6 +200,133 @@ impl FirstTouchArming {
     }
 }
 
+/// Who a residency fact was observed under. A root-owned anonymous page's
+/// fact names the root node incarnation that held the page; a guest-venue
+/// `munmap` retires that incarnation without telling the host, so the fact
+/// stops matching and is dead by construction. Everything else (host setup,
+/// host-owned rows, the heap, a range the host venue's own pending proposal
+/// holds) is the host's own fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidencyOwner {
+    Host,
+    Root(ReservationIncarnation),
+}
+
+/// Residency facts: the pages carrick has made resident, each tagged with
+/// the [`ResidencyOwner`] it was observed under. A fact answers only for its
+/// own owner: [`Self::contains`] asks "resident under THIS owner?", so a
+/// fact about a retired incarnation can never describe a new mapping at the
+/// same address.
+#[derive(Clone, Default)]
+pub struct ResidentFacts {
+    /// `start -> (end, owner)`, non-overlapping, ordered by `start`.
+    facts: std::collections::BTreeMap<u64, (u64, ResidencyOwner)>,
+}
+
+impl ResidentFacts {
+    /// Record `range` resident under `owner`, replacing any fact it covers.
+    pub(crate) fn insert(&mut self, range: carrick_vfs::GuestMemoryRange, owner: ResidencyOwner) {
+        self.remove(range);
+        let mut start = range.start().raw();
+        let mut end = range.end().raw();
+        if let Some((&previous_start, &(previous_end, previous_owner))) =
+            self.facts.range(..start).next_back()
+            && previous_end == start
+            && previous_owner == owner
+        {
+            self.facts.remove(&previous_start);
+            start = previous_start;
+        }
+        if let Some(&(next_end, next_owner)) = self.facts.get(&end)
+            && next_owner == owner
+        {
+            self.facts.remove(&end);
+            end = next_end;
+        }
+        self.facts.insert(start, (end, owner));
+    }
+
+    /// Drop every fact inside `range`, whatever its owner.
+    pub(crate) fn remove(&mut self, range: carrick_vfs::GuestMemoryRange) {
+        let (start, end) = (range.start().raw(), range.end().raw());
+        if let Some((&head_start, &(head_end, owner))) = self.facts.range(..start).next_back()
+            && head_end > start
+        {
+            self.facts.insert(head_start, (start, owner));
+            if head_end > end {
+                self.facts.insert(end, (head_end, owner));
+            }
+        }
+        while let Some((&covered_start, &(covered_end, owner))) =
+            self.facts.range(start..end).next()
+        {
+            self.facts.remove(&covered_start);
+            if covered_end > end {
+                self.facts.insert(end, (covered_end, owner));
+            }
+        }
+    }
+
+    /// Whether `page` is resident under exactly `owner`.
+    pub(crate) fn contains(&self, page: u64, owner: ResidencyOwner) -> bool {
+        self.facts
+            .range(..=page)
+            .next_back()
+            .is_some_and(|(_, &(end, fact))| page < end && fact == owner)
+    }
+
+    /// The parts of `[start, end)` resident under exactly `owner`, clipped,
+    /// in address order: O(log n + k).
+    pub(crate) fn within(&self, start: u64, end: u64, owner: ResidencyOwner) -> Vec<(u64, u64)> {
+        let head = self
+            .facts
+            .range(..start)
+            .next_back()
+            .filter(|(_, (fact_end, _))| *fact_end > start)
+            .map(|(&fact_start, &fact)| (fact_start, fact));
+        head.into_iter()
+            .chain(
+                self.facts
+                    .range(start..end)
+                    .map(|(&fact_start, &fact)| (fact_start, fact)),
+            )
+            .filter(|(_, (_, fact))| *fact == owner)
+            .map(|(fact_start, (fact_end, _))| (fact_start.max(start), fact_end.min(end)))
+            .filter(|(clipped_start, clipped_end)| clipped_start < clipped_end)
+            .collect()
+    }
+
+    /// Hand `range` to a new owner: facts observed under `live` become facts
+    /// under `owner`; every other fact inside `range` describes memory that
+    /// no longer exists there and is dropped.
+    pub(crate) fn hand_over(
+        &mut self,
+        range: carrick_vfs::GuestMemoryRange,
+        live: ResidencyOwner,
+        owner: ResidencyOwner,
+    ) {
+        let kept = self.within(range.start().raw(), range.end().raw(), live);
+        self.remove(range);
+        for (start, end) in kept {
+            if let Some(piece) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
+                self.insert(piece, owner);
+            }
+        }
+    }
+
+    /// Every fact's range regardless of owner, coalesced.
+    #[cfg(test)]
+    pub(crate) fn ranges(&self) -> Vec<carrick_vfs::GuestMemoryRange> {
+        let mut ranges = Vec::new();
+        for (&start, &(end, _)) in &self.facts {
+            if let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
+                locked_ranges_insert(&mut ranges, range);
+            }
+        }
+        ranges
+    }
+}
+
 fn bus_fault_contains(ranges: &[(u64, u64)], address: u64) -> bool {
     ranges.iter().any(|&(start, len)| {
         start
@@ -222,8 +349,8 @@ pub(in crate::dispatch) enum FirstTouchOwner {
     /// Host setup, a host-owned (opaque) root node, the root's heap, or the
     /// range this MM's pending host proposal holds: the host's own arming.
     Host,
-    /// A root-owned anonymous page outside the heap.
-    Root(Mapping),
+    /// A root-owned anonymous page outside the heap: its node and incarnation.
+    Root(Mapping, ReservationIncarnation),
     /// No root node covers the page.
     Unmapped,
 }
@@ -249,6 +376,21 @@ pub(in crate::dispatch) fn root_holes(
     Ok(holes)
 }
 
+/// One root-owned first-touch piece: an anonymous node outside the heap,
+/// clipped to the query, with the incarnation its residency facts must name.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::dispatch) struct RootPiece {
+    pub(in crate::dispatch) range: carrick_vfs::GuestMemoryRange,
+    pub(in crate::dispatch) protection: ReservationProtection,
+    pub(in crate::dispatch) incarnation: ReservationIncarnation,
+}
+
+impl RootPiece {
+    pub(in crate::dispatch) fn owner(&self) -> ResidencyOwner {
+        ResidencyOwner::Root(self.incarnation)
+    }
+}
+
 impl MemState {
     /// Who answers `page`'s first-touch facts (see [`FirstTouchOwner`]).
     pub(in crate::dispatch) fn first_touch_owner(&self, page: u64) -> FirstTouchOwner {
@@ -258,12 +400,12 @@ impl MemState {
         if self.venue_owns(page, page.saturating_add(1)) {
             return FirstTouchOwner::Host;
         }
-        let mapping = root
-            .with_root(|model| Ok(model.mapping(page)))
+        let node = root
+            .with_root(|model| Ok(model.node(page)))
             .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal));
-        match mapping {
+        match node {
             None => FirstTouchOwner::Unmapped,
-            Some(mapping)
+            Some((mapping, incarnation))
                 if mapping.anonymous
                     && !super::anonymous::in_heap(
                         mapping.range.start(),
@@ -271,20 +413,45 @@ impl MemState {
                         self.layout,
                     ) =>
             {
-                FirstTouchOwner::Root(mapping)
+                FirstTouchOwner::Root(mapping, incarnation)
             }
             Some(_) => FirstTouchOwner::Host,
         }
     }
 
-    /// The root-owned first-touch extents (anonymous nodes outside the heap)
-    /// overlapping `[start, end)`, clipped to it, in address order. Empty in
-    /// host setup.
-    pub(in crate::dispatch) fn root_first_touch_extents(
+    /// Record `range` resident, each piece under the owner that holds it
+    /// now. O(log n + k) in the root nodes `range` touches.
+    pub(in crate::dispatch) fn record_resident(&mut self, range: carrick_vfs::GuestMemoryRange) {
+        let (start, end) = (range.start().raw(), range.end().raw());
+        let pieces = if self.venue_owns(start, end) {
+            Vec::new()
+        } else {
+            self.root_first_touch_pieces(start, end)
+        };
+        let mut cursor = start;
+        for piece in &pieces {
+            if let Some(host) = carrick_vfs::GuestMemoryRange::new(
+                GuestVa(cursor),
+                GuestVa(piece.range.start().raw()),
+            ) {
+                self.resident.insert(host, ResidencyOwner::Host);
+            }
+            self.resident.insert(piece.range, piece.owner());
+            cursor = piece.range.end().raw();
+        }
+        if let Some(host) = carrick_vfs::GuestMemoryRange::new(GuestVa(cursor), GuestVa(end)) {
+            self.resident.insert(host, ResidencyOwner::Host);
+        }
+    }
+
+    /// The root-owned first-touch pieces (anonymous nodes outside the heap)
+    /// overlapping `[start, end)`, clipped to it, in address order, one per
+    /// node. Empty in host setup.
+    pub(in crate::dispatch) fn root_first_touch_pieces(
         &self,
         start: u64,
         end: u64,
-    ) -> Vec<(carrick_vfs::GuestMemoryRange, ReservationProtection)> {
+    ) -> Vec<RootPiece> {
         let Some(root) = self.delegated_root() else {
             return Vec::new();
         };
@@ -292,9 +459,9 @@ impl MemState {
             return Vec::new();
         };
         let layout = self.layout;
-        let mut extents = Vec::new();
+        let mut pieces = Vec::new();
         root.with_root(|model| {
-            model.observe_range(range, &mut |mapping| {
+            model.observe_nodes(range, &mut |mapping, incarnation| {
                 let (node_start, node_end) = (mapping.range.start(), mapping.range.end());
                 if !mapping.anonymous || super::anonymous::in_heap(node_start, node_end, layout) {
                     return;
@@ -303,18 +470,30 @@ impl MemState {
                     GuestVa(node_start.max(start)),
                     GuestVa(node_end.min(end)),
                 ) {
-                    extents.push((clipped, mapping.protection));
+                    pieces.push(RootPiece {
+                        range: clipped,
+                        protection: mapping.protection,
+                        incarnation,
+                    });
                 }
             })
         })
         .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal));
-        extents
+        pieces
     }
 
     /// The protection a first touch of root-owned `page` publishes, or
     /// `None` when it is already resident or inaccessible.
-    fn root_armed_prot(&self, mapping: &Mapping, page: u64) -> Option<LinuxProtFlags> {
-        if ranges_contain_page(&self.resident_ranges, page) {
+    fn root_armed_prot(
+        &self,
+        mapping: &Mapping,
+        incarnation: ReservationIncarnation,
+        page: u64,
+    ) -> Option<LinuxProtFlags> {
+        if self
+            .resident
+            .contains(page, ResidencyOwner::Root(incarnation))
+        {
             return None;
         }
         let prot = LinuxProtFlags::from_bits_truncate(mapping.protection.bits());
@@ -327,43 +506,62 @@ impl MemState {
     fn root_grant_for_page(
         &self,
         mapping: &Mapping,
+        incarnation: ReservationIncarnation,
         page: u64,
         max_len: u64,
     ) -> Option<ResidentFaultRange> {
         if max_len == 0 {
             return None;
         }
-        let prot = self.root_armed_prot(mapping, page)?;
+        let prot = self.root_armed_prot(mapping, incarnation, page)?;
         let window_start = page - page % max_len;
         let window_end = window_start.checked_add(max_len)?;
-        let (mut start, mut end) = (page, page.checked_add(1)?);
-        for (extent, protection) in self.root_first_touch_extents(window_start, window_end) {
-            if protection != mapping.protection {
-                continue;
+        let pieces = self.root_first_touch_pieces(window_start, window_end);
+        // Grow the run through adjacent same-protection pieces, both ways.
+        let index = pieces.iter().position(|piece| {
+            piece.range.start().raw() <= page && page < piece.range.end().raw()
+        })?;
+        let (mut start, mut end) = (
+            pieces[index].range.start().raw(),
+            pieces[index].range.end().raw(),
+        );
+        let mut stops = vec![pieces[index]];
+        for piece in pieces[..index].iter().rev() {
+            if piece.protection != mapping.protection || piece.range.end().raw() != start {
+                break;
             }
-            let (extent_start, extent_end) = (extent.start().raw(), extent.end().raw());
-            if extent_start <= end && start <= extent_end {
-                start = start.min(extent_start);
-                end = end.max(extent_end);
+            start = piece.range.start().raw();
+            stops.push(*piece);
+        }
+        for piece in &pieces[index + 1..] {
+            if piece.protection != mapping.protection || piece.range.start().raw() != end {
+                break;
             }
+            end = piece.range.end().raw();
+            stops.push(*piece);
         }
-        // Committed pages split the run, exactly as a commit disarms them.
-        let resident = &self.resident_ranges;
-        let index = resident.partition_point(|range| range.end().raw() <= page);
-        if let Some(below) = index.checked_sub(1).and_then(|index| resident.get(index)) {
-            start = start.max(below.end().raw());
-        }
-        if let Some(above) = resident.get(index) {
-            end = end.min(above.start().raw());
+        // Committed pages split the run, exactly as a commit disarms them:
+        // each piece answers under its own incarnation.
+        for piece in stops {
+            for (resident_start, resident_end) in self.resident.within(
+                piece.range.start().raw(),
+                piece.range.end().raw(),
+                piece.owner(),
+            ) {
+                if resident_end <= page {
+                    start = start.max(resident_end);
+                } else if resident_start > page {
+                    end = end.min(resident_start);
+                }
+            }
         }
         let range = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))?;
         Some(ResidentFaultRange { range, prot })
     }
 
     /// Retire the host's residency facts for `holes`: ranges the root held
-    /// no node for, now handed out again. They describe pages of a mapping
-    /// the guest venue retired without the host, so they must not survive
-    /// into the new mapping.
+    /// no node for, now handed out again. Their facts are already dead
+    /// (they name retired incarnations); this only reclaims them.
     pub(in crate::dispatch) fn retire_stale_first_touch(&mut self, holes: &[(u64, u64)]) {
         for &(start, end) in holes {
             let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))
@@ -373,33 +571,45 @@ impl MemState {
             let _ = self
                 .deferred_anonymous
                 .retire(GuestVa(start), (end - start) as usize);
-            locked_ranges_remove(&mut self.resident_ranges, range);
+            self.resident.remove(range);
             locked_ranges_remove(&mut self.resident_tracked_ranges, range);
             locked_ranges_remove(&mut self.locked_ranges, range);
             self.resident_fault_ranges.disarm(range);
         }
     }
 
+    /// Facts the host venue recorded for a range its own pending proposal
+    /// held now belong to the node incarnations the completion committed.
+    pub(in crate::dispatch) fn adopt_completed_residency(&mut self, start: u64, end: u64) {
+        for piece in self.root_first_touch_pieces(start, end) {
+            self.resident
+                .hand_over(piece.range, ResidencyOwner::Host, piece.owner());
+        }
+    }
+
     /// Hand a demoted root node's first-touch observation to the host: its
     /// pages become host-owned, so the host tracks them and arms every page
-    /// not yet resident at the node's protection.
-    pub(in crate::dispatch) fn adopt_root_first_touch(&mut self, mapping: &Mapping) {
-        let (start, end) = (mapping.range.start(), mapping.range.end());
-        if super::anonymous::in_heap(start, end, self.layout) {
-            return;
-        }
-        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
-            return;
-        };
+    /// not yet resident (under the node's own incarnation) at the node's
+    /// protection.
+    pub(in crate::dispatch) fn adopt_root_first_touch(&mut self, piece: &RootPiece) {
+        let range = piece.range;
+        self.resident
+            .hand_over(range, piece.owner(), ResidencyOwner::Host);
         locked_ranges_insert(&mut self.resident_tracked_ranges, range);
         self.resident_fault_ranges.disarm(range);
-        let prot = LinuxProtFlags::from_bits_truncate(mapping.protection.bits());
+        let prot = LinuxProtFlags::from_bits_truncate(piece.protection.bits());
         if prot.is_empty() {
             return;
         }
         let mut untouched = vec![range];
-        for resident in &self.resident_ranges {
-            locked_ranges_remove(&mut untouched, *resident);
+        for (start, end) in
+            self.resident
+                .within(range.start().raw(), range.end().raw(), ResidencyOwner::Host)
+        {
+            if let Some(resident) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))
+            {
+                locked_ranges_remove(&mut untouched, resident);
+            }
         }
         for sub in untouched {
             self.resident_fault_ranges.arm(sub, prot);
@@ -410,26 +620,60 @@ impl MemState {
 /// The pages of `range` that lie inside a first-touch tracked extent and have
 /// not been committed resident: exactly the pages whose leaf must stay
 /// invalid so their first touch is still observed. On a delegated MM the
-/// root-owned extents are tracked too.
+/// root-owned pieces are tracked too, each against its own incarnation.
 pub(crate) fn tracked_nonresident_subranges(
     mem: &MemState,
     range: carrick_vfs::GuestMemoryRange,
 ) -> Vec<carrick_vfs::GuestMemoryRange> {
+    let (range_start, range_end) = (range.start().raw(), range.end().raw());
+    let pieces = mem.root_first_touch_pieces(range_start, range_end);
     let mut out = Vec::new();
-    for tracked in &mem.resident_tracked_ranges {
-        let start = tracked.start().raw().max(range.start().raw());
-        let end = tracked.end().raw().min(range.end().raw());
-        if let Some(sub) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
+    let first = mem
+        .resident_tracked_ranges
+        .partition_point(|tracked| tracked.end().raw() <= range_start);
+    for tracked in &mem.resident_tracked_ranges[first..] {
+        if tracked.start().raw() >= range_end {
+            break;
+        }
+        let start = tracked.start().raw().max(range_start);
+        let end = tracked.end().raw().min(range_end);
+        let Some(sub) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
+            continue;
+        };
+        // Host tracking answers only for host-owned pages.
+        let mut host = vec![sub];
+        for piece in &pieces {
+            locked_ranges_remove(&mut host, piece.range);
+        }
+        for (resident_start, resident_end) in mem.resident.within(start, end, ResidencyOwner::Host)
+        {
+            if let Some(resident) =
+                carrick_vfs::GuestMemoryRange::new(GuestVa(resident_start), GuestVa(resident_end))
+            {
+                locked_ranges_remove(&mut host, resident);
+            }
+        }
+        for piece in host {
+            locked_ranges_insert(&mut out, piece);
+        }
+    }
+    for piece in &pieces {
+        let mut untouched = vec![piece.range];
+        for (resident_start, resident_end) in mem.resident.within(
+            piece.range.start().raw(),
+            piece.range.end().raw(),
+            piece.owner(),
+        ) {
+            if let Some(resident) =
+                carrick_vfs::GuestMemoryRange::new(GuestVa(resident_start), GuestVa(resident_end))
+            {
+                locked_ranges_remove(&mut untouched, resident);
+            }
+        }
+        for sub in untouched {
             locked_ranges_insert(&mut out, sub);
         }
     }
-    for (extent, _) in mem.root_first_touch_extents(range.start().raw(), range.end().raw()) {
-        locked_ranges_insert(&mut out, extent);
-    }
-    for resident in &mem.resident_ranges {
-        locked_ranges_remove(&mut out, *resident);
-    }
-    out.sort_by_key(|sub| sub.start().raw());
     out
 }
 
@@ -538,7 +782,7 @@ impl<'a> MemView<'a> {
         // MAP_GROWSDOWN VMA and a process has a handful.
         let tracked = match mem.first_touch_owner(page) {
             FirstTouchOwner::Host => ranges_contain_page(&mem.resident_tracked_ranges, page),
-            FirstTouchOwner::Root(_) => true,
+            FirstTouchOwner::Root(..) => true,
             FirstTouchOwner::Unmapped => false,
         } || mem
             .growdown_ranges
@@ -697,7 +941,7 @@ impl<'a> MemView<'a> {
         if let Some(range) =
             carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            locked_ranges_insert(&mut self.mem().lock().resident_ranges, range);
+            self.mem().lock().record_resident(range);
         }
     }
 
@@ -712,7 +956,7 @@ impl<'a> MemView<'a> {
             table.retire_overlapping(authority.mm_id.raw(), start, len);
         }
         let mut mem = authority.lock();
-        locked_ranges_remove(&mut mem.resident_ranges, range);
+        mem.resident.remove(range);
         let _ = mem
             .deferred_anonymous
             .clear_zero_read_residency(GuestVa(start), len as usize);
@@ -732,7 +976,9 @@ impl<'a> MemView<'a> {
         }
         let prot = match mem.first_touch_owner(page) {
             FirstTouchOwner::Host => mem.resident_fault_ranges.prot_for_page(page)?,
-            FirstTouchOwner::Root(mapping) => mem.root_armed_prot(&mapping, page)?,
+            FirstTouchOwner::Root(mapping, incarnation) => {
+                mem.root_armed_prot(&mapping, incarnation, page)?
+            }
             FirstTouchOwner::Unmapped => return None,
         }
         .bits();
@@ -759,7 +1005,9 @@ impl<'a> MemView<'a> {
         let mem = mem_authority.lock();
         let grant = match mem.first_touch_owner(page) {
             FirstTouchOwner::Host => mem.resident_fault_ranges.grant_for_page(page, max_len)?,
-            FirstTouchOwner::Root(mapping) => mem.root_grant_for_page(&mapping, page, max_len)?,
+            FirstTouchOwner::Root(mapping, incarnation) => {
+                mem.root_grant_for_page(&mapping, incarnation, page, max_len)?
+            }
             FirstTouchOwner::Unmapped => return None,
         };
         let mut start = grant.range.start().raw();
@@ -840,7 +1088,7 @@ impl<'a> MemView<'a> {
         };
         let mem_authority_33 = self.mem();
         let mut mem = mem_authority_33.lock();
-        locked_ranges_insert(&mut mem.resident_ranges, range);
+        mem.record_resident(range);
         mem.resident_fault_ranges.disarm(range);
     }
 
@@ -879,7 +1127,7 @@ impl<'a> MemView<'a> {
         }
         let mem_authority_35 = self.mem();
         let mut mem = mem_authority_35.lock();
-        locked_ranges_insert(&mut mem.resident_ranges, range);
+        mem.record_resident(range);
         mem.resident_fault_ranges.disarm(range);
         Ok(())
     }

@@ -259,6 +259,13 @@ impl MemView<'_> {
             trim_live_boot_regions_for_range(&mut mem, start, end - start);
         }
         mem.delegate_anonymous(root.clone());
+        // Their residency facts now describe the incarnations just imported.
+        for &(start, end) in &owned {
+            for piece in mem.root_first_touch_pieces(start, end) {
+                mem.resident
+                    .hand_over(piece.range, super::ResidencyOwner::Host, piece.owner());
+            }
+        }
         // Their locks become root attributes (`set_locked` routes each
         // piece to its owner).
         for (start, end) in owned {

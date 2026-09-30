@@ -16,7 +16,8 @@ pub const EL1_RESERVATIONS_END: u64 = crate::EL1_COUNTERS_OFFSET + 0x8_0000;
 pub const RESERVATION_PROTOCOL_VERSION: u64 = 2;
 
 macro_rules! identity {
-    ($name:ident) => {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         #[repr(transparent)]
         pub struct $name(u64);
@@ -34,6 +35,15 @@ macro_rules! identity {
 identity!(ReservationMm);
 identity!(ReservationGeneration);
 identity!(ReservationSequence);
+identity!(
+    /// One incarnation of anonymous memory in one root: minted when a node is
+    /// created over retired or never-mapped memory, kept across splits,
+    /// protection and attribute edits, never reused within the root. A host
+    /// residency fact tagged with it is live only while the page's node still
+    /// carries it, so a guest-venue retire kills the fact without telling the
+    /// host.
+    ReservationIncarnation
+);
 
 /// Page-aligned half-open Linux 4 KiB virtual range; never an IPA/host VA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

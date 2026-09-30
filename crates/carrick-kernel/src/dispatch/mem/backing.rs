@@ -577,7 +577,7 @@ pub(crate) fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len
         return;
     };
     locked_ranges_remove(&mut mem.locked_ranges, remove);
-    locked_ranges_remove(&mut mem.resident_ranges, remove);
+    mem.resident.remove(remove);
     locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
     mem.resident_fault_ranges.disarm(remove);
     locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
@@ -898,10 +898,10 @@ impl<'a> MemView<'a> {
             mem.bus_fault_ranges.push((start, len));
         }
         if commit.resident {
-            locked_ranges_insert(&mut mem.resident_ranges, replacement);
+            mem.record_resident(replacement);
         }
         if let Some(locked) = commit.locked {
-            locked_ranges_insert(&mut mem.resident_ranges, locked);
+            mem.record_resident(locked);
             locked_ranges_insert(&mut mem.locked_ranges, locked);
         }
         if commit.write_sealed_shared {

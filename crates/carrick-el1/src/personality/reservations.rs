@@ -17,7 +17,7 @@ const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
-const VERSION: u64 = 4;
+const VERSION: u64 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -41,6 +41,15 @@ pub struct Mapping {
     /// host-owned and every EL1 edit touching it forwards.
     pub flags: ReservationNodeFlags,
     pub generation: ReservationGeneration,
+}
+
+/// Byte charges of committed nodes, whole-root or within one range: every
+/// node (`RLIMIT_AS`), `RLIMIT_DATA` nodes, and `LOCKED` anonymous nodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Charges {
+    pub bytes: u64,
+    pub data: u64,
+    pub locked: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -121,6 +130,11 @@ struct State {
     layout: Layout,
     pending: Option<Pending>,
     admitted: bool,
+    /// Last minted [`ReservationIncarnation`].
+    minted: u64,
+    /// Every incarnation at or below this one has had anonymous memory
+    /// retired; a new node may join (adopt) only a younger incarnation.
+    retired_below: u64,
 }
 
 #[repr(C)]
@@ -138,24 +152,40 @@ unsafe impl Sync for Root {}
 struct NodeData {
     start: u64,
     end: u64,
-    prot: u64,
     first: u64,
     last: u64,
     gap: u64,
     bytes: u64,
     data: u64,
+    /// Subtree bytes of `LOCKED` anonymous nodes.
+    locked: u64,
+    /// This node's [`ReservationIncarnation`]; zero never names one.
+    incarnation: u64,
     left: u32,
     right: u32,
     height: u32,
-    flags: u32,
+    /// [`ReservationProtection`] bits (three) and [`ReservationNodeFlags`]
+    /// bits (seven), packed so the bootstrap table fits its region.
+    prot: u16,
+    flags: u16,
+}
+/// Lossless: validated protections use three bits.
+const fn pack_prot(prot: ReservationProtection) -> u16 {
+    prot.bits() as u16
+}
+/// Lossless: validated node flags use seven bits.
+const fn pack_flags(flags: ReservationNodeFlags) -> u16 {
+    flags.bits() as u16
 }
 impl NodeData {
     fn flags(&self) -> ReservationNodeFlags {
         // Nodes are only written from validated flags.
-        ReservationNodeFlags::from_bits(self.flags).unwrap_or(ReservationNodeFlags::EMPTY)
+        ReservationNodeFlags::from_bits(u32::from(self.flags))
+            .unwrap_or(ReservationNodeFlags::EMPTY)
     }
     fn protection(&self) -> ReservationProtection {
-        ReservationProtection::from_bits(self.prot).unwrap_or(ReservationProtection::NONE)
+        ReservationProtection::from_bits(u64::from(self.prot))
+            .unwrap_or(ReservationProtection::NONE)
     }
     fn charged_data(&self) -> u64 {
         if self.flags().charges_data(self.protection()) {
@@ -164,6 +194,39 @@ impl NodeData {
             0
         }
     }
+    fn charged_locked(&self) -> u64 {
+        if self.flags().contains(ReservationNodeFlags::ANONYMOUS)
+            && self.flags().contains(ReservationNodeFlags::LOCKED)
+        {
+            self.end - self.start
+        } else {
+            0
+        }
+    }
+    /// Charges of the part of this one node inside `[start, end)`.
+    fn charges_within(&self, start: u64, end: u64) -> Charges {
+        let bytes = self.end.min(end).saturating_sub(self.start.max(start));
+        Charges {
+            bytes,
+            data: if self.charged_data() != 0 { bytes } else { 0 },
+            locked: if self.charged_locked() != 0 { bytes } else { 0 },
+        }
+    }
+    fn mapping(&self, generation: ReservationGeneration) -> Mapping {
+        // Nodes are only constructed from validated ABI ranges/protections.
+        Mapping {
+            range: ReservationRange::new(self.start, self.end).expect("reservation range"),
+            protection: self.protection(),
+            anonymous: self.flags().contains(ReservationNodeFlags::ANONYMOUS),
+            flags: self.flags(),
+            generation,
+        }
+    }
+    /// Whether an adjacent node is the same Linux mapping (a VMA boundary
+    /// the tree keeps only to separate incarnations).
+    fn same_mapping(&self, other: &NodeData) -> bool {
+        self.prot == other.prot && self.flags == other.flags
+    }
 }
 
 #[derive(Default)]
@@ -171,6 +234,38 @@ struct CopyList {
     head: u32,
     tail: u32,
     len: usize,
+}
+
+/// Merges adjacent nodes of one Linux mapping (same protection and
+/// attributes, differing only in incarnation) into one observed [`Mapping`].
+struct Runs<'v> {
+    run: Option<NodeData>,
+    generation: ReservationGeneration,
+    visit: &'v mut dyn FnMut(Mapping),
+}
+impl<'v> Runs<'v> {
+    fn new(generation: ReservationGeneration, visit: &'v mut dyn FnMut(Mapping)) -> Self {
+        Self {
+            run: None,
+            generation,
+            visit,
+        }
+    }
+    fn push(&mut self, node: NodeData) {
+        match &mut self.run {
+            Some(run) if run.end == node.start && run.same_mapping(&node) => run.end = node.end,
+            _ => {
+                if let Some(done) = self.run.replace(node) {
+                    (self.visit)(done.mapping(self.generation));
+                }
+            }
+        }
+    }
+    fn finish(mut self) {
+        if let Some(done) = self.run.take() {
+            (self.visit)(done.mapping(self.generation));
+        }
+    }
 }
 
 /// Pre-allocated nodes for one committed edit. Every split consumes at most
@@ -284,6 +379,8 @@ impl SharedReservations {
                     layout,
                     pending: None,
                     admitted: false,
+                    minted: 0,
+                    retired_below: 0,
                 });
             }
             root.key.store(mm.raw(), Ordering::Release);
@@ -438,7 +535,7 @@ impl Reservations<'_> {
             *self.table.node(id, self.banks).data.get() = node;
         }
     }
-    pub fn mapping(&mut self, address: u64) -> Option<Mapping> {
+    fn node_at(&mut self, address: u64) -> Option<NodeData> {
         if !self.is_admitted() {
             return None;
         }
@@ -450,44 +547,131 @@ impl Reservations<'_> {
             } else if address >= n.end {
                 id = n.right;
             } else {
-                return Some(Mapping {
-                    range: ReservationRange::new(n.start, n.end)?,
-                    protection: ReservationProtection::from_bits(n.prot)?,
-                    anonymous: n.flags().contains(ReservationNodeFlags::ANONYMOUS),
-                    flags: n.flags(),
-                    generation: self.generation(),
-                });
+                return Some(n);
             }
         }
         None
     }
-    /// Observe one committed generation in address order, with one node read
-    /// per mapping. The root guard excludes publication for the whole walk;
-    /// a pending proposal is not part of this committed observation.
+    /// The committed node holding `address`: one incarnation of one mapping
+    /// (a Linux mapping may span several adjacent nodes; see
+    /// [`Self::observe_range`]).
+    pub fn mapping(&mut self, address: u64) -> Option<Mapping> {
+        let generation = self.generation();
+        self.node_at(address).map(|n| n.mapping(generation))
+    }
+    /// The committed node holding `address`, with its incarnation.
+    pub fn node(&mut self, address: u64) -> Option<(Mapping, ReservationIncarnation)> {
+        let generation = self.generation();
+        let n = self.node_at(address)?;
+        Some((
+            n.mapping(generation),
+            ReservationIncarnation::new(n.incarnation)?,
+        ))
+    }
+    /// Observe one committed generation in address order, one node read per
+    /// node, adjacent nodes of one Linux mapping merged into one visit. The
+    /// root guard excludes publication for the whole walk; a pending proposal
+    /// is not part of this committed observation.
     pub fn observe_mappings(&mut self, visit: &mut dyn FnMut(Mapping)) -> Result<(), Refusal> {
         if !self.is_admitted() {
             return Err(Refusal::Stale);
         }
-        self.observe_tree(self.state().tree, visit);
+        let mut runs = Runs::new(self.generation(), visit);
+        self.observe_tree(self.state().tree, &mut runs);
+        runs.finish();
         Ok(())
     }
 
-    fn observe_tree(&mut self, id: u32, visit: &mut dyn FnMut(Mapping)) {
+    fn observe_tree(&mut self, id: u32, runs: &mut Runs<'_>) {
         if id == 0 {
             return;
         }
         let node = self.read(id);
-        self.observe_tree(node.left, visit);
-        // Nodes are only constructed from validated ABI ranges/protections.
-        visit(Mapping {
-            range: ReservationRange::new(node.start, node.end).expect("reservation range"),
-            protection: ReservationProtection::from_bits(node.prot)
-                .expect("reservation protection"),
-            anonymous: node.flags().contains(ReservationNodeFlags::ANONYMOUS),
-            flags: node.flags(),
-            generation: self.generation(),
-        });
-        self.observe_tree(node.right, visit);
+        self.observe_tree(node.left, runs);
+        runs.push(node);
+        self.observe_tree(node.right, runs);
+    }
+    /// The committed nodes overlapping `range`, each with its incarnation,
+    /// in address order: one bounded descent per node, independent of the
+    /// population outside `range`.
+    pub fn observe_nodes(
+        &mut self,
+        range: ReservationRange,
+        visit: &mut dyn FnMut(Mapping, ReservationIncarnation),
+    ) -> Result<(), Refusal> {
+        if !self.is_admitted() {
+            return Err(Refusal::Stale);
+        }
+        let generation = self.generation();
+        let mut cursor = range.start();
+        while let Some(n) = self.next(cursor) {
+            if n.start >= range.end() {
+                break;
+            }
+            let incarnation = ReservationIncarnation::new(n.incarnation).ok_or(Refusal::Invalid)?;
+            visit(n.mapping(generation), incarnation);
+            cursor = n.end;
+        }
+        Ok(())
+    }
+    /// Charges of every committed node: one read of the root's aggregates.
+    pub fn charges(&mut self) -> Charges {
+        let root = self.read(self.state().tree);
+        Charges {
+            bytes: root.bytes,
+            data: root.data,
+            locked: root.locked,
+        }
+    }
+    /// Charges of the committed nodes' parts inside `range`: O(tree height),
+    /// independent of how many nodes lie inside or outside it.
+    pub fn charges_within(&mut self, range: ReservationRange) -> Charges {
+        self.charges_in(self.state().tree, range.start(), range.end())
+    }
+    fn charges_in(&mut self, id: u32, start: u64, end: u64) -> Charges {
+        if id == 0 {
+            return Charges::default();
+        }
+        let n = self.read(id);
+        if n.last <= start || n.first >= end {
+            return Charges::default();
+        }
+        if start <= n.first && n.last <= end {
+            return Charges {
+                bytes: n.bytes,
+                data: n.data,
+                locked: n.locked,
+            };
+        }
+        let left = self.charges_in(n.left, start, end);
+        let right = self.charges_in(n.right, start, end);
+        let own = n.charges_within(start, end);
+        Charges {
+            bytes: left.bytes + own.bytes + right.bytes,
+            data: left.data + own.data + right.data,
+            locked: left.locked + own.locked + right.locked,
+        }
+    }
+    /// The highest committed node overlapping `range`: one descent.
+    pub fn last_mapping_within(&mut self, range: ReservationRange) -> Option<Mapping> {
+        if !self.is_admitted() {
+            return None;
+        }
+        let mut id = self.state().tree;
+        let mut found = None;
+        while id != 0 {
+            let n = self.read(id);
+            if n.start < range.end() {
+                found = Some(n);
+                id = n.right;
+            } else {
+                id = n.left;
+            }
+        }
+        let generation = self.generation();
+        found
+            .filter(|n| n.end > range.start())
+            .map(|n| n.mapping(generation))
     }
 
     pub fn fault_plan(
@@ -556,6 +740,7 @@ impl Reservations<'_> {
             .max(if n.right == 0 { 0 } else { r.first - n.end });
         n.bytes = l.bytes + r.bytes + n.end - n.start;
         n.data = l.data + r.data + n.charged_data();
+        n.locked = l.locked + r.locked + n.charged_locked();
         self.write(id, n);
         id
     }
@@ -640,6 +825,7 @@ impl Reservations<'_> {
             n.end = successor.end;
             n.prot = successor.prot;
             n.flags = successor.flags;
+            n.incarnation = successor.incarnation;
             (n.right, freed) = self.erase(n.right, successor.start);
         }
         self.write(root, n);
@@ -902,23 +1088,55 @@ impl Reservations<'_> {
         if !self.is_admitted() {
             return Err(Refusal::Stale);
         }
-        let generation = self.generation();
+        let mut runs = Runs::new(self.generation(), visit);
         let mut cursor = range.start();
         while let Some(n) = self.next(cursor) {
             if n.start >= range.end() {
                 break;
             }
-            // Nodes are only constructed from validated ABI ranges/protections.
-            visit(Mapping {
-                range: ReservationRange::new(n.start, n.end).ok_or(Refusal::Invalid)?,
-                protection: n.protection(),
-                anonymous: n.flags().contains(ReservationNodeFlags::ANONYMOUS),
-                flags: n.flags(),
-                generation,
-            });
+            runs.push(n);
             cursor = n.end;
         }
+        runs.finish();
         Ok(())
+    }
+    /// The Linux mapping around `[start, end)`: the adjacent run of nodes of
+    /// one mapping starting with the node holding `start`, extended until it
+    /// covers `end`. `None` when a hole or another mapping comes first.
+    fn run_covering(&mut self, start: u64, end: u64) -> Option<NodeData> {
+        let mut run = self.next(start).filter(|n| n.start <= start)?;
+        while run.end < end {
+            let n = self
+                .next(run.end)
+                .filter(|n| n.start == run.end && n.same_mapping(&run))?;
+            run.end = n.end;
+        }
+        Some(run)
+    }
+    /// The incarnation a node created as `node` takes: a younger adjacent
+    /// incarnation of the same mapping (then the two coalesce), else a fresh
+    /// one. Joining an incarnation that ever had memory retired could make a
+    /// fact about the retired pages look live, so that is never allowed.
+    fn incarnation_for(&mut self, node: &NodeData) -> u64 {
+        let floor = self.state().retired_below;
+        let joinable = |n: &NodeData| n.same_mapping(node) && n.incarnation > floor;
+        if let Some(left) = node
+            .start
+            .checked_sub(1)
+            .and_then(|va| self.next(va))
+            .filter(|l| l.end == node.start && joinable(l))
+        {
+            return left.incarnation;
+        }
+        if let Some(right) = self
+            .next(node.end)
+            .filter(|r| r.start == node.end && joinable(r))
+        {
+            return right.incarnation;
+        }
+        let minted = self.state().minted + 1;
+        self.state_mut().minted = minted;
+        minted
     }
     pub fn mmap(
         &mut self,
@@ -1012,8 +1230,7 @@ impl Reservations<'_> {
             return Err(Refusal::Invalid);
         }
         let node = self
-            .next(source.start())
-            .filter(|n| n.start <= source.start() && n.end >= source.end())
+            .run_covering(source.start(), source.end())
             .ok_or(Refusal::Hole)?;
         if !node.flags().root_editable() {
             return Err(Refusal::ForeignMapping);
@@ -1164,6 +1381,11 @@ impl Reservations<'_> {
             if n.start >= range.end() {
                 break;
             }
+            if n.flags().contains(ReservationNodeFlags::ANONYMOUS) {
+                // Anonymous memory is gone: no incarnation minted so far may
+                // be joined again.
+                self.state_mut().retired_below = self.state().minted;
+            }
             let (tree, freed) = self.erase(self.state().tree, n.start);
             self.state_mut().tree = tree;
             self.table.release(freed, self.banks);
@@ -1187,7 +1409,7 @@ impl Reservations<'_> {
             let (tree, freed) = self.erase(self.state().tree, n.start);
             self.state_mut().tree = tree;
             let mut edited = n;
-            edited.prot = prot.bits();
+            edited.prot = pack_prot(prot);
             edited.left = 0;
             edited.right = 0;
             self.write(freed, edited);
@@ -1204,6 +1426,7 @@ impl Reservations<'_> {
             return Err(Refusal::Stale);
         }
         let range = pending.request.range;
+        let created_flags = ReservationNodeFlags::from_bits(pending.flags).ok_or(Refusal::Stale)?;
         let creates = pending.request.operation != ReservationOperation::Retire;
         let mut spares = Spares(pending.nodes);
         // The pending proposal excluded every other edit, so these are the
@@ -1225,16 +1448,15 @@ impl Reservations<'_> {
         }
         if creates && pending.request.operation != ReservationOperation::Protect {
             let id = spares.take();
-            self.write(
-                id,
-                NodeData {
-                    start: range.start(),
-                    end: range.end(),
-                    prot: pending.request.protection.bits(),
-                    flags: pending.flags,
-                    ..NodeData::default()
-                },
-            );
+            let mut node = NodeData {
+                start: range.start(),
+                end: range.end(),
+                prot: pack_prot(pending.request.protection),
+                flags: pack_flags(created_flags),
+                ..NodeData::default()
+            };
+            node.incarnation = self.incarnation_for(&node);
+            self.write(id, node);
             self.insert_coalescing(id);
         }
         self.release_spares(spares.0);
@@ -1317,16 +1539,15 @@ impl Reservations<'_> {
             return Err(Refusal::Collision);
         }
         let id = self.table.allocate(self.banks, self.node_capacity)?;
-        self.write(
-            id,
-            NodeData {
-                start: range.start(),
-                end: range.end(),
-                prot: prot.bits(),
-                flags: flags.bits(),
-                ..NodeData::default()
-            },
-        );
+        let mut node = NodeData {
+            start: range.start(),
+            end: range.end(),
+            prot: pack_prot(prot),
+            flags: pack_flags(flags),
+            ..NodeData::default()
+        };
+        node.incarnation = self.incarnation_for(&node);
+        self.write(id, node);
         self.insert_coalescing(id);
         Ok(())
     }
@@ -1412,7 +1633,7 @@ impl Reservations<'_> {
                 let (tree, freed) = self.erase(self.state().tree, n.start);
                 self.state_mut().tree = tree;
                 let mut edited = n;
-                edited.flags = flags.bits();
+                edited.flags = pack_flags(flags);
                 edited.left = 0;
                 edited.right = 0;
                 self.write(freed, edited);
@@ -1460,9 +1681,12 @@ impl Reservations<'_> {
         let mut cursor = list.head;
         let tree = self.build_balanced(list.len, &mut cursor);
         let layout = self.state().layout;
+        let (minted, retired_below) = (self.state().minted, self.state().retired_below);
         let state = child.state_mut();
         state.tree = tree;
         state.layout = layout;
+        state.minted = minted;
+        state.retired_below = retired_below;
         state.admitted = true;
         state.generation += 1;
         Ok(())
@@ -1511,8 +1735,8 @@ impl Reservations<'_> {
         let mut n = self.read(id);
         if let Some(left) = n.start.checked_sub(1).and_then(|va| self.next(va))
             && left.end == n.start
-            && left.prot == n.prot
-            && left.flags == n.flags
+            && left.same_mapping(&n)
+            && left.incarnation == n.incarnation
         {
             let (tree, freed) = self.erase(self.state().tree, left.start);
             self.state_mut().tree = tree;
@@ -1521,8 +1745,8 @@ impl Reservations<'_> {
         }
         if let Some(right) = self.next(n.end)
             && right.start == n.end
-            && right.prot == n.prot
-            && right.flags == n.flags
+            && right.same_mapping(&n)
+            && right.incarnation == n.incarnation
         {
             let (tree, freed) = self.erase(self.state().tree, right.start);
             self.state_mut().tree = tree;
@@ -2590,15 +2814,21 @@ mod tests {
         assert_eq!(request.operation, ReservationOperation::Retire);
         assert_eq!(request.range, range(0x102000, 0x104000));
         assert_eq!(complete(&mut g, d), 0x100000);
-        // Grow in place into free space: prepare the extension, one node.
+        // Grow in place into free space: prepare the extension. The shrink
+        // retired memory, so the extension is its own incarnation (its node
+        // stays apart) but one Linux mapping with the source.
         let d = g
             .mremap(range(0x100000, 0x102000), 0x6000, MoveTarget::InPlace)
             .unwrap();
         assert_eq!(complete(&mut g, d), 0x100000);
         assert_eq!(
             g.mapping(0x105000).unwrap().range,
-            range(0x100000, 0x106000)
+            range(0x102000, 0x106000)
         );
+        let mut grown = std::vec::Vec::new();
+        g.observe_range(range(0x100000, 0x106000), &mut |m| grown.push(m.range))
+            .unwrap();
+        assert_eq!(grown, [range(0x100000, 0x106000)]);
         // Blocked growth: InPlace is ENOMEM, MayMove relocates as one Move.
         let d = g
             .mmap(
@@ -3059,5 +3289,134 @@ mod tests {
             .mmap(Placement::Anywhere, 4096, ReservationProtection::READ_WRITE)
             .unwrap();
         assert_eq!(complete(&mut model, d), 0x100000);
+    }
+
+    #[test]
+    fn reservation_incarnations_never_join_retired_memory() {
+        let table = table();
+        let mut g = admitted(&table, 0, 12);
+        let rw = ReservationProtection::READ_WRITE;
+        let inc = |g: &mut Reservations<'_>, va: u64| g.node(va).unwrap().1;
+        let d = g.mmap(Placement::Fixed(0x100000), 0x2000, rw).unwrap();
+        complete(&mut g, d);
+        // Nothing retired yet: an adjacent mapping joins the incarnation
+        // and the two coalesce into one node.
+        let d = g.mmap(Placement::Fixed(0x102000), 0x1000, rw).unwrap();
+        complete(&mut g, d);
+        let first = inc(&mut g, 0x100000);
+        assert_eq!(inc(&mut g, 0x102000), first);
+        assert_eq!(
+            g.mapping(0x102000).unwrap().range,
+            range(0x100000, 0x103000)
+        );
+        // A retire anywhere taints every incarnation minted so far.
+        let d = g.mmap(Placement::Fixed(0x110000), 0x1000, rw).unwrap();
+        complete(&mut g, d);
+        let d = g.munmap(range(0x110000, 0x111000)).unwrap();
+        complete(&mut g, d);
+        let d = g.mmap(Placement::Fixed(0x103000), 0x1000, rw).unwrap();
+        complete(&mut g, d);
+        let fresh = inc(&mut g, 0x103000);
+        assert_ne!(fresh, first);
+        // One Linux mapping, two incarnations.
+        let mut seen = std::vec::Vec::new();
+        g.observe_mappings(&mut |m| seen.push(m.range)).unwrap();
+        assert_eq!(seen, [range(0x100000, 0x104000)]);
+        let mut nodes = std::vec::Vec::new();
+        g.observe_nodes(range(0x100000, 0x104000), &mut |m, i| {
+            nodes.push((m.range, i))
+        })
+        .unwrap();
+        assert_eq!(
+            nodes,
+            [
+                (range(0x100000, 0x103000), first),
+                (range(0x103000, 0x104000), fresh)
+            ]
+        );
+        // mprotect splits and rejoins keep the incarnation.
+        let d = g
+            .mprotect(range(0x101000, 0x102000), ReservationProtection::NONE)
+            .unwrap();
+        complete(&mut g, d);
+        assert_eq!(inc(&mut g, 0x101000), first);
+        assert_eq!(inc(&mut g, 0x102000), first);
+        let d = g.mprotect(range(0x101000, 0x102000), rw).unwrap();
+        complete(&mut g, d);
+        assert_eq!(
+            g.mapping(0x101000).unwrap().range,
+            range(0x100000, 0x103000)
+        );
+        // A retired page recreated between live pages is a new incarnation.
+        let d = g.munmap(range(0x101000, 0x102000)).unwrap();
+        complete(&mut g, d);
+        let d = g.mmap(Placement::Fixed(0x101000), 0x1000, rw).unwrap();
+        complete(&mut g, d);
+        let recreated = inc(&mut g, 0x101000);
+        assert_ne!(recreated, first);
+        assert_ne!(recreated, fresh);
+        assert_eq!(inc(&mut g, 0x100000), first);
+        assert_eq!(inc(&mut g, 0x102000), first);
+        // mremap sees the Linux mapping, not the incarnations.
+        let d = g
+            .mremap(range(0x100000, 0x104000), 0x5000, MoveTarget::MayMove)
+            .unwrap();
+        assert_eq!(complete(&mut g, d), 0x100000);
+        assert_eq!(g.mapping(0x104000).unwrap().protection, rw);
+    }
+
+    #[test]
+    fn reservation_range_charges_and_high_water_are_logarithmic() {
+        for count in [16u64, 512] {
+            let table = table();
+            let mm = ReservationMm::new(1).unwrap();
+            table.publish(1, mm, layout()).unwrap();
+            let mut g = table.lock(1, mm).unwrap();
+            for i in 0..count {
+                let start = 0x100000 + i * 0x2000;
+                let prot = if i % 3 == 0 {
+                    ReservationProtection::NONE
+                } else {
+                    ReservationProtection::READ_WRITE
+                };
+                let flags = if i % 5 == 0 {
+                    ReservationNodeFlags::ANONYMOUS_PRIVATE.union(ReservationNodeFlags::LOCKED)
+                } else {
+                    ReservationNodeFlags::ANONYMOUS_PRIVATE
+                };
+                g.import_with(range(start, start + 0x1000), prot, flags)
+                    .unwrap();
+            }
+            g.finish_import().unwrap();
+            let height = g.read(g.state().tree).height as usize;
+            // Brute force over every node, then the one-descent answers.
+            let query = range(0x100000 + 0x7000, 0x100000 + 0x13000);
+            let mut expected = Charges::default();
+            g.observe_nodes(range(0x100000, 0x1000000), &mut |m, _| {
+                let bytes = m
+                    .range
+                    .end()
+                    .min(query.end())
+                    .saturating_sub(m.range.start().max(query.start()));
+                expected.bytes += bytes;
+                if m.flags.charges_data(m.protection) {
+                    expected.data += bytes;
+                }
+                if m.flags.contains(ReservationNodeFlags::LOCKED) {
+                    expected.locked += bytes;
+                }
+            })
+            .unwrap();
+            g.work = 0;
+            assert_eq!(g.charges_within(query), expected);
+            assert!(g.work <= 4 * (height + 1), "{} reads at {count}", g.work);
+            g.work = 0;
+            let last = g.last_mapping_within(range(0x100000, 0x1000000)).unwrap();
+            assert_eq!(last.range.start(), 0x100000 + (count - 1) * 0x2000);
+            assert!(g.work <= height + 1);
+            g.work = 0;
+            assert_eq!(g.charges().bytes, count * 0x1000);
+            assert_eq!(g.work, 1);
+        }
     }
 }

@@ -940,16 +940,23 @@ const MS_INVALIDATE: u64 = 2;
 const ANON: u64 = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
 
 impl Root {
-    /// The committed root node at `address`: (start, end, anonymous, flags).
+    /// The committed Linux mapping at `address` (adjacent nodes of one
+    /// mapping, whatever their incarnations): (start, end, anonymous, flags).
     fn node(&self, address: u64) -> Option<(u64, u64, bool, u32)> {
-        self.lock().mapping(address).map(|mapping| {
-            (
-                mapping.range.start(),
-                mapping.range.end(),
-                mapping.anonymous,
-                mapping.flags.bits(),
-            )
-        })
+        let mut found = None;
+        self.lock()
+            .observe_mappings(&mut |mapping| {
+                if mapping.range.start() <= address && address < mapping.range.end() {
+                    found = Some((
+                        mapping.range.start(),
+                        mapping.range.end(),
+                        mapping.anonymous,
+                        mapping.flags.bits(),
+                    ));
+                }
+            })
+            .unwrap();
+        found
     }
 }
 
@@ -1673,4 +1680,91 @@ fn delegated_heap_mremap_and_mlockall_match_a_host_setup_mm() {
     let root = run(true);
     assert_eq!(host.0, root.0, "outcomes differ");
     assert_eq!(host.1, root.1, "mlockall locked different memory");
+}
+
+// ---------------------------------------------------------------------------
+// S2: a host residency fact names the root node incarnation it was observed
+// on. A guest-venue munmap/mmap retires that incarnation without the host, so
+// the fact is dead by construction; nothing tells the host.
+// ---------------------------------------------------------------------------
+
+/// Every residency answer the host gives for `pages`: mincore(2) and the
+/// fault-planning answers.
+fn residency_answers(
+    dispatcher: &SyscallDispatcher,
+    memory: &CountingMmapMemory,
+    base: u64,
+    pages: u64,
+) -> (Option<Vec<u8>>, Vec<FaultAnswer>) {
+    let list: Vec<u64> = (0..pages).map(|page| base + page * PAGE).collect();
+    (
+        mincore(dispatcher, memory, base, pages),
+        fault_answers(dispatcher, &list),
+    )
+}
+
+#[test]
+fn delegated_guest_venue_munmap_then_mmap_retires_host_residency() {
+    // Host-venue first touch, then guest-venue munmap and guest-venue mmap
+    // at the same address: the host never sees the guest steps. Linux: the
+    // new mapping holds none of the old pages (mincore(2) 0, first touch
+    // still pending).
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.host_anonymous(base, 2 * PAGE, RW);
+    twin.touch(base);
+    twin.same("the host-venue touch", |d, m| {
+        residency_answers(d, m, base, 2)
+    });
+    twin.munmap(base, 2 * PAGE);
+    twin.anonymous(base, 2 * PAGE, RW);
+    twin.same("a guest-venue remap of a host-touched page", |d, m| {
+        residency_answers(d, m, base, 2)
+    });
+    assert_eq!(
+        mincore(&twin.delegated, &twin.delegated_memory, base, 2),
+        Some(vec![0, 0])
+    );
+    // The new incarnation's own first touch is observed and reported.
+    twin.touch(base + PAGE);
+    twin.same("the new incarnation's first touch", |d, m| {
+        residency_answers(d, m, base, 2)
+    });
+}
+
+#[test]
+fn delegated_residency_of_two_adjacent_mappings_survives_only_where_unretired() {
+    // Adversarial: two adjacent mappings touched by the host; the guest
+    // venue retires and recreates only the first, whose new node would
+    // coalesce with its untouched-by-the-guest neighbour. The neighbour's
+    // fact stays live; the recreated page's fact is dead.
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.host_anonymous(base, 2 * PAGE, RW);
+    twin.host_anonymous(base + 2 * PAGE, 2 * PAGE, RW);
+    twin.touch(base);
+    twin.touch(base + 2 * PAGE);
+    twin.munmap(base, 2 * PAGE);
+    twin.anonymous(base, 2 * PAGE, RW);
+    twin.same("a recreated mapping beside a live touched one", |d, m| {
+        residency_answers(d, m, base, 4)
+    });
+    assert_eq!(
+        mincore(&twin.delegated, &twin.delegated_memory, base, 4),
+        Some(vec![0, 0, 1, 0])
+    );
+    // A middle hole recreated between two touched pages of one mapping:
+    // mprotect splits keep residency, the retired page loses it.
+    twin.touch(base + 3 * PAGE);
+    twin.mprotect(base + 2 * PAGE, PAGE, LINUX_PROT_READ);
+    twin.mprotect(base + 2 * PAGE, PAGE, RW);
+    twin.munmap(base + 3 * PAGE, PAGE);
+    twin.anonymous(base + 3 * PAGE, PAGE, RW);
+    twin.same("split, rejoined and partly recreated", |d, m| {
+        residency_answers(d, m, base, 4)
+    });
+    assert_eq!(
+        mincore(&twin.delegated, &twin.delegated_memory, base, 4),
+        Some(vec![0, 0, 1, 0])
+    );
 }

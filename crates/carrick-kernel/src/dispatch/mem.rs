@@ -427,10 +427,10 @@ pub struct MemState {
     /// typed guest-VA ranges so `/proc` accounting cannot mix them with host or
     /// physical addresses.
     pub locked_ranges: Vec<carrick_vfs::GuestMemoryRange>,
-    /// Guest-page resident ranges for Carrick-managed mappings where host
+    /// Guest-page residency facts for Carrick-managed mappings where host
     /// `mincore` is too coarse (notably 4 KiB Linux pages on a 16 KiB Darwin
-    /// host page).
-    pub resident_ranges: Vec<carrick_vfs::GuestMemoryRange>,
+    /// host page), each tagged with the owner it was observed under.
+    pub resident: ResidentFacts,
     /// Ranges whose `mincore` answer is derived from `resident_ranges`.
     pub resident_tracked_ranges: Vec<carrick_vfs::GuestMemoryRange>,
     /// Shared-anon ranges that should fault once per guest page to become
@@ -523,7 +523,7 @@ impl MemState {
             remap_snapshots: std::collections::HashMap::new(),
             bus_fault_ranges: Vec::new(),
             locked_ranges: Vec::new(),
-            resident_ranges: Vec::new(),
+            resident: ResidentFacts::default(),
             resident_tracked_ranges: Vec::new(),
             resident_fault_ranges: FirstTouchArming::default(),
             deferred_anonymous: std::sync::Arc::new(
@@ -1761,20 +1761,36 @@ impl<'a> MemView<'a> {
         let zero_reads = mem.deferred_anonymous.snapshot().zero_read_resident;
         // A delegated root's anonymous rows outside the heap are post-exec
         // VMAs exactly like `dynamic_maps` (the heap stays loader-populated).
+        // Every source is walked once, in address order, over the queried
+        // range only: the cost is the range's own pages and rows, never the
+        // rest of the MM.
         let end = address.checked_add(pages.checked_mul(page_size)?)?;
-        let root_rows = mem.root_first_touch_extents(address, end);
+        let root_pieces = mem.root_first_touch_pieces(address, end);
+        let first_dynamic = mem.dynamic_maps.partition_point(|map| map.end <= address);
+        let dynamic = &mem.dynamic_maps[first_dynamic..];
+        let (mut next_dynamic, mut next_root) = (0usize, 0usize);
         let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
         for index in 0..pages {
             let page = address.checked_add(index.checked_mul(page_size)?)?;
-            let in_dynamic = mem
-                .dynamic_maps
-                .iter()
-                .any(|m| page >= m.start && page < m.end)
-                || root_rows
-                    .iter()
-                    .any(|(row, _)| row.start().raw() <= page && page < row.end().raw());
+            while dynamic.get(next_dynamic).is_some_and(|map| map.end <= page) {
+                next_dynamic += 1;
+            }
+            while root_pieces
+                .get(next_root)
+                .is_some_and(|piece| piece.range.end().raw() <= page)
+            {
+                next_root += 1;
+            }
+            let root_piece = root_pieces
+                .get(next_root)
+                .filter(|piece| piece.range.start().raw() <= page);
+            let in_dynamic = dynamic
+                .get(next_dynamic)
+                .is_some_and(|map| map.start <= page)
+                || root_piece.is_some();
+            let owner = root_piece.map_or(ResidencyOwner::Host, |piece| piece.owner());
             let resident = if in_dynamic {
-                ranges_contain_page(&mem.resident_ranges, page)
+                mem.resident.contains(page, owner)
                     || guest_residency.is_some_and(|table| table.is_guest_committed(mm_key, page))
                     || zero_reads
                         .iter()
@@ -1822,7 +1838,7 @@ impl<'a> MemView<'a> {
                 *range_start < end && start < range_start.saturating_add(*range_len)
             })
             || mem.locked_ranges.iter().any(overlaps)
-            || mem.resident_ranges.iter().any(overlaps)
+            || mem.resident.ranges().iter().any(overlaps)
             || mem.resident_tracked_ranges.iter().any(overlaps)
             || mem.resident_fault_ranges.overlaps(start, end)
             || mem.write_sealed_shared_maps.iter().any(overlaps)
@@ -1949,7 +1965,7 @@ impl<'a> MemView<'a> {
         };
         let mem_authority_37 = self.mem();
         let mut mem = mem_authority_37.lock();
-        locked_ranges_insert(&mut mem.resident_ranges, range);
+        mem.record_resident(range);
         locked_ranges_insert(&mut mem.locked_ranges, range);
     }
 
@@ -1993,7 +2009,7 @@ impl<'a> MemView<'a> {
         let mut mem = mem_authority_38.lock();
         mem.shared.free(address);
         locked_ranges_remove(&mut mem.locked_ranges, range);
-        locked_ranges_remove(&mut mem.resident_ranges, range);
+        mem.resident.remove(range);
         locked_ranges_remove(&mut mem.resident_tracked_ranges, range);
         mem.resident_fault_ranges.disarm(range);
         Ok(())
@@ -2117,7 +2133,7 @@ impl SyscallDispatcher {
             return false;
         };
         let mut mem = authority.mem.lock();
-        locked_ranges_insert(&mut mem.resident_ranges, range);
+        mem.record_resident(range);
         mem.resident_fault_ranges.disarm(range);
         true
     }
