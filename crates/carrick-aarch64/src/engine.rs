@@ -2015,12 +2015,32 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 let authority = self.vm.frame_cow_authority().ok_or_else(|| {
                     MemoryError::HostMap("prepared host write lacks exact-MM authority".to_owned())
                 })?;
-                let committed = authority
-                    .commit_host_first_touch(page, &mut |page, prot| {
+                let committed = if self.page_tables.live_descriptor_owner()
+                    == LiveDescriptorOwner::Guest
+                {
+                    authority.commit_guest_host_first_touch(page, &mut |mm, page| {
+                        let leaf = descriptor(self)
+                            .ok_or_else(|| "guest copyout lost its prepared leaf".to_owned())?;
+                        let tables = self.page_tables.clone();
+                        let slots = carrick_el1_abi::descriptor_txn_slots_host()
+                            .ok_or_else(|| "guest copyout has no descriptor slots".to_owned())?;
+                        crate::descriptor_drain::publish_copyout(
+                            &mut crate::descriptor_drain::EngineDrainVenue(self),
+                            &tables,
+                            slots,
+                            mm,
+                            page,
+                            leaf & 0x0000_FFFF_FFFF_F000,
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                } else {
+                    authority.commit_host_first_touch(page, &mut |page, prot| {
                         <Self as GuestMemory>::protect_range(self, page, 4096, prot)
                             .map_err(|error| error.to_string())
                     })
-                    .map_err(|error| MemoryError::HostMap(format!("host first touch: {error}")))?;
+                }
+                .map_err(|error| MemoryError::HostMap(format!("host first touch: {error}")))?;
                 // Another executor may have committed this leaf after our
                 // read-only walk. Its completed publication needs no second
                 // plan; an unchanged prepared leaf still does.

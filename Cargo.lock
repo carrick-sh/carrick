@@ -306,6 +306,7 @@ dependencies = [
  "bitflags 2.11.1",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
