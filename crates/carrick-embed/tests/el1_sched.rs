@@ -3512,3 +3512,246 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
         "guest workload did not exercise the deferred capture boundary"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Contract `kernel.el1.thread-lifecycle` (stage L0 witnesses).
+//
+// Every fixture mode asserts LINUX semantics only and must print `ok=true` on
+// native arm64 Docker (`el1-sched <mode>` run directly). The structural
+// assertions read the zone counters and are the part that is red today.
+// Run: `just test-embed el1_thread_lifecycle_` (one filter; serial).
+
+/// Thread-lifecycle syscalls by aarch64 number.
+const THREAD_SYSCALLS: [(&str, usize); 6] = [
+    ("clone", 220),
+    ("exit", 93),
+    ("rt_sigprocmask", 135),
+    ("sigaltstack", 132),
+    ("set_robust_list", 99),
+    ("gettid", 178),
+];
+
+/// `[served, forwarded]` per thread-lifecycle syscall.
+fn thread_counters() -> [[u64; 2]; 6] {
+    read_el1_counters().map_or([[0; 2]; 6], |c| {
+        THREAD_SYSCALLS.map(|(_, nr)| {
+            [
+                c.served[nr].load(std::sync::atomic::Ordering::Relaxed),
+                c.forwarded[nr].load(std::sync::atomic::Ordering::Relaxed),
+            ]
+        })
+    })
+}
+
+/// Run one witness mode and assert its Linux-semantic line. Returns the
+/// measurement, the stdout and the per-syscall `[served, forwarded]` deltas.
+fn thread_witness(
+    carrier: &Carrier,
+    mode: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> (Measured, String, [[u64; 2]; 6]) {
+    let mut argv = vec![mode];
+    argv.extend_from_slice(args);
+    let before = thread_counters();
+    let measured = run_fixture(carrier, &argv, timeout);
+    let after = thread_counters();
+    let delta = std::array::from_fn(|i| {
+        [
+            after[i][0].saturating_sub(before[i][0]),
+            after[i][1].saturating_sub(before[i][1]),
+        ]
+    });
+    let stdout = measured.result.stdout_utf8();
+    println!(
+        "el1-sched {mode} {args:?} exits={} served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]={delta:?}\n{}",
+        measured.exits,
+        stdout.trim()
+    );
+    assert!(measured.result.success(), "{mode}: {}", describe(&measured));
+    let summary = format!("{mode} summary parent_ok=true child_ok=true ok=true");
+    let single = stdout
+        .lines()
+        .any(|line| line.starts_with(&format!("{mode} ")) && line.ends_with("ok=true"));
+    assert!(
+        stdout.contains(&summary) || (single && !stdout.contains("ok=false")),
+        "{mode}: Linux-semantic check failed: {stdout:?}"
+    );
+    (measured, stdout, delta)
+}
+
+/// Stage L0(a): spawn/join slope. Four threads are spawned and joined per
+/// round in each of two live processes. The Linux semantics (every thread
+/// runs once) must hold; the structural target is that thread exit is born in
+/// the zone: fewer than 0.05 forwarded `exit` calls per thread added across
+/// scales (the fractional slope is asserted here; the schema cannot express
+/// it). Forwarded counts of the other per-thread calls are printed.
+///
+/// Expected RED today: every thread exit forwards (slope about 1.0).
+#[test]
+fn el1_thread_lifecycle_spawn_slope() {
+    const PER_ROUND: u64 = 4;
+    const PROCESSES: u64 = 2;
+    const ROUNDS: [u64; 3] = [16, 64, 256];
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for rounds in ROUNDS {
+        let (measured, _, delta) = thread_witness(
+            &carrier,
+            "thread-spawn-slope",
+            &[&PER_ROUND.to_string(), &rounds.to_string()],
+            Duration::from_secs(120),
+        );
+        runs.push((rounds * PER_ROUND * PROCESSES, measured.exits, delta));
+    }
+    for pair in runs.windows(2) {
+        let (threads0, exits0, delta0) = &pair[0];
+        let (threads1, exits1, delta1) = &pair[1];
+        let added = (threads1 - threads0) as f64;
+        let mut report = Vec::new();
+        for (i, (name, _)) in THREAD_SYSCALLS.iter().enumerate() {
+            let slope = (delta1[i][1] as f64 - delta0[i][1] as f64) / added;
+            report.push(format!("{name}={slope:.4}"));
+        }
+        println!(
+            "el1-sched thread-spawn-slope threads {threads0}->{threads1} forwarded-per-added-thread [{}] exits_per_thread={:.4}",
+            report.join(" "),
+            (*exits1 as f64 - *exits0 as f64) / added
+        );
+        let exit_slope = (delta1[1][1] as f64 - delta0[1][1] as f64) / added;
+        assert!(
+            exit_slope < 0.05,
+            "forwarded thread exits per added thread {exit_slope:.4} must be < 0.05 \
+             (threads {threads0}->{threads1}: exit forwarded {} -> {})",
+            delta0[1][1],
+            delta1[1][1]
+        );
+    }
+}
+
+/// Stage L0(b): the parent `tgkill`s a `CLONE_THREAD` child the moment `clone`
+/// returns. The child's `gettid` equals the `PARENT_SETTID` value and the
+/// clone result; the signal handler ran on that tid; `/proc/self/task` lists
+/// it; a second process `kill(tid)`s it. Semantic; the host lane may already
+/// pass it, and the thread lifecycle must keep it green when births move into
+/// the zone.
+#[test]
+fn el1_thread_lifecycle_tgkill_right_after_clone() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(
+        &carrier,
+        "tgkill-after-clone",
+        &["16"],
+        Duration::from_secs(120),
+    );
+}
+
+/// Stage L0(c): mask Dekker storm. One thread blocks and unblocks a
+/// real-time signal in a loop while another process `sigqueue`s 2000 distinct
+/// values: each is delivered exactly once. A process-directed signal while one
+/// thread blocks it goes to the other thread, in both directions.
+#[test]
+fn el1_thread_lifecycle_mask_storm_exactly_once() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(&carrier, "mask-storm", &["2000"], Duration::from_secs(180));
+    thread_witness(
+        &carrier,
+        "signal-retarget",
+        &["32"],
+        Duration::from_secs(120),
+    );
+}
+
+/// Stage L0(d): after `join` (CLEARTID) the tid leaves `/proc/self/task`, and
+/// a tid still listed is not handed to a new thread.
+#[test]
+fn el1_thread_lifecycle_cleartid_tid_reuse() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(&carrier, "tid-reuse", &["100"], Duration::from_secs(180));
+}
+
+/// Stage L0(e): `RLIMIT_NPROC` counts threads uid-wide. As an unprivileged uid
+/// (the fixture drops from root), a clone and a fork at the limit fail
+/// `EAGAIN` while a peer process of that uid, with its own limit, forks; the
+/// smallest admitting limit counts both processes; with limit L and C
+/// existing tasks exactly L - C held threads are admitted (refused when the
+/// uid already has >= L tasks) and exiting threads free their slots. The uid is
+/// 34567 rather than 1000 so a Docker host's own uid-1000 tasks cannot shift
+/// the count. Oracle: native Docker.
+#[test]
+fn el1_thread_lifecycle_rlimit_nproc_exact() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(&carrier, "nproc-limit", &[], Duration::from_secs(180));
+}
+
+/// Stage L0(f): `fork` during an 8-thread clone storm; every child has
+/// exactly one thread (its own tid equals its pid) and can clone again.
+#[test]
+fn el1_thread_lifecycle_fork_during_clone_storm() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(&carrier, "fork-storm", &["16"], Duration::from_secs(180));
+}
+
+/// Stage L0(g): `exit_group` and `execve` from one thread during a clone storm
+/// leave no surviving thread and do not hang; the exec image is a
+/// single-threaded process in the victim's pid.
+#[test]
+fn el1_thread_lifecycle_exit_group_and_exec_during_clone_storm() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(
+        &carrier,
+        "exit-group-storm",
+        &["4"],
+        Duration::from_secs(180),
+    );
+    thread_witness(&carrier, "exec-storm", &["4"], Duration::from_secs(180));
+}
+
+/// Stage L0(h): `PTRACE_O_TRACECLONE` reports the clone event, yields the new
+/// tid through `PTRACE_GETEVENTMSG` and auto-attaches the new thread (initial
+/// SIGSTOP stop). Needs only `PTRACE_TRACEME` (no `CAP_SYS_PTRACE`). If the
+/// carrier has no ptrace, this fails with the tracee's errno named: that is
+/// the gate the thread lifecycle must keep closed for traced tasks.
+#[test]
+fn el1_thread_lifecycle_ptrace_traceclone() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(&carrier, "ptrace-clone", &[], Duration::from_secs(120));
+}
+
+/// Stage L0(h): a seccomp filter that returns `EPERM` for thread clones
+/// refuses the clone, creates no task and still admits `fork`, while an
+/// unfiltered peer keeps spawning threads.
+#[test]
+fn el1_thread_lifecycle_seccomp_clone_filter() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(&carrier, "seccomp-clone", &[], Duration::from_secs(120));
+}
+
+/// Stage L0(j): 192 threads per process, in two live processes, parked in
+/// private futex waits and pipe polls (far beyond the executor pool's default
+/// worker count) all complete: a guest wait releases execution capacity.
+#[test]
+fn el1_thread_lifecycle_parked_threads_beyond_executor_pool() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    thread_witness(&carrier, "futex-flood", &["192"], Duration::from_secs(180));
+}

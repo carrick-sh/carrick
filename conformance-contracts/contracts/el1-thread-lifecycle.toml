@@ -1,0 +1,55 @@
+schema_version = 1
+id = "kernel.el1.thread-lifecycle"
+title = "Thread birth, exit, signal masks and rlimits keep Linux semantics while born and retired in the guest zone"
+guest_surfaces = [
+  "syscall:clone",
+  "syscall:exit",
+  "syscall:exit_group",
+  "syscall:execve",
+  "syscall:fork",
+  "syscall:gettid",
+  "syscall:tgkill",
+  "syscall:kill",
+  "syscall:rt_sigprocmask",
+  "syscall:rt_sigqueueinfo",
+  "syscall:sigaltstack",
+  "syscall:set_robust_list",
+  "syscall:futex",
+  "syscall:setrlimit",
+  "syscall:ptrace",
+  "syscall:seccomp",
+  "kernel:thread-ledger",
+  "kernel:signal-mask",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 clone: CLONE_PARENT_SETTID stores the child tid in the parent before clone returns, CLONE_CHILD_CLEARTID clears the word and wakes a futex when the child exits; the returned tid is valid for tgkill immediately",
+  "man 2 gettid / man 2 tgkill / man 2 kill: a thread's tid is stable for its life; tgkill targets exactly that thread; kill with a thread's tid signals the thread group",
+  "man 7 signal: a process-directed signal is delivered to exactly one thread that does not block it; a real-time signal queued with sigqueue is delivered once per send; changing the mask so a pending signal becomes unblocked delivers it",
+  "man 2 getrlimit (RLIMIT_NPROC): the limit applies to every task (process or thread) of the real uid, across processes; clone and fork fail with EAGAIN when the uid's count would exceed it",
+  "man 2 fork: the child has exactly one thread, the caller's copy, whatever other threads existed in the parent",
+  "man 2 execve / man 2 exit_group: every other thread of the group is destroyed and does not survive; after execve the process is single-threaded with the caller's pid",
+  "man 2 ptrace: PTRACE_O_TRACECLONE stops the tracee with PTRACE_EVENT_CLONE, reports the new tid through PTRACE_GETEVENTMSG, and auto-attaches the new thread with an initial SIGSTOP",
+  "man 2 seccomp: a filter's SECCOMP_RET_ERRNO action fails the matching clone with that errno before any task is created",
+  "man 2 futex: a thread blocked in a futex wait or a poll never prevents other threads of any process from running",
+]
+fixture = "embed:el1-sched thread-spawn-slope 4 16|64|256; embed:el1-sched tgkill-after-clone 16; embed:el1-sched mask-storm 2000; embed:el1-sched signal-retarget 32; embed:el1-sched tid-reuse 100; embed:el1-sched nproc-limit; embed:el1-sched fork-storm 16; embed:el1-sched exit-group-storm 4; embed:el1-sched exec-storm 4; embed:el1-sched ptrace-clone; embed:el1-sched seccomp-clone; embed:el1-sched futex-flood 192"
+scale_points = [16, 64, 256]
+rationale = "EL1 thread lifecycle stage L0 (docs/superpowers/plans/2026-09-30-el1-thread-lifecycle.md). The signed fork-COW fixture pays about 9 forwarded calls per thread spawn and exit (clone, four rt_sigprocmask, three sigaltstack, exit); the design moves birth and exit into the zone behind a kernel-issued identity pool. These witnesses fix what that must not change, each asserting Linux semantics only so the same fixture binary is green on native arm64 Docker: (a) thread spawn/join across two live processes; (b) a CLONE_THREAD child is tgkill-able the instant clone returns, its gettid equals the PARENT_SETTID word and the clone result, the handler runs on that tid, /proc/self/task lists it, and a second process kill(tid)s it; (c) a thread flipping a signal's mask in a loop while another process sigqueues 2000 values sees each exactly once, and a process-directed signal goes to the thread that does not block it, in both directions; (d) after CLEARTID join the tid leaves /proc/self/task and a still-listed tid is not reissued; (e) RLIMIT_NPROC counts threads uid-wide (fixture drops to uid 34567): at the limit clone and fork fail EAGAIN while a same-uid peer with its own limit forks, the smallest admitting limit counts both processes, and with limit L and C existing tasks exactly L-C held threads are admitted (a new task is refused when the uid already has >= L tasks); (f) fork during an 8-thread clone storm leaves the child exactly one thread; (g) exit_group and execve during a clone storm leave no surviving tid and no hang; (h) PTRACE_O_TRACECLONE and a seccomp EPERM filter on thread clone behave as on Linux; (j) 192 parked threads per process in two processes, beyond the executor pool's default workers, all complete. The structural claim asserted by the spawn-slope test is that thread exit is born in the zone: fewer than 0.05 forwarded exit calls per added thread across 16/64/256 rounds."
+
+[bindings]
+embed = "carrick-embed::el1_sched::{el1_thread_lifecycle_spawn_slope,el1_thread_lifecycle_tgkill_right_after_clone,el1_thread_lifecycle_mask_storm_exactly_once,el1_thread_lifecycle_cleartid_tid_reuse,el1_thread_lifecycle_rlimit_nproc_exact,el1_thread_lifecycle_fork_during_clone_storm,el1_thread_lifecycle_exit_group_and_exec_during_clone_storm,el1_thread_lifecycle_ptrace_traceclone,el1_thread_lifecycle_seccomp_clone_filter,el1_thread_lifecycle_parked_threads_beyond_executor_pool}"
+
+[bindings.unresolved]
+vm_free = "Pool, ledger and settle semantics get VM-free kernel tests in stage L1 (kernel-example suites); the live EL1 clone/exit path, cross-vCPU signal masks and executor-pool exhaustion need real trap frames."
+docker = "Each fixture mode asserts Linux semantics only and is meant to run unchanged as `el1-sched <mode>` in native arm64 Docker; the same-source differential binding is not yet automated. `nproc-limit` needs root in the container (it drops to uid 34567); `ptrace-clone` needs the default Docker seccomp profile (ptrace allowed)."
+embed_structural = "Not yet a registered WorkObservation binding: el1_thread_lifecycle_spawn_slope asserts, outside the contract evaluator, forwarded `exit` calls per added thread < 0.05 across 16/64/256 rounds (fractional, so not expressible as an integer affine budget) and prints the forwarded clone, rt_sigprocmask, sigaltstack, set_robust_list and gettid slopes. Expected RED until thread exit is served in the zone (stage L3/L4)."
+production = "Kernel ThreadIdentityPool and ThreadLedger (L1), lifecycle page and control slot ABI (L2), EL1 lifecycle personality (L3) and settle-before-context runtime gates (L4)."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 1024
+per_unit = 2
+layers = ["embed-structural"]
+rationale = "Declared from el1_thread_lifecycle_spawn_slope (4 threads per round in each of two processes, so 8 threads per scale unit = one round). Today each thread costs about 9 forwarded calls (about 72 per round). With thread birth, exit, signal masks, sigaltstack and robust-list setup served in the zone, forwarded dispatches per round are a small constant, so at most 2 per round remain (the design's own budget is about 0 per round) on top of a fixed base for fixture start-up, the fork and the pipe pair. The test's exact assertion, forwarded thread exits per added thread below 0.05, is stricter than this integer form and stays in the embed test."
