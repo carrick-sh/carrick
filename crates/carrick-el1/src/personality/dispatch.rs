@@ -1,5 +1,5 @@
 //! Linux syscall dispatch and completion mapping.
-use super::{file, inotify, ipc, sched};
+use super::{file, inotify, ipc, lifecycle, sched};
 use crate::fault::dispatch_fault;
 use crate::memory;
 use carrick_el1_abi::{
@@ -227,8 +227,47 @@ pub fn dispatch_syscall_with_ipc<F, C, U>(
     open_table: &[DelegatedOpenFile],
     inotify_table: &[DelegatedInotify],
     name_cache: &InotifyNameCache,
+    zone: Option<Zone<'_, C, U>>,
+    ipc: Option<&ipc::IpcVenue<'_>>,
+    cache_lookup: F,
+) -> Action
+where
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+{
+    dispatch_syscall_with_lifecycle(
+        frame,
+        counters,
+        current_tasks,
+        fd_map,
+        object_table,
+        open_table,
+        inotify_table,
+        name_cache,
+        zone,
+        ipc,
+        None,
+        cache_lookup,
+    )
+}
+
+/// [`dispatch_syscall_with_ipc`] with the thread lifecycle state the host
+/// published for this venue ([`lifecycle::LifecycleVenue`]): thread clone
+/// and exit and the per-thread setup calls are served in EL1.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_syscall_with_lifecycle<F, C, U>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    fd_map: &[FdMapSlot],
+    object_table: &[DelegatedFile],
+    open_table: &[DelegatedOpenFile],
+    inotify_table: &[DelegatedInotify],
+    name_cache: &InotifyNameCache,
     mut zone: Option<Zone<'_, C, U>>,
     ipc: Option<&ipc::IpcVenue<'_>>,
+    lifecycle: Option<&dyn lifecycle::LifecycleVenue>,
     cache_lookup: F,
 ) -> Action
 where
@@ -358,6 +397,31 @@ where
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }
         return Action::Forward;
+    }
+
+    // Thread clone/exit and the per-thread setup calls, on the lifecycle
+    // page and control slots the host published.
+    if let (Some(venue), Some(task)) = (lifecycle, cur_task)
+        && lifecycle::is_lifecycle_syscall(nr)
+    {
+        let sched = match (zone.as_mut(), SlotId::from_index(slot)) {
+            (Some(zone), Some(zslot)) => Some(sched::Sched {
+                zone: zone.tables,
+                slot: zslot,
+                task,
+                cpu: &mut *zone.cpu,
+                user: zone.user,
+                counters,
+            }),
+            _ => None,
+        };
+        let mut user = file::ValidatedCopy {
+            task,
+            validator: &file::HardwareValidator,
+        };
+        if let Some(action) = lifecycle::serve(frame, counters, task, sched, venue, &mut user) {
+            return action;
+        }
     }
 
     // Threads queued on this vCPU wait for the running one to block in a

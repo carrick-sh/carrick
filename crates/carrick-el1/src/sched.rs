@@ -242,9 +242,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         Some(self.run_next(frame, timeout_result))
     }
 
-    /// The running thread parked: run the next runnable thread, or leave
-    /// for the host when that thread needs its executor, or idle.
-    fn run_next(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
+    /// The running thread parked (or exited in the zone): run the next
+    /// runnable thread, or leave for the host when that thread needs its
+    /// executor, or idle.
+    pub(crate) fn run_next(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
         if let Some(switched) = self.zone.switch_in_full(self.slot) {
             if self.load(frame, switched) {
                 return Served::Returned { switched: true };
@@ -255,6 +256,20 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return self.service_exit();
         }
         self.idle(frame, timeout_result)
+    }
+
+    /// A thread EL1 just created (`clone`), unpublished and with the context
+    /// its creator wrote, joins this vCPU's run queue: it runs when the
+    /// running thread parks, when an idle vCPU steals it, or when the slice
+    /// ends (the tick migrates it to an idle vCPU first).
+    pub(crate) fn enqueue_born(&mut self, record: carrick_el1_abi::RecordId) {
+        let (zone, slot) = (self.zone, self.slot);
+        let was_empty = zone.slot(slot).queued() == 0;
+        zone.requeue_preempted(slot, record);
+        if was_empty {
+            zone.note_queued_since(slot, self.cpu.now());
+        }
+        self.program_timer(true);
     }
 
     /// The next thread on this vCPU needs its executor: leave for the host

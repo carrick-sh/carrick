@@ -3,4 +3,5 @@ pub mod dispatch;
 pub mod file;
 pub mod inotify;
 pub mod ipc;
+pub mod lifecycle;
 pub mod sched;
