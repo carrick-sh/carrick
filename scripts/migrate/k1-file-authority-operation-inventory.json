@@ -7,7 +7,7 @@
     "description_backing": 24,
     "epoll": 423,
     "stream": 176,
-    "mapping": 1448,
+    "mapping": 1449,
     "lifecycle": 32
   },
   "production_counts": {
@@ -25,7 +25,7 @@
     "description_backing": 8,
     "epoll": 44,
     "stream": 21,
-    "mapping": 108,
+    "mapping": 109,
     "lifecycle": 10
   },
   "entries": [
@@ -8532,7 +8532,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 3811,
+      "line": 3848,
       "categories": [
         "mapping"
       ],
@@ -8541,7 +8541,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 3816,
+      "line": 3853,
       "categories": [
         "mapping"
       ],
@@ -8550,7 +8550,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 3867,
+      "line": 3904,
       "categories": [
         "mapping"
       ],
@@ -8559,7 +8559,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 3877,
+      "line": 3914,
       "categories": [
         "mapping"
       ],
@@ -8568,7 +8568,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 3885,
+      "line": 3922,
       "categories": [
         "mapping"
       ],
@@ -8577,7 +8577,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 3892,
+      "line": 3929,
       "categories": [
         "mapping"
       ],
@@ -8586,7 +8586,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 3947,
+      "line": 3984,
       "categories": [
         "mapping"
       ],
@@ -8595,7 +8595,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 4040,
+      "line": 4077,
       "categories": [
         "mapping"
       ],
@@ -8604,12 +8604,21 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 4095,
+      "line": 4132,
       "categories": [
         "mapping"
       ],
       "text": "// A zero `old_size` asks for a NEW mapping of the same pages, which",
       "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/settled.rs",
+      "line": 424,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mmap (host).",
+      "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",

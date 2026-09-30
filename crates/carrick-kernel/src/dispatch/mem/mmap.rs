@@ -3805,7 +3805,44 @@ impl<'a> MemView<'a> {
                         prot_none: false,
                     });
                 }
-                crate::mprotect_diag::record(hole_site, || None);
+                crate::mprotect_diag::record(hole_site, || {
+                    // What the rows say about the range the backend probe
+                    // just called a hole: the evidence one signed run needs.
+                    let authority = this.mem();
+                    let mem = authority.mem.lock();
+                    let (lo, hi) = (
+                        address.0.saturating_sub(0x10_000),
+                        address.0.saturating_add(length).saturating_add(0x10_000),
+                    );
+                    let dynamic: Vec<String> = mem
+                        .dynamic_maps
+                        .iter()
+                        .filter(|map| map.start < hi && lo < map.end)
+                        .map(|map| {
+                            format!(
+                                "{:#x}-{:#x}{}{}{}",
+                                map.start,
+                                map.end,
+                                if map.read { 'r' } else { '-' },
+                                if map.write { 'w' } else { '-' },
+                                if map.execute { 'x' } else { '-' }
+                            )
+                        })
+                        .collect();
+                    let semantic: Vec<String> = mem
+                        .semantic_vmas
+                        .overlapping(lo, hi)
+                        .map(|vma| format!("{:#x}-{:#x}", vma.start, vma.end))
+                        .collect();
+                    Some(format!(
+                        "mm={} range={:#x}+{:#x} dynamic_maps={} near_dynamic={dynamic:?} near_semantic={semantic:?} covers={}",
+                        authority.mm_id.raw(),
+                        address.0,
+                        length,
+                        mem.dynamic_maps.len(),
+                        guest_vma_covers_locked(&mem, address.0, length),
+                    ))
+                });
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             // A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to

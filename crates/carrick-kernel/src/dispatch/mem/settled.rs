@@ -371,4 +371,119 @@ mod tests {
             guest_vma_covers_locked(state, start, len)
         }
     }
+
+    /// The mm-occupancy scratch churn without a VM: eight threads each map an
+    /// adjacent 8-page scratch (rows coalesce across threads), narrow it
+    /// through EL1's journal, widen it on the host (validating first, as
+    /// `mprotect` does: a mapped range that reads as a hole answers ENOMEM),
+    /// and unmap it, while the MM forks.
+    #[test]
+    fn scratch_churn_with_forks_never_uncovers_a_mapped_range() {
+        use crate::dispatch::mem::backing::{
+            insert_dynamic_map_coalescing, remove_mapping_metadata_locked,
+        };
+        use crate::dispatch::mem::guest_vma_covers_locked;
+        const THREADS: u64 = 8;
+        const SCRATCH: u64 = 8 * PAGE;
+        let (authority, spaces) = mm();
+        // Start from an empty region: the threads own it.
+        {
+            let mut state = authority.lock();
+            remove_mapping_metadata_locked(&mut state, BASE, PAGES * PAGE);
+        }
+        let authority = Arc::new(authority);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let row = |start: u64| ProcMapsEntry {
+            start,
+            end: start + SCRATCH,
+            read: true,
+            write: true,
+            execute: false,
+            sharing: ProcMapSharing::Private,
+            path: String::new(),
+        };
+        let vma = |start: u64| SemanticVma {
+            start,
+            end: start + SCRATCH,
+            read: true,
+            write: true,
+            execute: false,
+            provenance: VmaBackingProvenance::PrivateAnonymous,
+            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            dump_policy: carrick_abi::VmaDumpPolicy::Include,
+            droppable: false,
+            path: String::new(),
+            file_page_offset: None,
+        };
+        let mut workers = Vec::new();
+        for thread in 0..THREADS {
+            let (authority, spaces) = (Arc::clone(&authority), Arc::clone(&spaces));
+            workers.push(std::thread::spawn(move || {
+                let start = BASE + thread * SCRATCH;
+                for round in 0..300u64 {
+                    // mmap (host).
+                    {
+                        let mut state = authority.lock();
+                        state.semantic_vmas.insert_replacing(vma(start));
+                        insert_dynamic_map_coalescing(&mut state, row(start));
+                    }
+                    // mprotect RO (EL1 serves: journal, or host commit when full).
+                    let index = spaces.find(KEY).unwrap();
+                    let owner = NonZeroU64::new(thread + 1).unwrap();
+                    let editor = spaces
+                        .try_begin_edit_bounded(index, KEY, owner, u32::MAX)
+                        .unwrap();
+                    if editor.journal_has_room() {
+                        editor.journal_protect(start, start + SCRATCH, R).unwrap();
+                    } else {
+                        drop(editor);
+                        authority.lock().set_mapping_prot(
+                            start,
+                            start + SCRATCH,
+                            LinuxProtFlags::READ,
+                        );
+                    }
+                    // mprotect RW (host): validate, then commit.
+                    {
+                        let mut state = authority.lock();
+                        assert!(
+                            guest_vma_covers_locked(&state, start, SCRATCH),
+                            "thread {thread} round {round}: a mapped scratch read as a hole"
+                        );
+                        state.set_mapping_prot(
+                            start,
+                            start + SCRATCH,
+                            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                        );
+                    }
+                    // munmap (host).
+                    {
+                        let mut state = authority.lock();
+                        remove_mapping_metadata_locked(&mut state, start, SCRATCH);
+                    }
+                }
+            }));
+        }
+        let forker = {
+            let (authority, stop) = (Arc::clone(&authority), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let child = authority.fork_private();
+                    // A child's own scratch: map, narrow, validate, widen.
+                    let start = BASE + THREADS * SCRATCH;
+                    let mut state = child.lock();
+                    state.semantic_vmas.insert_replacing(vma(start));
+                    insert_dynamic_map_coalescing(&mut state, row(start));
+                    assert!(guest_vma_covers_locked(&state, start, SCRATCH));
+                    state.set_mapping_prot(start, start + SCRATCH, LinuxProtFlags::READ);
+                    assert!(guest_vma_covers_locked(&state, start, SCRATCH));
+                }
+            })
+        };
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        forker.join().unwrap();
+    }
 }
