@@ -19,12 +19,9 @@ fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
 
 #[test]
 fn guest_lane_refuses_host_cow_before_copy_or_publication() {
+    // `materialize_retired_reuse` publishes through EL1 on the guest lane;
+    // `foreign_mm::tests::guest_retained_reuse_*` pin that contract.
     for (source, entry, first_effect) in [
-        (
-            include_str!("../cow_engine.rs"),
-            "fn materialize_retired_reuse(",
-            "let retained_ipa",
-        ),
         (
             include_str!("../foreign_mm.rs"),
             "fn perform_foreign_cow_transaction(",
