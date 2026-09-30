@@ -8,6 +8,12 @@ fn main() {}
 
 /// In-guest syscall entry point called from the EL1 exception vector.
 ///
+/// Every return toward EL0 (and every kicked interrupt leaving for the host)
+/// first applies the thread's MM's pending host descriptor submissions
+/// ([`carrick_el1::fault::drain_before_el0`]). A frame whose `esr` is
+/// [`carrick_el1_abi::DESCRIPTOR_DRAIN_ESR`] is the host-driven drain call,
+/// entered with the maintenance `hvc #1` as its return address.
+///
 /// Invoked with `frame` pointing to a [`carrick_el1_abi::TrapFrame`] allocated
 /// on the per-vCPU EL1 kernel stack.
 /// Also the entry of the vector's EL0 IRQ hook, which saves the same
@@ -33,9 +39,14 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
         return carrick_el1_abi::Action::Forward as u64;
     }
     let frame_ref = unsafe { &mut *frame };
+    if frame_ref.esr == carrick_el1_abi::DESCRIPTOR_DRAIN_ESR {
+        carrick_el1::fault::serve_host_drain_hw(frame_ref);
+        return carrick_el1_abi::Action::Served as u64;
+    }
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
-    carrick_el1::dispatch_entry(frame_ref, counters_ref) as u64
+    let action = carrick_el1::dispatch_entry(frame_ref, counters_ref);
+    carrick_el1::fault::drain_before_el0_hw(frame_ref, action) as u64
 }
 
 /// Observable bare-metal panic handler.

@@ -919,6 +919,7 @@ pub(super) fn publish_replacing(
     flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     retire_previous: &mut dyn FnMut(),
 ) -> Result<PublishedSparseExtent, TrapError> {
+    require_host_cow_lane(&context.state.page_tables_authority())?;
     #[cfg(debug_assertions)]
     const PAGE_SIZE: u64 = 4096;
     #[cfg(debug_assertions)]

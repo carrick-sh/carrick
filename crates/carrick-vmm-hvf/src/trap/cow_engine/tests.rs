@@ -4,6 +4,237 @@
 
 use std::path::Path;
 
+fn guest_cow_fixture() -> (
+    carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    crate::hvf_aarch64_engine::GuestCowBackingState,
+) {
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::aarch64::descriptor_txn::*;
+    let nz = |n| std::num::NonZeroU64::new(n).unwrap();
+    let backing = |n| BackingIdentity {
+        frame_id: nz(n),
+        mapping_id: nz(n + 1),
+        owner_generation: nz(n + 2),
+        inventory_revision: nz(n + 3),
+    };
+    let current = crate::hvf_aarch64_engine::GuestCowBackingState {
+        mm_key: nz(7),
+        root: SubstrateGpa(0x8000),
+        va: carrick_guest_mem::GuestVa(0x4000),
+        old_ipa: SubstrateGpa(0x10000),
+        new_ipa: SubstrateGpa(0x20000),
+        old_backing: backing(10),
+        new_backing: backing(20),
+    };
+    (
+        DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: current.mm_key,
+                generation: nz(1),
+            },
+            root: current.root,
+            op: DescriptorOp::CowRepoint {
+                va: current.va.raw(),
+                old_ipa: current.old_ipa,
+                new_ipa: current.new_ipa,
+                backing: current.new_backing,
+            },
+            tables: TableGrants::NONE,
+        },
+        current,
+    )
+}
+
+fn verified_cow_receipt(
+    txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+) -> carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt {
+    use carrick_mmu_core::aarch64::descriptor_txn::*;
+    txn.verify_receipt(&DescriptorReceipt {
+        id: txn.id,
+        digest: txn.digest(),
+        outcome: DescriptorOutcome::Applied(DescriptorApplied {
+            pages: 1,
+            resident: PageSpan::EMPTY,
+            tables_linked: 0,
+            live_stores: 1,
+            flush_required: true,
+        }),
+    })
+    .unwrap()
+}
+
+#[test]
+fn guest_cow_receipt_gate_rejects_stale_mm_root_generation_and_both_owners() {
+    use crate::hvf_aarch64_engine::{GuestCowBackingError, GuestCowBackingTransaction};
+    let (txn, expected) = guest_cow_fixture();
+    let verified = verified_cow_receipt(&txn);
+    let nz = |n| std::num::NonZeroU64::new(n).unwrap();
+    for changed in [
+        crate::hvf_aarch64_engine::GuestCowBackingState {
+            mm_key: nz(8),
+            ..expected
+        },
+        crate::hvf_aarch64_engine::GuestCowBackingState {
+            root: carrick_mmu_core::aarch64::SubstrateGpa(0x9000),
+            ..expected
+        },
+        crate::hvf_aarch64_engine::GuestCowBackingState {
+            old_backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                owner_generation: nz(99),
+                ..expected.old_backing
+            },
+            ..expected
+        },
+        crate::hvf_aarch64_engine::GuestCowBackingState {
+            new_backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                owner_generation: nz(99),
+                ..expected.new_backing
+            },
+            ..expected
+        },
+        crate::hvf_aarch64_engine::GuestCowBackingState {
+            new_backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                inventory_revision: nz(99),
+                ..expected.new_backing
+            },
+            ..expected
+        },
+    ] {
+        let mut pending = GuestCowBackingTransaction::new(txn, expected).unwrap();
+        let mut mm_repoints = [0, 0];
+        let mut retirements = 0;
+        assert_eq!(
+            pending.commit(&verified, changed, || {
+                mm_repoints[0] += 1;
+                retirements += 1;
+            }),
+            Err(GuestCowBackingError::StaleBacking)
+        );
+        assert_eq!((mm_repoints, retirements), ([0, 0], 0));
+        pending
+            .commit(&verified, expected, || {
+                mm_repoints[0] += 1;
+                retirements += 1;
+            })
+            .unwrap();
+        assert_eq!((mm_repoints, retirements), ([1, 0], 1));
+        assert_eq!(
+            pending.commit(&verified, expected, || retirements += 1),
+            Err(GuestCowBackingError::AlreadyCommitted)
+        );
+        assert_eq!(retirements, 1);
+    }
+    let mut other = txn;
+    other.id.generation = nz(2);
+    let mut pending = GuestCowBackingTransaction::new(txn, expected).unwrap();
+    assert_eq!(
+        pending.commit(&verified_cow_receipt(&other), expected, || panic!(
+            "stale receipt committed"
+        )),
+        Err(GuestCowBackingError::WrongReceipt)
+    );
+    other = txn;
+    other.id.mm_key = nz(8);
+    assert_eq!(
+        pending.commit(&verified_cow_receipt(&other), expected, || panic!(
+            "other MM committed"
+        )),
+        Err(GuestCowBackingError::WrongReceipt)
+    );
+}
+
+#[test]
+fn guest_cow_requires_an_applied_receipt_and_host_lane_is_unchanged() {
+    use carrick_mmu_core::aarch64::{LiveDescriptorOwner, descriptor_txn::*};
+    let (txn, _) = guest_cow_fixture();
+    for outcome in [
+        DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking),
+        DescriptorOutcome::RolledBack(DescriptorRefusal::Contended),
+    ] {
+        assert!(
+            txn.verify_receipt(&DescriptorReceipt {
+                id: txn.id,
+                digest: txn.digest(),
+                outcome
+            })
+            .is_err()
+        );
+    }
+    let authority = carrick_aarch64::Stage1Authority::new();
+    assert!(super::require_host_cow_lane(&authority).is_ok());
+    authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+    assert!(super::require_host_cow_lane(&authority).is_err());
+}
+
+#[test]
+fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
+    let parent = crate::hvf_aarch64_engine::HostCowStats::default();
+    let sibling = parent.clone();
+    let child = crate::hvf_aarch64_engine::HostCowStats::default();
+    parent.record_host_cow_resolution();
+    sibling.record_host_cow_resolution();
+    assert_eq!(parent.host_cow_resolutions(), 2);
+    assert_eq!(child.host_cow_resolutions(), 0);
+    drop(parent);
+    assert_eq!(sibling.host_cow_resolutions(), 2);
+}
+
+#[test]
+fn guest_lane_refuses_host_cow_before_copy_or_publication() {
+    for (source, entry, first_effect) in [
+        (
+            include_str!("../cow_engine.rs"),
+            "fn perform_frame_cow(",
+            "authority.quiesce()",
+        ),
+        (
+            include_str!("../cow_engine.rs"),
+            "fn materialize_retired_reuse(",
+            "let retained_ipa",
+        ),
+        (
+            include_str!("../foreign_mm.rs"),
+            "fn perform_foreign_cow_transaction(",
+            "let executable_span",
+        ),
+        (
+            include_str!("../sparse_materialization.rs"),
+            "fn publish_replacing(",
+            "let semantic_len",
+        ),
+    ] {
+        let body = source.split_once(entry).unwrap().1;
+        let guard = body
+            .find("require_host_cow_lane(")
+            .expect("guest lane must refuse before host work");
+        assert!(guard < body.find(first_effect).unwrap(), "{entry}");
+    }
+}
+
+#[test]
+fn host_cow_counter_counts_only_completed_local_and_foreign_transactions() {
+    for (source, entry, completion) in [
+        (
+            include_str!("../cow_engine.rs"),
+            "fn perform_frame_cow(",
+            "self.cow_armed.lock().disarm(span)",
+        ),
+        (
+            include_str!("../foreign_mm.rs"),
+            "fn perform_foreign_cow_transaction(",
+            "lease_guard.retained = committed.clone()",
+        ),
+    ] {
+        let body = source.split_once(entry).unwrap().1;
+        let body = body.split("\n    pub(crate) fn ").next().unwrap();
+        let count = body
+            .find("record_host_cow_resolution()")
+            .expect("completed COW needs its own counter");
+        assert!(count > body.find(completion).unwrap());
+        assert_eq!(body.matches("record_host_cow_resolution()").count(), 1);
+    }
+}
+
 #[test]
 fn alias_unmap_takes_frame_registry_guard_only_for_inventory_publication() {
     let source = include_str!("../cow_engine.rs");

@@ -411,6 +411,630 @@ fn el1_frame_grants_enabled() -> bool {
     })
 }
 
+/// Every host writer family that still stores live stage-1 descriptors. The
+/// guest-owned lane is admitted for an MM only when every one of them submits
+/// descriptor transactions instead; a single unconverted writer would be
+/// refused on that lane and turn an ordinary host edit into a guest fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct GuestDescriptorLanePrecondition {
+    /// The descriptor transaction slots are placed in the installed EL1 region.
+    pub(super) slots_placed: bool,
+    /// Bulk first-touch frame grants (this path).
+    pub(super) frame_grants: bool,
+    /// Host syscall copyout into prepared pages (`commit_prepared_host_write`).
+    pub(super) host_copyout: bool,
+    /// Fork parent COW arming (`build_process_spec`): built as EL1
+    /// transactions, applied synchronously on the forking vCPU through the
+    /// host-driven drain call and settled before the fork commits
+    /// (`apply_guest_fork_arm`); EL1 drains an MM's submissions before any of
+    /// its threads returns to EL0.
+    pub(super) fork_parent_arming: bool,
+    /// Backend COW, sparse/foreign materialization and exec publication.
+    pub(super) backend_writers: bool,
+}
+
+impl GuestDescriptorLanePrecondition {
+    /// The writer census of this build. Host copyout (pending the kernel's
+    /// deferred first-touch commit) and the backend writers are not
+    /// converted, so no MM may select the lane yet.
+    pub(super) fn current() -> Self {
+        Self {
+            slots_placed: carrick_el1_abi::descriptor_txn_slots_host().is_some(),
+            frame_grants: true,
+            host_copyout: false,
+            fork_parent_arming: true,
+            backend_writers: false,
+        }
+    }
+
+    pub(super) fn admits(self) -> bool {
+        self.slots_placed
+            && self.frame_grants
+            && self.host_copyout
+            && self.fork_parent_arming
+            && self.backend_writers
+    }
+}
+
+/// Select the guest-owned lane for `engine`'s MM when the precondition
+/// admits it. Called where an engine binds an MM (initial runner and exec);
+/// fork children inherit their parent's lane. Never demotes a guest-owned MM.
+pub(super) fn select_guest_descriptor_lane<E: ThreadedEngine>(
+    engine: &mut E,
+    precondition: GuestDescriptorLanePrecondition,
+) -> bool {
+    use carrick_mmu_core::aarch64::LiveDescriptorOwner;
+    if engine.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+        return true;
+    }
+    precondition.admits() && engine.select_live_descriptor_owner(LiveDescriptorOwner::Guest)
+}
+
+/// Host-retained copy of one submitted guest-lane frame grant: the exact
+/// transaction (never re-read from shared memory) and what the host commits
+/// once EL1's receipt verifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingGuestGrant {
+    pub(super) txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    /// The fault and span that produced the first-touch plan; settlement
+    /// re-derives the plan under the MM mutation guard and requires it
+    /// unchanged before committing.
+    pub(super) fault_va: u64,
+    pub(super) requested_len: u64,
+    pub(super) plan: (u64, u64, u64),
+    pub(super) residency: carrick_el1_abi::FrameGrantResidencyIdentity,
+}
+
+/// What settling one guest grant did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuestGrantSettlement {
+    /// EL1 published it; residency was committed for exactly this span.
+    Committed(carrick_mmu_core::aarch64::descriptor_txn::PageSpan),
+    /// EL1 refused or rolled it back; nothing was committed and its table
+    /// grants returned. The fault path starts over.
+    Refused(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal),
+}
+
+/// Per-vCPU-slot ledger of submitted guest grants, mirroring the shared
+/// `DescriptorTxnSlots`. The entry lock is held across submission so a
+/// receipt can never be settled before its host copy exists.
+pub(super) struct GuestGrantLedger {
+    pending:
+        [parking_lot::Mutex<Option<PendingGuestGrant>>; carrick_el1_abi::EL1_STACK_SLOTS as usize],
+    /// Occupied entries, so a boundary with nothing pending skips the scan.
+    occupied: std::sync::atomic::AtomicUsize,
+}
+
+impl GuestGrantLedger {
+    pub(super) const fn new() -> Self {
+        Self {
+            pending: [const { parking_lot::const_mutex(None) };
+                carrick_el1_abi::EL1_STACK_SLOTS as usize],
+            occupied: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Submit `pending` through `slot`. `false`: the slot is busy or out of
+    /// range; nothing was submitted.
+    pub(super) fn submit(
+        &self,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+        slot: usize,
+        pending: PendingGuestGrant,
+    ) -> bool {
+        let Some(entry) = self.pending.get(slot) else {
+            return false;
+        };
+        let mut entry = entry.lock();
+        if entry.is_some() || !slots.submit(slot, &pending.txn) {
+            return false;
+        }
+        *entry = Some(pending);
+        self.occupied
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    /// Whether any guest grant is pending anywhere in the carrier.
+    pub(super) fn is_occupied(&self) -> bool {
+        self.occupied.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    fn release(&self, entry: &mut Option<PendingGuestGrant>) {
+        if entry.take().is_some() {
+            self.occupied
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// Release every slot and ledger entry of an MM that is retiring (final
+    /// teardown or exec replacement). An unclaimed submission is withdrawn,
+    /// and a published receipt is consumed: the MM's tables and grants retire
+    /// with it, so nothing is settled or committed. A submission EL1 is
+    /// still applying stays until its receipt, which a later call releases.
+    /// Returns the entries released.
+    pub(super) fn withdraw_mm(
+        &self,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+        mm_key: u64,
+    ) -> usize {
+        let mut released = 0;
+        for (slot, entry) in self.pending.iter().enumerate() {
+            let mut entry = entry.lock();
+            let Some(pending) = *entry else {
+                continue;
+            };
+            if pending.txn.id.mm_key.get() != mm_key {
+                continue;
+            }
+            if slots.withdraw(slot, pending.txn.id)
+                || slots.take_receipt(slot, pending.txn.id).is_some()
+            {
+                self.release(&mut entry);
+                released += 1;
+            }
+        }
+        released
+    }
+
+    /// Settle every receipt EL1 has published for `mm_key`, in slot order.
+    /// Returns how many were settled.
+    pub(super) fn settle_ready<Err>(
+        &self,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+        mm_key: u64,
+        mut settle: impl FnMut(
+            PendingGuestGrant,
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+        ) -> Result<GuestGrantSettlement, Err>,
+    ) -> Result<usize, Err> {
+        let mut settled = 0;
+        for (slot, entry) in self.pending.iter().enumerate() {
+            let taken = {
+                let mut entry = entry.lock();
+                match *entry {
+                    Some(pending) if pending.txn.id.mm_key.get() == mm_key => {
+                        let receipt = slots.take_receipt(slot, pending.txn.id);
+                        if receipt.is_some() {
+                            self.release(&mut entry);
+                        }
+                        receipt.map(|receipt| (pending, receipt))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((pending, receipt)) = taken {
+                settle(pending, receipt)?;
+                settled += 1;
+            }
+        }
+        Ok(settled)
+    }
+}
+
+/// Carrier-wide ledger for the shared EL1 descriptor transaction slots.
+static GUEST_GRANT_LEDGER: GuestGrantLedger = GuestGrantLedger::new();
+
+/// Release a retiring MM's descriptor transaction slots and ledger entries,
+/// at final-MM teardown and at exec replacement, beside its residency
+/// records. A slot left SUBMITTED would refuse every later grant on that
+/// vCPU slot, whichever MM it next runs.
+pub(super) fn withdraw_guest_descriptor_work(mm_key: u64) -> usize {
+    carrick_el1_abi::descriptor_txn_slots_host()
+        .map_or(0, |slots| GUEST_GRANT_LEDGER.withdraw_mm(slots, mm_key))
+}
+
+/// Authenticate one guest grant receipt, then commit exactly its resident
+/// span. Residency is never committed before EL1's publication is proven,
+/// and an unauthenticated or indeterminate receipt fails stopped.
+pub(super) fn settle_guest_frame_grant(
+    pending: PendingGuestGrant,
+    receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    verify: impl FnOnce(
+        &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        TrapError,
+    >,
+    commit: impl FnOnce(
+        &PendingGuestGrant,
+        carrick_mmu_core::aarch64::descriptor_txn::PageSpan,
+    ) -> Result<(), TrapError>,
+) -> Result<GuestGrantSettlement, TrapError> {
+    use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+    match receipt.outcome {
+        DescriptorOutcome::Applied(_) => {
+            let verified = verify(&pending.txn, receipt)?;
+            commit(&pending, verified.resident())?;
+            Ok(GuestGrantSettlement::Committed(verified.resident()))
+        }
+        DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            // Settlement returns the grants of a refused transaction and
+            // reports it as not applied, which is the expected answer here.
+            let _ = verify(&pending.txn, receipt);
+            Ok(GuestGrantSettlement::Refused(refusal))
+        }
+        DescriptorOutcome::Indeterminate(refusal) => Err(TrapError::Hypervisor(format!(
+            "EL1 descriptor transaction {:?} could not roll back: {refusal:?}",
+            pending.txn.id
+        ))),
+    }
+}
+
+/// Settle every guest-lane grant receipt for the MM this boundary mutates.
+pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    engine: &mut E,
+    mutation: &carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
+) -> Result<(), TrapError> {
+    let Some(slots) = carrick_el1_abi::descriptor_txn_slots_host() else {
+        return Ok(());
+    };
+    let mm_key = mutation.host_alias_permit().mm().raw();
+    GUEST_GRANT_LEDGER.settle_ready(slots, mm_key, |pending, receipt| {
+        settle_guest_frame_grant(
+            pending,
+            &receipt,
+            |txn, receipt| engine.settle_el1_descriptor_receipt(txn, receipt),
+            |pending, _resident| {
+                let permit = mutation.host_alias_permit();
+                let plan = dispatcher
+                    .resident_frame_grant_plan(&permit, pending.fault_va, pending.requested_len)
+                    .filter(|plan| (plan.start(), plan.len(), plan.prot()) == pending.plan)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "EL1 published grant {:?} but its first-touch plan changed",
+                            pending.txn.id
+                        ))
+                    })?;
+                dispatcher.commit_resident_frame_grant(plan);
+                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                    let _ = table.publish(pending.residency);
+                }
+                Ok(())
+            },
+        )
+    })?;
+    Ok(())
+}
+
+/// Whether a forwarded-syscall boundary must settle guest grants before it
+/// services the syscall, so `mincore` and every other reader of residency
+/// sees what EL1 already published. Cheap when nothing is pending.
+pub(super) fn guest_grants_awaiting_settlement() -> bool {
+    GUEST_GRANT_LEDGER.is_occupied()
+}
+
+/// The venue a synchronous guest descriptor drain runs on: the exact vCPU
+/// (slot, TTBR0) of the MM, the host-driven EL1 call, and receipt settlement.
+pub(super) trait GuestDrainVenue {
+    fn slot(&self) -> Option<usize>;
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError>;
+    /// Run the EL1 drain call with `frame` on this vCPU; return the frame
+    /// EL1 answered.
+    fn drain_call(
+        &mut self,
+        frame: carrick_el1_abi::TrapFrame,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError>;
+    fn settle(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
+}
+
+/// The production venue: the engine's own vCPU and the shared EL1 region.
+pub(super) struct EngineDrainVenue<'a, E>(pub(super) &'a mut E);
+
+impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
+    fn slot(&self) -> Option<usize> {
+        self.0.mailbox_slot()
+    }
+
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+        self.0.live_ttbr0()
+    }
+
+    fn drain_call(
+        &mut self,
+        frame: carrick_el1_abi::TrapFrame,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        let unavailable = |what: &str| TrapError::Hypervisor(format!("guest drain call: {what}"));
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(unavailable("no EL1 region"));
+        }
+        let offset = carrick_el1_abi::descriptor_drain_frame_offset(frame.slot as usize)
+            .ok_or_else(|| unavailable("slot out of range"))?;
+        // SAFETY: the EL1 region owner keeps the region alive while it is
+        // installed; the header is its first 32 bytes.
+        let header = carrick_el1_abi::ImageHeader::read_from_prefix(unsafe {
+            std::slice::from_raw_parts(
+                region as *const u8,
+                std::mem::size_of::<carrick_el1_abi::ImageHeader>(),
+            )
+        })
+        .ok_or_else(|| unavailable("no EL1 image header"))?;
+        let host_frame = (region + offset as usize) as *mut carrick_el1_abi::TrapFrame;
+        // SAFETY: the offset lies in this vCPU slot's own EL1 stack, below the
+        // vector's trap frame, 16-aligned; this host thread owns the vCPU.
+        unsafe { host_frame.write_volatile(frame) };
+        self.0.run_el1_service_call(
+            carrick_el1_abi::EL1_REGION_BASE + header.entry_offset,
+            carrick_el1_abi::EL1_REGION_BASE + offset,
+        )?;
+        // SAFETY: as above; EL1 answered in place before `hvc #1`.
+        Ok(unsafe { host_frame.read_volatile() })
+    }
+
+    fn settle(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        self.0.settle_el1_descriptor_receipt(txn, receipt)
+    }
+}
+
+/// Apply `txns` for one MM synchronously, in order, on the venue's vCPU while
+/// the host holds that MM: each is submitted into a free slot, EL1 applies it
+/// through the host-driven drain call under the host's delegated custody, and
+/// its exact receipt is settled before the next one is submitted. Any
+/// refusal, blocked drain or unauthenticated receipt is an error; the caller
+/// decides whether that is fatal.
+pub(super) fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
+    venue: &mut V,
+    slots: &carrick_el1_abi::DescriptorTxnSlots,
+    txns: &[carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn],
+) -> Result<Vec<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt>, TrapError> {
+    let fail = |what: String| TrapError::Hypervisor(format!("guest descriptor drain: {what}"));
+    let own = venue
+        .slot()
+        .ok_or_else(|| fail("vCPU has no slot".to_owned()))?;
+    let mut verified = Vec::with_capacity(txns.len());
+    for txn in txns {
+        let ttbr0 = venue.live_ttbr0()?;
+        if ttbr0 & 0x0000_FFFF_FFFF_F000 != txn.root.raw() {
+            return Err(fail(format!(
+                "vCPU TTBR0 0x{ttbr0:x} is not the transaction root 0x{:x}",
+                txn.root.raw()
+            )));
+        }
+        let used = (0..slots.as_slice().len())
+            .map(|offset| (own + offset) % slots.as_slice().len())
+            .find(|&slot| slots.submit(slot, txn))
+            .ok_or_else(|| fail("every descriptor slot is busy".to_owned()))?;
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: carrick_el1_abi::DESCRIPTOR_DRAIN_ESR,
+            slot: own as u64,
+            ..carrick_el1_abi::TrapFrame::default()
+        };
+        frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM] = txn.id.mm_key.get();
+        frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_TTBR0] = ttbr0;
+        let answered = match venue.drain_call(frame) {
+            Ok(answered) => answered,
+            Err(error) => {
+                let _ = slots.withdraw(used, txn.id);
+                return Err(error);
+            }
+        };
+        if answered.x[0] & carrick_el1_abi::DESCRIPTOR_DRAIN_BLOCKED != 0 {
+            let _ = slots.withdraw(used, txn.id);
+            return Err(fail("EL1 could not claim the MM".to_owned()));
+        }
+        let receipt = slots
+            .take_receipt(used, txn.id)
+            .ok_or_else(|| fail(format!("no receipt for {:?}", txn.id)))?;
+        verified.push(venue.settle(txn, &receipt)?);
+    }
+    Ok(verified)
+}
+
+/// Fork parent arm on the guest-owned lane: applied synchronously on the
+/// forking vCPU before the fork commits and before any parent thread can run
+/// again. A failure here leaves the parent's frames shared with a child that
+/// may already exist, so it fails stopped.
+pub(super) fn apply_guest_fork_arm<E: ThreadedEngine>(
+    engine: &mut E,
+    txns: Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>,
+) {
+    let Some(slots) = carrick_el1_abi::descriptor_txn_slots_host() else {
+        carrick_fatal::carrick_fatal!(
+            "hvpatch::guest_fork_arm",
+            "guest fork arm has no descriptor transaction slots"
+        );
+    };
+    if let Err(error) = apply_guest_descriptor_txns_now(&mut EngineDrainVenue(engine), slots, &txns)
+    {
+        carrick_fatal::carrick_fatal!(
+            "hvpatch::guest_fork_arm",
+            "guest fork parent arm failed: {error}"
+        );
+    }
+}
+
+/// Why a guest COW continuation refused a step. Every refusal leaves the
+/// continuation, both MMs' descriptors and the backing exactly as they were.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuestCowStepError {
+    /// The step does not follow the continuation's current stage.
+    OutOfOrder,
+    /// The step names another MM, root, page, frame or backing identity.
+    WrongIdentity,
+    /// The backing gate refused the receipt or the current inventory state.
+    Backing(carrick_vmm_hvf::hvf_aarch64_engine::GuestCowBackingError),
+}
+
+/// Where one guest COW resolution stands.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum GuestCowStage {
+    /// The host allocates and maps the replacement frame and its inventory.
+    AwaitBacking,
+    /// EL1 copies the shared frame into the granted replacement.
+    AwaitGuestCopy {
+        state: carrick_vmm_hvf::hvf_aarch64_engine::GuestCowBackingState,
+        grant: carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant,
+    },
+    /// The exact copy is proven; its CowRepoint is submitted to EL1.
+    AwaitDescriptor {
+        state: carrick_vmm_hvf::hvf_aarch64_engine::GuestCowBackingState,
+        copy: carrick_mmu_core::aarch64::descriptor_txn::CowCopyComplete,
+    },
+    /// EL1's verified receipt releases the inventory repoint and old-owner
+    /// retirement through the one-shot backing gate.
+    AwaitBackingCommit {
+        gate: carrick_vmm_hvf::hvf_aarch64_engine::GuestCowBackingTransaction,
+    },
+    Done,
+}
+
+/// One guest-resolved COW write fault on the guest-owned lane, keyed by the
+/// exact task, MM, root and request generation that suspended it:
+/// `AwaitBacking -> AwaitGuestCopy -> AwaitDescriptor -> AwaitBackingCommit`.
+/// The host never copies guest bytes or edits a live descriptor here; it
+/// only grants backing and commits inventory after EL1's verified receipt.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) struct GuestCowContinuation {
+    pub(super) task: u64,
+    pub(super) mm_key: std::num::NonZeroU64,
+    pub(super) root: carrick_mmu_core::aarch64::SubstrateGpa,
+    pub(super) request_generation: std::num::NonZeroU64,
+    stage: GuestCowStage,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "guest COW continuation: the fault path cannot drive it until EL1 has a hardware copy window for the granted replacement frame"
+    )
+)]
+impl GuestCowContinuation {
+    pub(super) fn new(
+        task: u64,
+        mm_key: std::num::NonZeroU64,
+        root: carrick_mmu_core::aarch64::SubstrateGpa,
+        request_generation: std::num::NonZeroU64,
+    ) -> Self {
+        Self {
+            task,
+            mm_key,
+            root,
+            request_generation,
+            stage: GuestCowStage::AwaitBacking,
+        }
+    }
+
+    /// The replacement frame's backing and inventory are live: grant EL1
+    /// exactly this copy.
+    pub(super) fn backing_ready(
+        &mut self,
+        state: carrick_vmm_hvf::hvf_aarch64_engine::GuestCowBackingState,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant, GuestCowStepError> {
+        if !matches!(self.stage, GuestCowStage::AwaitBacking) {
+            return Err(GuestCowStepError::OutOfOrder);
+        }
+        if state.mm_key != self.mm_key || state.root != self.root {
+            return Err(GuestCowStepError::WrongIdentity);
+        }
+        let grant = carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant {
+            mm_key: state.mm_key,
+            root: state.root,
+            va: state.va.raw(),
+            old_ipa: state.old_ipa,
+            new_ipa: state.new_ipa,
+            old_backing: state.old_backing,
+            new_backing: state.new_backing,
+        };
+        self.stage = GuestCowStage::AwaitGuestCopy { state, grant };
+        Ok(grant)
+    }
+
+    /// EL1 proved the exact copy of the granted page: the CowRepoint it
+    /// authorizes, to be built as a transaction and submitted.
+    pub(super) fn guest_copied(
+        &mut self,
+        copy: carrick_mmu_core::aarch64::descriptor_txn::CowCopyComplete,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp, GuestCowStepError> {
+        let GuestCowStage::AwaitGuestCopy { state, grant } = self.stage else {
+            return Err(GuestCowStepError::OutOfOrder);
+        };
+        if copy.grant() != grant || copy.bytes() != 4096 {
+            return Err(GuestCowStepError::WrongIdentity);
+        }
+        self.stage = GuestCowStage::AwaitDescriptor { state, copy };
+        Ok(copy.repoint_op())
+    }
+
+    /// The CowRepoint transaction built for the copy was submitted to EL1.
+    pub(super) fn submitted(
+        &mut self,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<(), GuestCowStepError> {
+        let GuestCowStage::AwaitDescriptor { state, copy } = self.stage else {
+            return Err(GuestCowStepError::OutOfOrder);
+        };
+        if txn.op != copy.repoint_op() {
+            return Err(GuestCowStepError::WrongIdentity);
+        }
+        let gate = carrick_vmm_hvf::hvf_aarch64_engine::GuestCowBackingTransaction::new(txn, state)
+            .map_err(GuestCowStepError::Backing)?;
+        self.stage = GuestCowStage::AwaitBackingCommit { gate };
+        Ok(())
+    }
+
+    /// EL1's verified receipt: commit the inventory repoint and old-owner
+    /// retirement exactly once, only if both owners are still the granted
+    /// ones. A refused step runs nothing and keeps the continuation.
+    pub(super) fn settled<R>(
+        &mut self,
+        verified: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        current: carrick_vmm_hvf::hvf_aarch64_engine::GuestCowBackingState,
+        commit: impl FnOnce() -> R,
+    ) -> Result<R, GuestCowStepError> {
+        let GuestCowStage::AwaitBackingCommit { gate } = &mut self.stage else {
+            return Err(GuestCowStepError::OutOfOrder);
+        };
+        let result = gate
+            .commit(verified, current, commit)
+            .map_err(GuestCowStepError::Backing)?;
+        self.stage = GuestCowStage::Done;
+        Ok(result)
+    }
+
+    pub(super) fn is_done(&self) -> bool {
+        matches!(self.stage, GuestCowStage::Done)
+    }
+
+    /// The exact suspension this continuation resumes: task, MM, root and
+    /// fault request generation.
+    pub(super) fn key(
+        &self,
+    ) -> (
+        u64,
+        std::num::NonZeroU64,
+        carrick_mmu_core::aarch64::SubstrateGpa,
+        std::num::NonZeroU64,
+    ) {
+        (self.task, self.mm_key, self.root, self.request_generation)
+    }
+}
+
+/// Whether a guest descriptor transaction for `mm_key` is in flight over
+/// `address`: the fault predates EL1's publication and must retry, never
+/// take a host first-touch path that would race the guest's edit.
+pub(super) fn guest_descriptor_edit_in_flight(
+    slots: Option<&carrick_el1_abi::DescriptorTxnSlots>,
+    mm_key: u64,
+    address: u64,
+) -> bool {
+    slots.is_some_and(|slots| slots.pending_covering(mm_key, address))
+}
+
 /// Resolve a fault whose read-only outer classification placed it inside a
 /// first-touch or grow-down extent. This entry point cannot be called without
 /// structural mutation authority and is kept separate from ordinary signal
@@ -448,6 +1072,15 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     let ring_tid = tid.raw();
     let mm_key = mutation.host_alias_permit().mm().raw();
     reconcile_guest_frame_commits(dispatcher, engine, mutation);
+    settle_guest_frame_grants(dispatcher, engine, mutation)?;
+    if guest_descriptor_edit_in_flight(
+        carrick_el1_abi::descriptor_txn_slots_host(),
+        mm_key,
+        address,
+    ) {
+        cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
+        return Ok(true);
+    }
     if !el1_frame_grants_enabled() {
         cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
     }
@@ -557,6 +1190,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     return Ok(true);
                 };
                 let fault_page = plan.fault_page();
+                let plan_shape = (plan.start(), plan.len(), plan.prot());
+                let deferred_to_guest = std::cell::Cell::new(false);
                 let residency_identity = carrick_el1_abi::FrameGrantResidencyIdentity {
                     mm_key: request.mm_key,
                     semantic_base: service.semantic_base,
@@ -581,15 +1216,56 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         inventory_revision: ready.inventory_revision,
                     },
                     |grant| {
-                        engine.publish_el1_frame_grant_on_host(
-                            grant.semantic_base,
-                            grant.physical_ipa,
-                            grant.len,
-                            fault_page,
-                            grant.permissions,
-                        )
+                        use carrick_hal::threaded::{
+                            El1FrameGrantPublication, El1FrameGrantPublished,
+                        };
+                        match engine.publish_el1_frame_grant(El1FrameGrantPublication {
+                            mm_key: grant.mm_key,
+                            semantic_base: grant.semantic_base,
+                            len: grant.len,
+                            fault_va: fault_page,
+                            permissions: grant.permissions,
+                            ready,
+                        })? {
+                            El1FrameGrantPublished::OnHost => Ok::<bool, TrapError>(true),
+                            El1FrameGrantPublished::Unsupported
+                            | El1FrameGrantPublished::Refused(_) => Ok(false),
+                            // Guest-owned lane: EL1 publishes. The mailbox
+                            // slot is released now; residency is committed
+                            // only when the verified receipt settles, and a
+                            // fault in the span retries until then.
+                            El1FrameGrantPublished::Submit(txn) => {
+                                let pending = PendingGuestGrant {
+                                    txn,
+                                    fault_va: address,
+                                    requested_len: request.requested_len,
+                                    plan: plan_shape,
+                                    residency: residency_identity,
+                                };
+                                let submitted = match (
+                                    carrick_el1_abi::descriptor_txn_slots_host(),
+                                    engine.mailbox_slot(),
+                                ) {
+                                    (Some(slots), Some(slot)) => {
+                                        GUEST_GRANT_LEDGER.submit(slots, slot, pending)
+                                    }
+                                    _ => false,
+                                };
+                                if submitted {
+                                    deferred_to_guest.set(true);
+                                    Ok(true)
+                                } else {
+                                    engine.abandon_el1_descriptor_txn(&txn)?;
+                                    Ok(false)
+                                }
+                            }
+                        }
                     },
                     || {
+                        if deferred_to_guest.get() {
+                            // Committed by `settle_guest_frame_grants`.
+                            return;
+                        }
                         dispatcher.commit_resident_frame_grant(plan);
                         // A full journal is safe: prepared leaves still use
                         // the existing host first-touch path. Publish only
@@ -1962,5 +2638,840 @@ mod first_touch_access_tests {
                 .is_some()
         );
         crate::probes::hvpatch_first_touch_refused(0x4000_1000, 3, 2, &error);
+    }
+}
+
+#[cfg(test)]
+mod guest_descriptor_lane_tests {
+    use super::*;
+    use carrick_aarch64::engine::Stage1Authority;
+    use carrick_el1_abi::{DescriptorTxnSlots, FrameGrantResidencyIdentity};
+    use carrick_mem::memory::{
+        AARCH64_LINUX_PAGE_TABLE_LAYOUT, LINUX_HVPATCH_GLOBAL_FRAME_BASE, LINUX_MMAP_BASE,
+        LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE, stage1_hvpatch_page_tables,
+    };
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, CallerInvalidatesAsid, DescriptorApplied, DescriptorOp, DescriptorOutcome,
+        DescriptorReceipt, DescriptorRefusal, InlineJournal, PageSpan, PrimaryTableWords,
+        apply_submitted_descriptor_txn,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, GuestPermissionEdit, HostArenaResolver, LiveDescriptorOwner,
+        PageTableManager, SubstrateGpa,
+    };
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+
+    struct BufferResolver {
+        buf: parking_lot::Mutex<Vec<u8>>,
+    }
+
+    unsafe impl HostArenaResolver for BufferResolver {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            (base == LINUX_PAGE_TABLES_BASE).then(|| self.buf.lock().as_mut_ptr())
+        }
+        fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+            (base == LINUX_PAGE_TABLES_BASE).then(|| self.buf.lock().as_ptr())
+        }
+    }
+
+    const MM: u64 = 41;
+    const VA: u64 = LINUX_MMAP_BASE + 0x80_0000;
+    const IPA: u64 = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+
+    fn nz(value: u64) -> NonZeroU64 {
+        NonZeroU64::new(value).unwrap()
+    }
+
+    /// A live MM on the guest-owned lane, selected in-test.
+    fn guest_lane() -> (Stage1Authority, Arc<BufferResolver>) {
+        let mut manager = PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        manager.set_prot_none(VA, 0x20_0000, None).unwrap();
+        let mut bytes = manager.as_bytes().to_vec();
+        bytes.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let resolver = Arc::new(BufferResolver {
+            buf: parking_lot::Mutex::new(bytes),
+        });
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        unsafe {
+            authority.bind_live_backing(
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+            );
+        }
+        authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        (authority, resolver)
+    }
+
+    /// EL1's side: claim the submission in `slot` and execute it.
+    fn el1_apply(
+        resolver: &BufferResolver,
+        slots: &DescriptorTxnSlots,
+        slot: usize,
+    ) -> Option<DescriptorReceipt> {
+        let mut buf = resolver.buf.lock();
+        let maintenance = CallerInvalidatesAsid;
+        let words = unsafe {
+            PrimaryTableWords::new(
+                buf.as_mut_ptr().cast(),
+                LINUX_PAGE_TABLES_BASE,
+                LINUX_PAGE_TABLES_SIZE as usize,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        apply_submitted_descriptor_txn(
+            slots.slot(slot)?,
+            MM,
+            &words,
+            SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+            &mut InlineJournal::new(),
+        )
+    }
+
+    fn residency() -> FrameGrantResidencyIdentity {
+        FrameGrantResidencyIdentity {
+            mm_key: MM,
+            semantic_base: VA,
+            physical_ipa: IPA,
+            len: 4 * 4096,
+            mapping_id: 2,
+            frame_id: 1,
+            owner_generation: 3,
+            inventory_revision: 4,
+        }
+    }
+
+    fn grant_op(fault: u64) -> DescriptorOp {
+        DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: VA,
+                ipa: IPA,
+                len: 4 * 4096,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(fault, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(1),
+                mapping_id: nz(2),
+                owner_generation: nz(3),
+                inventory_revision: nz(4),
+            },
+        }
+    }
+
+    fn settle_with(
+        authority: &Stage1Authority,
+        commits: &mut Vec<(PendingGuestGrant, PageSpan)>,
+    ) -> impl FnMut(PendingGuestGrant, DescriptorReceipt) -> Result<GuestGrantSettlement, TrapError>
+    {
+        move |pending, receipt| {
+            settle_guest_frame_grant(
+                pending,
+                &receipt,
+                |txn, receipt| {
+                    authority
+                        .settle_guest_descriptor_receipt(txn, receipt)
+                        .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+                },
+                |pending, resident| {
+                    commits.push((*pending, resident));
+                    Ok(())
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn the_lane_stays_unselected_until_every_writer_is_converted() {
+        let current = GuestDescriptorLanePrecondition::current();
+        assert!(!current.admits());
+        assert!(current.frame_grants && current.fork_parent_arming);
+        assert!(!current.host_copyout && !current.backend_writers);
+        let all = GuestDescriptorLanePrecondition {
+            slots_placed: true,
+            frame_grants: true,
+            host_copyout: true,
+            fork_parent_arming: true,
+            backend_writers: true,
+        };
+        assert!(all.admits());
+        for missing in 0..5 {
+            let mut partial = all;
+            match missing {
+                0 => partial.slots_placed = false,
+                1 => partial.frame_grants = false,
+                2 => partial.host_copyout = false,
+                3 => partial.fork_parent_arming = false,
+                _ => partial.backend_writers = false,
+            }
+            assert!(!partial.admits(), "missing writer {missing}");
+        }
+    }
+
+    #[test]
+    fn guest_grant_retries_until_its_receipt_then_commits_exact_residency_once() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let fault = VA + 2 * 4096;
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(fault))
+            .unwrap();
+        let pending = PendingGuestGrant {
+            txn,
+            fault_va: fault,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: residency(),
+        };
+        let untouched = resolver.buf.lock().clone();
+        assert!(ledger.submit(&slots, 4, pending));
+        assert!(!ledger.submit(&slots, 4, pending), "one grant per slot");
+        assert_eq!(*resolver.buf.lock(), untouched, "the host stored nothing");
+
+        // Until EL1 publishes, a fault in the span retries on the host.
+        assert!(guest_descriptor_edit_in_flight(
+            Some(&slots),
+            MM,
+            VA + 0x3abc
+        ));
+        assert!(!guest_descriptor_edit_in_flight(Some(&slots), MM + 1, VA));
+        assert!(!guest_descriptor_edit_in_flight(
+            Some(&slots),
+            MM,
+            VA + 4 * 4096
+        ));
+        assert!(!guest_descriptor_edit_in_flight(None, MM, VA));
+        let mut commits = Vec::new();
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+                .unwrap(),
+            0
+        );
+        assert!(commits.is_empty(), "no residency before the receipt");
+
+        let receipt = el1_apply(&resolver, &slots, 4).expect("EL1 claims its MM's work");
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        assert!(!guest_descriptor_edit_in_flight(Some(&slots), MM, fault));
+        // Another MM's boundary never settles this MM's receipt.
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM + 1, settle_with(&authority, &mut commits))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+                .unwrap(),
+            1
+        );
+        assert_eq!(commits, vec![(pending, PageSpan::new(fault, 4096))]);
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(fault)),
+            Some(Some(IPA + 2 * 4096))
+        );
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(VA)),
+            Some(None),
+            "the rest of the grant stays prepared"
+        );
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+                .unwrap(),
+            0,
+            "a receipt settles exactly once"
+        );
+        assert!(ledger.submit(&slots, 4, pending), "the slot is free again");
+    }
+
+    #[test]
+    fn refused_or_indeterminate_guest_grants_never_commit_residency() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        let pending = PendingGuestGrant {
+            txn,
+            fault_va: VA,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: residency(),
+        };
+        assert!(ledger.submit(&slots, 0, pending));
+        el1_apply(&resolver, &slots, 0).unwrap();
+        let mut commits = Vec::new();
+        ledger
+            .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+            .unwrap();
+        commits.clear();
+
+        // Planned against one graph, executed against a changed one: EL1
+        // refuses whole and nothing is committed.
+        let protect = authority
+            .prepare_guest_descriptor_txn(
+                nz(MM),
+                DescriptorOp::Protect(GuestPermissionEdit {
+                    va: VA,
+                    len: 4 * 4096,
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                }),
+            )
+            .unwrap();
+        let retire = authority
+            .prepare_guest_descriptor_txn(nz(MM), DescriptorOp::Retire(PageSpan::new(VA, 4096)))
+            .unwrap();
+        assert!(ledger.submit(
+            &slots,
+            1,
+            PendingGuestGrant {
+                txn: retire,
+                ..pending
+            }
+        ));
+        el1_apply(&resolver, &slots, 1).unwrap();
+        ledger
+            .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+            .unwrap();
+        assert!(ledger.submit(
+            &slots,
+            2,
+            PendingGuestGrant {
+                txn: protect,
+                ..pending
+            }
+        ));
+        let refused = el1_apply(&resolver, &slots, 2).unwrap();
+        assert_eq!(
+            refused.outcome,
+            DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+        );
+        let mut outcomes = Vec::new();
+        ledger
+            .settle_ready(&slots, MM, |pending, receipt| {
+                let outcome = settle_guest_frame_grant(
+                    pending,
+                    &receipt,
+                    |txn, receipt| {
+                        authority
+                            .settle_guest_descriptor_receipt(txn, receipt)
+                            .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+                    },
+                    |_, _| panic!("a refused transaction must not commit"),
+                );
+                if let Ok(settled) = outcome {
+                    outcomes.push(settled);
+                }
+                Ok::<_, TrapError>(GuestGrantSettlement::Refused(DescriptorRefusal::Contended))
+            })
+            .unwrap();
+        assert!(outcomes.contains(&GuestGrantSettlement::Refused(
+            DescriptorRefusal::NotPrivateAnonymous
+        )));
+
+        // An indeterminate rollback fails stopped.
+        let indeterminate = DescriptorReceipt {
+            id: txn.id,
+            digest: txn.digest(),
+            outcome: DescriptorOutcome::Indeterminate(DescriptorRefusal::Contended),
+        };
+        assert!(
+            settle_guest_frame_grant(
+                pending,
+                &indeterminate,
+                |_, _| panic!("never verified"),
+                |_, _| panic!("never committed"),
+            )
+            .is_err()
+        );
+        // An applied receipt that does not authenticate fails stopped too.
+        let forged = DescriptorReceipt {
+            id: txn.id,
+            digest: txn.digest() ^ 1,
+            outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                pages: 4,
+                resident: PageSpan::new(VA, 4096),
+                tables_linked: 0,
+                live_stores: 1,
+                flush_required: true,
+            }),
+        };
+        assert!(
+            settle_guest_frame_grant(
+                pending,
+                &forged,
+                |txn, receipt| {
+                    authority
+                        .settle_guest_descriptor_receipt(txn, receipt)
+                        .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+                },
+                |_, _| panic!("never committed"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_retiring_mm_releases_exactly_its_slots_and_ledger_entries() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let pending_for = |txn| PendingGuestGrant {
+            txn,
+            fault_va: VA,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: residency(),
+        };
+        // Slot 0: applied, receipt unsettled. Slot 1: submitted, unclaimed.
+        let applied = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        assert!(ledger.submit(&slots, 0, pending_for(applied)));
+        el1_apply(&resolver, &slots, 0).unwrap();
+        let unclaimed = authority
+            .prepare_guest_descriptor_txn(
+                nz(MM),
+                DescriptorOp::Retire(PageSpan::new(VA + 4096, 4096)),
+            )
+            .unwrap();
+        assert!(ledger.submit(&slots, 1, pending_for(unclaimed)));
+        // Another MM's pending work on slot 2 is untouched.
+        let other_lane = guest_lane().0;
+        let other = other_lane
+            .prepare_guest_descriptor_txn(nz(MM + 1), grant_op(VA))
+            .unwrap();
+        assert!(ledger.submit(
+            &slots,
+            2,
+            PendingGuestGrant {
+                txn: other,
+                ..pending_for(other)
+            }
+        ));
+
+        assert_eq!(ledger.withdraw_mm(&slots, MM), 2);
+        assert!(!guest_descriptor_edit_in_flight(
+            Some(&slots),
+            MM,
+            VA + 4096
+        ));
+        let mut commits = Vec::new();
+        assert_eq!(
+            ledger
+                .settle_ready(&slots, MM, settle_with(&authority, &mut commits))
+                .unwrap(),
+            0
+        );
+        assert!(commits.is_empty(), "a retired MM commits no residency");
+        // Both slots serve the next MM that runs on them.
+        assert!(ledger.submit(&slots, 0, pending_for(unclaimed)));
+        assert!(ledger.withdraw_mm(&slots, MM) == 1);
+        assert!(guest_descriptor_edit_in_flight(Some(&slots), MM + 1, VA));
+        assert_eq!(ledger.withdraw_mm(&slots, MM + 1), 1);
+    }
+
+    /// Lane selection sits where an engine binds an MM, and a retiring MM
+    /// releases its descriptor work beside its residency records, at final
+    /// teardown and at exec replacement.
+    #[test]
+    fn mm_bind_and_retirement_sites_select_and_withdraw_the_guest_lane() {
+        let binding = include_str!("binding.rs");
+        let exec = include_str!("exec.rs");
+        for (source, bind, retire) in [
+            (
+                binding,
+                "engine.bind_task_snapshot_identity(mm.raw(), asid_generation);",
+                "table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);",
+            ),
+            (
+                exec,
+                "engine.bind_task_snapshot_identity(committed_mm.raw(), committed_asid_generation);",
+                "table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);",
+            ),
+        ] {
+            let after_bind = source.split(bind).nth(1).expect("MM bind site");
+            let next = &after_bind[..after_bind.len().min(400)];
+            assert!(next.contains("select_guest_descriptor_lane("));
+            assert!(next.contains("GuestDescriptorLanePrecondition::current()"));
+            let after_retire = source.split(retire).nth(1).expect("retirement site");
+            let next = &after_retire[..after_retire.len().min(200)];
+            assert!(next.contains("withdraw_guest_descriptor_work("));
+        }
+    }
+
+    /// EL1 as the drain call sees it: apply every submission for the MM in
+    /// the frame, from any slot, and answer the count.
+    struct FakeVenue<'a> {
+        resolver: &'a BufferResolver,
+        slots: &'a DescriptorTxnSlots,
+        authority: &'a Stage1Authority,
+        ttbr0: u64,
+        block: bool,
+        max_in_flight: usize,
+    }
+
+    impl GuestDrainVenue for FakeVenue<'_> {
+        fn slot(&self) -> Option<usize> {
+            Some(9)
+        }
+        fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+            Ok(self.ttbr0)
+        }
+        fn drain_call(
+            &mut self,
+            mut frame: carrick_el1_abi::TrapFrame,
+        ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+            assert_eq!(frame.esr, carrick_el1_abi::DESCRIPTOR_DRAIN_ESR);
+            assert_eq!(frame.slot, 9, "the frame is the calling vCPU's");
+            let mm = frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM];
+            let in_flight = self.slots.submitted_for(mm).count();
+            self.max_in_flight = self.max_in_flight.max(in_flight);
+            if self.block {
+                frame.x[0] = carrick_el1_abi::DESCRIPTOR_DRAIN_BLOCKED;
+                return Ok(frame);
+            }
+            let mut applied = 0;
+            let indexes: Vec<usize> = (0..self.slots.as_slice().len())
+                .filter(|&i| self.slots.slot(i).unwrap().submitted_for(mm))
+                .collect();
+            for index in indexes {
+                el1_apply_mm(self.resolver, self.slots, index, mm).unwrap();
+                applied += 1;
+            }
+            frame.x[0] = applied;
+            Ok(frame)
+        }
+        fn settle(
+            &mut self,
+            txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+            receipt: &DescriptorReceipt,
+        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+        {
+            self.authority
+                .settle_guest_descriptor_receipt(txn, receipt)
+                .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+        }
+    }
+
+    fn el1_apply_mm(
+        resolver: &BufferResolver,
+        slots: &DescriptorTxnSlots,
+        slot: usize,
+        mm: u64,
+    ) -> Option<DescriptorReceipt> {
+        let mut buf = resolver.buf.lock();
+        let maintenance = CallerInvalidatesAsid;
+        let words = unsafe {
+            PrimaryTableWords::new(
+                buf.as_mut_ptr().cast(),
+                LINUX_PAGE_TABLES_BASE,
+                LINUX_PAGE_TABLES_SIZE as usize,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        apply_submitted_descriptor_txn(
+            slots.slot(slot)?,
+            mm,
+            &words,
+            SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+            &mut InlineJournal::new(),
+        )
+    }
+
+    fn resident_grant(authority: &Stage1Authority, resolver: &BufferResolver) {
+        let slots = DescriptorTxnSlots::new();
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), {
+                let DescriptorOp::Prepare {
+                    publication,
+                    backing,
+                    ..
+                } = grant_op(VA)
+                else {
+                    unreachable!()
+                };
+                DescriptorOp::Prepare {
+                    publication,
+                    resident: PageSpan::new(VA, 4 * 4096),
+                    backing,
+                }
+            })
+            .unwrap();
+        assert!(slots.submit(0, &txn));
+        el1_apply(resolver, &slots, 0).unwrap();
+        let receipt = slots.take_receipt(0, txn.id).unwrap();
+        authority
+            .settle_guest_descriptor_receipt(&txn, &receipt)
+            .unwrap();
+    }
+
+    fn writable(authority: &Stage1Authority, va: u64) -> bool {
+        authority
+            .with_manager(|manager| {
+                carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
+                    carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(va)),
+                    carrick_mmu_core::aarch64::LeafAccess::Write,
+                )
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn the_fork_arm_lands_in_order_and_settles_before_the_fork_commits() {
+        let (authority, resolver) = guest_lane();
+        resident_grant(&authority, &resolver);
+        assert!(writable(&authority, VA) && writable(&authority, VA + 3 * 4096));
+        let arm: Vec<_> = [(VA, 2 * 4096), (VA + 3 * 4096, 4096)]
+            .into_iter()
+            .map(|(va, len)| {
+                let op = authority
+                    .with_manager(|manager| manager.fork_arm_op(va, len, false, false))
+                    .unwrap();
+                authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap()
+            })
+            .collect();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let mut venue = FakeVenue {
+            resolver: &resolver,
+            slots: &slots,
+            authority: &authority,
+            ttbr0: LINUX_PAGE_TABLES_BASE | (7 << 48),
+            block: false,
+            max_in_flight: 0,
+        };
+        let receipts = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            venue.max_in_flight, 1,
+            "one submission at a time, settled in order"
+        );
+        assert!(!writable(&authority, VA));
+        assert!(!writable(&authority, VA + 4096));
+        assert!(writable(&authority, VA + 2 * 4096), "outside the arm");
+        assert!(!writable(&authority, VA + 3 * 4096));
+        assert!(slots.as_slice().iter().all(|slot| slot.state() == 0));
+    }
+
+    #[test]
+    fn a_fork_arm_on_the_wrong_vcpu_or_blocked_is_an_error_and_leaves_no_slot() {
+        let (authority, resolver) = guest_lane();
+        resident_grant(&authority, &resolver);
+        let op = authority
+            .with_manager(|manager| manager.fork_arm_op(VA, 4096, false, false))
+            .unwrap();
+        let arm = [authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap()];
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let mut venue = FakeVenue {
+            resolver: &resolver,
+            slots: &slots,
+            authority: &authority,
+            ttbr0: (LINUX_PAGE_TABLES_BASE + 0x1000) | (7 << 48),
+            block: false,
+            max_in_flight: 0,
+        };
+        assert!(apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).is_err());
+        assert!(
+            writable(&authority, VA),
+            "another root's vCPU applies nothing"
+        );
+        venue.ttbr0 = LINUX_PAGE_TABLES_BASE | (7 << 48);
+        venue.block = true;
+        assert!(apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).is_err());
+        assert!(writable(&authority, VA));
+        assert!(
+            slots.as_slice().iter().all(|slot| slot.state() == 0),
+            "a failed drain withdraws its submission"
+        );
+    }
+
+    /// The fork commits only after its guest arm is applied, and a
+    /// forwarded syscall settles published grants before it is serviced.
+    #[test]
+    fn fork_commit_and_syscall_entry_order_guest_descriptor_work() {
+        let lifecycle = include_str!("lifecycle.rs");
+        let commit = lifecycle
+            .split("fn commit_parent(&mut self, memory: &mut E)")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("commit_parent");
+        let take = commit
+            .find("take_guest_fork_arm_txns()")
+            .expect("arm taken");
+        let apply = commit.find("apply_guest_fork_arm(").expect("arm applied");
+        let commit_fork = commit
+            .find("commit_process_fork()")
+            .expect("fork committed");
+        assert!(take < apply && apply < commit_fork);
+        let module = include_str!("mod.rs");
+        let service = module
+            .split("fn service_threaded_syscall_for_executor(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("syscall service");
+        let settle = service
+            .find("settle_guest_frame_grants(")
+            .expect("settlement at syscall entry");
+        let dispatch = service
+            .find("service_threaded_syscall_for_executor_inner(")
+            .expect("dispatch");
+        assert!(settle < dispatch);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn guest_cow_repoints_only_after_copy_inventory_and_a_verified_receipt() {
+        use carrick_mmu_core::aarch64::descriptor_txn::{BackingIdentity, copy_granted_cow_page};
+        use carrick_vmm_hvf::hvf_aarch64_engine::{GuestCowBackingError, GuestCowBackingState};
+        let (authority, resolver) = guest_lane();
+        resident_grant(&authority, &resolver);
+        // Fork-arm the page on EL1, as a parent after fork.
+        let arm_op = authority
+            .with_manager(|manager| manager.fork_arm_op(VA, 4096, false, false))
+            .unwrap();
+        let arm = authority
+            .prepare_guest_descriptor_txn(nz(MM), arm_op)
+            .unwrap();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        assert!(slots.submit(0, &arm));
+        el1_apply(&resolver, &slots, 0).unwrap();
+        let receipt = slots.take_receipt(0, arm.id).unwrap();
+        authority
+            .settle_guest_descriptor_receipt(&arm, &receipt)
+            .unwrap();
+        assert!(!writable(&authority, VA));
+
+        let backing = |seed| BackingIdentity {
+            frame_id: nz(seed),
+            mapping_id: nz(seed + 1),
+            owner_generation: nz(seed + 2),
+            inventory_revision: nz(seed + 3),
+        };
+        let state = GuestCowBackingState {
+            mm_key: nz(MM),
+            root: SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+            va: carrick_guest_mem::GuestVa(VA),
+            old_ipa: SubstrateGpa(IPA),
+            new_ipa: SubstrateGpa(IPA + 0x10_0000),
+            old_backing: backing(1),
+            new_backing: backing(20),
+        };
+        let mut cow =
+            GuestCowContinuation::new(5, nz(MM), SubstrateGpa(LINUX_PAGE_TABLES_BASE), nz(9));
+        assert_eq!(cow.key().0, 5);
+        assert_eq!(cow.key().3, nz(9));
+        // Nothing before the backing is live.
+        assert_eq!(
+            cow.submitted(arm).unwrap_err(),
+            GuestCowStepError::OutOfOrder
+        );
+        let foreign = GuestCowBackingState {
+            mm_key: nz(MM + 1),
+            ..state
+        };
+        assert_eq!(
+            cow.backing_ready(foreign).unwrap_err(),
+            GuestCowStepError::WrongIdentity
+        );
+        let grant = cow.backing_ready(state).unwrap();
+
+        // EL1 copies the shared frame exactly (under its editor).
+        let source: Vec<u8> = (0..4096).map(|i| (i % 241) as u8).collect();
+        let mut destination = vec![0; 4096];
+        let copy = {
+            let mut buf = resolver.buf.lock();
+            let maintenance = CallerInvalidatesAsid;
+            let words = unsafe {
+                PrimaryTableWords::new(
+                    buf.as_mut_ptr().cast(),
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    &maintenance,
+                )
+            }
+            .unwrap();
+            copy_granted_cow_page(&words, grant, &source, &mut destination).unwrap()
+        };
+        assert_eq!(destination, source);
+        let op = cow.guest_copied(copy).unwrap();
+
+        // Only the authorized repoint can be submitted.
+        let wrong = authority
+            .prepare_guest_descriptor_txn(nz(MM), DescriptorOp::Retire(PageSpan::new(VA, 4096)))
+            .unwrap();
+        assert_eq!(
+            cow.submitted(wrong).unwrap_err(),
+            GuestCowStepError::WrongIdentity
+        );
+        authority.abandon_guest_descriptor_txn(&wrong).unwrap();
+        let repoint = authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap();
+        cow.submitted(repoint).unwrap();
+
+        // A receipt for another transaction, or a moved inventory owner,
+        // commits nothing and mutates neither MM.
+        let mut commits = 0;
+        let other = authority
+            .prepare_guest_descriptor_txn(
+                nz(MM),
+                DescriptorOp::Retire(PageSpan::new(VA + 4096, 4096)),
+            )
+            .unwrap();
+        assert!(slots.submit(1, &other));
+        el1_apply(&resolver, &slots, 1).unwrap();
+        let other_receipt = slots.take_receipt(1, other.id).unwrap();
+        let other_verified = authority
+            .settle_guest_descriptor_receipt(&other, &other_receipt)
+            .unwrap();
+        assert_eq!(
+            cow.settled(&other_verified, state, || commits += 1)
+                .unwrap_err(),
+            GuestCowStepError::Backing(GuestCowBackingError::WrongReceipt)
+        );
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(VA)),
+            Some(Some(IPA)),
+            "no repoint before EL1 applies it"
+        );
+
+        assert!(slots.submit(2, &repoint));
+        el1_apply(&resolver, &slots, 2).unwrap();
+        let receipt = slots.take_receipt(2, repoint.id).unwrap();
+        let verified = authority
+            .settle_guest_descriptor_receipt(&repoint, &receipt)
+            .unwrap();
+        let moved = GuestCowBackingState {
+            old_backing: backing(40),
+            ..state
+        };
+        assert_eq!(
+            cow.settled(&verified, moved, || commits += 1).unwrap_err(),
+            GuestCowStepError::Backing(GuestCowBackingError::StaleBacking)
+        );
+        assert_eq!(commits, 0);
+        cow.settled(&verified, state, || commits += 1).unwrap();
+        assert_eq!(commits, 1);
+        assert!(cow.is_done());
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(VA)),
+            Some(Some(IPA + 0x10_0000))
+        );
+        assert!(writable(&authority, VA));
+        assert_eq!(
+            cow.settled(&verified, state, || commits += 1).unwrap_err(),
+            GuestCowStepError::OutOfOrder,
+            "one-shot"
+        );
     }
 }

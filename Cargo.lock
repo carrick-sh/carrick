@@ -449,6 +449,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-fd-core",
  "carrick-inotify-core",
+ "carrick-mmu-core",
  "carrick-pipe-core",
  "carrick-sched-core",
 ]

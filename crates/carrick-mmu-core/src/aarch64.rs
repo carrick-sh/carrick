@@ -16,6 +16,40 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+pub mod descriptor_txn;
+
+/// Why the host could not build a guest descriptor transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTxnPrepareError {
+    /// The image is on the host-owned lane; edit it directly.
+    NotGuestOwned,
+    /// The image has no live primary arena to plan against.
+    NotLive,
+    /// EL1 would refuse the operation; nothing was reserved or submitted.
+    Refused(descriptor_txn::DescriptorRefusal),
+    /// Table grants could not be reserved.
+    Manager(PageTableError),
+}
+
+/// Why a guest descriptor receipt did not settle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTxnSettleError {
+    Receipt(descriptor_txn::ReceiptError),
+    Manager(PageTableError),
+}
+
+/// Which venue may store to an image's live, hardware-visible descriptor
+/// words. `Guest` selects the lane on which guest EL1 is the only live
+/// writer: host edits may stage and validate, but every store to live
+/// backing is refused with [`PageTableError::GuestOwnsLiveDescriptors`] and
+/// must instead be submitted as a [`descriptor_txn::DescriptorTxn`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LiveDescriptorOwner {
+    #[default]
+    Host,
+    Guest,
+}
+
 /// Narrow substrate guest-physical address type for stage-1 table arena boundaries.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -326,12 +360,17 @@ pub enum GuestPreparedCommitError {
     NotPrepared,
     WrongBacking,
     PermissionDenied,
+    /// A failed commit could not restore its pre-image: editor exclusion
+    /// was violated and the MM's table graph is indeterminate.
+    RollbackFailed,
 }
 
 /// Validate an existing prepared L3 leaf without changing its output or
 /// permission tags. The grant owner must have published stage 2 and its frame
 /// inventory before the leaf became prepared. VALID is the residency truth.
 /// The caller holds the exact-MM editor through the following ASID TLBI.
+/// This is a one-page [`descriptor_txn::DescriptorOp::Publish`] through the
+/// shared transaction executor, with no table grants.
 ///
 /// # Safety
 ///
@@ -345,45 +384,48 @@ pub unsafe fn commit_existing_el1_prepared_page(
     expected_ipa: u64,
     access: LeafAccess,
 ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
-    use core::sync::atomic::Ordering;
+    use descriptor_txn::{DescriptorOp, DescriptorOutcome, DescriptorRefusal, PageSpan};
 
-    if words.is_null()
-        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
-        || !physical_base.is_multiple_of(PT_PAGE)
-        || !va.is_multiple_of(PT_PAGE)
-        || !expected_ipa.is_multiple_of(PT_PAGE)
-    {
+    let maintenance = descriptor_txn::CallerInvalidatesAsid;
+    let Ok(live) = (unsafe {
+        descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+    }) else {
         return Err(GuestPreparedCommitError::BadAddress);
-    }
-    let leaf =
-        unsafe { existing_l3_descriptor(words, physical_base, byte_len, va) }.map_err(|error| {
-            match error {
-                GuestLeafPublicationError::TableOutsidePrimary => {
-                    GuestPreparedCommitError::TableOutsidePrimary
-                }
-                _ => GuestPreparedCommitError::MissingTable,
-            }
-        })?;
-    let descriptor = unsafe { (*leaf).load(Ordering::Acquire) };
-    if descriptor & PA_MASK_4KIB != expected_ipa {
-        return Err(GuestPreparedCommitError::WrongBacking);
-    }
-    match el1_private_leaf_state(descriptor) {
-        El1PrivateLeafState::Resident => {
-            if terminal_descriptor_permits_el0(descriptor, access) {
-                Ok(GuestPreparedCommit::AlreadyResident)
-            } else {
-                Err(GuestPreparedCommitError::PermissionDenied)
-            }
-        }
-        El1PrivateLeafState::Prepared => {
-            if !terminal_descriptor_permits_el0(descriptor | VALID, access) {
-                return Err(GuestPreparedCommitError::PermissionDenied);
-            }
-            unsafe { (*leaf).store(descriptor | VALID, Ordering::Release) };
+    };
+    let mut journal = descriptor_txn::InlineJournal::new();
+    let outcome = descriptor_txn::execute_descriptor_op(
+        &live,
+        SubstrateGpa(physical_base),
+        DescriptorOp::Publish {
+            span: PageSpan::new(va, PT_PAGE),
+            expected_ipa: SubstrateGpa(expected_ipa),
+            access,
+        },
+        &descriptor_txn::TableGrants::NONE,
+        &mut journal,
+    );
+    match outcome {
+        DescriptorOutcome::Applied(applied) if applied.live_stores != 0 => {
             Ok(GuestPreparedCommit::Committed)
         }
-        _ => Err(GuestPreparedCommitError::NotPrepared),
+        DescriptorOutcome::Applied(_) => Ok(GuestPreparedCommit::AlreadyResident),
+        DescriptorOutcome::Indeterminate(_) => Err(GuestPreparedCommitError::RollbackFailed),
+        DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            Err(match refusal {
+                DescriptorRefusal::BadRange | DescriptorRefusal::StaleRoot => {
+                    GuestPreparedCommitError::BadAddress
+                }
+                DescriptorRefusal::TableOutsidePrimary => {
+                    GuestPreparedCommitError::TableOutsidePrimary
+                }
+                DescriptorRefusal::MissingTable | DescriptorRefusal::TablesExhausted => {
+                    GuestPreparedCommitError::MissingTable
+                }
+                DescriptorRefusal::WrongBacking => GuestPreparedCommitError::WrongBacking,
+                DescriptorRefusal::PermissionDenied => GuestPreparedCommitError::PermissionDenied,
+                _ => GuestPreparedCommitError::NotPrepared,
+            })
+        }
     }
 }
 
@@ -451,6 +493,9 @@ pub enum GuestRetirementError {
     TableOutsidePrimary,
     MissingTable,
     NotPrivateAnonymous,
+    /// A failed retirement could not restore its pre-image: editor
+    /// exclusion was violated and the MM's table graph is indeterminate.
+    RollbackFailed,
 }
 
 unsafe fn live_primary_descriptor(
@@ -655,10 +700,14 @@ pub unsafe fn publish_existing_invalid_private_pages(
 }
 
 /// Apply one permission transition to existing L1/L2 blocks or L3 leaves
-/// carrying EL1's private-anonymous authority. The complete range, terminal
-/// coverage, and permission ceiling are checked before the first store; no
-/// metadata or table allocation occurs. A partially covered block is rejected
-/// so its split can remain an explicit host-owned fallback.
+/// carrying EL1's private-anonymous authority, prepared or resident (a
+/// prepared leaf stays invalid; its AP/UXN govern its later commit and host
+/// buffer access). The complete range, terminal coverage, and permission
+/// ceiling are checked before the first store; COW-armed leaves report
+/// `PermissionWidening`. This entry point carries no table grants, so a
+/// partially covered block is refused; a host submission carrying grants
+/// splits it (see [`descriptor_txn`]). A rolled-back edit restores every
+/// word; the caller still invalidates the ASID only after success.
 ///
 /// # Safety
 ///
@@ -670,78 +719,47 @@ pub unsafe fn protect_existing_el1_private_pages(
     byte_len: usize,
     edit: GuestPermissionEdit,
 ) -> Result<usize, GuestPermissionEditError> {
-    use core::sync::atomic::Ordering;
+    use descriptor_txn::{DescriptorOp, DescriptorOutcome, DescriptorRefusal};
 
-    if words.is_null()
-        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
-        || !physical_base.is_multiple_of(PT_PAGE)
-        || !edit.va.is_multiple_of(PT_PAGE)
-        || edit.len == 0
-        || !edit.len.is_multiple_of(PT_PAGE)
-        || edit.va.checked_add(edit.len).is_none()
-    {
+    let maintenance = descriptor_txn::CallerInvalidatesAsid;
+    let Ok(live) = (unsafe {
+        descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+    }) else {
         return Err(GuestPermissionEditError::BadRange);
-    }
-    let pages =
-        usize::try_from(edit.len / PT_PAGE).map_err(|_| GuestPermissionEditError::BadRange)?;
-    let terminal_for = |va| unsafe {
-        existing_terminal_descriptor(words, physical_base, byte_len, va).map_err(
-            |error| match error {
-                GuestLeafPublicationError::TableOutsidePrimary => {
+    };
+    let mut journal = descriptor_txn::InlineJournal::new();
+    match descriptor_txn::execute_descriptor_op(
+        &live,
+        SubstrateGpa(physical_base),
+        DescriptorOp::Protect(edit),
+        &descriptor_txn::TableGrants::NONE,
+        &mut journal,
+    ) {
+        DescriptorOutcome::Applied(applied) => {
+            usize::try_from(applied.pages).map_err(|_| GuestPermissionEditError::BadRange)
+        }
+        DescriptorOutcome::Indeterminate(_) => Err(GuestPermissionEditError::RollbackFailed),
+        DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            Err(match refusal {
+                DescriptorRefusal::BadRange => GuestPermissionEditError::BadRange,
+                DescriptorRefusal::TableOutsidePrimary => {
                     GuestPermissionEditError::TableOutsidePrimary
                 }
-                GuestLeafPublicationError::MissingTable => GuestPermissionEditError::MissingTable,
+                DescriptorRefusal::MissingTable => GuestPermissionEditError::MissingTable,
+                DescriptorRefusal::PermissionWidening | DescriptorRefusal::CowArmed => {
+                    GuestPermissionEditError::PermissionWidening
+                }
                 _ => GuestPermissionEditError::NotPrivateAnonymous,
-            },
-        )
-    };
-
-    let end = edit.va + edit.len;
-    let mut current = edit.va;
-    while current < end {
-        let terminal = terminal_for(current)?;
-        let terminal_end = terminal
-            .semantic_base
-            .checked_add(terminal.span)
-            .ok_or(GuestPermissionEditError::BadRange)?;
-        if terminal.semantic_base < edit.va || terminal_end > end {
-            return Err(GuestPermissionEditError::NotPrivateAnonymous);
+            })
         }
-        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        if el1_private_leaf_state(descriptor) != El1PrivateLeafState::Resident {
-            return Err(GuestPermissionEditError::NotPrivateAnonymous);
-        }
-        if el1_cow(descriptor)
-            || (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
-            || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
-        {
-            return Err(GuestPermissionEditError::PermissionWidening);
-        }
-        current = terminal_end;
     }
-
-    current = edit.va;
-    while current < end {
-        let terminal = terminal_for(current)?;
-        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        let (ap, uxn) = if !(edit.readable || edit.writable || edit.executable) {
-            (AP_PRIV_RO, UXN)
-        } else if edit.writable {
-            (AP_RW, if edit.executable { 0 } else { UXN })
-        } else {
-            (AP_RO, if edit.executable { 0 } else { UXN })
-        };
-        let updated = (descriptor & !AP_MASK & !UXN) | ap | uxn | VALID;
-        unsafe { (*terminal.word).store(updated, Ordering::Release) };
-        current = terminal.semantic_base + terminal.span;
-    }
-    Ok(pages)
 }
 
 /// Retire existing L1/L2 blocks or L3 leaves carrying EL1's
 /// private-anonymous authority. The complete range and every terminal are
-/// checked before the first store. A partial coarse block is refused rather
-/// than allocating a split table on the syscall path.
+/// checked before the first store. This entry point carries no table grants,
+/// so a partial coarse block is refused rather than split on the syscall
+/// path; a host submission carrying grants splits it (see [`descriptor_txn`]).
 ///
 /// The output address and permission ceiling remain in each invalid retired
 /// descriptor so the host's authenticated bulk-return path can reconcile its
@@ -760,60 +778,35 @@ pub unsafe fn retire_existing_el1_private_pages(
     va: u64,
     len: u64,
 ) -> Result<usize, GuestRetirementError> {
-    use core::sync::atomic::Ordering;
+    use descriptor_txn::{DescriptorOp, DescriptorOutcome, DescriptorRefusal, PageSpan};
 
-    if words.is_null()
-        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
-        || !physical_base.is_multiple_of(PT_PAGE)
-        || !va.is_multiple_of(PT_PAGE)
-        || len == 0
-        || !len.is_multiple_of(PT_PAGE)
-        || va.checked_add(len).is_none()
-    {
+    let maintenance = descriptor_txn::CallerInvalidatesAsid;
+    let Ok(live) = (unsafe {
+        descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+    }) else {
         return Err(GuestRetirementError::BadRange);
-    }
-    let pages = usize::try_from(len / PT_PAGE).map_err(|_| GuestRetirementError::BadRange)?;
-    let terminal_for = |address| unsafe {
-        existing_terminal_descriptor(words, physical_base, byte_len, address).map_err(|error| {
-            match error {
-                GuestLeafPublicationError::TableOutsidePrimary => {
-                    GuestRetirementError::TableOutsidePrimary
-                }
-                GuestLeafPublicationError::MissingTable => GuestRetirementError::MissingTable,
-                _ => GuestRetirementError::NotPrivateAnonymous,
-            }
-        })
     };
-
-    let end = va + len;
-    let mut current = va;
-    while current < end {
-        let terminal = terminal_for(current)?;
-        let terminal_end = terminal
-            .semantic_base
-            .checked_add(terminal.span)
-            .ok_or(GuestRetirementError::BadRange)?;
-        if terminal.semantic_base < va || terminal_end > end {
-            return Err(GuestRetirementError::NotPrivateAnonymous);
+    let mut journal = descriptor_txn::InlineJournal::new();
+    match descriptor_txn::execute_descriptor_op(
+        &live,
+        SubstrateGpa(physical_base),
+        DescriptorOp::Retire(PageSpan::new(va, len)),
+        &descriptor_txn::TableGrants::NONE,
+        &mut journal,
+    ) {
+        DescriptorOutcome::Applied(applied) => {
+            usize::try_from(applied.pages).map_err(|_| GuestRetirementError::BadRange)
         }
-        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        if !matches!(
-            el1_private_leaf_state(descriptor),
-            El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
-        ) {
-            return Err(GuestRetirementError::NotPrivateAnonymous);
+        DescriptorOutcome::Indeterminate(_) => Err(GuestRetirementError::RollbackFailed),
+        DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            Err(match refusal {
+                DescriptorRefusal::BadRange => GuestRetirementError::BadRange,
+                DescriptorRefusal::TableOutsidePrimary => GuestRetirementError::TableOutsidePrimary,
+                DescriptorRefusal::MissingTable => GuestRetirementError::MissingTable,
+                _ => GuestRetirementError::NotPrivateAnonymous,
+            })
         }
-        current = terminal_end;
     }
-
-    current = va;
-    while current < end {
-        let terminal = terminal_for(current)?;
-        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        unsafe { (*terminal.word).store((descriptor & !VALID) | SW_RETIRED, Ordering::Release) };
-        current = terminal.semantic_base + terminal.span;
-    }
-    Ok(pages)
 }
 
 /// The outcome of attempting to resolve a COW fault in EL1.
@@ -990,6 +983,184 @@ pub enum PtOp {
     KernelReadOnly { exec: bool },
 }
 
+/// Build the leaf descriptor for `op` covering `base_pa` at `level`.
+fn pt_desc_for(asid_scoped_leaves: bool, op: PtOp, base_pa: u64, level: usize) -> u64 {
+    let (_, mask) = PageTableManager::level_span(level);
+    // Block at L1/L2, page at L3 (type bit differs; USER_PAGE_FLAGS adds it).
+    let kernel_only = matches!(op, PtOp::KernelReadOnly { .. });
+    let flags = if level == 3 {
+        if kernel_only {
+            KERNEL_PAGE_FLAGS
+        } else {
+            USER_PAGE_FLAGS
+        }
+    } else if kernel_only {
+        KERNEL_BLOCK_FLAGS
+    } else {
+        USER_BLOCK_FLAGS
+    };
+    let base = base_pa & mask;
+    let scope = if asid_scoped_leaves { NON_GLOBAL } else { 0 };
+    // UXN (bit 54) is set for a non-exec leaf; cleared for an exec one.
+    // USER_*_FLAGS start UXN-clear (executable), so OR in UXN when !exec.
+    let uxn = |exec: bool| if exec { 0 } else { UXN };
+    match op {
+        PtOp::Invalidate => base | (flags & !VALID) | scope,
+        PtOp::Retire => base | (flags & !VALID) | scope | SW_RETIRED,
+        PtOp::ReadWrite { exec } => base | flags | uxn(exec) | scope,
+        PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec) | scope,
+        PtOp::ForkReadOnly => {
+            // Fork arming is a permission restriction, not a remap: a
+            // PROT_NONE descriptor must remain invalid while gaining nG so
+            // a later mprotect-to-write still inherits ASID scoping. An
+            // absent leaf has no execute state to preserve; arm it NX.
+            base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | UXN
+        }
+        PtOp::KernelReadOnly { exec } => base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec) | scope,
+    }
+}
+
+/// Does a leaf with `(valid, ap, uxn_set)` already satisfy `op`? Includes the
+/// UXN (execute) bit so a re-protect that only flips PROT_EXEC still applies.
+fn pt_satisfies(
+    asid_scoped_leaves: bool,
+    op: PtOp,
+    valid: bool,
+    ap: u64,
+    uxn_set: bool,
+    non_global: bool,
+    retired: bool,
+) -> bool {
+    let scoped = !asid_scoped_leaves || non_global;
+    match op {
+        PtOp::Invalidate => !valid && scoped,
+        PtOp::Retire => !valid && scoped && retired,
+        PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec && scoped,
+        PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec && scoped,
+        PtOp::ForkReadOnly => (ap == AP_RO || ap == AP_PRIV_RO) && non_global,
+        PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec && scoped,
+    }
+}
+
+/// The descriptor `op` makes of one covering terminal at `level` whose
+/// semantic block starts at `block_start`, or `None` when the terminal
+/// already satisfies `op` (then its whole span is skipped, never split).
+/// The host editor's `apply` and guest fork-arm transactions share this one
+/// definition; callers check the GIC window for descriptors they store.
+pub(crate) fn pt_terminal_edit(
+    asid_scoped_leaves: bool,
+    op: PtOp,
+    desc: u64,
+    level: usize,
+    block_start: u64,
+) -> Option<u64> {
+    let empty = !PageTableManager::records_output(desc, level);
+    let tagged = match op {
+        PtOp::ReadWrite { exec } => private_permission_tags(desc & !SW_EL1_COW, true, exec),
+        PtOp::ReadOnly { exec } | PtOp::KernelReadOnly { exec } => {
+            private_permission_tags(desc & !SW_EL1_COW, false, exec)
+        }
+        PtOp::ForkReadOnly => arm_private_cow(desc),
+        PtOp::Invalidate | PtOp::Retire => desc,
+    };
+    let already = tagged == desc
+        && match op {
+            // An EMPTY descriptor is already as invalid as it can be, and
+            // nothing about it (nG, retirement) survives to a revalidation
+            // — which rebuilds it from scratch. Writing anything into it
+            // would turn "no output recorded" into a descriptor that a
+            // later in-place edit or split treats as carrying one.
+            PtOp::Invalidate | PtOp::Retire if empty => true,
+            // A speculative EL1 grant leaf has no live EL0 write
+            // permission to revoke at fork. Keep its current AP as
+            // Linux intent until first touch publishes the page under
+            // the backend's armed physical COW authority.
+            PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
+                desc & NON_GLOBAL != 0
+            }
+            _ => pt_satisfies(
+                asid_scoped_leaves,
+                op,
+                desc & VALID != 0,
+                desc & AP_MASK,
+                desc & UXN != 0,
+                desc & NON_GLOBAL != 0,
+                desc & SW_RETIRED != 0,
+            ),
+        };
+    if already {
+        return None;
+    }
+    let new_desc = match op {
+        PtOp::Invalidate | PtOp::Retire => {
+            let scope = if asid_scoped_leaves { NON_GLOBAL } else { 0 };
+            let retired = if matches!(op, PtOp::Retire) {
+                SW_RETIRED
+            } else {
+                0
+            };
+            (desc & !VALID & !if el1_cow(desc) { SW_EL1_COW } else { 0 }) | scope | retired
+        }
+        PtOp::ReadOnly { .. }
+        | PtOp::ForkReadOnly
+        | PtOp::ReadWrite { .. }
+        | PtOp::KernelReadOnly { .. }
+            if !empty =>
+        {
+            let ap = match op {
+                PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
+                    desc & AP_MASK
+                }
+                PtOp::ForkReadOnly if desc & AP_MASK == AP_PRIV_RO => AP_PRIV_RO,
+                PtOp::ReadOnly { .. } | PtOp::ForkReadOnly => AP_RO,
+                PtOp::KernelReadOnly { .. } => AP_PRIV_RO,
+                _ => AP_RW,
+            };
+            // Fork arming keeps the leaf's own execute permission;
+            // every other edit sets it from the requested prot.
+            let uxn = match op {
+                PtOp::ForkReadOnly => desc & UXN,
+                PtOp::ReadOnly { exec }
+                | PtOp::ReadWrite { exec }
+                | PtOp::KernelReadOnly { exec } => {
+                    if exec {
+                        0
+                    } else {
+                        UXN
+                    }
+                }
+                PtOp::Invalidate | PtOp::Retire => unreachable!(),
+            };
+            let non_global = if asid_scoped_leaves || matches!(op, PtOp::ForkReadOnly) {
+                NON_GLOBAL
+            } else {
+                0
+            };
+            let validity = if matches!(op, PtOp::ForkReadOnly) {
+                desc & VALID
+            } else {
+                VALID
+            };
+            // A revalidated output is live again by definition;
+            // retirement only survives an edit that keeps the
+            // leaf invalid.
+            let retired = if validity == 0 {
+                desc & SW_RETIRED
+            } else if matches!(op, PtOp::ForkReadOnly) {
+                tagged & SW_EL1_COW
+            } else {
+                0
+            };
+            (tagged & !AP_MASK & !UXN & !SW_RETIRED) | ap | uxn | non_global | validity | retired
+        }
+        PtOp::ReadOnly { .. }
+        | PtOp::ForkReadOnly
+        | PtOp::ReadWrite { .. }
+        | PtOp::KernelReadOnly { .. } => pt_desc_for(asid_scoped_leaves, op, block_start, level),
+    };
+    Some(new_desc)
+}
+
 /// The outcome of an edit applied to a page-table range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PageTableApplyOutcome {
@@ -1048,6 +1219,9 @@ pub enum PageTableError {
     GicWindowOutput,
     /// Metadata allocation failed or was refused.
     MetadataAllocation,
+    /// A host store to live descriptors on the lane where guest EL1 owns
+    /// them. The edit must be submitted as a guest descriptor transaction.
+    GuestOwnsLiveDescriptors,
 }
 
 impl core::fmt::Display for PageTableError {
@@ -1066,6 +1240,9 @@ impl core::fmt::Display for PageTableError {
             }
             Self::GicWindowOutput => write!(f, "output address in the in-kernel GIC window"),
             Self::MetadataAllocation => write!(f, "metadata allocation failed"),
+            Self::GuestOwnsLiveDescriptors => {
+                write!(f, "guest EL1 owns the live stage-1 descriptors")
+            }
         }
     }
 }
@@ -1626,6 +1803,8 @@ pub struct PageTableManager {
     /// content-discovered cursor would hand one page to both. EL1 publishes
     /// only into existing tables and hands the rest back to the host.
     table_allocation_forbidden: bool,
+    /// The only venue allowed to store into this image's live backing.
+    live_descriptor_owner: LiveDescriptorOwner,
 }
 
 impl core::fmt::Debug for PageTableManager {
@@ -1643,6 +1822,7 @@ impl core::fmt::Debug for PageTableManager {
             .field("staged", &self.staged)
             .field("is_live", &self.is_live())
             .field("undo", &self.undo)
+            .field("live_descriptor_owner", &self.live_descriptor_owner)
             .finish()
     }
 }
@@ -1712,6 +1892,7 @@ impl PageTableManager {
             resolver: None,
             undo: None,
             table_allocation_forbidden: false,
+            live_descriptor_owner: LiveDescriptorOwner::Host,
         }
     }
 
@@ -1759,12 +1940,216 @@ impl PageTableManager {
             resolver: Some(resolver),
             undo: None,
             table_allocation_forbidden: false,
+            live_descriptor_owner: LiveDescriptorOwner::Host,
         })
     }
 
     /// Refuse every table-page allocation (see `table_allocation_forbidden`).
     pub fn forbid_table_allocation(&mut self) {
         self.table_allocation_forbidden = true;
+    }
+
+    /// Select the venue that owns this image's live descriptor stores.
+    pub fn set_live_descriptor_owner(&mut self, owner: LiveDescriptorOwner) {
+        self.live_descriptor_owner = owner;
+    }
+
+    /// The venue that owns this image's live descriptor stores.
+    pub fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
+        self.live_descriptor_owner
+    }
+
+    fn refuse_guest_owned_live_store(&self) -> Result<(), PageTableError> {
+        if self.live_descriptor_owner == LiveDescriptorOwner::Guest {
+            return Err(PageTableError::GuestOwnsLiveDescriptors);
+        }
+        Ok(())
+    }
+
+    /// Reserve `count` unlinked table pages in the EL1-reachable primary
+    /// arena for one guest descriptor transaction. The host remains the only
+    /// allocator of table-page identity; EL1 fills and links the pages it
+    /// uses. Extension arenas are never granted: EL1 cannot reach them, so a
+    /// shortfall is `OutOfTables` and the transaction must not be submitted.
+    /// Nothing is reserved on failure.
+    pub fn reserve_primary_table_grants(
+        &mut self,
+        count: usize,
+    ) -> Result<descriptor_txn::TableGrants, PageTableError> {
+        if count > descriptor_txn::MAX_TABLE_GRANTS {
+            return Err(PageTableError::OutOfTables);
+        }
+        if self.table_allocation_forbidden || self.arenas.is_empty() {
+            return Err(PageTableError::OutOfTables);
+        }
+        let mut pages = [SubstrateGpa(0); descriptor_txn::MAX_TABLE_GRANTS];
+        let mut reserved = 0;
+        let mut from_free = 0;
+        let primary_base = self.arenas[0].base;
+        let primary_end = primary_base + self.arenas[0].capacity as u64;
+        for &pa in self.free_tables.iter().rev() {
+            if reserved == count {
+                break;
+            }
+            if pa >= primary_base && pa < primary_end {
+                pages[reserved] = SubstrateGpa(pa);
+                reserved += 1;
+            }
+        }
+        from_free += reserved;
+        let bump_needed = (count - reserved) as u64;
+        let arena = &self.arenas[0];
+        let bump_end = arena
+            .next_free
+            .checked_add(bump_needed * PT_PAGE)
+            .ok_or(PageTableError::OutOfTables)?;
+        if bump_end > arena.capacity as u64 {
+            return Err(PageTableError::OutOfTables);
+        }
+        for index in 0..bump_needed {
+            pages[reserved] = SubstrateGpa(arena.base + arena.next_free + index * PT_PAGE);
+            reserved += 1;
+        }
+        let grants =
+            descriptor_txn::TableGrants::new(&pages[..count]).ok_or(PageTableError::BadAddress)?;
+        if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[0].storage {
+            let needed = bump_end as usize;
+            if bytes.len() < needed {
+                bytes
+                    .try_reserve(needed - bytes.len())
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
+                bytes.resize(needed, 0);
+            }
+        }
+        self.free_tables
+            .retain(|pa| !pages[..from_free].contains(&SubstrateGpa(*pa)));
+        self.arenas[0].next_free = bump_end;
+        Ok(grants)
+    }
+
+    /// Build the guest descriptor transaction for `op` on this guest-owned
+    /// live image: plan it against the live primary arena without storing,
+    /// then reserve exactly the table grants it needs. The caller submits the
+    /// result and later settles its receipt with
+    /// [`Self::settle_guest_descriptor_receipt`] (or
+    /// [`Self::abandon_guest_descriptor_txn`] if it is withdrawn unclaimed).
+    pub fn prepare_guest_descriptor_txn(
+        &mut self,
+        id: descriptor_txn::DescriptorTxnId,
+        op: descriptor_txn::DescriptorOp,
+    ) -> Result<descriptor_txn::DescriptorTxn, GuestTxnPrepareError> {
+        if self.live_descriptor_owner != LiveDescriptorOwner::Guest {
+            return Err(GuestTxnPrepareError::NotGuestOwned);
+        }
+        let Some(primary) = self.arenas.first().filter(|arena| arena.is_live()) else {
+            return Err(GuestTxnPrepareError::NotLive);
+        };
+        let (base, capacity) = (primary.base, primary.capacity);
+        let resolver = self
+            .resolver
+            .as_ref()
+            .ok_or(GuestTxnPrepareError::NotLive)?;
+        let host = resolver.host_const_ptr_for_range(base, capacity).ok_or(
+            GuestTxnPrepareError::Manager(PageTableError::UnresolvedArena(base)),
+        )?;
+        let maintenance = descriptor_txn::CallerInvalidatesAsid;
+        // SAFETY: the resolver contract makes `host` a resident, aligned
+        // mapping of the whole primary arena. Planning only loads.
+        let words = unsafe {
+            descriptor_txn::PrimaryTableWords::new(
+                host.cast_mut().cast::<core::sync::atomic::AtomicU64>(),
+                base,
+                capacity,
+                &maintenance,
+            )
+        }
+        .map_err(GuestTxnPrepareError::Refused)?;
+        let root = SubstrateGpa(self.base());
+        let plan = descriptor_txn::plan_descriptor_op(&words, root, op)
+            .map_err(GuestTxnPrepareError::Refused)?;
+        let tables = self
+            .reserve_primary_table_grants(plan.table_grants)
+            .map_err(GuestTxnPrepareError::Manager)?;
+        Ok(descriptor_txn::DescriptorTxn {
+            id,
+            root,
+            op,
+            tables,
+        })
+    }
+
+    /// The guest descriptor operation that arms `[va, va + len)` for fork COW
+    /// exactly as [`Self::set_fork_readonly`] (or [`Self::set_kernel_readonly`]
+    /// for a kernel-only range) would on this image.
+    pub fn fork_arm_op(
+        &self,
+        va: u64,
+        len: u64,
+        kernel_only: bool,
+        executable: bool,
+    ) -> descriptor_txn::DescriptorOp {
+        descriptor_txn::DescriptorOp::ForkArm {
+            span: descriptor_txn::PageSpan::new(va, len),
+            arm: descriptor_txn::ForkArmMode {
+                kernel_only,
+                executable,
+                asid_scoped: self.asid_scoped_leaves,
+                excluded_ipa: self.layout.excluded_ipa_start,
+                excluded_len: self.layout.excluded_ipa_len,
+            },
+        }
+    }
+
+    /// Authenticate EL1's receipt for `txn` and return the table grants it
+    /// did not link. Grants of a refused or rolled-back transaction all
+    /// return; after an unauthenticated or indeterminate receipt they stay
+    /// reserved, because their linkage is unknown.
+    pub fn settle_guest_descriptor_receipt(
+        &mut self,
+        txn: &descriptor_txn::DescriptorTxn,
+        receipt: &descriptor_txn::DescriptorReceipt,
+    ) -> Result<descriptor_txn::VerifiedDescriptorReceipt, GuestTxnSettleError> {
+        use descriptor_txn::{DescriptorOutcome, ReceiptError};
+        match txn.verify_receipt(receipt) {
+            Ok(verified) => {
+                self.release_table_grants(verified.unused_table_grants())
+                    .map_err(GuestTxnSettleError::Manager)?;
+                Ok(verified)
+            }
+            Err(
+                error @ ReceiptError::NotApplied(
+                    DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_),
+                ),
+            ) => {
+                self.release_table_grants(txn.tables.as_slice())
+                    .map_err(GuestTxnSettleError::Manager)?;
+                Err(GuestTxnSettleError::Receipt(error))
+            }
+            Err(error) => Err(GuestTxnSettleError::Receipt(error)),
+        }
+    }
+
+    /// Return every grant of a submission withdrawn before EL1 claimed it.
+    pub fn abandon_guest_descriptor_txn(
+        &mut self,
+        txn: &descriptor_txn::DescriptorTxn,
+    ) -> Result<(), PageTableError> {
+        self.release_table_grants(txn.tables.as_slice())
+    }
+
+    /// Return table grants that a transaction did not link. The pages stay
+    /// out of the bump range and are reused from the free list; they are
+    /// re-zeroed at handout like every other freed table.
+    pub fn release_table_grants(&mut self, pages: &[u64]) -> Result<(), PageTableError> {
+        self.free_tables
+            .try_reserve(pages.len())
+            .map_err(|_| PageTableError::MetadataAllocation)?;
+        for &pa in pages {
+            if !self.free_tables.contains(&pa) {
+                self.free_tables.push(pa);
+            }
+        }
+        Ok(())
     }
 
     /// True if this manager is bound to live hardware-visible memory.
@@ -2037,6 +2422,9 @@ impl PageTableManager {
             resolver: None,
             undo: None,
             table_allocation_forbidden: false,
+            // A snapshot is an offline image. Restoring it over a guest-owned
+            // live authority is refused by that authority, not by the copy.
+            live_descriptor_owner: LiveDescriptorOwner::Host,
         };
         self.snapshot_into(&mut target)?;
         Ok(target)
@@ -2557,6 +2945,9 @@ impl PageTableManager {
         resolver: impl HostArenaResolver,
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
+        if !self.dirty.is_empty() {
+            self.refuse_guest_owned_live_store()?;
+        }
         // An EL1 editor may have linked a table page after this live manager
         // cached its bump cursor. A host edit that reached and dirtied that page
         // has now authenticated it through the live table graph. Adopt the
@@ -3033,9 +3424,13 @@ impl PageTableManager {
         let Some(ref journal) = self.undo else {
             return Ok(Vec::new());
         };
+        // On the guest-owned lane `sync_to_host` refuses before its first
+        // store, so no journaled word ever reached live backing: discard the
+        // staged transaction without writing hardware memory.
+        let publish_preimages = self.live_descriptor_owner == LiveDescriptorOwner::Host;
 
         // Pre-validate that all touched arenas resolve before modifying recoverable state.
-        for &(loc, _) in &journal.words {
+        for &(loc, _) in journal.words.iter().filter(|_| publish_preimages) {
             if loc.arena < self.arenas.len() {
                 let arena = &self.arenas[loc.arena];
                 if resolver
@@ -3052,6 +3447,14 @@ impl PageTableManager {
         // must remain retryable and must not release newly attached arenas.
         for &(loc, previous) in journal.words.iter().rev() {
             let arena = &mut self.arenas[loc.arena];
+            if !publish_preimages {
+                if let TableArenaStorage::Owned(ref mut bytes) = arena.storage
+                    && loc.offset + 8 <= bytes.len()
+                {
+                    bytes[loc.offset..loc.offset + 8].copy_from_slice(&previous.to_le_bytes());
+                }
+                continue;
+            }
             let host = resolver
                 .host_ptr_for_range(arena.base, loc.offset + 8)
                 .ok_or(PageTableError::UnresolvedArena(arena.base))?;
@@ -3112,6 +3515,7 @@ impl PageTableManager {
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{Ordering, fence};
 
+        self.refuse_guest_owned_live_store()?;
         // Resolve the complete destination set before publishing any bytes.
         // The caller's quiescence/ownership scope must keep these mappings valid
         // through the copy pass; a second fallible lookup could reintroduce a
@@ -3906,71 +4310,6 @@ impl PageTableManager {
         desc & mask != 0
     }
 
-    /// Build the leaf descriptor for `op` covering `base_pa` at `level`.
-    fn desc_for(&self, op: PtOp, base_pa: u64, level: usize) -> u64 {
-        let (_, mask) = Self::level_span(level);
-        // Block at L1/L2, page at L3 (type bit differs; USER_PAGE_FLAGS adds it).
-        let kernel_only = matches!(op, PtOp::KernelReadOnly { .. });
-        let flags = if level == 3 {
-            if kernel_only {
-                KERNEL_PAGE_FLAGS
-            } else {
-                USER_PAGE_FLAGS
-            }
-        } else if kernel_only {
-            KERNEL_BLOCK_FLAGS
-        } else {
-            USER_BLOCK_FLAGS
-        };
-        let base = base_pa & mask;
-        let scope = if self.asid_scoped_leaves {
-            NON_GLOBAL
-        } else {
-            0
-        };
-        // UXN (bit 54) is set for a non-exec leaf; cleared for an exec one.
-        // USER_*_FLAGS start UXN-clear (executable), so OR in UXN when !exec.
-        let uxn = |exec: bool| if exec { 0 } else { UXN };
-        match op {
-            PtOp::Invalidate => base | (flags & !VALID) | scope,
-            PtOp::Retire => base | (flags & !VALID) | scope | SW_RETIRED,
-            PtOp::ReadWrite { exec } => base | flags | uxn(exec) | scope,
-            PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec) | scope,
-            PtOp::ForkReadOnly => {
-                // Fork arming is a permission restriction, not a remap: a
-                // PROT_NONE descriptor must remain invalid while gaining nG so
-                // a later mprotect-to-write still inherits ASID scoping. An
-                // absent leaf has no execute state to preserve; arm it NX.
-                base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | UXN
-            }
-            PtOp::KernelReadOnly { exec } => {
-                base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec) | scope
-            }
-        }
-    }
-
-    /// Does a leaf with `(valid, ap, uxn_set)` already satisfy `op`? Includes the
-    /// UXN (execute) bit so a re-protect that only flips PROT_EXEC still applies.
-    fn satisfies(
-        &self,
-        op: PtOp,
-        valid: bool,
-        ap: u64,
-        uxn_set: bool,
-        non_global: bool,
-        retired: bool,
-    ) -> bool {
-        let scoped = !self.asid_scoped_leaves || non_global;
-        match op {
-            PtOp::Invalidate => !valid && scoped,
-            PtOp::Retire => !valid && scoped && retired,
-            PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec && scoped,
-            PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec && scoped,
-            PtOp::ForkReadOnly => (ap == AP_RO || ap == AP_PRIV_RO) && non_global,
-            PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec && scoped,
-        }
-    }
-
     /// Apply `op` to `[va, va+len)` at the COARSEST granularity possible: edit a
     /// covering block descriptor in place when the whole block lies inside the
     /// range, and split one level finer only at an unaligned range edge. This
@@ -3995,127 +4334,17 @@ impl PageTableManager {
             let block_start = cur & mask;
             let block_end = block_start + span;
             let desc = self.read_desc(off)?;
-            let empty = !Self::records_output(desc, level);
-            let tagged = match op {
-                PtOp::ReadWrite { exec } => private_permission_tags(desc & !SW_EL1_COW, true, exec),
-                PtOp::ReadOnly { exec } | PtOp::KernelReadOnly { exec } => {
-                    private_permission_tags(desc & !SW_EL1_COW, false, exec)
-                }
-                PtOp::ForkReadOnly => arm_private_cow(desc),
-                PtOp::Invalidate | PtOp::Retire => desc,
-            };
-            let already = tagged == desc
-                && match op {
-                    // An EMPTY descriptor is already as invalid as it can be, and
-                    // nothing about it (nG, retirement) survives to a revalidation
-                    // — which rebuilds it from scratch. Writing anything into it
-                    // would turn "no output recorded" into a descriptor that a
-                    // later in-place edit or split treats as carrying one.
-                    PtOp::Invalidate | PtOp::Retire if empty => true,
-                    // A speculative EL1 grant leaf has no live EL0 write
-                    // permission to revoke at fork. Keep its current AP as
-                    // Linux intent until first touch publishes the page under
-                    // the backend's armed physical COW authority.
-                    PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
-                        desc & NON_GLOBAL != 0
-                    }
-                    _ => self.satisfies(
-                        op,
-                        desc & VALID != 0,
-                        desc & AP_MASK,
-                        desc & UXN != 0,
-                        desc & NON_GLOBAL != 0,
-                        desc & SW_RETIRED != 0,
-                    ),
-                };
-            if already {
+            let edited = pt_terminal_edit(self.asid_scoped_leaves, op, desc, level, block_start);
+            if edited.is_none() {
                 // The covering block is ALREADY at the target — skip its whole
                 // span with no split (this is what keeps RW-on-already-RW, and a
                 // re-protect of an unchanged range, free).
                 cur = block_end;
-            } else if block_start >= va && block_end <= end {
+            } else if let Some(new_desc) = edited.filter(|_| block_start >= va && block_end <= end)
+            {
                 // The whole covering block is inside the range and needs the
                 // change: edit it in place at this level (no split).
                 let previously_valid = desc & VALID != 0;
-                let new_desc = match op {
-                    PtOp::Invalidate | PtOp::Retire => {
-                        let scope = if self.asid_scoped_leaves {
-                            NON_GLOBAL
-                        } else {
-                            0
-                        };
-                        let retired = if matches!(op, PtOp::Retire) {
-                            SW_RETIRED
-                        } else {
-                            0
-                        };
-                        (desc & !VALID & !if el1_cow(desc) { SW_EL1_COW } else { 0 })
-                            | scope
-                            | retired
-                    }
-                    PtOp::ReadOnly { .. }
-                    | PtOp::ForkReadOnly
-                    | PtOp::ReadWrite { .. }
-                    | PtOp::KernelReadOnly { .. }
-                        if !empty =>
-                    {
-                        let ap = match op {
-                            PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
-                                desc & AP_MASK
-                            }
-                            PtOp::ForkReadOnly if desc & AP_MASK == AP_PRIV_RO => AP_PRIV_RO,
-                            PtOp::ReadOnly { .. } | PtOp::ForkReadOnly => AP_RO,
-                            PtOp::KernelReadOnly { .. } => AP_PRIV_RO,
-                            _ => AP_RW,
-                        };
-                        // Fork arming keeps the leaf's own execute permission;
-                        // every other edit sets it from the requested prot.
-                        let uxn = match op {
-                            PtOp::ForkReadOnly => desc & UXN,
-                            PtOp::ReadOnly { exec }
-                            | PtOp::ReadWrite { exec }
-                            | PtOp::KernelReadOnly { exec } => {
-                                if exec {
-                                    0
-                                } else {
-                                    UXN
-                                }
-                            }
-                            PtOp::Invalidate | PtOp::Retire => unreachable!(),
-                        };
-                        let non_global =
-                            if self.asid_scoped_leaves || matches!(op, PtOp::ForkReadOnly) {
-                                NON_GLOBAL
-                            } else {
-                                0
-                            };
-                        let validity = if matches!(op, PtOp::ForkReadOnly) {
-                            desc & VALID
-                        } else {
-                            VALID
-                        };
-                        // A revalidated output is live again by definition;
-                        // retirement only survives an edit that keeps the
-                        // leaf invalid.
-                        let retired = if validity == 0 {
-                            desc & SW_RETIRED
-                        } else if matches!(op, PtOp::ForkReadOnly) {
-                            tagged & SW_EL1_COW
-                        } else {
-                            0
-                        };
-                        (tagged & !AP_MASK & !UXN & !SW_RETIRED)
-                            | ap
-                            | uxn
-                            | non_global
-                            | validity
-                            | retired
-                    }
-                    PtOp::ReadOnly { .. }
-                    | PtOp::ForkReadOnly
-                    | PtOp::ReadWrite { .. }
-                    | PtOp::KernelReadOnly { .. } => self.desc_for(op, block_start, level),
-                };
                 // A valid leaf whose output lies in the in-kernel GIC's window
                 // would expose the distributor or a redistributor as memory,
                 // whether the output was rebuilt from the identity VA or kept.
@@ -10616,5 +10845,420 @@ mod tests {
             .unwrap();
         assert_eq!(mgr.translate(va + 2 * PT_PAGE), Some(ipa + 2 * PT_PAGE));
         assert_eq!(mgr.translate(va + 3 * PT_PAGE), None);
+    }
+
+    fn live_arena_bytes(resolver: &MockLiveResolver) -> Vec<u8> {
+        resolver
+            .arenas
+            .lock()
+            .unwrap()
+            .get(&LINUX_PAGE_TABLES_BASE)
+            .expect("primary arena")
+            .clone()
+    }
+
+    #[test]
+    fn guest_owned_live_image_refuses_every_host_descriptor_store() {
+        let (mut mgr, resolver) = create_live_fixture();
+        let snapshot = mgr.snapshot_image().expect("offline snapshot");
+        mgr.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        let before = live_arena_bytes(&resolver);
+
+        // Ordinary host edit funnel: stage, refuse publication, discard.
+        mgr.begin_undo().unwrap();
+        mgr.set_readonly(LINUX_MMAP_BASE, 0x4000, false, None)
+            .expect("staging is not a live store");
+        assert_eq!(
+            unsafe { mgr.sync_to_host(&*resolver) },
+            Err(PageTableError::GuestOwnsLiveDescriptors)
+        );
+        unsafe { mgr.rollback_undo(&*resolver, None) }.expect("discard staged edit");
+        assert_eq!(live_arena_bytes(&resolver), before);
+        assert_eq!(
+            mgr.translate(LINUX_MMAP_BASE),
+            snapshot.translate(LINUX_MMAP_BASE),
+            "the discarded host edit is not observable through the live image"
+        );
+
+        // Guest-publication transactions are host-venue publishers too.
+        let publication = GuestLeafPublication {
+            va: LINUX_MMAP_BASE + 0x40_0000,
+            ipa: LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+            len: 2 * PT_PAGE,
+            writable: true,
+            executable: false,
+        };
+        assert_eq!(
+            mgr.publish_live_private_pages_transaction(publication),
+            Err(GuestLeafPublicationError::Manager(
+                PageTableError::GuestOwnsLiveDescriptors
+            ))
+        );
+        assert_eq!(live_arena_bytes(&resolver), before);
+
+        // Snapshot restore through a guest-owned image is refused too.
+        assert_eq!(
+            unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) },
+            Err(PageTableError::GuestOwnsLiveDescriptors)
+        );
+        assert_eq!(live_arena_bytes(&resolver), before);
+
+        // The host lane is unchanged.
+        mgr.set_live_descriptor_owner(LiveDescriptorOwner::Host);
+        mgr.begin_undo().unwrap();
+        mgr.set_readonly(LINUX_MMAP_BASE, 0x4000, false, None)
+            .unwrap();
+        unsafe { mgr.sync_to_host(&*resolver) }.expect("host lane publishes");
+        mgr.commit_undo();
+        assert_ne!(live_arena_bytes(&resolver), before);
+    }
+
+    #[test]
+    fn primary_table_grants_are_exact_reversible_and_never_extension_pages() {
+        let (mut mgr, _resolver) = create_live_fixture();
+        let cursor = mgr.arenas[0].next_free;
+        let grants = mgr.reserve_primary_table_grants(3).expect("three pages");
+        assert_eq!(
+            grants.as_slice(),
+            &[
+                LINUX_PAGE_TABLES_BASE + cursor,
+                LINUX_PAGE_TABLES_BASE + cursor + PT_PAGE,
+                LINUX_PAGE_TABLES_BASE + cursor + 2 * PT_PAGE,
+            ]
+        );
+        assert_eq!(mgr.arenas[0].next_free, cursor + 3 * PT_PAGE);
+        // The host allocator never hands a reserved page to another edit.
+        let next = mgr.alloc_table_for_test().expect("host allocation");
+        assert!(!grants.as_slice().contains(&next));
+
+        // The unused suffix returns to the allocator and is granted again.
+        mgr.release_table_grants(grants.unused_after(1)).unwrap();
+        let again = mgr.reserve_primary_table_grants(2).expect("reuse");
+        let mut reused = again.as_slice().to_vec();
+        reused.sort_unstable();
+        assert_eq!(reused, grants.as_slice()[1..].to_vec());
+
+        // A shortfall reserves nothing: EL1 cannot reach extension arenas.
+        let free_before = mgr.free_tables.clone();
+        let cursor_before = mgr.arenas[0].next_free;
+        let remaining = (mgr.arenas[0].capacity as u64 - cursor_before) / PT_PAGE;
+        if remaining < descriptor_txn::MAX_TABLE_GRANTS as u64 {
+            assert_eq!(
+                mgr.reserve_primary_table_grants(remaining as usize + 1),
+                Err(PageTableError::OutOfTables)
+            );
+        }
+        assert_eq!(
+            mgr.reserve_primary_table_grants(descriptor_txn::MAX_TABLE_GRANTS + 1),
+            Err(PageTableError::OutOfTables)
+        );
+        assert_eq!(mgr.free_tables, free_before);
+        assert_eq!(mgr.arenas[0].next_free, cursor_before);
+    }
+
+    #[derive(Default)]
+    struct RecordingMaintenance {
+        barriers: core::cell::Cell<usize>,
+        invalidations: core::cell::RefCell<Vec<(u64, u64)>>,
+    }
+
+    impl descriptor_txn::TableMaintenance for RecordingMaintenance {
+        fn publish_barrier(&self) {
+            self.barriers.set(self.barriers.get() + 1);
+        }
+        fn invalidate_range(&self, va: u64, len: u64) {
+            self.invalidations.borrow_mut().push((va, len));
+        }
+    }
+
+    /// Execute a submitted transaction as EL1 would: over the live primary
+    /// arena, rooted at the root it authenticated for the MM.
+    fn guest_apply(
+        resolver: &MockLiveResolver,
+        slot: &descriptor_txn::DescriptorTxnSlot,
+        mm_key: u64,
+        maintenance: &RecordingMaintenance,
+    ) -> Option<descriptor_txn::DescriptorReceipt> {
+        let host = resolver
+            .host_ptr_for_range(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize)
+            .unwrap();
+        let words = unsafe {
+            descriptor_txn::PrimaryTableWords::new(
+                host.cast::<core::sync::atomic::AtomicU64>(),
+                LINUX_PAGE_TABLES_BASE,
+                LINUX_PAGE_TABLES_SIZE as usize,
+                maintenance,
+            )
+        }
+        .unwrap();
+        let mut journal = descriptor_txn::InlineJournal::new();
+        descriptor_txn::apply_submitted_descriptor_txn(
+            slot,
+            mm_key,
+            &words,
+            SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+            &mut journal,
+        )
+    }
+
+    fn txn_backing(seed: u64) -> descriptor_txn::BackingIdentity {
+        let nz = |v| core::num::NonZeroU64::new(v).unwrap();
+        descriptor_txn::BackingIdentity {
+            frame_id: nz(seed),
+            mapping_id: nz(seed + 1),
+            owner_generation: nz(seed + 2),
+            inventory_revision: nz(seed + 3),
+        }
+    }
+
+    #[test]
+    fn guest_owned_lane_publishes_a_grant_only_through_el1_transactions() {
+        use descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, DescriptorTxnId, DescriptorTxnSlot, PageSpan,
+        };
+        let (mut mgr, resolver) = create_live_fixture();
+        mgr.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        // A fresh 2 MiB window inside the reserved sparse mmap arena: the
+        // boot image covers it with invalid coarse reservation blocks, so the
+        // grant needs split tables from the host allocator.
+        let va = LINUX_MMAP_BASE + 0x80_0000;
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
+        let fault = va + 3 * PT_PAGE;
+        let op = DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va,
+                ipa,
+                len: 8 * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(fault, PT_PAGE),
+            backing: txn_backing(10),
+        };
+        let id = DescriptorTxnId {
+            mm_key: core::num::NonZeroU64::new(41).unwrap(),
+            generation: core::num::NonZeroU64::new(1).unwrap(),
+        };
+        let before = live_arena_bytes(&resolver);
+        let txn = mgr
+            .prepare_guest_descriptor_txn(id, op)
+            .expect("plan and reserve");
+        assert_eq!(
+            live_arena_bytes(&resolver),
+            before,
+            "planning and grant reservation store nothing"
+        );
+        assert!(
+            !txn.tables.is_empty(),
+            "the reservation block must be split"
+        );
+
+        let slot = DescriptorTxnSlot::new();
+        assert!(slot.submit(&txn));
+        assert!(slot.pending_covering(41, fault));
+        let maintenance = RecordingMaintenance::default();
+        // Another MM's EL1 editor cannot apply it.
+        assert!(guest_apply(&resolver, &slot, 42, &maintenance).is_none());
+        let receipt = guest_apply(&resolver, &slot, 41, &maintenance).expect("claimed");
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        assert!(
+            maintenance.barriers.get() >= 1,
+            "links follow a publish barrier"
+        );
+        let host_receipt = slot.take_receipt(id).unwrap();
+        let verified = mgr
+            .settle_guest_descriptor_receipt(&txn, &host_receipt)
+            .expect("authentic receipt");
+        assert_eq!(verified.resident(), PageSpan::new(fault, PT_PAGE));
+
+        // The host live view observes exactly the guest's publication.
+        assert_eq!(mgr.translate(fault), Some(ipa + 3 * PT_PAGE));
+        for page in 0..8 {
+            let address = va + page * PT_PAGE;
+            let leaf = terminal_descriptor(mgr.debug_walk(address));
+            assert_eq!(leaf & PA_MASK_4KIB, ipa + page * PT_PAGE);
+            assert_eq!(
+                el1_private_leaf_state(leaf),
+                if address == fault {
+                    El1PrivateLeafState::Resident
+                } else {
+                    El1PrivateLeafState::Prepared
+                },
+                "page {page}"
+            );
+        }
+        // Reserved grants the guest linked are never reissued by the host.
+        let next = mgr.alloc_table_for_test().unwrap();
+        assert!(!txn.tables.as_slice().contains(&next));
+
+        // Host copyout into a prepared page is a guest Publish, not a store.
+        let copyout = DescriptorOp::Publish {
+            span: PageSpan::new(va, PT_PAGE),
+            expected_ipa: SubstrateGpa(ipa),
+            access: LeafAccess::Write,
+        };
+        let id2 = DescriptorTxnId {
+            generation: core::num::NonZeroU64::new(2).unwrap(),
+            ..id
+        };
+        let copyout_txn = mgr.prepare_guest_descriptor_txn(id2, copyout).unwrap();
+        assert!(copyout_txn.tables.is_empty());
+        let before = live_arena_bytes(&resolver);
+        assert!(slot.submit(&copyout_txn));
+        assert_eq!(live_arena_bytes(&resolver), before);
+        guest_apply(&resolver, &slot, 41, &maintenance).unwrap();
+        let receipt = slot.take_receipt(id2).unwrap();
+        let verified = mgr
+            .settle_guest_descriptor_receipt(&copyout_txn, &receipt)
+            .unwrap();
+        assert_eq!(verified.resident(), PageSpan::new(va, PT_PAGE));
+        assert_eq!(mgr.translate(va), Some(ipa));
+
+        // A refused submission returns every grant it carried.
+        let id3 = DescriptorTxnId {
+            generation: core::num::NonZeroU64::new(3).unwrap(),
+            ..id
+        };
+        let occupied = mgr.prepare_guest_descriptor_txn(id3, op);
+        assert_eq!(
+            occupied,
+            Err(GuestTxnPrepareError::Refused(
+                descriptor_txn::DescriptorRefusal::AlreadyValid
+            ))
+        );
+    }
+
+    #[test]
+    fn host_lane_images_never_build_guest_transactions() {
+        let (mut mgr, _resolver) = create_live_fixture();
+        let id = descriptor_txn::DescriptorTxnId {
+            mm_key: core::num::NonZeroU64::new(1).unwrap(),
+            generation: core::num::NonZeroU64::new(1).unwrap(),
+        };
+        assert_eq!(
+            mgr.prepare_guest_descriptor_txn(
+                id,
+                descriptor_txn::DescriptorOp::Retire(descriptor_txn::PageSpan::new(
+                    LINUX_MMAP_BASE,
+                    PT_PAGE
+                ))
+            ),
+            Err(GuestTxnPrepareError::NotGuestOwned)
+        );
+    }
+
+    /// A guest fork-arm transaction and the host editor produce the same
+    /// terminal descriptor for every page of every armed range and of their
+    /// neighbours, across prepared/resident EL1 grants, untagged host
+    /// aliases, fully and partially covered coarse blocks, kernel-only
+    /// ranges and never-populated reservations.
+    #[test]
+    fn guest_fork_arm_matches_the_host_editor_page_for_page() {
+        use core::sync::atomic::AtomicU64;
+        use descriptor_txn::{
+            CallerInvalidatesAsid, DescriptorOutcome, InlineJournal, PrimaryTableWords,
+            TableGrants, execute_descriptor_op,
+        };
+        const TWO_MIB: u64 = 1 << 21;
+        let mut image = hvpatch_manager();
+        let grant_va = LINUX_MMAP_BASE + 0x40_0000;
+        image
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va: grant_va,
+                    ipa: LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+                    len: 4 * PT_PAGE,
+                    writable: true,
+                    executable: false,
+                },
+                grant_va + PT_PAGE,
+                None,
+            )
+            .unwrap();
+        let block_va = LINUX_MMAP_BASE + 4 * TWO_MIB;
+        image
+            .set_rw(block_va, 2 * TWO_MIB as usize, false, None)
+            .unwrap();
+        image.declare_live_hardware_image();
+        // (va, len, kernel_only, executable)
+        let ranges = [
+            (grant_va, 4 * PT_PAGE, false, false),
+            (block_va, TWO_MIB, false, false),
+            (block_va + TWO_MIB + 3 * PT_PAGE, 5 * PT_PAGE, false, false),
+            (block_va + TWO_MIB + 64 * PT_PAGE, 2 * PT_PAGE, true, false),
+            (
+                LINUX_MMAP_BASE + 16 * TWO_MIB + PT_PAGE,
+                3 * PT_PAGE,
+                false,
+                false,
+            ),
+        ];
+
+        let mut host = image.snapshot_image().unwrap();
+        host.declare_live_hardware_image();
+        for &(va, len, kernel_only, executable) in &ranges {
+            if kernel_only {
+                host.set_kernel_readonly(va, len as usize, executable, None)
+                    .unwrap();
+            } else {
+                host.set_fork_readonly(va, len as usize, None).unwrap();
+            }
+        }
+
+        let mut guest = image;
+        let base = guest.base();
+        let mut bytes = guest.as_bytes().to_vec();
+        bytes.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let words: Vec<AtomicU64> = bytes
+            .chunks_exact(8)
+            .map(|w| AtomicU64::new(u64::from_le_bytes(w.try_into().unwrap())))
+            .collect();
+        let maintenance = CallerInvalidatesAsid;
+        let live = unsafe {
+            PrimaryTableWords::new(
+                words.as_ptr().cast_mut(),
+                base,
+                words.len() * 8,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        let mut linked_total = 0;
+        for &(va, len, kernel_only, executable) in &ranges {
+            let op = guest.fork_arm_op(va, len, kernel_only, executable);
+            let plan = descriptor_txn::plan_descriptor_op(&live, SubstrateGpa(base), op).unwrap();
+            let grants: TableGrants = guest
+                .reserve_primary_table_grants(plan.table_grants)
+                .unwrap();
+            let outcome = execute_descriptor_op(
+                &live,
+                SubstrateGpa(base),
+                op,
+                &grants,
+                &mut InlineJournal::new(),
+            );
+            let DescriptorOutcome::Applied(applied) = outcome else {
+                panic!("fork arm {va:#x} not applied: {outcome:?}");
+            };
+            linked_total += usize::from(applied.tables_linked);
+        }
+        assert!(linked_total >= 2, "range edges inside coarse blocks split");
+
+        let guest_bytes: Vec<u8> = words
+            .iter()
+            .flat_map(|w| w.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes())
+            .collect();
+        for &(va, len, _, _) in &ranges {
+            let mut page = va.saturating_sub(2 * PT_PAGE);
+            while page < va + len + 2 * PT_PAGE {
+                let host_leaf = terminal_descriptor(host.debug_walk(page));
+                let guest_leaf = terminal_descriptor(walk_descriptors(&guest_bytes, base, page));
+                assert_eq!(
+                    host_leaf, guest_leaf,
+                    "page {page:#x}: host {host_leaf:#x} guest {guest_leaf:#x}"
+                );
+                page += PT_PAGE;
+            }
+        }
     }
 }

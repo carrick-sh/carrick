@@ -1390,6 +1390,18 @@ where
         mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
+        if signal::guest_grants_awaiting_settlement() {
+            // Residency EL1 already published is settled before the syscall
+            // reads it (mincore, madvise, copyout into a granted page).
+            let mutation = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "settle guest grants before syscall: {error:?}"
+                    ))
+                })?;
+            signal::settle_guest_frame_grants(&kernel.dispatcher, engine, &mutation)
+                .map_err(RuntimeError::Trap)?;
+        }
         if !crate::el1_census::enabled() {
             return self.service_threaded_syscall_for_executor_inner(
                 kernel,

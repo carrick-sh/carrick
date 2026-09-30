@@ -1,0 +1,13 @@
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.54s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-fea42d8256e59d6b)
+
+running 3 tests
+test engine::tests::guest_owned_lane_has_no_engine_live_descriptor_store ... ok
+test engine::tests::wait_diagnostics_prefer_post_syscall_guest_resume_pc ... ok
+test stage1_authority::tests::guest_owned_authority_refuses_host_live_stores_and_builds_guest_transactions ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 0.04s
+

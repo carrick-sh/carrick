@@ -1,0 +1,56 @@
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel-example v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.87s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-aae5e357a01dabd8)
+
+running 37 tests
+test execute::exit_code_tests::seed_guest_baseline_adds_bridge_host_gateway_names ... ok
+test execute::exit_code_tests::seed_guest_baseline_does_not_shadow_rootfs_symlinks ... ok
+test execute::exit_code_tests::seed_guest_baseline_expands_extra_host_gateway_token ... ok
+test execute::exit_code_tests::seed_guest_baseline_extra_hosts_override_generated_gateway_name ... ok
+test execute::exit_code_tests::seed_guest_baseline_writes_extra_hosts_entries ... ok
+test execute::exit_code_tests::seed_guest_baseline_writes_requested_hostname_surfaces ... ok
+test hvpatch::patcher::tests::patched_syscall_branch_does_not_write_the_guest_link_register ... ok
+test vcpu_loop::binding::tests::guest_run_accounting_uses_non_aliasing_engine_receipts ... ok
+test vcpu_loop::binding::tests::initial_execution_authority_precedes_registration_and_guest_run ... ok
+test vcpu_loop::binding::tests::persistent_exec_stop_control_wakes_unreleased_vfork_parent_without_guest_readiness ... ok
+test vcpu_loop::binding::tests::retired_host_wait_finishes_only_its_thread_without_guest_return ... ok
+test vcpu_loop::continuation::tests::kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sidecars ... ok
+test vcpu_loop::exec::tests::guest_syscall_completion_owner_retains_token_inline ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_guest_exec_failure_completes_errno_once ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_delayed_guest_and_internal_suffix_errors_consume_origins ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_delayed_guest_exec_drain_finish_error_consumes_origin ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_guest_exec_missing_token_is_rejected ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_guest_valid_exec_authenticates_before_preparation ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_immediate_guest_exec_drain_begin_error_consumes_origin ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_immediate_guest_exec_suffix_error_consumes_origin ... ok
+test vcpu_loop::executor::tests::spares_take_only_what_the_vcpu_budget_leaves_after_the_guest_cpus ... ok
+test vcpu_loop::executor::tests::test_lazy_vcpu_source_shape_no_guest_cpu_from_resident_lease ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_uses_live_leaf_after_guest_publication ... ok
+test vcpu_loop::memory::tests::native_buffers::repeated_copyout_crosses_private_guest_pages ... ok
+test vcpu_loop::memory::tests::native_buffers::stage1_snapshot_observes_live_leaf_after_guest_publication ... ok
+test vcpu_loop::quiesce::pt_pause_tests::raised_pt_pause_denies_guest_reentry_until_guard_releases ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::a_fork_arm_on_the_wrong_vcpu_or_blocked_is_an_error_and_leaves_no_slot ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::a_retiring_mm_releases_exactly_its_slots_and_ledger_entries ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::fork_commit_and_syscall_entry_order_guest_descriptor_work ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::guest_cow_repoints_only_after_copy_inventory_and_a_verified_receipt ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::guest_grant_retries_until_its_receipt_then_commits_exact_residency_once ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::mm_bind_and_retirement_sites_select_and_withdraw_the_guest_lane ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::refused_or_indeterminate_guest_grants_never_commit_residency ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::the_fork_arm_lands_in_order_and_settles_before_the_fork_commits ... ok
+test vcpu_loop::signal::guest_descriptor_lane_tests::the_lane_stays_unselected_until_every_writer_is_converted ... ok
+test vcpu_loop::terminal::tests::guest_visible_resume_pc_passes_through_a_non_island_pc_unchanged ... ok
+test vcpu_loop::terminal::tests::guest_visible_resume_pc_recovers_the_original_svc_return_address ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 0.29s
+

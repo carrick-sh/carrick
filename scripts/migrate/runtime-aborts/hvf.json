@@ -2015,6 +2015,17 @@
       "rationale": "A vCPU create after the VM generation's first run, a first run during teardown, or a destroy before teardown violates Hypervisor.framework's final-topology rule (hv_gic.h) that EL1 plan 1a D2 makes structural; continuing would run the in-kernel GIC on a topology HVF forbids.",
       "sink": "fatal",
       "domain": "hvf::vcpu_lifetime"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+      "function": "HostCowStats::record_host_cow_resolution",
+      "ordinal_in_function": 1,
+      "fingerprint": "01b749cfb2bbcfa99598d2d7d7974d9659810791f60e013493a683b97637dd3e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_accounting",
+      "rationale": "Exact-MM completed host COW accounting exhausted its nonwrapping counter. Continuing would lose the required structural measurement and could falsely certify guest ownership; stop the carrier instead of wrapping or silently dropping completed work.",
+      "sink": "fatal",
+      "domain": "hvpatch::cow_accounting"
     }
   ]
 }
