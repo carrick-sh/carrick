@@ -63,14 +63,25 @@ an active descriptor lane. Do not count this plan edit as implementation progres
    superseded authority, prove pause-free progress once all writers are converted,
    then run full checkpoint correctness, structural and workload-cost acceptance.
 
-**Immediate implementation unit:** existing engine private/shared repoint callers
-through verified EL1 descriptor publication and subsequent backend alias
-bookkeeping. Source inspection shows the engine performs the descriptor write;
-private backend publication is bookkeeping, while shared backend publication
-also repeats the descriptor edit. Classify by actual mutation, not method name.
-Preserve physical-owner pins through completion and distinguish inventory mapping
-extents from physical-owner extents. Use the existing journal and submission
-channel; do not use COW byte copying to implement an alias-only mapping.
+**Immediate implementation unit:** replacement-grant retirement and retired/sparse
+backing publication. Convert the actual writer and its rollback/completion route
+using existing descriptor transactions and retained backing authority. Then
+foreign-MM publication and the remaining engine/exec writers. The finite known
+caller worklist is adapter memory-integration `descriptor-writers.md`; reconcile
+it against live/offline construction and compiler evidence before enabling admission.
+
+**Alias callers connected, adapter `cdb5abd64`:** both engine private/shared
+repoint callers now use the driving-vCPU service on the guest lane. MapAlias
+protocol v5 uses existing grants/journal, preserves correctly aligned coarse
+outputs and performs break-before-make. All target mappings are authenticated and
+physical owners pinned under exact-MM exclusion before private seeding or
+publication. Metadata commits after exact receipts. Logical inventory extent and
+physical owner extent are checked independently. Red NotPrepared and missing-BBM
+controls, eight-store rollback, MMU 165, EL1 114, engine 75, backend 11, focused
+authority/bookkeeping, affected Clippy and hardware image build pass; see
+`alias-caller.md`. The engine source assertion was stale after the earlier COW
+service refactor and now verifies that ASID-scoped service. Admission remains
+disabled; full caller/hardware composition and checkpoint acceptance stay open.
 
 **Writer removed, adapter `ec366760f`:** shared backend repoint no longer
 repeats the engine's descriptor edit. Its production hook checks the full expected
@@ -78,14 +89,13 @@ translation before publishing metadata. The red witness caught silent creation
 of an unpublished leaf; green covers missing/partial/wrong-output/read-only
 mappings and success with host edits prohibited. Focused check, 11 backend tests
 and affected Clippy pass; see `repoint-publication.md`. This is one writer removed,
-not an active EL1 lane. The engine private/shared writer remains the immediate
-conversion target; private backend publication is bookkeeping, still lane-guarded.
-Adapter is clean at this commit; no main advancement or signed acceptance.
+not an active EL1 lane. The subsequent alias caller conversion is recorded above.
+The adapter is clean at `cdb5abd64`; no main advancement or signed acceptance.
 
-Finish this unit with caller-connected rollback/refusal coverage. Then convert
-replacement/retired/sparse/foreign writers and engine protection/discard/exec,
-using one finite caller checklist beside the implementation. No separate framework
-or new transport project. Every added abstraction must have its production caller
+Finish each remaining writer with caller-connected rollback/refusal coverage.
+The alias conversion is committed prerequisite work; do not restart it or treat
+its lower-layer tests as execution evidence. No separate framework or new
+transport project. Every added abstraction must have its production caller
 in the same implementation unit. Do not remove ownership guards or enable partial
 admission to obtain an early green result.
 
