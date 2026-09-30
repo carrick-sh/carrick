@@ -4060,6 +4060,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.prepare_el1_frame_grant(request)
     }
 
+    fn roll_back_el1_frame_grant(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, TrapError> {
+        self.vm.roll_back_el1_frame_grant(grant)
+    }
+
     fn publish_el1_frame_grant(
         &mut self,
         grant: carrick_hal::threaded::El1FrameGrantPublication,

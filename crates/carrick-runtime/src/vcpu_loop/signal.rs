@@ -629,19 +629,71 @@ pub(super) fn withdraw_guest_descriptor_work(mm_key: u64) -> usize {
         .map_or(0, |slots| GUEST_GRANT_LEDGER.withdraw_mm(slots, mm_key))
 }
 
+impl PendingGuestGrant {
+    /// What the backend published for this grant before submission, as the
+    /// backend's single rollback names it.
+    pub(super) fn rollback(&self) -> carrick_hal::threaded::El1FrameGrantRollback {
+        carrick_hal::threaded::El1FrameGrantRollback {
+            mm_key: self.residency.mm_key,
+            semantic_base: self.residency.semantic_base,
+            len: self.residency.len,
+            ready: carrick_hal::El1FrameGrantReady {
+                physical_ipa: self.residency.physical_ipa,
+                frame_id: self.residency.frame_id,
+                mapping_id: self.residency.mapping_id,
+                owner_generation: self.residency.owner_generation,
+                inventory_revision: self.residency.inventory_revision,
+            },
+        }
+    }
+}
+
+/// The backend side of settling one guest grant receipt.
+pub(super) trait GuestGrantBackend {
+    /// Authenticate EL1's receipt against the retained submission and
+    /// return its unused table grants.
+    fn verify(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
+    /// Undo what the backend published for a grant EL1 never exposed.
+    fn roll_back(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, TrapError>;
+}
+
+/// The production backend: the engine that prepared the MM's grants.
+pub(super) struct EngineGrantBackend<'a, E>(pub(super) &'a mut E);
+
+impl<E: ThreadedEngine> GuestGrantBackend for EngineGrantBackend<'_, E> {
+    fn verify(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        self.0.settle_el1_descriptor_receipt(txn, receipt)
+    }
+
+    fn roll_back(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, TrapError> {
+        self.0.roll_back_el1_frame_grant(grant)
+    }
+}
+
 /// Authenticate one guest grant receipt, then commit exactly its resident
 /// span. Residency is never committed before EL1's publication is proven,
-/// and an unauthenticated or indeterminate receipt fails stopped.
+/// and an unauthenticated or indeterminate receipt fails stopped. A refused
+/// or rolled-back grant exposed no leaf, so what the backend published for
+/// it before submission is rolled back.
 pub(super) fn settle_guest_frame_grant(
     pending: PendingGuestGrant,
     receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    verify: impl FnOnce(
-        &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-        &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    ) -> Result<
-        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
-        TrapError,
-    >,
+    backend: &mut impl GuestGrantBackend,
     commit: impl FnOnce(
         &PendingGuestGrant,
         carrick_mmu_core::aarch64::descriptor_txn::PageSpan,
@@ -650,14 +702,15 @@ pub(super) fn settle_guest_frame_grant(
     use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
     match receipt.outcome {
         DescriptorOutcome::Applied(_) => {
-            let verified = verify(&pending.txn, receipt)?;
+            let verified = backend.verify(&pending.txn, receipt)?;
             commit(&pending, verified.resident())?;
             Ok(GuestGrantSettlement::Committed(verified.resident()))
         }
         DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
             // Settlement returns the grants of a refused transaction and
             // reports it as not applied, which is the expected answer here.
-            let _ = verify(&pending.txn, receipt);
+            let _ = backend.verify(&pending.txn, receipt);
+            backend.roll_back(pending.rollback())?;
             Ok(GuestGrantSettlement::Refused(refusal))
         }
         DescriptorOutcome::Indeterminate(refusal) => Err(TrapError::Hypervisor(format!(
@@ -681,7 +734,7 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
         settle_guest_frame_grant(
             pending,
             &receipt,
-            |txn, receipt| engine.settle_el1_descriptor_receipt(txn, receipt),
+            &mut EngineGrantBackend(&mut *engine),
             |pending, _resident| {
                 let permit = mutation.host_alias_permit();
                 let plan = dispatcher
@@ -990,6 +1043,16 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     },
                 )?;
                 if !completed {
+                    // Nothing exposed the prepared backing: undo exactly what
+                    // `prepare_el1_frame_grant` published before refusing.
+                    EngineGrantBackend(&mut *engine).roll_back(
+                        carrick_hal::threaded::El1FrameGrantRollback {
+                            mm_key: service.mm_key,
+                            semantic_base: service.semantic_base,
+                            len: service.len,
+                            ready,
+                        },
+                    )?;
                     publish_frame_grant_refusal(
                         mailbox,
                         request,
@@ -2479,6 +2542,43 @@ mod guest_descriptor_lane_tests {
         }
     }
 
+    /// The engine's settlement side over a bare authority, recording the
+    /// backend rollbacks it is asked for.
+    struct AuthorityBackend<'a> {
+        authority: &'a Stage1Authority,
+        rolled_back: Vec<carrick_hal::threaded::El1FrameGrantRollback>,
+    }
+
+    impl<'a> AuthorityBackend<'a> {
+        fn new(authority: &'a Stage1Authority) -> Self {
+            Self {
+                authority,
+                rolled_back: Vec::new(),
+            }
+        }
+    }
+
+    impl GuestGrantBackend for AuthorityBackend<'_> {
+        fn verify(
+            &mut self,
+            txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+            receipt: &DescriptorReceipt,
+        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+        {
+            self.authority
+                .settle_guest_descriptor_receipt(txn, receipt)
+                .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
+        }
+
+        fn roll_back(
+            &mut self,
+            grant: carrick_hal::threaded::El1FrameGrantRollback,
+        ) -> Result<bool, TrapError> {
+            self.rolled_back.push(grant);
+            Ok(true)
+        }
+    }
+
     fn settle_with(
         authority: &Stage1Authority,
         commits: &mut Vec<(PendingGuestGrant, PageSpan)>,
@@ -2488,11 +2588,7 @@ mod guest_descriptor_lane_tests {
             settle_guest_frame_grant(
                 pending,
                 &receipt,
-                |txn, receipt| {
-                    authority
-                        .settle_guest_descriptor_receipt(txn, receipt)
-                        .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
-                },
+                &mut AuthorityBackend::new(authority),
                 |pending, resident| {
                     commits.push((*pending, resident));
                     Ok(())
@@ -2678,11 +2774,7 @@ mod guest_descriptor_lane_tests {
                 let outcome = settle_guest_frame_grant(
                     pending,
                     &receipt,
-                    |txn, receipt| {
-                        authority
-                            .settle_guest_descriptor_receipt(txn, receipt)
-                            .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
-                    },
+                    &mut AuthorityBackend::new(&authority),
                     |_, _| panic!("a refused transaction must not commit"),
                 );
                 if let Ok(settled) = outcome {
@@ -2702,12 +2794,9 @@ mod guest_descriptor_lane_tests {
             outcome: DescriptorOutcome::Indeterminate(DescriptorRefusal::Contended),
         };
         assert!(
-            settle_guest_frame_grant(
-                pending,
-                &indeterminate,
-                |_, _| panic!("never verified"),
-                |_, _| panic!("never committed"),
-            )
+            settle_guest_frame_grant(pending, &indeterminate, &mut PanicBackend, |_, _| panic!(
+                "never committed"
+            ),)
             .is_err()
         );
         // An applied receipt that does not authenticate fails stopped too.
@@ -2727,15 +2816,91 @@ mod guest_descriptor_lane_tests {
             settle_guest_frame_grant(
                 pending,
                 &forged,
-                |txn, receipt| {
-                    authority
-                        .settle_guest_descriptor_receipt(txn, receipt)
-                        .map_err(|error| TrapError::Hypervisor(format!("{error:?}")))
-                },
+                &mut AuthorityBackend::new(&authority),
                 |_, _| panic!("never committed"),
             )
             .is_err()
         );
+    }
+
+    /// A backend that must not be consulted.
+    struct PanicBackend;
+
+    impl GuestGrantBackend for PanicBackend {
+        fn verify(
+            &mut self,
+            _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+            _receipt: &DescriptorReceipt,
+        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+        {
+            panic!("never verified")
+        }
+
+        fn roll_back(
+            &mut self,
+            _grant: carrick_hal::threaded::El1FrameGrantRollback,
+        ) -> Result<bool, TrapError> {
+            panic!("never rolled back")
+        }
+    }
+
+    /// The backend registered backing, inventory, an alias and a mapping
+    /// row, and committed the pristine transition, before EL1 published.
+    /// A refused or rolled-back receipt exposed no leaf, so settlement must
+    /// hand exactly that publication to the backend's rollback, once; an
+    /// applied one must not.
+    #[test]
+    fn a_refused_or_rolled_back_guest_grant_rolls_back_its_publication_once() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        let pending = PendingGuestGrant {
+            txn,
+            fault_va: VA,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: residency(),
+        };
+        for outcome in [
+            DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+            DescriptorOutcome::RolledBack(DescriptorRefusal::Contended),
+        ] {
+            let receipt = DescriptorReceipt {
+                id: txn.id,
+                digest: txn.digest(),
+                outcome,
+            };
+            let mut backend = AuthorityBackend::new(&authority);
+            assert!(matches!(
+                settle_guest_frame_grant(pending, &receipt, &mut backend, |_, _| panic!(
+                    "a refused grant never commits"
+                )),
+                Ok(GuestGrantSettlement::Refused(_))
+            ));
+            assert_eq!(
+                backend.rolled_back,
+                vec![pending.rollback()],
+                "{outcome:?} left the grant's backing registered"
+            );
+        }
+        let rollback = pending.rollback();
+        assert_eq!(
+            (rollback.mm_key, rollback.semantic_base, rollback.len),
+            (MM, VA, 4 * 4096)
+        );
+        assert_eq!(rollback.ready.physical_ipa, IPA);
+        assert_eq!(rollback.ready.owner_generation, 3);
+        // Applied: the grant is live; nothing is rolled back.
+        assert!(slots.submit(0, &txn));
+        let applied = el1_apply(&resolver, &slots, 0).unwrap();
+        let mut backend = AuthorityBackend::new(&authority);
+        assert!(matches!(
+            settle_guest_frame_grant(pending, &applied, &mut backend, |_, _| Ok(())),
+            Ok(GuestGrantSettlement::Committed(_))
+        ));
+        assert!(backend.rolled_back.is_empty());
     }
 
     #[test]
