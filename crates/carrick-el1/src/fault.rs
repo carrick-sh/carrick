@@ -696,6 +696,58 @@ pub fn dispatch_fault_with_regions<C: CowResolver>(
     )
 }
 
+/// Release one observed refusal. A racing consumer may have released it
+/// first; either way it no longer occupies the mailbox for this fault.
+fn release_refusal(source: &FrameGrantMailbox, mm_key: u64, request_generation: u64) {
+    if source.claim_response(mm_key, request_generation).is_some() {
+        assert!(source.finish_response(mm_key, request_generation));
+    }
+}
+
+/// Consume the refusal answering this fault, left on the faulting vCPU's
+/// mailbox or, after an EL1 scheduler migration, on a peer's. `true` when one
+/// was found.
+fn consume_refusal(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, access: u64) -> bool {
+    let found = mailboxes
+        .own
+        .response_for_fault(mm_key, far, access)
+        .map(|response| (mailboxes.own, response))
+        .or_else(|| {
+            mailboxes.peers?.iter().find_map(|peer| {
+                peer.response_covering_fault(mm_key, far, access)
+                    .map(|response| (peer, response))
+            })
+        });
+    let Some((source, response)) = found else {
+        return false;
+    };
+    release_refusal(source, mm_key, response.request.request_generation);
+    true
+}
+
+/// A fault the residency table served may still have a refusal outstanding
+/// for its page: its request raced the host settling the grant that now
+/// covers it, and the host refused the no-longer-pristine span. The retry
+/// never reaches the refusal path, so every refusal covering the page is
+/// consumed here; the page is resident, so none of them still answers a
+/// fault. Left in RESPONSE, a mailbox could never carry another request, and
+/// every later first touch on that vCPU slot, in any MM, would fall back to
+/// page-granular host service.
+fn consume_served_refusals(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, esr: u64) {
+    let Some(access) = frame_grant_access(esr) else {
+        return;
+    };
+    let release = |source: &FrameGrantMailbox| {
+        if let Some(response) = source.response_covering_fault(mm_key, far, access) {
+            release_refusal(source, mm_key, response.request.request_generation);
+        }
+    };
+    release(mailboxes.own);
+    if let Some(peers) = mailboxes.peers {
+        peers.iter().for_each(release);
+    }
+}
+
 pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
@@ -705,10 +757,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     mut prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
 ) -> Action {
-    let GrantMailboxes {
-        own: mailbox,
-        peers,
-    } = mailboxes;
+    let mailbox = mailboxes.own;
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
     if is_write_permission_fault(frame.esr) {
         let Some(task) = current_tasks.get(frame.slot as usize) else {
@@ -772,9 +821,13 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         ) {
             Ok(GuestPreparedCommit::Committed) => {
                 assert!(path.residency.record_commit(page));
+                consume_served_refusals(mailboxes, mm_key, frame.far, frame.esr);
                 return Action::Served;
             }
-            Ok(GuestPreparedCommit::AlreadyResident) => return Action::Served,
+            Ok(GuestPreparedCommit::AlreadyResident) => {
+                consume_served_refusals(mailboxes, mm_key, frame.far, frame.esr);
+                return Action::Served;
+            }
             Err(GuestPreparedCommitError::RollbackFailed) => {
                 panic!("EL1 prepared-page commit rollback failed")
             }
@@ -786,22 +839,9 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         return Action::Forward;
     };
 
-    let found = mailbox
-        .response_for_fault(mm_key, frame.far, access)
-        .map(|response| (mailbox, response))
-        .or_else(|| {
-            peers?.iter().find_map(|peer| {
-                peer.response_covering_fault(mm_key, frame.far, access)
-                    .map(|response| (peer, response))
-            })
-        });
-    if let Some((source, response)) = found {
-        let generation = response.request.request_generation;
-        // Only refusals cross back to EL1. Successful grants have already
-        // published and released their slot on the host, even after migration.
-        if source.claim_response(mm_key, generation).is_some() {
-            assert!(source.finish_response(mm_key, generation));
-        }
+    // Only refusals cross back to EL1. Successful grants have already
+    // published and released their slot on the host, even after migration.
+    if consume_refusal(mailboxes, mm_key, frame.far, access) {
         return Action::Forward;
     }
 
@@ -1166,6 +1206,113 @@ mod tests {
         );
         assert!(!mailbox.has_guest_work());
         assert_ne!(request.request_generation, 0);
+    }
+
+    /// Guest-lane shape: a fault inside a grant EL1 already applied, before
+    /// the host settled it, requests again; the host settles (publishing
+    /// residency) and refuses the now non-pristine span. The retry is then
+    /// served from residency. Its refusal must be consumed there too: left in
+    /// RESPONSE, the vCPU slot's mailbox can never carry another request, so
+    /// every later first touch on that slot, in any MM, is page-granular.
+    #[test]
+    fn a_refusal_whose_retry_is_served_from_residency_is_consumed() {
+        let mm = 83;
+        let base = 0x4000_0000;
+        let va = base + 0x5000;
+        for migrated in [false, true] {
+            let task = CurrentTask::new();
+            task.zone_mm.store(mm, Ordering::Release);
+            let tasks = [task, CurrentTask::new()];
+            tasks[1].zone_mm.store(mm, Ordering::Release);
+            let spaces = published_space(mm, 0x8800_0000);
+            let boxes = FrameGrantMailboxes::new();
+            let origin = boxes.slot(0).unwrap();
+            let counters = Counters::default();
+            let table = carrick_el1_abi::FrameGrantResidencyTable::new();
+            let mut first = write_translation_fault(0, va);
+            assert_eq!(
+                dispatch_fault_with_prepared(
+                    &mut first,
+                    &counters,
+                    &tasks,
+                    &spaces,
+                    GrantMailboxes {
+                        own: origin,
+                        peers: Some(&boxes),
+                    },
+                    Some(PreparedFaultPath {
+                        residency: &table,
+                        resolver: &mut RecordingPreparedResolver::default(),
+                    }),
+                    &mut NoopCowResolver,
+                ),
+                Action::Forward
+            );
+            assert!(origin.claim_request().is_some());
+            table
+                .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                    mm_key: mm,
+                    semantic_base: base,
+                    physical_ipa: 0x9000_0000,
+                    len: 16 * 4096,
+                    mapping_id: 11,
+                    frame_id: 12,
+                    owner_generation: 13,
+                    inventory_revision: 14,
+                })
+                .unwrap();
+            assert!(origin.publish_refusal(FRAME_GRANT_ERR_DENIED));
+
+            let retry_slot = u64::from(migrated);
+            let mut retry = write_translation_fault(retry_slot, va);
+            let own = boxes.slot(retry_slot as usize).unwrap();
+            assert_eq!(
+                dispatch_fault_with_prepared(
+                    &mut retry,
+                    &counters,
+                    &tasks,
+                    &spaces,
+                    GrantMailboxes {
+                        own,
+                        peers: Some(&boxes),
+                    },
+                    Some(PreparedFaultPath {
+                        residency: &table,
+                        resolver: &mut RecordingPreparedResolver::default(),
+                    }),
+                    &mut NoopCowResolver,
+                ),
+                Action::Served
+            );
+            assert!(
+                boxes.iter().all(|mailbox| !mailbox.has_guest_work()),
+                "migrated={migrated}: a refusal outlived the fault it answered"
+            );
+
+            let mut next = write_translation_fault(0, base + 0x20_0000);
+            assert_eq!(
+                dispatch_fault_with_prepared(
+                    &mut next,
+                    &counters,
+                    &tasks,
+                    &spaces,
+                    GrantMailboxes {
+                        own: origin,
+                        peers: Some(&boxes),
+                    },
+                    Some(PreparedFaultPath {
+                        residency: &table,
+                        resolver: &mut RecordingPreparedResolver::default(),
+                    }),
+                    &mut NoopCowResolver,
+                ),
+                Action::Forward
+            );
+            assert!(
+                origin.claim_request().is_some(),
+                "migrated={migrated}: the next first touch could not request a grant"
+            );
+        }
     }
 
     #[test]
