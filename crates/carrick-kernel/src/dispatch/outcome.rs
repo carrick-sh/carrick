@@ -1098,6 +1098,12 @@ pub enum DispatchError {
     Errno(LinuxErrno),
     #[error("fatal file authority error: {0:?}")]
     FileAuthorityFatal(crate::file_authority::AuthorityFatal),
+    /// The shared EL1 reservation root that owns this MM's delegated anonymous
+    /// facts refused a host-venue step that its ownership invariant requires
+    /// to succeed (exact MM, admitted root, host queue held). Fatal: no host
+    /// copy exists to answer from instead.
+    #[error("reservation root refused a host-venue step: {0:?}")]
+    ReservationAuthority(carrick_el1::memory::reservations::Refusal),
     #[error("MM executor admission failed: {0}")]
     MmExecutorAdmission(crate::kernel::MmOccupancyError),
     #[error("MM mutation requires a page-table pause while a peer executor is active")]

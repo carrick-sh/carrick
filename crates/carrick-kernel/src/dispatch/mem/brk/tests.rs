@@ -10,7 +10,7 @@ fn brk_shrink_scrubs_backing_before_regrowth() {
     let mut dispatcher = SyscallDispatcher::new();
     let initial = dispatcher.mem().lock().layout.heap_base;
     let grown = initial + PAGES * LINUX_PAGE_SIZE;
-    dispatcher.mem().lock().brk_current = grown;
+    dispatcher.mem().lock().seed_brk_current_for_test(grown);
 
     let mut memory = CountingMmapMemory::new(initial, (PAGES * LINUX_PAGE_SIZE) as usize);
     memory.bytes.fill(0xa5);
@@ -294,7 +294,279 @@ fn brk_growth_past_rlimit_data_returns_the_unchanged_break() {
         "brk past RLIMIT_DATA must report the unchanged break"
     );
     assert_eq!(
-        dispatcher.mem().lock().brk_current,
+        dispatcher.mem().lock().program_break(),
         initial + LINUX_PAGE_SIZE
     );
+}
+
+/// S1a: an MM whose shared EL1 reservation root is admitted owns its program
+/// break in that root. Host-forwarded `brk` and a guest-venue `brk` applied to
+/// the root are the SAME authority; MemState keeps no second copy.
+mod delegated {
+    use super::super::super::tests::{CountingMmapMemory, returned};
+    use super::*;
+    use crate::dispatch::mem::el1_reservations::{
+        HostReservationProvider, PreparedHostReservations,
+    };
+    use carrick_el1::memory::reservations::{
+        Decision, Layout, Refusal, Reservations, SharedReservations,
+    };
+    use carrick_el1_abi::{
+        ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationRange,
+    };
+
+    const SYS_BRK: u64 = 214;
+    const SYS_PRLIMIT64: u64 = 261;
+    const LINUX_RLIMIT_DATA: u64 = 2;
+
+    struct Root {
+        table: Arc<SharedReservations>,
+        mm: ReservationMm,
+    }
+
+    struct View(Arc<SharedReservations>, ReservationMm);
+    impl PreparedHostReservations for View {
+        fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
+            if mm != self.1 {
+                return Err(Refusal::Stale);
+            }
+            self.0.lock(0, mm)
+        }
+    }
+    struct Provider(Arc<SharedReservations>, ReservationMm);
+    impl HostReservationProvider for Provider {
+        fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
+            Ok(Box::new(View(Arc::clone(&self.0), self.1)))
+        }
+    }
+
+    impl Root {
+        /// Publish this dispatcher MM's root, install the carrier provider and
+        /// seal the break into the root (the conformance-fixture admission).
+        fn admit(dispatcher: &SyscallDispatcher) -> Self {
+            // Same zeroed-region initialization as EL1 bootstrap.
+            let ptr = unsafe {
+                std::alloc::alloc_zeroed(std::alloc::Layout::new::<SharedReservations>())
+            };
+            assert!(!ptr.is_null());
+            let table: Arc<SharedReservations> =
+                Arc::from(unsafe { Box::<SharedReservations>::from_raw(ptr.cast()) });
+            let mm = ReservationMm::new(dispatcher.mm_authority().mm_id.raw()).unwrap();
+            let layout = dispatcher.mem().lock().layout;
+            table
+                .publish(
+                    0,
+                    mm,
+                    Layout {
+                        heap: ReservationRange::new(
+                            layout.heap_base,
+                            layout.heap_base + layout.heap_size,
+                        )
+                        .unwrap(),
+                        arena: ReservationRange::new(
+                            layout.mmap_base,
+                            layout.mmap_base + layout.mmap_size,
+                        )
+                        .unwrap(),
+                        brk: layout.heap_base,
+                        address_limit: u64::MAX,
+                        data_limit: u64::MAX,
+                        external_address_bytes: 0,
+                        external_data_bytes: 0,
+                    },
+                )
+                .unwrap();
+            dispatcher
+                .install_reservation_provider(Arc::new(Provider(Arc::clone(&table), mm)))
+                .unwrap();
+            dispatcher.mem_view().delegate_break_for_test().unwrap();
+            Self { table, mm }
+        }
+
+        fn lock(&self) -> Reservations<'_> {
+            self.table.lock(0, self.mm).unwrap()
+        }
+
+        /// What guest EL1 does for `brk` on its own venue: propose, run the
+        /// descriptor/backing transaction, complete.
+        fn guest_brk(&self, requested: u64) -> u64 {
+            let mut root = self.lock();
+            match root.brk(requested).unwrap() {
+                Decision::Complete(value) => value,
+                Decision::Work(request) => {
+                    // Mock substrate: this VM-free test has no descriptors.
+                    let completion = unsafe {
+                        ReservationCompletion::after_descriptor_and_backing_commit(
+                            request,
+                            ReservationBackingReceipt {
+                                receipt: 1,
+                                granted_bytes: 0,
+                                returned_bytes: 0,
+                            },
+                        )
+                    }
+                    .unwrap();
+                    root.complete(completion).unwrap()
+                }
+            }
+        }
+    }
+
+    fn host_brk(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut CountingMmapMemory,
+        requested: u64,
+    ) -> u64 {
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(SYS_BRK, SyscallArgs([requested, 0, 0, 0, 0, 0])),
+                memory,
+                &CompatReporter::default(),
+            )
+            .expect("brk dispatch");
+        returned(outcome) as u64
+    }
+
+    #[test]
+    fn delegated_brk_host_reads_the_break_a_guest_venue_moved() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let base = dispatcher.mem().lock().layout.heap_base;
+        let mut memory = CountingMmapMemory::new(base, (4 * LINUX_PAGE_SIZE) as usize);
+
+        let guest = base + 2 * LINUX_PAGE_SIZE + 0x10;
+        assert_eq!(root.guest_brk(guest), guest);
+        assert_eq!(
+            host_brk(&mut dispatcher, &mut memory, 0),
+            guest,
+            "host brk(0) must answer from the root the guest venue moved"
+        );
+        // A host shrink starts from the guest's break, not a stale host copy.
+        assert_eq!(
+            host_brk(&mut dispatcher, &mut memory, base + LINUX_PAGE_SIZE),
+            base + LINUX_PAGE_SIZE
+        );
+        assert_eq!(root.lock().brk_current(), base + LINUX_PAGE_SIZE);
+        assert!(
+            memory.zero_backing_calls.get() >= 1,
+            "the host venue still performs its backend retire work"
+        );
+    }
+
+    #[test]
+    fn delegated_brk_host_growth_is_the_root_view() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let base = dispatcher.mem().lock().layout.heap_base;
+        let mut memory = CountingMmapMemory::new(base, (4 * LINUX_PAGE_SIZE) as usize);
+
+        let grown = base + 3 * LINUX_PAGE_SIZE;
+        assert_eq!(host_brk(&mut dispatcher, &mut memory, grown), grown);
+        let mut view = root.lock();
+        assert_eq!(view.brk_current(), grown);
+        let heap = view.mapping(base).expect("root owns the grown heap node");
+        assert_eq!(heap.range, ReservationRange::new(base, grown).unwrap());
+        drop(view);
+        // Guest venue continues from the host's growth.
+        assert_eq!(root.guest_brk(0), grown);
+    }
+
+    #[test]
+    fn delegated_brk_rlimit_data_is_the_roots_answer() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let base = dispatcher.mem().lock().layout.heap_base;
+        let mut memory = CountingMmapMemory::new(base, (4 * LINUX_PAGE_SIZE) as usize);
+        let data_now = super::super::data_va_bytes(&dispatcher.mem().lock());
+        let limit = data_now + LINUX_PAGE_SIZE;
+
+        // setrlimit(RLIMIT_DATA) through the guest ABI, struct in guest memory.
+        let rlimit_at = base + 3 * LINUX_PAGE_SIZE;
+        let mut bytes = limit.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&LINUX_RLIM_INFINITY.to_le_bytes());
+        memory.write_bytes(rlimit_at, &bytes).unwrap();
+        let set = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_PRLIMIT64,
+                    SyscallArgs([0, LINUX_RLIMIT_DATA, rlimit_at, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .expect("prlimit64 dispatch");
+        assert_eq!(returned(set), 0);
+        assert_eq!(
+            root.lock().layout().data_limit,
+            limit,
+            "setrlimit must push RLIMIT_DATA to the root"
+        );
+
+        let one = base + LINUX_PAGE_SIZE;
+        assert_eq!(host_brk(&mut dispatcher, &mut memory, one), one);
+        assert_eq!(
+            host_brk(&mut dispatcher, &mut memory, base + 2 * LINUX_PAGE_SIZE),
+            one,
+            "brk past RLIMIT_DATA returns the unchanged break"
+        );
+        assert_eq!(
+            root.guest_brk(base + 2 * LINUX_PAGE_SIZE),
+            one,
+            "the guest venue reaches the same limit answer"
+        );
+        assert_eq!(root.lock().brk_current(), one);
+    }
+
+    #[test]
+    fn delegated_brk_proc_heap_is_the_roots_break() {
+        let dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let base = dispatcher.mem().lock().layout.heap_base;
+
+        let guest = base + 2 * LINUX_PAGE_SIZE + 0x20;
+        assert_eq!(root.guest_brk(guest), guest);
+        assert_eq!(
+            dispatcher.synthetic_proc_context(&context).brk_current,
+            guest,
+            "/proc [heap] end comes from the root"
+        );
+        let snapshot = dispatcher
+            .mem()
+            .mem
+            .snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        let heap = snapshot
+            .vmas
+            .iter()
+            .find(|vma| vma.start.raw() == base)
+            .expect("[heap] summary row");
+        assert_eq!(heap.end.raw(), guest);
+    }
+
+    #[test]
+    fn delegated_brk_fork_child_inherits_the_value_not_the_root() {
+        let dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let base = dispatcher.mem().lock().layout.heap_base;
+        let first = base + 2 * LINUX_PAGE_SIZE;
+        assert_eq!(root.guest_brk(first), first);
+
+        let child_mm = crate::kernel::MmId::from_registry_allocation(
+            std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
+        );
+        let child = dispatcher.mm_authority().fork_private(child_mm);
+        assert!(matches!(
+            *child.lock().break_authority(),
+            BreakAuthority::HostSetup(value) if value == first
+        ));
+        // The parent's root moves on; the child's break is its own.
+        let second = base + LINUX_PAGE_SIZE;
+        assert_eq!(root.guest_brk(second), second);
+        assert_eq!(child.lock().program_break(), first);
+        assert_eq!(dispatcher.mem().lock().program_break(), second);
+    }
 }

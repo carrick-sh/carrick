@@ -1158,6 +1158,14 @@ impl Reservations<'_> {
         layout.address_limit = address_limit;
         layout.data_limit = data_limit;
     }
+    /// Push the current charges of mappings this root does not model (the
+    /// host-owned VMAs), so `set_limits` compares the whole mm against its
+    /// limits. Like `set_limits`, no mapping changes and no new generation.
+    pub fn set_external_charges(&mut self, address_bytes: u64, data_bytes: u64) {
+        let layout = &mut self.state_mut().layout;
+        layout.external_address_bytes = address_bytes;
+        layout.external_data_bytes = data_bytes;
+    }
     /// Host admission of an existing mapping, before the guest lane is opened.
     /// The caller supplies the complete current snapshot and exact limits.
     /// This is not a second mutable VMA model: guest/host operations thereafter
@@ -2197,6 +2205,29 @@ mod tests {
             "unknown mprotect prot bit"
         );
         assert!(g.pending().is_none());
+    }
+
+    #[test]
+    fn reservation_external_charges_count_against_pushed_limits() {
+        let table = table();
+        let mm = ReservationMm::new(6).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut g = table.lock(0, mm).unwrap();
+        g.finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        let generation = g.generation();
+        g.set_limits(u64::MAX, 0x4000);
+        // Host-owned data the root does not model consumes the budget.
+        g.set_external_charges(0x3000, 0x3000);
+        assert_eq!(g.generation(), generation, "no mapping changed");
+        assert_eq!(g.mmap(Placement::Anywhere, 0x2000, rw), Err(Refusal::Limit));
+        let d = g.mmap(Placement::Anywhere, 0x1000, rw).unwrap();
+        complete(&mut g, d);
+        g.set_external_charges(0x3000, 0);
+        let d = g.mmap(Placement::Anywhere, 0x2000, rw).unwrap();
+        complete(&mut g, d);
+        g.set_limits(0x4000, u64::MAX);
+        assert_eq!(g.mmap(Placement::Anywhere, 0x1000, rw), Err(Refusal::Limit));
     }
 
     #[test]

@@ -94,7 +94,7 @@ fn import_snapshot(
     model.configure_import(Layout {
         heap,
         arena,
-        brk: mem.brk_current,
+        brk: mem.program_break(),
         address_limit: limits.0,
         data_limit: limits.1,
         external_address_bytes: committed_va_bytes(mem).saturating_sub(modeled_address),
@@ -193,6 +193,55 @@ impl MemView<'_> {
     }
 }
 
+impl MemView<'_> {
+    /// S1a conformance fixture: seal this MM's published root as the owner of
+    /// its program break. The root imports the host break, the current limits
+    /// and the host-owned charges; `MemState` then keeps no break of its own.
+    /// Production admission still refuses (`admit_host_snapshot`): the other
+    /// anonymous facts have not relinquished their host writer yet.
+    #[cfg(test)]
+    pub(in crate::dispatch) fn delegate_break_for_test(&self) -> Result<(), Refusal> {
+        let root = self.mm_authority().delegated_break()?;
+        let (address_limit, data_limit) = self
+            .address_space_limits_apply(true)
+            .unwrap_or((u64::MAX, u64::MAX));
+        let authority = self.mem();
+        let mut mem = authority.lock();
+        let brk::BreakAuthority::HostSetup(host_break) = *mem.break_authority() else {
+            return Err(Refusal::Stale);
+        };
+        let (external_address_bytes, external_data_bytes) = host_owned_charges(&mem);
+        let heap = mem
+            .layout
+            .heap_base
+            .checked_add(mem.layout.heap_size)
+            .and_then(|end| ReservationRange::new(mem.layout.heap_base, end))
+            .ok_or(Refusal::Invalid)?;
+        let heap_rows: Vec<_> = mem
+            .semantic_vmas
+            .iter()
+            .filter(|vma| heap.start() <= vma.start && vma.end <= heap.end())
+            .map(|vma| (vma.start, vma.end, eligible(vma, &mem)))
+            .collect();
+        root.with_root_for_import(|model| {
+            let mut layout = model.layout();
+            layout.brk = host_break;
+            layout.address_limit = address_limit;
+            layout.data_limit = data_limit;
+            layout.external_address_bytes = external_address_bytes;
+            layout.external_data_bytes = external_data_bytes;
+            model.configure_import(layout)?;
+            for (start, end, anonymous) in heap_rows {
+                let range = ReservationRange::new(start, end).ok_or(Refusal::Invalid)?;
+                model.import(range, ReservationProtection::READ_WRITE, anonymous)?;
+            }
+            model.finish_import()
+        })?;
+        *mem.break_authority_mut() = brk::BreakAuthority::Delegated(root);
+        Ok(())
+    }
+}
+
 impl SyscallDispatcher {
     pub fn admit_el1_reservations(
         &self,
@@ -268,7 +317,7 @@ mod tests {
                         mem.layout.mmap_base + mem.layout.mmap_size,
                     )
                     .unwrap(),
-                    brk: mem.brk_current,
+                    brk: mem.program_break(),
                     address_limit: u64::MAX,
                     data_limit: u64::MAX,
                     external_address_bytes: 0,
@@ -606,5 +655,5 @@ pub use projection::{NonAnonymousVmas, ReservationProcMaps};
 
 #[path = "el1_reservations/provider.rs"]
 mod provider;
-pub(in crate::dispatch) use provider::ReservationProviderSlot;
+pub(in crate::dispatch) use provider::{DelegatedBreak, ReservationProviderSlot};
 pub use provider::{HostReservationProvider, PreparedHostReservations, PreparedReservationSession};

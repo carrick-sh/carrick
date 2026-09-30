@@ -963,7 +963,7 @@ impl<'a> MemView<'a> {
                     &[]
                 },
                 mem.layout,
-                mem.brk_current,
+                mem.program_break(),
             );
             for vma in semantic.iter_mut() {
                 vma.droppable = commit.droppable;
@@ -1422,7 +1422,7 @@ impl<'a> MemView<'a> {
                     &[]
                 },
                 mem.layout,
-                mem.brk_current,
+                mem.program_break(),
             );
             for vma in semantic.iter_mut() {
                 vma.droppable = droppable;
