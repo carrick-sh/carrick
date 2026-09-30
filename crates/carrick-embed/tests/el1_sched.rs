@@ -1225,6 +1225,7 @@ fn el1_sched_mm_occupancy_two_processes() {
     const FORKS: u64 = 150;
     let _guard = common::guest_lock();
     reset_el1_counters();
+    carrick_kernel::mprotect_diag::reset();
     let carrier = carrier_or_fail();
     let measured = run_fixture(
         &carrier,
@@ -1233,11 +1234,12 @@ fn el1_sched_mm_occupancy_two_processes() {
     );
     let stdout = measured.result.stdout_utf8();
     println!(
-        "el1-sched mm-occupancy exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+        "el1-sched mm-occupancy exits={} carrier_cpu_ns={} wall_ms={} zone={:?} mprotect_enomem_sites=[{}] {}",
         measured.exits,
         measured.cpu_ns,
         measured.wall.as_millis(),
         measured.zone,
+        carrick_kernel::mprotect_diag::report_line(),
         stdout.trim()
     );
     assert!(measured.result.success(), "{}", describe(&measured));

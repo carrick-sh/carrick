@@ -516,10 +516,10 @@
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "function": "MemView<'a>::mprotect_served",
       "ordinal_in_function": 1,
-      "fingerprint": "1d5684eff4d84a1d9c50f6fe036c11a824ae502946649817439856eb23c178c0",
+      "fingerprint": "275a4dde0585fbe2c64256f3cd70c6448ec9da788d1367106583824328fe696d",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mprotect",
-      "rationale": "Stored reservation fork semantics contradict selected VMA subrange, corrupting semantic-VMA authority during host alias transaction commit. Re-reviewed 2026-09-30: unchanged abort; the host handler became `*_served` behind the reservation-root wrapper (S1b).",
+      "rationale": "Stored reservation fork semantics contradict selected VMA subrange, corrupting semantic-VMA authority during host alias transaction commit. Re-reviewed 2026-09-30: unchanged abort; the host handler became `*_served` behind the reservation-root wrapper (S1b). Re-reviewed 2026-09-30: unchanged abort; the ENOMEM returns gained mprotect_diag records.",
       "sink": "fatal",
       "domain": "dispatch::mprotect"
     },

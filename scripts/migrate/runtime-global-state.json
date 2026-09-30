@@ -1971,6 +1971,22 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-kernel/src/mprotect_diag.rs",
+      "symbol": "COUNTS",
+      "fingerprint": "692d0902d5123513c410f720d4594fe1b973886453be81dbcd233c3acd106d55",
+      "classification": "config_debug",
+      "rationale": "Witness diagnostic: process-wide counters naming which host mprotect path answered ENOMEM; never read by dispatch logic."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/mprotect_diag.rs",
+      "symbol": "FIRST_DETAIL",
+      "fingerprint": "4668f4c0f4aab1e1ba31ab89a9ce6d1bdeddbee42feb06ddc096e489ffbcfef7",
+      "classification": "config_debug",
+      "rationale": "Witness diagnostic: process-wide counters naming which host mprotect path answered ENOMEM; never read by dispatch logic."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-kernel/src/namespace/process.rs",
       "symbol": "alloc_ns_id::NEXT_NS_ID",
       "fingerprint": "51fb906a65a2ac194150487d53538f344fe2633228d290614fb2504177b3509a",

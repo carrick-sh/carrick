@@ -1633,7 +1633,16 @@ impl MemView<'_> {
                 return Ok(DispatchOutcome::errno(errno));
             }
         }
+        let recorded = crate::mprotect_diag::total();
         let outcome = self.mprotect_served(cx);
+        if matches!(&outcome, Ok(DispatchOutcome::Errno { errno }) if *errno == LINUX_ENOMEM)
+            && crate::mprotect_diag::total() == recorded
+        {
+            crate::mprotect_diag::record(
+                crate::mprotect_diag::MprotectEnomemSite::Unattributed,
+                || None,
+            );
+        }
         self.settle_host_venue(&outcome, |outcome, _| {
             matches!(outcome, DispatchOutcome::Returned { value: 0 })
         })?;
