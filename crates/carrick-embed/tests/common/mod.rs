@@ -164,9 +164,30 @@ impl Watchdog {
                     {
                         let _ =
                             carrick_el1_abi::ipc::write_ipc_wait_census(zone, &region, &mut census);
+                        // Host-side waiters hold no zone record: the objects
+                        // they subscribe to, what each is owed, and the owed
+                        // index a host boundary would drain.
+                        let _ = region.write_host_wake_census(&mut census);
                     }
+                    // The flags through which EL1 announces owed host work.
+                    let _ = carrick_el1_abi::write_current_task_census(&mut census);
                     eprintln!("WATCHDOG zone census:\n{census}");
                 }
+                // The abort's post-mortem names every blocked thread's
+                // continuation and whether the wait service still holds it
+                // (never woken) or published its wake (woken, never run).
+                // Persist it for every watchdog wedge, not only when an
+                // operator remembered CARRICK_POSTMORTEM_DIR.
+                let post_mortem_dir = carrick_kernel::kernel::debug::PostMortem::configured_dir()
+                    .unwrap_or_else(|| {
+                        let dir = repo_root().join("target/embed-post-mortem").join(&run_id);
+                        carrick_kernel::kernel::debug::PostMortem::install_dir(dir.clone());
+                        dir
+                    });
+                eprintln!(
+                    "WATCHDOG post-mortem directory: {}",
+                    post_mortem_dir.display()
+                );
                 // The kernel graph's view of the wedge: the runner answers a
                 // latched abort with a post-mortem (written under
                 // CARRICK_POSTMORTEM_DIR when set) before the reap.

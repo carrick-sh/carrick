@@ -734,3 +734,163 @@ fn serial_host_el1_ipc_host_completed_handback_wakes_host_subscribers() {
     owner.release(closed.backing).unwrap();
     assert_eq!(delivered, 1, "the host subscriber must be woken");
 }
+
+/// `el1_ipc_mixed_venue_roundtrips` on one object, in the host model: a
+/// host-blocked `readv(2)` (the vector venue, a continuation on the eventfd's
+/// wait queue with a host subscription) and an EL1-served `write(2)` (the
+/// scalar venue: step and publish under the object lock, mark the slot's
+/// pending host work, leave served-with-work). The write lands before the
+/// reader's enrollment (it owes no host wake: the post-enrollment probe must
+/// see it) or after (it owes one: the writer's exit boundary must deliver
+/// it). Either way the reader wakes and its redispatched `readv` returns the
+/// value.
+fn mixed_venue_readv_wakes_on_el1_write(write_before_enroll: bool) {
+    use crate::compat::{CompatReporter, SyscallArgs};
+    use crate::dispatch::{DispatchOutcome, SyscallRequest};
+    use crate::kernel::continuation::test_support::{capture, publish};
+    use crate::kernel::continuation::{
+        BlockedContinuation, CancellationCause, CarrierWaitService, ContinuationCompletion,
+        ContinuationEvent,
+    };
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll, Waker};
+    use std::time::{Duration, Instant};
+    use zerocopy::IntoBytes;
+    const SLOT: usize = 2;
+    let region_bytes = vec![0u8; carrick_el1_abi::EL1_REGION_SIZE as usize];
+    carrick_el1_abi::record_el1_region_host_ptr(region_bytes.as_ptr() as usize);
+    let task = |slot: usize| {
+        let at = region_bytes.as_ptr() as usize
+            + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+            + slot * std::mem::size_of::<carrick_el1_abi::CurrentTask>();
+        // SAFETY: inside the zeroed region; all-zero is an empty task.
+        unsafe { &*(at as *const carrick_el1_abi::CurrentTask) }
+    };
+    let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let kernel = Arc::clone(context.kernel());
+    let mut memory = LinearMemory::new(0x4000, vec![0u8; 4096]);
+    let reporter = CompatReporter::default();
+    let returned = |outcome: DispatchOutcome| match outcome {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("fixture syscall: {other:?}"),
+    };
+    let efd = returned(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(19, SyscallArgs([0; 6])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+    );
+    let object = dispatcher
+        .open_file(efd as i32)
+        .unwrap()
+        .description
+        .inspect_kind(|open| match open {
+            crate::dispatch::fd_table::OpenDescription::EventFd { state, .. } => state.ipc_object(),
+            other => panic!("eventfd description: {other:?}"),
+        })
+        .unwrap();
+    memory
+        .write_bytes(0x4200, carrick_abi::LinuxIovec::new(0x4000, 8).as_bytes())
+        .unwrap();
+    let readv = SyscallRequest::new(65, SyscallArgs([efd as u64, 0x4200, 1, 0, 0, 0]));
+    let outcome = dispatcher
+        .dispatch(&context, readv, &mut memory, &reporter)
+        .unwrap();
+    assert!(
+        matches!(&outcome, DispatchOutcome::WaitOnFds { .. }),
+        "empty blocking eventfd readv must park: {outcome:?}"
+    );
+    let generation = publish(&context, 0x3a5);
+    let mut continuation =
+        BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
+            .expect("eventfd readv continuation");
+    let service =
+        CarrierWaitService::new(Arc::new(crate::kernel::Scheduler::new(Arc::clone(&kernel))));
+    let owner = kernel.ipc().unwrap();
+    // As `personality::ipc::run` serves the scalar write in EL1, then the
+    // writer's served-with-work exit at its slot's host boundary.
+    let el1_write = || {
+        let region = owner.region();
+        let mut guard = region.lock(object, &HostIpcWait).unwrap();
+        let step = guard.eventfd().unwrap().try_write(5);
+        let published = guard.publish(step.wake);
+        drop(guard);
+        assert_eq!(
+            published.host_owed, !write_before_enroll,
+            "a wake is owed exactly when the host reader is subscribed"
+        );
+        if published.host_owed {
+            task(SLOT).mark_pending_host_work();
+        }
+        task(SLOT).served_with_work.store(1, Ordering::Release);
+        assert!(crate::el1_delegation::settle_el1_boundary(SLOT, &kernel));
+    };
+    if write_before_enroll {
+        el1_write();
+    }
+    let mut registration = service.prepare_registration(&continuation);
+    service.enroll(&mut registration).expect("enroll");
+    let token = registration.wake_token();
+    continuation
+        .attach_registration(registration)
+        .expect("attach");
+    if !write_before_enroll {
+        el1_write();
+    }
+    let mut future = std::pin::pin!(service.event(token));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let event = loop {
+        if let Poll::Ready(event) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            break Some(event);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::yield_now();
+    };
+    let Some(event) = event else {
+        let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+        carrick_el1_abi::record_el1_region_host_ptr(0);
+        panic!("host readv lost the EL1 write's wake (write_before_enroll={write_before_enroll})");
+    };
+    assert_eq!(event.expect("readv wake"), ContinuationEvent::Ready);
+    assert_eq!(
+        continuation
+            .resume(ContinuationEvent::Ready, &context)
+            .unwrap()
+            .completion,
+        ContinuationCompletion::Redispatch
+    );
+    assert_eq!(
+        returned(
+            dispatcher
+                .dispatch(&context, readv, &mut memory, &reporter)
+                .unwrap()
+        ),
+        8
+    );
+    let value = memory.read_bytes(0x4000, 8).unwrap();
+    assert_eq!(u64::from_ne_bytes(value.try_into().unwrap()), 5);
+    assert!(!task(SLOT).has_pending_host_work());
+    carrick_el1_abi::record_el1_region_host_ptr(0);
+}
+
+#[test]
+fn serial_host_el1_ipc_mixed_venue_readv_wakes_on_el1_write_after_enroll() {
+    mixed_venue_readv_wakes_on_el1_write(false);
+}
+
+#[test]
+fn serial_host_el1_ipc_mixed_venue_readv_wakes_on_el1_write_before_enroll() {
+    mixed_venue_readv_wakes_on_el1_write(true);
+}
