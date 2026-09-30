@@ -211,7 +211,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mem/madvise.rs::MemView::membarrier::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
-      "line": 206,
+      "line": 208,
       "item": "MemView::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -220,7 +220,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mem/madvise.rs::MemView::membarrier::proc#2",
       "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
-      "line": 210,
+      "line": 212,
       "item": "MemView::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -229,17 +229,17 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mem/madvise.rs::MemView::membarrier::proc#3",
       "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
-      "line": 216,
+      "line": 218,
       "item": "MemView::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 3
     },
     {
-      "id": "crates/carrick-kernel/src/dispatch/mem/mmap.rs::MemView::mmap::proc#1",
+      "id": "crates/carrick-kernel/src/dispatch/mem/mmap.rs::MemView::mmap_served::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "line": 612,
-      "item": "MemView::mmap",
+      "item": "MemView::mmap_served",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 1

@@ -1039,7 +1039,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
-      "line": 2070,
+      "line": 2064,
       "categories": [
         "description_guard"
       ],
@@ -1634,7 +1634,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1201,
+      "line": 1196,
       "categories": [
         "table_guard"
       ],
@@ -1645,7 +1645,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1207,
+      "line": 1202,
       "categories": [
         "table_guard"
       ],
@@ -1656,7 +1656,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1392,
+      "line": 1387,
       "categories": [
         "description_guard"
       ],
@@ -1667,7 +1667,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1403,
+      "line": 1398,
       "categories": [
         "table_guard"
       ],
@@ -1678,7 +1678,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1405,
+      "line": 1400,
       "categories": [
         "description_guard"
       ],
@@ -1689,7 +1689,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1432,
+      "line": 1427,
       "categories": [
         "table_guard"
       ],
@@ -1700,7 +1700,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1434,
+      "line": 1429,
       "categories": [
         "description_guard"
       ],
@@ -1711,7 +1711,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1485,
+      "line": 1480,
       "categories": [
         "table_guard"
       ],
@@ -1722,7 +1722,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1487,
+      "line": 1482,
       "categories": [
         "description_guard"
       ],
@@ -1733,7 +1733,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1513,
+      "line": 1508,
       "categories": [
         "description_guard"
       ],
@@ -1744,7 +1744,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1849,
+      "line": 1844,
       "categories": [
         "description_guard"
       ],
@@ -1755,7 +1755,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 2062,
+      "line": 2057,
       "categories": [
         "description_guard"
       ],
@@ -1766,7 +1766,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 2270,
+      "line": 2265,
       "categories": [
         "description_guard"
       ],
@@ -1777,7 +1777,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 2318,
+      "line": 2313,
       "categories": [
         "description_guard"
       ],
@@ -1887,7 +1887,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
-      "line": 320,
+      "line": 322,
       "categories": [
         "description_guard"
       ],
@@ -1898,7 +1898,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
-      "line": 347,
+      "line": 349,
       "categories": [
         "description_guard"
       ],
@@ -1943,7 +1943,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 1627,
+      "line": 1641,
       "categories": [
         "description_guard"
       ],
@@ -1954,7 +1954,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 1634,
+      "line": 1648,
       "categories": [
         "description_guard"
       ],
@@ -1965,7 +1965,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 1649,
+      "line": 1663,
       "categories": [
         "description_guard"
       ],
@@ -1976,7 +1976,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 1999,
+      "line": 2013,
       "categories": [
         "description_guard"
       ],
