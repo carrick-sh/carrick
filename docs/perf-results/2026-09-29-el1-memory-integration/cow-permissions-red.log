@@ -1,0 +1,22 @@
+   Compiling carrick-mmu-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mmu-core)
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-image)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1-abi)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.12s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-795688a8226b9d93)
+
+running 1 test
+
+thread 'aarch64::descriptor_txn::tests::executor::cow_compound_preserves_readonly_prot_none_and_prepared_neighbors' (34697823) panicked at crates/carrick-mmu-core/src/aarch64/descriptor_txn.rs:2521:26:
+expected an applied outcome, got Refused(PermissionDenied)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test aarch64::descriptor_txn::tests::executor::cow_compound_preserves_readonly_prot_none_and_prepared_neighbors ... FAILED
+
+failures:
+
+failures:
+    aarch64::descriptor_txn::tests::executor::cow_compound_preserves_readonly_prot_none_and_prepared_neighbors
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 159 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

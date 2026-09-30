@@ -52,3 +52,23 @@ existing permission-preserving MMU operations, and compose its successful backin
 commit with the real kernel authority. Do not add a second copy transport or
 another broad boot qualification campaign. Final signed memory, two-MM progress,
 frame return, full gates and all later ARM64 checkpoints remain required.
+
+
+## Mixed private-anonymous permissions follow-up
+
+The compound executor previously refused at a read-only neighbor. The retained
+red witness receives PermissionDenied for a four-page compound containing RW,
+read-only, PROT_NONE and untouched prepared leaves. The executor now restores
+write only from the current intent recorded by fork arming; other resident
+permissions and execute attributes remain unchanged. Prepared neighbors are
+repointed without becoming resident. Retired, unowned and unarmed resident
+leaves remain refused. The backend no longer rejects the whole guest transaction
+solely because its source metadata is read-only.
+
+The witness passes; MMU 160 and EL1 114 tests plus affected all-target Clippy
+pass. This removes the private-anonymous mixed-permission executor restriction,
+not the remaining legacy/kernel/private-file/maintenance writers. No signed or
+real kernel-authority successful COW composition is claimed. The existing
+runtime production-carrier fixture in vcpu_loop/memory.rs composes real kernel
+and backend ownership and should be reused for that check; a synthetic grant
+commit without descriptor execution would be insufficient.

@@ -190,8 +190,9 @@ pub enum DescriptorOp {
     /// Retire prepared and resident private leaves, retaining outputs for the
     /// host's lease reconciliation.
     Retire(PageSpan),
-    /// Repoint a COW-armed resident private span from `old_ipa` to the
-    /// private copy at `new_ipa`, restoring the recorded write permission.
+    /// Repoint a private compound from `old_ipa` to the private copy at
+    /// `new_ipa`. Resident leaves must be COW-armed and recover only their
+    /// recorded write intent; prepared neighbors retain residency and access.
     /// EL1 copies every page before publishing the span under one journal.
     CowRepoint {
         va: u64,
@@ -1660,18 +1661,31 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 new_ipa,
                 ..
             } => {
-                if state != El1PrivateLeafState::Resident || !el1_cow(descriptor) {
+                if state != El1PrivateLeafState::Prepared
+                    && (state != El1PrivateLeafState::Resident || !el1_cow(descriptor))
+                {
                     return Err(DescriptorRefusal::NotCowArmed);
                 }
                 if descriptor & PA_MASK_4KIB != old_ipa.raw() + (base - va) {
                     return Err(DescriptorRefusal::WrongBacking);
                 }
-                if descriptor & SW_EL1_MAY_WRITE == 0 || descriptor & AP_MASK == AP_PRIV_RO {
-                    return Err(DescriptorRefusal::PermissionDenied);
+                let repointed = (descriptor & !PA_MASK_4KIB) | (new_ipa.raw() + (base - va));
+                if state == El1PrivateLeafState::Prepared {
+                    // The compound can include untouched pages. Moving their
+                    // backing must not make them resident or widen access.
+                    return Ok(repointed);
                 }
-                Ok((descriptor & !PA_MASK_4KIB & !SW_EL1_COW & !AP_MASK)
-                    | (new_ipa.raw() + (base - va))
-                    | AP_RW)
+                // Fork arming recorded the page's actual Linux write intent,
+                // not just the allocation ceiling. Read-only and PROT_NONE
+                // neighbors move with the compound without gaining access.
+                let private = repointed & !SW_EL1_COW;
+                Ok(
+                    if descriptor & SW_EL1_MAY_WRITE != 0 && descriptor & AP_MASK != AP_PRIV_RO {
+                        (private & !AP_MASK) | AP_RW
+                    } else {
+                        private
+                    },
+                )
             }
             // Fork arming shares the host editor's terminal rule and is
             // applied in `visit_entry` before this per-op table.
@@ -2016,8 +2030,8 @@ pub enum CowCopyError {
 }
 
 /// Copy one granted COW page. The live graph at `grant.root` must still map
-/// `grant.va` COW-armed onto `grant.old_ipa` with write intent (validated by
-/// planning the repoint, without storing); only then are the 4096 bytes of
+/// `grant.va` onto `grant.old_ipa` as a private prepared or COW-armed leaf
+/// (validated by planning the repoint, without storing); then the 4096 bytes of
 /// `source` (the old frame) copied into `destination` (the new frame). The
 /// caller holds the exact-MM editor, so the leaf cannot change between the
 /// check and the repoint that follows.
@@ -3133,6 +3147,75 @@ mod tests {
                 assert_eq!(descriptor & PA_MASK_4KIB, destination + index * PT_PAGE);
                 assert!(!el1_cow(descriptor));
             }
+        }
+
+        #[test]
+        fn cow_compound_preserves_readonly_prot_none_and_prepared_neighbors() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(4, PageSpan::new(VA, 3 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            for (index, readable) in [(1, true), (2, false)] {
+                applied(run(
+                    &words,
+                    DescriptorOp::Protect(GuestPermissionEdit {
+                        va: VA + index * PT_PAGE,
+                        len: PT_PAGE,
+                        readable,
+                        writable: false,
+                        executable: false,
+                    }),
+                    &TableGrants::NONE,
+                ));
+            }
+            let before: Vec<_> = (0..4)
+                .map(|i| words.get(leaf_pa(VA + i * PT_PAGE)))
+                .collect();
+            unsafe {
+                arm_existing_el1_fork_pages(
+                    words.words.as_ptr().cast_mut(),
+                    ROOT,
+                    words.words.len() * 8,
+                    VA,
+                    4 * PT_PAGE,
+                )
+            }
+            .unwrap();
+            let destination = 0x009d_0000_0000;
+            applied(run(
+                &words,
+                DescriptorOp::CowRepoint {
+                    va: VA,
+                    len: 4 * PT_PAGE,
+                    old_ipa: SubstrateGpa(IPA),
+                    new_ipa: SubstrateGpa(destination),
+                    backing: backing(80),
+                },
+                &TableGrants::NONE,
+            ));
+            for index in 0..4 {
+                let leaf = words.get(leaf_pa(VA + index * PT_PAGE));
+                assert_eq!(leaf & PA_MASK_4KIB, destination + index * PT_PAGE);
+                assert_eq!(
+                    leaf & (VALID | AP_MASK | UXN),
+                    before[index as usize] & (VALID | AP_MASK | UXN)
+                );
+                assert!(!el1_cow(leaf));
+            }
+            assert!(!terminal_descriptor_permits_el0(
+                words.get(leaf_pa(VA + PT_PAGE)),
+                LeafAccess::Write
+            ));
+            assert!(!terminal_descriptor_permits_el0(
+                words.get(leaf_pa(VA + 2 * PT_PAGE)),
+                LeafAccess::Read
+            ));
+            assert_eq!(
+                el1_private_leaf_state(words.get(leaf_pa(VA + 3 * PT_PAGE))),
+                El1PrivateLeafState::Prepared
+            );
         }
 
         #[test]
