@@ -925,12 +925,18 @@ fn delegated_exec_leaves_no_root_row_in_the_new_image() {
 // root; /proc merges the root projection with host rows exactly once.
 // ---------------------------------------------------------------------------
 
+const SYS_MREMAP: u64 = 216;
+const SYS_MSYNC: u64 = 227;
 const SYS_MLOCK: u64 = 228;
 const SYS_MUNLOCK: u64 = 229;
 const SYS_MLOCKALL: u64 = 230;
 const SYS_MUNLOCKALL: u64 = 231;
 const SYS_MADVISE: u64 = 233;
+const MREMAP_MAYMOVE: u64 = 1;
+const MREMAP_FIXED: u64 = 2;
+const MREMAP_DONTUNMAP: u64 = 4;
 const MCL_CURRENT: u64 = 1;
+const MS_INVALIDATE: u64 = 2;
 const ANON: u64 = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
 
 impl Root {
@@ -945,6 +951,19 @@ impl Root {
             )
         })
     }
+}
+
+fn mremap(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut CountingMmapMemory,
+    args: [u64; 5],
+) -> DispatchOutcome {
+    call(
+        dispatcher,
+        memory,
+        SYS_MREMAP,
+        [args[0], args[1], args[2], args[3], args[4], 0],
+    )
 }
 
 fn anon_mmap(
@@ -982,6 +1001,333 @@ fn locked_memory(dispatcher: &SyscallDispatcher) -> Vec<(u64, u64)> {
 const ANON_FLAGS: u32 = carrick_el1_abi::ReservationNodeFlags::ANONYMOUS_PRIVATE.bits();
 const LOCKED: u32 = carrick_el1_abi::ReservationNodeFlags::LOCKED.bits();
 const DONTFORK: u32 = carrick_el1_abi::ReservationNodeFlags::DONTFORK.bits();
+
+#[test]
+fn delegated_mremap_shapes_stay_root_owned() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let a = anon_mmap(&mut dispatcher, &mut memory, 0, 4 * PAGE);
+    memory.write_bytes(a, b"root").unwrap();
+
+    // Shrink retires the tail in the root.
+    assert_eq!(
+        returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a, 4 * PAGE, 2 * PAGE, 0, 0]
+        )) as u64,
+        a
+    );
+    assert_eq!(root.node(a), Some((a, a + 2 * PAGE, true, ANON_FLAGS)));
+    assert_eq!(root.node(a + 2 * PAGE), None);
+    // In-place growth into the freed hole extends the root node.
+    assert_eq!(
+        returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a, 2 * PAGE, 3 * PAGE, 0, 0]
+        )) as u64,
+        a
+    );
+    assert_eq!(root.node(a), Some((a, a + 3 * PAGE, true, ANON_FLAGS)));
+    // A MAYMOVE move relocates the root node with its contents. (The
+    // blocker is read-only so it stays a separate mapping.)
+    let blocker = root
+        .guest_mmap(Placement::Fixed(a + 3 * PAGE), PAGE, READ)
+        .unwrap();
+    assert_eq!(blocker, a + 3 * PAGE);
+    let moved = returned(mremap(
+        &mut dispatcher,
+        &mut memory,
+        [a, 3 * PAGE, 5 * PAGE, MREMAP_MAYMOVE, 0],
+    )) as u64;
+    assert_ne!(moved, a);
+    assert_eq!(memory.read_bytes(moved, 4).unwrap(), b"root");
+    assert_eq!(root.node(a), None);
+    assert_eq!(
+        root.node(moved),
+        Some((moved, moved + 5 * PAGE, true, ANON_FLAGS))
+    );
+    // MREMAP_FIXED to a named destination.
+    let fixed = returned(mremap(
+        &mut dispatcher,
+        &mut memory,
+        [moved, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, a],
+    )) as u64;
+    assert_eq!(fixed, a);
+    assert_eq!(memory.read_bytes(a, 4).unwrap(), b"root");
+    assert_eq!(root.node(a), Some((a, a + PAGE, true, ANON_FLAGS)));
+    assert_eq!(root.node(moved), None);
+    assert_eq!(
+        root.node(moved + PAGE),
+        Some((moved + PAGE, moved + 5 * PAGE, true, ANON_FLAGS))
+    );
+    // MREMAP_DONTUNMAP keeps the source (zeroed) and adds a destination.
+    let kept = returned(mremap(
+        &mut dispatcher,
+        &mut memory,
+        [a, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0],
+    )) as u64;
+    assert_ne!(kept, a);
+    assert_eq!(memory.read_bytes(kept, 4).unwrap(), b"root");
+    assert_eq!(memory.read_bytes(a, 4).unwrap(), [0; 4]);
+    // Both stay root mappings (they may coalesce when placed adjacent).
+    assert_eq!(root.node(a).map(|node| (node.0, node.2)), Some((a, true)));
+    assert_eq!(root.node(kept).map(|node| node.2), Some(true));
+    assert!(
+        host_owns_no_anonymous_row(&dispatcher, LINUX_MMAP_BASE, LINUX_MMAP_BASE + 32 * PAGE),
+        "mremap demoted root rows into host rows"
+    );
+}
+
+#[test]
+fn delegated_mremap_growth_stops_at_an_adjacent_host_file_mapping() {
+    // Two mappings: a root anonymous page and, right after a one-page
+    // hole, a host-owned file mapping. mremap(2): growth that would reach
+    // the file mapping fails in place (ENOMEM) and moves with MAYMOVE;
+    // growth that fits the hole succeeds in place.
+    for delegated in [false, true] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = delegated.then(|| Root::admit(&dispatcher));
+        install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+        let mut memory = arena_memory();
+        let a = anon_mmap(&mut dispatcher, &mut memory, 0, PAGE);
+        let file = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            a + 2 * PAGE,
+            PAGE,
+            LINUX_PROT_READ,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+            FILE_FD,
+        )) as u64;
+        assert_eq!(file, a + 2 * PAGE);
+        assert_eq!(
+            mremap(&mut dispatcher, &mut memory, [a, PAGE, 3 * PAGE, 0, 0]),
+            DispatchOutcome::errno(LINUX_ENOMEM),
+            "delegated={delegated}: the file mapping is in the way"
+        );
+        let Some(root) = root else {
+            // Host setup grows only at its bump cursor, so this hole below
+            // the cursor answers ENOMEM there although nothing is in the
+            // way: a host-setup divergence from mremap(2), recorded here
+            // rather than asserted.
+            continue;
+        };
+        assert_eq!(
+            mremap(&mut dispatcher, &mut memory, [a, PAGE, 2 * PAGE, 0, 0]),
+            DispatchOutcome::Returned { value: a as i64 },
+            "the hole fits exactly"
+        );
+        let moved = returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a, 2 * PAGE, 3 * PAGE, MREMAP_MAYMOVE, 0],
+        )) as u64;
+        assert!(
+            moved + 3 * PAGE <= file || file + PAGE <= moved,
+            "delegated={delegated}: the move must not overlap the file mapping"
+        );
+        let file_row = proc_row_at(&dispatcher, file).expect("the file mapping survives");
+        assert_eq!((file_row.start, file_row.end), (file, file + PAGE));
+        assert_eq!(root.node(moved).map(|node| node.2), Some(true));
+        assert!(root.node(file).is_some_and(|node| !node.2));
+        assert!(host_owns_no_anonymous_row(
+            &dispatcher,
+            moved,
+            moved + 3 * PAGE
+        ));
+        // MREMAP_FIXED onto the file mapping discards it (like MAP_FIXED):
+        // the destination becomes the root's anonymous mapping, once.
+        memory.write_bytes(moved, b"move").unwrap();
+        assert_eq!(
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [moved, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, file],
+            ),
+            DispatchOutcome::Returned { value: file as i64 }
+        );
+        assert_eq!(memory.read_bytes(file, 4).unwrap(), b"move");
+        assert_eq!(root.node(file), Some((file, file + PAGE, true, ANON_FLAGS)));
+        let row = proc_row_at(&dispatcher, file).unwrap();
+        assert!(row.write && row.path.is_empty(), "{row:?}");
+        assert!(host_owns_no_anonymous_row(&dispatcher, file, file + PAGE));
+        assert_rows_ordered_and_disjoint(&dispatcher);
+    }
+}
+
+/// The attributes (r, w, x, path) of the /proc row covering one page.
+type ProcPage = Option<(bool, bool, bool, String)>;
+
+/// Every page of the arena window: the attributes of the /proc row covering
+/// it, if any.
+fn proc_pages(dispatcher: &SyscallDispatcher, base: u64, pages: u64) -> Vec<ProcPage> {
+    let rows = proc_rows(dispatcher);
+    (0..pages)
+        .map(|page| {
+            let address = base + page * PAGE;
+            rows.iter()
+                .find(|row| row.start <= address && address < row.end)
+                .map(|row| (row.read, row.write, row.execute, row.path.clone()))
+        })
+        .collect()
+}
+
+fn assert_rows_ordered_and_disjoint(dispatcher: &SyscallDispatcher) {
+    let rows = proc_rows(dispatcher);
+    for pair in rows.windows(2) {
+        assert!(
+            pair[0].end <= pair[1].start,
+            "overlapping /proc rows {:?} and {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+#[test]
+fn delegated_mremap_madvise_mlock_sequence_matches_a_host_setup_mm() {
+    fn run(delegated: bool) -> (Vec<DispatchOutcome>, Vec<ProcPage>) {
+        let mut dispatcher = SyscallDispatcher::new();
+        let _root = delegated.then(|| Root::admit(&dispatcher));
+        install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+        let mut memory = arena_memory();
+        let a = anon_mmap(&mut dispatcher, &mut memory, 0, 4 * PAGE);
+        let file = a + 4 * PAGE;
+        returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            file,
+            PAGE,
+            LINUX_PROT_READ,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+            FILE_FD,
+        ));
+        memory.write_bytes(a, b"data").unwrap();
+        let mut outcomes = vec![
+            // mremap validation shapes, in the served path's precedence.
+            mremap(&mut dispatcher, &mut memory, [a, PAGE, 0, 0, 0]),
+            mremap(&mut dispatcher, &mut memory, [a, PAGE, PAGE, 1 << 20, 0]),
+            mremap(&mut dispatcher, &mut memory, [a + 1, PAGE, PAGE, 0, 0]),
+            mremap(&mut dispatcher, &mut memory, [a, 0, PAGE, 0, 0]),
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [a, PAGE, PAGE, MREMAP_FIXED, a + 8 * PAGE],
+            ),
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [a, PAGE, PAGE, MREMAP_DONTUNMAP, 0],
+            ),
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [a, PAGE, 2 * PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0],
+            ),
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [
+                    a,
+                    PAGE,
+                    PAGE,
+                    MREMAP_MAYMOVE | MREMAP_FIXED,
+                    a + 8 * PAGE + 1,
+                ],
+            ),
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [
+                    a,
+                    2 * PAGE,
+                    2 * PAGE,
+                    MREMAP_MAYMOVE | MREMAP_FIXED,
+                    a + PAGE,
+                ],
+            ),
+            mremap(&mut dispatcher, &mut memory, [a, u64::MAX, PAGE, 0, 0]),
+            // A source spanning the anonymous mapping and the file mapping.
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [a + 3 * PAGE, 2 * PAGE, PAGE, 0, 0],
+            ),
+            // A source in an unmapped hole.
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [a + 6 * PAGE, PAGE, PAGE, 0, 0],
+            ),
+            // Growth into the file mapping without MAYMOVE.
+            mremap(&mut dispatcher, &mut memory, [a, 4 * PAGE, 5 * PAGE, 0, 0]),
+            // Shrink, then attributes, then locks.
+            mremap(&mut dispatcher, &mut memory, [a, 4 * PAGE, 3 * PAGE, 0, 0]),
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MADVISE,
+                [a, 4 * PAGE, carrick_abi::LINUX_MADV_DONTFORK, 0, 0, 0],
+            ),
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MLOCK,
+                [a + PAGE, PAGE, 0, 0, 0, 0],
+            ),
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MADVISE,
+                [a, 2 * PAGE, carrick_abi::LINUX_MADV_DONTNEED, 0, 0, 0],
+            ),
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MSYNC,
+                [a, 2 * PAGE, MS_INVALIDATE, 0, 0, 0],
+            ),
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNLOCK,
+                [a, 5 * PAGE, 0, 0, 0, 0],
+            ),
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MADVISE,
+                [a, 2 * PAGE, carrick_abi::LINUX_MADV_DONTNEED, 0, 0, 0],
+            ),
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MPROTECT,
+                [a, PAGE, LINUX_PROT_READ, 0, 0, 0],
+            ),
+        ];
+        outcomes.push(DispatchOutcome::Returned {
+            value: i64::from(dispatcher.mem_view().vma_dump_omitted_for_test(a, PAGE)),
+        });
+        if delegated {
+            assert!(
+                host_owns_no_anonymous_row(&dispatcher, a, file),
+                "the sequence demoted root rows into host rows"
+            );
+        }
+        assert_rows_ordered_and_disjoint(&dispatcher);
+        (outcomes, proc_pages(&dispatcher, a, 8))
+    }
+    let (host_outcomes, host_pages) = run(false);
+    let (root_outcomes, root_pages) = run(true);
+    for (index, (host, root)) in host_outcomes.iter().zip(&root_outcomes).enumerate() {
+        assert_eq!(host, root, "outcome {index} differs");
+    }
+    assert_eq!(host_pages, root_pages, "/proc rows differ page for page");
+}
 
 #[test]
 fn delegated_madvise_attributes_stay_on_the_root_node() {
@@ -1175,4 +1521,47 @@ fn delegated_proc_rows_merge_the_root_heap_with_boot_regions_once() {
     );
     assert!(covering(a) >= 1);
     let _ = dispatcher;
+}
+
+#[test]
+fn delegated_mremap_carries_the_lock_with_the_mapping() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let a = anon_mmap(&mut dispatcher, &mut memory, 0, PAGE);
+    returned(call(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MLOCK,
+        [a, PAGE, 0, 0, 0, 0],
+    ));
+    // In-place growth of a locked mapping extends the locked VMA.
+    assert_eq!(
+        returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a, PAGE, 2 * PAGE, 0, 0]
+        )) as u64,
+        a
+    );
+    assert_eq!(
+        root.node(a),
+        Some((a, a + 2 * PAGE, true, ANON_FLAGS | LOCKED))
+    );
+    assert_eq!(locked_memory(&dispatcher), [(a, a + 2 * PAGE)]);
+    // A move takes the lock along; the old range holds none.
+    let moved = returned(mremap(
+        &mut dispatcher,
+        &mut memory,
+        [
+            a,
+            2 * PAGE,
+            2 * PAGE,
+            MREMAP_MAYMOVE | MREMAP_FIXED,
+            a + 4 * PAGE,
+        ],
+    )) as u64;
+    assert_eq!(moved, a + 4 * PAGE);
+    assert_eq!(locked_memory(&dispatcher), [(moved, moved + 2 * PAGE)]);
+    assert!(dispatcher.mem().lock().locked_ranges.is_empty());
 }
