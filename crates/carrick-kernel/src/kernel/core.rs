@@ -1288,6 +1288,14 @@ impl Kernel {
         *ipc = Some(Arc::clone(&owner));
         Ok(owner)
     }
+    /// Give a kernel with no IPC authority yet a specific one (a zone with a
+    /// small file-table limit).
+    #[cfg(test)]
+    pub(crate) fn install_ipc_for_test(&self, owner: Arc<crate::el1_ipc::HostIpc>) {
+        let mut ipc = self.ipc.lock();
+        assert!(ipc.is_none(), "the kernel already has an IPC authority");
+        *ipc = Some(owner);
+    }
     /// The execution backend's host-signal bridge this kernel was booted with.
     pub fn host_signal(&self) -> &Arc<dyn HostSignalBridge> {
         &self.host_signal

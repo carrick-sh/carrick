@@ -220,8 +220,11 @@ impl PipeInner {
         owner: Arc<crate::el1_ipc::HostIpc>,
         pipe_id: u64,
         capacity: usize,
-    ) -> Result<Self, crate::el1_ipc::AdmissionError> {
-        let object = owner.create_pipe(capacity)?;
+    ) -> Result<Self, crate::el1_ipc::CreateError> {
+        use crate::el1_ipc::CreateError;
+        let object = owner
+            .create_pipe(capacity)
+            .map_err(CreateError::from_admission)?;
         let description = |end, access| {
             carrick_el1_abi::ipc::fd::Description::new(
                 IpcBacking::Pipe { object, end }.encode(),
@@ -245,7 +248,7 @@ impl PipeInner {
                             )
                         });
                 }
-                return Err(error.into());
+                return Err(CreateError::from_admission(error));
             }
         };
         let writer = match owner.admit_description(description(
@@ -269,7 +272,7 @@ impl PipeInner {
                         )
                     });
                 drop(reader);
-                return Err(error.into());
+                return Err(CreateError::from_admission(error));
             }
         };
         let wait_queue = owner.wait_queue(object);
@@ -935,9 +938,11 @@ impl<'a> FsView<'a> {
             let fd_flags = linux_fd_flags_from_open_flags(flags);
 
             let pipe_id = next_pipe_id();
+            // Only the authority's own host memory is ENOMEM; creation
+            // refusals are typed Linux limits (ENFILE), never a table size.
             let owner = cx.kernel.kernel().ipc().map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?;
             let pipe = Arc::new(PipeInner::create(owner, pipe_id, DEFAULT_PIPE_CAPACITY)
-                .map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?);
+                .map_err(|error| DispatchError::Errno(error.errno()))?);
 
             let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock)
                 .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
@@ -1072,7 +1077,10 @@ mod tests {
             })
             .collect();
         for _ in 0..4 {
-            assert!(PipeInner::create(Arc::clone(&owner), 1, 65536).is_err());
+            assert!(matches!(
+                PipeInner::create(Arc::clone(&owner), 1, 65536),
+                Err(crate::el1_ipc::CreateError::FileTableFull)
+            ));
         }
         // Both raw endpoints and the first OFD must be returned on refusal.
         let objects: Vec<_> = (0..IPC_OBJECTS)
@@ -1087,6 +1095,71 @@ mod tests {
         // Repeated failures also must not strand the pipe's backing extent.
         for _ in 0..32 {
             drop(PipeInner::create(Arc::clone(&owner), 1, 65536).unwrap());
+        }
+    }
+
+    /// Work budget `pipe(2)`/`close(2)`: creating and closing N pipes
+    /// costs O(N). Store growth initializes each object and description
+    /// record once (a segment at a time, never a rescan), an idle pipe takes
+    /// no pool bytes, re-creating after the closes grows nothing, and one
+    /// create next to many live pipes costs the same as next to none: no
+    /// growth at all unless it crosses a segment, then exactly one segment.
+    #[test]
+    fn serial_host_el1_ipc_pipe_create_close_work_is_linear() {
+        use carrick_el1_abi::ipc::{IPC_OBJECT_SEGMENT, IPC_OFD_SEGMENT};
+        let growth_for = |n: usize| crate::el1_ipc::IpcGrowth {
+            object_records: n.next_multiple_of(IPC_OBJECT_SEGMENT) - IPC_OBJECT_SEGMENT,
+            description_records: (2 * n).next_multiple_of(IPC_OFD_SEGMENT) - IPC_OFD_SEGMENT,
+        };
+        for n in [1_000usize, 8_192, 65_536] {
+            let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+            let pipes: Vec<_> = (0..n)
+                .map(|id| PipeInner::create(Arc::clone(&owner), id as u64, 65536).unwrap())
+                .collect();
+            assert_eq!(
+                owner.growth(),
+                growth_for(n),
+                "n={n}: each record initialized once"
+            );
+            drop(pipes);
+            let pipes: Vec<_> = (0..n)
+                .map(|id| PipeInner::create(Arc::clone(&owner), id as u64, 65536).unwrap())
+                .collect();
+            assert_eq!(
+                owner.growth(),
+                growth_for(n),
+                "n={n}: re-creation reuses records"
+            );
+            // Adversarial rows: one more pipe beside n live ones.
+            let before = owner.growth();
+            let one = PipeInner::create(Arc::clone(&owner), 0, 65536).unwrap();
+            let delta = crate::el1_ipc::IpcGrowth {
+                object_records: owner.growth().object_records - before.object_records,
+                description_records: owner.growth().description_records
+                    - before.description_records,
+            };
+            assert_eq!(
+                delta,
+                crate::el1_ipc::IpcGrowth {
+                    object_records: if n.is_multiple_of(IPC_OBJECT_SEGMENT) {
+                        IPC_OBJECT_SEGMENT
+                    } else {
+                        0
+                    },
+                    description_records: if (2 * n).is_multiple_of(IPC_OFD_SEGMENT) {
+                        IPC_OFD_SEGMENT
+                    } else {
+                        0
+                    },
+                },
+                "n={n}: one create costs at most one segment, independent of n"
+            );
+            drop(one);
+            drop(pipes);
+            // The first write of one pipe takes one ring, whatever n.
+            let pipe = PipeInner::create(Arc::clone(&owner), 0, 65536).unwrap();
+            assert_eq!(pipe.write_bytes(b"x"), Ok(1));
+            assert_eq!(pipe.snapshot().unread, 1);
         }
     }
 

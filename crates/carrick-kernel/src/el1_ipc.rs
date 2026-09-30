@@ -35,6 +35,37 @@ impl From<fd::Error> for AdmissionError {
     }
 }
 
+/// Why creating a pipe or eventfd was refused. Only Linux-visible limits
+/// exist here: an exhausted internal store is grown, never reported, so no
+/// fixed table can surface as ENOMEM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateError {
+    /// The zone-wide file table is full (ENFILE, `fs.file-max`).
+    FileTableFull,
+}
+impl CreateError {
+    /// Classify an admission refusal. The zone ceiling is ENFILE; any other
+    /// refusal is an authority invariant violation (a store that could not
+    /// grow without reaching its ceiling, a stale identity, bad backing)
+    /// and fails closed rather than inventing an errno.
+    pub fn from_admission(error: AdmissionError) -> Self {
+        match error {
+            AdmissionError::Shared(IpcError::ZoneLimit) => Self::FileTableFull,
+            error @ (AdmissionError::NoMemory | AdmissionError::Shared(_)) => {
+                carrick_fatal::carrick_fatal!(
+                    "ipc::admission",
+                    "object creation refused outside the zone limit: {error:?}"
+                )
+            }
+        }
+    }
+    pub fn errno(self) -> carrick_abi::LinuxErrno {
+        match self {
+            Self::FileTableFull => carrick_abi::LINUX_ENFILE,
+        }
+    }
+}
+
 /// An owned, zero-filled, shared mapping. Only the synchronized IPC views
 /// access its contents; no slice of mutable shared memory escapes.
 struct Mapping {

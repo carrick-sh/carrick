@@ -174,8 +174,11 @@ impl EventFdState {
         owner: Arc<crate::el1_ipc::HostIpc>,
         initial: u32,
         mode: carrick_el1_abi::ipc::pipe::EventMode,
-    ) -> Result<Self, crate::el1_ipc::AdmissionError> {
-        let object = owner.create_eventfd(initial, mode)?;
+    ) -> Result<Self, crate::el1_ipc::CreateError> {
+        use crate::el1_ipc::CreateError;
+        let object = owner
+            .create_eventfd(initial, mode)
+            .map_err(CreateError::from_admission)?;
         let backing = carrick_el1_abi::ipc::IpcBacking::EventFd { object }.encode();
         let description = carrick_el1_abi::ipc::fd::Description::new(
             backing,
@@ -188,7 +191,7 @@ impl EventFdState {
                 owner.release(backing).unwrap_or_else(|_| {
                     carrick_fatal!("ipc::eventfd", "failed to roll back object admission")
                 });
-                return Err(error.into());
+                return Err(CreateError::from_admission(error));
             }
         };
         let wait_queue = owner.wait_queue(object);
@@ -4133,7 +4136,10 @@ mod tests {
             })
             .collect();
         for _ in 0..4 {
-            assert!(EventFdState::create(Arc::clone(&owner), 0, EventMode::Counter).is_err());
+            assert!(matches!(
+                EventFdState::create(Arc::clone(&owner), 0, EventMode::Counter),
+                Err(crate::el1_ipc::CreateError::FileTableFull)
+            ));
         }
         // Admission failure must not strand any of the finite object slots.
         let objects: Vec<_> = (0..IPC_OBJECTS)
