@@ -513,6 +513,7 @@ impl HvfVmState {
                     std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
                     root_host_cow_stats,
                     root_custody,
+                    super::foreign_mm::LiveBackingBinding::Deferred,
                 ),
                 last_exit_class: 0,
                 last_fault_esr: 0,

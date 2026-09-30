@@ -332,6 +332,8 @@ pub(crate) struct MmAccessState {
     >,
     pub(crate) identity:
         parking_lot::RwLock<Option<(carrick_hal::ForeignMmId, CarrierForeignMmBinding)>>,
+    /// How binding a stage-1 authority to the live backing treats its manager.
+    pub(crate) backing_binding: LiveBackingBinding,
     pub(crate) live_resolver: parking_lot::RwLock<
         Option<std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>>,
     >,
@@ -583,6 +585,20 @@ pub(crate) struct MmCowRuntimeBinding {
     pub(crate) persistent_vm_lifecycle: bool,
 }
 
+/// How binding a stage-1 authority to its live backing treats the manager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiveBackingBinding {
+    /// The manager becomes live on the resolver at once (exec and fork
+    /// children, whose tables and arenas are published before binding).
+    Immediate,
+    /// The resolver is recorded but the manager stays the host's owned copy
+    /// until a guest lane selection makes it live: the initial process
+    /// carves its mmap arena and apertures with host edits that allocate
+    /// extension arenas the resolver cannot yet resolve, and the host lane
+    /// keeps editing that copy for the process's whole life.
+    Deferred,
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MmAccessState {
     /// An MM's backend state, bound to its live backing from birth: the
@@ -603,8 +619,9 @@ impl MmAccessState {
         >,
         host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
         custody: std::sync::Arc<CarrierVmCustody>,
+        backing_binding: LiveBackingBinding,
     ) -> std::sync::Arc<Self> {
-        let state = Self::new_unbound(
+        let mut state = Self::new_unbound(
             page_tables,
             protections,
             frame_inventory,
@@ -612,6 +629,10 @@ impl MmAccessState {
             cow_deferred_publications,
             host_cow_stats,
         );
+        // Sole owner until it is shared below: choose the binding mode.
+        std::sync::Arc::get_mut(&mut state)
+            .expect("a new state is uniquely owned")
+            .backing_binding = backing_binding;
         let resolver = MmAccessLiveResolver::new(&state, custody);
         state.set_live_resolver(resolver);
         state
@@ -630,6 +651,7 @@ impl MmAccessState {
         host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
+            backing_binding: LiveBackingBinding::Immediate,
             host_cow_stats,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             native_activation_leaf_checks: std::sync::atomic::AtomicU64::new(0),
@@ -747,9 +769,29 @@ impl MmAccessState {
     ) {
         *self.live_resolver.write() = Some(std::sync::Arc::clone(&resolver));
         // SAFETY: `resolver` is authenticated by the caller/live state.
-        let promoted = unsafe { self.page_tables.read().bind_live_backing(resolver) };
+        let promoted = unsafe { self.bind_backing(&self.page_tables.read(), resolver) };
         self.record_guest_lane_promotion(promoted);
         self.sample_host_lane(carrick_aarch64::stage1_authority::GuestLaneSite::InitialBind);
+    }
+
+    /// Bind `authority` to the live backing as [`LiveBackingBinding`] says.
+    ///
+    /// # Safety
+    /// `resolver` must be authenticated for `authority`'s arenas.
+    unsafe fn bind_backing(
+        &self,
+        authority: &carrick_aarch64::Stage1Authority,
+        resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
+    ) -> bool {
+        match self.backing_binding {
+            LiveBackingBinding::Immediate => unsafe { authority.bind_live_backing(resolver) },
+            // The placeholder authority a state is born with holds no manager:
+            // recording the backing there would be copied to the engine's
+            // authority by `adopt_unshared_predecessor`, which makes its
+            // manager live. Only an authority with a manager records it.
+            LiveBackingBinding::Deferred if authority.is_none() => false,
+            LiveBackingBinding::Deferred => unsafe { authority.record_live_backing(resolver) },
+        }
     }
 
     pub(crate) fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {
@@ -761,7 +803,7 @@ impl MmAccessState {
         if let Some(ref resolver) = *self.live_resolver.read() {
             // SAFETY: `resolver` was authenticated when stored in `self.live_resolver`.
             let promoted =
-                unsafe { page_tables.bind_live_backing(std::sync::Arc::clone(resolver)) };
+                unsafe { self.bind_backing(&page_tables, std::sync::Arc::clone(resolver)) };
             self.record_guest_lane_promotion(promoted);
             self.sample_host_lane(carrick_aarch64::stage1_authority::GuestLaneSite::InitialBind);
         }

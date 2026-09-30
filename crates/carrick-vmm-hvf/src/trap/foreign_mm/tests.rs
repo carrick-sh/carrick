@@ -12466,6 +12466,7 @@ mod guest_cow {
             Arc::new(parking_lot::Mutex::new(Vec::new())),
             crate::hvf_aarch64_engine::HostCowStats::default(),
             custody,
+            crate::trap::foreign_mm::LiveBackingBinding::Immediate,
         );
         state.bind_page_tables_authority(engine_authority.clone());
         assert_eq!(
@@ -12516,6 +12517,73 @@ mod guest_cow {
             .expect("replacement alias");
         assert!(replacement.guest_writable, "the leaf recorded write intent");
         assert!(pool.finish(&excluded, &completion.grant));
+    }
+
+    /// The initial process carves its sparse mmap arena and apertures with
+    /// host edits on the owned page-table copy. Binding its live backing at
+    /// construction made that manager live on a resolver that cannot yet
+    /// resolve the arenas those edits allocate ("unresolved arena"), breaking
+    /// the host lane at startup. The root state records its backing and the
+    /// manager stays the host's owned copy until a guest lane selection makes
+    /// it live; a selection already pending still completes at the bind.
+    #[test]
+    fn a_production_root_state_keeps_its_owned_manager_until_the_guest_lane_selects() {
+        use crate::trap::foreign_mm::LiveBackingBinding;
+        use carrick_aarch64::stage1_authority::GuestLaneSelection;
+        use carrick_mmu_core::aarch64::LiveDescriptorOwner;
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let state_with = |binding| {
+            MmAccessState::new(
+                carrick_aarch64::Stage1Authority::new(),
+                Arc::new(MemoryProtections::default()),
+                Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+                Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+                Arc::new(parking_lot::Mutex::new(Vec::new())),
+                crate::hvf_aarch64_engine::HostCowStats::default(),
+                Arc::clone(&custody),
+                binding,
+            )
+        };
+        let authority = || {
+            carrick_aarch64::Stage1Authority::new_with_manager(Some(
+                carrick_mmu_core::aarch64::PageTableManager::new(
+                    carrick_mem::memory::stage1_hvpatch_page_tables(),
+                    carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+                ),
+            ))
+        };
+        let live = |authority: &carrick_aarch64::Stage1Authority| {
+            authority.with_manager(|manager| manager.is_live()).unwrap()
+        };
+        // Exec and fork children bind live at once.
+        let child = authority();
+        state_with(LiveBackingBinding::Immediate).bind_page_tables_authority(child.clone());
+        assert!(live(&child), "an exec/fork state makes its manager live");
+        // The root stays an owned copy on the host lane.
+        let root = authority();
+        state_with(LiveBackingBinding::Deferred).bind_page_tables_authority(root.clone());
+        assert!(
+            !live(&root),
+            "the root manager stays owned: host edits work"
+        );
+        assert_eq!(root.live_descriptor_owner(), LiveDescriptorOwner::Host);
+        // The backing is known, so the guest selection is immediate and makes
+        // the manager live at that point.
+        assert_eq!(
+            root.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Selected)
+        );
+        assert!(live(&root));
+        // A selection made before the backing was recorded completes at it.
+        let pending = authority();
+        assert_eq!(
+            pending.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Deferred)
+        );
+        state_with(LiveBackingBinding::Deferred).bind_page_tables_authority(pending.clone());
+        assert_eq!(pending.live_descriptor_owner(), LiveDescriptorOwner::Guest);
     }
 
     #[test]

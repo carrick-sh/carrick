@@ -1457,6 +1457,7 @@ impl HvfVmState {
             cow_deferred_publications,
             custody.host_cow_ledger.admit_mm(),
             std::sync::Arc::clone(&custody),
+            crate::trap::foreign_mm::LiveBackingBinding::Immediate,
         );
         // Exec replaces the MM owner as well as its tables: the successor is
         // born bound to its own resolver, before the engine adopts it, or a
