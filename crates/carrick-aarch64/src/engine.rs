@@ -1993,11 +1993,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         ensure_sparse_page_table_editor(editor_present, || {
             self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
         })?;
+        // The driving-vCPU service: host flush on the host lane, and on a
+        // guest-owned MM the verified EL1 publication sparse materialization
+        // requires. It reads TTBR0 only when a guest publication is submitted.
+        let slot = self.mailbox_slot();
+        let tables = self.page_tables.clone();
         let vm = &mut self.vm;
-        let vcpu = &mut self.vcpu;
-        let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
+        let mut flush = EngineStage1Services::<V> {
+            vcpu: &mut self.vcpu,
+            tables,
+            slot,
+            process_asid: self.process_asid,
+            carrier_root,
+        };
         vm.ensure_sparse_mmap_backing(va, len, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch sparse mmap backing: {error}")))
     }
@@ -2736,11 +2745,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         ensure_sparse_page_table_editor(editor_present, || {
             self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
         })?;
+        let slot = self.mailbox_slot();
+        let tables = self.page_tables.clone();
         let vm = &mut self.vm;
-        let vcpu = &mut self.vcpu;
-        let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
+        let mut flush = EngineStage1Services::<V> {
+            vcpu: &mut self.vcpu,
+            tables,
+            slot,
+            process_asid: self.process_asid,
+            carrier_root,
+        };
         vm.materialize_private_file_backing(va, len, host_fd, offset, source, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
     }
@@ -5123,6 +5138,39 @@ mod tests {
                 "{live_path} must select ASIDE1IS directly or through the driving-vCPU service"
             );
             assert!(!body.contains("run_el1_maintenance"));
+        }
+    }
+
+    /// Backend entry points that can publish descriptors on a guest-owned MM
+    /// must receive the driving-vCPU service. A bare flush closure reports
+    /// `guest_publication_available() == false`, so sparse and private-file
+    /// materialization on the guest lane would refuse instead of publishing.
+    #[test]
+    fn guest_publishing_backend_paths_receive_the_driving_vcpu_service() {
+        let source = include_str!("engine.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production AArch64 engine source");
+        for path in [
+            "fn ensure_frame_cow_write",
+            "fn ensure_sparse_mmap_backing",
+            "fn map_private_file_backed",
+            "fn repoint_guest_alias",
+        ] {
+            let body = production
+                .split(path)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("production backend path {path}"));
+            assert!(
+                body.contains("EngineStage1Services::<V>") && body.contains("slot"),
+                "{path} must hand the backend the driving-vCPU publication service"
+            );
+            assert!(
+                !body.contains("let mut flush = ||"),
+                "{path} must not pass a flush-only closure"
+            );
         }
     }
 
