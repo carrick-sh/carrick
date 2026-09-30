@@ -327,7 +327,7 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
     // host boundary, which recognizes it as in flight.
     let _editor = spaces.try_begin_edit(index, mm_key, owner)?;
     let mut covered = false;
-    for slot in path.slots.submitted_for(mm_key) {
+    for slot in path.slots.submitted_in_order(mm_key) {
         let covers = slot.pending_covering(mm_key, frame.far);
         if let Some(receipt) = path.applier.apply(slot, mm_key, grant.ttbr0) {
             covered |= covers && matches!(receipt.outcome, DescriptorOutcome::Applied(_));
@@ -486,7 +486,7 @@ fn try_drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
     };
     let apply_all = |applier: &mut X| {
         let mut applied = 0;
-        for slot in slots.submitted_for(mm_key) {
+        for slot in slots.submitted_in_order(mm_key) {
             if applier.apply(slot, mm_key, ttbr0).is_some() {
                 applied += 1;
             }
@@ -1914,6 +1914,74 @@ mod tests {
                 DrainOutcome::Clean,
                 "a published receipt is not in flight"
             );
+        }
+
+        /// The host prepares and submits one MM's transactions in
+        /// generation order under that MM's mutation guard, but they sit in
+        /// whichever vCPU slot was free. An async frame-grant `Prepare`
+        /// left in a higher slot must still land before a later munmap
+        /// retirement of the same range in a lower slot; applied in slot
+        /// order, the grant would re-expose backing the host has retired.
+        #[test]
+        fn a_drain_applies_one_mms_submissions_in_generation_order() {
+            use carrick_mmu_core::aarch64::descriptor_txn::TerminalEdit;
+            use carrick_mmu_core::aarch64::{PtOp, TerminalRule};
+            let mm = 77;
+            let arena = Arena::new();
+            let mut grant = grant_txn(mm, ROOT, VA);
+            grant.id.generation = nz(4);
+            let retire = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(mm),
+                    generation: nz(5),
+                },
+                root: SubstrateGpa(ROOT),
+                op: DescriptorOp::Terminal {
+                    span: PageSpan::new(VA, 4 * 4096),
+                    edit: TerminalEdit {
+                        rule: TerminalRule::pt(PtOp::Retire),
+                        asid_scoped: true,
+                        excluded_ipa: 0,
+                        excluded_len: 0,
+                        reclaim_budget: 0,
+                    },
+                },
+                tables: TableGrants::NONE,
+            };
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            // The faulting vCPU's slot is above the munmap caller's.
+            assert!(slots.submit(6, &grant));
+            assert!(slots.submit(2, &retire));
+            let spaces = published_space(mm, ROOT | ASID);
+            let mut applier = ArenaApplier::new(&arena);
+            assert_eq!(
+                drain_mm_descriptor_txns(
+                    &spaces,
+                    &slots,
+                    mm,
+                    ROOT | ASID,
+                    nz(1),
+                    &mut applier,
+                    false
+                ),
+                DrainOutcome::Drained(2)
+            );
+            for page in 0..4 {
+                let state = el1_private_leaf_state(arena.leaf(VA + page * 4096));
+                assert!(
+                    !matches!(
+                        state,
+                        El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
+                    ),
+                    "page {page} still names the granted backing after its retirement: {state:?}"
+                );
+            }
+            let grant_receipt = slots.take_receipt(6, grant.id).unwrap();
+            assert!(matches!(
+                grant_receipt.outcome,
+                DescriptorOutcome::Applied(_)
+            ));
+            assert!(slots.take_receipt(2, retire.id).is_some());
         }
 
         struct Frames {

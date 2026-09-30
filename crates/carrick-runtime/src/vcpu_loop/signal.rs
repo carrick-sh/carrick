@@ -2859,8 +2859,16 @@ mod guest_descriptor_lane_tests {
                 return Ok(frame);
             }
             let mut applied = 0;
-            let indexes: Vec<usize> = (0..self.slots.as_slice().len())
-                .filter(|&i| self.slots.slot(i).unwrap().submitted_for(mm))
+            // As EL1 does: in the host's submission (generation) order.
+            let indexes: Vec<usize> = self
+                .slots
+                .submitted_in_order(mm)
+                .filter_map(|slot| {
+                    self.slots
+                        .as_slice()
+                        .iter()
+                        .position(|candidate| std::ptr::eq(candidate, slot))
+                })
                 .collect();
             for index in indexes {
                 el1_apply_mm(self.resolver, self.slots, index, mm).unwrap();
