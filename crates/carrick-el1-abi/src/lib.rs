@@ -20,6 +20,8 @@
 
 #![no_std]
 
+mod cow_grants;
+pub use cow_grants::*;
 mod descriptor_txn;
 pub use descriptor_txn::*;
 mod metadata_extent;
@@ -488,11 +490,14 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
     ];
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
-    while i < facts.len() + DESCRIPTOR_TXN_LAYOUT_FACTS.len() {
+    let txn_end = facts.len() + DESCRIPTOR_TXN_LAYOUT_FACTS.len();
+    while i < txn_end + COW_GRANT_LAYOUT_FACTS.len() {
         let mut word = if i < facts.len() {
             facts[i]
-        } else {
+        } else if i < txn_end {
             DESCRIPTOR_TXN_LAYOUT_FACTS[i - facts.len()]
+        } else {
+            COW_GRANT_LAYOUT_FACTS[i - txn_end]
         };
         let mut b = 0;
         while b < 8 {
