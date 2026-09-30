@@ -704,7 +704,26 @@ impl CurrentTask {
     #[inline]
     #[must_use]
     pub fn leave_served_with_work(&self) -> Action {
-        self.served_with_work.store(1, Ordering::Release);
+        // `fetch_max`: a later drain that cannot complete must not downgrade a
+        // call that already owes its host commit (`leave_commit_owed`).
+        self.served_with_work
+            .fetch_max(SERVED_WAKES_OWED, Ordering::AcqRel);
+        Action::ServedWithWork
+    }
+
+    /// Leave for the host with a call whose guest-table effect EL1 has made
+    /// but whose host metadata commit is still owed (a retired `munmap`, an
+    /// `mprotect` whose VMA journal was full). `orig_x0` is the call's
+    /// argument 0 before EL1 wrote the result over it; the host re-issues the
+    /// call with it ([`ServedBoundary::ReplayOriginal`]). Only this entry
+    /// point asks for a replay: a call that merely left served (a drain that
+    /// could not finish, an owed wake) is complete and is never re-run.
+    #[inline]
+    #[must_use]
+    pub fn leave_commit_owed(&self, orig_x0: u64) -> Action {
+        self.orig_arg0.store(orig_x0, Ordering::Relaxed);
+        self.served_with_work
+            .store(SERVED_COMMIT_OWED, Ordering::Release);
         Action::ServedWithWork
     }
 
@@ -3008,13 +3027,7 @@ pub fn current_task_snapshot(slot: usize) -> Option<(El1TaskId, u64)> {
 
 /// Check and atomically clear the `served_with_work` flag for an executor slot.
 pub fn take_served_with_work(slot: usize) -> bool {
-    let ptr = get_el1_region_host_ptr();
-    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
-        return false;
-    }
-    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
-    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.served_with_work.swap(0, Ordering::AcqRel) != 0
+    take_served_boundary(slot).is_some()
 }
 
 /// Whether the syscall the vCPU at `slot` last left EL1 with was served at
@@ -3029,31 +3042,43 @@ pub fn peek_served_with_work(slot: usize) -> bool {
     current_task.served_with_work.load(Ordering::Acquire) != 0
 }
 
+/// `CurrentTask::served_with_work` value: the call is complete, only wakes
+/// (pipe, eventfd, inotify) are owed.
+pub const SERVED_WAKES_OWED: u32 = 1;
+/// `CurrentTask::served_with_work` value: the host must still commit the
+/// call's metadata and re-run it with the preserved argument 0.
+pub const SERVED_COMMIT_OWED: u32 = 2;
+
 /// What a thread owes the host after EL1 served its syscall with work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServedBoundary {
-    /// The call is complete; only owed wakes are delivered (pipe, eventfd,
-    /// inotify). The guest resumes after the syscall instruction.
+    /// The call is complete; only owed wakes are delivered. The guest
+    /// resumes after the syscall instruction.
     Completed,
     /// EL1 edited the guest tables but the host must still commit the call's
-    /// metadata (a retired `munmap`, an `mprotect` whose VMA journal was
-    /// full). The host runs the call again, and it must see the ORIGINAL
+    /// metadata. The host runs the call again, and it must see the ORIGINAL
     /// arguments: EL1 overwrote x0 with the result, so `x0` here is the
     /// argument 0 EL1 preserved. Never re-read x0 from the mutated frame.
     ReplayOriginal { x0: u64 },
 }
 
-/// Classify a served-with-work call `nr` whose preserved argument 0 is
-/// `orig_arg0`.
-pub const fn served_boundary(nr: u64, orig_arg0: u64) -> ServedBoundary {
-    match nr {
-        SYS_MUNMAP | SYS_MPROTECT => ServedBoundary::ReplayOriginal { x0: orig_arg0 },
-        _ => ServedBoundary::Completed,
+/// Atomically take the served-with-work boundary of an executor slot: `None`
+/// when the slot's last call left no work, else what it owes.
+pub fn take_served_boundary(slot: usize) -> Option<ServedBoundary> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return None;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    match current_task.served_with_work.swap(0, Ordering::AcqRel) {
+        0 => None,
+        SERVED_COMMIT_OWED => Some(ServedBoundary::ReplayOriginal {
+            x0: current_task.orig_arg0.load(Ordering::Relaxed),
+        }),
+        _ => Some(ServedBoundary::Completed),
     }
 }
-
-const SYS_MUNMAP: u64 = 215;
-const SYS_MPROTECT: u64 = 226;
 
 /// Read the preserved original argument 0 for an executor slot.
 pub fn get_orig_arg0(slot: usize) -> u64 {
@@ -3568,16 +3593,29 @@ impl Default for InotifyNameCache {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_served_munmap_or_mprotect_replays_with_the_preserved_argument() {
+    fn only_a_commit_owed_call_replays_and_a_drain_never_downgrades_it() {
+        let task = CurrentTask::new();
+        // A plain served call that left because a drain blocked: complete,
+        // whatever its stale `orig_arg0` and syscall number.
+        task.orig_arg0.store(0, Ordering::Relaxed);
+        let _ = task.leave_served_with_work();
         assert_eq!(
-            served_boundary(226, 0x6000),
-            ServedBoundary::ReplayOriginal { x0: 0x6000 }
+            task.served_with_work.load(Ordering::Relaxed),
+            SERVED_WAKES_OWED
         );
+        // A call owing its commit replays with the preserved argument ...
+        let _ = task.leave_commit_owed(0x6000);
         assert_eq!(
-            served_boundary(215, 0x7000),
-            ServedBoundary::ReplayOriginal { x0: 0x7000 }
+            task.served_with_work.load(Ordering::Relaxed),
+            SERVED_COMMIT_OWED
         );
-        assert_eq!(served_boundary(64, 9), ServedBoundary::Completed);
+        assert_eq!(task.orig_arg0.load(Ordering::Relaxed), 0x6000);
+        // ... and a later blocked drain (`leave_served_with_work`) keeps it.
+        let _ = task.leave_served_with_work();
+        assert_eq!(
+            task.served_with_work.load(Ordering::Relaxed),
+            SERVED_COMMIT_OWED
+        );
     }
 
     use super::*;

@@ -105,24 +105,18 @@ pub(super) fn with_original_arg0(state: GuestCpuState, x0: u64) -> GuestCpuState
     GuestCpuState::from_aarch64_v1(cpu)
 }
 
-/// How a thread taken off its vCPU resumes after EL1 served its syscall
-/// (`served`): `(state, completed)`. A call whose host commit is still owed
-/// re-issues with its original arguments; any other served call is complete.
+/// How a thread taken off its vCPU resumes after EL1 served its syscall:
+/// `(state, completed)`. A call whose host commit is owed re-issues with its
+/// original arguments; any other served call is complete; an unserved call
+/// re-issues as it is.
 pub(super) fn settle_served_state(
     state: GuestCpuState,
-    served: bool,
-    orig_arg0: u64,
+    boundary: Option<carrick_el1_abi::ServedBoundary>,
 ) -> (GuestCpuState, bool) {
-    if !served {
-        return (state, false);
-    }
-    let nr = match &state {
-        GuestCpuState::Aarch64V1(cpu) => cpu.gprs[8],
-        _ => return (state, true),
-    };
-    match carrick_el1_abi::served_boundary(nr, orig_arg0) {
-        carrick_el1_abi::ServedBoundary::Completed => (state, true),
-        carrick_el1_abi::ServedBoundary::ReplayOriginal { x0 } => {
+    match boundary {
+        None => (state, false),
+        Some(carrick_el1_abi::ServedBoundary::Completed) => (state, true),
+        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0 }) => {
             (with_original_arg0(state, x0), false)
         }
     }
@@ -252,16 +246,12 @@ where
                 // state; this executor claims it next. This job's thread,
                 // which EL1 parked, settles below.
                 // Delivers what the served call owed (inotify, IPC).
-                let served_with_work = carrick_kernel::el1_delegation::settle_el1_boundary_for(
+                let boundary = carrick_kernel::el1_delegation::settle_el1_boundary_for(
                     slot.raw().into(),
                     &self.kernel.dispatcher,
                 );
                 let state = engine.snapshot_guest_state_for_publication()?;
-                let (ctx_state, completed) = settle_served_state(
-                    state.clone(),
-                    served_with_work,
-                    carrick_el1_abi::get_orig_arg0(slot.raw().into()),
-                );
+                let (ctx_state, completed) = settle_served_state(state.clone(), boundary);
                 let ctx = zone_ctx_from_state(
                     &ctx_state,
                     match exit {
@@ -296,7 +286,7 @@ where
                 // The vCPU left EL1 with no thread on it (the idle exit)
                 // with this job's thread parked or preempted: host work, or
                 // a queued thread that needs this executor.
-                let served = carrick_kernel::el1_delegation::settle_el1_boundary_for(
+                let boundary = carrick_kernel::el1_delegation::settle_el1_boundary_for(
                     slot.raw().into(),
                     &self.kernel.dispatcher,
                 );
@@ -305,11 +295,7 @@ where
                 // served whose host commit is owed must re-issue with its
                 // ORIGINAL x0, not the result EL1 wrote there (a re-issued
                 // `mprotect(0, len)` answered ENOMEM).
-                match settle_served_state(
-                    state.clone(),
-                    served,
-                    carrick_el1_abi::get_orig_arg0(slot.raw().into()),
-                ) {
+                match settle_served_state(state.clone(), boundary) {
                     (replayed, false) => replayed,
                     (_, true) => state,
                 }
@@ -1276,25 +1262,30 @@ mod ipc_tests {
         }
     }
 
-    /// A full VMA journal leaves `mprotect` with work owed, and EL1 has
+    /// A full VMA journal leaves `mprotect` with its commit owed, and EL1 has
     /// already written the result 0 into x0. The re-issued call must carry
     /// the original address, not 0.
     #[test]
-    fn a_served_mprotect_with_work_replays_with_its_original_address() {
-        let (state, completed) = settle_served_state(syscall_state(226, 0), true, 0x60_0000_5000);
+    fn a_commit_owed_call_replays_with_its_original_address() {
+        let boundary = Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 0x60_0000_5000 });
+        let (state, completed) = settle_served_state(syscall_state(226, 0), boundary);
         assert!(!completed, "the host commit is still owed");
         assert_eq!(x0_x1(&state), (0x60_0000_5000, 0x20000));
-        let (state, completed) = settle_served_state(syscall_state(215, 0), true, 0x1000);
-        assert!(!completed);
-        assert_eq!(x0_x1(&state).0, 0x1000);
     }
 
+    /// A call that merely left served (a drain that could not finish, an
+    /// owed wake) is complete: its x0 is the result and it is never re-run,
+    /// whatever its number (a journaled `mprotect` that blocked in a drain
+    /// was re-run as `mprotect(0, len)` and answered ENOMEM).
     #[test]
-    fn other_served_calls_complete_and_unserved_calls_are_untouched() {
-        let (state, completed) = settle_served_state(syscall_state(64, 7), true, 0x1234);
+    fn a_completed_served_call_is_not_replayed_even_for_mprotect() {
+        let (state, completed) = settle_served_state(
+            syscall_state(226, 0),
+            Some(carrick_el1_abi::ServedBoundary::Completed),
+        );
         assert!(completed);
-        assert_eq!(x0_x1(&state).0, 7, "an owed wake does not rewrite x0");
-        let (state, completed) = settle_served_state(syscall_state(226, 0x5000), false, 0x1234);
+        assert_eq!(x0_x1(&state).0, 0, "the result stays");
+        let (state, completed) = settle_served_state(syscall_state(226, 0x5000), None);
         assert!(!completed);
         assert_eq!(x0_x1(&state).0, 0x5000, "a forwarded call keeps its frame");
     }

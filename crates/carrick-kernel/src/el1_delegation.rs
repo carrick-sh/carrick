@@ -45,8 +45,12 @@ impl From<crate::kernel::ids::TaskId> for El1TaskId {
 /// index would leave a host waiter asleep until an unrelated boundary.
 /// Clear first, then drain: a publication after the drain marks pending
 /// host work again for the next boundary.
-pub fn settle_el1_boundary(slot: usize, kernel: &crate::kernel::Kernel) -> bool {
-    let served = carrick_el1_abi::take_served_with_work(slot);
+pub fn settle_el1_boundary(
+    slot: usize,
+    kernel: &crate::kernel::Kernel,
+) -> Option<carrick_el1_abi::ServedBoundary> {
+    let boundary = carrick_el1_abi::take_served_boundary(slot);
+    let served = boundary.is_some();
     let pending = carrick_el1_abi::take_pending_host_work(slot);
     if served {
         crate::el1_inotify::deliver_owed_wakes();
@@ -54,14 +58,14 @@ pub fn settle_el1_boundary(slot: usize, kernel: &crate::kernel::Kernel) -> bool 
     if served || pending {
         kernel.deliver_ipc_host_wakes();
     }
-    served
+    boundary
 }
 
 /// [`settle_el1_boundary`] for the kernel `dispatcher` serves.
 pub fn settle_el1_boundary_for(
     slot: usize,
     dispatcher: &crate::dispatch::SyscallDispatcher,
-) -> bool {
+) -> Option<carrick_el1_abi::ServedBoundary> {
     let kernel = std::sync::Arc::clone(dispatcher.kernel_binding.read().kernel());
     settle_el1_boundary(slot, &kernel)
 }
