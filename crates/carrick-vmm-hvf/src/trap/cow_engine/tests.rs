@@ -19,12 +19,26 @@ fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
 
 #[test]
 fn guest_lane_refuses_host_cow_before_copy_or_publication() {
+    // Converted writers publish through EL1 and must refuse a missing
+    // driving vCPU before any allocation or inventory staging.
+    let source = include_str!("../cow_engine.rs");
+    let body = source
+        .split_once("fn materialize_retired_reuse(")
+        .unwrap()
+        .1;
+    let guard = body
+        .find("guest_publication_available()")
+        .expect("guest retained reuse must require its driving vCPU");
+    assert!(guard < body.find("let retained_ipa").unwrap());
+    assert!(
+        !body
+            .split("\n    }\n")
+            .next()
+            .unwrap()
+            .contains("require_host_cow_lane("),
+        "retained reuse is converted; it must not refuse the guest lane"
+    );
     for (source, entry, first_effect) in [
-        (
-            include_str!("../cow_engine.rs"),
-            "fn materialize_retired_reuse(",
-            "let retained_ipa",
-        ),
         (
             include_str!("../foreign_mm.rs"),
             "fn perform_foreign_cow_transaction(",

@@ -864,40 +864,40 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 1,
-      "fingerprint": "7689f0ec276b4d4814765493766577a5bdc643675ef66422f681ff28f2637569",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed during retained-reuse rollback, leaving stale stage-1 translations in the hardware TLB. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint. Re-reviewed 2026-09-29: unchanged abort; EL1 migration edits to the enclosing function (and, for shifted ordinals, newly inserted guest-publication aborts ahead of it) moved the fingerprint.",
-      "sink": "fatal",
-      "domain": "hvpatch::mm_authority"
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 2,
-      "fingerprint": "c267448f8d638dbb2c389243dc8e642c3ce73b6dcdd2e098a0ad08970b1ecf71",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed after publishing retained reuse page table updates, leaving hardware TLB out of sync with published stage-1 translations. Re-reviewed 2026-09-29: unchanged abort; EL1 migration edits to the enclosing function (and, for shifted ordinals, newly inserted guest-publication aborts ahead of it) moved the fingerprint.",
-      "sink": "fatal",
-      "domain": "hvpatch::mm_authority"
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "function": "HvfVmState::materialize_retired_reuse",
       "ordinal_in_function": 3,
-      "fingerprint": "59b22977ed31a965e1eda95ca1f98930df58933baf1c268dd7ef95b3a8d0652c",
+      "fingerprint": "8ffc5d0a82fa2758fd99b175f69d5747b6177f1892769d4bf15717c7f411da53",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed during retained-reuse rollback, leaving stale stage-1 translations in the hardware TLB. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint. Re-reviewed 2026-09-29: unchanged abort; EL1 migration edits to the enclosing function (and, for shifted ordinals, newly inserted guest-publication aborts ahead of it) moved the fingerprint. Re-reviewed 2026-09-29: unchanged host-lane abort; the guest-lane EL1 publication branch inserted two receipt aborts ahead of it.",
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 4,
+      "fingerprint": "8ffc5d0a82fa2758fd99b175f69d5747b6177f1892769d4bf15717c7f411da53",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed after publishing retained reuse page table updates, leaving hardware TLB out of sync with published stage-1 translations. Re-reviewed 2026-09-29: unchanged abort; EL1 migration edits to the enclosing function (and, for shifted ordinals, newly inserted guest-publication aborts ahead of it) moved the fingerprint. Re-reviewed 2026-09-29: unchanged host-lane abort; the guest-lane EL1 publication branch inserted two receipt aborts ahead of it.",
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 5,
+      "fingerprint": "8ffc5d0a82fa2758fd99b175f69d5747b6177f1892769d4bf15717c7f411da53",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing frame inventory reservation failed after retained reuse mappings were installed, desynchronizing carrier memory from Kernel inventory authority.",
+      "rationale": "Committing frame inventory reservation failed after retained reuse mappings were installed, desynchronizing carrier memory from Kernel inventory authority. Re-reviewed 2026-09-29: unchanged host-lane abort; the guest-lane EL1 publication branch inserted two receipt aborts ahead of it.",
       "sink": "fatal",
       "domain": "hvpatch::frame_inventory"
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 4,
+      "ordinal_in_function": 6,
       "fingerprint": "692b957fdb97e7fbac5d68f7c966c473857b77a68645b4fabb2233d8ed4e78bf",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
@@ -908,7 +908,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 5,
+      "ordinal_in_function": 7,
       "fingerprint": "fa53404a4db12bc717ac9b6bd451d5456194e8c845d0aa3f8f016eca19bb78c4",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::cow_token",
@@ -919,7 +919,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 6,
+      "ordinal_in_function": 8,
       "fingerprint": "fa53404a4db12bc717ac9b6bd451d5456194e8c845d0aa3f8f016eca19bb78c4",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::cow_token",
@@ -2191,6 +2191,28 @@
       "rationale": "The verified EL1 receipt must name the exact submitted sparse transaction; another transaction means completions crossed and the sparse mapping is unauthenticated.",
       "sink": "fatal",
       "domain": "hvpatch::sparse_materialization"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 1,
+      "fingerprint": "40b9aa53c024dd0f07a50ed48cbfec2572b692ee6cb25780e12700359903ccdd",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow",
+      "rationale": "The retained-reuse Deferred MapAlias was submitted to EL1 under exact-MM quiesce; without a verified completion the retired leaf may already name the new frame, so the prepared grant can neither commit nor roll back soundly.",
+      "sink": "fatal",
+      "domain": "hvpatch::cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 2,
+      "fingerprint": "40b9aa53c024dd0f07a50ed48cbfec2572b692ee6cb25780e12700359903ccdd",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow",
+      "rationale": "The verified EL1 receipt must name the exact submitted retained-reuse transaction; another transaction means completions crossed and the published alias is unauthenticated.",
+      "sink": "fatal",
+      "domain": "hvpatch::cow"
     }
   ]
 }
