@@ -3680,6 +3680,41 @@ impl ZoneTables {
                 record.entry_count(),
                 record.deadline(),
             )?;
+            if let Some(wait) = record.object_wait_census() {
+                writeln!(
+                    out,
+                    "zone record {index} object wait: queue={} generation={} operation={}:{}",
+                    wait.queue, wait.generation, wait.operation, wait.operation_generation,
+                )?;
+            }
+        }
+        // Each queue a record is linked on, once.
+        let mut seen = [0u64; object_wait::OBJECT_WAIT_QUEUES / 64];
+        for record in self.records.iter().skip(1) {
+            if record.claim() == Claim::Free {
+                continue;
+            }
+            let Some(wait) = record.object_wait_census() else {
+                continue;
+            };
+            let q = wait.queue as usize;
+            if q == 0 || q >= object_wait::OBJECT_WAIT_QUEUES || seen[q / 64] & (1 << (q % 64)) != 0
+            {
+                continue;
+            }
+            seen[q / 64] |= 1 << (q % 64);
+            if let Some(queue) = self.object_queue_census(wait.queue) {
+                writeln!(
+                    out,
+                    "zone object queue {q}: generation={} epoch={} head={} tail={} waiters={} locked={}",
+                    queue.generation,
+                    queue.epoch,
+                    queue.head,
+                    queue.tail,
+                    queue.waiters,
+                    queue.locked,
+                )?;
+            }
         }
         Ok(())
     }

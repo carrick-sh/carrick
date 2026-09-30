@@ -156,6 +156,15 @@ impl Watchdog {
                 if let Some(zone) = carrick_el1_abi::zone_tables() {
                     let mut census = String::new();
                     let _ = zone.write_census(&mut census);
+                    // The object each parked record waits on, and its state:
+                    // a lost write leaves the object empty; a lost wake
+                    // leaves it readable with the waiter still linked.
+                    if let Some(region) =
+                        carrick_el1_abi::ipc_window_host().and_then(|window| window.attach().ok())
+                    {
+                        let _ =
+                            carrick_el1_abi::ipc::write_ipc_wait_census(zone, &region, &mut census);
+                    }
                     eprintln!("WATCHDOG zone census:\n{census}");
                 }
                 // The kernel graph's view of the wedge: the runner answers a
