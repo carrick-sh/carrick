@@ -3157,11 +3157,8 @@ impl<'a> MemView<'a> {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     let old_end = old_address.0.saturating_add(old_size);
-                    let tail_occupied = this.mem()
-                        .lock()
-                        .dynamic_maps
-                        .iter()
-                        .any(|map| map.start < new_end && map.end > old_end);
+                    // Any mapping, host row or delegated root row, blocks it.
+                    let tail_occupied = this.dynamic_mapping_overlaps(old_end, new_end - old_end);
                     if tail_occupied {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
