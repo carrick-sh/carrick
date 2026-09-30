@@ -585,6 +585,29 @@ pub(crate) struct MmCowRuntimeBinding {
     pub(crate) persistent_vm_lifecycle: bool,
 }
 
+/// The carrier custody an MM state resolves its live backing through, and how
+/// binding an authority to it treats the manager.
+pub(crate) struct LiveBacking {
+    custody: std::sync::Arc<CarrierVmCustody>,
+    binding: LiveBackingBinding,
+}
+
+impl LiveBacking {
+    pub(crate) fn immediate(custody: std::sync::Arc<CarrierVmCustody>) -> Self {
+        Self {
+            custody,
+            binding: LiveBackingBinding::Immediate,
+        }
+    }
+
+    pub(crate) fn deferred(custody: std::sync::Arc<CarrierVmCustody>) -> Self {
+        Self {
+            custody,
+            binding: LiveBackingBinding::Deferred,
+        }
+    }
+}
+
 /// How binding a stage-1 authority to its live backing treats the manager.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LiveBackingBinding {
@@ -618,22 +641,18 @@ impl MmAccessState {
             parking_lot::Mutex<Vec<PendingFrameCowPublication>>,
         >,
         host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
-        custody: std::sync::Arc<CarrierVmCustody>,
-        backing_binding: LiveBackingBinding,
+        backing: LiveBacking,
     ) -> std::sync::Arc<Self> {
-        let mut state = Self::new_unbound(
+        let state = Self::build(
             page_tables,
             protections,
             frame_inventory,
             cow_armed,
             cow_deferred_publications,
             host_cow_stats,
+            backing.binding,
         );
-        // Sole owner until it is shared below: choose the binding mode.
-        std::sync::Arc::get_mut(&mut state)
-            .expect("a new state is uniquely owned")
-            .backing_binding = backing_binding;
-        let resolver = MmAccessLiveResolver::new(&state, custody);
+        let resolver = MmAccessLiveResolver::new(&state, backing.custody);
         state.set_live_resolver(resolver);
         state
     }
@@ -650,8 +669,30 @@ impl MmAccessState {
         >,
         host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
     ) -> std::sync::Arc<Self> {
+        Self::build(
+            page_tables,
+            protections,
+            frame_inventory,
+            cow_armed,
+            cow_deferred_publications,
+            host_cow_stats,
+            LiveBackingBinding::Immediate,
+        )
+    }
+
+    fn build(
+        page_tables: carrick_aarch64::Stage1Authority,
+        protections: std::sync::Arc<MemoryProtections>,
+        frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+        cow_deferred_publications: std::sync::Arc<
+            parking_lot::Mutex<Vec<PendingFrameCowPublication>>,
+        >,
+        host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
+        backing_binding: LiveBackingBinding,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            backing_binding: LiveBackingBinding::Immediate,
+            backing_binding,
             host_cow_stats,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             native_activation_leaf_checks: std::sync::atomic::AtomicU64::new(0),
