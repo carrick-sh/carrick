@@ -1430,3 +1430,44 @@ fn setpriority_getpriority_round_trip_reports_kernel_abi_nice() {
         .unwrap();
     assert_eq!(out, DispatchOutcome::Returned { value: 15 });
 }
+
+#[test]
+fn get_robust_list_returns_what_set_robust_list_stored() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut call = |memory: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                memory,
+                &reporter,
+            )
+            .unwrap()
+    };
+    let read = |memory: &mut LinearMemory, addr: u64| {
+        u64::from_le_bytes(memory.read_bytes(addr, 8).unwrap().try_into().unwrap())
+    };
+
+    // A thread that never registered reports a null head, length 24.
+    assert_eq!(
+        call(&mut memory, 100, [0, 0x10000, 0x10008, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(read(&mut memory, 0x10000), 0);
+    assert_eq!(read(&mut memory, 0x10008), 24);
+
+    // Linux returns the head the thread registered.
+    assert_eq!(
+        call(&mut memory, 99, [0x10100, 24, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        call(&mut memory, 100, [0, 0x10000, 0x10008, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(read(&mut memory, 0x10000), 0x10100);
+    assert_eq!(read(&mut memory, 0x10008), 24);
+}

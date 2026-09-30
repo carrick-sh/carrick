@@ -1867,13 +1867,13 @@ impl<'a> ProcView<'a> {
 
         fn set_robust_list(this, cx, head: GuestPtr, len: u64) {
             // Linux rejects any len != sizeof(struct robust_list_head) with
-            // EINVAL (LTP set_robust_list01 passes len = (size_t)-1). carrick
-            // has no robust-futex death-cleanup, so the head pointer is accepted
-            // but not retained — this is purely the ABI-conformant validation.
+            // EINVAL (LTP set_robust_list01 passes len = (size_t)-1). The head
+            // and length are kept in the thread's control slot so
+            // `get_robust_list` returns what was set.
             if len != ROBUST_LIST_HEAD_SIZE {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let _ = head;
+            cx.kernel.thread().set_robust_list(head.0, len as u32);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1882,9 +1882,9 @@ impl<'a> ProcView<'a> {
         /// another task we can't inspect without ptrace privilege (EPERM), and a
         /// pid that doesn't exist is ESRCH (LTP get_robust_list01: pid 1 → EPERM,
         /// an unused pid → ESRCH). For the caller, both output pointers must be
-        /// writable (NULL → EFAULT). carrick keeps no robust-list head, so it
-        /// reports an empty list with the ABI-fixed length; the test checks only
-        /// the errno/return path, not the contents.
+        /// writable (NULL → EFAULT). Reports the head and length the caller last
+        /// passed to `set_robust_list`, or a null head with the ABI-fixed
+        /// length if it never registered one (Linux's initial state).
         fn get_robust_list(this, cx, pid: Pid, head_ptr: GuestPtr, len_ptr: GuestPtr) {
             // "Is this me?" is a guest question. It used to compare against
             // `std::process::id()`, so guest process 3 asking for its OWN
@@ -1906,10 +1906,12 @@ impl<'a> ProcView<'a> {
             if head_ptr.0 == 0 || len_ptr.0 == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
+            let (head, len) = cx.kernel.thread().robust_list();
+            let len = if len == 0 { ROBUST_LIST_HEAD_SIZE } else { u64::from(len) };
             let memory = &mut *cx.memory;
-            if memory.write_bytes(head_ptr.0, &0u64.to_le_bytes()).is_err()
+            if memory.write_bytes(head_ptr.0, &head.to_le_bytes()).is_err()
                 || memory
-                    .write_bytes(len_ptr.0, &ROBUST_LIST_HEAD_SIZE.to_le_bytes())
+                    .write_bytes(len_ptr.0, &len.to_le_bytes())
                     .is_err()
             {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
