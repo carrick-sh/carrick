@@ -3681,8 +3681,9 @@ fn el1_thread_lifecycle_cleartid_tid_reuse() {
 /// Stage L0(e): `RLIMIT_NPROC` counts threads uid-wide. As an unprivileged uid
 /// (the fixture drops from root), a clone and a fork at the limit fail
 /// `EAGAIN` while a peer process of that uid, with its own limit, forks; the
-/// smallest admitting limit counts both processes; two spare slots admit
-/// exactly two held threads and an exiting thread frees its slot. The uid is
+/// smallest admitting limit counts both processes; with limit L and C
+/// existing tasks exactly L - C held threads are admitted (refused when the
+/// uid already has >= L tasks) and exiting threads free their slots. The uid is
 /// 34567 rather than 1000 so a Docker host's own uid-1000 tasks cannot shift
 /// the count. Oracle: native Docker.
 #[test]

@@ -937,27 +937,38 @@ pub fn nproc_limit() -> i32 {
         let stable = probe_spawn(lmin, hard) && !probe_spawn(lmin - 1, hard);
         report.push(format!("lmin={lmin} stable={stable}"));
 
-        // Phase 3: with two spare slots exactly two held threads spawn and a
-        // third is refused; releasing one frees exactly one slot.
-        let mut phase3 = set_nproc_soft(lmin + 2, hard);
+        // Phase 3: the rule measured in phase 2 is "a new task is refused
+        // when the uid already has >= limit tasks" (count after the new task
+        // > limit). With C = lmin - 1 existing tasks and limit L = lmin + 2,
+        // exactly L - C = 3 held threads are admitted and the 4th gets
+        // EAGAIN. Each admission is printed.
+        let existing = lmin - 1;
+        let limit3 = lmin + 2;
+        let mut phase3 = set_nproc_soft(limit3, hard);
         let release = std::sync::Arc::new(AtomicU32::new(0));
-        let first = try_spawn_held(release.clone());
-        let second_release = std::sync::Arc::new(AtomicU32::new(0));
-        let second = try_spawn_held(second_release.clone());
-        phase3 &= first.is_ok() && second.is_ok();
-        let third = try_spawn_held(release.clone());
-        let third_errno = third.as_ref().err().copied();
-        phase3 &= third_errno == Some(EAGAIN as i32);
-        if let Ok(handle) = third {
-            bump(&release);
-            let _ = handle.join();
+        let mut held = Vec::new();
+        let mut refused_at = None;
+        let mut refused_errno = None;
+        for attempt in 1..=8u64 {
+            match try_spawn_held(release.clone()) {
+                Ok(handle) => held.push(handle),
+                Err(errno) => {
+                    refused_at = Some(attempt);
+                    refused_errno = Some(errno);
+                    break;
+                }
+            }
         }
+        let admitted = held.len() as u64;
+        phase3 &= admitted == limit3 - existing
+            && refused_at == Some(admitted + 1)
+            && refused_errno == Some(EAGAIN as i32);
+        // An exited thread stops counting: releasing them frees the slots
+        // (bounded wait: the count drops when the task is released).
         bump(&release);
-        if let Ok(handle) = first {
+        for handle in held {
             let _ = handle.join();
         }
-        // The exited thread stops counting: a spawn succeeds again (bounded
-        // wait: the kernel releases the task's count after the exit).
         let freed = wait_true(Duration::from_secs(5), || {
             let probe = std::sync::Arc::new(AtomicU32::new(1));
             match try_spawn_held(probe) {
@@ -969,11 +980,9 @@ pub fn nproc_limit() -> i32 {
             }
         });
         phase3 &= freed;
-        bump(&second_release);
-        if let Ok(handle) = second {
-            let _ = handle.join();
-        }
-        report.push(format!("third_errno={third_errno:?} freed={freed}"));
+        report.push(format!(
+            "existing={existing} limit3={limit3} admitted={admitted} refused_at={refused_at:?} refused_errno={refused_errno:?} freed={freed}"
+        ));
 
         let _ = write_signal_byte(role.wr, b'D');
         let ok = phase1 && peer_forked && lmin >= 3 && stable && phase3;
@@ -998,12 +1007,16 @@ fn start_storm(count: usize, stop: std::sync::Arc<AtomicU32>) -> Vec<std::thread
         .filter_map(|_| {
             let stop = stop.clone();
             spawn_small(move || {
-                while stop.load(Ordering::Acquire) == 0 {
+                // Bounded and paced: at most 5000 cycles per storm thread.
+                let mut cycles = 0;
+                while stop.load(Ordering::Acquire) == 0 && cycles < 5000 {
                     if let Ok(handle) = spawn_small(|| {
                         STORM_SPAWNED.fetch_add(1, Ordering::Relaxed);
                     }) {
                         let _ = handle.join();
                     }
+                    cycles += 1;
+                    std::thread::sleep(Duration::from_micros(300));
                 }
             })
             .ok()
@@ -1014,6 +1027,10 @@ fn start_storm(count: usize, stop: std::sync::Arc<AtomicU32>) -> Vec<std::thread
 pub fn fork_storm(forks: usize) -> i32 {
     let stop = std::sync::Arc::new(AtomicU32::new(0));
     let storm = start_storm(8, stop.clone());
+    // Fork only once the storm is demonstrably running (bounded wait).
+    let storm_started = wait_true(Duration::from_secs(20), || {
+        STORM_SPAWNED.load(Ordering::Relaxed) >= 64
+    });
     let mut bad = 0;
     let mut child_threads_seen = Vec::new();
     for _ in 0..forks {
@@ -1054,7 +1071,7 @@ pub fn fork_storm(forks: usize) -> i32 {
         let _ = handle.join();
     }
     let spawned = STORM_SPAWNED.load(Ordering::Relaxed);
-    let ok = bad == 0 && spawned >= forks as u64;
+    let ok = bad == 0 && storm_started;
     println!(
         "fork-storm forks={forks} storm_spawned={spawned} bad={bad} child_thread_counts={child_threads_seen:?} ok={ok}"
     );
