@@ -69,6 +69,23 @@ pub(in crate::dispatch::mem) fn insert_dynamic_map_coalescing(
     }
 }
 
+/// Merge the `dynamic_maps` rows touching `[start, end)` with their
+/// neighbours wherever they again describe one canonical VMA.
+pub(in crate::dispatch) fn coalesce_dynamic_maps_around(mem: &mut MemState, start: u64, end: u64) {
+    let maps = &mut mem.dynamic_maps;
+    let mut idx = maps
+        .partition_point(|map| map.end < start)
+        .saturating_sub(1);
+    while idx + 1 < maps.len() && maps[idx].start <= end {
+        if dynamic_maps_share_canonical_vma(&maps[idx], &maps[idx + 1], &mem.semantic_vmas) {
+            let next_end = maps.remove(idx + 1).end;
+            maps[idx].end = next_end;
+        } else {
+            idx += 1;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateRepointRecovery {
     RecoveredCleanly,
