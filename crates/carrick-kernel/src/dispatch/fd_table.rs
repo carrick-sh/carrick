@@ -115,7 +115,10 @@ pub(crate) struct EpollInterest {
     /// It is distinct from `last_read_avail`: a guest-to-guest connection
     /// arrives through EVFILT_USER, while host listener arrivals carry kqueue
     /// queue depth.  Equal depths across those sources still describe a new ET
-    /// edge.
+    /// edge. For a shared IPC object (pipe read end, eventfd) it is the
+    /// object's reader-wake sequence: EL1 serves those reads in-guest, so no
+    /// host-dispatched drain re-arms `last_ready`, and a byte count cannot
+    /// tell a drain-and-refill from "unchanged".
     pub(super) last_inzone_arrival_generation: Option<u64>,
     /// Last host listener accept-queue depth delivered from a real kqueue
     /// record. Kept separate from the in-zone enqueue generation: a fallback
@@ -158,6 +161,15 @@ pub(crate) struct EventFdState {
     pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 impl EventFdState {
+    /// The reader-wake sequence of this eventfd incarnation (see
+    /// `PipeInner::read_arrival_generation`). `None` once retired.
+    pub(crate) fn read_arrival_generation(&self) -> Option<u64> {
+        self.owner
+            .region()
+            .observe(self.object)
+            .ok()
+            .map(|seqs| seqs.read)
+    }
     pub(super) fn create(
         owner: Arc<crate::el1_ipc::HostIpc>,
         initial: u32,

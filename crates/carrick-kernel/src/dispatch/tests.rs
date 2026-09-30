@@ -1592,6 +1592,62 @@ mod overlay_dispatch_tests {
         );
     }
 
+    /// `epollexclusive`'s `epoll_et_after_drain_new_write_fires`: EL1 serves
+    /// pipe reads in-guest, so the host never dispatches the drain and
+    /// `epoll_rearm_after_io` never clears the ET latch. A byte count cannot
+    /// tell "drained then refilled to the same count" from "unchanged"; the
+    /// write that follows must still be a new ET edge (Linux wakes pipe
+    /// readers on every write).
+    #[test]
+    fn epoll_et_pipe_new_write_after_undispatched_drain_fires() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+        let pair_addr = h.reserve(8);
+        assert_eq!(
+            returned(h.call(59, [pair_addr, LINUX_O_NONBLOCK, 0, 0, 0, 0])),
+            0
+        );
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let reader = i32::from_le_bytes(pair[0..4].try_into().unwrap());
+        let writer = i32::from_le_bytes(pair[4..8].try_into().unwrap());
+        let ev_addr = h.reserve(16);
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        ev[8..16].copy_from_slice(&(reader as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, ev_addr, 0, 0]
+            )),
+            0
+        );
+        let out_addr = h.reserve(16);
+        let a = h.put_bytes(b"a");
+        assert_eq!(returned(h.call(64, [writer as u64, a, 1, 0, 0, 0])), 1);
+        assert_eq!(returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])), 1);
+        assert_eq!(returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])), 0);
+
+        // Drain through the shared object, as the EL1 venue does: no host
+        // dispatch, so no consumption re-arm reaches the epoll interest.
+        {
+            let open = h.dispatcher.open_file(reader).expect("pipe reader");
+            let description = open.description.inspect().expect("reader description");
+            let OpenDescription::PipeReader { pipe, .. } = &*description else {
+                panic!("pipe2 read end must be a shared pipe reader");
+            };
+            assert_eq!(pipe.read_with(16, |bytes| bytes.len()), Ok(1));
+        }
+
+        let c = h.put_bytes(b"c");
+        assert_eq!(returned(h.call(64, [writer as u64, c, 1, 0, 0, 0])), 1);
+        assert_eq!(
+            returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])),
+            1,
+            "a write after an undispatched drain is a new ET edge"
+        );
+    }
+
     #[test]
     fn epoll_et_read_via_dup_rearms_registered_sibling() {
         let mut h = Harness::new();
