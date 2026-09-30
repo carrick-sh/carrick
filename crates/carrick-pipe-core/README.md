@@ -26,6 +26,11 @@ small-write atomicity are decided before any copy runs, so a refused atomic
 write stages no byte. `try_read`/`try_write`/`WriteCursor` are these same
 functions over a slice. `WriteProgress {len, written}` is the owned
 continuation's byte offset: a resumed write never restarts at zero.
+An *unbacked* pipe (`PipeRecord::unbacked`, attached over empty storage)
+has a capacity but no ring yet, as Linux allocates pipe pages on demand:
+reads, readiness, closure and F_SETPIPE_SZ work on it, and its first write
+refuses with `Error::Storage` (after the EPIPE check) before any effect, so
+the venue provides storage (`Pipe::replace_storage`) and retries.
 VM-free bindings: `el1_ipc_*` unit tests in this crate (shared-view/owned
 equivalence over a 4000-step model, attach validation, all atomic sizes through
 the shared record, read/write faults preserving undelivered bytes, eventfd

@@ -603,3 +603,64 @@ fn el1_ipc_peek_then_commit_preserves_undelivered_suffix() {
     assert_eq!(p.try_read(&mut out).result, Ok(1000));
     assert!(out[..1000].iter().all(|b| *b == 7));
 }
+
+/// Linux allocates pipe pages on demand: a pipe with no ring storage is a
+/// complete pipe for everything but a write, and its first write refuses
+/// with `Storage` before any effect (after the EPIPE check), so the venue
+/// can provide storage and retry.
+#[test]
+fn el1_ipc_unbacked_pipe_needs_storage_only_to_write() {
+    let mut record = PipeRecord::unbacked(4096, 65536).unwrap();
+    assert_eq!(record.capacity_pages, 16);
+    let before = record;
+    {
+        let mut p = Pipe::attach(&mut record, &mut [], &mut []).unwrap();
+        assert!(!p.is_backed());
+        assert_eq!(p.capacity(), 65536);
+        let mut out = [0; 8];
+        assert_eq!(
+            p.try_read(&mut out).result,
+            Err(Error::WouldBlock(WaitFor::Readable))
+        );
+        let r = p.readiness(End::Writer);
+        assert!(r.writable && !r.err);
+        let step = p.try_write(b"x");
+        assert_eq!(step.result, Err(Error::Storage));
+        assert_eq!(step.wake, WakeSet::default());
+    }
+    assert_eq!(record, before, "a refused write changes nothing");
+    // F_SETPIPE_SZ on an unbacked pipe only records the capacity.
+    {
+        let mut p = Pipe::attach(&mut record, &mut [], &mut []).unwrap();
+        assert_eq!(p.set_capacity(8192, 1 << 20).result, Ok(8192));
+        assert_eq!(p.set_capacity(8192, 1 << 20).wake, WakeSet::default());
+        assert_eq!(p.set_capacity(1 << 20, 1 << 20).result, Ok(1 << 20));
+        assert_eq!(p.set_capacity(4096, 0).result, Ok(4096));
+    }
+    // Storage for the current capacity makes it an ordinary pipe.
+    let mut bytes = [0u8; 4096];
+    let mut slots = [Page::default(); 1];
+    {
+        let p = Pipe::attach(&mut record, &mut [], &mut []).unwrap();
+        let mut p = p.replace_storage(&mut bytes, &mut slots).unwrap();
+        assert!(p.is_backed());
+        assert_eq!(p.try_write(b"ping").result, Ok(4));
+        let mut out = [0; 4];
+        assert_eq!(p.try_read(&mut out).result, Ok(4));
+        assert_eq!(&out, b"ping");
+    }
+    // EPIPE precedes the storage request; EOF needs no storage either.
+    let mut record = PipeRecord::unbacked(4096, 4096).unwrap();
+    let mut p = Pipe::attach(&mut record, &mut [], &mut []).unwrap();
+    assert!(p.release(End::Reader).wake.writers);
+    assert_eq!(p.try_write(b"x").result, Err(Error::BrokenPipe));
+    let mut record = PipeRecord::unbacked(4096, 4096).unwrap();
+    let mut p = Pipe::attach(&mut record, &mut [], &mut []).unwrap();
+    assert!(p.release(End::Writer).wake.readers);
+    assert_eq!(p.try_read(&mut [0; 4]).result, Ok(0));
+    // An unbacked view of a record that holds bytes is corrupt.
+    let mut record = PipeRecord::unbacked(4096, 4096).unwrap();
+    record.used = 1;
+    record.unread = 1;
+    assert!(Pipe::attach(&mut record, &mut [], &mut []).is_err());
+}
