@@ -2064,10 +2064,10 @@
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::repoint_guest_alias",
       "ordinal_in_function": 1,
-      "fingerprint": "17574afee2b9e299de3e4bfc6672f9d06ad85f2427b6bc38256aab229b862ea6",
+      "fingerprint": "76c9dac52caf7ebadd0bd3c2c65300563454705b98c1b8c756541bd32daa0630",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::alias",
-      "rationale": "A later chunk of an alias publication failed to prepare after earlier chunks were published through EL1; there is no descriptor rollback for published alias chunks, so continuing leaves a partially repointed alias.",
+      "rationale": "A later chunk of an alias publication failed to prepare after earlier chunks were published through EL1; there is no descriptor rollback for published alias chunks, so continuing leaves a partially repointed alias. Re-reviewed 2026-09-29: unchanged abort; guest alias publication was extracted into a shared helper / the host-alias install arm gained a lane decision, moving the fingerprint.",
       "sink": "fatal",
       "domain": "hvpatch::alias"
     },
@@ -2075,10 +2075,10 @@
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::repoint_guest_alias",
       "ordinal_in_function": 2,
-      "fingerprint": "17574afee2b9e299de3e4bfc6672f9d06ad85f2427b6bc38256aab229b862ea6",
+      "fingerprint": "76c9dac52caf7ebadd0bd3c2c65300563454705b98c1b8c756541bd32daa0630",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::alias",
-      "rationale": "An alias MapAlias was submitted to EL1 under exact-MM exclusion; without verified completion the alias leaf state is unknown and owner pins cannot be released or committed.",
+      "rationale": "An alias MapAlias was submitted to EL1 under exact-MM exclusion; without verified completion the alias leaf state is unknown and owner pins cannot be released or committed. Re-reviewed 2026-09-29: unchanged abort; guest alias publication was extracted into a shared helper / the host-alias install arm gained a lane decision, moving the fingerprint.",
       "sink": "fatal",
       "domain": "hvpatch::alias"
     },
@@ -2086,10 +2086,10 @@
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::repoint_guest_alias",
       "ordinal_in_function": 3,
-      "fingerprint": "17574afee2b9e299de3e4bfc6672f9d06ad85f2427b6bc38256aab229b862ea6",
+      "fingerprint": "76c9dac52caf7ebadd0bd3c2c65300563454705b98c1b8c756541bd32daa0630",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::alias",
-      "rationale": "The verified EL1 receipt must name the exact submitted MapAlias transaction; another transaction means completions crossed and the published alias is unauthenticated.",
+      "rationale": "The verified EL1 receipt must name the exact submitted MapAlias transaction; another transaction means completions crossed and the published alias is unauthenticated. Re-reviewed 2026-09-29: unchanged abort; guest alias publication was extracted into a shared helper / the host-alias install arm gained a lane decision, moving the fingerprint.",
       "sink": "fatal",
       "domain": "hvpatch::alias"
     },
@@ -2213,6 +2213,50 @@
       "rationale": "The verified EL1 receipt must name the exact submitted retained-reuse transaction; another transaction means completions crossed and the published alias is unauthenticated. Re-attributed 2026-09-29 from HvfVmState to HvfTaskState (the MM-scoped state it only uses), unchanged abort.",
       "sink": "fatal",
       "domain": "hvpatch::cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_alias.rs",
+      "function": "GuestAliasContext<'_>::publish_host_alias",
+      "ordinal_in_function": 1,
+      "fingerprint": "1b2361c6160db69e948ad86bd223368c9d53b4f048e8f14e49d38469b15af83e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::alias",
+      "rationale": "The kernel refused a staged alias inventory batch whose staging this MM owns under MM mutation; the host lane aborts the carrier on the same publication-order invariant (refuse_alias_install), and continuing would publish descriptors for an alias the authority does not know.",
+      "sink": "fatal",
+      "domain": "hvpatch::alias"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_alias.rs",
+      "function": "GuestAliasContext<'_>::roll_back_host_alias",
+      "ordinal_in_function": 1,
+      "fingerprint": "8975fbcbccef4668bc84f1871529be4022a3165530fa34e62c82618a7ca1bc5e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::alias",
+      "rationale": "After a refused EL1 alias publication the host must retire the VA span it may have partially published; failure leaves translations to a grant that is about to be rolled back.",
+      "sink": "fatal",
+      "domain": "hvpatch::alias"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_alias.rs",
+      "function": "GuestAliasContext<'_>::roll_back_host_alias",
+      "ordinal_in_function": 2,
+      "fingerprint": "18751b1e9aa68cfc25fa4afd35561a58716aa0a6d606ca49a6e806d3f627e96d",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::alias",
+      "rationale": "The span is retired; the kernel must accept rollback of the exact alias grant receipt it issued, otherwise frame ownership is leaked or double-owned.",
+      "sink": "fatal",
+      "domain": "hvpatch::alias"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_alias.rs",
+      "function": "GuestAliasContext<'_>::roll_back_host_alias",
+      "ordinal_in_function": 3,
+      "fingerprint": "8e318dc6a4a6d8f84dac0b3a6a059b6305446612e3b24e32a8bb25e215a974f6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::alias",
+      "rationale": "After kernel rollback the backend must retire the unpublished alias staging for the same extents; refusal desynchronizes backend inventory from kernel frame authority.",
+      "sink": "fatal",
+      "domain": "hvpatch::alias"
     }
   ]
 }
