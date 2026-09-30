@@ -86,7 +86,8 @@ fn validate_mlock_range(
 
 impl<'a> MemView<'a> {
     /// Derive `madvise` range validity + properties from carrick's mapping
-    /// metadata (`semantic_vmas`), never by probing a page.
+    /// metadata (every row of the MM, `MemState::observed_vmas`), never by
+    /// probing a page.
     pub(crate) fn madvise_range_meta(&self, start: u64, end: u64) -> MadviseRangeMeta {
         let mem_authority_2 = self.mem();
         let mem = mem_authority_2.lock();
@@ -98,7 +99,8 @@ impl<'a> MemView<'a> {
         let mut any_special = false;
         let mut any_droppable = false;
 
-        for vma in mem.semantic_vmas.overlapping(start, end) {
+        let vmas = mem.observed_vmas();
+        for vma in vmas.overlapping(start, end) {
             if vma.start > covered_to {
                 // Gap before this interval → unmapped hole. Keep walking:
                 // the VMAs past the hole still decide the per-VMA verdict.

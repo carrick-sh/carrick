@@ -305,112 +305,13 @@ fn brk_growth_past_rlimit_data_returns_the_unchanged_break() {
 mod delegated {
     use super::super::super::tests::{CountingMmapMemory, returned};
     use super::*;
-    use crate::dispatch::mem::el1_reservations::{
-        HostReservationProvider, PreparedHostReservations,
-    };
-    use carrick_el1::memory::reservations::{
-        Decision, Layout, Refusal, Reservations, SharedReservations,
-    };
-    use carrick_el1_abi::{
-        ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationRange,
-    };
+    use crate::dispatch::mem::anonymous::AnonymousAuthority;
+    use crate::dispatch::mem::delegated_tests::Root;
+    use carrick_el1_abi::ReservationRange;
 
     const SYS_BRK: u64 = 214;
     const SYS_PRLIMIT64: u64 = 261;
     const LINUX_RLIMIT_DATA: u64 = 2;
-
-    struct Root {
-        table: Arc<SharedReservations>,
-        mm: ReservationMm,
-    }
-
-    struct View(Arc<SharedReservations>, ReservationMm);
-    impl PreparedHostReservations for View {
-        fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-            if mm != self.1 {
-                return Err(Refusal::Stale);
-            }
-            self.0.lock(0, mm)
-        }
-    }
-    struct Provider(Arc<SharedReservations>, ReservationMm);
-    impl HostReservationProvider for Provider {
-        fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
-            Ok(Box::new(View(Arc::clone(&self.0), self.1)))
-        }
-    }
-
-    impl Root {
-        /// Publish this dispatcher MM's root, install the carrier provider and
-        /// seal the break into the root (the conformance-fixture admission).
-        fn admit(dispatcher: &SyscallDispatcher) -> Self {
-            // Same zeroed-region initialization as EL1 bootstrap.
-            let ptr = unsafe {
-                std::alloc::alloc_zeroed(std::alloc::Layout::new::<SharedReservations>())
-            };
-            assert!(!ptr.is_null());
-            let table: Arc<SharedReservations> =
-                Arc::from(unsafe { Box::<SharedReservations>::from_raw(ptr.cast()) });
-            let mm = ReservationMm::new(dispatcher.mm_authority().mm_id.raw()).unwrap();
-            let layout = dispatcher.mem().lock().layout;
-            table
-                .publish(
-                    0,
-                    mm,
-                    Layout {
-                        heap: ReservationRange::new(
-                            layout.heap_base,
-                            layout.heap_base + layout.heap_size,
-                        )
-                        .unwrap(),
-                        arena: ReservationRange::new(
-                            layout.mmap_base,
-                            layout.mmap_base + layout.mmap_size,
-                        )
-                        .unwrap(),
-                        brk: layout.heap_base,
-                        address_limit: u64::MAX,
-                        data_limit: u64::MAX,
-                        external_address_bytes: 0,
-                        external_data_bytes: 0,
-                    },
-                )
-                .unwrap();
-            dispatcher
-                .install_reservation_provider(Arc::new(Provider(Arc::clone(&table), mm)))
-                .unwrap();
-            dispatcher.mem_view().delegate_break_for_test().unwrap();
-            Self { table, mm }
-        }
-
-        fn lock(&self) -> Reservations<'_> {
-            self.table.lock(0, self.mm).unwrap()
-        }
-
-        /// What guest EL1 does for `brk` on its own venue: propose, run the
-        /// descriptor/backing transaction, complete.
-        fn guest_brk(&self, requested: u64) -> u64 {
-            let mut root = self.lock();
-            match root.brk(requested).unwrap() {
-                Decision::Complete(value) => value,
-                Decision::Work(request) => {
-                    // Mock substrate: this VM-free test has no descriptors.
-                    let completion = unsafe {
-                        ReservationCompletion::after_descriptor_and_backing_commit(
-                            request,
-                            ReservationBackingReceipt {
-                                receipt: 1,
-                                granted_bytes: 0,
-                                returned_bytes: 0,
-                            },
-                        )
-                    }
-                    .unwrap();
-                    root.complete(completion).unwrap()
-                }
-            }
-        }
-    }
 
     fn host_brk(
         dispatcher: &mut SyscallDispatcher,
@@ -544,7 +445,9 @@ mod delegated {
             .iter()
             .find(|vma| vma.start.raw() == base)
             .expect("[heap] summary row");
-        assert_eq!(heap.end.raw(), guest);
+        // The root's heap node, page-granular like the host-setup heap row
+        // (`update_heap_pages`) and Linux's VMA end.
+        assert_eq!(heap.end.raw(), base + 3 * LINUX_PAGE_SIZE);
     }
 
     #[test]
@@ -560,8 +463,8 @@ mod delegated {
         );
         let child = dispatcher.mm_authority().fork_private(child_mm);
         assert!(matches!(
-            *child.lock().break_authority(),
-            BreakAuthority::HostSetup(value) if value == first
+            child.lock().anonymous_authority(),
+            AnonymousAuthority::HostSetup(arena) if arena.brk == first
         ));
         // The parent's root moves on; the child's break is its own.
         let second = base + LINUX_PAGE_SIZE;
