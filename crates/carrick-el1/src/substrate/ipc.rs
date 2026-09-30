@@ -152,6 +152,10 @@ pub fn transfer<U: UserCopy>(
             }
         }
         IpcOpKind::PipeWrite => {
+            // A fresh pipe's first write takes a stocked ring here, under
+            // the object lock; with none in stock the write reports
+            // `Storage` before any effect and the call leaves for the host.
+            guard.provide_ring_from_stock()?;
             let mut p = guard.pipe()?;
             loop {
                 let step = p.write_progress(&mut op.progress, |at, dst| {

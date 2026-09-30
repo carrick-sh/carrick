@@ -106,6 +106,13 @@ pub const IPC_OPERATIONS: usize = 1024;
 pub const IPC_MAX_OBJECTS: usize = 1 << 18;
 /// Object records published per growth step.
 pub const IPC_OBJECT_SEGMENT: usize = 1024;
+/// Default-capacity rings the host keeps provisioned in the shared ring
+/// stock, so a pipe's first write takes its ring in either venue without a
+/// host exit. The stock is refilled by the host (one ring per pipe it
+/// creates, and at its own first writes), never by EL1.
+pub const IPC_RING_STOCK: usize = 512;
+/// Ring bytes of a stock ring: the default pipe capacity (sixteen pages).
+pub const IPC_STOCK_RING_BYTES: u64 = (pipe::DEFAULT_PIPE_PAGES * IPC_PIPE_PAGE_SIZE) as u64;
 /// Guest page size used for pipe capacity and ring pages.
 pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
@@ -415,7 +422,12 @@ pub struct IpcDirectory {
     _reserved: [u64; 5],
     fd: IpcFdCore,
     free_operations: AtomicU64,
-    _reserved_ops: [u64; 7],
+    /// Ring stock: two tagged lock-free stacks over `ring_stock` slots, the
+    /// provisioned rings and the empty slots.
+    ring_stock_full: AtomicU64,
+    ring_stock_empty: AtomicU64,
+    _reserved_ops: [u64; 5],
+    ring_stock: [RingStockSlot; IPC_RING_STOCK],
     operations: [IpcOperationSlot; IPC_OPERATIONS],
     /// Three-level pending index (summary → middle → leaf words, the
     /// leaves in the elastic area). Publishers set the leaf bit first and
@@ -509,6 +521,10 @@ const LAYOUT_FACTS: &[u64] = &[
     HOST_WAKE_MID_WORDS as u64,
     HOST_WAKE_LEAF_WORDS as u64,
     core::mem::offset_of!(IpcOperationSlot, op) as u64,
+    IPC_RING_STOCK as u64,
+    IPC_STOCK_RING_BYTES,
+    core::mem::size_of::<RingStockSlot>() as u64,
+    core::mem::offset_of!(IpcDirectory, ring_stock) as u64,
 ];
 
 /// FNV-1a over `LAYOUT_FACTS` and the fd core's layout facts. Written into
@@ -709,6 +725,18 @@ pub struct IpcOperationSlot {
     next_free: AtomicU64,
     op: UnsafeCell<IpcOperation>,
 }
+/// One provisioned ring waiting in the stock (pool extent of a default
+/// capacity ring). Written only by the party that popped the slot from the
+/// empty stack, read only by the party that popped it from the full stack.
+#[repr(C)]
+#[derive(Default)]
+struct RingStockSlot {
+    next_free: AtomicU64,
+    offset: AtomicU64,
+    ring_bytes: AtomicU64,
+    pages: AtomicU64,
+}
+
 // SAFETY: `op` is accessed only by the single owner of the slot's live
 // token; ownership moves between vCPUs/host through the scheduler's claim
 // CAS (Acquire/Release), which orders the accesses.
@@ -818,6 +846,9 @@ impl<'a> IpcRegion<'a> {
         };
         region.grow_ofds()?;
         region.grow_objects()?;
+        for i in (0..IPC_RING_STOCK).rev() {
+            push(&d.ring_stock_empty, i, &d.ring_stock[i].next_free);
+        }
         for i in (0..IPC_OPERATIONS).rev() {
             push(&d.free_operations, i, &d.operations[i].next_free);
         }
@@ -908,6 +939,54 @@ impl<'a> IpcRegion<'a> {
                     .add(word)
             }
         })
+    }
+
+    /// Host: whether the ring stock has an empty slot to refill.
+    pub fn ring_stock_has_room(&self) -> bool {
+        self.dir.ring_stock_empty.load(Ordering::Acquire) & u64::from(u32::MAX) != 0
+    }
+
+    /// Host: put a provisioned default-capacity ring (an extent it owns
+    /// exclusively, outside any lock) into the stock. Lock-free, O(1).
+    /// A full stock or a ring of another size hands the extent back.
+    pub fn stock_ring(&self, ring: IpcPipeStorage) -> Result<(), IpcPipeStorage> {
+        if ring.ring_bytes != IPC_STOCK_RING_BYTES
+            || !ring.fits(IPC_STOCK_RING_BYTES as usize)
+            || self
+                .pool_range(ring.offset, ring.footprint(), IPC_POOL_ALIGN)
+                .is_none()
+        {
+            return Err(ring);
+        }
+        let slots = &self.dir.ring_stock;
+        let Some(index) = pop(&self.dir.ring_stock_empty, |i| {
+            slots.get(i).map(|s| s.next_free.load(Ordering::Relaxed))
+        }) else {
+            return Err(ring);
+        };
+        let slot = &slots[index];
+        slot.offset.store(ring.offset, Ordering::Relaxed);
+        slot.ring_bytes.store(ring.ring_bytes, Ordering::Relaxed);
+        slot.pages.store(ring.pages, Ordering::Relaxed);
+        push(&self.dir.ring_stock_full, index, &slot.next_free);
+        Ok(())
+    }
+
+    /// Take one stocked ring (either venue; lock-free, no allocation, so it
+    /// may run under an object lock).
+    fn take_stock_ring(&self) -> Option<IpcPipeStorage> {
+        let slots = &self.dir.ring_stock;
+        let index = pop(&self.dir.ring_stock_full, |i| {
+            slots.get(i).map(|s| s.next_free.load(Ordering::Relaxed))
+        })?;
+        let slot = &slots[index];
+        let ring = IpcPipeStorage {
+            offset: slot.offset.load(Ordering::Relaxed),
+            ring_bytes: slot.ring_bytes.load(Ordering::Relaxed),
+            pages: slot.pages.load(Ordering::Relaxed),
+        };
+        push(&self.dir.ring_stock_empty, index, &slot.next_free);
+        Some(ring)
     }
 
     /// Published object records ([`IpcRegion::grow_objects`]).
@@ -1573,6 +1652,36 @@ impl<'a> IpcObjectGuard<'a> {
         }
         let (state, bytes, slots) = self.pipe_parts()?;
         Pipe::attach(&mut state.pipe, bytes, slots).map_err(|_| IpcError::Corrupt)
+    }
+
+    /// Either venue, under this lock: give an unbacked pipe a ring from the
+    /// host-provisioned stock, so its first write needs no host exit.
+    /// `true` when the pipe has its ring (already, or now); `false` when the
+    /// stock is empty, the pipe has no reader (the write is EPIPE) or its
+    /// capacity exceeds a stock ring (the host sizes it). No allocation.
+    pub fn provide_ring_from_stock(&mut self) -> Result<bool, IpcError> {
+        let pipe = self.pipe()?;
+        if pipe.is_backed() {
+            return Ok(true);
+        }
+        // EPIPE is decided before any ring is spent; a pipe resized past the
+        // default capacity is sized by the host.
+        if pipe.references(End::Reader) == 0 || pipe.capacity() as u64 > IPC_STOCK_RING_BYTES {
+            return Ok(false);
+        }
+        let Some(mut ring) = self.region.take_stock_ring() else {
+            return Ok(false);
+        };
+        match self.provide_pipe_storage(&mut ring) {
+            Ok(installed) => Ok(installed),
+            Err(error) => {
+                // Unreachable for a stocked ring; never lose the extent.
+                if self.region.stock_ring(ring).is_err() {
+                    return Err(IpcError::Corrupt);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Host, under this lock: give an unbacked pipe its ring. `storage` is an

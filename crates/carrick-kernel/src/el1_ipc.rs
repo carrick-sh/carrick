@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_el1_abi::ipc::{
     HostResourceToken, IPC_DIRECTORY_BYTES, IPC_MAX_OBJECTS, IPC_MAX_OFDS, IPC_OBJECT_SEGMENT,
-    IPC_OFD_SEGMENT, IPC_PIPE_PAGE_SIZE, IPC_POOL_ALIGN, IpcDirectory, IpcError, IpcObjectHandle,
-    IpcPipeStorage, IpcRegion, IpcReleased, descriptor_extent_bytes, fd, pipe,
+    IPC_OFD_SEGMENT, IPC_PIPE_PAGE_SIZE, IPC_POOL_ALIGN, IPC_STOCK_RING_BYTES, IpcDirectory,
+    IpcError, IpcObjectHandle, IpcPipeStorage, IpcRegion, IpcReleased, descriptor_extent_bytes, fd,
+    pipe,
 };
 use parking_lot::Mutex;
 
@@ -698,7 +699,30 @@ impl HostIpc {
         }
         let object = object?;
         self.bind_waits(object);
+        self.top_up_ring_stock();
         Ok(object)
+    }
+
+    /// Add one default-capacity ring to the shared stock if it has room: one
+    /// ring per pipe created keeps a fresh pipe's first write in EL1 (no host
+    /// exit) for up to [`carrick_el1_abi::ipc::IPC_RING_STOCK`] pipes created between writes. The
+    /// stock bounds the pool address space idle pipes can claim, so a zone
+    /// of many idle pipes still costs records only. A refused provision
+    /// only means later first writes take the host path.
+    fn top_up_ring_stock(&self) {
+        let region = self.region();
+        if !region.ring_stock_has_room() {
+            return;
+        }
+        let Ok(ring) = self.provision_pipe(
+            IPC_STOCK_RING_BYTES,
+            IPC_STOCK_RING_BYTES / IPC_PIPE_PAGE_SIZE as u64,
+        ) else {
+            return;
+        };
+        if let Err(ring) = region.stock_ring(ring) {
+            self.pool.lock().release(ring.offset);
+        }
     }
 
     /// Give `object`'s pipe its ring before a host write: provisioned from
@@ -712,8 +736,15 @@ impl HostIpc {
     ) -> Result<(), AdmissionError> {
         let region = self.region();
         loop {
+            // The same stocked ring an EL1 first write takes; the stock is
+            // refilled first. Only a pipe resized past the default capacity,
+            // or an empty stock the pool cannot refill, is sized here.
+            self.top_up_ring_stock();
             let capacity = {
                 let mut guard = region.lock(object, &HostLockWait)?;
+                if guard.provide_ring_from_stock()? {
+                    return Ok(());
+                }
                 let pipe = guard.pipe()?;
                 if pipe.is_backed() {
                     return Ok(());
@@ -1040,7 +1071,9 @@ mod tests {
                 Err(IpcError::Stale)
             ));
         }
-        assert_eq!(owner.pool.lock().allocated.len(), 1);
+        // 2048 pipes ran in a pool of eight 128 KiB blocks: the freed
+        // record's ring and the stock are reused, never one ring per pipe.
+        assert!(owner.pool.lock().allocated.len() <= 8);
     }
 
     #[test]
@@ -1098,34 +1131,62 @@ mod tests {
             .unwrap();
     }
 
-    /// An idle pipe costs its record only: many pipes take no pool bytes;
-    /// the first write provides one ring (a second provision finds it and
-    /// takes nothing), and F_SETPIPE_SZ on an unbacked pipe only records the
-    /// capacity the first write then sizes.
+    /// An idle pipe costs its record only: 4096 idle pipes claim no more
+    /// pool than the bounded ring stock (one ring per creation until it is
+    /// full). A first write takes a stocked ring (a second provision finds it
+    /// and takes nothing; the stock is refilled by one), and F_SETPIPE_SZ on
+    /// an unbacked pipe only records the capacity its first write then sizes.
     #[test]
     fn serial_host_el1_ipc_rings_are_provided_at_first_write() {
-        let owner = HostIpc::new(1 << 24).unwrap();
+        use carrick_el1_abi::ipc::IPC_RING_STOCK;
+        let owner = HostIpc::new(1 << 27).unwrap();
         let pipes: Vec<_> = (0..4096)
             .map(|_| owner.create_pipe(65536).unwrap())
             .collect();
-        assert!(
-            owner.pool.lock().allocated.is_empty(),
-            "idle pipes: no rings"
-        );
+        let allocated = || owner.pool.lock().allocated.len();
+        assert_eq!(allocated(), IPC_RING_STOCK, "idle pipes: the stock only");
         let first = pipes[4000];
         owner.ensure_pipe_storage(first).unwrap();
+        assert_eq!(allocated(), IPC_RING_STOCK, "taken from the stock");
         owner.ensure_pipe_storage(first).unwrap();
-        assert_eq!(owner.pool.lock().allocated.len(), 1);
+        assert_eq!(allocated(), IPC_RING_STOCK + 1, "stock refilled by one");
         let second = pipes[7];
         assert_eq!(owner.resize_pipe(second, 1 << 20, 1 << 20), Ok(1 << 20));
-        assert_eq!(owner.pool.lock().allocated.len(), 1, "resize takes no ring");
+        assert_eq!(allocated(), IPC_RING_STOCK + 1, "resize takes no ring");
         owner.ensure_pipe_storage(second).unwrap();
+        assert_eq!(allocated(), IPC_RING_STOCK + 2, "sized past a stock ring");
         let region = owner.region();
         let mut guard = region.lock(second, &HostLockWait).unwrap();
         let mut ring = guard.pipe().unwrap();
         assert_eq!((ring.capacity(), ring.is_backed()), (1 << 20, true));
         assert_eq!(ring.try_write(&[7; 70_000]).result, Ok(70_000));
         drop(guard);
+        for object in pipes {
+            for end in [pipe::End::Reader, pipe::End::Writer] {
+                owner
+                    .release(IpcBacking::Pipe { object, end }.encode())
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Every pipe the host created since the last writes can take its first
+    /// ring in EL1 (the `el1_ipc_pairs_blocking` shape: 128 pipes created,
+    /// then each written from the guest): creation stocks one ring per pipe,
+    /// so no first write needs a host exit while the stock covers them.
+    #[test]
+    fn serial_host_el1_ipc_each_created_pipe_can_take_a_stocked_ring() {
+        let owner = HostIpc::new(1 << 27).unwrap();
+        let pipes: Vec<_> = (0..128)
+            .map(|_| owner.create_pipe(65536).unwrap())
+            .collect();
+        let region = owner.region();
+        for object in &pipes {
+            // What EL1's first write does under the object lock.
+            let mut guard = region.lock(*object, &HostLockWait).unwrap();
+            assert_eq!(guard.provide_ring_from_stock(), Ok(true));
+        }
+        assert_eq!(owner.pool.lock().allocated.len(), 128, "one ring per pipe");
         for object in pipes {
             for end in [pipe::End::Reader, pipe::End::Writer] {
                 owner
