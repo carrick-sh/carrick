@@ -1340,7 +1340,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "function": "FrameInventoryAuthority::apply_with_receipt",
+      "function": "FrameInventoryAuthority::apply_with_receipt_inner",
       "ordinal_in_function": 1,
       "fingerprint": "155a86b08a7bb112ff010ca5b4f2c935c24bbcd1b67b11fb3fefef0939792fb1",
       "verdict": "carrier_fault",
