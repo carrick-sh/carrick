@@ -10600,3 +10600,462 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
         "a recorded extension prefix must be zeroed before pool reissue"
     );
 }
+
+/// A munmap-retired compound that same-VA reuse is about to scrub: every
+/// Linux page of `[TEST_VA, TEST_VA + OWNER_LEN)` keeps its retained stage-1
+/// output (VALID clear, `PtOp::Retire`), the VMA is unmapped, and no alias or
+/// mapping row names the old IPA any more. That is exactly the state that
+/// routes `FrameCowWriteRoute::MaterializeRetired` into
+/// `materialize_retired_reuse`.
+struct RetainedReuseFixture {
+    installed: InstalledMm,
+    task: HvfTaskState,
+    authority: Arc<TestForeignCowAuthority>,
+    root_key: (u64, u64),
+    root_host: usize,
+}
+
+fn retained_reuse_fixture(
+    transport: &CarrierForeignMmTransport,
+    ordinal: u64,
+    root: u64,
+    data_ipa: u64,
+    lane: carrick_mmu_core::aarch64::LiveDescriptorOwner,
+) -> RetainedReuseFixture {
+    let installed = install_mm(transport, ordinal, root, data_ipa, *b"old!");
+    let root_key = installed.owners.0[0];
+    let (root_host, root_generation) =
+        global_frame_host_owner_identity(root_key.0, root_key.1).expect("root table owner");
+    let tables = installed.state.page_tables_authority();
+    installed
+        .state
+        .protections
+        .set_unmapped(TEST_VA, OWNER_LEN, true);
+    let mut authority = TestForeignCowAuthority::new(&installed);
+    authority.allow_quiesce = true;
+    let authority = Arc::new(authority);
+    let mut task = HvfTaskState::neutral();
+    task.mm_access = Arc::clone(&installed.state);
+    task.persistent_vm_lifecycle = true;
+    task.mm_root_slot = Some(root_key);
+    task.container_root = ContainerRootToken::ROOT;
+    task.cow_authority = Some(authority.clone());
+    task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+        linux_pid: ordinal as i32,
+        linux_tid: ordinal as i32,
+        mm: installed.snapshot.mm.get(),
+        asid: installed.snapshot.asid.get(),
+    });
+    // The identity-mapped page-table window row whose host backing is this
+    // mm's live table arena, as the HVPatch root slot publishes it.
+    task.mappings.insert(HvfMappedRegion {
+        start: carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        ipa: carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        physical_ipa: carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        end: carrick_mem::memory::LINUX_PAGE_TABLES_BASE + root_key.1,
+        host_addr: root_host as *mut u8,
+        size: root_key.1 as usize,
+        physical_size: root_key.1 as usize,
+        perms: applevisor::memory::MemPerms::ReadWrite,
+        memory: None,
+        host_mapping: None,
+        structural_owner: None,
+        stage2_lease: None,
+        is_dynamic_alias: false,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: false,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: root_generation,
+    });
+    // munmap: retire the leaves through the host editor while the host
+    // still owns descriptors (output retained, VALID clear), then hand the
+    // live descriptors to the requested lane.
+    tables
+        .edit(
+            || Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
+            |editor| {
+                editor.manager.invalidate(TEST_VA, OWNER_LEN, None)?;
+                let resolver = task.page_table_resolver(editor.base(), Some(root_host as *mut u8));
+                unsafe { editor.sync_to_host(resolver) }
+            },
+        )
+        .expect("retire fixture leaves");
+    tables.select_live_descriptor_owner(lane);
+    let retained = tables
+        .with_manager(|manager| manager.translate_retained_output(TEST_VA))
+        .flatten();
+    assert_eq!(retained, Some(data_ipa), "fixture keeps the retired output");
+    assert_eq!(tables.with_manager(|m| m.translate(TEST_VA)), Some(None));
+    assert!(task.physical_cow_source(TEST_VA, data_ipa).is_none());
+    RetainedReuseFixture {
+        installed,
+        task,
+        authority,
+        root_key,
+        root_host,
+    }
+}
+
+/// Descriptor service for the guest lane: the real neutral journal over the
+/// fixture's live table words, settled by the manager. Host edit/flush is a
+/// failure.
+struct RetainedReuseGuestService<'a> {
+    tables: carrick_aarch64::Stage1Authority,
+    authority: Arc<TestForeignCowAuthority>,
+    root: (u64, u64),
+    host: usize,
+    available: bool,
+    published:
+        &'a std::cell::RefCell<Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>>,
+    maintenance: RetainedReuseMaintenance,
+}
+
+struct RetainedReuseMaintenance(std::cell::Cell<usize>);
+
+impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for RetainedReuseMaintenance {
+    fn publish_barrier(&self) {}
+    fn invalidate_range(&self, _va: u64, _len: u64) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+impl carrick_aarch64::vmm::Stage1Services for RetainedReuseGuestService<'_> {
+    fn flush(&mut self) -> Result<(), TrapError> {
+        panic!("guest retained reuse must not use host edit/flush")
+    }
+    fn guest_publication_available(&self) -> bool {
+        self.available
+    }
+    fn publish(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            InlineJournal, PrimaryTableWords, execute_descriptor_txn,
+        };
+        assert!(
+            self.authority.published.lock().is_some(),
+            "kernel grant must precede descriptors"
+        );
+        self.published.borrow_mut().push(*txn);
+        let words = unsafe {
+            PrimaryTableWords::new(
+                self.host as *mut _,
+                self.root.0,
+                self.root.1 as usize,
+                &self.maintenance,
+            )
+        }
+        .unwrap();
+        let receipt = execute_descriptor_txn(
+            &words,
+            carrick_mmu_core::aarch64::SubstrateGpa(self.root.0),
+            txn,
+            &mut InlineJournal::new(),
+        );
+        self.tables
+            .settle_guest_descriptor_receipt(txn, &receipt)
+            .map_err(|error| TrapError::Hypervisor(format!("model guest receipt: {error:?}")))
+    }
+}
+
+/// The live primary table arena the descriptor journal edits.
+fn live_table_words(fixture: &RetainedReuseFixture) -> Vec<u8> {
+    unsafe {
+        std::slice::from_raw_parts(fixture.root_host as *const u8, fixture.root_key.1 as usize)
+    }
+    .to_vec()
+}
+
+fn owner_keys() -> std::collections::BTreeSet<(u64, u64)> {
+    global_frame_host_owners().lock().keys().copied().collect()
+}
+
+#[test]
+fn guest_retained_reuse_publishes_one_deferred_alias_without_host_writes() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{AliasAccess, DescriptorOp, PageSpan};
+    const VALID: u64 = 1;
+    const AP_MASK: u64 = 0b11 << 6;
+    const AP_USER_RO: u64 = 0b11 << 6;
+    const NON_GLOBAL: u64 = 1 << 11;
+    const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        705,
+        0x9a01_2000_0000,
+        0x9b01_2000_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+    );
+    let tables = fixture.installed.state.page_tables_authority();
+    let pending_before = fixture.task.cow_deferred_publications.lock().len();
+    let cow_before = fixture.task.host_cow_stats.host_cow_resolutions();
+    let owners_before = owner_keys();
+    let published = std::cell::RefCell::new(Vec::new());
+    let mut service = RetainedReuseGuestService {
+        tables: tables.clone(),
+        authority: fixture.authority.clone(),
+        root: fixture.root_key,
+        host: fixture.root_host,
+        available: true,
+        published: &published,
+        maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+    };
+    let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+    let end = fixture
+        .task
+        .materialize_retired_reuse(&custody, TEST_VA, TEST_VA + OWNER_LEN as u64, &mut service)
+        .expect("guest lane materializes retained reuse");
+    assert_eq!(end, Some(TEST_VA + OWNER_LEN as u64));
+
+    let new_owner: Vec<_> = owner_keys().difference(&owners_before).copied().collect();
+    assert_eq!(new_owner.len(), 1, "exactly one replacement compound owner");
+    let (new_physical_ipa, new_len) = new_owner[0];
+    fixture.installed.owners.0.push(new_owner[0]);
+    assert_eq!(new_len, CowArmedRanges::COMPOUND_SIZE);
+    let new_ipa = new_physical_ipa + (TEST_VA % CowArmedRanges::COMPOUND_SIZE);
+
+    let published = published.into_inner();
+    assert_eq!(published.len(), 1, "one EL1 descriptor transaction");
+    assert!(
+        matches!(
+            published[0].op,
+            DescriptorOp::MapAlias {
+                access: AliasAccess::Deferred,
+                span,
+                target_ipa,
+                ..
+            } if span == PageSpan::new(TEST_VA, OWNER_LEN as u64) && target_ipa.raw() == new_ipa
+        ),
+        "{:?}",
+        published[0].op
+    );
+    for page in (0..OWNER_LEN as u64).step_by(4096) {
+        let va = TEST_VA + page;
+        assert_eq!(tables.with_manager(|m| m.translate(va)), Some(None));
+        assert_eq!(
+            tables.with_manager(|m| m.translate_retained_output(va)),
+            Some(Some(new_ipa + page))
+        );
+        let leaf = tables.with_manager(|m| m.debug_walk(va)[3]).unwrap();
+        assert_eq!(leaf & VALID, 0, "deferred leaf stays invalid: {leaf:#x}");
+        assert_eq!(leaf & AP_MASK, AP_USER_RO, "deferred leaf is RO: {leaf:#x}");
+        assert_ne!(leaf & NON_GLOBAL, 0, "deferred leaf is nG: {leaf:#x}");
+        assert_eq!(leaf & PA_MASK_4KIB, (new_ipa + page) & PA_MASK_4KIB);
+    }
+    let (mapping, frame, gpa, length) = fixture
+        .authority
+        .published
+        .lock()
+        .expect("kernel grant survives the verified receipt");
+    assert_eq!((gpa, length), (Gpa(new_physical_ipa), new_len));
+    assert!(
+        carrick_hal::FrameCowAuthority::mapping_is_live(
+            &*fixture.authority,
+            mapping,
+            frame,
+            gpa,
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(new_len).unwrap()),
+        )
+        .unwrap()
+    );
+    let pending = fixture.task.cow_deferred_publications.lock().clone();
+    assert_eq!(pending.len(), pending_before + OWNER_LEN / 4096);
+    for page in (0..OWNER_LEN as u64).step_by(4096) {
+        assert!(pending.iter().any(|receipt| receipt.va == TEST_VA + page
+            && receipt.len == 4096
+            && receipt.expected_ipa == new_ipa + page));
+    }
+    assert_eq!(
+        fixture.task.host_cow_stats.host_cow_resolutions(),
+        cow_before
+    );
+}
+
+#[test]
+fn guest_retained_reuse_without_driving_vcpu_refuses_before_allocation() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        706,
+        0x9a01_2100_0000,
+        0x9b01_2100_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+    );
+    let tables = fixture.installed.state.page_tables_authority();
+    let stage1_before = live_table_words(&fixture);
+    let inventory_before =
+        inventory_fingerprint(&fixture.installed.state.frame_inventory.ledger.lock());
+    let owners_before = owner_keys();
+    let published = std::cell::RefCell::new(Vec::new());
+    let mut service = RetainedReuseGuestService {
+        tables: tables.clone(),
+        authority: fixture.authority.clone(),
+        root: fixture.root_key,
+        host: fixture.root_host,
+        available: false,
+        published: &published,
+        maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+    };
+    let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+    let error = fixture
+        .task
+        .materialize_retired_reuse(&custody, TEST_VA, TEST_VA + OWNER_LEN as u64, &mut service)
+        .expect_err("guest lane without its driving vCPU refuses");
+    assert!(
+        error.to_string().contains("requires its driving vCPU"),
+        "{error}"
+    );
+    assert!(published.borrow().is_empty());
+    assert_eq!(owner_keys(), owners_before, "no replacement owner");
+    assert!(fixture.authority.published.lock().is_none(), "no grant");
+    assert_eq!(
+        inventory_fingerprint(&fixture.installed.state.frame_inventory.ledger.lock()),
+        inventory_before
+    );
+    assert_eq!(live_table_words(&fixture), stage1_before);
+    assert!(fixture.task.cow_deferred_publications.lock().is_empty());
+}
+
+#[test]
+fn guest_retained_reuse_plan_refusal_rolls_back_grant_and_owner() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        707,
+        0x9a01_2200_0000,
+        0x9b01_2200_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+    );
+    let tables = fixture.installed.state.page_tables_authority();
+    // Make the live L2 entry over TEST_VA an invalidated 2 MiB block that
+    // still retains the old output: retained reuse selects the page exactly
+    // as before, but the neutral planner refuses the descriptor as malformed
+    // (an invalid table-typed entry records no output to split). This is the
+    // "prepare refused after the kernel grant" boundary.
+    let walk = tables.with_manager(|m| m.debug_walk(TEST_VA)).unwrap();
+    let l2_table = walk[1] & 0x0000_FFFF_FFFF_F000;
+    let l2_index = (TEST_VA >> 21) & 0x1ff;
+    let l2_host =
+        (fixture.root_host + (l2_table + l2_index * 8 - fixture.root_key.0) as usize) as *mut u64;
+    let saved = unsafe { l2_host.read() };
+    assert_eq!(saved, walk[2]);
+    unsafe { l2_host.write(0x9b01_2200_0000 | 0b10) };
+    assert_eq!(
+        tables.with_manager(|m| m.translate_retained_output(TEST_VA)),
+        Some(Some(0x9b01_2200_0000))
+    );
+    let stage1_before = live_table_words(&fixture);
+    let inventory_before =
+        inventory_fingerprint(&fixture.installed.state.frame_inventory.ledger.lock());
+    let owners_before = owner_keys();
+    let aliases_before = alias_registry().lock().ordered();
+    let published = std::cell::RefCell::new(Vec::new());
+    let mut service = RetainedReuseGuestService {
+        tables: tables.clone(),
+        authority: fixture.authority.clone(),
+        root: fixture.root_key,
+        host: fixture.root_host,
+        available: true,
+        published: &published,
+        maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+    };
+    let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+    let error = fixture
+        .task
+        .materialize_retired_reuse(&custody, TEST_VA, TEST_VA + OWNER_LEN as u64, &mut service)
+        .expect_err("malformed live tables refuse the plan");
+    assert!(
+        error.to_string().contains("prepare guest retained reuse"),
+        "{error}"
+    );
+    assert!(published.borrow().is_empty(), "nothing reached EL1");
+    assert!(
+        fixture.authority.published.lock().is_none(),
+        "kernel grant rolled back"
+    );
+    assert_eq!(owner_keys(), owners_before, "replacement owner rolled back");
+    assert_eq!(
+        inventory_fingerprint(&fixture.installed.state.frame_inventory.ledger.lock()),
+        inventory_before
+    );
+    assert_eq!(alias_registry().lock().ordered(), aliases_before);
+    assert_eq!(live_table_words(&fixture), stage1_before);
+    assert!(fixture.task.cow_deferred_publications.lock().is_empty());
+    unsafe { l2_host.write(saved) };
+}
+
+#[test]
+fn host_retained_reuse_repoints_through_the_host_editor() {
+    const VALID: u64 = 1;
+    const AP_MASK: u64 = 0b11 << 6;
+    const AP_USER_RO: u64 = 0b11 << 6;
+    const NON_GLOBAL: u64 = 1 << 11;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        708,
+        0x9a01_2300_0000,
+        0x9b01_2300_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Host,
+    );
+    struct HostFlush(usize);
+    impl carrick_aarch64::vmm::Stage1Services for HostFlush {
+        fn flush(&mut self) -> Result<(), TrapError> {
+            self.0 += 1;
+            Ok(())
+        }
+        fn publish(
+            &mut self,
+            _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+        {
+            panic!("host lane must not submit guest descriptors")
+        }
+    }
+    let owners_before = owner_keys();
+    let mut service = HostFlush(0);
+    let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+    let end = fixture
+        .task
+        .materialize_retired_reuse(&custody, TEST_VA, TEST_VA + OWNER_LEN as u64, &mut service)
+        .expect("host lane materializes retained reuse");
+    assert_eq!(end, Some(TEST_VA + OWNER_LEN as u64));
+    assert_eq!(service.0, 1, "one stage-1 TLBI after the host edit");
+    let new_owner: Vec<_> = owner_keys().difference(&owners_before).copied().collect();
+    assert_eq!(new_owner.len(), 1);
+    fixture.installed.owners.0.push(new_owner[0]);
+    let new_ipa = new_owner[0].0 + (TEST_VA % CowArmedRanges::COMPOUND_SIZE);
+    let tables = fixture.installed.state.page_tables_authority();
+    for page in (0..OWNER_LEN as u64).step_by(4096) {
+        let va = TEST_VA + page;
+        assert_eq!(tables.with_manager(|m| m.translate(va)), Some(None));
+        assert_eq!(
+            tables.with_manager(|m| m.translate_retained_output(va)),
+            Some(Some(new_ipa + page))
+        );
+        let leaf = tables.with_manager(|m| m.debug_walk(va)[3]).unwrap();
+        assert_eq!(leaf & VALID, 0);
+        assert_eq!(leaf & AP_MASK, AP_USER_RO);
+        assert_ne!(leaf & NON_GLOBAL, 0);
+    }
+    assert!(fixture.authority.published.lock().is_some());
+    assert_eq!(
+        fixture.task.cow_deferred_publications.lock().len(),
+        OWNER_LEN / 4096
+    );
+}
