@@ -6768,7 +6768,8 @@ fn cow_armed_ranges_split_one_compound_and_leave_peers_armed() {
     }]);
     let writer = armed
         .span_for(base + CowArmedRanges::COMPOUND_SIZE + 8)
-        .expect("second compound is armed");
+        .expect("second compound is armed")
+        .live(base + CowArmedRanges::COMPOUND_SIZE + 8, |_| None);
     assert_eq!(writer.va, base + CowArmedRanges::COMPOUND_SIZE);
     assert_eq!(writer.len, CowArmedRanges::COMPOUND_SIZE as usize);
     armed.disarm(writer);
@@ -6833,7 +6834,8 @@ fn cow_armed_ranges_prefer_exact_alias_fragment_over_broad_arena() {
 
     let span = armed
         .span_for(alias + 0x1000)
-        .expect("exact alias fragment is armed");
+        .expect("exact alias fragment is armed")
+        .live(alias + 0x1000, |_| None);
     assert_eq!(
         span,
         CowArmedSpan {
