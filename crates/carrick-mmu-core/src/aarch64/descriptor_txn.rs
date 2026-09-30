@@ -86,7 +86,7 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 6;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 7;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
@@ -212,13 +212,14 @@ pub enum DescriptorOp {
         target_ipa: SubstrateGpa,
         backing: BackingIdentity,
     },
-    /// Arm one parent range for fork COW with exactly the host editor's
-    /// per-descriptor rule (`PtOp::ForkReadOnly`, or `PtOp::KernelReadOnly`
-    /// for Carrick-owned EL1 pages): terminals that already satisfy it are
-    /// skipped without a split, covered blocks are armed in place, and only
-    /// range edges split. `arm` carries the image construction mode and the
-    /// IPA window no valid output may name.
-    ForkArm { span: PageSpan, arm: ForkArmMode },
+    /// Apply one host-originated range rule with exactly the host editor's
+    /// per-terminal definition ([`super::TerminalRule`], the one
+    /// `PageTableManager::apply_rule` uses): fork COW arming, mprotect,
+    /// munmap retirement, retired-leaf reset and BUS-tail tags. Terminals
+    /// that already satisfy it are skipped without a split, covered blocks
+    /// are edited in place, and only range edges split. `edit` carries the
+    /// image construction mode and the IPA window no valid output may name.
+    Terminal { span: PageSpan, edit: TerminalEdit },
 }
 
 /// Permissions of a populated alias. Deferred backing retains its output
@@ -288,14 +289,11 @@ impl CowRepointAccess {
     }
 }
 
-/// How [`DescriptorOp::ForkArm`] arms its range.
+/// How [`DescriptorOp::Terminal`] edits its range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ForkArmMode {
-    /// Carrick-owned EL1 page: EL1 read-only, EL0 no access.
-    pub kernel_only: bool,
-    /// Execute permission for a kernel-only arm (ignored otherwise: private
-    /// arming preserves each leaf's own execute permission).
-    pub executable: bool,
+pub struct TerminalEdit {
+    /// The shared per-terminal rule.
+    pub rule: super::TerminalRule,
     /// The live image builds nG leaves (every HVPatch MM does).
     pub asid_scoped: bool,
     /// IPA window no valid output may name (the in-kernel GIC).
@@ -303,20 +301,132 @@ pub struct ForkArmMode {
     pub excluded_len: u64,
 }
 
-impl ForkArmMode {
-    fn pt_op(self) -> super::PtOp {
-        if self.kernel_only {
-            super::PtOp::KernelReadOnly {
-                exec: self.executable,
-            }
+impl TerminalEdit {
+    /// Fork COW arming of one parent range: `PtOp::ForkReadOnly`, or
+    /// `PtOp::KernelReadOnly` for Carrick-owned EL1 pages (EL1 read-only,
+    /// EL0 no access, with `executable` choosing UXN).
+    #[must_use]
+    pub const fn fork_arm(
+        kernel_only: bool,
+        executable: bool,
+        asid_scoped: bool,
+        excluded_ipa: u64,
+        excluded_len: u64,
+    ) -> Self {
+        let op = if kernel_only {
+            super::PtOp::KernelReadOnly { exec: executable }
         } else {
             super::PtOp::ForkReadOnly
+        };
+        Self {
+            rule: super::TerminalRule::pt(op),
+            asid_scoped,
+            excluded_ipa,
+            excluded_len,
         }
     }
 
     fn excludes(self, output: u64, len: u64) -> bool {
         super::PageTableLayoutConfig::new(0, 0, self.excluded_ipa, self.excluded_len)
             .ipa_overlaps_excluded(output, len)
+    }
+
+    const OP_NONE: u64 = 0;
+    const OP_INVALIDATE: u64 = 1;
+    const OP_RETIRE: u64 = 2;
+    const OP_READ_ONLY: u64 = 3;
+    const OP_FORK_READ_ONLY: u64 = 4;
+    const OP_READ_WRITE: u64 = 5;
+    const OP_KERNEL_READ_ONLY: u64 = 6;
+    const RULE_BUS_FAULT: u64 = 7;
+    const EXEC: u64 = 1 << 3;
+    const RESET_RETIRED: u64 = 1 << 4;
+    const DENY_HOST_BUFFERS: u64 = 1 << 5;
+    const FORK_ARM: u64 = 1 << 6;
+    const ASID_SCOPED: u64 = 1 << 7;
+    const KNOWN: u64 = 0xff;
+
+    fn wire(self) -> u64 {
+        use super::{PtOp, TerminalRule};
+        let scoped = if self.asid_scoped {
+            Self::ASID_SCOPED
+        } else {
+            0
+        };
+        let flag = |on: bool, bit: u64| if on { bit } else { 0 };
+        match self.rule {
+            TerminalRule::BusFault => Self::RULE_BUS_FAULT | scoped,
+            TerminalRule::Pt {
+                op,
+                reset_retired,
+                deny_host_buffers,
+                fork_arm,
+            } => {
+                let (code, exec) = match op {
+                    None => (Self::OP_NONE, false),
+                    Some(PtOp::Invalidate) => (Self::OP_INVALIDATE, false),
+                    Some(PtOp::Retire) => (Self::OP_RETIRE, false),
+                    Some(PtOp::ReadOnly { exec }) => (Self::OP_READ_ONLY, exec),
+                    Some(PtOp::ForkReadOnly) => (Self::OP_FORK_READ_ONLY, false),
+                    Some(PtOp::ReadWrite { exec }) => (Self::OP_READ_WRITE, exec),
+                    Some(PtOp::KernelReadOnly { exec }) => (Self::OP_KERNEL_READ_ONLY, exec),
+                };
+                code | flag(exec, Self::EXEC)
+                    | flag(reset_retired, Self::RESET_RETIRED)
+                    | flag(deny_host_buffers, Self::DENY_HOST_BUFFERS)
+                    | flag(fork_arm, Self::FORK_ARM)
+                    | scoped
+            }
+        }
+    }
+
+    fn from_wire(word: u64, excluded_ipa: u64, excluded_len: u64) -> Option<Self> {
+        use super::{PtOp, TerminalRule};
+        if word & !Self::KNOWN != 0 {
+            return None;
+        }
+        let exec = word & Self::EXEC != 0;
+        let flags = word & (Self::RESET_RETIRED | Self::DENY_HOST_BUFFERS | Self::FORK_ARM);
+        let op = match word & 0b111 {
+            Self::OP_NONE => None,
+            Self::OP_INVALIDATE => Some(PtOp::Invalidate),
+            Self::OP_RETIRE => Some(PtOp::Retire),
+            Self::OP_READ_ONLY => Some(PtOp::ReadOnly { exec }),
+            Self::OP_FORK_READ_ONLY => Some(PtOp::ForkReadOnly),
+            Self::OP_READ_WRITE => Some(PtOp::ReadWrite { exec }),
+            Self::OP_KERNEL_READ_ONLY => Some(PtOp::KernelReadOnly { exec }),
+            _ => {
+                // BusFault carries no op, execute bit or composition flags.
+                if exec || flags != 0 {
+                    return None;
+                }
+                return Some(Self {
+                    rule: TerminalRule::BusFault,
+                    asid_scoped: word & Self::ASID_SCOPED != 0,
+                    excluded_ipa,
+                    excluded_len,
+                });
+            }
+        };
+        // Only ops with an execute choice may carry the execute bit.
+        let has_exec = matches!(
+            op,
+            Some(PtOp::ReadOnly { .. } | PtOp::ReadWrite { .. } | PtOp::KernelReadOnly { .. })
+        );
+        if exec && !has_exec {
+            return None;
+        }
+        Some(Self {
+            rule: TerminalRule::Pt {
+                op,
+                reset_retired: word & Self::RESET_RETIRED != 0,
+                deny_host_buffers: word & Self::DENY_HOST_BUFFERS != 0,
+                fork_arm: word & Self::FORK_ARM != 0,
+            },
+            asid_scoped: word & Self::ASID_SCOPED != 0,
+            excluded_ipa,
+            excluded_len,
+        })
     }
 }
 
@@ -326,7 +436,7 @@ impl DescriptorOp {
     const KIND_PROTECT: u64 = 3;
     const KIND_RETIRE: u64 = 4;
     const KIND_COW_REPOINT: u64 = 5;
-    const KIND_FORK_ARM: u64 = 6;
+    const KIND_TERMINAL: u64 = 6;
     const KIND_MAP_ALIAS: u64 = 7;
 
     /// The complete semantic span this operation may edit.
@@ -336,7 +446,7 @@ impl DescriptorOp {
             Self::Prepare { publication, .. } => PageSpan::new(publication.va, publication.len),
             Self::Publish { span, .. }
             | Self::Retire(span)
-            | Self::ForkArm { span, .. }
+            | Self::Terminal { span, .. }
             | Self::MapAlias { span, .. } => span,
             Self::Protect(edit) => PageSpan::new(edit.va, edit.len),
             Self::CowRepoint { va, len, .. } => PageSpan::new(va, len),
@@ -361,7 +471,7 @@ impl DescriptorOp {
             Self::Protect(_) => Self::KIND_PROTECT,
             Self::Retire(_) => Self::KIND_RETIRE,
             Self::CowRepoint { .. } => Self::KIND_COW_REPOINT,
-            Self::ForkArm { .. } => Self::KIND_FORK_ARM,
+            Self::Terminal { .. } => Self::KIND_TERMINAL,
             Self::MapAlias { .. } => Self::KIND_MAP_ALIAS,
         }
     }
@@ -412,14 +522,12 @@ impl DescriptorOp {
                 target_ipa,
                 ..
             } => [span.va, span.len, target_ipa.raw(), access.wire(), 0, 0],
-            Self::ForkArm { span, arm } => [
+            Self::Terminal { span, edit } => [
                 span.va,
                 span.len,
-                bool_word(arm.kernel_only, 0)
-                    | bool_word(arm.executable, 1)
-                    | bool_word(arm.asid_scoped, 2),
-                arm.excluded_ipa,
-                arm.excluded_len,
+                edit.wire(),
+                edit.excluded_ipa,
+                edit.excluded_len,
                 0,
             ],
         };
@@ -474,15 +582,9 @@ impl DescriptorOp {
                 target_ipa: SubstrateGpa(payload[2]),
                 backing: backing?,
             }),
-            Self::KIND_FORK_ARM if payload[2] & !0b111 == 0 => Some(Self::ForkArm {
+            Self::KIND_TERMINAL => Some(Self::Terminal {
                 span: PageSpan::new(payload[0], payload[1]),
-                arm: ForkArmMode {
-                    kernel_only: payload[2] & 1 != 0,
-                    executable: payload[2] & 2 != 0,
-                    asid_scoped: payload[2] & 4 != 0,
-                    excluded_ipa: payload[3],
-                    excluded_len: payload[4],
-                },
+                edit: TerminalEdit::from_wire(payload[2], payload[3], payload[4])?,
             }),
             _ => None,
         }
@@ -1119,7 +1221,7 @@ impl DescriptorTxnSlot {
             DescriptorOp::KIND_PUBLISH
             | DescriptorOp::KIND_PROTECT
             | DescriptorOp::KIND_RETIRE
-            | DescriptorOp::KIND_FORK_ARM => PageSpan::new(payload[0], payload[1]),
+            | DescriptorOp::KIND_TERMINAL => PageSpan::new(payload[0], payload[1]),
             DescriptorOp::KIND_COW_REPOINT => PageSpan::new(payload[0], PT_PAGE),
             _ => return false,
         };
@@ -1514,9 +1616,14 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
             };
         }
         let covers_entry = self.start <= base && base + span <= self.end;
-        if let DescriptorOp::ForkArm { arm, .. } = self.op {
+        if let DescriptorOp::Terminal { edit, .. } = self.op {
             let Some(armed) =
-                super::pt_terminal_edit(arm.asid_scoped, arm.pt_op(), descriptor, level, base)
+                super::terminal_rule_edit(edit.asid_scoped, edit.rule, descriptor, level, base)
+                    .map_err(|refusal| match refusal {
+                        super::TerminalRefusal::Occupied => DescriptorRefusal::Occupied,
+                        super::TerminalRefusal::Resident => DescriptorRefusal::AlreadyValid,
+                        super::TerminalRefusal::Malformed => DescriptorRefusal::Malformed,
+                    })?
             else {
                 return Ok(());
             };
@@ -1526,7 +1633,7 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
             if level < 3 && !covers_entry {
                 return self.descend(level, loc, descriptor, base);
             }
-            if armed & VALID != 0 && arm.excludes(armed & output_mask(level), span) {
+            if armed & VALID != 0 && edit.excludes(armed & output_mask(level), span) {
                 return Err(DescriptorRefusal::ExcludedOutput);
             }
             if armed != descriptor {
@@ -1606,7 +1713,7 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
             && !matches!(
                 self.op,
                 DescriptorOp::Prepare { .. }
-                    | DescriptorOp::ForkArm { .. }
+                    | DescriptorOp::Terminal { .. }
                     | DescriptorOp::MapAlias { .. }
             )
         {
@@ -1880,9 +1987,9 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                     },
                 )
             }
-            // Fork arming shares the host editor's terminal rule and is
+            // Terminal rules share the host editor's definition and are
             // applied in `visit_entry` before this per-op table.
-            DescriptorOp::ForkArm { .. } => Err(DescriptorRefusal::Malformed),
+            DescriptorOp::Terminal { .. } => Err(DescriptorRefusal::Malformed),
         }
     }
 }
@@ -1937,8 +2044,8 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
                     .is_some_and(|end| end <= PA_MASK_4KIB + PT_PAGE)
         }
         DescriptorOp::Protect(_) | DescriptorOp::Retire(_) => true,
-        DescriptorOp::ForkArm { arm, .. } => {
-            arm.excluded_ipa.checked_add(arm.excluded_len).is_some()
+        DescriptorOp::Terminal { edit, .. } => {
+            edit.excluded_ipa.checked_add(edit.excluded_len).is_some()
         }
         DescriptorOp::CowRepoint {
             access,
@@ -2422,6 +2529,72 @@ mod tests {
             assert_eq!(slot.take_receipt(txn.id), Some(receipt));
             assert_eq!(slot.state(), DESCRIPTOR_TXN_IDLE);
             assert!(txn.verify_receipt(&receipt).is_ok());
+        }
+    }
+
+    #[test]
+    fn every_terminal_rule_round_trips_and_invalid_rule_words_are_refused() {
+        use super::super::{PtOp, TerminalRule};
+        let mut ops = alloc::vec![None];
+        for exec in [false, true] {
+            ops.extend([
+                Some(PtOp::ReadOnly { exec }),
+                Some(PtOp::ReadWrite { exec }),
+                Some(PtOp::KernelReadOnly { exec }),
+            ]);
+        }
+        ops.extend([
+            Some(PtOp::Invalidate),
+            Some(PtOp::Retire),
+            Some(PtOp::ForkReadOnly),
+        ]);
+        let mut rules = alloc::vec![TerminalRule::BusFault];
+        for op in ops {
+            for bits in 0..8u8 {
+                rules.push(TerminalRule::Pt {
+                    op,
+                    reset_retired: bits & 1 != 0,
+                    deny_host_buffers: bits & 2 != 0,
+                    fork_arm: bits & 4 != 0,
+                });
+            }
+        }
+        for rule in rules {
+            for asid_scoped in [false, true] {
+                let op = DescriptorOp::Terminal {
+                    span: PageSpan::new(0x5000, 3 * PT_PAGE),
+                    edit: TerminalEdit {
+                        rule,
+                        asid_scoped,
+                        excluded_ipa: 0x0800_0000,
+                        excluded_len: 0x0100_0000,
+                    },
+                };
+                let (kind, payload) = op.encode();
+                assert_eq!(
+                    DescriptorOp::decode(kind, payload, None),
+                    Some(op),
+                    "{rule:?}"
+                );
+            }
+        }
+        let decode = |word| {
+            DescriptorOp::decode(
+                DescriptorOp::KIND_TERMINAL,
+                [0x5000, PT_PAGE, word, 0, 0, 0],
+                None,
+            )
+        };
+        // Unknown bits, an execute bit on an op without one, and composition
+        // flags on a BUS-tail rule are malformed, not reinterpreted.
+        for word in [
+            1 << 8,
+            TerminalEdit::OP_INVALIDATE | TerminalEdit::EXEC,
+            TerminalEdit::OP_NONE | TerminalEdit::EXEC,
+            TerminalEdit::RULE_BUS_FAULT | TerminalEdit::FORK_ARM,
+            TerminalEdit::RULE_BUS_FAULT | TerminalEdit::EXEC,
+        ] {
+            assert_eq!(decode(word), None, "{word:#x}");
         }
     }
 
@@ -3183,15 +3356,9 @@ mod tests {
             let words = fixture(2);
             let entry = resident_block(&words, 0x009c_0000_0000);
             let before = words.image();
-            let op = DescriptorOp::ForkArm {
+            let op = DescriptorOp::Terminal {
                 span: PageSpan::new(VA + 7 * PT_PAGE, PT_PAGE),
-                arm: ForkArmMode {
-                    kernel_only: false,
-                    executable: false,
-                    asid_scoped: true,
-                    excluded_ipa: 0,
-                    excluded_len: 0,
-                },
+                edit: TerminalEdit::fork_arm(false, false, true, 0, 0),
             };
             // The link after break-before-make observes a concurrent writer.
             words.fail_cas_at.set(Some(1));

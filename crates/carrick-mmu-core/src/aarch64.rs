@@ -2200,11 +2200,33 @@ impl PageTableManager {
         kernel_only: bool,
         executable: bool,
     ) -> descriptor_txn::DescriptorOp {
-        descriptor_txn::DescriptorOp::ForkArm {
-            span: descriptor_txn::PageSpan::new(va, len),
-            arm: descriptor_txn::ForkArmMode {
+        self.terminal_op(
+            va,
+            len,
+            descriptor_txn::TerminalEdit::fork_arm(
                 kernel_only,
                 executable,
+                self.asid_scoped_leaves,
+                self.layout.excluded_ipa_start,
+                self.layout.excluded_ipa_len,
+            )
+            .rule,
+        )
+    }
+
+    /// A guest transaction applying `rule` over `[va, va+len)` exactly as
+    /// [`Self::apply_rule`] would on this image (same nG scoping and GIC
+    /// output exclusion).
+    pub fn terminal_op(
+        &self,
+        va: u64,
+        len: u64,
+        rule: TerminalRule,
+    ) -> descriptor_txn::DescriptorOp {
+        descriptor_txn::DescriptorOp::Terminal {
+            span: descriptor_txn::PageSpan::new(va, len),
+            edit: descriptor_txn::TerminalEdit {
+                rule,
                 asid_scoped: self.asid_scoped_leaves,
                 excluded_ipa: self.layout.excluded_ipa_start,
                 excluded_len: self.layout.excluded_ipa_len,
@@ -11333,6 +11355,278 @@ mod tests {
                 );
                 page += PT_PAGE;
             }
+        }
+    }
+
+    /// Every host-originated range rule produces the same terminal
+    /// descriptor through the guest executor (`DescriptorOp::Terminal`) as
+    /// through the host editor (`apply_rule`), page for page, across
+    /// prepared/resident/retired EL1 grants, untagged coarse alias blocks,
+    /// partially covered blocks and never-populated reservations. This is
+    /// the proof that host mprotect/munmap/BUS-tail edits submitted on the
+    /// guest lane keep exactly the host lane's semantics.
+    #[test]
+    fn guest_terminal_rules_match_the_host_editor_page_for_page() {
+        use core::sync::atomic::AtomicU64;
+        use descriptor_txn::{
+            CallerInvalidatesAsid, DescriptorOutcome, InlineJournal, PrimaryTableWords,
+            TableGrants, execute_descriptor_op,
+        };
+        const TWO_MIB: u64 = 1 << 21;
+        // Bulk-prepare four pages; only `fault_page` becomes resident.
+        let publish = |image: &mut PageTableManager, va: u64, ipa: u64, fault_page: u64| {
+            image
+                .publish_private_pages(
+                    GuestLeafPublication {
+                        va,
+                        ipa,
+                        len: 4 * PT_PAGE,
+                        writable: true,
+                        executable: false,
+                    },
+                    va + fault_page.min(3) * PT_PAGE,
+                    None,
+                )
+                .unwrap();
+        };
+        let rw = |exec| TerminalRule::pt(PtOp::ReadWrite { exec });
+        let ro = |exec| TerminalRule::pt(PtOp::ReadOnly { exec });
+        let composed = |op, reset_retired, deny_host_buffers, fork_arm| TerminalRule::Pt {
+            op,
+            reset_retired,
+            deny_host_buffers,
+            fork_arm,
+        };
+        // Each case gets its own disjoint neighbourhood: (va, len, rule).
+        let mut image = hvpatch_manager();
+        let base_va = LINUX_MMAP_BASE + 0x40_0000;
+        let frame = LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        let mut cases = Vec::new();
+        let mut slot = 0;
+        let mut next = |image: &mut PageTableManager, fault_page: u64| {
+            let va = base_va + slot * 0x10_0000;
+            publish(image, va, frame + slot * 0x10_0000, fault_page);
+            slot += 1;
+            va
+        };
+        // Protection over prepared+resident grants, with and without exec.
+        let va = next(&mut image, 2);
+        cases.push((va, 4 * PT_PAGE, rw(false)));
+        let va = next(&mut image, 2);
+        cases.push((va + PT_PAGE, 2 * PT_PAGE, ro(true)));
+        // Host-forwarded PROT_NONE that denies host buffers.
+        let va = next(&mut image, 3);
+        cases.push((
+            va,
+            4 * PT_PAGE,
+            composed(Some(PtOp::Invalidate), false, true, false),
+        ));
+        // munmap retirement, then a new mapping over the retired grant.
+        let va = next(&mut image, 2);
+        cases.push((va, 4 * PT_PAGE, TerminalRule::pt(PtOp::Retire)));
+        let retired_va = next(&mut image, 4);
+        image
+            .apply(retired_va, 4 * PT_PAGE as usize, PtOp::Retire, None)
+            .unwrap();
+        cases.push((
+            retired_va,
+            4 * PT_PAGE,
+            composed(Some(PtOp::ReadWrite { exec: false }), true, false, false),
+        ));
+        let reset_only = next(&mut image, 4);
+        image
+            .apply(reset_only, 2 * PT_PAGE as usize, PtOp::Retire, None)
+            .unwrap();
+        cases.push((reset_only, 2 * PT_PAGE, composed(None, true, false, false)));
+        // mprotect to write over a fork-armed range re-arms it.
+        let va = next(&mut image, 4);
+        image
+            .set_fork_readonly(va, 4 * PT_PAGE as usize, None)
+            .unwrap();
+        cases.push((
+            va,
+            4 * PT_PAGE,
+            composed(Some(PtOp::ReadWrite { exec: false }), false, false, true),
+        ));
+        // BUS tail over prepared-only leaves.
+        let va = next(&mut image, 0);
+        cases.push((va + PT_PAGE, 3 * PT_PAGE, TerminalRule::BusFault));
+        // Coarse untagged alias blocks: whole, bisected, and a never-populated
+        // reservation (empty terminals).
+        let block_va = LINUX_MMAP_BASE + 8 * TWO_MIB;
+        image
+            .set_rw(block_va, 2 * TWO_MIB as usize, false, None)
+            .unwrap();
+        cases.push((block_va, TWO_MIB, ro(false)));
+        cases.push((
+            block_va + TWO_MIB + 3 * PT_PAGE,
+            5 * PT_PAGE,
+            TerminalRule::pt(PtOp::Retire),
+        ));
+        cases.push((
+            LINUX_MMAP_BASE + 20 * TWO_MIB + PT_PAGE,
+            3 * PT_PAGE,
+            rw(true),
+        ));
+        image.declare_live_hardware_image();
+
+        let original = image.snapshot_image().unwrap();
+        let mut host = image.snapshot_image().unwrap();
+        host.declare_live_hardware_image();
+        for &(va, len, rule) in &cases {
+            host.apply_rule(va, len as usize, rule, None).unwrap();
+        }
+        // Not vacuous: every case edits at least one page.
+        for &(va, len, rule) in &cases {
+            assert!(
+                (0..len / PT_PAGE).any(|page| {
+                    let page = va + page * PT_PAGE;
+                    terminal_descriptor(host.debug_walk(page))
+                        != terminal_descriptor(original.debug_walk(page))
+                }),
+                "{rule:?} at {va:#x} changed nothing"
+            );
+        }
+
+        let mut guest = image;
+        let base = guest.base();
+        let mut bytes = guest.as_bytes().to_vec();
+        bytes.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let words: Vec<AtomicU64> = bytes
+            .chunks_exact(8)
+            .map(|w| AtomicU64::new(u64::from_le_bytes(w.try_into().unwrap())))
+            .collect();
+        let maintenance = CallerInvalidatesAsid;
+        let live = unsafe {
+            PrimaryTableWords::new(
+                words.as_ptr().cast_mut(),
+                base,
+                words.len() * 8,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        for &(va, len, rule) in &cases {
+            let op = guest.terminal_op(va, len, rule);
+            let plan = descriptor_txn::plan_descriptor_op(&live, SubstrateGpa(base), op).unwrap();
+            let grants: TableGrants = guest
+                .reserve_primary_table_grants(plan.table_grants)
+                .unwrap();
+            let outcome = execute_descriptor_op(
+                &live,
+                SubstrateGpa(base),
+                op,
+                &grants,
+                &mut InlineJournal::new(),
+            );
+            assert!(
+                matches!(outcome, DescriptorOutcome::Applied(_)),
+                "{rule:?} at {va:#x}: {outcome:?}"
+            );
+        }
+
+        let guest_bytes: Vec<u8> = words
+            .iter()
+            .flat_map(|w| w.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes())
+            .collect();
+        for &(va, len, rule) in &cases {
+            let mut page = va.saturating_sub(2 * PT_PAGE);
+            while page < va + len + 2 * PT_PAGE {
+                let host_leaf = terminal_descriptor(host.debug_walk(page));
+                let guest_leaf = terminal_descriptor(walk_descriptors(&guest_bytes, base, page));
+                assert_eq!(
+                    host_leaf, guest_leaf,
+                    "{rule:?} page {page:#x}: host {host_leaf:#x} guest {guest_leaf:#x}"
+                );
+                page += PT_PAGE;
+            }
+        }
+    }
+
+    /// The per-terminal refusals the host editor reports as `BadAddress`
+    /// roll the whole guest transaction back.
+    #[test]
+    fn guest_terminal_rule_refusals_roll_back() {
+        use core::sync::atomic::AtomicU64;
+        use descriptor_txn::{
+            CallerInvalidatesAsid, DescriptorOutcome, DescriptorRefusal, InlineJournal,
+            PrimaryTableWords, TableGrants, execute_descriptor_op,
+        };
+        let mut image = hvpatch_manager();
+        let va = LINUX_MMAP_BASE + 0x40_0000;
+        image
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va,
+                    ipa: LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+                    len: 4 * PT_PAGE,
+                    writable: true,
+                    executable: false,
+                },
+                va + 2 * PT_PAGE,
+                None,
+            )
+            .unwrap();
+        image.declare_live_hardware_image();
+        let base = image.base();
+        let mut bytes = image.as_bytes().to_vec();
+        bytes.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let words: Vec<AtomicU64> = bytes
+            .chunks_exact(8)
+            .map(|w| AtomicU64::new(u64::from_le_bytes(w.try_into().unwrap())))
+            .collect();
+        let snapshot = |words: &[AtomicU64]| -> Vec<u64> {
+            words
+                .iter()
+                .map(|w| w.load(core::sync::atomic::Ordering::Relaxed))
+                .collect()
+        };
+        let maintenance = CallerInvalidatesAsid;
+        let live = unsafe {
+            PrimaryTableWords::new(
+                words.as_ptr().cast_mut(),
+                base,
+                words.len() * 8,
+                &maintenance,
+            )
+        }
+        .unwrap();
+        for (rule, refusal) in [
+            // A new mapping over a live grant.
+            (
+                TerminalRule::Pt {
+                    op: Some(PtOp::ReadWrite { exec: false }),
+                    reset_retired: true,
+                    deny_host_buffers: false,
+                    fork_arm: false,
+                },
+                DescriptorRefusal::Occupied,
+            ),
+            // A BUS tail over a resident page.
+            (TerminalRule::BusFault, DescriptorRefusal::AlreadyValid),
+        ] {
+            let before = snapshot(&words);
+            let op = image.terminal_op(va, 4 * PT_PAGE, rule);
+            let outcome = execute_descriptor_op(
+                &live,
+                SubstrateGpa(base),
+                op,
+                &TableGrants::NONE,
+                &mut InlineJournal::new(),
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    DescriptorOutcome::Refused(r) | DescriptorOutcome::RolledBack(r) if r == refusal
+                ),
+                "{rule:?}: {outcome:?}"
+            );
+            assert_eq!(snapshot(&words), before, "{rule:?} left stores behind");
+            let mut host = image.snapshot_image().unwrap();
+            assert_eq!(
+                host.apply_rule(va, 4 * PT_PAGE as usize, rule, None),
+                Err(PageTableError::BadAddress)
+            );
         }
     }
 }
