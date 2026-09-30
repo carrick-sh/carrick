@@ -1,0 +1,29 @@
+schema_version = 1
+id = "kernel.el1.fork-cow"
+title = "Guest EL1 fork copy-on-write resolution and leaf repointing"
+guest_surfaces = [
+  "syscall:clone",
+  "syscall:fork",
+  "fault:permission",
+  "kernel:stage1-mmu",
+  "kernel:frame-inventory",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 fork: after a fork in a multithreaded program, each child process receives a private copy of the parent's memory",
+  "man 2 clone: CLONE_VM not set establishes copy-on-write page sharing between parent and child",
+  "Arm A-profile translation architecture: write access to a read-only translation generates a Permission Fault delivered to EL1; EL1 allocates a private physical frame, copies the source page, updates stage-1 descriptors to AP_RW, invalidates the local ASID, and returns to EL0 without host intervention",
+]
+fixture = "embed:el1-sched fork-cow 20 16|64|256"
+scale_points = [16, 64, 256]
+rationale = "EL1 increment 2 fork copy-on-write checkpoint (TASK 2 and TASK 3). Prior to this increment, write permission faults on COW pages trapped through HardwareCowResolver, which returned PermissionDenied and exited to the host carrier's cow_engine for physical allocation, host copying, stage-2 mapping and descriptor update. Under guest COW ownership, EL1 directly handles write permission faults on shared read-only private pages: it acquires a private frame from its pre-mapped pool, copies page contents in guest memory, updates the stage-1 leaf to read-write (AP_RW), issues an ASID-scoped TLBI, and resumes EL0 with zero host exits. Parent and child verify memory isolation across multiple worker threads. The signed witness verifies that the carrier-scoped host COW ledger (`carrick_embed::host_cow_snapshot`, completed host COW transactions of every MM the carrier admitted, including fork children) records none, that COW faults enter EL1, that frame grants balance returns, and that incremental host exits across scales remain below 0.125 exits per added COW page. Host fault exits are reported but are not host COW resolutions and are never used as that count."
+structural_budgets = []
+
+[bindings]
+embed = "carrick-embed::el1_sched::el1_fork_cow_resolves_in_guest"
+
+[bindings.unresolved]
+vm_free = "VM-free table manager tests verify descriptor transitions and rollback, but cannot execute EL0 data aborts or concurrent multi-vCPU COW races."
+docker = "Native arm64 Docker differential verification for the multi-worker fork-COW fixture across 16, 64, and 256 pages; automated same-source binding remains open."
+embed_structural = "Assert a zero carrier-scoped host COW resolution delta (with the ledger having admitted at least one MM per fork), guest fault entries covering the pages written, balanced frame accounting, and incremental exit slope < 0.125 exits per added page across scales."
+production = "Implement in-guest frame allocation, copy, and leaf upgrade in HardwareCowResolver, reducing the host cow_engine to background backing services."

@@ -23,7 +23,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = "carrick-vmm-hvf::trap::frame_inventory::tests::process_retirement_does_not_combine_counts_from_different_populations (one deterministic sibling publication/retirement attempt, no stale RetireFrame); carrick-mmu-core::aarch64::tests::owned_host_image_reuse_clears_live_descriptors_written_by_an_el1_editor; carrick-kernel::dispatch::mem::tests::lazy_fixed_anonymous_replacement_rearms_first_touch_after_retirement; carrick-vmm-hvf::trap::global_frame::allocator_stats_tests::el1_grant_stats_count_owned_and_pooled_return_and_reuse"
-embed = "carrick-embed::el1_sched::el1_anonymous_mapping_retirement_returns_and_reuses_frames"
+embed = "carrick-embed::el1_sched::el1_anonymous_mapping_retirement_returns_and_reuses_frames; carrick-embed::el1_sched::el1_anonymous_discard_and_exit_return_frames"
 docker = "native-arm64 same-source mapping-retirement fixture at 256, 1024 and 4096 pages; docs/perf-results/2026-09-27-el1-anonymous-retirement"
 
 [bindings.unresolved]
