@@ -156,6 +156,12 @@ enum HostWakeTarget {
         prime: std::sync::Weak<dyn Fn() + Send + Sync>,
     },
 }
+/// A resolved, live [`HostWakeTarget`]: owning it is what licenses consuming
+/// an owed host wake.
+enum HostWakeDelivery {
+    Queue(std::sync::Arc<crate::kernel::WaitQueue>),
+    Publisher(std::sync::Arc<dyn Fn() + Send + Sync>),
+}
 struct HostWakeEntry {
     object: IpcObjectHandle,
     target: HostWakeTarget,
@@ -435,41 +441,50 @@ impl HostIpc {
     }
     /// Deliver guest-produced readiness work by exact object incarnation.
     /// Runtime calls this after returning from EL1; it never scans the pool.
+    ///
+    /// The delivery target is resolved (and held alive) BEFORE the owed flag
+    /// is consumed: a wake is only ever consumed by a delivery that happens.
+    /// With no live target for this exact incarnation the wake stays owed
+    /// and indexed, and the region counts it
+    /// ([`IpcRegion::owed_host_wakes_without_target`], which must stay 0).
     pub fn service_host_wake(&self, object: IpcObjectHandle) -> bool {
+        let target = self.host_wake_target(object);
         // Authenticate and consume under the object lock: a recycled slot
         // cannot lose its successor's wake between generation check and swap.
         let region = self.region();
-        let Ok(guard) = region.lock(object, &HostLockWait) else {
+        let Ok(mut guard) = region.lock(object, &HostLockWait) else {
             return false;
         };
-        let owed = region.take_host_wake(object);
+        let Some(target) = target else {
+            guard.retain_undeliverable_host_wake();
+            return false;
+        };
+        let owed = guard.take_host_wake();
         drop(guard);
         if !owed {
             return false;
         }
-        let (queue, publisher) = {
-            let wakes = self.host_wakes.lock();
-            let Some(entry) = wakes
-                .get(object.index() as usize)
-                .and_then(Option::as_ref)
-                .filter(|entry| entry.object == object)
-            else {
-                return false;
-            };
-            match &entry.target {
-                HostWakeTarget::Queue(queue) => (queue.upgrade(), None),
-                HostWakeTarget::Publisher { wake, .. } => (None, wake.upgrade()),
+        match target {
+            HostWakeDelivery::Queue(queue) => queue.wake_all(),
+            HostWakeDelivery::Publisher(publisher) => publisher(),
+        }
+        true
+    }
+
+    /// The live delivery target registered for exactly `object`'s
+    /// incarnation, held strongly so it outlives the consumption it justifies.
+    fn host_wake_target(&self, object: IpcObjectHandle) -> Option<HostWakeDelivery> {
+        let wakes = self.host_wakes.lock();
+        let entry = wakes
+            .get(object.index() as usize)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.object == object)?;
+        match &entry.target {
+            HostWakeTarget::Queue(queue) => queue.upgrade().map(HostWakeDelivery::Queue),
+            HostWakeTarget::Publisher { wake, .. } => {
+                wake.upgrade().map(HostWakeDelivery::Publisher)
             }
-        };
-        if let Some(queue) = queue {
-            queue.wake_all();
-            return true;
         }
-        if let Some(publisher) = publisher {
-            publisher();
-            return true;
-        }
-        false
     }
 
     pub fn directory_ptr(&self) -> *mut IpcDirectory {
@@ -721,6 +736,68 @@ mod tests {
         owner
             .release(IpcBacking::EventFd { object }.encode())
             .unwrap();
+    }
+
+    /// Publish one owed host wake on `object` (a host subscriber exists).
+    fn publish_owed(owner: &HostIpc, object: IpcObjectHandle) {
+        let region = owner.region();
+        let mut guard = region.lock(object, &HostLockWait).unwrap();
+        let step = guard.eventfd().unwrap().try_write(1);
+        assert!(guard.publish(step.wake).host_owed);
+    }
+
+    fn indexed(owner: &HostIpc) -> Vec<IpcObjectHandle> {
+        let mut candidates = Vec::new();
+        owner
+            .region()
+            .drain_host_wake_candidates(|candidate| candidates.push(candidate));
+        candidates
+    }
+
+    /// An owed host wake whose object has no live delivery target (none
+    /// registered for this incarnation, or its queue is gone) is never
+    /// consumed: it stays owed and indexed for the boundary after a target
+    /// exists, and the region counts it (a count that must stay zero).
+    #[test]
+    fn serial_host_el1_ipc_owed_host_wake_survives_a_missing_target() {
+        for dead_queue in [false, true] {
+            let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+            let object = owner.create_eventfd(0, pipe::EventMode::Counter).unwrap();
+            if dead_queue {
+                drop(owner.wait_queue(object));
+            }
+            let subscription = owner.subscribe_host(object).unwrap();
+            publish_owed(&owner, object);
+            assert_eq!(indexed(&owner), [object]);
+            assert!(!owner.service_host_wake(object), "no target to deliver to");
+            assert_eq!(
+                indexed(&owner),
+                [object],
+                "the undelivered wake stays indexed (dead_queue={dead_queue})"
+            );
+            assert_eq!(owner.region().owed_host_wakes_without_target(), 1);
+            let mut census = String::new();
+            owner.region().write_host_wake_census(&mut census).unwrap();
+            assert!(
+                census.starts_with("ipc host-wake index: owed_without_target=1 "),
+                "{census}"
+            );
+            let queue = owner.wait_queue(object);
+            let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&woken);
+            let enrollment = queue.enroll_callback(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            assert!(owner.service_host_wake(object), "the target receives it");
+            assert_eq!(woken.load(Ordering::SeqCst), 1);
+            assert!(!owner.service_host_wake(object), "delivered exactly once");
+            assert_eq!(owner.region().owed_host_wakes_without_target(), 1);
+            drop(enrollment);
+            drop(subscription);
+            owner
+                .release(IpcBacking::EventFd { object }.encode())
+                .unwrap();
+        }
     }
 
     #[test]
