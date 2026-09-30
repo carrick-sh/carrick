@@ -1497,9 +1497,10 @@ where
         }
 
         // Owed inotify and pipe/eventfd host wakes are delivered here.
-        let served_with_work = engine.mailbox_slot().is_some_and(|slot| {
+        let served_boundary = engine.mailbox_slot().and_then(|slot| {
             carrick_kernel::el1_delegation::settle_el1_boundary(slot, kernel_context.kernel())
         });
+        let served_with_work = served_boundary.is_some();
         if served_with_work {
             CENSUS_EL1_BOUNDARY.with(|flag| flag.set(true));
         }
@@ -1531,8 +1532,8 @@ where
             // metadata. Reapplying retirement there is idempotent and remains
             // temporary until mmap-family policy itself moves into EL1.
             if matches!(
-                carrick_el1_abi::served_boundary(request.number.raw(), original_args.0[0]),
-                carrick_el1_abi::ServedBoundary::ReplayOriginal { .. }
+                served_boundary,
+                Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { .. })
             ) {
                 (syscall, None)
             } else {

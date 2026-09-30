@@ -359,8 +359,7 @@ where
                 frame.x[0] = 0;
                 counters.served[nr].fetch_add(1, Ordering::Relaxed);
                 if let Some(task) = cur_task {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    return task.leave_served_with_work();
+                    return task.leave_commit_owed(orig_x0);
                 }
                 return Action::Served;
             }
@@ -384,8 +383,7 @@ where
                 frame.x[0] = 0;
                 counters.served[nr].fetch_add(1, Ordering::Relaxed);
                 if let Some(task) = cur_task {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    return task.leave_served_with_work();
+                    return task.leave_commit_owed(orig_x0);
                 }
             }
         }
