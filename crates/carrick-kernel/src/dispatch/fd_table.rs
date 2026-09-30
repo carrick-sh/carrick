@@ -202,6 +202,12 @@ impl EventFdState {
         let object = self.lifetime.lock().take();
         drop(object);
     }
+    /// The shared object this description names, for tests that act as the
+    /// EL1 venue on it directly.
+    #[cfg(test)]
+    pub(crate) fn ipc_object(&self) -> carrick_el1_abi::ipc::IpcObjectHandle {
+        self.object
+    }
     pub(super) fn counter_value(&self) -> u64 {
         let region = self.owner.region();
         match region.lock(self.object, &crate::el1_zone::HostLockWait) {
