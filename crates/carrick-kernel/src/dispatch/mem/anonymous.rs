@@ -105,7 +105,7 @@ enum HostVenue {
 /// A root refusal where the host already committed backend work, or where
 /// the MM permit and the host queue exclude every contender: the root is the
 /// only owner, so answering from anything else would be a second authority.
-fn broken_root(context: &str, refusal: Refusal) -> ! {
+pub(super) fn broken_root(context: &str, refusal: Refusal) -> ! {
     carrick_fatal!(
         "dispatch::anonymous",
         "delegated anonymous root refused {context}: {refusal:?}"
@@ -160,7 +160,7 @@ fn proc_row(vma: &SemanticVma) -> ProcMapsEntry {
     }
 }
 
-fn in_heap(start: u64, end: u64, layout: MemoryLayout) -> bool {
+pub(super) fn in_heap(start: u64, end: u64, layout: MemoryLayout) -> bool {
     layout.heap_base <= start
         && layout
             .heap_base
