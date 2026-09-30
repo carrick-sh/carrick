@@ -145,7 +145,7 @@ fn process_with_population(population: usize) -> Process {
     {
         let mem_authority = process.dispatcher.mem();
         let mut mem = mem_authority.lock();
-        assert!(mem.free_regions.len() >= population);
+        assert!(mem.arena_for_test().free_regions.len() >= population);
         // Shared-object segments of a dynamically linked process, far from
         // the anonymous churn below.
         let file_base = crate::memory::LINUX_HIGH_VA_THRESHOLD;

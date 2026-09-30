@@ -1017,13 +1017,8 @@ impl<'a> FsView<'a> {
         after_proc_snapshot();
         let mem = self.mem_snapshot();
         let brk_current = mem.program_break();
-        let mut address_space_regions = mem.address_space_regions;
-        if !mem.dynamic_maps.is_empty() {
-            match &mut address_space_regions {
-                Some(regions) => regions.extend(mem.dynamic_maps),
-                None => address_space_regions = Some(mem.dynamic_maps),
-            }
-        }
+        let mmap_next = mem.arena_high_water();
+        let address_space_regions = mem.proc_regions();
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
         let oom_score_adj = hvpatch_process
@@ -1088,7 +1083,7 @@ impl<'a> FsView<'a> {
             address_space_regions,
             locked_memory: mem.locked_ranges,
             brk_current,
-            mmap_next: mem.mmap_next,
+            mmap_next,
             heap_base: mem.layout.heap_base,
             native_guest_va: self.page_geometry().native_geometry().is_some(),
             ruid: creds.ruid,

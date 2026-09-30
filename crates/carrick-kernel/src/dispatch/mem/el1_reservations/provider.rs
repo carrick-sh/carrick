@@ -47,17 +47,17 @@ impl ReservationProviderSlot {
     }
 }
 
-/// The exact root that owns a delegated MM's program break: the installed
+/// The exact root that owns a delegated MM's anonymous memory: the installed
 /// carrier provider, this MM's key and its host queue. Minted only from the
 /// MM's own authority, so it cannot name a sibling's or a successor's root.
 #[derive(Clone)]
-pub(in crate::dispatch) struct DelegatedBreak {
+pub(in crate::dispatch) struct DelegatedRoot {
     provider: Arc<dyn HostReservationProvider>,
     host_serial: Arc<parking_lot::Mutex<()>>,
     mm: ReservationMm,
 }
 
-impl DelegatedBreak {
+impl DelegatedRoot {
     /// One host-venue step on the exact admitted root. The root guard lives
     /// only for `step`: no host backend service ever runs under it.
     pub(in crate::dispatch) fn with_root<R>(
@@ -117,11 +117,11 @@ impl DispatchMmAuthority {
     }
 
     /// The break authority handle for this exact MM's root. Used by root
-    /// admission, which production still refuses (see `BreakAuthority`).
+    /// admission, which production still refuses (see `AnonymousAuthority`).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(in crate::dispatch) fn delegated_break(&self) -> Result<DelegatedBreak, Refusal> {
+    pub(in crate::dispatch) fn delegated_root(&self) -> Result<DelegatedRoot, Refusal> {
         let slot = self.reservation_provider.lock();
-        Ok(DelegatedBreak {
+        Ok(DelegatedRoot {
             provider: slot.provider.clone().ok_or(Refusal::ForeignMapping)?,
             host_serial: Arc::clone(&slot.host_serial),
             mm: ReservationMm::new(self.mm_id.raw()).ok_or(Refusal::Invalid)?,

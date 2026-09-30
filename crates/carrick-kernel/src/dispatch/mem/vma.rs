@@ -686,6 +686,21 @@ impl IntoIterator for VmaMap {
 }
 
 pub(crate) fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
+    vma_summaries_of(project_core_maps(mem), mem, true)
+}
+
+/// Summaries of the host-owned rows only (no delegated root rows). `heap`:
+/// whether the program-break heap is a host charge (host setup) rather than
+/// root nodes (delegated).
+pub(crate) fn host_vma_summaries(mem: &MemState, heap: bool) -> Vec<crate::kernel::VmaSummary> {
+    vma_summaries_of(project_host_core_maps(mem), mem, heap)
+}
+
+fn vma_summaries_of(
+    mut maps: Vec<ProcMapsEntry>,
+    mem: &MemState,
+    heap: bool,
+) -> Vec<crate::kernel::VmaSummary> {
     fn append_uncovered(
         maps: &mut Vec<ProcMapsEntry>,
         start: u64,
@@ -738,22 +753,19 @@ pub(crate) fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSum
         }
     }
 
-    let mut maps = project_core_maps(mem);
-    let heap_template = ProcMapsEntry {
-        start: mem.layout.heap_base,
-        end: mem.program_break(),
-        read: true,
-        write: true,
-        execute: false,
-        sharing: ProcMapSharing::Private,
-        path: "[heap]".to_owned(),
-    };
-    append_uncovered(
-        &mut maps,
-        mem.layout.heap_base,
-        mem.program_break(),
-        &heap_template,
-    );
+    if heap {
+        let brk = mem.program_break();
+        let heap_template = ProcMapsEntry {
+            start: mem.layout.heap_base,
+            end: brk,
+            read: true,
+            write: true,
+            execute: false,
+            sharing: ProcMapSharing::Private,
+            path: "[heap]".to_owned(),
+        };
+        append_uncovered(&mut maps, mem.layout.heap_base, brk, &heap_template);
+    }
     for (_, current, end) in &mem.growdown_ranges {
         let template = mem
             .dynamic_maps
@@ -840,53 +852,43 @@ pub(crate) fn mapping_is_data(write: bool, private: bool, growsdown: bool) -> bo
 
 /// Bytes charged to `RLIMIT_DATA`: the brk heap span plus every private
 /// writable mapping in the visible boot image (`.data`/`.bss`) and the dynamic
-/// VMAs. A dynamic map overlapping a grow-down range is stack, not data.
+/// VMAs. A dynamic map overlapping a grow-down range is stack, not data. A
+/// delegated root's writable anonymous rows outside the heap count too.
 pub(crate) fn data_va_bytes(mem: &MemState) -> u64 {
-    let heap = mem.program_break().saturating_sub(mem.layout.heap_base);
-    heap.saturating_add(mapped_data_va_bytes(mem))
-}
-
-/// Charges of everything a delegated reservation root does not model: every
-/// projected VMA outside the heap reservation it owns, and the private
-/// writable mappings (the heap excluded). The root adds its own heap nodes.
-pub(crate) fn host_owned_charges(mem: &MemState) -> (u64, u64) {
-    let heap_start = mem.layout.heap_base;
-    let heap_end = heap_start.saturating_add(mem.layout.heap_size);
-    let address = project_vma_summaries(mem)
+    let layout = mem.layout;
+    let heap_end = layout.heap_base.saturating_add(layout.heap_size);
+    let heap = mem.program_break().saturating_sub(layout.heap_base);
+    let root: u64 = mem
+        .root_anonymous_rows()
         .iter()
-        .map(|vma| {
-            let (start, end) = (vma.start.0, vma.end.0);
-            let len = end.saturating_sub(start);
-            let inside = end.min(heap_end).saturating_sub(start.max(heap_start));
-            len.saturating_sub(inside)
-        })
+        .filter(|row| row.write && !(layout.heap_base <= row.start && row.end <= heap_end))
+        .map(|row| row.end - row.start)
         .sum();
-    (address, mapped_data_va_bytes(mem))
+    heap.saturating_add(
+        mapped_data_rows(mem)
+            .map(|map| map.end - map.start)
+            .sum::<u64>(),
+    )
+    .saturating_add(root)
 }
 
-/// `RLIMIT_DATA` bytes of the mapped (non-heap) private writable VMAs.
-fn mapped_data_va_bytes(mem: &MemState) -> u64 {
-    let is_growdown = |map: &ProcMapsEntry| {
-        mem.growdown_ranges
-            .iter()
-            .any(|(low, _, end)| map.start < *end && map.end > *low)
-    };
+/// The mapped (non-heap) host rows charged to `RLIMIT_DATA`: private writable
+/// VMAs that are not grow-down stacks.
+pub(crate) fn mapped_data_rows(mem: &MemState) -> impl Iterator<Item = &ProcMapsEntry> {
     mem.address_space_regions
         .iter()
         .flatten()
         .filter(|map| !boot_region_is_carrick_kernel_hole(map))
-        .filter(|map| !boot_region_is_hidden_reservation(map, mem.layout))
+        .filter(move |map| !boot_region_is_hidden_reservation(map, mem.layout))
         .chain(mem.dynamic_maps.iter())
         .filter(|map| map.start < map.end)
-        .filter(|map| {
-            mapping_is_data(
-                map.write,
-                map.sharing == ProcMapSharing::Private,
-                is_growdown(map),
-            )
+        .filter(move |map| {
+            let growdown = mem
+                .growdown_ranges
+                .iter()
+                .any(|(low, _, end)| map.start < *end && map.end > *low);
+            mapping_is_data(map.write, map.sharing == ProcMapSharing::Private, growdown)
         })
-        .map(|map| map.end - map.start)
-        .sum()
 }
 
 /// Exact Linux-visible mapping metadata used by the live core publisher.
@@ -894,6 +896,28 @@ fn mapped_data_va_bytes(mem: &MemState) -> u64 {
 /// implementation backing, not VMAs; the heap is clamped to `brk`, and dynamic
 /// mappings supply the committed pieces of the hidden mmap arena.
 pub(crate) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
+    let mut maps = project_host_core_maps(mem);
+    let root_rows = mem.root_anonymous_rows();
+    if !root_rows.is_empty() {
+        for row in &root_rows {
+            trim_proc_maps_for_range(&mut maps, row.start, row.end - row.start);
+        }
+        maps.extend(root_rows.iter().map(|row| ProcMapsEntry {
+            start: row.start,
+            end: row.end,
+            read: row.read,
+            write: row.write,
+            execute: row.execute,
+            sharing: ProcMapSharing::Private,
+            path: row.path.clone(),
+        }));
+        maps.sort_by_key(|map| (map.start, map.end));
+    }
+    maps
+}
+
+/// [`project_core_maps`] without a delegated root's anonymous rows.
+fn project_host_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
     let mut maps: Vec<ProcMapsEntry> = mem
         .address_space_regions
         .iter()
