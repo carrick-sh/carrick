@@ -1212,18 +1212,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1210 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1219 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000059",
     "source": {
-      "byte_end": 60280,
-      "byte_start": 60265,
+      "byte_end": 60722,
+      "byte_start": 60707,
       "column": 15,
       "column_end": 30,
       "column_start": 15,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1210,
-      "line_end": 1210,
-      "line_start": 1210
+      "line": 1219,
+      "line_end": 1219,
+      "line_start": 1219
     }
   },
   {
@@ -1612,18 +1612,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1279 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1288 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000076",
     "source": {
-      "byte_end": 63587,
-      "byte_start": 63572,
+      "byte_end": 64029,
+      "byte_start": 64014,
       "column": 9,
       "column_end": 24,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1279,
-      "line_end": 1279,
-      "line_start": 1279
+      "line": 1288,
+      "line_end": 1288,
+      "line_start": 1288
     }
   },
   {
@@ -5981,18 +5981,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1246 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1255 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
     "review_id": "HA-000642",
     "source": {
-      "byte_end": 62029,
-      "byte_start": 62012,
+      "byte_end": 62471,
+      "byte_start": 62454,
       "column": 5,
       "column_end": 22,
       "column_start": 5,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1246,
-      "line_end": 1246,
-      "line_start": 1246
+      "line": 1255,
+      "line_end": 1255,
+      "line_start": 1255
     }
   },
   {
@@ -11274,8 +11274,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2266 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 91061,
-      "byte_start": 91045,
+      "byte_end": 91067,
+      "byte_start": 91051,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
@@ -11301,8 +11301,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2481 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 99672,
-      "byte_start": 99656,
+      "byte_end": 99678,
+      "byte_start": 99662,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
