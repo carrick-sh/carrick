@@ -1425,9 +1425,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                              reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
                         )))
                     }
-                    // An output in the in-kernel GIC's window is an address
-                    // no guest translation may reach, like a bad address.
-                    Err(PageTableError::BadAddress | PageTableError::GicWindowOutput) => {
+                    // An output in the in-kernel GIC's window, or a leaf in
+                    // the Carrick-owned EL1 COW copy window, is an address no
+                    // guest edit may reach, like a bad address.
+                    Err(
+                        PageTableError::BadAddress
+                        | PageTableError::GicWindowOutput
+                        | PageTableError::CarrickOwnedWindow,
+                    ) => {
                         Err(MemoryError::OutOfBounds {
                             address: 0,
                             length: 0,
@@ -4728,6 +4733,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let builder = self
             .vm
             .build_process_builder(request, &mut page_tables, &cow_ranges)?;
+        // The child is a new MM image: re-assert its idle EL1 COW copy window
+        // with the one provisioning writer before anything can publish it.
+        page_tables
+            .provision_cow_copy_window(child_source.as_deref_mut())
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("provision child EL1 COW copy window: {error:?}"))
+            })?;
         let child_authority = self.page_tables.child_with_manager(page_tables);
         if let Some(source) = child_source {
             child_authority.install_source(source).map_err(|error| {

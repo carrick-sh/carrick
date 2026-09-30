@@ -684,6 +684,15 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
             ))
         },
     )?;
+    // The rebuilt image is a new MM: its EL1 COW copy window is written by
+    // the one provisioning writer, whatever the kernel remaps above did.
+    page_tables
+        .provision_cow_copy_window(None)
+        .map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "provision hvpatch exec EL1 COW copy window: {error:?}"
+            ))
+        })?;
     let table_bytes = page_tables.into_bytes().map_err(|error| {
         TrapError::Hypervisor(format!("execve stage1 into_bytes failed: {error:?}"))
     })?;

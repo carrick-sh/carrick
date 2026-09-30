@@ -3594,16 +3594,14 @@ pub fn stage1_hvpatch_page_tables() -> Vec<u8> {
     // one kernel block here means EL1 can map a granted source/replacement
     // without allocating tables while it owns the exact-MM editor. The
     // aliases have no live translation outside that bounded copy operation.
+    // Every later constructor of this MM's image (exec rebuild, fork child)
+    // re-provisions through the same one writer.
     let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
         bytes,
         LINUX_PAGE_TABLES_BASE,
         AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
-    if let Err(error) = manager.set_prot_none(
-        carrick_el1_abi::EL1_COW_COPY_BASE,
-        carrick_el1_abi::EL1_COW_COPY_SIZE as usize,
-        None,
-    ) {
+    if let Err(error) = manager.provision_cow_copy_window(None) {
         carrick_fatal!(
             "mem::stage1_tables",
             "reserve EL1 COW copy aliases: {error:?}"
