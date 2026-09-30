@@ -649,6 +649,24 @@ impl FrameCowExactMmGuard {
         crate::kernel::note_foreign_cow(self.mm());
         Ok(())
     }
+
+    /// Admit the exact paused target's ASID generation for a borrowed-TTBR0
+    /// window of the caller's lent vCPU; `None` when the binding is not this
+    /// lease's or its generation retires.
+    pub(crate) fn admit_borrowed_ttbr0(
+        &self,
+        expected_binding: carrick_hal::ForeignMmBinding,
+    ) -> Option<Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>> {
+        let stage1 = match self {
+            Self::Nested { foreign_stage1, .. }
+            | Self::Sole { foreign_stage1, .. }
+            | Self::Paused { foreign_stage1, .. } => foreign_stage1.as_ref()?,
+        };
+        if stage1.foreign_mm_binding() != expected_binding {
+            return None;
+        }
+        stage1.admit_borrowed_ttbr0()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

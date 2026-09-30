@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::num::{NonZeroU16, NonZeroU64};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use carrick_kernel::kernel::Asid;
 
@@ -124,6 +124,8 @@ struct ResidencyState {
 pub(crate) struct AsidResidency {
     generation: AsidGeneration,
     state: Arc<Mutex<ResidencyState>>,
+    /// Signalled whenever an admitted load completes or is cancelled.
+    loads_settled: Arc<Condvar>,
 }
 
 impl AsidResidency {
@@ -131,6 +133,7 @@ impl AsidResidency {
         Self {
             generation,
             state: Arc::new(Mutex::new(ResidencyState::default())),
+            loads_settled: Arc::new(Condvar::new()),
         }
     }
 
@@ -142,6 +145,7 @@ impl AsidResidency {
         state.loading += 1;
         Ok(AsidLoad {
             state: Arc::clone(&self.state),
+            loads_settled: Arc::clone(&self.loads_settled),
             active: true,
             hardware_dirty: false,
         })
@@ -189,6 +193,7 @@ impl AsidResidency {
 #[derive(Debug)]
 pub(crate) struct AsidLoad {
     state: Arc<Mutex<ResidencyState>>,
+    loads_settled: Arc<Condvar>,
     active: bool,
     hardware_dirty: bool,
 }
@@ -214,6 +219,7 @@ impl AsidLoad {
             .ok_or(AsidResidencyError::UnexpectedLoad)?;
         state.installed = true;
         self.active = false;
+        self.loads_settled.notify_all();
         Ok(())
     }
 }
@@ -227,6 +233,7 @@ impl Drop for AsidLoad {
         // vCPU may hold translations even though the install did not finish.
         let mut state = self.state.lock();
         state.loading = state.loading.saturating_sub(1);
+        self.loads_settled.notify_all();
     }
 }
 
@@ -266,6 +273,7 @@ impl PreparedAsidResidencyRetirement {
         AsidRetirement {
             generation: self.residency.generation,
             state: Arc::clone(&self.residency.state),
+            loads_settled: Arc::clone(&self.residency.loads_settled),
         }
     }
 }
@@ -290,11 +298,25 @@ impl Drop for PreparedAsidResidencyRetirement {
 pub(crate) struct AsidRetirement {
     generation: AsidGeneration,
     state: Arc<Mutex<ResidencyState>>,
+    loads_settled: Arc<Condvar>,
 }
 
 impl AsidRetirement {
     pub(crate) const fn generation(&self) -> AsidGeneration {
         self.generation
+    }
+
+    /// Wait until every load admitted before retirement closed admission has
+    /// completed or been cancelled. Retirement admits no new load, so this
+    /// ends: executor loads are gone once no task of the space is left, and
+    /// a borrowed foreign-drain window is one bounded EL1 call. Only after it
+    /// can [`Self::needs_invalidation`] see every vCPU that may hold this
+    /// generation's translations, and [`Self::acknowledge`] succeed.
+    pub(crate) fn wait_for_admitted_loads(&self) {
+        let mut state = self.state.lock();
+        while state.loading != 0 {
+            self.loads_settled.wait(&mut state);
+        }
     }
 
     /// Whether a broadcast invalidation is still owed: some vCPU may hold

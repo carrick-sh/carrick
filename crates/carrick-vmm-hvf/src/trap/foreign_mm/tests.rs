@@ -470,11 +470,12 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
                 _ => {}
             }
         }
+        // A guest-lane split reuses the replacement its earlier frame grant
+        // already published; only a new-frame mapping replaces `published`.
         let new = prepared
             .iter()
             .copied()
-            .find(|(_, frame, _, _)| *frame != self.old_frame)
-            .expect("new private foreign COW mapping");
+            .find(|(_, frame, _, _)| *frame != self.old_frame);
         let mut live = self.live.write();
         live.mapping_ids
             .retain(|mapping| !removed.contains(mapping));
@@ -486,7 +487,14 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
             carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
                 live.frame_inventory_revision.raw_for_probe() + 1,
             );
-        *self.published.lock() = Some(new);
+        if let Some(new) = new {
+            *self.published.lock() = Some(new);
+        } else {
+            assert!(
+                self.published.lock().is_some(),
+                "a split without a new frame needs its earlier grant"
+            );
+        }
         Ok(())
     }
 
@@ -588,6 +596,41 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
             self.apply_with_receipt(commit)?,
             carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(())),
             owner_generation,
+        ))
+    }
+
+    fn attest_foreign_identity_write(
+        &self,
+        _semantic_start: carrick_guest_mem::GuestVa,
+        _semantic_len: std::num::NonZeroUsize,
+        inventory_revision: u64,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        gpa: Gpa,
+        length: carrick_hal::FrameLength,
+    ) -> Result<
+        (
+            carrick_hal::ForeignCowKernelProof,
+            carrick_hal::ForeignOwnerGeneration,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let live = self.live.read();
+        if live.frame_inventory_revision.raw_for_probe() != inventory_revision
+            || !live.mapping_ids.contains(&mapping)
+            || self.published.lock().as_ref() != Some(&(mapping, frame, gpa, length.raw()))
+        {
+            return Err(Box::new(std::io::Error::other(
+                "test attestation: mapping not live at revision",
+            )));
+        }
+        let generation =
+            NonZeroU64::new(global_frame_host_owner_generation(gpa.raw(), length.raw()))
+                .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
+                .ok_or_else(|| std::io::Error::other("test attestation owner is not live"))?;
+        Ok((
+            carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(())),
+            generation,
         ))
     }
 
@@ -968,8 +1011,218 @@ fn foreign_cow_fingerprint(installed: &InstalledMm) -> (Vec<u8>, String, Vec<(u6
     (stage1, inventory, owners)
 }
 
+/// Host model of EL1's host-driven drain on a lent caller vCPU: it claims
+/// the target MM's submissions from the slots, performs `CowRepoint`'s byte
+/// copy exactly as EL1's copy window would, and runs the real neutral
+/// descriptor executor over the target's fixture tables. It never fabricates
+/// a receipt: the receipt is the executor's.
+struct ModelCallerEl1 {
+    slots: &'static carrick_el1_abi::DescriptorTxnSlots,
+    root: (u64, usize),
+    expected_ttbr0: u64,
+    drains: usize,
+    submitted: Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp>,
+    before_apply: Box<dyn FnMut()>,
+}
+
+impl ModelCallerEl1 {
+    fn new(installed: &InstalledMm, before_apply: Box<dyn FnMut()>) -> Self {
+        let root_key = installed.owners.0[0];
+        let root_host = global_frame_host_owner_identity(root_key.0, root_key.1)
+            .expect("fixture root owner")
+            .0;
+        Self {
+            slots: Box::leak(Box::new(carrick_el1_abi::DescriptorTxnSlots::new())),
+            root: (root_key.0, root_host),
+            expected_ttbr0: root_key.0 | (u64::from(installed.snapshot.asid.get()) << 48),
+            drains: 0,
+            submitted: Vec::new(),
+            before_apply,
+        }
+    }
+}
+
+fn model_owner_host(ipa: u64) -> *mut u8 {
+    global_frame_host_owners()
+        .lock()
+        .iter()
+        .find_map(|(&(base, len), entry)| {
+            (ipa >= base && ipa < base + len).then(|| {
+                // SAFETY: the owner is live and the offset is inside it.
+                unsafe { entry.owner().as_ptr().add((ipa - base) as usize) }
+            })
+        })
+        .expect("model EL1 copy window names a live owner")
+}
+
+impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
+    fn slot(&self) -> Option<usize> {
+        Some(3)
+    }
+
+    fn drain_foreign(
+        &mut self,
+        mm_key: u64,
+        ttbr0: u64,
+        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    ) -> Result<u64, String> {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, InlineJournal, PrimaryTableWords, TableMaintenance,
+            execute_descriptor_txn,
+        };
+        struct Maintenance;
+        impl TableMaintenance for Maintenance {
+            fn publish_barrier(&self) {}
+            fn invalidate_range(&self, _va: u64, _len: u64) {}
+        }
+        assert_eq!(
+            ttbr0, self.expected_ttbr0,
+            "the drain installs the target's TTBR0"
+        );
+        // As the engine does: the target generation is armed before its
+        // TTBR0 is installed on this vCPU.
+        admission.arm()?;
+        self.drains += 1;
+        (self.before_apply)();
+        let words = unsafe {
+            PrimaryTableWords::new(
+                self.root.1 as *mut _,
+                self.root.0,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                &Maintenance,
+            )
+        }
+        .map_err(|error| format!("{error:?}"))?;
+        let root = carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & 0x0000_FFFF_FFFF_F000);
+        let mut applied = 0;
+        for slot in self.slots.submitted_for(mm_key) {
+            let Some(claimed) = slot.claim_for_mm(mm_key) else {
+                continue;
+            };
+            let outcome = match claimed.txn() {
+                Err(refusal) => {
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal)
+                }
+                Ok(txn) => {
+                    self.submitted.push(txn.op);
+                    if let DescriptorOp::CowRepoint {
+                        old_ipa,
+                        new_ipa,
+                        len,
+                        ..
+                    } = txn.op
+                    {
+                        // SAFETY: both owners are live and pinned by host custody.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                model_owner_host(old_ipa.raw()),
+                                model_owner_host(new_ipa.raw()),
+                                len as usize,
+                            );
+                        }
+                    }
+                    execute_descriptor_txn(&words, root, txn, &mut InlineJournal::new()).outcome
+                }
+            };
+            claimed.complete(outcome);
+            applied += 1;
+        }
+        Ok(applied)
+    }
+}
+
+/// Model of the runtime's ASID residency for the target generation: counts
+/// admitted-but-unsettled windows and whether any was armed.
+#[derive(Clone, Default)]
+struct ModelAsidResidency {
+    retiring: Arc<std::sync::atomic::AtomicBool>,
+    loading: Arc<std::sync::atomic::AtomicUsize>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    resident: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ModelAdmission {
+    residency: ModelAsidResidency,
+    armed: bool,
+}
+
+impl carrick_guest_mem::BorrowedTtbr0Admission for ModelAdmission {
+    fn arm(&mut self) -> Result<(), String> {
+        self.armed = true;
+        self.residency
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl Drop for ModelAdmission {
+    fn drop(&mut self) {
+        if self.armed {
+            self.residency
+                .resident
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.residency
+            .loading
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The runtime's exact-target capability with (or without) a lent vCPU. On
+/// the guest lane host TLB maintenance is never requested: EL1 invalidates.
+struct LendingInvalidator {
+    inner: TestInvalidator,
+    caller: Option<ModelCallerEl1>,
+    residency: ModelAsidResidency,
+}
+
+impl carrick_hal::ForeignMmInvalidator for LendingInvalidator {
+    fn invalidate_exact_asid(
+        &mut self,
+        binding: carrick_hal::ForeignMmBinding,
+        deadline: Instant,
+    ) -> Result<(), carrick_hal::ForeignMmTransportError> {
+        self.inner.invalidate_exact_asid(binding, deadline)
+    }
+
+    fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
+        self.caller
+            .as_mut()
+            .map(|caller| caller as &mut dyn carrick_guest_mem::CallerEl1Call)
+    }
+
+    fn admit_borrowed_ttbr0(
+        &mut self,
+        binding: carrick_hal::ForeignMmBinding,
+    ) -> Result<
+        Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>,
+        carrick_hal::ForeignMmTransportError,
+    > {
+        assert_eq!(binding, self.inner.expected);
+        if self
+            .residency
+            .retiring
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable);
+        }
+        self.residency
+            .loading
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(ModelAdmission {
+            residency: self.residency.clone(),
+            armed: false,
+        }))
+    }
+}
+
+fn install_test_slots(installed: &InstalledMm, caller: &ModelCallerEl1) {
+    *installed.state.test_descriptor_slots.lock() = Some(caller.slots);
+}
+
 #[test]
-fn guest_owned_foreign_cow_and_sparse_replacement_refuse_without_mutation() {
+fn guest_owned_foreign_cow_without_a_lent_vcpu_refuses_without_mutation() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();
     let _stub = ScopedStage2MapTestStub::enable();
@@ -996,6 +1249,7 @@ fn guest_owned_foreign_cow_and_sparse_replacement_refuse_without_mutation() {
     let before = foreign_cow_fingerprint(&child);
     let peer_before = foreign_cow_fingerprint(&peer);
     let aliases_before = alias_registry().lock().ordered();
+    let mappings_before = child.live.0.read().clone();
     assert!(matches!(
         lease.break_cow(
             &mut invalidator,
@@ -1007,6 +1261,7 @@ fn guest_owned_foreign_cow_and_sparse_replacement_refuse_without_mutation() {
         Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
     ));
     assert_eq!(invalidator.calls, 0);
+    assert_eq!(*child.live.0.read(), mappings_before);
 
     let mut authority = TestForeignCowAuthority::new(&child);
     authority.allow_quiesce = true;
@@ -1039,6 +1294,451 @@ fn guest_owned_foreign_cow_and_sparse_replacement_refuse_without_mutation() {
     assert_eq!(&bytes, b"old!");
     read_installed(&transport, &peer, &mut bytes).unwrap();
     assert_eq!(&bytes, b"peer");
+}
+
+#[test]
+fn guest_owned_foreign_cow_publishes_through_the_lent_vcpu_before_retirement() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{CowRepointAccess, DescriptorOp};
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut child = install_mm(
+        &transport,
+        705,
+        0x9a01_1c00_0000,
+        0x9b01_1c00_0000,
+        *b"old!",
+    );
+    let peer = install_mm(
+        &transport,
+        706,
+        0x9a01_1d00_0000,
+        0x9b01_1d00_0000,
+        *b"peer",
+    );
+    let (authority, lease, invalidator) = prepare_foreign_cow(&child);
+    let tables = child.state.page_tables_authority();
+    tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let old_key = child.owners.0[1];
+    let old_owner = global_frame_host_owner_identity(old_key.0, old_key.1).unwrap();
+    let old_mapping = child.snapshot.mapping_ids[1];
+    // The peer's tables and inventory; the carrier owner registry is global.
+    let peer_view = |peer: &InstalledMm| {
+        let (stage1, inventory, _) = foreign_cow_fingerprint(peer);
+        (stage1, inventory)
+    };
+    let peer_before = peer_view(&peer);
+    // At EL1's application nothing may have retired yet: the old inventory
+    // extent, its stage-2 owner and its kernel mapping are all still live,
+    // and the replacement grant already precedes the descriptor.
+    let observe = {
+        let state = Arc::clone(&child.state);
+        let live = Arc::clone(&child.live.0);
+        let authority = Arc::clone(&authority);
+        Box::new(move || {
+            assert!(
+                state
+                    .frame_inventory
+                    .ledger
+                    .lock()
+                    .extents
+                    .contains_key(&old_key),
+                "old inventory extent retired before EL1 completion"
+            );
+            assert_eq!(
+                global_frame_host_owner_identity(old_key.0, old_key.1),
+                Some(old_owner),
+                "old stage-2 owner retired before EL1 completion"
+            );
+            assert!(live.read().mapping_ids.contains(&old_mapping));
+            let _ = &authority;
+        }) as Box<dyn FnMut()>
+    };
+    let mut lending = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
+        inner: invalidator,
+        caller: Some(ModelCallerEl1::new(&child, observe)),
+    };
+    install_test_slots(&child, lending.caller.as_ref().unwrap());
+    let cow = lease
+        .break_cow(
+            &mut lending,
+            &child.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("guest-owned foreign COW publishes through the lent vCPU");
+    let caller = lending.caller.as_ref().unwrap();
+    assert_eq!(caller.drains, 1);
+    assert_eq!(lending.inner.calls, 0, "EL1 owns TLB maintenance");
+    // The borrowed window was admitted, armed before the TTBR0 install, and
+    // settled resident: the target's retirement now owes the caller vCPU's
+    // translations a broadcast invalidation, and nothing holds it open.
+    use std::sync::atomic::Ordering::SeqCst;
+    assert!(lending.residency.armed.load(SeqCst));
+    assert!(lending.residency.resident.load(SeqCst));
+    assert_eq!(lending.residency.loading.load(SeqCst), 0);
+    assert!(matches!(
+        caller.submitted.as_slice(),
+        [DescriptorOp::CowRepoint {
+            access: CowRepointAccess::User { .. },
+            ..
+        }]
+    ));
+    assert!(
+        caller
+            .slots
+            .submitted_for(child.snapshot.mm.get())
+            .next()
+            .is_none()
+    );
+    // The live leaf now names the replacement, whose bytes EL1 copied.
+    let new_key = (cow.physical_base().raw(), cow.physical_len());
+    assert_ne!(new_key, old_key);
+    let leaf = tables
+        .with_manager(|manager| manager.translate_retained_output(TEST_VA))
+        .unwrap()
+        .unwrap();
+    assert_eq!(leaf & !0xfff, new_key.0 & !0xfff);
+    let new_owner = global_frame_host_owners().lock()[&new_key].owner().clone();
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(new_owner.as_ptr(), 4) },
+        b"old!"
+    );
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(old_owner.0 as *const u8, 4) },
+        b"old!"
+    );
+    assert!(!child.live.0.read().mapping_ids.contains(&old_mapping));
+    assert!(child.live.0.read().mapping_ids.contains(&cow.mapping()));
+    assert_eq!(child.state.host_cow_stats.host_cow_resolutions(), 0);
+    assert_eq!(peer_view(&peer), peer_before);
+    child.owners.0.push(new_key);
+}
+
+#[test]
+fn guest_owned_foreign_cow_refusal_before_submission_rolls_back_every_stage() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    for phase in [1_u8, 2, 5] {
+        let _stub = ScopedStage2MapTestStub::enable();
+        let transport = CarrierForeignMmTransport::new();
+        let installed = install_mm(
+            &transport,
+            710 + u64::from(phase),
+            0x9a01_2000_0000 + u64::from(phase) * 0x0200_0000,
+            0x9b01_2000_0000 + u64::from(phase) * 0x0200_0000,
+            *b"same",
+        );
+        let (authority, lease, invalidator) = prepare_foreign_cow(&installed);
+        installed
+            .state
+            .page_tables_authority()
+            .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+        installed.state.set_foreign_cow_failpoint(phase);
+        let before = foreign_cow_fingerprint(&installed);
+        let live_before = installed.live.0.read().clone();
+        let aliases_before = alias_registry().lock().ordered();
+        let mut lending = LendingInvalidator {
+            residency: ModelAsidResidency::default(),
+            inner: invalidator,
+            caller: Some(ModelCallerEl1::new(
+                &installed,
+                Box::new(|| panic!("a refused COW must never reach EL1")),
+            )),
+        };
+        install_test_slots(&installed, lending.caller.as_ref().unwrap());
+        let result = lease.break_cow(
+            &mut lending,
+            &installed.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(carrick_hal::ForeignMmTransportError::MutationFailed)
+            ),
+            "phase {phase}"
+        );
+        assert_eq!(foreign_cow_fingerprint(&installed), before, "phase {phase}");
+        assert_eq!(
+            installed.live.0.read().mapping_ids,
+            live_before.mapping_ids,
+            "phase {phase}: the kernel grant must be rolled back"
+        );
+        assert!(authority.published.lock().is_none(), "phase {phase}");
+        assert_eq!(
+            alias_registry().lock().ordered(),
+            aliases_before,
+            "phase {phase}"
+        );
+        assert!(installed.state.cow_armed.lock().span_for(TEST_VA).is_some());
+        let caller = lending.caller.as_ref().unwrap();
+        assert_eq!(caller.drains, 0, "phase {phase}");
+        assert!(
+            !lending
+                .residency
+                .armed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "phase {phase}: no TTBR0 was borrowed, so none was armed"
+        );
+        assert_eq!(
+            lending
+                .residency
+                .loading
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "phase {phase}: the unarmed admission is cancelled"
+        );
+        assert!(
+            caller.slots.as_slice().iter().all(|slot| slot.state() == 0),
+            "phase {phase}"
+        );
+        assert_eq!(lending.inner.calls, 0, "phase {phase}");
+    }
+}
+
+#[test]
+fn guest_owned_foreign_cow_refuses_a_retiring_target_before_borrowing_its_ttbr0() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        740,
+        0x9a01_5000_0000,
+        0x9b01_5000_0000,
+        *b"dies",
+    );
+    let (authority, lease, invalidator) = prepare_foreign_cow(&installed);
+    installed
+        .state
+        .page_tables_authority()
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let before = foreign_cow_fingerprint(&installed);
+    let live_before = installed.live.0.read().clone();
+    let residency = ModelAsidResidency::default();
+    residency
+        .retiring
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut lending = LendingInvalidator {
+        residency,
+        inner: invalidator,
+        caller: Some(ModelCallerEl1::new(
+            &installed,
+            Box::new(|| panic!("a retiring target's TTBR0 must never be borrowed")),
+        )),
+    };
+    install_test_slots(&installed, lending.caller.as_ref().unwrap());
+    assert!(matches!(
+        lease.break_cow(
+            &mut lending,
+            &installed.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
+    ));
+    assert_eq!(foreign_cow_fingerprint(&installed), before);
+    assert_eq!(*installed.live.0.read(), live_before);
+    assert!(authority.published.lock().is_none());
+    assert_eq!(lending.caller.as_ref().unwrap().drains, 0);
+    assert!(
+        !lending
+            .residency
+            .armed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let transport = CarrierForeignMmTransport::new();
+    let target = install_mm(
+        &transport,
+        720,
+        0x9a01_3000_0000,
+        0x9b01_3000_0000,
+        *b"targ",
+    );
+    let other = install_mm(
+        &transport,
+        721,
+        0x9a01_3200_0000,
+        0x9b01_3200_0000,
+        *b"othr",
+    );
+    let tables = target.state.page_tables_authority();
+    tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let requested = CarrierForeignMmSnapshot::capture(&target.snapshot);
+    let mut lending = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
+        inner: TestInvalidator {
+            expected: carrick_hal::ForeignMmSnapshot::binding(&target.snapshot),
+            calls: 0,
+            fail_call: None,
+        },
+        caller: Some(ModelCallerEl1::new(
+            &target,
+            Box::new(|| panic!("an unauthenticated target must never reach EL1")),
+        )),
+    };
+    // Another MM's root under the target's identity is not the target.
+    let mut wrong_root = requested.binding;
+    wrong_root.stage1_root = Gpa(other.owners.0[0].0);
+    assert!(matches!(
+        ForeignEl1Publisher::authenticate(&mut lending, &target.state, requested.mm, wrong_root),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+    // A host-owned target never publishes through EL1.
+    assert!(matches!(
+        ForeignEl1Publisher::authenticate(
+            &mut lending,
+            &other.state,
+            requested.mm,
+            CarrierForeignMmSnapshot::capture(&other.snapshot).binding,
+        ),
+        Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
+    ));
+    // A transaction of another root is refused before any slot is used.
+    install_test_slots(&target, lending.caller.as_ref().unwrap());
+    let other_tables = other.state.page_tables_authority();
+    other_tables
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let foreign_txn = other_tables
+        .prepare_guest_descriptor_txn(
+            NonZeroU64::new(requested.mm.raw_for_probe()).unwrap(),
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
+                access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
+                    writable_pages: 0,
+                },
+                va: TEST_VA,
+                len: 4096,
+                old_ipa: carrick_mmu_core::aarch64::SubstrateGpa(other.owners.0[1].0),
+                new_ipa: carrick_mmu_core::aarch64::SubstrateGpa(other.owners.0[1].0 + 0x10_0000),
+                backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                    frame_id: NonZeroU64::new(1).unwrap(),
+                    mapping_id: NonZeroU64::new(2).unwrap(),
+                    owner_generation: NonZeroU64::new(3).unwrap(),
+                    inventory_revision: NonZeroU64::new(4).unwrap(),
+                },
+            },
+        )
+        .expect("prepare a transaction on another root");
+    let mut publisher = ForeignEl1Publisher::authenticate(
+        &mut lending,
+        &target.state,
+        requested.mm,
+        requested.binding,
+    )
+    .expect("the exact target authenticates");
+    assert!(publisher.publish(&foreign_txn).is_err());
+    other_tables
+        .abandon_guest_descriptor_txn(&foreign_txn)
+        .unwrap();
+    drop(publisher);
+    let caller = lending.caller.as_ref().unwrap();
+    assert_eq!(caller.drains, 0);
+    assert!(caller.slots.as_slice().iter().all(|slot| slot.state() == 0));
+    let mut absent = TestInvalidator {
+        expected: carrick_hal::ForeignMmSnapshot::binding(&target.snapshot),
+        calls: 0,
+        fail_call: None,
+    };
+    assert!(matches!(
+        ForeignEl1Publisher::authenticate(
+            &mut absent,
+            &target.state,
+            requested.mm,
+            requested.binding,
+        ),
+        Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
+    ));
+}
+
+#[test]
+fn guest_owned_foreign_pristine_write_publishes_user_writable_through_the_lent_vcpu() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{AliasAccess, DescriptorOp};
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut installed = install_mm_sparse(
+        &transport,
+        730,
+        0x9a01_4000_0000,
+        0x9b01_4000_0000,
+        OWNER_LEN,
+        OWNER_LEN * 2,
+        b"data",
+    );
+    let (authority, lease, invalidator) = prepare_foreign_cow(&installed);
+    let tables = installed.state.page_tables_authority();
+    tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let target_va = TEST_VA + OWNER_LEN as u64;
+    let observe = {
+        let authority = Arc::clone(&authority);
+        Box::new(move || {
+            assert!(
+                authority.published.lock().is_some(),
+                "the grant must precede the descriptor"
+            );
+        }) as Box<dyn FnMut()>
+    };
+    let mut lending = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
+        inner: invalidator,
+        caller: Some(ModelCallerEl1::new(&installed, observe)),
+    };
+    install_test_slots(&installed, lending.caller.as_ref().unwrap());
+    let receipt = lease
+        .break_cow(
+            &mut lending,
+            &installed.snapshot,
+            GuestVa(target_va),
+            4,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("guest-owned pristine write publishes through the lent vCPU");
+    let caller = lending.caller.as_ref().unwrap();
+    assert_eq!(caller.drains, 1);
+    assert_eq!(lending.inner.calls, 0, "EL1 owns TLB maintenance");
+    assert!(matches!(
+        caller.submitted.as_slice(),
+        [DescriptorOp::MapAlias {
+            access: AliasAccess::User {
+                writable: true,
+                executable: false
+            },
+            ..
+        }]
+    ));
+    assert_eq!(receipt.range_start(), GuestVa(target_va));
+    let new_key = (receipt.physical_base().raw(), receipt.physical_len());
+    assert_eq!(
+        tables
+            .with_manager(|manager| manager.translate(target_va).map(|ipa| ipa & !0xfff))
+            .unwrap(),
+        Some(new_key.0 & !0xfff)
+    );
+    assert!(
+        installed
+            .live
+            .0
+            .read()
+            .mapping_ids
+            .contains(&receipt.mapping())
+    );
+    assert_eq!(installed.state.host_cow_stats.host_cow_resolutions(), 0);
+    installed.owners.0.push(new_key);
 }
 
 #[test]
@@ -1431,15 +2131,30 @@ fn foreign_cow_write_keeps_the_shared_parent_owner_unchanged() {
 #[test]
 fn ptrace_text_cow_accepts_unarmed_rx_mapping_and_preserves_peer_and_stage1_ap() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    rx_ptrace_text_cow_case(false);
+}
+
+/// On a guest-owned target the same RX text COW publishes through EL1 and
+/// never grants write: its `CowRepoint` carries no writable page.
+#[test]
+fn guest_owned_rx_ptrace_text_cow_publishes_read_only_through_the_lent_vcpu() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    rx_ptrace_text_cow_case(true);
+}
+
+/// The caller holds `FOREIGN_MM_TEST_LOCK`.
+fn rx_ptrace_text_cow_case(guest: bool) {
     let _external_alias_restore = ExternalAliasStateRestore::capture();
+    let _stub = guest.then(ScopedStage2MapTestStub::enable);
     let request_va = TEST_VA + 0x100;
     let neighbor_va = TEST_VA + 0x800;
     let transport = CarrierForeignMmTransport::new();
+    let lane = u64::from(guest);
     let mut child = install_mm(
         &transport,
-        132,
-        0x9a00_2300_0000,
-        0x9b00_2300_0000,
+        132 + lane * 600,
+        0x9a00_2300_0000 + lane * 0x0100_0000_0000,
+        0x9b00_2300_0000 + lane * 0x0100_0000_0000,
         *b"old!",
     );
     child.snapshot.executable_ranges = vec![
@@ -1567,11 +2282,22 @@ fn ptrace_text_cow_accepts_unarmed_rx_mapping_and_preserves_peer_and_stage1_ap()
         }),
         "fixture must publish a semantic alias for source IPA 0x{before_ipa:x}",
     );
-    let mut invalidator = TestInvalidator {
-        expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
-        calls: 0,
-        fail_call: None,
+    let mut invalidator = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
+        inner: TestInvalidator {
+            expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
+            calls: 0,
+            fail_call: None,
+        },
+        caller: guest.then(|| ModelCallerEl1::new(&child, Box::new(|| {}))),
     };
+    if let Some(caller) = invalidator.caller.as_ref() {
+        install_test_slots(&child, caller);
+    }
+    if guest {
+        page_tables
+            .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    }
     let cow = lease
         .break_cow_prepared_ptrace_text(
             &mut invalidator,
@@ -1582,6 +2308,20 @@ fn ptrace_text_cow_accepts_unarmed_rx_mapping_and_preserves_peer_and_stage1_ap()
             deadline,
         )
         .expect("RX ptrace text must break COW without writable-fault arming");
+    if let Some(caller) = invalidator.caller.as_ref() {
+        assert_eq!(invalidator.inner.calls, 0, "EL1 owns TLB maintenance");
+        assert!(matches!(
+            caller.submitted.as_slice(),
+            [
+                carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
+                    access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
+                        writable_pages: 0
+                    },
+                    ..
+                }
+            ]
+        ));
+    }
     let after_ap = page_tables
         .with_manager(|mgr| carrick_mmu_core::aarch64::terminal_descriptor(mgr.debug_walk(TEST_VA)))
         .expect("post-COW RX page tables")
