@@ -920,6 +920,22 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(())
     }
 
+    /// Publish an alias through EL1 and commit its ownership metadata while
+    /// retaining exact-MM exclusion and all destination owner pins. Private
+    /// content is seeded before publication; shared aliases never copy bytes.
+    fn repoint_guest_alias(
+        &mut self,
+        _va: u64,
+        _target_ipa: u64,
+        _len: usize,
+        _content: Option<&[u8]>,
+        _services: &mut dyn Stage1Services,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend cannot publish guest aliases".to_owned(),
+        ))
+    }
+
     /// Publish semantic VA ownership after `MAP_FIXED|MAP_PRIVATE` repoints a
     /// live stage-1 leaf into an existing private-overlay frame. The stage-2
     /// extent already exists; HVPatch records only the VA→global-frame edge so

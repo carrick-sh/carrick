@@ -1921,6 +1921,27 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         )
     }
 
+    fn repoint_guest_alias(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+        content: Option<&[u8]>,
+    ) -> Result<(), MemoryError> {
+        let slot = self.mailbox_slot();
+        let carrier_root = self.vm.carrier_maintenance_root().ok();
+        let mut services = EngineStage1Services::<V> {
+            vcpu: &mut self.vcpu,
+            tables: self.page_tables.clone(),
+            slot,
+            process_asid: self.process_asid,
+            carrier_root,
+        };
+        self.vm
+            .repoint_guest_alias(va, target_ipa, len, content, &mut services)
+            .map_err(|error| MemoryError::HostMap(format!("guest alias publication: {error}")))
+    }
+
     fn ensure_frame_cow_write(
         &mut self,
         va: u64,
@@ -2901,6 +2922,11 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                     length: len,
                 })
             })?;
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            return self
+                .repoint_guest_alias(va, overlay_ipa, len, Some(content))
+                .map_err(RepointPrivateError::indeterminate);
+        }
         let dst = self.vm.host_ptr(overlay_ipa, len.max(1)).ok_or_else(|| {
             RepointPrivateError::clean(MemoryError::OutOfBounds {
                 address: overlay_ipa,
@@ -2951,6 +2977,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         target_ipa: u64,
         len: usize,
     ) -> Result<(), MemoryError> {
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            return self.repoint_guest_alias(va, target_ipa, len, None);
+        }
         let outcome = self
             .pt_edit_locked(|mgr| {
                 mgr.map_aliased(va, target_ipa, len as u64, true)
@@ -5064,7 +5093,16 @@ mod tests {
             .expect("compatibility process retirement");
         assert!(compatibility_retirement.contains("self.run_el1_maintenance()"));
 
+        let service = production
+            .split("impl<V: Aarch64Vmm> crate::vmm::Stage1Services for EngineStage1Services")
+            .nth(1)
+            .and_then(|tail| tail.split("fn guest_publication_available").next())
+            .expect("driving-vCPU maintenance service");
+        assert!(service.contains("run_stage1_maintenance_on("));
+        assert!(service.contains("self.process_asid"));
+        assert!(!service.contains("run_el1_maintenance"));
         for live_path in [
+            "fn repoint_guest_alias",
             "fn pt_edit_and_flush",
             "fn ensure_frame_cow_write",
             "fn ensure_sparse_mmap_backing",
@@ -5079,8 +5117,10 @@ mod tests {
                 .and_then(|tail| tail.split("\n    fn ").next())
                 .unwrap_or_else(|| panic!("production live mutation path {live_path}"));
             assert!(
-                body.contains("run_stage1_maintenance"),
-                "{live_path} must select ASIDE1IS for a bound process ASID"
+                body.contains("run_stage1_maintenance")
+                    || (body.contains("EngineStage1Services::<V>")
+                        && body.contains("process_asid")),
+                "{live_path} must select ASIDE1IS directly or through the driving-vCPU service"
             );
             assert!(!body.contains("run_el1_maintenance"));
         }

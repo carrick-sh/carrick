@@ -86,7 +86,7 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 4;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 5;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
@@ -203,6 +203,14 @@ pub enum DescriptorOp {
         new_ipa: SubstrateGpa,
         backing: BackingIdentity,
     },
+    /// Map already-populated backing with the user RWX alias permissions.
+    /// Unlike CowRepoint, this never copies bytes. The host retains exact-MM
+    /// exclusion and authenticated backing until the verified receipt.
+    MapAlias {
+        span: PageSpan,
+        target_ipa: SubstrateGpa,
+        backing: BackingIdentity,
+    },
     /// Arm one parent range for fork COW with exactly the host editor's
     /// per-descriptor rule (`PtOp::ForkReadOnly`, or `PtOp::KernelReadOnly`
     /// for Carrick-owned EL1 pages): terminals that already satisfy it are
@@ -289,13 +297,17 @@ impl DescriptorOp {
     const KIND_RETIRE: u64 = 4;
     const KIND_COW_REPOINT: u64 = 5;
     const KIND_FORK_ARM: u64 = 6;
+    const KIND_MAP_ALIAS: u64 = 7;
 
     /// The complete semantic span this operation may edit.
     #[must_use]
     pub fn span(&self) -> PageSpan {
         match *self {
             Self::Prepare { publication, .. } => PageSpan::new(publication.va, publication.len),
-            Self::Publish { span, .. } | Self::Retire(span) | Self::ForkArm { span, .. } => span,
+            Self::Publish { span, .. }
+            | Self::Retire(span)
+            | Self::ForkArm { span, .. }
+            | Self::MapAlias { span, .. } => span,
             Self::Protect(edit) => PageSpan::new(edit.va, edit.len),
             Self::CowRepoint { va, len, .. } => PageSpan::new(va, len),
         }
@@ -305,7 +317,9 @@ impl DescriptorOp {
     #[must_use]
     pub fn backing(&self) -> Option<BackingIdentity> {
         match *self {
-            Self::Prepare { backing, .. } | Self::CowRepoint { backing, .. } => Some(backing),
+            Self::Prepare { backing, .. }
+            | Self::CowRepoint { backing, .. }
+            | Self::MapAlias { backing, .. } => Some(backing),
             _ => None,
         }
     }
@@ -318,6 +332,7 @@ impl DescriptorOp {
             Self::Retire(_) => Self::KIND_RETIRE,
             Self::CowRepoint { .. } => Self::KIND_COW_REPOINT,
             Self::ForkArm { .. } => Self::KIND_FORK_ARM,
+            Self::MapAlias { .. } => Self::KIND_MAP_ALIAS,
         }
     }
 
@@ -361,6 +376,9 @@ impl DescriptorOp {
                 new_ipa,
                 ..
             } => [va, old_ipa.raw(), new_ipa.raw(), len, access.wire(), 0],
+            Self::MapAlias {
+                span, target_ipa, ..
+            } => [span.va, span.len, target_ipa.raw(), 0, 0, 0],
             Self::ForkArm { span, arm } => [
                 span.va,
                 span.len,
@@ -415,6 +433,11 @@ impl DescriptorOp {
                 va: payload[0],
                 old_ipa: SubstrateGpa(payload[1]),
                 new_ipa: SubstrateGpa(payload[2]),
+                backing: backing?,
+            }),
+            Self::KIND_MAP_ALIAS => Some(Self::MapAlias {
+                span: PageSpan::new(payload[0], payload[1]),
+                target_ipa: SubstrateGpa(payload[2]),
                 backing: backing?,
             }),
             Self::KIND_FORK_ARM if payload[2] & !0b111 == 0 => Some(Self::ForkArm {
@@ -1267,10 +1290,11 @@ pub trait TableMaintenance {
     fn invalidate_range(&self, va: u64, len: u64);
 }
 
-/// Maintenance for callers that edit only existing terminals and perform
-/// their own trailing ASID invalidation. Such a transaction never links a
-/// table, so it never needs a publication barrier or break-before-make; the
-/// executor guarantees that by refusing any grant need when it has no grants.
+/// No-op maintenance for callers that change only terminal permissions or
+/// residency and perform their own trailing ASID invalidation. Those callers
+/// supply no table grants. Live alias replacement and table linking require
+/// real maintenance, including intermediate break-before-make invalidations;
+/// they must not use this implementation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CallerInvalidatesAsid;
 
@@ -1480,25 +1504,53 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
             if descriptor != 0 {
                 return Err(DescriptorRefusal::Malformed);
             }
-            if !matches!(self.op, DescriptorOp::Prepare { .. }) {
+            if !matches!(
+                self.op,
+                DescriptorOp::Prepare { .. } | DescriptorOp::MapAlias { .. }
+            ) {
                 return Err(DescriptorRefusal::MissingTable);
             }
         }
-        if level == 3 || (level > 0 && covers_entry && self.op_edits_blocks()) {
+        if level == 3 || (level > 0 && covers_entry && self.op_edits_blocks(level, base)) {
             let updated = self.edit(descriptor, level, base)?;
             if updated != descriptor {
-                self.store(loc, descriptor, updated, None)?;
+                if matches!(self.op, DescriptorOp::MapAlias { .. })
+                    && matches!(loc, Loc::Live(_))
+                    && descriptor & VALID != 0
+                {
+                    // The alias can replace output and attributes. Invalidate
+                    // the old terminal before exposing its replacement; keep
+                    // both stores in the same rollback journal.
+                    self.store(loc, descriptor, 0, None)?;
+                    if self.apply {
+                        self.words.publish_barrier();
+                        self.words.invalidate_range(base, span);
+                    }
+                    self.store(loc, 0, updated, Some((base, span)))?;
+                } else {
+                    self.store(loc, descriptor, updated, None)?;
+                }
             }
             return Ok(());
         }
         self.descend(level, loc, descriptor, base)
     }
 
-    fn op_edits_blocks(&self) -> bool {
-        matches!(
-            self.op,
-            DescriptorOp::Publish { .. } | DescriptorOp::Protect(_) | DescriptorOp::Retire(_)
-        )
+    fn op_edits_blocks(&self, level: usize, base: u64) -> bool {
+        match self.op {
+            DescriptorOp::MapAlias {
+                span, target_ipa, ..
+            } => {
+                // Match map_aliased's 2 MiB blocks. A contiguous output is
+                // not sufficient: its base must align to the block itself.
+                level == 2
+                    && (target_ipa.raw() + (base - span.va)).is_multiple_of(entry_span(level))
+            }
+            DescriptorOp::Publish { .. } | DescriptorOp::Protect(_) | DescriptorOp::Retire(_) => {
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Replace a coarse or empty entry by a granted table, filled while
@@ -1519,7 +1571,9 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
         if empty
             && !matches!(
                 self.op,
-                DescriptorOp::Prepare { .. } | DescriptorOp::ForkArm { .. }
+                DescriptorOp::Prepare { .. }
+                    | DescriptorOp::ForkArm { .. }
+                    | DescriptorOp::MapAlias { .. }
             )
         {
             return Err(DescriptorRefusal::MissingTable);
@@ -1624,6 +1678,17 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
     fn edit(&self, descriptor: u64, level: usize, base: u64) -> Result<u64, DescriptorRefusal> {
         let state = el1_private_leaf_state(descriptor);
         match self.op {
+            DescriptorOp::MapAlias {
+                span, target_ipa, ..
+            } => {
+                let output = target_ipa.raw() + (base - span.va);
+                let flags = if level == 3 {
+                    USER_PAGE_FLAGS
+                } else {
+                    super::USER_BLOCK_FLAGS
+                };
+                Ok(output | flags | NON_GLOBAL)
+            }
             DescriptorOp::Prepare {
                 publication,
                 resident,
@@ -1812,6 +1877,13 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
         }
         DescriptorOp::Publish { expected_ipa, .. } => {
             aligned(expected_ipa.raw()) && expected_ipa.raw().checked_add(span.len).is_some()
+        }
+        DescriptorOp::MapAlias { target_ipa, .. } => {
+            aligned(target_ipa.raw())
+                && target_ipa
+                    .raw()
+                    .checked_add(span.len)
+                    .is_some_and(|end| end <= PA_MASK_4KIB + PT_PAGE)
         }
         DescriptorOp::Protect(_) | DescriptorOp::Retire(_) => true,
         DescriptorOp::ForkArm { arm, .. } => {
@@ -2229,6 +2301,11 @@ mod tests {
     #[test]
     fn every_operation_round_trips_through_the_slot_wire_encoding() {
         let ops = [
+            DescriptorOp::MapAlias {
+                span: PageSpan::new(0x5000, 2 * PT_PAGE),
+                target_ipa: SubstrateGpa(0x7000),
+                backing: backing(90),
+            },
             prepare_txn(1).op,
             DescriptorOp::Publish {
                 span: PageSpan::new(0x5000, 2 * PT_PAGE),
@@ -3216,6 +3293,121 @@ mod tests {
                 ),
                 DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared)
             );
+        }
+
+        #[test]
+        fn map_alias_replaces_outputs_without_private_tags_and_rolls_back() {
+            let destination = IPA + 0x8000;
+            for failure in core::iter::once(None).chain((0..8).map(Some)) {
+                let words = fixture(3);
+                applied(run(
+                    &words,
+                    prepare(4, PageSpan::new(VA, 4 * PT_PAGE), true),
+                    &TableGrants::NONE,
+                ));
+                let before = words.image();
+                words.log.borrow_mut().clear();
+                words.forward_cas.set(0);
+                words.fail_cas_at.set(failure);
+                let result = run(
+                    &words,
+                    DescriptorOp::MapAlias {
+                        span: PageSpan::new(VA, 4 * PT_PAGE),
+                        target_ipa: SubstrateGpa(destination),
+                        backing: backing(90),
+                    },
+                    &TableGrants::NONE,
+                );
+                if failure.is_some() {
+                    assert!(
+                        matches!(result, DescriptorOutcome::RolledBack(_)),
+                        "{result:?}"
+                    );
+                    assert_eq!(words.image(), before);
+                } else {
+                    let receipt = applied(result);
+                    assert_eq!(receipt.live_stores, 8);
+                    let events = words.log.borrow();
+                    for index in 0..4 {
+                        let address = VA + index * PT_PAGE;
+                        let pa = leaf_pa(address);
+                        let cleared = events
+                            .iter()
+                            .position(|event| {
+                                matches!(event,
+                            Event::Cas { pa: at, after: 0, .. } if *at == pa)
+                            })
+                            .unwrap();
+                        let invalidated = events
+                            .iter()
+                            .position(|event| *event == Event::Invalidate(address, PT_PAGE))
+                            .unwrap();
+                        let installed = events
+                            .iter()
+                            .position(|event| {
+                                matches!(event,
+                            Event::Cas { pa: at, before: 0, after } if *at == pa && *after != 0)
+                            })
+                            .unwrap();
+                        assert!(cleared < invalidated && invalidated < installed);
+                    }
+                    for index in 0..4 {
+                        assert_eq!(
+                            words.get(leaf_pa(VA + index * PT_PAGE)),
+                            (destination + index * PT_PAGE) | USER_PAGE_FLAGS | NON_GLOBAL
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn map_alias_builds_missing_tables_and_requires_aligned_block_outputs() {
+            let empty = fixture(0);
+            let created = applied(run(
+                &empty,
+                DescriptorOp::MapAlias {
+                    span: PageSpan::new(VA, 4 * PT_PAGE),
+                    target_ipa: SubstrateGpa(IPA),
+                    backing: backing(90),
+                },
+                &grants(&[1, 2, 3]),
+            ));
+            assert_eq!(created.tables_linked, 3);
+            for index in 0..4 {
+                assert_eq!(
+                    empty.get(leaf_pa(VA + index * PT_PAGE)) & PA_MASK_4KIB,
+                    IPA + index * PT_PAGE
+                );
+            }
+            for offset in [0, PT_PAGE] {
+                let words = fixture(2);
+                let block_pa = page(2) + indices(VA)[2] as u64 * 8;
+                words.set(block_pa, IPA | super::super::super::USER_BLOCK_FLAGS);
+                let target = IPA + 0x400000 + offset;
+                let result = applied(run(
+                    &words,
+                    DescriptorOp::MapAlias {
+                        span: PageSpan::new(VA, 0x200000),
+                        target_ipa: SubstrateGpa(target),
+                        backing: backing(90),
+                    },
+                    &grants(&[3]),
+                ));
+                if offset == 0 {
+                    assert_eq!(result.tables_linked, 0);
+                    assert_eq!(result.live_stores, 2);
+                    assert_eq!(words.get(block_pa) & PA_MASK_2MIB, target);
+                } else {
+                    assert_eq!(result.tables_linked, 1);
+                    for index in 0..512 {
+                        assert_eq!(
+                            words.get(leaf_pa(VA + index * PT_PAGE)) & PA_MASK_4KIB,
+                            target + index * PT_PAGE
+                        );
+                    }
+                }
+            }
         }
 
         #[test]

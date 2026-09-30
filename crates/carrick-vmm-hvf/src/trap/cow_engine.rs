@@ -5,16 +5,15 @@
 use super::*;
 use carrick_fatal::carrick_fatal;
 
-/// Refuse before allocating, copying, staging inventory or editing a live
-/// image. A synchronous host adapter cannot complete guest-owned COW: its
-/// caller must suspend until EL1 has copied and returned a descriptor receipt.
+/// Refuse an unconverted host descriptor writer before allocating, copying,
+/// staging inventory or editing a live image. Converted callers submit an
+/// owned EL1 transaction and retain backing until its verified completion.
 pub(crate) fn require_host_cow_lane(
     authority: &carrick_aarch64::Stage1Authority,
 ) -> Result<(), TrapError> {
     if authority.live_descriptor_owner() == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest {
         return Err(TrapError::Hypervisor(
-            "guest-owned COW requires a guest copy continuation and verified descriptor receipt"
-                .to_owned(),
+            "host descriptor writer requires conversion to owned EL1 publication".to_owned(),
         ));
     }
     Ok(())
@@ -452,13 +451,184 @@ impl HvfVmState {
         self.cow_armed.lock().overlapping(va, len)
     }
 
+    pub(crate) fn repoint_guest_alias(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+        content: Option<&[u8]>,
+        services: &mut dyn carrick_aarch64::vmm::Stage1Services,
+    ) -> Result<(), TrapError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::{BackingIdentity, DescriptorOp, PageSpan};
+        use carrick_mmu_core::aarch64::{LiveDescriptorOwner, SubstrateGpa};
+        let error = |message: &str| TrapError::Hypervisor(message.to_owned());
+        let tables = self.page_tables_authority();
+        if tables.live_descriptor_owner() != LiveDescriptorOwner::Guest
+            || !services.guest_publication_available()
+        {
+            return Err(error(
+                "guest alias requires its driving vCPU and descriptor owner",
+            ));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let span = PageSpan::new(va, len as u64);
+        let end = target_ipa
+            .checked_add(len as u64)
+            .ok_or_else(|| error("alias IPA overflow"))?;
+        if !span.is_well_formed()
+            || !target_ipa.is_multiple_of(4096)
+            || content.is_some_and(|bytes| bytes.len() != len)
+        {
+            return Err(error("invalid alias publication span"));
+        }
+        let identity = self
+            .cow_identity
+            .ok_or_else(|| error("alias has no bound MM"))?;
+        let authority = self
+            .cow_authority
+            .clone()
+            .ok_or_else(|| error("alias has no inventory authority"))?;
+        let _quiesce = authority
+            .quiesce()
+            .map_err(|e| error(&format!("quiesce alias MM: {e}")))?;
+        let mm = std::num::NonZeroU64::new(identity.mm).ok_or_else(|| error("zero alias MM"))?;
+        struct RetainedAlias {
+            start: u64,
+            end: u64,
+            physical_base: u64,
+            backing: BackingIdentity,
+            pin: GlobalFrameOwnerPin,
+        }
+        // Authenticate the complete range before copying or publishing any
+        // part. The logical inventory and containing physical owner can have
+        // different extents after COW; retain both exact identities.
+        let mut retained = Vec::new();
+        let mut current = target_ipa;
+        while current < end {
+            let (key, extent) = self
+                .frame_inventory
+                .lock()
+                .extents
+                .containing(current)
+                .map(|(key, extent)| (*key, *extent))
+                .ok_or_else(|| error("alias target has no live inventory mapping"))?;
+            let limit = key
+                .0
+                .checked_add(key.1)
+                .ok_or_else(|| error("alias inventory overflow"))?
+                .min(end);
+            let pin = pin_exact_live_global_frame_owner_in(
+                self.custody(),
+                extent.stage2_base,
+                extent.stage2_length,
+                extent.stage2_owner.host_addr,
+                extent.stage2_owner.generation,
+            )
+            .ok_or_else(|| error("alias physical owner is not current"))?;
+            let length = |raw| {
+                std::num::NonZeroU64::new(raw)
+                    .map(carrick_hal::FrameLength::from_mapping_extent)
+                    .ok_or_else(|| error("empty alias backing extent"))
+            };
+            let (authenticated_mm, backing) = authority
+                .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                    mapping: extent.mapping,
+                    frame: extent.frame,
+                    gpa: carrick_guest_mem::Gpa(key.0),
+                    length: length(key.1)?,
+                    owner_gpa: carrick_guest_mem::Gpa(extent.stage2_base),
+                    owner_length: length(extent.stage2_length)?,
+                })
+                .map_err(|e| error(&format!("authenticate alias backing: {e}")))?;
+            if authenticated_mm != mm
+                || backing.mapping_id.get() != extent.mapping.raw()
+                || backing.frame_id.get() != extent.frame.raw()
+                || backing.owner_generation.get() != extent.stage2_owner.generation
+            {
+                return Err(error("alias backing identity mismatch"));
+            }
+            retained.push(RetainedAlias {
+                start: current,
+                end: limit,
+                physical_base: extent.stage2_base,
+                backing,
+                pin,
+            });
+            current = limit;
+        }
+        if let Some(bytes) = content {
+            for region in &retained {
+                let offset = (region.start - target_ipa) as usize;
+                let count = (region.end - region.start) as usize;
+                // SAFETY: the authenticated logical span lies inside this
+                // pinned physical mapping and bytes is exactly the full span.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr().add(offset),
+                        region
+                            .pin
+                            .owner()
+                            .as_ptr()
+                            .add((region.start - region.physical_base) as usize),
+                        count,
+                    );
+                }
+            }
+        }
+        let mut published = false;
+        for region in &retained {
+            let mut current = region.start;
+            while current < region.end {
+                // Keep each request within the existing bounded table-grant
+                // capacity, independently of a file mapping's total length.
+                let count = (region.end - current).min(2 * 1024 * 1024);
+                let op = DescriptorOp::MapAlias {
+                    span: PageSpan::new(va + (current - target_ipa), count),
+                    target_ipa: SubstrateGpa(current),
+                    backing: region.backing,
+                };
+                let txn = match tables.prepare_guest_descriptor_txn(mm, op) {
+                    Ok(txn) => txn,
+                    Err(e) if !published => return Err(error(&format!("prepare alias: {e:?}"))),
+                    Err(e) => carrick_fatal!("hvpatch::alias", "alias partially published: {e:?}"),
+                };
+                let receipt = services.publish(&txn).unwrap_or_else(|e| {
+                    carrick_fatal!(
+                        "hvpatch::alias",
+                        "alias publication lacks verified completion: {e}"
+                    );
+                });
+                if *receipt.txn() != txn {
+                    carrick_fatal!("hvpatch::alias", "alias receipt names another transaction");
+                }
+                published = true;
+                current += count;
+            }
+        }
+        let result = if content.is_some() {
+            self.publish_private_repoint(va, target_ipa, len)
+        } else {
+            self.publish_shared_repoint(va, target_ipa, len)
+        };
+        if let Err(e) = result {
+            carrick_fatal!(
+                "hvpatch::alias",
+                "published alias ownership commit failed: {e}"
+            );
+        }
+        // Keep every owner pin and exact-MM exclusion until metadata commits.
+        drop(retained);
+        Ok(())
+    }
+
     pub(crate) fn publish_private_repoint(
         &mut self,
         va: u64,
         overlay_ipa: u64,
         len: usize,
     ) -> Result<(), TrapError> {
-        require_host_cow_lane(&self.page_tables_authority())?;
         let overlay_end = overlay_ipa.checked_add(len as u64).ok_or_else(|| {
             TrapError::Hypervisor("private repoint semantic IPA overflow".to_owned())
         })?;
@@ -539,6 +709,7 @@ impl HvfVmState {
             } else {
                 mapping_owner_generation
             };
+        require_published_repoint(&self.page_tables_authority(), va, overlay_ipa, len)?;
         // The stage-1 repoint has replaced every promise about the previous
         // VA -> IPA output. Retire those promises before publishing the alias,
         // so the protection commit authenticates only the replacement state.
@@ -2908,12 +3079,18 @@ impl HvfTaskState {
                         .ok_or_else(|| TrapError::Hypervisor("zero COW compound".to_owned()))?,
                 );
                 let (mm, backing) = authority
-                    .authenticate_frame_backing(
-                        extent.mapping,
-                        extent.frame,
-                        carrick_guest_mem::Gpa(new_physical_ipa),
+                    .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                        mapping: extent.mapping,
+                        frame: extent.frame,
+                        gpa: carrick_guest_mem::Gpa(new_physical_ipa),
                         length,
-                    )
+                        owner_gpa: carrick_guest_mem::Gpa(extent.stage2_base),
+                        owner_length: carrick_hal::FrameLength::from_mapping_extent(
+                            std::num::NonZeroU64::new(extent.stage2_length).ok_or_else(|| {
+                                TrapError::Hypervisor("zero COW physical extent".to_owned())
+                            })?,
+                        ),
+                    })
                     .map_err(|error| {
                         TrapError::Hypervisor(format!("authenticate reused COW backing: {error}"))
                     })?;

@@ -2065,6 +2065,18 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.observe_frame_cow_protection(va, len, prot)
     }
 
+    fn repoint_guest_alias(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+        content: Option<&[u8]>,
+        services: &mut dyn carrick_aarch64::vmm::Stage1Services,
+    ) -> Result<(), TrapError> {
+        self.state
+            .repoint_guest_alias(va, target_ipa, len, content, services)
+    }
+
     fn publish_private_repoint(
         &mut self,
         va: u64,

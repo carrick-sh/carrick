@@ -399,10 +399,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
 
     fn authenticate_frame_backing(
         &self,
-        mapping: carrick_hal::MappingId,
-        frame: carrick_hal::FrameId,
-        gpa: carrick_guest_mem::Gpa,
-        length: carrick_hal::FrameLength,
+        request: carrick_hal::FrameBackingAuthentication,
     ) -> Result<
         (
             std::num::NonZeroU64,
@@ -410,7 +407,28 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let owner = self.owner_inventory.retain_current(gpa, length)?;
+        let carrick_hal::FrameBackingAuthentication {
+            mapping,
+            frame,
+            gpa,
+            length,
+            owner_gpa,
+            owner_length,
+        } = request;
+        if gpa.0 < owner_gpa.0
+            || gpa
+                .0
+                .checked_add(length.raw())
+                .zip(owner_gpa.0.checked_add(owner_length.raw()))
+                .is_none_or(|(end, owner_end)| end > owner_end)
+        {
+            return Err(Box::new(std::io::Error::other(
+                "mapping exceeds its physical owner extent",
+            )));
+        }
+        let owner = self
+            .owner_inventory
+            .retain_current(owner_gpa, owner_length)?;
         let revision = self
             .kernel
             .frame_inventory()
@@ -3657,12 +3675,36 @@ mod tests {
             .unwrap();
         let current_owner =
             carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(71).unwrap());
+        #[derive(Debug)]
+        struct RecordingOwnerInventory {
+            generation: carrick_hal::ForeignOwnerGeneration,
+            requests: parking_lot::Mutex<Vec<(Gpa, carrick_hal::FrameLength)>>,
+        }
+        impl carrick_hal::FrameCowOwnerInventory for RecordingOwnerInventory {
+            fn retain_current(
+                &self,
+                gpa: Gpa,
+                length: carrick_hal::FrameLength,
+            ) -> Result<
+                Box<dyn carrick_hal::FrameCowOwnerLease>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                self.requests.lock().push((gpa, length));
+                Ok(Box::new(super::FixedFrameCowOwnerLease {
+                    generation: self.generation,
+                }))
+            }
+        }
+        let owners = Arc::new(RecordingOwnerInventory {
+            generation: current_owner,
+            requests: parking_lot::Mutex::new(Vec::new()),
+        });
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
             mm,
             tid,
             7,
-            crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
+            owners.clone(),
         );
 
         let (receipt, authenticated_owner) = authority
@@ -3681,7 +3723,14 @@ mod tests {
         ));
 
         let (authenticated_mm, existing) = authority
-            .authenticate_frame_backing(mapping, frame, gpa, length)
+            .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                mapping,
+                frame,
+                gpa,
+                length,
+                owner_gpa: gpa,
+                owner_length: length,
+            })
             .expect("authenticate existing COW destination without a new grant");
         assert_eq!(authenticated_mm.get(), mm.raw());
         assert_eq!(existing.mapping_id.get(), mapping.raw());
@@ -3691,9 +3740,54 @@ mod tests {
             current_owner.raw_for_probe()
         );
         assert_eq!(existing.inventory_revision.get(), receipt.revision());
+        // A fragmented kernel row authenticates its exact logical extent,
+        // while the owner lookup uses the larger physical lease independently.
+        let owner_gpa = Gpa(0x8000);
+        let owner_length =
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x400000).unwrap());
+        let (_, fragmented) = authority
+            .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                mapping,
+                frame,
+                gpa,
+                length,
+                owner_gpa,
+                owner_length,
+            })
+            .expect("logical row inside larger physical owner");
+        assert_eq!(fragmented, existing);
+        assert_eq!(
+            owners.requests.lock().last().copied(),
+            Some((owner_gpa, owner_length))
+        );
+        let count = owners.requests.lock().len();
         assert!(
             authority
-                .authenticate_frame_backing(mapping, frame, Gpa(gpa.0 + 4096), length)
+                .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                    mapping,
+                    frame,
+                    gpa,
+                    length,
+                    owner_gpa: Gpa(gpa.0 + 4096),
+                    owner_length,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            owners.requests.lock().len(),
+            count,
+            "refuse out-of-owner rows before retaining"
+        );
+        assert!(
+            authority
+                .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                    mapping,
+                    frame,
+                    gpa: Gpa(gpa.0 + 4096),
+                    length,
+                    owner_gpa: gpa,
+                    owner_length: length
+                })
                 .is_err()
         );
 
@@ -3702,7 +3796,14 @@ mod tests {
             .expect("roll back unpublished frame grant");
         assert!(
             authority
-                .authenticate_frame_backing(mapping, frame, gpa, length)
+                .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                    mapping,
+                    frame,
+                    gpa,
+                    length,
+                    owner_gpa: gpa,
+                    owner_length: length
+                })
                 .is_err()
         );
         assert!(
