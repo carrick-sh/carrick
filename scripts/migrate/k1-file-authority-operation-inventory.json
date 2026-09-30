@@ -12864,7 +12864,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 1141,
+      "line": 1154,
       "categories": [
         "epoll"
       ],
@@ -12873,7 +12873,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 1530,
+      "line": 1566,
       "categories": [
         "mapping"
       ],
@@ -12882,7 +12882,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 1833,
+      "line": 1869,
       "categories": [
         "description_guard"
       ],
@@ -18323,7 +18323,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 502,
+      "line": 638,
       "categories": [
         "lifecycle"
       ],
@@ -18332,7 +18332,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 798,
+      "line": 934,
       "categories": [
         "mapping"
       ],
@@ -18341,7 +18341,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 801,
+      "line": 937,
       "categories": [
         "mapping"
       ],
@@ -18350,7 +18350,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 1462,
+      "line": 1616,
       "categories": [
         "lifecycle"
       ],
@@ -18359,7 +18359,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 1466,
+      "line": 1620,
       "categories": [
         "lifecycle"
       ],
@@ -18368,7 +18368,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 1567,
+      "line": 1721,
       "categories": [
         "lifecycle"
       ],
