@@ -1340,25 +1340,21 @@ fn ipc_window_geometry(backing: &dyn IpcWindowBacking) -> Result<(usize, usize),
     Ok((directory_len, backing.pool_len()))
 }
 
-/// Register the host IPC authority's memory for this carrier (before its
-/// persistent executor is published). Refuses memory that does not fit the
-/// window or a second, different backing.
+/// Offer the launching kernel's IPC authority memory for the NEXT carrier
+/// VM installation (before its persistent executor is published). Refuses
+/// memory that does not fit the window. The latest offer wins: a carrier
+/// maps exactly one window when its first root is published and that
+/// installation retains its own owner, so a later container's kernel on a
+/// reused carrier is simply not the window owner (`publish_file_table`
+/// refuses a different region and its IPC stays host-served), and the next
+/// carrier VM maps the latest kernel's window. A process-lifetime refusal
+/// would fail every container after the first in one process.
 pub fn register_ipc_window_backing(
     backing: std::sync::Arc<dyn IpcWindowBacking>,
 ) -> Result<(), TrapError> {
     ipc_window_geometry(backing.as_ref())?;
-    let mut slot = IPC_WINDOW_BACKING.lock();
-    match slot.as_ref() {
-        Some(existing) if !std::sync::Arc::ptr_eq(existing, &backing) => {
-            Err(TrapError::Hypervisor(
-                "a different IPC window backing is already registered".to_owned(),
-            ))
-        }
-        _ => {
-            *slot = Some(backing);
-            Ok(())
-        }
-    }
+    *IPC_WINDOW_BACKING.lock() = Some(backing);
+    Ok(())
 }
 
 pub(crate) fn registered_ipc_window_backing() -> Option<std::sync::Arc<dyn IpcWindowBacking>> {
@@ -1527,6 +1523,27 @@ mod ipc_window_tests {
             pool: alloc(IPC_WINDOW_GRANULE),
             pool_len,
         })
+    }
+
+    /// Two containers run in one process each offer their own kernel's IPC
+    /// authority. The second offer must not fail the launch; it becomes the
+    /// window a later carrier VM installs.
+    #[test]
+    fn serial_host_a_later_kernel_ipc_offer_replaces_the_registration() {
+        let previous = IPC_WINDOW_BACKING.lock().take();
+        let first = backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize);
+        let second = backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize);
+        register_ipc_window_backing(std::sync::Arc::clone(&first)).unwrap();
+        register_ipc_window_backing(std::sync::Arc::clone(&second))
+            .expect("a later kernel's offer must not fail its launch");
+        let registered = registered_ipc_window_backing().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&registered, &second));
+        assert!(register_ipc_window_backing(backing(IPC_WINDOW_GRANULE)).is_err());
+        assert!(std::sync::Arc::ptr_eq(
+            &registered_ipc_window_backing().unwrap(),
+            &second
+        ));
+        *IPC_WINDOW_BACKING.lock() = previous;
     }
 
     #[test]
