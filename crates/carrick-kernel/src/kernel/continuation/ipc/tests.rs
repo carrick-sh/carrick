@@ -7,7 +7,7 @@ use crate::dispatch::LinearMemory;
 use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags, TableId};
 use carrick_el1_abi::ipc::{
     End, Extent, IPC_POOL_ALIGN, IpcBacking, IpcDirectory, IpcPipeStorage, IpcTaskKey, IpcUserVa,
-    WriteProgress, descriptor_extent_bytes,
+    WriteProgress,
 };
 use carrick_guest_mem::GuestMemory;
 use std::alloc::Layout;
@@ -185,7 +185,7 @@ fn world() -> World {
         table: TableId::from_raw(Default::default()),
     };
     let mut extent = Extent {
-        token: w.bump(descriptor_extent_bytes(64)),
+        token: carrick_el1_abi::ipc::ipc_descriptor_area(pool_len as u64).start,
         capacity: 64,
     };
     let table = region

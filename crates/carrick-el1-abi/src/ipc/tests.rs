@@ -54,7 +54,9 @@ const EL1: BoundedSpin = BoundedSpin(1024);
 // ---- fixture: zeroed directory + pool, published by the "host" ----
 struct Fixture {
     region: &'static IpcRegion<'static>,
+    /// Next free byte of the ring area, and of the descriptor area.
     next: Cell<u64>,
+    next_descriptor: Cell<u64>,
     pool_len: u64,
 }
 static IDENTITY: AtomicU64 = AtomicU64::new(0x1_0000);
@@ -77,20 +79,29 @@ fn fixture(pool_len: usize) -> Fixture {
     Fixture {
         region: Box::leak(Box::new(region)),
         next: Cell::new(0),
+        next_descriptor: Cell::new(ipc_descriptor_area(pool_len as u64).start),
         pool_len: pool_len as u64,
     }
 }
 impl Fixture {
+    /// Ring-area bytes.
     fn bump(&self, bytes: u64) -> u64 {
         let at = self.next.get();
         let end = (at + bytes).next_multiple_of(IPC_POOL_ALIGN);
-        assert!(end <= self.pool_len, "fixture pool exhausted");
+        assert!(
+            end <= ipc_ring_area(self.pool_len).end,
+            "fixture ring area exhausted"
+        );
         self.next.set(end);
         at
     }
     fn descriptors(&self, capacity: usize) -> Extent {
+        let at = self.next_descriptor.get();
+        let end = (at + descriptor_extent_bytes(capacity)).next_multiple_of(IPC_POOL_ALIGN);
+        assert!(end <= self.pool_len, "fixture descriptor area exhausted");
+        self.next_descriptor.set(end);
         Extent {
-            token: self.bump(descriptor_extent_bytes(capacity)),
+            token: at,
             capacity: capacity as u64,
         }
     }
@@ -295,7 +306,7 @@ fn el1_ipc_region_attach_authenticates_the_header() {
         .create_table(
             8,
             &mut Extent {
-                token: 0,
+                token: ipc_descriptor_area(len as u64).start,
                 capacity: 8,
             },
         )
@@ -775,13 +786,13 @@ fn el1_ipc_steady_state_transfers_scale_linearly_without_allocation() {
     assert!(allocations() > before);
     drop(probe);
     for pairs in [1, 8, 64] {
-        let fx = fixture(16 << 20);
+        let fx = fixture(32 << 20);
         let (bytes, allocs) = pairs_steady_state(&fx, pairs, 16);
         assert_eq!(bytes, pairs * 16 * 4 * 64, "exact payload at N={pairs}");
         assert_eq!(allocs, 0, "zero allocations per transfer at N={pairs}");
         // Round-count scaling: twice the rounds, exactly twice the work,
         // so a fixed setup boundary cannot hide per-round fallback.
-        let fx = fixture(16 << 20);
+        let fx = fixture(32 << 20);
         let (bytes2, allocs2) = pairs_steady_state(&fx, pairs, 32);
         assert_eq!(bytes2, 2 * bytes);
         assert_eq!(allocs2, 0);
@@ -837,7 +848,7 @@ fn el1_ipc_operation_tokens_own_their_record_and_reject_stale_copies() {
 
 #[test]
 fn el1_ipc_live_pipe_storage_replacement_preserves_both_venues() {
-    let fx = fixture(256 * 1024);
+    let fx = fixture(512 * 1024);
     let table = fx.table();
     let (_, _, object) = fx.pipe(table);
     let old = {
@@ -872,7 +883,7 @@ fn el1_ipc_live_pipe_storage_replacement_preserves_both_venues() {
 
 #[test]
 fn el1_ipc_live_pipe_storage_replacement_refuses_overlap_and_bounds() {
-    let fx = fixture(256 * 1024);
+    let fx = fixture(512 * 1024);
     let table = fx.table();
     let (_, _, object) = fx.pipe(table);
     let mut guard = fx.region.lock(object, &Spin).unwrap();
@@ -1248,4 +1259,44 @@ fn el1_ipc_ring_stock_is_bounded_and_spent_only_on_first_writes() {
     }
     assert_eq!(fill, IPC_RING_STOCK);
     assert_eq!(fx.region.stock_ring(ring), Err(ring), "bounded");
+}
+
+/// The pool's two areas are type-stable: rings only in the lower half,
+/// descriptor extents only in the upper half. A lock-free lookup can read a
+/// retired extent's words; they can only ever be another extent's atomics.
+#[test]
+fn el1_ipc_pool_areas_are_type_stable() {
+    let fx = fixture(1 << 20);
+    let descriptors = ipc_descriptor_area(fx.pool_len);
+    let rings = ipc_ring_area(fx.pool_len);
+    assert_eq!(
+        (rings.end, descriptors.start),
+        (fx.pool_len / 2, fx.pool_len / 2)
+    );
+    // A descriptor extent in the ring area is refused (BadBacking).
+    assert_eq!(
+        fx.host().create_table(
+            8,
+            &mut Extent {
+                token: 0,
+                capacity: 8
+            }
+        ),
+        Err(fd::Error::BadBacking)
+    );
+    // A ring in the descriptor area is refused, stocked or provided.
+    let ring = IpcPipeStorage {
+        offset: descriptors.start,
+        ring_bytes: 65536,
+        pages: 16,
+    };
+    assert_eq!(fx.region.stock_ring(ring), Err(ring));
+    let mut retired = None;
+    let pipe = fx.region.create_pipe(65536, &mut retired, &Spin).unwrap();
+    let mut g = fx.region.lock(pipe, &Spin).unwrap();
+    let mut misplaced = ring;
+    assert_eq!(
+        g.provide_pipe_storage(&mut misplaced),
+        Err(IpcError::BadStorage)
+    );
 }
