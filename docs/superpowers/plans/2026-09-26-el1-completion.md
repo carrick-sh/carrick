@@ -5,7 +5,7 @@
 > This controller is director-owned. Workers report evidence and proposed
 > status changes; the director maintains this file.
 
-**Updated:** 2026-09-29, from local Git state, source inspection and retained
+**Updated:** 2026-09-30 (status block below); earlier text 2026-09-29, from local Git state, source inspection and retained
 receipts. After requesting the refresh, the user explicitly said "Set the
 goal and go." The end-to-end goal is paused at the user-requested local-main consolidation. Migration acceptance remains incomplete; see the stopping receipt below.
 
@@ -55,18 +55,68 @@ historical. Current state, from signed and host evidence on main:
 - **Lane selection** completes when live backing binds (deferred intent);
   the carrier ledger records selected/deferred/refused-by-reason and the
   fork-COW witness prints them.
-- **Admission experiment (forced locally, signed):** the lane is now
-  actually selected; el1_sched passes 17/17. Next blocker:
-  `CopyWindowAbsent` - exec-rebuilt images lose the EL1 COW copy-alias
-  leaves (worker assigned: one provisioning invariant + fork-arm
-  exclusion).
-- **Open signed reds:** anonymous reservations (host mmap/brk policy,
-  checkpoint 2), fork COW host-resolved until admission, two-process IPC
-  blocking wedge at pipe n=64 (owed-wake fix landed; census
-  discriminators in progress), inotify09 contract watchdog (pre-existing).
-- **Follow-ups:** guest-lane refusal of a kernel-staged alias batch loses
-  the host lane's abort post-mortem; `cow_armed` backend metadata can be
-  stale after EL1-resolved COW; foreign-drain retirement wait lock order.
+
+**Status 2026-09-30 (main `fb9a5e038`):**
+
+- **Delegated anonymous root (S1b/S1c/S1d landed):** on a delegated MM the
+  EL1 root owns anonymous private mmap/munmap/mprotect/mremap placement,
+  madvise flags and mlock; `/proc` maps merge root and host rows once;
+  first-touch planning and mincore read the root (`FirstTouchOwner`).
+  Delegation is still admitted only by the conformance fixture.
+- **Guest COW settlement fixed (`618be9af2`):** completions settle into the
+  custody-registered MM state; fork planning and host frame COW fail
+  closed on unsettled completions. Forced admission: fork-COW data correct,
+  settled == resolved.
+- **Fork-COW host work, measured (signed, forced admission):** 219 host
+  COWs, all stage faults, all on MMs not yet on the guest lane (children
+  before promotion); 160 EL1 declines are `not_el1_private` (host-published
+  leaves not tagged); 111 more host COWs on guest-lane MMs (91 stage,
+  20 privileged-internal). Fix in flight: children inherit the lane at
+  fork commit; host-published armable leaves carry `SW_EL1_PRIVATE`.
+  (A grant seed at binding measured neutral and was not landed.)
+- **Exit budget:** the fork-COW absolute ceiling (144 for 20x16) fails in
+  BOTH lanes (~6k exits, `host_fault_exits=0`): forwarded fork/thread
+  lifecycle syscalls, not COW. S3 below does not close it.
+
+**S3 plan (design review 2026-09-30):**
+
+- **Findings:** EL1's anonymous policy (`dispatch_anonymous_with_reservations`)
+  has no production caller; production delegation is refused
+  (`admit_host_snapshot` always errors, only `delegate_anonymous_for_test`
+  delegates); `fork_materialized` returns fork children to `HostSetup`; every
+  munmap still crosses to the host (runtime `vcpu_loop/mod.rs` ~1517);
+  `El1ReservationFaultPlan` is an unused second API; the lane census has
+  no `=0` hatch.
+- **Gates (opt-out, exact `=0` hatches):** G1 IPC entry gate (serve a
+  completing IPC transfer with pending host work, leave served-with-work);
+  G2 `backend_writers=true` + `CARRICK_EL1_DESCRIPTOR_LANE=0`; G3+G4 one
+  production delegated-root admission (initial bind, exec, fork commit with
+  a child root seeded from the parent) + EL1 anonymous dispatch switch for
+  mmap/munmap/mprotect/brk, hatch `CARRICK_EL1_RESERVATIONS=0`.
+- **Authority split:** fork/clone/wait/exit stay kernel-served (identity,
+  zombies, wait queues in the kernel graph); reuse `served_with_work` +
+  `settle_el1_boundary`, `IPC_HANDBACK_NR`, `zone_park`, `kick_slot`. EL1
+  child tables, EL1 tid pools, EL1 signal masks or EL1 `gettid` would be
+  second paths.
+- **Batched retirement:** retired frames may reconcile at the next boundary
+  only if they stay unreusable until the inventory receipt (the
+  stage-1/stage-2/inventory transaction rule stands).
+- **Fork-COW ceiling ruling (director):** the 144-exit assertion stays in
+  the test, unchanged and red; it is registered as
+  `kernel.el1.fork-lifecycle-exits`, closed only by born-in-zone thread
+  lifecycle (a later stage). S3 fork-COW acceptance = ownership
+  (`host_cow_resolutions=0`) + per-page slope.
+- **Tasks:** T1 EL1 dispatch (`carrick-el1/src/personality/dispatch.rs`),
+  T2 runtime lane/binding (`carrick-runtime/src/vcpu_loop/*`), T3 EL1 memory
+  policy + frame return (`carrick-el1/src/{memory.rs,personality/reservations.rs,alloc.rs}`),
+  T4 kernel root admission + fork (`carrick-kernel/src/dispatch/mem/*`),
+  T5 witnesses/contracts (`carrick-embed/tests/el1_sched.rs`, fixtures,
+  `conformance-contracts/`). Order: T5 reds + T1 now; T4 after S2 (file
+  overlap); then T3; then T2; then the director's signed ladder.
+- **In flight:** S2 (root fencing: alias-install rollback, recoverable node
+  exhaustion, residency tagged by root incarnation; range-proportional
+  projection/charging; one shared mremap move backend), T1, T5, fork-COW
+  lane/tag fix.
 
 X86 remains deferred. No checkpoint closure is claimed until admission
 is enabled and the signed two-live-MM ownership witnesses pass.
