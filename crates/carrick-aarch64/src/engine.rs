@@ -1305,6 +1305,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         )
     }
 
+    /// Ensure the software stage-1 manager exists, built from the live tables,
+    /// WITHOUT editing. Valid on every lane: a guest-owned MM can legitimately
+    /// have an absent manager (persistent exec drops it), and the refusing live
+    /// edit funnel is the wrong door for a load that stores nothing.
+    fn load_live_stage1_manager(&self) -> Result<(), MemoryError> {
+        if self.page_tables.is_present() {
+            return Ok(());
+        }
+        let manager = self.build_page_tables_manager_from_live()?;
+        self.page_tables
+            .load_manager_if_absent(|| Ok::<_, MemoryError>(manager))
+            .map(|_installed| ())
+    }
+
     fn pt_edit_locked(
         &mut self,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
@@ -1990,9 +2004,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // so a redundant TTBR0 read from that parked vCPU would fail even though
         // the target stack is already materialized.
         let editor_present = self.page_tables.is_present();
-        ensure_sparse_page_table_editor(editor_present, || {
-            self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
-        })?;
+        ensure_sparse_page_table_editor(editor_present, || self.load_live_stage1_manager())?;
         // The driving-vCPU service: host flush on the host lane, and on a
         // guest-owned MM the verified EL1 publication sparse materialization
         // requires. It reads TTBR0 only when a guest publication is submitted.
@@ -2742,9 +2754,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // Same editor precondition as `ensure_sparse_mmap_backing`: a fresh
         // materialization needs the software stage-1 editor.
         let editor_present = self.page_tables.is_present();
-        ensure_sparse_page_table_editor(editor_present, || {
-            self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
-        })?;
+        ensure_sparse_page_table_editor(editor_present, || self.load_live_stage1_manager())?;
         let slot = self.mailbox_slot();
         let tables = self.page_tables.clone();
         let vm = &mut self.vm;
@@ -4041,15 +4051,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         if self.page_tables.is_none() {
             // Persistent exec intentionally defers the software observer until
             // the first edit. Core capture needs a read-only live walk even if
-            // this process never called mmap/mprotect after exec. The no-op
-            // edit initializes from TTBR backing, writes nothing, and performs
-            // no TLBI.
-            self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "load live page tables for core snapshot: {error}"
-                    ))
-                })?;
+            // this process never called mmap/mprotect after exec. The load
+            // initializes from TTBR backing, writes nothing, performs no TLBI,
+            // and (unlike an edit) is valid on a guest-owned MM.
+            self.load_live_stage1_manager().map_err(|error| {
+                TrapError::Hypervisor(format!("load live page tables for core snapshot: {error}"))
+            })?;
         }
         Ok(())
     }
@@ -5170,6 +5177,39 @@ mod tests {
             assert!(
                 !body.contains("let mut flush = ||"),
                 "{path} must not pass a flush-only closure"
+            );
+        }
+    }
+
+    /// A guest-owned MM can have an absent software manager (persistent exec
+    /// drops it and lane selection never builds one), so read-only and
+    /// precondition loads must not be phrased as no-op edits: the refusing
+    /// live-edit funnel would turn them into a misleading "submit a descriptor
+    /// transaction" error. They go through the manager-load authority instead.
+    #[test]
+    fn manager_loads_do_not_route_through_the_live_edit_funnel() {
+        let source = include_str!("engine.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production AArch64 engine source");
+        for path in [
+            "fn prepare_core_snapshot",
+            "fn ensure_sparse_mmap_backing",
+            "fn map_private_file_backed",
+        ] {
+            let body = production
+                .split(path)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("production path {path}"));
+            assert!(
+                !body.contains("self.pt_edit("),
+                "{path} must load the manager without a no-op live edit"
+            );
+            assert!(
+                body.contains("load_live_stage1_manager"),
+                "{path} must use the read-only manager load"
             );
         }
     }
