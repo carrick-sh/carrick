@@ -1557,6 +1557,74 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         Ok(())
     }
 
+    /// munmap retirement of `[va, va+len)` on either lane. `reclaim` also
+    /// frees every spare sub-table the retirement empties (the host editor's
+    /// `unmap_aliased`); otherwise tables stay for in-place reuse (the host
+    /// editor's `invalidate`). Guest lane: EL1 `Terminal` retirements whose
+    /// receipts return the unlinked tables to the pool; a span that would
+    /// empty more tables than one receipt carries is split at a 2 MiB-aligned
+    /// midpoint and submitted in pieces, each taking its pages straight to
+    /// their final state.
+    fn retire_stage1_range(
+        &mut self,
+        va: u64,
+        len: usize,
+        reclaim: bool,
+    ) -> Result<(), MemoryError> {
+        if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
+            return self.pt_edit_and_flush_after_adopting(va, len, |editor| {
+                if reclaim {
+                    editor.unmap_aliased(va, len)
+                } else {
+                    editor.invalidate(va, len)
+                }
+            });
+        }
+        if !reclaim {
+            return self
+                .apply_stage1_rules((va, len), &[(va, len, TerminalRule::pt(PtOp::Retire))]);
+        }
+        let failure = |what: String| MemoryError::HostMap(format!("guest stage-1 unmap: {what}"));
+        let mm = std::num::NonZeroU64::new(self.mm_generation)
+            .ok_or_else(|| failure("no MM identity".to_owned()))?;
+        let slots = carrick_el1_abi::descriptor_txn_slots_host()
+            .ok_or_else(|| failure("no descriptor slots".to_owned()))?;
+        self.load_live_stage1_manager()?;
+        let tables = self.page_tables.clone();
+        const TWO_MIB: u64 = 2 << 20;
+        let mut pending = vec![(va, len as u64)];
+        while let Some((start, span)) = pending.pop() {
+            let op = tables
+                .with_manager(|manager| manager.unmap_aliased_op(start, span))
+                .ok_or_else(|| failure("stage-1 image absent".to_owned()))?;
+            let txn = match tables.prepare_guest_descriptor_txn(mm, op) {
+                Ok(txn) => txn,
+                Err(carrick_mmu_core::aarch64::GuestTxnPrepareError::Refused(
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ReclaimCapacity,
+                )) => {
+                    let mid = (start + span / 2) & !(TWO_MIB - 1);
+                    if mid <= start || mid >= start + span {
+                        return Err(failure(format!(
+                            "0x{start:x}+0x{span:x} empties more tables than one receipt carries"
+                        )));
+                    }
+                    // Upper half first so the lower half is submitted first.
+                    pending.push((mid, start + span - mid));
+                    pending.push((start, mid - start));
+                    continue;
+                }
+                Err(error) => return Err(failure(format!("prepare at 0x{start:x}: {error:?}"))),
+            };
+            crate::descriptor_drain::apply_guest_descriptor_txns_now(
+                &mut crate::descriptor_drain::EngineDrainVenue(self),
+                slots,
+                &[txn],
+            )
+            .map_err(|error| failure(format!("apply at 0x{start:x}: {error}")))?;
+        }
+        Ok(())
+    }
+
     /// Revert uncommitted page table edits from the undo journal to shadow and host memory,
     /// and flush stale translations from the stage-1 TLB.
     fn pt_rollback_undo_and_flush(&mut self) -> Result<(), MemoryError> {
@@ -2674,8 +2742,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         };
         // Keep semantic mapping/protection metadata intact. After editing starts,
         // uncertain publication must fail stopped with old owners still retained.
-        self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
-            .map_err(RepointPrivateError::indeterminate)?;
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            self.retire_stage1_range(address, len, true)
+        } else {
+            self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
+        }
+        .map_err(RepointPrivateError::indeterminate)?;
         self.vm
             .commit_anonymous_discard(prepared)
             .map_err(|error| {
@@ -2935,14 +3007,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 }))
                 || carrick_mem::memory::is_high_va(address))
         {
-            self.pt_edit_and_flush_after_adopting(address, len, |mgr| {
-                mgr.unmap_aliased(address, len)
-            })?;
+            self.retire_stage1_range(address, len, true)?;
         } else {
-            self.apply_stage1_rules(
-                (address, len),
-                &[(address, len, TerminalRule::pt(PtOp::Retire))],
-            )?;
+            self.retire_stage1_range(address, len, false)?;
         }
         self.vm.on_unmap(address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend mapping after munmap: {error}"))
@@ -2958,7 +3025,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // Reclaim the alias leaves/table and complete TLBI before unregistering
         // backend lookup metadata. An Err therefore leaves the alias registry
         // intact and consistent with the still-owned host/stage-2 backing.
-        self.pt_edit_and_flush_after_adopting(address, len, |mgr| mgr.unmap_aliased(address, len))?;
+        self.retire_stage1_range(address, len, true)?;
         self.vm.on_unmap(address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend alias after munmap: {error}"))
         })?;
@@ -5382,6 +5449,26 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("production AArch64 engine source");
+        for path in ["fn unmap_range", "fn unmap_alias_range"] {
+            // Stop at the next item's doc comment, which may name the funnel.
+            let body = production
+                .split(path)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    fn ").next())
+                .and_then(|body| body.split("\n    ///").next())
+                .unwrap_or_else(|| panic!("production writer {path}"));
+            assert!(body.contains("self.retire_stage1_range("), "{path}");
+            assert!(
+                !body.contains("pt_edit"),
+                "{path} must not use the host-only funnel"
+            );
+        }
+        let retire = production
+            .split("fn retire_stage1_range")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("reclaiming retirement");
+        assert!(retire.contains("unmap_aliased_op") && retire.contains("ReclaimCapacity"));
         for path in ["fn protect_range", "fn mark_bus_fault"] {
             let body = production
                 .split(path)
