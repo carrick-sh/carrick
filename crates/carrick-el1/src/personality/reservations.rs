@@ -2470,10 +2470,13 @@ mod tests {
         let rw = ReservationProtection::READ_WRITE;
         let d = g.mmap(Placement::Fixed(0x100000), 0x4000, rw).unwrap();
         complete(&mut g, d);
-        // A grow-down stack is host-owned: every edit touching it forwards.
-        // (The carried attributes ride EL1 edits instead; see
+        // A grow-down stack is host-owned, locked or not: every edit touching
+        // it forwards. (The carried attributes alone ride EL1 edits; see
         // `reservation_carried_attributes_ride_el1_edits`.)
-        for flag in [ReservationNodeFlags::GROWSDOWN] {
+        for flag in [
+            ReservationNodeFlags::GROWSDOWN,
+            ReservationNodeFlags::GROWSDOWN.union(ReservationNodeFlags::LOCKED),
+        ] {
             let before = g.generation();
             g.set_flags(range(0x101000, 0x102000), flag, ReservationNodeFlags::EMPTY)
                 .unwrap();
