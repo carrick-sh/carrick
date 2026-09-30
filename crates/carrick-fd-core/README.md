@@ -1,8 +1,13 @@
 # Descriptor substrate (checkpoint 3.1, shared records for checkpoint 3)
 
-`Core<T, O>` owns T table identities and O shared open file descriptions as
-one `repr(C)` object of atomics with no pointers, so a single instance can live
-in memory shared by the host and EL1. Both venues operate on it through
+`Core<T>` owns T table identities as one `repr(C)` object of atomics with no
+pointers, so a single instance can live in memory shared by the host and EL1.
+Open file descriptions are elastic venue records (`SlotBacking::ofd`): the
+venue publishes them in segments (`publish_ofds`, O(count), outside any lock;
+the count is published with Release before the records join the lock-free free
+list) and the core only resolves published indices. An empty free list is
+`NeedsOfds`, an internal request: the venue grows and retries, or reports its
+zone-wide file limit (ENFILE). It is never EMFILE and never ENOMEM by itself. Both venues operate on it through
 `core.bind(&backing, wait)`, an `Authority` view supplying descriptor-slot
 resolution (`SlotBacking`) and a lock-wait policy (`LockWait`, shared with
 sched-core: EL1 uses a bounded spin and forwards on `Contended`, the host

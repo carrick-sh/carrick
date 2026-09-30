@@ -55,6 +55,11 @@ pub enum Error {
     TooManyFiles,
     /// Authority storage exhausted (not the process's RLIMIT_NOFILE).
     NoMemory,
+    /// Every published open-file-description record is in use. The venue
+    /// publishes more ([`Authority::publish_ofds`]) outside any lock and
+    /// retries, or reports its zone-wide file limit (ENFILE). An internal
+    /// storage request: never EMFILE, and never ENOMEM by itself.
+    NeedsOfds,
     StaleTable,
     /// Supply at least this many descriptor slots and their bitmap, then retry.
     /// This is an internal storage request, never EMFILE.
@@ -247,8 +252,14 @@ impl Extent {
 /// least `bitmap_words(capacity)` words, or `None` (fails closed as
 /// [`Error::BadBacking`]). Allocation of extents happens outside this
 /// authority, never under a table lock.
+///
+/// The venue also holds the open-file-description records: `ofd(index)`
+/// resolves record `index` for every index below the core's published
+/// count ([`Core::ofd_count`], grown by [`Authority::publish_ofds`]). The
+/// core never asks for an unpublished index; `None` fails closed.
 pub trait SlotBacking {
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])>;
+    fn ofd(&self, index: usize) -> Option<&OfdRecord>;
 }
 
 #[cfg(test)]
@@ -501,23 +512,27 @@ fn decode_mode(mode: u64, immutable: u64) -> (AccessMode, StatusFlags) {
     )
 }
 
-/// Venue-backed descriptor capacity, T table identities and O shared OFDs,
-/// as one `repr(C)` object of atomics. All-zero memory is a valid
-/// *unpublished* core; exactly one initialization venue calls
+/// Venue-backed descriptor capacity and T table identities as one `repr(C)`
+/// object of atomics. Open file descriptions live in venue memory
+/// ([`SlotBacking::ofd`]) and grow elastically: the core records how many
+/// the venue has published and keeps their free list. All-zero memory is a
+/// valid *unpublished* core; exactly one initialization venue calls
 /// [`Core::initialize`] (in shared memory: the host, before EL1 attaches).
 /// Not Clone: copying the authority would duplicate backing ownership.
 #[repr(C, align(64))]
-pub struct Core<const T: usize, const O: usize> {
+pub struct Core<const T: usize> {
     identity: AtomicU64,
     free_tables: AtomicU64,
     free_ofds: AtomicU64,
-    _reserved: [u64; 5],
+    /// OFD records published by the venue ([`Authority::publish_ofds`]):
+    /// indices below it resolve; it only grows.
+    ofd_count: AtomicU64,
+    _reserved: [u64; 4],
     tables: [TableRecord; T],
-    ofds: [OfdRecord; O],
 }
 
 /// Layout facts a shared-memory venue folds into its ABI layout hash.
-pub const LAYOUT_FACTS: [u64; 10] = [
+pub const LAYOUT_FACTS: [u64; 12] = [
     core::mem::size_of::<TableRecord>() as u64,
     core::mem::align_of::<TableRecord>() as u64,
     core::mem::size_of::<OfdRecord>() as u64,
@@ -528,6 +543,8 @@ pub const LAYOUT_FACTS: [u64; 10] = [
     core::mem::offset_of!(OfdRecord, mode) as u64,
     SLOT_CLOEXEC,
     MODE_MUTABLE,
+    core::mem::offset_of!(Core<1>, ofd_count) as u64,
+    core::mem::offset_of!(Core<1>, tables) as u64,
 ];
 
 /// A tagged lock-free stack of free record indices, for venue record arrays
@@ -585,17 +602,17 @@ pub mod free_list {
 }
 use free_list::{pop, push};
 
-impl<const T: usize, const O: usize> Core<T, O> {
+impl<const T: usize> Core<T> {
     /// A published core for a single address space (host-only venues and
-    /// tests), with a process-unique identity.
+    /// tests), with a process-unique identity and no OFD records yet.
     pub fn new() -> Result<Self, Error> {
         let core = Self {
             identity: AtomicU64::new(0),
             free_tables: AtomicU64::new(0),
             free_ofds: AtomicU64::new(0),
-            _reserved: [0; 5],
+            ofd_count: AtomicU64::new(0),
+            _reserved: [0; 4],
             tables: core::array::from_fn(|_| TableRecord::default()),
-            ofds: core::array::from_fn(|_| OfdRecord::default()),
         };
         let identity = NEXT_AUTHORITY
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -606,12 +623,13 @@ impl<const T: usize, const O: usize> Core<T, O> {
 
     /// Publish a zeroed core in place with a nonzero `identity` chosen by the
     /// one initialization venue (unique among authorities it serves). Links
-    /// the free lists, then publishes the identity with Release; a core whose
-    /// identity reads zero is unpublished and every operation fails closed.
+    /// the table free list, then publishes the identity with Release; a core
+    /// whose identity reads zero is unpublished and every operation fails
+    /// closed. OFD records are published separately, as the venue grows
+    /// ([`Authority::publish_ofds`]).
     pub fn initialize(&self, identity: u64) -> Result<(), Error> {
         if identity == 0
             || T >= FREE_INDEX as usize
-            || O >= FREE_INDEX as usize
             || T.checked_mul(MAX_DESCRIPTORS)
                 .is_none_or(|n| n == usize::MAX)
             || self.identity.load(Ordering::Acquire) != 0
@@ -621,9 +639,6 @@ impl<const T: usize, const O: usize> Core<T, O> {
         for i in (0..T).rev() {
             push(&self.free_tables, i, &self.tables[i].next_free);
         }
-        for i in (0..O).rev() {
-            push(&self.free_ofds, i, &self.ofds[i].next_free);
-        }
         self.identity.store(identity, Ordering::Release);
         Ok(())
     }
@@ -632,12 +647,17 @@ impl<const T: usize, const O: usize> Core<T, O> {
         self.identity.load(Ordering::Acquire)
     }
 
+    /// OFD records the venue has published (indices `0..ofd_count`).
+    pub fn ofd_count(&self) -> usize {
+        self.ofd_count.load(Ordering::Acquire) as usize
+    }
+
     /// Operate on this core with a venue's slot resolution and lock policy.
     pub fn bind<'a, B: SlotBacking, W: LockWait>(
         &'a self,
         backing: &'a B,
         wait: W,
-    ) -> Authority<'a, B, W, T, O> {
+    ) -> Authority<'a, B, W, T> {
         Authority {
             core: self,
             backing,
@@ -650,8 +670,8 @@ impl<const T: usize, const O: usize> Core<T, O> {
 /// exactly the tables they touch; OFD references, pins and free lists are
 /// lock-free words. No operation allocates, sleeps or calls out except the
 /// release callbacks documented per method.
-pub struct Authority<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> {
-    core: &'a Core<T, O>,
+pub struct Authority<'a, B: SlotBacking, W: LockWait, const T: usize> {
+    core: &'a Core<T>,
     backing: &'a B,
     wait: W,
 }
@@ -665,7 +685,7 @@ impl Drop for Locked<'_> {
     }
 }
 
-impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<'a, B, W, T, O> {
+impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     fn identity(&self) -> Result<u64, Error> {
         match self.core.identity.load(Ordering::Acquire) {
             0 => Err(Error::StaleTable),
@@ -728,32 +748,73 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
         Ok((guard, table))
     }
 
-    fn ofd(&self, index: u32) -> &'a OfdRecord {
-        // Indices come from slots this authority wrote or from checked pins.
-        &self.core.ofds[index as usize]
+    /// A published OFD record. Indices come from slots this authority wrote,
+    /// from checked pins or from its free list, so a failure is a venue bug
+    /// (fail closed).
+    fn ofd(&self, index: u32) -> Result<&'a OfdRecord, Error> {
+        if u64::from(index) >= self.core.ofd_count.load(Ordering::Acquire) {
+            return Err(Error::BadBacking);
+        }
+        self.backing.ofd(index as usize).ok_or(Error::BadBacking)
     }
 
-    fn snapshot(&self, index: u32) -> Description {
-        let ofd = self.ofd(index);
+    fn snapshot(&self, index: u32) -> Result<Description, Error> {
+        let ofd = self.ofd(index)?;
         let (access, flags) = decode_mode(
             ofd.mode.load(Ordering::Acquire),
             ofd.immutable.load(Ordering::Relaxed),
         );
-        Description {
+        Ok(Description {
             backing: BackingToken(ofd.backing.load(Ordering::Relaxed)),
             offset: Offset(ofd.offset.load(Ordering::Acquire)),
             access,
             flags,
+        })
+    }
+
+    /// Publish `count` more OFD records: the venue has made records
+    /// `ofd_count()..ofd_count() + count` resolvable, zero-filled and used by
+    /// nothing else. The count is published (Release) before the records
+    /// join the free list, so every index the list hands out resolves. The
+    /// one growth venue serializes its calls; a concurrent publication
+    /// refuses with `Contended` and changes nothing. O(count), outside any
+    /// table lock.
+    pub fn publish_ofds(&self, count: usize) -> Result<(), Error> {
+        self.identity()?;
+        let first = self.core.ofd_count.load(Ordering::Acquire);
+        let end = first
+            .checked_add(count as u64)
+            .filter(|end| *end < FREE_INDEX)
+            .ok_or(Error::InvalidArgument)?;
+        if count == 0 {
+            return Ok(());
         }
+        for index in [first, end - 1] {
+            let record = self.backing.ofd(index as usize).ok_or(Error::BadBacking)?;
+            if record.holds.load(Ordering::Relaxed) != 0 {
+                return Err(Error::BadBacking);
+            }
+        }
+        self.core
+            .ofd_count
+            .compare_exchange(first, end, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::Contended)?;
+        for index in (first..end).rev() {
+            let record = self.ofd(index as u32)?;
+            push(&self.core.free_ofds, index as usize, &record.next_free);
+        }
+        Ok(())
     }
 
     fn alloc_ofd(&self, description: Description) -> Result<u32, Error> {
-        let ofds = &self.core.ofds;
         let index = pop(&self.core.free_ofds, |i| {
-            ofds.get(i).map(|o| o.next_free.load(Ordering::Relaxed))
+            self.ofd(u32::try_from(i).ok()?)
+                .ok()
+                .map(|o| o.next_free.load(Ordering::Relaxed))
         })
-        .ok_or(Error::NoMemory)?;
-        let ofd = &ofds[index];
+        .ok_or(Error::NeedsOfds)?;
+        let index = u32::try_from(index).map_err(|_| Error::BadBacking)?;
+        let ofd = self.ofd(index)?;
         ofd.backing.store(description.backing.0, Ordering::Relaxed);
         ofd.offset.store(description.offset.0, Ordering::Relaxed);
         ofd.immutable
@@ -763,21 +824,22 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
             Ordering::Relaxed,
         );
         ofd.holds.store(REF, Ordering::Release);
-        Ok(index as u32)
+        Ok(index)
     }
 
-    fn free_ofd(&self, index: u32) {
-        let ofd = self.ofd(index);
+    fn free_ofd(&self, index: u32) -> Result<(), Error> {
+        let ofd = self.ofd(index)?;
         // A generation that cannot advance retires the record (fail closed).
         if ofd.generation.fetch_add(1, Ordering::AcqRel) < u64::MAX - 1 {
             push(&self.core.free_ofds, index as usize, &ofd.next_free);
         }
+        Ok(())
     }
 
     /// Add one descriptor reference or pin; refuses to resurrect a finalized
     /// description or overflow either half.
     fn retain(&self, index: u32, amount: u64) -> Result<(), Error> {
-        let holds = &self.ofd(index).holds;
+        let holds = &self.ofd(index)?.holds;
         let mut current = holds.load(Ordering::Relaxed);
         loop {
             let half = if amount == REF {
@@ -803,7 +865,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     /// Drop one reference or pin; the caller that reaches zero receives the
     /// description and frees the record (exactly once).
     fn drop_hold(&self, index: u32, amount: u64) -> Result<Option<Description>, Error> {
-        let holds = &self.ofd(index).holds;
+        let holds = &self.ofd(index)?.holds;
         let mut current = holds.load(Ordering::Relaxed);
         loop {
             let half = if amount == REF {
@@ -827,8 +889,8 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
         if current != amount {
             return Ok(None);
         }
-        let released = self.snapshot(index);
-        self.free_ofd(index);
+        let released = self.snapshot(index)?;
+        self.free_ofd(index)?;
         Ok(Some(released))
     }
 
@@ -923,17 +985,17 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     /// O(1) read-only snapshot; it does not retain the backing beyond the lock.
     pub fn get(&self, table: TableId, fd: Fd) -> Result<Description, Error> {
         let (_guard, t) = self.lock(table)?;
-        Ok(self.snapshot(t.entry(fd)?.ofd))
+        self.snapshot(t.entry(fd)?.ofd)
     }
     /// Descriptor references to `fd`'s description (pins are not counted).
     pub fn refcount(&self, table: TableId, fd: Fd) -> Result<usize, Error> {
         let (_guard, t) = self.lock(table)?;
-        let holds = self.ofd(t.entry(fd)?.ofd).holds.load(Ordering::Acquire);
+        let holds = self.ofd(t.entry(fd)?.ofd)?.holds.load(Ordering::Acquire);
         Ok((holds >> 32) as usize)
     }
     pub fn set_offset(&self, table: TableId, fd: Fd, offset: Offset) -> Result<(), Error> {
         let (_guard, t) = self.lock(table)?;
-        let ofd = self.ofd(t.entry(fd)?.ofd);
+        let ofd = self.ofd(t.entry(fd)?.ofd)?;
         ofd.offset.store(offset.0, Ordering::Release);
         Ok(())
     }
@@ -958,7 +1020,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     /// SCM_RIGHTS) and updated atomically.
     pub fn setfl(&self, table: TableId, fd: Fd, flags: StatusFlags) -> Result<(), Error> {
         let (_guard, t) = self.lock(table)?;
-        let ofd = self.ofd(t.entry(fd)?.ofd);
+        let ofd = self.ofd(t.entry(fd)?.ofd)?;
         Self::set_ofd_flags(ofd, flags)
     }
 
@@ -1250,7 +1312,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
         let (_guard, t) = self.lock(table)?;
         let entry = t.entry(fd)?;
         self.retain(entry.ofd, PIN)?;
-        let generation = self.ofd(entry.ofd).generation.load(Ordering::Acquire);
+        let generation = self.ofd(entry.ofd)?.generation.load(Ordering::Acquire);
         let pin = OfdPin {
             authority: self.core.identity.load(Ordering::Relaxed),
             key: OfdKey {
@@ -1258,15 +1320,11 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
                 generation,
             },
         };
-        Ok((pin, self.snapshot(entry.ofd)))
+        Ok((pin, self.snapshot(entry.ofd)?))
     }
 
     fn check_pin(&self, pin: &OfdPin) -> Result<(), Error> {
-        let ofd = self
-            .core
-            .ofds
-            .get(pin.key.index as usize)
-            .ok_or(Error::StalePin)?;
+        let ofd = self.ofd(pin.key.index).map_err(|_| Error::StalePin)?;
         if pin.authority != self.identity()?
             || ofd.generation.load(Ordering::Acquire) != pin.key.generation
             || ofd.holds.load(Ordering::Acquire) & FREE_INDEX == 0
@@ -1280,7 +1338,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     /// an operation is suspended, e.g. F_SETFL O_NONBLOCK from a sibling).
     pub fn pinned(&self, pin: &OfdPin) -> Result<Description, Error> {
         self.check_pin(pin)?;
-        Ok(self.snapshot(pin.key.index))
+        self.snapshot(pin.key.index)
     }
 
     /// Admit a description before installing a numeric descriptor. The pin
@@ -1289,7 +1347,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     pub fn create_pinned(&self, description: Description) -> Result<OfdPin, Error> {
         let authority = self.identity()?;
         let index = self.alloc_ofd(description)?;
-        let ofd = self.ofd(index);
+        let ofd = self.ofd(index)?;
         // Newly allocated and unpublished: exchange the initial descriptor
         // hold for the caller's pin before exposing the OFD identity.
         ofd.holds.store(PIN, Ordering::Release);
@@ -1357,7 +1415,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     /// numeric fd reuse. Uses the same immutable/mutable mask as `setfl`.
     pub fn set_pinned_flags(&self, pin: &OfdPin, flags: StatusFlags) -> Result<(), Error> {
         self.check_pin(pin)?;
-        Self::set_ofd_flags(self.ofd(pin.key.index), flags)
+        Self::set_ofd_flags(self.ofd(pin.key.index)?, flags)
     }
 
     /// Release a pin. Returns the description exactly when this was its final
@@ -1372,7 +1430,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize, const O: usize> Authority<
     /// Descriptor references and pins of a pinned description.
     pub fn holds(&self, pin: &OfdPin) -> Result<(usize, usize), Error> {
         self.check_pin(pin)?;
-        let holds = self.ofd(pin.key.index).holds.load(Ordering::Acquire);
+        let holds = self.ofd(pin.key.index)?.holds.load(Ordering::Acquire);
         Ok(((holds >> 32) as usize, (holds & FREE_INDEX) as usize))
     }
 

@@ -65,10 +65,11 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use carrick_fd_core::BoundedSpin;
 use carrick_fd_core::free_list::{pop, push};
 pub use carrick_fd_core::{
-    self as fd, BackingToken, DescriptorSlot, Extent, LockWait, OfdPin, RawOfdPin, RawTableId,
-    SlotBacking, bitmap_words,
+    self as fd, BackingToken, DescriptorSlot, Extent, LockWait, OfdPin, OfdRecord, RawOfdPin,
+    RawTableId, SlotBacking, bitmap_words,
 };
 pub use carrick_pipe_core::{
     self as pipe, End, EventFd, EventMode, Page, Pipe, PipeRecord, WakeSet, WriteProgress,
@@ -94,9 +95,9 @@ const HOST_WAKE_WORDS: usize = IPC_OBJECTS.div_ceil(64);
 const _: () = assert!(HOST_WAKE_WORDS <= 64);
 
 /// The descriptor authority shared by host and EL1.
-pub type IpcFdCore = fd::Core<IPC_FD_TABLES, IPC_OFDS>;
+pub type IpcFdCore = fd::Core<IPC_FD_TABLES>;
 /// The descriptor authority bound to this region and a lock policy.
-pub type IpcFdAuthority<'a, W> = fd::Authority<'a, IpcRegion<'a>, W, IPC_FD_TABLES, IPC_OFDS>;
+pub type IpcFdAuthority<'a, W> = fd::Authority<'a, IpcRegion<'a>, W, IPC_FD_TABLES>;
 
 // ---------------------------------------------------------------- handles
 
@@ -374,6 +375,7 @@ pub struct IpcDirectory {
     owed_host_wakes_without_target: AtomicU64,
     _reserved: [u64; 6],
     fd: IpcFdCore,
+    ofds: [OfdRecord; IPC_OFDS],
     objects: [IpcObjectRecord; IPC_OBJECTS],
     free_operations: AtomicU64,
     _reserved_ops: [u64; 7],
@@ -397,6 +399,7 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::align_of::<IpcDirectory>() as u64,
     core::mem::offset_of!(IpcDirectory, owed_host_wakes_without_target) as u64,
     core::mem::offset_of!(IpcDirectory, fd) as u64,
+    core::mem::offset_of!(IpcDirectory, ofds) as u64,
     core::mem::offset_of!(IpcDirectory, objects) as u64,
     core::mem::size_of::<IpcFdCore>() as u64,
     core::mem::size_of::<IpcObjectRecord>() as u64,
@@ -723,6 +726,15 @@ impl<'a> IpcRegion<'a> {
             return Err(IpcError::BadRegion);
         }
         d.fd.initialize(identity).map_err(IpcError::Fd)?;
+        let region = Self {
+            dir: d,
+            pool,
+            pool_len: pool_len as u64,
+            _pool: PhantomData,
+        };
+        d.fd.bind(&region, BoundedSpin(0))
+            .publish_ofds(IPC_OFDS)
+            .map_err(IpcError::Fd)?;
         for i in (0..IPC_OBJECTS).rev() {
             push(&d.free_objects, i, &d.objects[i].next_free);
         }
@@ -735,12 +747,7 @@ impl<'a> IpcRegion<'a> {
             .store(IPC_LAYOUT_HASH, Ordering::Relaxed);
         d.header.pool_len.store(pool_len as u64, Ordering::Relaxed);
         d.header.state.store(IPC_READY, Ordering::Release);
-        Ok(Self {
-            dir: d,
-            pool,
-            pool_len: pool_len as u64,
-            _pool: PhantomData,
-        })
+        Ok(region)
     }
 
     /// Attach to a published region, authenticating magic, layout hash,
@@ -1235,6 +1242,10 @@ impl<'a> IpcRegion<'a> {
 }
 
 impl SlotBacking for IpcRegion<'_> {
+    fn ofd(&self, index: usize) -> Option<&OfdRecord> {
+        self.dir.ofds.get(index)
+    }
+
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
         let capacity = usize::try_from(extent.capacity).ok()?;
         let words = bitmap_words(capacity);
