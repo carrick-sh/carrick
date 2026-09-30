@@ -541,6 +541,39 @@
       "rationale": "Serializing the freshly built page-table image cannot legitimately fail; failure means the manager produced an unrepresentable image that EL1 would boot on.",
       "sink": "fatal",
       "domain": "mem::stage1_tables"
+    },
+    {
+      "file": "crates/carrick-aarch64/src/engine.rs",
+      "function": "Aarch64EngineCore<V>::map_host_alias_on_guest_lane",
+      "ordinal_in_function": 1,
+      "fingerprint": "fe1be694643ade99fbf18dd8119fa5c27296f8dd38bdbdb81b26ebcdd8bf8545",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::alias_cleanup",
+      "rationale": "The alias length was accepted as a u64 VA span during installation; failing to represent it as usize while unwinding a refused publication means cleanup cannot name the range it must retire.",
+      "sink": "fatal",
+      "domain": "aarch64::alias_cleanup"
+    },
+    {
+      "file": "crates/carrick-aarch64/src/engine.rs",
+      "function": "Aarch64EngineCore<V>::map_host_alias_on_guest_lane",
+      "ordinal_in_function": 2,
+      "fingerprint": "c6e6cb904a8d8708d9b4c440c121432f5ed826a7622a184bc0e0b27daa3f005c",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::alias_cleanup",
+      "rationale": "A refused alias publication before inventory application must retire whatever the VA span holds; failing leaves translations to an abandoned staging, exactly as the host lane's unmap_aliased cleanup would.",
+      "sink": "fatal",
+      "domain": "aarch64::alias_cleanup"
+    },
+    {
+      "file": "crates/carrick-aarch64/src/engine.rs",
+      "function": "Aarch64EngineCore<V>::map_host_alias_on_guest_lane",
+      "ordinal_in_function": 3,
+      "fingerprint": "7a9d9b52a691309737cae81e61fffb11b02921517d892cd1aeb3639d08935fcf",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::alias_cleanup",
+      "rationale": "After retirement, unregistering the alias is the last cleanup step; failure leaves backend alias metadata naming a mapping the MM no longer has.",
+      "sink": "fatal",
+      "domain": "aarch64::alias_cleanup"
     }
   ]
 }
