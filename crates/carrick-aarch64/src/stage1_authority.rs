@@ -16,7 +16,7 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 };
 use carrick_mmu_core::aarch64::{
     GuestTxnPrepareError, GuestTxnSettleError, HostArenaResolver, LiveDescriptorOwner,
-    PageTableApplyOutcome, PageTableError, PageTableManager, PtOp, TableArenaSource,
+    PageTableApplyOutcome, PageTableError, PageTableManager, PtOp, TableArenaSource, TerminalRule,
 };
 
 /// Explicit sharing lifecycle for stage-1 page tables across process fork/execve boundaries.
@@ -959,6 +959,79 @@ impl Stage1Authority {
 ///
 /// Created inside [`Stage1Authority::edit`]. Automatically routes mutating operations
 /// to `PageTableManager`'s `*_with_source` variants, passing the active arena source.
+/// One host `mprotect` of `[address, address+len)` as shared terminal rules,
+/// in the order they must apply. Both lanes use this one plan: the host
+/// editor applies it with `apply_rule`, the guest lane submits each entry as
+/// an EL1 `DescriptorOp::Terminal`. It reproduces the host's historical
+/// sequence exactly (retired-leaf reset for a new mapping, then the
+/// protection over the whole range, then fork re-arming of every
+/// overlapping armed range, in full) by composing those passes per
+/// terminal: armed intersections carry `fork_arm`, armed parts outside the
+/// range get a plain fork arm. Every span in the plan is disjoint, so each
+/// guest transaction takes its pages straight to their final state.
+pub fn protection_terminal_rules(
+    address: u64,
+    len: usize,
+    prot: u64,
+    armed_cow: &[crate::vmm::ForkCowRange],
+    new_mapping: bool,
+) -> Vec<(u64, usize, TerminalRule)> {
+    use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+    let exec = prot & LINUX_PROT_EXEC != 0;
+    let (op, deny_host_buffers) = if prot & LINUX_PROT_WRITE != 0 {
+        (PtOp::ReadWrite { exec }, false)
+    } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
+        (PtOp::ReadOnly { exec }, false)
+    } else {
+        // PROT_NONE over EL1-private leaves also denies host buffer access.
+        (PtOp::Invalidate, true)
+    };
+    let start = address;
+    let end = address.saturating_add(len as u64);
+    // Merge the armed ranges into disjoint, sorted intervals.
+    let mut armed: Vec<(u64, u64)> = armed_cow
+        .iter()
+        .filter(|range| range.len != 0)
+        .map(|range| (range.va, range.va.saturating_add(range.len as u64)))
+        .collect();
+    armed.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(armed.len());
+    for (lo, hi) in armed {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    let rule = |fork_arm| TerminalRule::Pt {
+        op: Some(op),
+        reset_retired: new_mapping,
+        deny_host_buffers,
+        fork_arm,
+    };
+    let arm_only = TerminalRule::pt(PtOp::ForkReadOnly);
+    let mut plan = Vec::new();
+    let mut push = |lo: u64, hi: u64, rule: TerminalRule| {
+        if lo < hi {
+            plan.push((lo, (hi - lo) as usize, rule));
+        }
+    };
+    let mut cursor = start;
+    for &(lo, hi) in &merged {
+        // Armed part before the protected range: re-arm only.
+        push(lo, hi.min(start), arm_only);
+        let (in_lo, in_hi) = (lo.max(start), hi.min(end));
+        if in_lo < in_hi {
+            push(cursor, in_lo, rule(false));
+            push(in_lo, in_hi, rule(true));
+            cursor = cursor.max(in_hi);
+        }
+        // Armed part after the protected range: re-arm only.
+        push(lo.max(end), hi, arm_only);
+    }
+    push(cursor, end, rule(false));
+    plan
+}
+
 pub struct Stage1Editor<'a> {
     pub manager: &'a mut PageTableManager,
     pub arena_source: &'a mut Option<Box<dyn TableArenaSource>>,
@@ -1018,6 +1091,8 @@ impl<'a> Stage1Editor<'a> {
         )
     }
 
+    /// Host-lane mprotect: apply [`protection_terminal_rules`] with the
+    /// shared per-terminal rule, exactly what the guest lane submits.
     pub fn apply_protection_edit(
         &mut self,
         address: u64,
@@ -1025,21 +1100,34 @@ impl<'a> Stage1Editor<'a> {
         prot: u64,
         armed_cow: &[crate::vmm::ForkCowRange],
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
-        let exec = prot & LINUX_PROT_EXEC != 0;
-        let mut outcome = if prot & LINUX_PROT_WRITE != 0 {
-            self.set_rw(address, len, exec)?
-        } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
-            self.set_readonly(address, len, exec)?
-        } else {
-            self.manager.set_prot_none_denying_host_buffers(
-                address,
-                len,
-                self.arena_source.as_deref_mut(),
-            )?
-        };
-        for range in armed_cow {
-            outcome |= self.set_fork_readonly(range.va, range.len)?;
+        self.apply_terminal_rules(&protection_terminal_rules(
+            address, len, prot, armed_cow, false,
+        ))
+    }
+
+    /// Apply shared terminal rules in order. A retired-leaf reset is
+    /// validated over its whole span first, so the journal-less host editor
+    /// refuses an occupied new mapping without a partial edit.
+    pub fn apply_terminal_rules(
+        &mut self,
+        rules: &[(u64, usize, TerminalRule)],
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        for &(va, len, rule) in rules {
+            if matches!(
+                rule,
+                TerminalRule::Pt {
+                    reset_retired: true,
+                    ..
+                }
+            ) {
+                self.manager.check_vacant_for_new_mapping(va, len)?;
+            }
+        }
+        let mut outcome = PageTableApplyOutcome::default();
+        for &(va, len, rule) in rules {
+            outcome |= self
+                .manager
+                .apply_rule(va, len, rule, self.arena_source.as_deref_mut())?;
         }
         Ok(outcome)
     }
@@ -1303,6 +1391,177 @@ mod tests {
 
         fn return_arena(&mut self, gpa: SubstrateGpa) {
             self.returned.lock().unwrap().push(Gpa(gpa.0));
+        }
+    }
+
+    /// The shared protection plan reproduces the host's historical mprotect
+    /// sequence exactly: retired-leaf reset (new mapping), protection over
+    /// the whole range, then fork re-arming of every overlapping armed range
+    /// in full. Page for page, across prepared/resident/armed/retired EL1
+    /// grants, coarse blocks and armed ranges inside, straddling and
+    /// outside the protected range.
+    #[test]
+    fn protection_plan_matches_the_sequential_host_mprotect() {
+        use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+        use carrick_mmu_core::aarch64::{GuestLeafPublication, terminal_descriptor};
+        const PAGE: u64 = 4096;
+        const TWO_MIB: u64 = 2 << 20;
+        let base = LINUX_MMAP_BASE + 0x40_0000;
+        let mut image = test_manager();
+        image
+            .set_prot_none(LINUX_MMAP_BASE, 64 << 20, None)
+            .unwrap();
+        // Eight 4-page EL1 grants, one resident page each.
+        for slot in 0..8u64 {
+            image
+                .publish_private_pages(
+                    GuestLeafPublication {
+                        va: base + slot * 16 * PAGE,
+                        ipa: 0x009b_4000_0000 + slot * 16 * PAGE,
+                        len: 4 * PAGE,
+                        writable: true,
+                        executable: false,
+                    },
+                    base + slot * 16 * PAGE + (slot % 4) * PAGE,
+                    None,
+                )
+                .unwrap();
+        }
+        // Grant 2 fork-armed, grant 3 retired, plus a coarse RW block.
+        image
+            .set_fork_readonly(base + 32 * PAGE, 4 * PAGE as usize, None)
+            .unwrap();
+        image
+            .apply(base + 48 * PAGE, 4 * PAGE as usize, PtOp::Retire, None)
+            .unwrap();
+        let block = LINUX_MMAP_BASE + 16 * TWO_MIB;
+        image.set_rw(block, TWO_MIB as usize, false, None).unwrap();
+        let armed = |va: u64, len: u64| crate::vmm::ForkCowRange {
+            va,
+            len: len as usize,
+            executable: false,
+            kernel_only: false,
+            granule: crate::vmm::CowGranule::Page,
+        };
+        // (address, len, prot, armed ranges, new mapping)
+        let cases: Vec<(u64, u64, u64, Vec<crate::vmm::ForkCowRange>, bool)> = vec![
+            (
+                base,
+                4 * PAGE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                vec![],
+                false,
+            ),
+            (
+                base + 16 * PAGE,
+                4 * PAGE,
+                LINUX_PROT_READ | LINUX_PROT_EXEC,
+                vec![],
+                false,
+            ),
+            (base + 16 * PAGE, 4 * PAGE, 0, vec![], false),
+            // Armed range inside, straddling the start, and wholly outside.
+            (
+                base + 32 * PAGE,
+                4 * PAGE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                vec![armed(base + 33 * PAGE, 2 * PAGE)],
+                false,
+            ),
+            (
+                base + 34 * PAGE,
+                2 * PAGE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                vec![
+                    armed(base + 32 * PAGE, 3 * PAGE),
+                    armed(base + 64 * PAGE, 4 * PAGE),
+                ],
+                false,
+            ),
+            (
+                base + 32 * PAGE,
+                4 * PAGE,
+                0,
+                vec![armed(base + 32 * PAGE, 4 * PAGE)],
+                false,
+            ),
+            // New mapping over the retired grant.
+            (
+                base + 48 * PAGE,
+                4 * PAGE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                vec![],
+                true,
+            ),
+            // Bisected coarse block, with an armed range inside it.
+            (
+                block + 3 * PAGE,
+                5 * PAGE,
+                LINUX_PROT_READ,
+                vec![armed(block + 4 * PAGE, PAGE)],
+                false,
+            ),
+        ];
+        for (index, (address, len, prot, armed_cow, new_mapping)) in cases.iter().enumerate() {
+            let (address, len, prot) = (*address, *len as usize, *prot);
+            let mut sequential = image.snapshot_image().unwrap();
+            if *new_mapping {
+                sequential
+                    .clear_retired_for_new_mapping(address, len, None)
+                    .unwrap();
+            }
+            let exec = prot & LINUX_PROT_EXEC != 0;
+            if prot & LINUX_PROT_WRITE != 0 {
+                sequential.set_rw(address, len, exec, None).unwrap();
+            } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
+                sequential.set_readonly(address, len, exec, None).unwrap();
+            } else {
+                sequential
+                    .set_prot_none_denying_host_buffers(address, len, None)
+                    .unwrap();
+            }
+            for range in armed_cow {
+                sequential
+                    .set_fork_readonly(range.va, range.len, None)
+                    .unwrap();
+            }
+
+            let mut planned = image.snapshot_image().unwrap();
+            let mut source = None;
+            let mut editor = Stage1Editor {
+                manager: &mut planned,
+                arena_source: &mut source,
+            };
+            let plan = protection_terminal_rules(address, len, prot, armed_cow, *new_mapping);
+            editor.apply_terminal_rules(&plan).unwrap();
+
+            let lo = armed_cow
+                .iter()
+                .map(|range| range.va)
+                .chain([address])
+                .min()
+                .unwrap()
+                .saturating_sub(2 * PAGE);
+            let hi = armed_cow
+                .iter()
+                .map(|range| range.va + range.len as u64)
+                .chain([address + len as u64])
+                .max()
+                .unwrap()
+                + 2 * PAGE;
+            let mut page = lo;
+            let mut changed = false;
+            while page < hi {
+                let expected = terminal_descriptor(sequential.debug_walk(page));
+                let actual = terminal_descriptor(planned.debug_walk(page));
+                assert_eq!(
+                    expected, actual,
+                    "case {index} page {page:#x}: sequential {expected:#x} plan {actual:#x}"
+                );
+                changed |= expected != terminal_descriptor(image.debug_walk(page));
+                page += PAGE;
+            }
+            assert!(changed, "case {index} is vacuous");
         }
     }
 

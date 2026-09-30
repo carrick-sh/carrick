@@ -37,7 +37,8 @@ use carrick_hal::{
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mmu_core::aarch64::{
-    LiveDescriptorOwner, PageTableApplyOutcome, PageTableError, PageTableManager,
+    LiveDescriptorOwner, PageTableApplyOutcome, PageTableError, PageTableManager, PtOp,
+    TerminalRule,
 };
 
 pub use crate::stage1_authority::{ShareState, Stage1Authority, Stage1Editor};
@@ -1514,6 +1515,48 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
     }
 
+    /// Apply shared stage-1 range rules on either lane, over the adopted
+    /// range `adopt`. Host lane: the software editor applies each rule with
+    /// `apply_rule` and one TLBI follows when a valid leaf changed. Guest
+    /// lane: each rule is one EL1 `DescriptorOp::Terminal` transaction,
+    /// prepared against the live graph just before submission and applied
+    /// and settled on this vCPU, where EL1 performs the invalidation. The
+    /// plan's spans are disjoint, so a refusal part-way leaves every page at
+    /// either its old or its final state.
+    fn apply_stage1_rules(
+        &mut self,
+        adopt: (u64, usize),
+        rules: &[(u64, usize, TerminalRule)],
+    ) -> Result<(), MemoryError> {
+        if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
+            return self.pt_edit_and_flush_after_adopting(adopt.0, adopt.1, |editor| {
+                editor.apply_terminal_rules(rules)
+            });
+        }
+        let failure = |what: String| MemoryError::HostMap(format!("guest stage-1 rule: {what}"));
+        let mm = std::num::NonZeroU64::new(self.mm_generation)
+            .ok_or_else(|| failure("no MM identity".to_owned()))?;
+        let slots = carrick_el1_abi::descriptor_txn_slots_host()
+            .ok_or_else(|| failure("no descriptor slots".to_owned()))?;
+        self.load_live_stage1_manager()?;
+        let tables = self.page_tables.clone();
+        for &(va, len, rule) in rules {
+            let op = tables
+                .with_manager(|manager| manager.terminal_op(va, len as u64, rule))
+                .ok_or_else(|| failure("stage-1 image absent".to_owned()))?;
+            let txn = tables
+                .prepare_guest_descriptor_txn(mm, op)
+                .map_err(|error| failure(format!("prepare at 0x{va:x}: {error:?}")))?;
+            crate::descriptor_drain::apply_guest_descriptor_txns_now(
+                &mut crate::descriptor_drain::EngineDrainVenue(self),
+                slots,
+                &[txn],
+            )
+            .map_err(|error| failure(format!("apply at 0x{va:x}: {error}")))?;
+        }
+        Ok(())
+    }
+
     /// Revert uncommitted page table edits from the undo journal to shadow and host memory,
     /// and flush stale translations from the stage-1 TLB.
     fn pt_rollback_undo_and_flush(&mut self) -> Result<(), MemoryError> {
@@ -2523,11 +2566,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn mark_bus_fault(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.pt_edit_and_flush_after_adopting(address, len, |editor| {
-            editor
-                .manager
-                .mark_bus_fault(address, len, editor.arena_source.as_deref_mut())
-        })
+        if len == 0
+            || !address.is_multiple_of(4096)
+            || !len.is_multiple_of(4096)
+            || address.checked_add(len as u64).is_none()
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            });
+        }
+        self.apply_stage1_rules((address, len), &[(address, len, TerminalRule::BusFault)])
     }
 
     fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
@@ -2819,22 +2868,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             Vec::new()
         };
         let new_mapping = self.pending_new_mapping.take() == Some((address, len));
-        // pt_edit_AND_FLUSH: a guest can `mprotect` an ALREADY-TOUCHED page (e.g.
-        // RELRO RW→RO), so the stale stage-1 TLB entry must be invalidated for the
-        // new protection to take effect.
-        self.pt_edit_and_flush_after_adopting(address, len, |editor| {
-            let reset = if new_mapping {
-                editor.manager.clear_retired_for_new_mapping(
-                    address,
-                    len,
-                    editor.arena_source.as_deref_mut(),
-                )?
-            } else {
-                PageTableApplyOutcome::default()
-            };
-            let protection = editor.apply_protection_edit(address, len, prot, &armed_cow)?;
-            Ok(reset | protection)
-        })?;
+        // One plan for both lanes. A guest can `mprotect` an ALREADY-TOUCHED
+        // page (e.g. RELRO RW→RO), so a changed valid leaf is invalidated:
+        // by the host TLBI, or by EL1 on the guest-owned lane.
+        let plan = crate::stage1_authority::protection_terminal_rules(
+            address,
+            len,
+            prot,
+            &armed_cow,
+            new_mapping,
+        );
+        self.apply_stage1_rules((address, len), &plan)?;
         self.vm
             .observe_frame_cow_protection(address, len, prot)
             .map_err(|error| {
@@ -2875,9 +2919,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 mgr.unmap_aliased(address, len)
             })?;
         } else {
-            self.pt_edit_and_flush_after_adopting(address, len, |mgr| {
-                mgr.invalidate(address, len)
-            })?;
+            self.apply_stage1_rules(
+                (address, len),
+                &[(address, len, TerminalRule::pt(PtOp::Retire))],
+            )?;
         }
         self.vm.on_unmap(address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend mapping after munmap: {error}"))
@@ -5212,6 +5257,38 @@ mod tests {
                 "{path} must use the read-only manager load"
             );
         }
+    }
+
+    /// Host-originated range edits are lane-agnostic: they build the shared
+    /// terminal-rule plan and hand it to `apply_stage1_rules`, which submits
+    /// EL1 transactions on a guest-owned MM instead of refusing there.
+    #[test]
+    fn range_edit_writers_use_the_lane_agnostic_rule_applier() {
+        let source = include_str!("engine.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production AArch64 engine source");
+        for path in ["fn protect_range", "fn mark_bus_fault"] {
+            let body = production
+                .split(path)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("production writer {path}"));
+            assert!(body.contains("self.apply_stage1_rules("), "{path}");
+            assert!(
+                !body.contains("pt_edit"),
+                "{path} must not use the host-only funnel"
+            );
+        }
+        let applier = production
+            .split("fn apply_stage1_rules")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("rule applier");
+        assert!(applier.contains("LiveDescriptorOwner::Guest"));
+        assert!(applier.contains("apply_guest_descriptor_txns_now"));
+        assert!(applier.contains("terminal_op"));
     }
 
     /// The guest-owned lane has no host live-descriptor writer in the engine:
