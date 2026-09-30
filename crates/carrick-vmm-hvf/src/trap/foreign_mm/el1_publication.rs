@@ -13,6 +13,7 @@
 //! before submitting, and settles every receipt against that authority.
 
 use super::*;
+use carrick_aarch64::descriptor_drain::GuestPublishError;
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorReceipt, DescriptorTxn, VerifiedDescriptorReceipt,
 };
@@ -84,18 +85,21 @@ impl<'a> ForeignEl1Publisher<'a> {
     pub(crate) fn publish(
         &mut self,
         txn: &DescriptorTxn,
-    ) -> Result<VerifiedDescriptorReceipt, TrapError> {
+    ) -> Result<VerifiedDescriptorReceipt, GuestPublishError> {
         if txn.id.mm_key != self.mm_key || txn.root.raw() != self.root {
             return Err(TrapError::Hypervisor(
                 "foreign descriptor transaction names another target".to_owned(),
-            ));
+            )
+            .into());
         }
         let slots = self
             .slots
             .ok_or_else(|| TrapError::Hypervisor("foreign descriptor slots absent".to_owned()))?;
         carrick_aarch64::descriptor_drain::apply_guest_descriptor_txns_now(self, slots, &[*txn])?
             .pop()
-            .ok_or_else(|| TrapError::Hypervisor("foreign descriptor receipt absent".to_owned()))
+            .ok_or_else(|| {
+                TrapError::Hypervisor("foreign descriptor receipt absent".to_owned()).into()
+            })
     }
 }
 
@@ -134,10 +138,10 @@ impl carrick_aarch64::descriptor_drain::GuestDrainVenue for ForeignEl1Publisher<
         &mut self,
         txn: &DescriptorTxn,
         receipt: &DescriptorReceipt,
-    ) -> Result<VerifiedDescriptorReceipt, TrapError> {
+    ) -> Result<VerifiedDescriptorReceipt, GuestPublishError> {
         self.tables
             .settle_guest_descriptor_receipt(txn, receipt)
-            .map_err(|error| TrapError::Hypervisor(format!("settle foreign descriptor: {error:?}")))
+            .map_err(|error| GuestPublishError::from_settle(error, "settle foreign descriptor"))
     }
 }
 
@@ -200,12 +204,16 @@ impl carrick_aarch64::vmm::Stage1Services for ForeignStage1Services<'_> {
         matches!(self, Self::Guest(_))
     }
 
-    fn publish(&mut self, txn: &DescriptorTxn) -> Result<VerifiedDescriptorReceipt, TrapError> {
+    fn publish(
+        &mut self,
+        txn: &DescriptorTxn,
+    ) -> Result<VerifiedDescriptorReceipt, GuestPublishError> {
         match self {
             Self::Guest(publisher) => publisher.publish(txn),
             Self::Host { .. } => Err(TrapError::Hypervisor(
                 "host-owned foreign MM has no guest publication".to_owned(),
-            )),
+            )
+            .into()),
         }
     }
 }
