@@ -5,8 +5,9 @@
 //! anonymous arena cursor and free list ([`HostArena`]) and every VMA row.
 //!
 //! [`AnonymousAuthority::Delegated`]: the MM's shared EL1 reservation root is
-//! admitted. It owns the break, arena placement and every plain private
-//! anonymous row inside its heap/arena layout; there is no cursor or free list
+//! admitted. It owns the break, arena placement and every private anonymous
+//! row inside its heap/arena layout, with its fork/dump/lock attributes;
+//! there is no cursor or free list
 //! left to consult. `MemState` keeps only host-owned rows (file, shared,
 //! attributed, out-of-layout), each mirrored in the root as an opaque node, so
 //! the root alone answers placement and `RLIMIT_AS`.
@@ -17,10 +18,16 @@
 //!   `mprotect` of root-owned anonymous memory) is ONE root proposal, held
 //!   pending across the unchanged backend work and completed or refused with
 //!   the syscall's outcome; the host records no row for it;
+//! - `madvise` fork/dump attributes and `mlock` state of root-owned memory
+//!   are root node attributes (`set_flags`), never host rows: the range
+//!   stays EL1-editable, and every lock reader asks [`MemState::locked_view`];
 //! - any other edit first demotes the root-owned anonymous nodes it touches
 //!   into host-owned rows (which fences the guest venue out of the range),
 //!   runs the host path, and mirrors the resulting host rows as opaque nodes.
 //!   Host-placed mappings hold an opaque placeholder until that mirror.
+//!
+//! `/proc/<pid>/maps` of a delegated MM is the root's anonymous projection
+//! merged once with the host rows, which never describe root-owned memory.
 
 use super::el1_reservations::DelegatedRoot;
 use super::*;
@@ -136,8 +143,23 @@ fn anonymous_row(mapping: &Mapping, layout: MemoryLayout) -> SemanticVma {
         write,
         execute,
         provenance: VmaBackingProvenance::PrivateAnonymous,
-        fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
-        dump_policy: carrick_abi::VmaDumpPolicy::Include,
+        fork_policy: carrick_abi::VmaForkPolicy {
+            copy: if mapping.flags.contains(ReservationNodeFlags::DONTFORK) {
+                carrick_abi::VmaForkCopyPolicy::Omit
+            } else {
+                carrick_abi::VmaForkCopyPolicy::Inherit
+            },
+            child_contents: if mapping.flags.contains(ReservationNodeFlags::WIPEONFORK) {
+                carrick_abi::VmaForkChildPolicy::ZeroInChild
+            } else {
+                carrick_abi::VmaForkChildPolicy::Preserve
+            },
+        },
+        dump_policy: if mapping.flags.contains(ReservationNodeFlags::DONTDUMP) {
+            carrick_abi::VmaDumpPolicy::Omit
+        } else {
+            carrick_abi::VmaDumpPolicy::Include
+        },
         droppable: false,
         path: if in_heap(mapping.range.start(), mapping.range.end(), layout) {
             "[heap]".to_owned()
@@ -168,7 +190,6 @@ pub(super) fn in_heap(start: u64, end: u64, layout: MemoryLayout) -> bool {
             .is_some_and(|heap_end| end <= heap_end)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn in_layout(start: u64, end: u64, layout: MemoryLayout) -> bool {
     in_heap(start, end, layout)
         || (layout.mmap_base <= start
@@ -179,18 +200,54 @@ fn in_layout(start: u64, end: u64, layout: MemoryLayout) -> bool {
 }
 
 /// Whether the root owns this host row as an EL1-editable anonymous node:
-/// plain private anonymous memory inside the heap/arena layout.
+/// private anonymous memory inside the heap/arena layout (its fork/dump
+/// attributes ride the node, see [`carried_flags`]).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::dispatch) fn root_owned_row(vma: &SemanticVma, mem: &MemState) -> bool {
     vma.provenance.is_private_anonymous()
-        && vma.fork_policy == carrick_abi::VmaForkPolicy::DEFAULT
-        && vma.dump_policy == carrick_abi::VmaDumpPolicy::Include
         && !vma.droppable
         && !mem
             .growdown_ranges
             .iter()
             .any(|(low, _, end)| vma.start < *end && *low < vma.end)
         && in_layout(vma.start, vma.end, mem.layout)
+}
+
+/// The fork/dump attributes a row's policies name, as root node flags.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::dispatch) fn carried_flags(vma: &SemanticVma) -> ReservationNodeFlags {
+    let mut flags = ReservationNodeFlags::EMPTY;
+    if vma.fork_policy.copy == carrick_abi::VmaForkCopyPolicy::Omit {
+        flags = flags.union(ReservationNodeFlags::DONTFORK);
+    }
+    if vma.fork_policy.child_contents == carrick_abi::VmaForkChildPolicy::ZeroInChild {
+        flags = flags.union(ReservationNodeFlags::WIPEONFORK);
+    }
+    if vma.dump_policy != carrick_abi::VmaDumpPolicy::Include {
+        flags = flags.union(ReservationNodeFlags::DONTDUMP);
+    }
+    flags
+}
+
+fn guest_range(start: u64, end: u64) -> Option<carrick_vfs::GuestMemoryRange> {
+    carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))
+}
+
+/// `[start, end)` minus the sorted, disjoint `covered` pieces.
+fn uncovered_segments(start: u64, end: u64, covered: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut segments = Vec::new();
+    let mut cursor = start;
+    for &(cover_start, cover_end) in covered {
+        if cover_start > cursor {
+            segments.push((cursor, cover_start.min(end)));
+        }
+        cursor = cursor.max(cover_end);
+    }
+    if cursor < end {
+        segments.push((cursor, end));
+    }
+    segments.retain(|(start, end)| start < end);
+    segments
 }
 
 /// Insertion-time attributes of a host-owned row: `RLIMIT_DATA` and fork read
@@ -389,25 +446,42 @@ impl MemState {
         rows
     }
 
-    /// The `/proc/<pid>/maps` region list: boot regions and host rows, with a
-    /// delegated root's anonymous rows merged in from the same observation.
+    /// The `/proc/<pid>/maps` region list: boot regions and host rows, and
+    /// once delegated the root's anonymous rows merged in exactly once. The
+    /// root owns the heap and describes it itself, so the hidden heap backing
+    /// row is not rendered beside it; the host rows never describe root-owned
+    /// memory (only carrick's hidden backing rows may enclose it).
     pub(in crate::dispatch) fn proc_regions(&self) -> Option<Vec<ProcMapsEntry>> {
-        let mut regions = self.address_space_regions.clone();
-        if !self.dynamic_maps.is_empty() {
-            regions
-                .get_or_insert_with(Vec::new)
-                .extend(self.dynamic_maps.iter().cloned());
-        }
-        let root_rows = self.root_anonymous_rows();
-        if !root_rows.is_empty() {
-            let regions = regions.get_or_insert_with(Vec::new);
-            for row in &root_rows {
-                trim_proc_maps_for_range(regions, row.start, row.end - row.start);
+        let host = || {
+            let mut regions = self.address_space_regions.clone();
+            if !self.dynamic_maps.is_empty() {
+                regions
+                    .get_or_insert_with(Vec::new)
+                    .extend(self.dynamic_maps.iter().cloned());
             }
-            regions.extend(root_rows.iter().map(proc_row));
-            regions.sort_by_key(|region| region.start);
+            regions
+        };
+        if self.delegated_root().is_none() {
+            return host();
         }
-        regions
+        let layout = self.layout;
+        let mut host_rows: Vec<ProcMapsEntry> = self
+            .address_space_regions
+            .iter()
+            .flatten()
+            .filter(|map| !super::boot_region_is_hidden_heap_backing(map, layout))
+            .chain(self.dynamic_maps.iter())
+            .cloned()
+            .collect();
+        host_rows.sort_by_key(|row| row.start);
+        let root_rows: Vec<ProcMapsEntry> =
+            self.root_anonymous_rows().iter().map(proc_row).collect();
+        if host_rows.is_empty() && root_rows.is_empty() {
+            return host();
+        }
+        Some(merge_root_rows(host_rows, root_rows, |row| {
+            super::boot_region_is_hidden_reservation(row, layout)
+        }))
     }
 
     /// Whether a root-owned anonymous row overlaps `[start, start + len)`.
@@ -435,6 +509,178 @@ impl MemState {
                 rows.sort_by_key(|vma| vma.start);
                 Cow::Owned(VmaMap::from_vec(rows))
             }
+        }
+    }
+
+    /// Every committed root anonymous node overlapping `[start, end)`,
+    /// clipped to it.
+    fn root_anonymous_pieces(root: &DelegatedRoot, start: u64, end: u64) -> Vec<Mapping> {
+        let mut pieces = Self::root_mappings(root, start, end);
+        pieces.retain(|mapping| mapping.anonymous);
+        for mapping in &mut pieces {
+            mapping.range = reservation_range(
+                mapping.range.start().max(start),
+                mapping.range.end().min(end),
+            )
+            .unwrap_or_else(|refusal| broken_root("a clipped observation", refusal));
+        }
+        pieces
+    }
+
+    /// Every locked range of this MM: the host's lock table (host-owned
+    /// rows only) and, once delegated, the root's `LOCKED` anonymous nodes.
+    /// Lock readers (`/proc`, `mlock` accounting, `MADV_DONTNEED`,
+    /// `MS_INVALIDATE`) use this, never `locked_ranges` alone.
+    pub(in crate::dispatch) fn locked_view(&self) -> Cow<'_, [carrick_vfs::GuestMemoryRange]> {
+        let Some(root) = self.delegated_root() else {
+            return Cow::Borrowed(&self.locked_ranges);
+        };
+        let mut ranges = self.locked_ranges.clone();
+        root.with_root(|model| {
+            model.observe_mappings(&mut |mapping| {
+                if mapping.anonymous
+                    && mapping.flags.contains(ReservationNodeFlags::LOCKED)
+                    && let Some(range) = guest_range(mapping.range.start(), mapping.range.end())
+                {
+                    super::locked_ranges_insert(&mut ranges, range);
+                }
+            })
+        })
+        .unwrap_or_else(|refusal| broken_root("a lock observation", refusal));
+        Cow::Owned(ranges)
+    }
+
+    /// Set (or clear) `set`/`clear` attributes on the root-owned anonymous
+    /// part of `[start, end)`; returns the parts the root does not own, in
+    /// address order, for the host to apply to its own rows.
+    fn edit_root_attributes(
+        &mut self,
+        start: u64,
+        end: u64,
+        set: ReservationNodeFlags,
+        clear: ReservationNodeFlags,
+    ) -> Vec<(u64, u64)> {
+        let Some(root) = self.delegated_root().cloned() else {
+            return vec![(start, end)];
+        };
+        if start >= end {
+            return Vec::new();
+        }
+        let pieces = Self::root_anonymous_pieces(&root, start, end);
+        if !pieces.is_empty() {
+            root.with_root(|model| {
+                for piece in &pieces {
+                    model.set_flags(piece.range, set, clear)?;
+                }
+                Ok(())
+            })
+            .unwrap_or_else(|refusal| broken_root("an attribute edit", refusal));
+        }
+        let covered: Vec<_> = pieces
+            .iter()
+            .map(|piece| (piece.range.start(), piece.range.end()))
+            .collect();
+        uncovered_segments(start, end, &covered)
+    }
+
+    /// `mlock`/`munlock` of `range`: the root's anonymous nodes take the
+    /// `LOCKED` attribute, host-owned memory the host lock table.
+    pub(in crate::dispatch) fn set_locked(
+        &mut self,
+        range: carrick_vfs::GuestMemoryRange,
+        locked: bool,
+    ) {
+        let (set, clear) = if locked {
+            (ReservationNodeFlags::LOCKED, ReservationNodeFlags::EMPTY)
+        } else {
+            (ReservationNodeFlags::EMPTY, ReservationNodeFlags::LOCKED)
+        };
+        for (start, end) in
+            self.edit_root_attributes(range.start().raw(), range.end().raw(), set, clear)
+        {
+            let Some(piece) = guest_range(start, end) else {
+                continue;
+            };
+            if locked {
+                super::locked_ranges_insert(&mut self.locked_ranges, piece);
+            } else {
+                super::locked_ranges_remove(&mut self.locked_ranges, piece);
+            }
+        }
+    }
+
+    /// `munlockall`: every lock of the MM, root and host, is dropped.
+    pub(in crate::dispatch) fn unlock_all(&mut self) {
+        self.locked_ranges.clear();
+        let Some(root) = self.delegated_root().cloned() else {
+            return;
+        };
+        let mut locked = Vec::new();
+        root.with_root(|model| {
+            model.observe_mappings(&mut |mapping| {
+                if mapping.anonymous && mapping.flags.contains(ReservationNodeFlags::LOCKED) {
+                    locked.push(mapping.range);
+                }
+            })?;
+            for range in &locked {
+                model.set_flags(
+                    *range,
+                    ReservationNodeFlags::EMPTY,
+                    ReservationNodeFlags::LOCKED,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|refusal| broken_root("munlockall", refusal));
+    }
+
+    /// `madvise` fork/dump attributes over `[start, end)`: root-owned
+    /// anonymous memory keeps its node and takes the attribute; host rows
+    /// take the policy and are mirrored.
+    pub(in crate::dispatch) fn update_policy(
+        &mut self,
+        start: u64,
+        end: u64,
+        copy_update: Option<carrick_abi::VmaForkCopyPolicy>,
+        child_update: Option<carrick_abi::VmaForkChildPolicy>,
+        dump_update: Option<carrick_abi::VmaDumpPolicy>,
+    ) {
+        let mut set = ReservationNodeFlags::EMPTY;
+        let mut clear = ReservationNodeFlags::EMPTY;
+        let mut edit = |flag, on: bool| {
+            if on {
+                set = set.union(flag);
+            } else {
+                clear = clear.union(flag);
+            }
+        };
+        if let Some(copy) = copy_update {
+            edit(
+                ReservationNodeFlags::DONTFORK,
+                copy == carrick_abi::VmaForkCopyPolicy::Omit,
+            );
+        }
+        if let Some(child) = child_update {
+            edit(
+                ReservationNodeFlags::WIPEONFORK,
+                child == carrick_abi::VmaForkChildPolicy::ZeroInChild,
+            );
+        }
+        if let Some(dump) = dump_update {
+            edit(
+                ReservationNodeFlags::DONTDUMP,
+                dump != carrick_abi::VmaDumpPolicy::Include,
+            );
+        }
+        for (piece_start, piece_end) in self.edit_root_attributes(start, end, set, clear) {
+            self.semantic_vmas.update_policy(
+                piece_start,
+                piece_end,
+                copy_update,
+                child_update,
+                dump_update,
+            );
+            self.mirror_host_rows(piece_start, piece_end);
         }
     }
 
@@ -486,22 +732,30 @@ impl MemState {
                 Refusal::Busy,
             );
         }
-        let rows: Vec<_> = self
-            .semantic_vmas
-            .overlapping(start, end)
-            .map(|vma| {
-                (
-                    vma.start.max(start),
-                    vma.end.min(end),
+        // Root-owned anonymous nodes are not host rows: the mirror replaces
+        // only the opaque part of the range.
+        let covered: Vec<_> = Self::root_anonymous_pieces(&delegated.root, start, end)
+            .iter()
+            .map(|piece| (piece.range.start(), piece.range.end()))
+            .collect();
+        let segments = uncovered_segments(start, end, &covered);
+        let mut rows = Vec::new();
+        for &(segment_start, segment_end) in &segments {
+            for vma in self.semantic_vmas.overlapping(segment_start, segment_end) {
+                rows.push((
+                    vma.start.max(segment_start),
+                    vma.end.min(segment_end),
                     protection(vma.read, vma.write, vma.execute),
                     opaque_flags(vma, self),
-                )
-            })
-            .collect();
+                ));
+            }
+        }
         delegated
             .root
             .with_root(|model| {
-                model.retire_opaque(reservation_range(start, end)?)?;
+                for &(segment_start, segment_end) in &segments {
+                    model.retire_opaque(reservation_range(segment_start, segment_end)?)?;
+                }
                 for (row_start, row_end, prot, flags) in rows {
                     model.insert_opaque(reservation_range(row_start, row_end)?, prot, flags)?;
                 }
@@ -537,7 +791,12 @@ impl MemState {
                 )?;
                 mapping.range = clipped;
                 model.retire_opaque(clipped)?;
-                model.insert_opaque(clipped, mapping.protection, ReservationNodeFlags::PRIVATE)?;
+                // The lock moves to the host lock table below.
+                model.insert_opaque(
+                    clipped,
+                    mapping.protection,
+                    mapping.flags.difference(ReservationNodeFlags::LOCKED),
+                )?;
             }
             Ok(())
         })
@@ -551,6 +810,11 @@ impl MemState {
                 insert_dynamic_map_coalescing(self, entry);
             }
             self.adopt_root_first_touch(mapping);
+            if mapping.flags.contains(ReservationNodeFlags::LOCKED)
+                && let Some(range) = guest_range(mapping.range.start(), mapping.range.end())
+            {
+                super::locked_ranges_insert(&mut self.locked_ranges, range);
+            }
         }
     }
 
@@ -582,6 +846,13 @@ impl MemState {
                 forked.semantic_vmas.insert_replacing(row);
                 if !heap {
                     insert_dynamic_map_coalescing(&mut forked, entry);
+                }
+                // The host-setup child keeps locks where a host-setup fork
+                // does: in its host lock table (cloned with `MemState`).
+                if mapping.flags.contains(ReservationNodeFlags::LOCKED)
+                    && let Some(range) = guest_range(start, end)
+                {
+                    super::locked_ranges_insert(&mut forked.locked_ranges, range);
                 }
             }
             if start >= arena_start && end <= arena_end {
@@ -616,6 +887,49 @@ impl MemState {
         }
         delegated.venue = Some(venue);
     }
+}
+
+/// Merge the root's sorted anonymous rows into the sorted host rows in one
+/// linear pass. A root row may lie only inside a carrick backing row
+/// (`encloses`); overlapping any other host row means two owners describe the
+/// same memory, which the root admission forbids.
+pub(in crate::dispatch) fn merge_root_rows(
+    host: Vec<ProcMapsEntry>,
+    root: Vec<ProcMapsEntry>,
+    encloses: impl Fn(&ProcMapsEntry) -> bool,
+) -> Vec<ProcMapsEntry> {
+    let mut merged = Vec::with_capacity(host.len() + root.len());
+    let mut host = host.into_iter().peekable();
+    let mut owners: Vec<ProcMapsEntry> = Vec::new();
+    for row in root {
+        while let Some(next) = host.next_if(|next| next.start <= row.start) {
+            if !encloses(&next) {
+                owners.push(next.clone());
+            }
+            merged.push(next);
+        }
+        owners.retain(|owner| owner.end > row.start);
+        if let Some(conflict) = owners
+            .iter()
+            .chain(
+                host.peek()
+                    .filter(|next| !encloses(next) && next.start < row.end),
+            )
+            .next()
+        {
+            carrick_fatal!(
+                "dispatch::anonymous",
+                "host row {:#x}..{:#x} describes root-owned memory {:#x}..{:#x}",
+                conflict.start,
+                conflict.end,
+                row.start,
+                row.end
+            );
+        }
+        merged.push(row);
+    }
+    merged.extend(host);
+    merged
 }
 
 /// Host projection rows (no root rows) for `RLIMIT_AS`: a delegated root owns

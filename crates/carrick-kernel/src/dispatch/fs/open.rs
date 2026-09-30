@@ -1628,7 +1628,7 @@ impl<'a> FsView<'a> {
             carrick_vfs::OpenContextMemorySnapshot {
                 auxv: std::borrow::Cow::Owned(mem.linux_auxv_image.clone()),
                 address_space_regions: address_space_regions.map(std::borrow::Cow::Owned),
-                locked_memory: std::borrow::Cow::Owned(mem.locked_ranges.clone()),
+                locked_memory: std::borrow::Cow::Owned(mem.locked_view().into_owned()),
                 brk_current: mem.program_break(),
                 mmap_next: mem.arena_high_water(),
                 heap_base: mem.layout.heap_base,
