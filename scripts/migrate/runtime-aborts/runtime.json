@@ -2977,6 +2977,28 @@
       "rationale": "A delegated MM's anonymous facts (break, placement, anonymous rows) are read from its own admitted reservation root under the MM's host lock; the root refusing or missing for that exact MM means the facts have no owner, and continuing with a guessed value would split mm authority. (Moved 2026-09-30 from BreakAuthority::observe when S1b generalized the delegated break to the anonymous authority.)",
       "sink": "fatal",
       "domain": "dispatch::anonymous"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "function": "merge_root_rows",
+      "ordinal_in_function": 1,
+      "fingerprint": "34e64cccc6fe8ca732532b803ceda73f2955061cc6528553294608c34c23ec37",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::anonymous",
+      "rationale": "A host row (other than carrick's hidden backing rows) overlapping a delegated root's anonymous row means two owners describe the same memory: admission trims the host rows the root takes, and every later host edit of root-owned memory either proposes to the root or demotes first. Rendering either answer (or trimming one away, as S1b did) would publish a /proc or core view no authority holds, so the invariant break is a carrier fault. (Added 2026-09-30, S1c: /proc and core maps merge the root projection with the host rows once.)",
+      "sink": "fatal",
+      "domain": "dispatch::anonymous"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "function": "MemView<'_>::mremap_root_move",
+      "ordinal_in_function": 1,
+      "fingerprint": "5263797c2478272e990c65f1909c8bf60ba3c7fc794760c83f2fc58b49c3e92a",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mremap",
+      "rationale": "The root-served mremap move has already published the destination with the contents when the source unmap fails twice; returning an errno would leave two live owners of the same contents while the pending root proposal is refused. Same fail-stop as the host-served `mremap_served` source reclaim, now on the root venue. (Added 2026-09-30, S1c.)",
+      "sink": "fatal",
+      "domain": "dispatch::mremap"
     }
   ]
 }
