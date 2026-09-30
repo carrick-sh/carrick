@@ -5405,7 +5405,17 @@ mod tests {
             )
             .expect("dispatch rt_sigsuspend")
         };
-        let outcome = dispatch(&mut memory);
+        // Bound the wait so a regression fails as a false line instead of
+        // hanging the suite (a liveness bound, not a performance claim).
+        let bounded = |memory: &mut crate::dispatch::LinearMemory| {
+            std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                scope.spawn(move || tx.send(dispatch(memory)).unwrap());
+                rx.recv_timeout(Duration::from_secs(5))
+                    .expect("rt_sigsuspend dispatch parked instead of returning")
+            })
+        };
+        let outcome = bounded(&mut memory);
         assert!(matches!(
             outcome,
             DispatchOutcome::WaitOnSignals {
@@ -5428,21 +5438,22 @@ mod tests {
         // sibling thread (the tgkill/tkill dispatcher this syscall must not
         // starve) can publish the wake, and re-dispatching the continuation
         // observes it and completes with EINTR rather than waiting again.
-        // `join` is unbounded; a retained lock would hang, not flake.
         std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    d.mark_signal_pending(
-                        &d.exact_signal_context_for_test(),
-                        tid,
-                        crate::linux_abi::LINUX_SIGUSR1,
-                    );
-                })
-                .join()
-                .expect("sibling publishes wake");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let d = &d;
+            scope.spawn(move || {
+                d.mark_signal_pending(
+                    &d.exact_signal_context_for_test(),
+                    tid,
+                    crate::linux_abi::LINUX_SIGUSR1,
+                );
+                tx.send(()).unwrap();
+            });
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("sibling wake blocked on a lock dispatch retained");
         });
         assert_eq!(
-            dispatch(&mut memory),
+            bounded(&mut memory),
             DispatchOutcome::errno(LINUX_EINTR),
             "redispatch after a sibling wake completes instead of waiting again"
         );
