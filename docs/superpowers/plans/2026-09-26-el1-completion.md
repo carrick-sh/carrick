@@ -384,6 +384,28 @@ zero-IPC-exit proof and full qualification remain required. A remains an
 acceptance blocker. Advancing independent memory work defers these blockers;
 it does not resolve or waive them. Keep one implementation vertical active.
 
+**Memory development integration:** adapter `8fc9513fd` joins elastic-return
+`8f268dee4` (merge `3f8e349fc`) and descriptor/COW `c555f5dd1`. Additive IPC/MMU
+exports and dependencies are preserved. Six return-lifecycle tests and one
+three-scale discard/fork-retention test pass; combined 97 EL1 + 55 ABI + 152
+MMU + 37 runtime guest + three architecture authority tests pass. Embed test
+compile and affected Clippy pass. Receipts are in adapter
+`docs/perf-results/2026-09-29-el1-memory-integration/`.
+
+This advances the development integration only. Compiler capture and line
+inventories remain stale pending clean stable reconciliation; full source
+writer census, signed memory tests and checkpoint acceptance are open.
+`GuestCowContinuation` and guest `copy_granted_cow_page` currently have only
+test callers. Production admission still refuses host copyout and backend
+writers. Do not count their helper coverage as migrated guest memory.
+
+**Immediate next action:** review/join reservation provider candidate
+`f2efa3716`, implement its carrier-bound resolver/installation, and connect
+real reservation operations and host-copyout/backend transitions. Preserve
+its explicit fixture race as a bounded validation obligation. Do not spend
+the next interval expanding accounting or rerunning unchanged helper suites;
+connect a production owner. Keep host pause removal last.
+
 ### A. Close batch-3 lifecycle blockers
 
 Deferred investigation: [signed deferred handback ordering](2026-09-29-el1-signed-handback-proof.md).
