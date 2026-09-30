@@ -336,17 +336,18 @@ impl TerminalEdit {
     pub const fn fork_arm(
         kernel_only: bool,
         executable: bool,
+        adopt_private: bool,
         asid_scoped: bool,
         excluded_ipa: u64,
         excluded_len: u64,
     ) -> Self {
-        let op = if kernel_only {
-            super::PtOp::KernelReadOnly { exec: executable }
+        let rule = if kernel_only {
+            super::TerminalRule::pt(super::PtOp::KernelReadOnly { exec: executable })
         } else {
-            super::PtOp::ForkReadOnly
+            super::TerminalRule::fork_arm(adopt_private)
         };
         Self {
-            rule: super::TerminalRule::pt(op),
+            rule,
             asid_scoped,
             excluded_ipa,
             excluded_len,
@@ -395,6 +396,9 @@ impl TerminalEdit {
     const FORK_ARM: u64 = 1 << 6;
     const ASID_SCOPED: u64 = 1 << 7;
     const RECLAIM_SHIFT: u32 = 8;
+    /// The reclaim budget is at most `MAX_TABLE_GRANTS` (8): four bits.
+    const RECLAIM_MASK: u64 = 0xf;
+    const ADOPT_PRIVATE: u64 = 1 << 12;
     const KNOWN: u64 = 0xffff;
 
     fn wire(self) -> u64 {
@@ -413,6 +417,7 @@ impl TerminalEdit {
                 reset_retired,
                 deny_host_buffers,
                 fork_arm,
+                adopt_private,
             } => {
                 let (code, exec) = match op {
                     None => (Self::OP_NONE, false),
@@ -427,6 +432,7 @@ impl TerminalEdit {
                     | flag(reset_retired, Self::RESET_RETIRED)
                     | flag(deny_host_buffers, Self::DENY_HOST_BUFFERS)
                     | flag(fork_arm, Self::FORK_ARM)
+                    | flag(adopt_private, Self::ADOPT_PRIVATE)
                     | scoped
             }
         }
@@ -437,9 +443,13 @@ impl TerminalEdit {
         if word & !Self::KNOWN != 0 {
             return None;
         }
-        let reclaim_budget = (word >> Self::RECLAIM_SHIFT) as u8;
+        let reclaim_budget = ((word >> Self::RECLAIM_SHIFT) & Self::RECLAIM_MASK) as u8;
         let exec = word & Self::EXEC != 0;
-        let flags = word & (Self::RESET_RETIRED | Self::DENY_HOST_BUFFERS | Self::FORK_ARM);
+        let flags = word
+            & (Self::RESET_RETIRED
+                | Self::DENY_HOST_BUFFERS
+                | Self::FORK_ARM
+                | Self::ADOPT_PRIVATE);
         let op = match word & 0b111 {
             Self::OP_NONE => None,
             Self::OP_INVALIDATE => Some(PtOp::Invalidate),
@@ -477,6 +487,7 @@ impl TerminalEdit {
                 reset_retired: word & Self::RESET_RETIRED != 0,
                 deny_host_buffers: word & Self::DENY_HOST_BUFFERS != 0,
                 fork_arm: word & Self::FORK_ARM != 0,
+                adopt_private: word & Self::ADOPT_PRIVATE != 0,
             },
             asid_scoped: word & Self::ASID_SCOPED != 0,
             excluded_ipa,
@@ -2958,6 +2969,14 @@ mod tests {
                     reset_retired: bits & 1 != 0,
                     deny_host_buffers: bits & 2 != 0,
                     fork_arm: bits & 4 != 0,
+                    adopt_private: false,
+                });
+                rules.push(TerminalRule::Pt {
+                    op,
+                    reset_retired: bits & 1 != 0,
+                    deny_host_buffers: bits & 2 != 0,
+                    fork_arm: bits & 4 != 0,
+                    adopt_private: true,
                 });
             }
         }
@@ -3791,7 +3810,7 @@ mod tests {
             let before = words.image();
             let op = DescriptorOp::Terminal {
                 span: PageSpan::new(VA + 7 * PT_PAGE, PT_PAGE),
-                edit: TerminalEdit::fork_arm(false, false, true, 0, 0),
+                edit: TerminalEdit::fork_arm(false, false, false, true, 0, 0),
             };
             // The link after break-before-make observes a concurrent writer.
             words.fail_cas_at.set(Some(1));
@@ -4998,7 +5017,7 @@ mod carrick_owned_window_tests {
             },
             DescriptorOp::Terminal {
                 span,
-                edit: TerminalEdit::fork_arm(true, false, true, 0, 0),
+                edit: TerminalEdit::fork_arm(true, false, false, true, 0, 0),
             },
             DescriptorOp::Terminal {
                 span,

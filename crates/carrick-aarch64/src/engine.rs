@@ -128,6 +128,7 @@ fn guest_fork_arm_txns(
                     range.len as u64,
                     range.kernel_only,
                     range.executable,
+                    range.el1_adoptable(),
                 )
             })
             .ok_or_else(|| {
@@ -4580,6 +4581,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // no mmap/mprotect edit has already done so. The no-op edit publishes
         // nothing and performs no TLBI.
         let stage_started = std::time::Instant::now();
+        // A guest selection still pending behind an already bound backing is
+        // completed before the lane is read: the parent's arming venue and
+        // the child image's inherited owner must agree from fork commit.
+        if self.page_tables.complete_pending_guest_lane() {
+            self.vm.record_guest_descriptor_lane(Ok(
+                crate::stage1_authority::GuestLaneSelection::Selected,
+            ));
+        }
         let guest_lane = self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest;
         let page_tables_absent = self.page_tables.is_none();
         if page_tables_absent && guest_lane {
@@ -4722,6 +4731,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "prepare hvpatch child kernel fork leaves read-only: {error:?}"
+                        ))
+                    })?;
+            } else if guest_lane && range.el1_adoptable() {
+                // The child image inherits the parent's lane; adopt exactly
+                // what the parent's guest arm adopts so both see one state.
+                page_tables
+                    .set_fork_readonly_adopting(range.va, range.len, child_source.as_deref_mut())
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "prepare hvpatch child private fork leaves read-only: {error:?}"
                         ))
                     })?;
             } else {

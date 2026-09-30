@@ -279,6 +279,30 @@ impl Stage1Authority {
         promote
     }
 
+    /// Complete a guest lane selection that is still pending although the
+    /// live backing is already bound: a promotion `bind_live_backing`
+    /// refused (host edits that could not be synced) is otherwise retried by
+    /// nothing, so the MM and every child forked from it would stay on the
+    /// host lane until each child's own bind. Fork calls this before it
+    /// reads the lane, so the parent is armed and the child image inherits
+    /// the same owner. Returns whether this call completed the selection;
+    /// an absent backing leaves it pending.
+    pub fn complete_pending_guest_lane(&self) -> bool {
+        let resolver = {
+            let inner = self.inner.lock();
+            if !inner.guest_lane_pending || inner.live_owner == LiveDescriptorOwner::Guest {
+                return false;
+            }
+            match inner.host_resolver.clone() {
+                Some(resolver) => resolver,
+                None => return false,
+            }
+        };
+        // SAFETY: the stored resolver was authenticated by the caller of
+        // `bind_live_backing` that installed it.
+        unsafe { self.bind_live_backing(resolver) }
+    }
+
     /// Create the `Exclusive` authority of a forked child around its private
     /// image. The child shares this authority's image pool, so its image
     /// returns to the parent's pool when the child retires.
@@ -1089,6 +1113,7 @@ pub fn protection_terminal_rules(
         reset_retired: new_mapping,
         deny_host_buffers,
         fork_arm,
+        adopt_private: false,
     };
     let arm_only = TerminalRule::pt(PtOp::ForkReadOnly);
     let mut plan = Vec::new();
@@ -3074,5 +3099,43 @@ mod tests {
             Some(LiveDescriptorOwner::Guest)
         );
         assert!(!guest_child.shares_exact_authority(&parent));
+    }
+
+    /// A pending guest selection whose live backing is already bound (its
+    /// promotion was refused at bind and nothing retries it) must be completed
+    /// at fork, before the lane decides how the parent is armed, so the child
+    /// image inherits the Guest owner instead of being promoted at its own
+    /// bind after its first writes.
+    #[test]
+    fn a_fork_child_inherits_guest_from_a_parent_whose_pending_selection_is_completed() {
+        let resolver = Arc::new(BufferResolver {
+            buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
+            base: LINUX_PAGE_TABLES_BASE,
+        });
+        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
+        assert_eq!(
+            parent.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Deferred)
+        );
+        // The backing is bound, but the pending promotion never completed.
+        parent.inner.lock().host_resolver =
+            Some(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        assert_eq!(parent.live_descriptor_owner(), LiveDescriptorOwner::Host);
+        assert!(parent.complete_pending_guest_lane());
+        assert_eq!(parent.live_descriptor_owner(), LiveDescriptorOwner::Guest);
+        assert!(
+            !parent.complete_pending_guest_lane(),
+            "only a pending selection completes"
+        );
+        let child = parent.child_with_manager(test_manager());
+        assert_eq!(child.live_descriptor_owner(), LiveDescriptorOwner::Guest);
+        // No backing yet: nothing to complete, the selection stays pending.
+        let unbound = Stage1Authority::new_with_manager(Some(test_manager()));
+        assert_eq!(
+            unbound.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Deferred)
+        );
+        assert!(!unbound.complete_pending_guest_lane());
+        assert_eq!(unbound.live_descriptor_owner(), LiveDescriptorOwner::Host);
     }
 }

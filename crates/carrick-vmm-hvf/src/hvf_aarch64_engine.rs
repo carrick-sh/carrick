@@ -40,8 +40,6 @@ use std::sync::Arc;
 pub struct HostCowStats {
     host_cow_resolutions: Arc<std::sync::atomic::AtomicU64>,
     ledger: Option<HostCowLedger>,
-    /// Admission order within the carrier ledger (0 = the first MM admitted).
-    ordinal: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -57,8 +55,8 @@ struct HostCowLedgerInner {
     guest_cow_settled: std::sync::atomic::AtomicU64,
     guest_cow_provisioned: std::sync::atomic::AtomicU64,
     host_cow_by_path: [std::sync::atomic::AtomicU64; HostCowPath::COUNT],
-    /// Host COW resolutions credited by the first MM the carrier admitted.
-    host_cow_first_mm: std::sync::atomic::AtomicU64,
+    /// The most host COW resolutions any one MM of the carrier has credited.
+    host_cow_max_per_mm: std::sync::atomic::AtomicU64,
     /// COWs the host completed for an MM already on the guest lane (not in
     /// `host_cow_resolutions`), by path.
     guest_lane_host_cow_by_path: [std::sync::atomic::AtomicU64; HostCowPath::COUNT],
@@ -140,8 +138,11 @@ pub struct HostCowSnapshot {
     pub guest_cow_provisioned: u64,
     /// `host_cow_resolutions` by [`HostCowPath`].
     pub host_cow_by_path: [u64; HostCowPath::COUNT],
-    /// Part of `host_cow_resolutions` credited by the first admitted MM.
-    pub host_cow_first_mm: u64,
+    /// The most host COW resolutions any single MM has credited, absolute
+    /// (a maximum is not differenced): near `host_cow_resolutions` means one
+    /// MM (a parent) owns them; near the per-fork rate means they are spread
+    /// over the children.
+    pub host_cow_max_per_mm: u64,
     /// Host-completed COWs of MMs on the guest lane, by [`HostCowPath`];
     /// these are NOT in `host_cow_resolutions`.
     pub guest_lane_host_cow_by_path: [u64; HostCowPath::COUNT],
@@ -194,9 +195,7 @@ impl HostCowSnapshot {
                 }
                 delta
             },
-            host_cow_first_mm: self
-                .host_cow_first_mm
-                .checked_sub(before.host_cow_first_mm)?,
+            host_cow_max_per_mm: self.host_cow_max_per_mm,
             guest_lane_host_cow_by_path: {
                 let mut delta = [0; HostCowPath::COUNT];
                 for (slot, (now, then)) in delta.iter_mut().zip(
@@ -249,7 +248,7 @@ impl HostCowLedger {
             host_cow_by_path: core::array::from_fn(|path| {
                 self.inner.host_cow_by_path[path].load(Ordering::Relaxed)
             }),
-            host_cow_first_mm: self.inner.host_cow_first_mm.load(Ordering::Relaxed),
+            host_cow_max_per_mm: self.inner.host_cow_max_per_mm.load(Ordering::Relaxed),
             guest_lane_host_cow_by_path: core::array::from_fn(|path| {
                 self.inner.guest_lane_host_cow_by_path[path].load(Ordering::Relaxed)
             }),
@@ -290,11 +289,10 @@ impl HostCowLedger {
     /// Admit one MM: the returned handle credits this ledger.
     pub(crate) fn admit_mm(&self) -> HostCowStats {
         use std::sync::atomic::Ordering;
-        let ordinal = self.inner.admitted_mms.fetch_add(1, Ordering::Relaxed);
+        self.inner.admitted_mms.fetch_add(1, Ordering::Relaxed);
         HostCowStats {
             host_cow_resolutions: Arc::default(),
             ledger: Some(self.clone()),
-            ordinal: Some(ordinal),
         }
     }
 }
@@ -340,12 +338,6 @@ impl HostCowStats {
         use std::sync::atomic::Ordering;
         if let Some(ledger) = &self.ledger {
             ledger.inner.host_cow_by_path[path as usize].fetch_add(1, Ordering::Relaxed);
-            if self.ordinal == Some(0) {
-                ledger
-                    .inner
-                    .host_cow_first_mm
-                    .fetch_add(1, Ordering::Relaxed);
-            }
         }
         let bump = |n: u64| n.checked_add(1);
         let own =
@@ -358,6 +350,12 @@ impl HostCowStats {
                 bump,
             )
         });
+        if let (Ok(previous), Some(ledger)) = (own, &self.ledger) {
+            ledger
+                .inner
+                .host_cow_max_per_mm
+                .fetch_max(previous + 1, Ordering::Relaxed);
+        }
         if own.is_err() || ledger.is_err() {
             carrick_fatal!(
                 "hvpatch::cow_accounting",

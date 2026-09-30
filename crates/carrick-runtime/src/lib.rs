@@ -286,7 +286,7 @@ pub struct HostCowSnapshot {
     pub guest_cow_settled: u64,
     pub guest_cow_provisioned: u64,
     pub host_cow_by_path: [u64; 5],
-    pub host_cow_first_mm: u64,
+    pub host_cow_max_per_mm: u64,
     pub guest_lane_host_cow_by_path: [u64; 5],
 }
 

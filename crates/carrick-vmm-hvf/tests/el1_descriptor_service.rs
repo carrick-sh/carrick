@@ -133,7 +133,7 @@ fn serial_host_el1_descriptor_service_executes_and_settles() {
             mm,
             DescriptorOp::Terminal {
                 span: PageSpan::new(DATA, 4096),
-                edit: TerminalEdit::fork_arm(false, false, false, 0, 0),
+                edit: TerminalEdit::fork_arm(false, false, false, false, 0, 0),
             },
         )
         .unwrap();

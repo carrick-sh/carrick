@@ -3545,7 +3545,7 @@ mod guest_descriptor_lane_tests {
             .into_iter()
             .map(|(va, len)| {
                 let op = authority
-                    .with_manager(|manager| manager.fork_arm_op(va, len, false, false))
+                    .with_manager(|manager| manager.fork_arm_op(va, len, false, false, false))
                     .unwrap();
                 authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap()
             })
@@ -3579,7 +3579,7 @@ mod guest_descriptor_lane_tests {
         let (authority, resolver) = guest_lane();
         resident_grant(&authority, &resolver);
         let op = authority
-            .with_manager(|manager| manager.fork_arm_op(VA, 4096, false, false))
+            .with_manager(|manager| manager.fork_arm_op(VA, 4096, false, false, false))
             .unwrap();
         let arm = [authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap()];
         let slots = Box::new(DescriptorTxnSlots::new());
@@ -3621,7 +3621,7 @@ mod guest_descriptor_lane_tests {
                 .into_iter()
                 .map(|(va, len)| {
                     let op = authority
-                        .with_manager(|manager| manager.fork_arm_op(va, len, false, false))
+                        .with_manager(|manager| manager.fork_arm_op(va, len, false, false, false))
                         .unwrap();
                     authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap()
                 })

@@ -492,6 +492,18 @@ pub struct ForkCowRange {
     pub granule: CowGranule,
 }
 
+impl ForkCowRange {
+    /// Whether a guest-lane fork arm adopts this range's host-published
+    /// leaves as EL1-private so EL1 resolves their COW itself: EL0 private
+    /// ranges armed at compound granule (the granule EL1 privatizes per
+    /// fault). Kernel-only state and page-granule private file views stay
+    /// with the host.
+    #[must_use]
+    pub const fn el1_adoptable(&self) -> bool {
+        !self.kernel_only && matches!(self.granule, CowGranule::Compound)
+    }
+}
+
 /// How much of a host compound one stage-1 permission fault privatizes.
 ///
 /// Fork arms a whole private anonymous frame: every 4 KiB page of a 16 KiB
