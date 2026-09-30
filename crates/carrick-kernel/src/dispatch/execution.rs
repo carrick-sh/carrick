@@ -535,6 +535,7 @@ impl SyscallDispatcher {
                         errno: LINUX_EINVAL,
                     }
                 } else {
+                    kernel.thread().set_robust_list(request.arg(0), len as u32);
                     DispatchOutcome::Returned { value: 0 }
                 }
             }

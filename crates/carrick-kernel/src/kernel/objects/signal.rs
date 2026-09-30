@@ -1039,7 +1039,7 @@ impl SignalAuthority {
         let action = self.sighand.action_entry(signal);
         let blocked = {
             let state = self.thread.signal_state.lock();
-            state.blocked().contains(signal.raw())
+            self.thread.blocked_mask().contains(signal.raw())
                 || state
                     .active_wait_set()
                     .is_some_and(|set| set.contains(signal.raw()))
@@ -1070,7 +1070,7 @@ impl SignalAuthority {
     }
 
     pub fn blocked(&self) -> SigSet {
-        self.thread.signal_state.lock().blocked()
+        self.thread.blocked_mask()
     }
 
     pub fn signal_state_generation(&self) -> u64 {
@@ -1078,8 +1078,8 @@ impl SignalAuthority {
     }
 
     pub fn set_blocked(&self, blocked: SigSet) {
-        let mut state = self.thread.signal_state.lock();
-        state.set_blocked(blocked);
+        let state = self.thread.signal_state.lock();
+        let _ = self.thread.store_blocked(blocked);
         self.thread.publish_signal_state(&state);
     }
 
@@ -1193,7 +1193,7 @@ impl SignalAuthority {
             let blocked = *masks.entry(recipient).or_insert_with(|| {
                 self.task
                     .thread(recipient)
-                    .map(|thread| thread.signal_state().blocked())
+                    .map(|thread| thread.blocked_mask())
             });
             // A live recipient that does not block the signal receives it. A
             // gone recipient, or one that blocks it, leaves it to any thread.
@@ -1259,7 +1259,7 @@ impl SignalAuthority {
             self.thread.publish_signal_state(&thread);
             inserted.then_some((tid, signum))
         });
-        let live_mask = thread.blocked();
+        let live_mask = self.thread.blocked_mask();
         let armed_restore = thread.armed_restore_mask();
         let persistent_restore = armed_restore.unwrap_or(live_mask);
         let effective_mask = armed_restore.map_or_else(
@@ -1357,13 +1357,12 @@ impl SignalAuthority {
     }
 
     pub fn altstack(&self) -> Option<LinuxSigaltstack> {
-        self.thread.signal_state.lock().altstack()
+        self.thread.altstack()
     }
 
     pub fn set_altstack(&self, altstack: Option<LinuxSigaltstack>) {
-        let mut state = self.thread.signal_state.lock();
-        state.set_altstack(altstack);
-        self.thread.publish_signal_state(&state);
+        self.thread
+            .update_signal_state(|state| state.set_altstack(altstack));
     }
 
     pub fn handler_frame_depth(&self) -> usize {

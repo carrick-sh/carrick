@@ -1025,7 +1025,7 @@ fn child_exit_signal_needs_notification(
     let action = parent.shared().sighand().action_entry(signal);
     let any_thread_blocks = parent.threads().iter().any(|thread| {
         let state = thread.signal_state.lock();
-        state.blocked().contains(signal.raw())
+        thread.blocked_mask().contains(signal.raw())
             || state
                 .active_wait_set()
                 .is_some_and(|set| set.contains(signal.raw()))

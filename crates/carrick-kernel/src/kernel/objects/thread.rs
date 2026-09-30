@@ -10,8 +10,9 @@ use std::sync::{Arc, Weak};
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, RwLock};
 
-use carrick_abi::LinuxGuestAbi;
 use carrick_abi::keyring::KeySerial;
+use carrick_abi::{LinuxGuestAbi, LinuxSigaltstack, SigSet};
+use carrick_el1_abi::{AltStack, BlockedMask, PendingSignals, PendingSummary, ThreadControlSlot};
 use carrick_fatal::carrick_fatal;
 use carrick_hal::threaded::GuestCpuState;
 use carrick_hal::{CpuAffinity, ThreadId};
@@ -840,7 +841,13 @@ pub struct Thread {
     task: Weak<Task>,
     resources: ArcSwap<ThreadResources>,
     pub(in crate::kernel) signal_state: Mutex<ThreadSignalState>,
-    signal_pending_hint: AtomicU64,
+    /// Thread-directed pending summary: the host lane's instance of the
+    /// shared Dekker partner of the blocked mask (see `control`).
+    signal_pending: PendingSummary,
+    /// The only storage of this thread's blocked mask, `sigaltstack` and
+    /// robust-list head (L2 ABI slot). Allocated with the thread, freed when
+    /// the last `Arc<Thread>` drops at reap.
+    control: ThreadControlSlot,
     pub(in crate::kernel) revision: ObjectRevision,
     runner_gate: Arc<RunnerGate>,
     start_gate_open: AtomicBool,
@@ -2680,37 +2687,161 @@ impl Thread {
         self.task_key
     }
 
+    /// Copy of the live signal state. The blocked mask and altstack are read
+    /// from the control slot, their only storage.
     pub fn signal_state(&self) -> ThreadSignalState {
-        self.signal_state.lock().clone()
+        let mut snapshot = self.signal_state.lock().clone();
+        self.overlay_masks(&mut snapshot);
+        snapshot
     }
 
     pub fn may_have_pending_signals(&self) -> bool {
-        self.signal_pending_hint.load(Ordering::Acquire) != 0
+        self.signal_pending.load().0 != 0
+    }
+
+    /// The control slot holding this thread's blocked mask, altstack and
+    /// robust-list head. The EL1 personality indexes the same layout.
+    pub fn control_slot(&self) -> &ThreadControlSlot {
+        &self.control
+    }
+
+    /// Current blocked mask (plain read; the owner's or diagnostic view).
+    pub fn blocked_mask(&self) -> SigSet {
+        SigSet::from_raw(self.control.blocked().0)
+    }
+
+    /// Masker half of the Dekker pair: install `new`, then read the pending
+    /// summary. Returns `(old mask, pending)`; the caller must serve with
+    /// work when `pending` holds a bit that `new` does not block.
+    pub fn store_blocked(&self, new: SigSet) -> (SigSet, SigSet) {
+        let (old, pending) = self
+            .control
+            .store_blocked_then_read_pending(BlockedMask(new.raw()), &self.signal_pending);
+        (SigSet::from_raw(old.0), SigSet::from_raw(pending.0))
+    }
+
+    /// Sender half of the Dekker pair: post `bits` to the pending summary,
+    /// then read the blocked mask. A signal the returned mask does not block
+    /// is the sender's to deliver; a blocked one is the masker's to find.
+    pub fn post_pending_read_blocked(&self, bits: SigSet) -> SigSet {
+        let blocked = self
+            .signal_pending
+            .post_then_read_blocked(PendingSignals(bits.raw()), &self.control);
+        SigSet::from_raw(blocked.0)
+    }
+
+    /// Retire `bits` from the pending summary (delivery consumed them).
+    pub fn clear_pending_summary(&self, bits: SigSet) {
+        self.signal_pending.clear(PendingSignals(bits.raw()));
+    }
+
+    /// Current `sigaltstack`; `None` is disabled.
+    pub fn altstack(&self) -> Option<LinuxSigaltstack> {
+        altstack_from_slot(self.control.read_altstack())
+    }
+
+    /// Install the `sigaltstack`. Callers hold `signal_state`, the single
+    /// writer the slot's seqlock requires.
+    fn write_altstack(&self, altstack: Option<LinuxSigaltstack>) {
+        self.control.write_altstack(altstack_to_slot(altstack));
+    }
+
+    /// Record `set_robust_list(head, len)`.
+    pub fn set_robust_list(&self, head: u64, len: u32) {
+        self.control.set_robust_list(head, len);
+    }
+
+    /// `(head, len)` last passed to `set_robust_list`; `(0, 0)` if never set.
+    pub fn robust_list(&self) -> (u64, u32) {
+        self.control.robust_list()
+    }
+
+    /// Load the slot's masks into `state` so a closure sees them.
+    fn overlay_masks(&self, state: &mut ThreadSignalState) {
+        state.set_blocked(self.blocked_mask());
+        state.set_altstack(self.altstack());
+    }
+
+    /// Write `state`'s masks back to the slot when they changed, then reset
+    /// `state`'s copy so the live mutex value never holds mask authority.
+    fn commit_masks(
+        &self,
+        state: &mut ThreadSignalState,
+        loaded: (SigSet, Option<LinuxSigaltstack>),
+    ) {
+        if state.blocked() != loaded.0 {
+            let _ = self.store_blocked(state.blocked());
+        }
+        if state.altstack() != loaded.1 {
+            self.write_altstack(state.altstack());
+        }
+        state.set_blocked(SigSet::EMPTY);
+        state.set_altstack(None);
     }
 
     pub fn replace_signal_state(&self, replacement: ThreadSignalState) {
         let mut state = self.signal_state.lock();
-        self.signal_pending_hint
-            .store(replacement.pending().raw(), Ordering::Release);
+        let _ = self.store_blocked(replacement.blocked());
+        self.write_altstack(replacement.altstack());
+        let mut replacement = replacement;
+        replacement.set_blocked(SigSet::EMPTY);
+        replacement.set_altstack(None);
         *state = replacement;
+        self.publish_pending(state.pending());
         self.revision.publish();
     }
 
     pub fn update_signal_state<R>(&self, operation: impl FnOnce(&mut ThreadSignalState) -> R) -> R {
         let mut state = self.signal_state.lock();
+        let loaded = (self.blocked_mask(), self.altstack());
+        state.set_blocked(loaded.0);
+        state.set_altstack(loaded.1);
         let result = operation(&mut state);
+        self.commit_masks(&mut state, loaded);
         self.publish_signal_state(&state);
         result
     }
 
+    /// Publish `state`'s pending set to the lock-free summary and bump the
+    /// revision. The caller holds `signal_state`.
     pub(in crate::kernel) fn publish_signal_state(&self, state: &ThreadSignalState) {
-        self.signal_pending_hint
-            .store(state.pending().raw(), Ordering::Release);
+        self.publish_pending(state.pending());
         self.revision.publish();
-        debug_assert_eq!(
-            self.signal_pending_hint.load(Ordering::Relaxed),
-            state.pending().raw()
-        );
+        debug_assert_eq!(self.signal_pending.load().0, state.pending().raw());
+    }
+
+    /// Make the summary equal `pending`. Newly pending bits are posted first
+    /// (sender half of the Dekker pair), then retired bits are cleared, so a
+    /// lock-free reader never sees a still-pending signal missing. Only
+    /// callers holding `signal_state` write the summary.
+    fn publish_pending(&self, pending: SigSet) {
+        let current = self.signal_pending.load().0;
+        let added = pending.raw() & !current;
+        let removed = current & !pending.raw();
+        if added != 0 {
+            let _blocked = self.post_pending_read_blocked(SigSet::from_raw(added));
+        }
+        if removed != 0 {
+            self.clear_pending_summary(SigSet::from_raw(removed));
+        }
+    }
+
+    /// A control slot seeded from a detached value before the thread is
+    /// visible to any sender.
+    fn new_control(seed: &ThreadSignalState) -> ThreadControlSlot {
+        let slot = ThreadControlSlot::new();
+        slot.init_blocked(BlockedMask(seed.blocked().raw()));
+        slot.write_altstack(altstack_to_slot(seed.altstack()));
+        slot
+    }
+
+    /// The value the mutex holds: everything but the masks, which only the
+    /// slot owns.
+    fn live_state(seed: &ThreadSignalState) -> ThreadSignalState {
+        let mut live = seed.clone();
+        live.set_blocked(SigSet::EMPTY);
+        live.set_altstack(None);
+        live
     }
 
     pub fn bind_runner(self: &Arc<Self>) -> Result<ThreadRunner, ObjectGraphError> {
@@ -2740,7 +2871,9 @@ impl Thread {
         deadline: std::time::Instant,
     ) -> Option<(u64, ThreadSignalState)> {
         let state = self.signal_state.try_lock_until(deadline)?;
-        Some((self.revision.load(), state.clone()))
+        let mut snapshot = state.clone();
+        self.overlay_masks(&mut snapshot);
+        Some((self.revision.load(), snapshot))
     }
 
     pub(in crate::kernel) fn revision(&self) -> u64 {
@@ -2769,7 +2902,7 @@ impl Thread {
     }
 
     pub(in crate::kernel) fn accepts_unhandled_signal(&self, signal: LinuxSignal) -> bool {
-        if self.signal_state.lock().blocked().contains(signal.raw()) {
+        if self.blocked_mask().contains(signal.raw()) {
             return true;
         }
         if let Some(continuation) = self.execution.lock().blocked_continuation.as_ref() {
@@ -2793,7 +2926,8 @@ impl Thread {
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::default()),
-            signal_pending_hint: AtomicU64::new(0),
+            signal_pending: PendingSummary::new(),
+            control: Self::new_control(&ThreadSignalState::default()),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(true),
@@ -2818,14 +2952,16 @@ impl Thread {
         caller_signal_state: ThreadSignalState,
         caller_affinity: CpuAffinity,
     ) -> ThreadRef {
+        let seed = &ThreadSignalState::for_clone_thread(&caller_signal_state);
         Arc::new(Thread {
             key,
             registry_id,
             task_key: task.key(),
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
-            signal_state: Mutex::new(ThreadSignalState::for_clone_thread(&caller_signal_state)),
-            signal_pending_hint: AtomicU64::new(0),
+            signal_state: Mutex::new(Self::live_state(seed)),
+            signal_pending: PendingSummary::new(),
+            control: Self::new_control(seed),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(false),
@@ -2850,14 +2986,16 @@ impl Thread {
         caller_signal_state: ThreadSignalState,
         caller_affinity: CpuAffinity,
     ) -> ThreadRef {
+        let seed = &ThreadSignalState::for_fork(&caller_signal_state);
         Arc::new(Thread {
             key,
             registry_id,
             task_key: task.key(),
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
-            signal_state: Mutex::new(ThreadSignalState::for_fork(&caller_signal_state)),
-            signal_pending_hint: AtomicU64::new(0),
+            signal_state: Mutex::new(Self::live_state(seed)),
+            signal_pending: PendingSummary::new(),
+            control: Self::new_control(seed),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(false),
@@ -2881,14 +3019,16 @@ impl Thread {
         resources: Arc<ThreadResources>,
         caller: &ThreadRef,
     ) -> ThreadRef {
-        Arc::new(Thread {
+        let seed = &ThreadSignalState::for_exec(&caller.signal_state());
+        let thread = Arc::new(Thread {
             key,
             registry_id,
             task_key: task.key(),
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
-            signal_state: Mutex::new(ThreadSignalState::for_exec(&caller.signal_state())),
-            signal_pending_hint: AtomicU64::new(caller.signal_pending_hint.load(Ordering::Acquire)),
+            signal_state: Mutex::new(Self::live_state(seed)),
+            signal_pending: PendingSummary::new(),
+            control: Self::new_control(seed),
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
             start_gate_open: AtomicBool::new(true),
@@ -2902,8 +3042,41 @@ impl Thread {
             thread_keyring: Mutex::new(None),
             last_cpu: AtomicU32::new(u32::MAX),
             affinity: RwLock::new(caller.affinity()),
-        })
+        });
+        thread.publish_pending(seed.pending());
+        thread
     }
+}
+
+/// A disabled altstack is stored as `SS_DISABLE`; an enabled one keeps its
+/// `ss_sp`/`ss_size` with `ss_flags` (0 once validated). A zeroed slot
+/// therefore decodes as enabled-and-empty, so every `Thread` constructor
+/// seeds the slot explicitly.
+fn altstack_to_slot(altstack: Option<LinuxSigaltstack>) -> AltStack {
+    match altstack {
+        None => AltStack {
+            sp: 0,
+            size: 0,
+            flags: carrick_abi::LINUX_SS_DISABLE as u32,
+        },
+        Some(stack) => AltStack {
+            sp: stack.ss_sp,
+            size: stack.ss_size,
+            flags: stack.ss_flags as u32,
+        },
+    }
+}
+
+fn altstack_from_slot(slot: AltStack) -> Option<LinuxSigaltstack> {
+    if u64::from(slot.flags) & carrick_abi::LINUX_SS_DISABLE != 0 {
+        return None;
+    }
+    Some(LinuxSigaltstack {
+        ss_sp: slot.sp,
+        ss_flags: slot.flags as i32,
+        __pad: 0,
+        ss_size: slot.size,
+    })
 }
 
 #[cfg(test)]

@@ -5331,6 +5331,100 @@ mod tests {
         );
     }
 
+    /// The blocked mask and altstack live only in the thread's control slot:
+    /// every reader and writer of the signal state goes through it.
+    #[test]
+    fn blocked_mask_and_altstack_live_in_the_control_slot() {
+        let d = SyscallDispatcher::new();
+        let context = d.capture_one_task_context().unwrap();
+        let thread = context.thread();
+        // A fresh thread has no altstack and an empty mask.
+        assert_eq!(thread.altstack(), None);
+        assert_eq!(thread.blocked_mask(), SigSet::EMPTY);
+
+        let mask = SigSet::EMPTY.with(10).with(34);
+        thread.update_signal_state(|state| {
+            state.set_blocked(mask);
+            state.set_altstack(Some(LinuxSigaltstack {
+                ss_sp: 0x4000,
+                ss_flags: 0,
+                __pad: 0,
+                ss_size: 0x2000,
+            }));
+        });
+        assert_eq!(thread.control_slot().blocked().0, mask.raw());
+        let slot = thread.control_slot().read_altstack();
+        assert_eq!((slot.sp, slot.size), (0x4000, 0x2000));
+        assert_eq!(thread.signal_state().blocked(), mask);
+        assert_eq!(thread.altstack().map(|s| s.ss_sp), Some(0x4000));
+
+        // Enabled-but-empty is distinct from disabled.
+        thread.update_signal_state(|state| state.set_altstack(Some(LinuxSigaltstack::empty())));
+        assert_eq!(thread.altstack(), Some(LinuxSigaltstack::empty()));
+        thread.update_signal_state(|state| state.set_altstack(None));
+        assert_eq!(thread.altstack(), None);
+    }
+
+    /// Dekker pair between a sender and a masker on the host lane. Each round
+    /// starts with the signal blocked and the masker unblocking it while the
+    /// sender posts it: either the sender observes the new mask (and so
+    /// delivers) or the masker observes the posted signal (and so serves
+    /// with work). The sender reading the OLD mask while the masker misses
+    /// the post is a lost signal.
+    #[test]
+    fn sender_and_masker_never_both_miss_each_other() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let d = SyscallDispatcher::new();
+        let context = d.capture_one_task_context().unwrap();
+        let thread = context.thread().clone();
+        let bit = SigSet::EMPTY.with(10);
+        let start = Barrier::new(3);
+        let done = Barrier::new(3);
+        let sender_saw_blocked = AtomicU64::new(0);
+        let masker_saw_pending = AtomicU64::new(0);
+        let rounds = 50_000u64;
+        let mut lost = 0u64;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 0..rounds {
+                    start.wait();
+                    let blocked = thread.post_pending_read_blocked(bit);
+                    sender_saw_blocked.store(
+                        u64::from(blocked.contains(10)) << 32 | round,
+                        Ordering::Relaxed,
+                    );
+                    done.wait();
+                }
+            });
+            scope.spawn(|| {
+                for round in 0..rounds {
+                    start.wait();
+                    let (_old, pending) = thread.store_blocked(SigSet::EMPTY);
+                    masker_saw_pending.store(
+                        u64::from(pending.contains(10)) << 32 | round,
+                        Ordering::Relaxed,
+                    );
+                    done.wait();
+                }
+            });
+            for _ in 0..rounds {
+                thread.store_blocked(bit);
+                thread.clear_pending_summary(bit);
+                start.wait();
+                done.wait();
+                let sender = sender_saw_blocked.load(Ordering::Relaxed) >> 32;
+                let masker = masker_saw_pending.load(Ordering::Relaxed) >> 32;
+                if sender == 1 && masker == 0 {
+                    lost += 1;
+                }
+            }
+        });
+        // Only "sender saw the old blocked mask AND masker missed the post"
+        // loses the signal; seeing each other's store is fine.
+        assert_eq!(lost, 0, "sender and masker both missed each other");
+    }
+
     #[test]
     fn exec_rekey_preserves_survivor_mask_and_pending_but_retires_siblings() {
         let d = SyscallDispatcher::new();
