@@ -1,11 +1,21 @@
 //! Shared IPC records for checkpoint 3: the descriptor authority, pipe and
 //! eventfd objects that the host and EL1 both operate on, in place.
 //!
-//! # Frozen ABI (v1)
+//! # ABI (v4: elastic stores)
 //!
-//! One [`IpcDirectory`] plus one byte *pool* hold every record. Both are plain
-//! `repr(C)` memory with no pointers, `Arc`, `Mutex` or trait objects; every
-//! cross-reference is a typed index + generation or a pool offset:
+//! One directory mapping plus one byte *pool* hold every record. Both are
+//! plain `repr(C)` memory with no pointers, `Arc`, `Mutex` or trait objects;
+//! every cross-reference is a typed index + generation or a pool offset.
+//! The directory mapping ([`IPC_DIRECTORY_BYTES`]) starts with the fixed
+//! [`IpcDirectory`] and reserves, at fixed offsets, the elastic stores: the
+//! object records ([`IPC_MAX_OBJECTS`]), the open-file-description records
+//! ([`IPC_MAX_OFDS`]) and the leaf words of the owed-host-wake index. The
+//! reservation is address space only: a store grows by *publishing* one
+//! segment at a time (the growth venue, the host, links the new zeroed
+//! records into the free list after publishing the count with Release), so
+//! memory is committed in proportion to the records ever used, and both
+//! venues resolve an index only below the published count. The ceilings are
+//! the zone-wide file table's limit (ENFILE), not an allocation policy.
 //!
 //! - **Descriptors** — [`IpcFdCore`] (`carrick_fd_core::Core`): tables, open
 //!   file descriptions (OFDs), descriptor-local CLOEXEC, shared status flags,
@@ -76,23 +86,41 @@ pub use carrick_pipe_core::{
 };
 
 /// Descriptor tables (distinct `CLONE_FILES` groups) in the shared authority.
+/// Exhaustion is not guest-visible: the host keeps serving a table it could
+/// not publish.
 pub const IPC_FD_TABLES: usize = 256;
-/// Open file descriptions in the shared authority.
-pub const IPC_OFDS: usize = 2048;
+/// Zone-wide ceiling on open file descriptions: the elastic OFD store's
+/// reservation, and the zone's file-table limit (ENFILE, `fs.file-max`).
+pub const IPC_MAX_OFDS: usize = 1 << 20;
+/// OFD records published per growth step.
+pub const IPC_OFD_SEGMENT: usize = 2048;
 /// Suspended-operation records ([`IpcOperation`] behind an [`IpcOpToken`]).
 /// Exhaustion refuses before effects (`NoOperations`: EL1 forwards).
 pub const IPC_OPERATIONS: usize = 1024;
-/// Pipe and eventfd objects.
-pub const IPC_OBJECTS: usize = 1024;
+/// Zone-wide ceiling on pipe and eventfd objects: the elastic object store's
+/// reservation (ENFILE beyond it).
+pub const IPC_MAX_OBJECTS: usize = 1 << 18;
+/// Object records published per growth step.
+pub const IPC_OBJECT_SEGMENT: usize = 1024;
 /// Guest page size used for pipe capacity and ring pages.
 pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
-/// Region magic: "CRKIPC" + ABI version 3 (indexed host wake publication).
-pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x03");
+/// Region magic: "CRKIPC" + ABI version 4 (elastic object and description
+/// stores, three-level host wake index).
+pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x04");
 const IPC_READY: u64 = 1;
-const HOST_WAKE_WORDS: usize = IPC_OBJECTS.div_ceil(64);
-const _: () = assert!(HOST_WAKE_WORDS <= 64);
+/// Leaf words of the owed-host-wake index: one bit per object.
+const HOST_WAKE_LEAF_WORDS: usize = IPC_MAX_OBJECTS / 64;
+/// Middle words: one bit per leaf word.
+const HOST_WAKE_MID_WORDS: usize = HOST_WAKE_LEAF_WORDS / 64;
+const _: () = assert!(
+    HOST_WAKE_MID_WORDS <= 64,
+    "one summary word covers the middle level"
+);
+const _: () = assert!(IPC_MAX_OBJECTS.is_multiple_of(IPC_OBJECT_SEGMENT));
+const _: () = assert!(IPC_MAX_OFDS.is_multiple_of(IPC_OFD_SEGMENT));
+const _: () = assert!(IPC_MAX_OFDS < u32::MAX as usize);
 
 /// The descriptor authority shared by host and EL1.
 pub type IpcFdCore = fd::Core<IPC_FD_TABLES>;
@@ -161,7 +189,9 @@ pub fn write_ipc_wait_census(
     region: &IpcRegion<'_>,
     out: &mut impl core::fmt::Write,
 ) -> core::fmt::Result {
-    let mut seen = [0u64; IPC_OBJECTS / 64];
+    // Zone queues name only objects below ZONE_RECORDS / 2 (two lanes each).
+    const QUEUED_OBJECTS: usize = carrick_sched_core::ZONE_RECORDS / 2;
+    let mut seen = [0u64; QUEUED_OBJECTS.div_ceil(64)];
     for id in 1..carrick_sched_core::ZONE_RECORDS as u32 {
         let Some(record) = carrick_sched_core::RecordId::from_raw(id) else {
             continue;
@@ -177,7 +207,7 @@ pub fn write_ipc_wait_census(
             continue;
         };
         let o = object as usize;
-        if o >= IPC_OBJECTS || seen[o / 64] & (1 << (o % 64)) != 0 {
+        if o >= QUEUED_OBJECTS || seen[o / 64] & (1 << (o % 64)) != 0 {
             continue;
         }
         seen[o / 64] |= 1 << (o % 64);
@@ -276,7 +306,7 @@ impl IpcBacking {
 const fn object_bits(object: IpcObjectHandle) -> u64 {
     ((object.index as u64 & INDEX_BITS) << INDEX_SHIFT) | object.generation as u64
 }
-const _: () = assert!(IPC_OBJECTS as u64 <= INDEX_BITS);
+const _: () = assert!(IPC_MAX_OBJECTS as u64 <= INDEX_BITS);
 
 // ---------------------------------------------------------------- records
 
@@ -362,8 +392,10 @@ pub struct IpcHeader {
     _reserved: [u64; 4],
 }
 
-/// Every IPC record, as one zero-initializable `repr(C)` object. The byte
-/// pool is separate memory (see [`IpcRegion`]).
+/// The fixed head of the directory mapping, as one zero-initializable
+/// `repr(C)` object. The elastic stores follow it in the same mapping at
+/// [`IPC_OBJECTS_OFFSET`], [`IPC_OFDS_OFFSET`] and [`IPC_WAKE_LEAVES_OFFSET`];
+/// the byte pool is separate memory (see [`IpcRegion`]).
 #[repr(C, align(4096))]
 pub struct IpcDirectory {
     header: IpcHeader,
@@ -373,25 +405,54 @@ pub struct IpcDirectory {
     /// than consumed. Must stay zero: nonzero names a host subscriber whose
     /// wake target was never registered or was dropped while it waited.
     owed_host_wakes_without_target: AtomicU64,
-    _reserved: [u64; 6],
+    /// Object records published ([`IpcRegion::grow_objects`]); only grows,
+    /// always a multiple of [`IPC_OBJECT_SEGMENT`].
+    object_count: AtomicU64,
+    _reserved: [u64; 5],
     fd: IpcFdCore,
-    ofds: [OfdRecord; IPC_OFDS],
-    objects: [IpcObjectRecord; IPC_OBJECTS],
     free_operations: AtomicU64,
     _reserved_ops: [u64; 7],
     operations: [IpcOperationSlot; IPC_OPERATIONS],
-    /// Two-level pending index. Publishers set object bits before summary bits;
-    /// a host boundary takes one bounded snapshot, never scans live objects.
+    /// Three-level pending index (summary → middle → leaf words, the
+    /// leaves in the elastic area). Publishers set the leaf bit first and
+    /// the summary bit last; a host boundary takes one bounded snapshot,
+    /// visiting only pending words, never live objects.
     host_wake_summary: AtomicU64,
-    host_wake_words: [AtomicU64; HOST_WAKE_WORDS],
+    host_wake_mid: [AtomicU64; HOST_WAKE_MID_WORDS],
 }
+
+const fn page_round(n: usize) -> usize {
+    n.next_multiple_of(IPC_PIPE_PAGE_SIZE)
+}
+/// Offset, in the directory mapping, of the object store's reservation.
+pub const IPC_OBJECTS_OFFSET: usize = page_round(core::mem::size_of::<IpcDirectory>());
+/// Offset of the OFD store's reservation.
+pub const IPC_OFDS_OFFSET: usize =
+    page_round(IPC_OBJECTS_OFFSET + IPC_MAX_OBJECTS * core::mem::size_of::<IpcObjectRecord>());
+/// Offset of the owed-host-wake index's leaf words.
+pub const IPC_WAKE_LEAVES_OFFSET: usize =
+    page_round(IPC_OFDS_OFFSET + IPC_MAX_OFDS * core::mem::size_of::<OfdRecord>());
+/// Length of the directory mapping: fixed head plus every store's
+/// reservation, a multiple of 16 KiB (the host's stage-2 granule).
+pub const IPC_DIRECTORY_BYTES: usize = (IPC_WAKE_LEAVES_OFFSET
+    + HOST_WAKE_LEAF_WORDS * core::mem::size_of::<AtomicU64>())
+.next_multiple_of(0x4000);
+const _: () = assert!(IPC_OBJECTS_OFFSET.is_multiple_of(core::mem::align_of::<IpcObjectRecord>()));
+const _: () = assert!(IPC_OFDS_OFFSET.is_multiple_of(core::mem::align_of::<OfdRecord>()));
 
 /// Layout facts of this ABI; see [`IPC_LAYOUT_HASH`].
 const LAYOUT_FACTS: &[u64] = &[
     IPC_MAGIC,
     IPC_FD_TABLES as u64,
-    IPC_OFDS as u64,
-    IPC_OBJECTS as u64,
+    IPC_MAX_OFDS as u64,
+    IPC_OFD_SEGMENT as u64,
+    IPC_MAX_OBJECTS as u64,
+    IPC_OBJECT_SEGMENT as u64,
+    IPC_OBJECTS_OFFSET as u64,
+    IPC_OFDS_OFFSET as u64,
+    IPC_WAKE_LEAVES_OFFSET as u64,
+    IPC_DIRECTORY_BYTES as u64,
+    core::mem::offset_of!(IpcDirectory, object_count) as u64,
     IPC_PIPE_PAGE_SIZE as u64,
     IPC_POOL_ALIGN,
     core::mem::size_of::<usize>() as u64,
@@ -399,8 +460,6 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::align_of::<IpcDirectory>() as u64,
     core::mem::offset_of!(IpcDirectory, owed_host_wakes_without_target) as u64,
     core::mem::offset_of!(IpcDirectory, fd) as u64,
-    core::mem::offset_of!(IpcDirectory, ofds) as u64,
-    core::mem::offset_of!(IpcDirectory, objects) as u64,
     core::mem::size_of::<IpcFdCore>() as u64,
     core::mem::size_of::<IpcObjectRecord>() as u64,
     core::mem::offset_of!(IpcObjectRecord, generation) as u64,
@@ -433,8 +492,9 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::size_of::<IpcOperationSlot>() as u64,
     core::mem::offset_of!(IpcDirectory, operations) as u64,
     core::mem::offset_of!(IpcDirectory, host_wake_summary) as u64,
-    core::mem::offset_of!(IpcDirectory, host_wake_words) as u64,
-    HOST_WAKE_WORDS as u64,
+    core::mem::offset_of!(IpcDirectory, host_wake_mid) as u64,
+    HOST_WAKE_MID_WORDS as u64,
+    HOST_WAKE_LEAF_WORDS as u64,
     core::mem::offset_of!(IpcOperationSlot, op) as u64,
 ];
 
@@ -651,8 +711,12 @@ pub enum IpcError {
     Stale,
     /// The handle names an object of another kind.
     WrongKind,
-    /// Every object record is in use.
+    /// Every published object record is in use: the host grows the store
+    /// ([`IpcRegion::grow_objects`]) and retries. Never an errno by itself.
     NoObjects,
+    /// A store is at its zone-wide ceiling ([`IPC_MAX_OBJECTS`] objects or
+    /// [`IPC_MAX_OFDS`] descriptions): the zone's file table is full (ENFILE).
+    ZoneLimit,
     /// Every operation record is in use (refused before effects).
     NoOperations,
     /// The host must provision pipe storage of at least this size (outside
@@ -672,12 +736,16 @@ pub enum IpcError {
 
 // ---------------------------------------------------------------- region
 
-/// A venue's view of the shared IPC memory: the directory plus the byte
-/// pool, each at this venue's own address (host mapping or EL1 VA). Offsets
-/// in records are pool-relative, so both venues resolve the same records.
+/// A venue's view of the shared IPC memory: the directory mapping plus the
+/// byte pool, each at this venue's own address (host mapping or EL1 VA).
+/// Offsets in records are directory- or pool-relative, so both venues
+/// resolve the same records.
 #[derive(Clone, Copy)]
 pub struct IpcRegion<'a> {
     dir: &'a IpcDirectory,
+    /// The whole directory mapping ([`IPC_DIRECTORY_BYTES`]): the head `dir`
+    /// and the elastic stores after it.
+    base: *mut u8,
     pool: *mut u8,
     pool_len: u64,
     _pool: PhantomData<&'a UnsafeCell<[u8]>>,
@@ -692,13 +760,15 @@ impl<'a> IpcRegion<'a> {
     /// mismatched owners before consuming an operation or releasing a host token.
     pub fn same_mapping(&self, other: &IpcRegion<'_>) -> bool {
         core::ptr::eq(self.dir, other.dir)
+            && self.base == other.base
             && self.pool == other.pool
             && self.pool_len == other.pool_len
     }
 
-    fn checked(dir: *mut IpcDirectory, pool: *mut u8) -> Result<(), IpcError> {
+    fn checked(dir: *mut IpcDirectory, dir_len: usize, pool: *mut u8) -> Result<(), IpcError> {
         if dir.is_null()
             || !(dir as usize).is_multiple_of(core::mem::align_of::<IpcDirectory>())
+            || dir_len < IPC_DIRECTORY_BYTES
             || pool.is_null()
             || !(pool as usize).is_multiple_of(IPC_POOL_ALIGN as usize)
         {
@@ -707,19 +777,22 @@ impl<'a> IpcRegion<'a> {
         Ok(())
     }
 
-    /// Publish a new region (the one initialization venue, once).
+    /// Publish a new region (the one initialization venue, once), with the
+    /// first segment of each elastic store.
     ///
     /// # Safety
-    /// `dir` points to zeroed memory of `size_of::<IpcDirectory>()` bytes and
-    /// `pool` to `pool_len` bytes, both valid and shared for `'a`, used for
-    /// nothing else.
+    /// `dir` points to zeroed memory of `dir_len` (at least
+    /// [`IPC_DIRECTORY_BYTES`]) bytes and `pool` to `pool_len` bytes, both
+    /// valid and shared for `'a`, used for nothing else. The reservation may
+    /// be committed lazily: only published segments are ever touched.
     pub unsafe fn initialize(
         dir: *mut IpcDirectory,
+        dir_len: usize,
         pool: *mut u8,
         pool_len: usize,
         identity: u64,
     ) -> Result<Self, IpcError> {
-        Self::checked(dir, pool)?;
+        Self::checked(dir, dir_len, pool)?;
         // SAFETY: caller contract; all-zero is a valid IpcDirectory.
         let d: &'a IpcDirectory = unsafe { &*dir };
         if d.header.state.load(Ordering::Acquire) != 0 {
@@ -728,16 +801,13 @@ impl<'a> IpcRegion<'a> {
         d.fd.initialize(identity).map_err(IpcError::Fd)?;
         let region = Self {
             dir: d,
+            base: dir.cast(),
             pool,
             pool_len: pool_len as u64,
             _pool: PhantomData,
         };
-        d.fd.bind(&region, BoundedSpin(0))
-            .publish_ofds(IPC_OFDS)
-            .map_err(IpcError::Fd)?;
-        for i in (0..IPC_OBJECTS).rev() {
-            push(&d.free_objects, i, &d.objects[i].next_free);
-        }
+        region.grow_ofds()?;
+        region.grow_objects()?;
         for i in (0..IPC_OPERATIONS).rev() {
             push(&d.free_operations, i, &d.operations[i].next_free);
         }
@@ -754,14 +824,16 @@ impl<'a> IpcRegion<'a> {
     /// readiness and pool length.
     ///
     /// # Safety
-    /// `dir`/`pool` map the same shared memory the initializing venue
-    /// published (at this venue's addresses), valid for `'a`.
+    /// `dir` (`dir_len` bytes) and `pool` map the same shared memory the
+    /// initializing venue published (at this venue's addresses), valid for
+    /// `'a`.
     pub unsafe fn attach(
         dir: *mut IpcDirectory,
+        dir_len: usize,
         pool: *mut u8,
         pool_len: usize,
     ) -> Result<Self, IpcError> {
-        Self::checked(dir, pool)?;
+        Self::checked(dir, dir_len, pool)?;
         // SAFETY: caller contract.
         let d: &'a IpcDirectory = unsafe { &*dir };
         let h = &d.header;
@@ -775,6 +847,7 @@ impl<'a> IpcRegion<'a> {
         }
         Ok(Self {
             dir: d,
+            base: dir.cast(),
             pool,
             pool_len: pool_len as u64,
             _pool: PhantomData,
@@ -796,8 +869,84 @@ impl<'a> IpcRegion<'a> {
         Some(unsafe { self.pool.add(offset as usize) })
     }
 
+    /// A published object record; `None` past the published count.
     fn record(&self, index: u32) -> Option<&'a IpcObjectRecord> {
-        self.dir.objects.get(index as usize)
+        if u64::from(index) >= self.dir.object_count.load(Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: the mapping spans IPC_DIRECTORY_BYTES (checked at attach)
+        // and index < object_count <= IPC_MAX_OBJECTS; all-zero is a valid
+        // record, accessed through atomics and the object lock.
+        Some(unsafe {
+            &*self
+                .base
+                .add(IPC_OBJECTS_OFFSET)
+                .cast::<IpcObjectRecord>()
+                .add(index as usize)
+        })
+    }
+
+    /// Leaf word `word` of the owed-host-wake index.
+    fn wake_leaf(&self, word: usize) -> Option<&'a AtomicU64> {
+        (word < HOST_WAKE_LEAF_WORDS).then(|| {
+            // SAFETY: in bounds of the leaf reservation of the mapping.
+            unsafe {
+                &*self
+                    .base
+                    .add(IPC_WAKE_LEAVES_OFFSET)
+                    .cast::<AtomicU64>()
+                    .add(word)
+            }
+        })
+    }
+
+    /// Published object records ([`IpcRegion::grow_objects`]).
+    pub fn object_count(&self) -> usize {
+        self.dir.object_count.load(Ordering::Acquire) as usize
+    }
+
+    /// Published open-file-description records ([`IpcRegion::grow_ofds`]).
+    pub fn ofd_count(&self) -> usize {
+        self.dir.fd.ofd_count()
+    }
+
+    /// Publish the next [`IPC_OBJECT_SEGMENT`] object records: the count is
+    /// published (Release) before the zeroed records join the free list, so
+    /// every popped index resolves in both venues. Growth venue (the host)
+    /// only, outside any lock; a concurrent growth refuses (`Contended`).
+    /// Returns the records added: O(segment) work, once per segment.
+    pub fn grow_objects(&self) -> Result<usize, IpcError> {
+        let first = self.dir.object_count.load(Ordering::Acquire);
+        if first >= IPC_MAX_OBJECTS as u64 {
+            return Err(IpcError::ZoneLimit);
+        }
+        let end = first + IPC_OBJECT_SEGMENT as u64;
+        self.dir
+            .object_count
+            .compare_exchange(first, end, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| IpcError::Contended)?;
+        for index in (first..end).rev() {
+            let record = self.record(index as u32).ok_or(IpcError::Corrupt)?;
+            push(&self.dir.free_objects, index as usize, &record.next_free);
+        }
+        Ok(IPC_OBJECT_SEGMENT)
+    }
+
+    /// Publish the next [`IPC_OFD_SEGMENT`] open-file-description records
+    /// (see [`fd::Authority::publish_ofds`]). Growth venue only. Returns the
+    /// records added.
+    pub fn grow_ofds(&self) -> Result<usize, IpcError> {
+        let first = self.ofd_count();
+        if first >= IPC_MAX_OFDS {
+            return Err(IpcError::ZoneLimit);
+        }
+        let count = IPC_OFD_SEGMENT.min(IPC_MAX_OFDS - first);
+        self.dir
+            .fd
+            .bind(self, BoundedSpin(0))
+            .publish_ofds(count)
+            .map_err(IpcError::Fd)?;
+        Ok(count)
     }
 
     /// For a wedge post-mortem: the owed-host-wake index as a host boundary
@@ -816,20 +965,23 @@ impl<'a> IpcRegion<'a> {
             self.owed_host_wakes_without_target(),
             self.dir.host_wake_summary.load(Ordering::Acquire)
         )?;
-        for (word, bits) in self.dir.host_wake_words.iter().enumerate() {
+        for (word, bits) in self.dir.host_wake_mid.iter().enumerate() {
             let bits = bits.load(Ordering::Acquire);
             if bits != 0 {
-                write!(out, " word{word}={bits:#x}")?;
+                write!(out, " mid{word}={bits:#x}")?;
             }
         }
         writeln!(out)?;
-        for (index, record) in self.dir.objects.iter().enumerate() {
+        for index in 0..self.object_count() {
+            let Some(record) = self.record(index as u32) else {
+                break;
+            };
             if record.kind.load(Ordering::Acquire) == KIND_FREE {
                 continue;
             }
-            let indexed = self.dir.host_wake_words[index / 64].load(Ordering::Acquire)
-                & (1 << (index % 64))
-                != 0;
+            let indexed = self
+                .wake_leaf(index / 64)
+                .is_some_and(|w| w.load(Ordering::Acquire) & (1 << (index % 64)) != 0);
             if record.host_subscribers.load(Ordering::Acquire) == 0
                 && record.host_wake_owed.load(Ordering::Acquire) == 0
                 && !indexed
@@ -963,12 +1115,13 @@ impl<'a> IpcRegion<'a> {
     }
 
     fn pop_object(&self) -> Result<(u32, &'a IpcObjectRecord), IpcError> {
-        let objects = &self.dir.objects;
         let index = pop(&self.dir.free_objects, |i| {
-            objects.get(i).map(|o| o.next_free.load(Ordering::Relaxed))
+            self.record(u32::try_from(i).ok()?)
+                .map(|o| o.next_free.load(Ordering::Relaxed))
         })
         .ok_or(IpcError::NoObjects)?;
-        Ok((index as u32, &objects[index]))
+        let index = u32::try_from(index).map_err(|_| IpcError::Corrupt)?;
+        Ok((index, self.record(index).ok_or(IpcError::Corrupt)?))
     }
 
     fn lock_fresh<W: LockWait>(
@@ -1136,19 +1289,29 @@ impl<'a> IpcRegion<'a> {
         let mut summary = self.dir.host_wake_summary.swap(0, Ordering::AcqRel);
         let mut visited = 0;
         while summary != 0 {
-            let word = summary.trailing_zeros() as usize;
+            let mid = summary.trailing_zeros() as usize;
             summary &= summary - 1;
-            let mut pending = self.dir.host_wake_words[word].swap(0, Ordering::AcqRel);
-            while pending != 0 {
-                let bit = pending.trailing_zeros() as usize;
-                pending &= pending - 1;
-                let index = word * 64 + bit;
-                if let Some(record) = self.dir.objects.get(index) {
-                    visited += 1;
-                    deliver(IpcObjectHandle {
-                        index: index as u32,
-                        generation: record.generation.load(Ordering::Acquire) as u32,
-                    });
+            let Some(mid_word) = self.dir.host_wake_mid.get(mid) else {
+                continue;
+            };
+            let mut leaves = mid_word.swap(0, Ordering::AcqRel);
+            while leaves != 0 {
+                let leaf = mid * 64 + leaves.trailing_zeros() as usize;
+                leaves &= leaves - 1;
+                let Some(leaf_word) = self.wake_leaf(leaf) else {
+                    continue;
+                };
+                let mut pending = leaf_word.swap(0, Ordering::AcqRel);
+                while pending != 0 {
+                    let index = leaf * 64 + pending.trailing_zeros() as usize;
+                    pending &= pending - 1;
+                    if let Some(record) = self.record(index as u32) {
+                        visited += 1;
+                        deliver(IpcObjectHandle {
+                            index: index as u32,
+                            generation: record.generation.load(Ordering::Acquire) as u32,
+                        });
+                    }
                 }
             }
         }
@@ -1243,7 +1406,18 @@ impl<'a> IpcRegion<'a> {
 
 impl SlotBacking for IpcRegion<'_> {
     fn ofd(&self, index: usize) -> Option<&OfdRecord> {
-        self.dir.ofds.get(index)
+        (index < IPC_MAX_OFDS).then(|| {
+            // SAFETY: in bounds of the OFD reservation of the mapping; the
+            // fd core resolves only published (initialized) indices, and
+            // all-zero is a valid record of atomics.
+            unsafe {
+                &*self
+                    .base
+                    .add(IPC_OFDS_OFFSET)
+                    .cast::<OfdRecord>()
+                    .add(index)
+            }
+        })
     }
 
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
@@ -1476,16 +1650,22 @@ impl<'a> IpcObjectGuard<'a> {
             host_owed,
         }
     }
-    /// Set this object's bits in the owed-wake index: object bit before
-    /// summary bit, so a boundary that sees the summary finds the object.
+    /// Set this object's bits in the owed-wake index: leaf bit, then middle
+    /// bit, then summary bit, so a boundary that sees the summary finds the
+    /// object. O(1): three words, whatever the live population.
     fn index_host_wake(&self) {
         let index = self.handle.index as usize;
-        self.region.dir.host_wake_words[index / 64]
-            .fetch_or(1u64 << (index % 64), Ordering::Release);
+        let leaf = index / 64;
+        let Some(leaf_word) = self.region.wake_leaf(leaf) else {
+            return;
+        };
+        leaf_word.fetch_or(1u64 << (index % 64), Ordering::Release);
+        let mid = leaf / 64;
+        self.region.dir.host_wake_mid[mid].fetch_or(1u64 << (leaf % 64), Ordering::Release);
         self.region
             .dir
             .host_wake_summary
-            .fetch_or(1u64 << (index / 64), Ordering::Release);
+            .fetch_or(1u64 << mid, Ordering::Release);
     }
 
     /// Host, under this lock: consume the owed host wake, for delivery to a

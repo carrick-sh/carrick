@@ -1412,6 +1412,34 @@ mod overlay_dispatch_tests {
         );
     }
 
+    /// `pipemass`: Linux has no pipe-object limit below `RLIMIT_NOFILE`; the
+    /// first failing `pipe2` reports EMFILE with every slot but one used.
+    #[test]
+    fn pipe2_mass_open_fails_only_at_nofile_with_emfile() {
+        const NOFILE: u64 = 8192;
+        let mut h = Harness::new();
+        let limit = h.reserve(16);
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&NOFILE.to_le_bytes());
+        bytes[8..16].copy_from_slice(&NOFILE.to_le_bytes());
+        h.memory.write_bytes(limit, &bytes).unwrap();
+        assert_eq!(returned(h.call(261, [0, 7, limit, 0, 0, 0])), 0);
+        let pair = h.reserve(8);
+        let mut pipes = 0u64;
+        let failure = loop {
+            match h.call(59, [pair, 0, 0, 0, 0, 0]) {
+                DispatchOutcome::Returned { value: 0 } => pipes += 1,
+                DispatchOutcome::Errno { errno } => break errno.get(),
+                other => panic!("pipe2: {other:?}"),
+            }
+        };
+        assert_eq!(
+            (failure, pipes),
+            (linux_errno::EMFILE.get(), (NOFILE - 3) / 2),
+            "pipe2 must fail only at RLIMIT_NOFILE, with EMFILE"
+        );
+    }
+
     #[test]
     fn blocked_sendfile_captures_input_and_output_before_input_reuse() {
         let mut h = Harness::new();

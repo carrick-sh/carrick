@@ -201,19 +201,24 @@ pub const EL1_HEAP_SIZE: u64 = EL1_REGION_SIZE - EL1_HEAP_OFFSET;
 /// pool at [`EL1_IPC_POOL_BASE`]. EL1 attaches only once the directory is
 /// published, so an unmapped or unpublished window fails closed.
 pub const EL1_IPC_BASE: u64 = EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE;
-/// IPA span reserved for the directory (its length must fit).
-pub const EL1_IPC_DIRECTORY_SPAN: u64 = 0x20_0000;
+/// IPA span reserved for the directory mapping: the fixed directory head
+/// and the reservations of its elastic stores
+/// ([`ipc::IPC_DIRECTORY_BYTES`] must fit). Address space only: the host
+/// commits a store's pages as it publishes segments.
+pub const EL1_IPC_DIRECTORY_SPAN: u64 = 0x800_0000;
 /// Guest VA/IPA of the IPC byte pool.
 pub const EL1_IPC_POOL_BASE: u64 = EL1_IPC_BASE + EL1_IPC_DIRECTORY_SPAN;
-/// Length of the IPC byte pool (the authority's pool is exactly this long).
-pub const EL1_IPC_POOL_SPAN: u64 = 0x800_0000;
+/// Length of the IPC byte pool (the authority's pool is exactly this long):
+/// descriptor-table extents and the rings of pipes that hold (or held)
+/// data; a pipe's ring is allocated at its first write.
+pub const EL1_IPC_POOL_SPAN: u64 = 0x2000_0000;
 /// The whole kernel-only IPC window.
 pub const EL1_IPC_SIZE: u64 = EL1_IPC_DIRECTORY_SPAN + EL1_IPC_POOL_SPAN;
 /// Offset, within the EL1 region, of the [`ipc_tables::IpcTableMap`]
 /// (region memory the carrier owns, so it exists before any IPC authority).
 pub const EL1_IPC_TABLE_MAP_OFFSET: u64 = EL1_OPEN_FILE_TABLE_OFFSET + EL1_OPEN_FILE_TABLE_SIZE;
 
-const _: () = assert!(core::mem::size_of::<ipc::IpcDirectory>() as u64 <= EL1_IPC_DIRECTORY_SPAN);
+const _: () = assert!(ipc::IPC_DIRECTORY_BYTES as u64 <= EL1_IPC_DIRECTORY_SPAN);
 const _: () = assert!(
     EL1_IPC_TABLE_MAP_OFFSET + core::mem::size_of::<ipc_tables::IpcTableMap>() as u64
         <= EL1_CACHE_OFFSET
@@ -2538,7 +2543,7 @@ impl IpcWindow {
     ) -> Option<Self> {
         (directory != 0
             && pool != 0
-            && directory_len >= core::mem::size_of::<ipc::IpcDirectory>()
+            && directory_len >= ipc::IPC_DIRECTORY_BYTES
             && directory_len as u64 <= EL1_IPC_DIRECTORY_SPAN
             && pool_len as u64 == EL1_IPC_POOL_SPAN)
             .then_some(Self {
@@ -2567,6 +2572,7 @@ impl IpcWindow {
         unsafe {
             ipc::IpcRegion::attach(
                 self.directory as *mut ipc::IpcDirectory,
+                self.directory_len,
                 self.pool as *mut u8,
                 self.pool_len,
             )

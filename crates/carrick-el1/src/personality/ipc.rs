@@ -650,6 +650,12 @@ mod tests {
             // SAFETY: the caller's contract.
             unsafe { System.alloc(layout) }
         }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+            // SAFETY: the caller's contract. Keeps the directory mapping's
+            // large reservation lazily committed.
+            unsafe { System.alloc_zeroed(layout) }
+        }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             // SAFETY: the caller's contract.
             unsafe { System.dealloc(ptr, layout) }
@@ -790,12 +796,24 @@ mod tests {
 
     fn world() -> World {
         let dir = unsafe {
-            std::alloc::alloc_zeroed(Layout::new::<IpcDirectory>()).cast::<IpcDirectory>()
+            std::alloc::alloc_zeroed(
+                Layout::from_size_align(carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES, 4096).unwrap(),
+            )
+            .cast::<IpcDirectory>()
         };
         let pool_len = 16 << 20;
         let pool =
             unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
-        let region = unsafe { IpcRegion::initialize(dir, pool, pool_len, 42) }.unwrap();
+        let region = unsafe {
+            IpcRegion::initialize(
+                dir,
+                carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES,
+                pool,
+                pool_len,
+                42,
+            )
+        }
+        .unwrap();
         let zone: Box<ZoneTables> =
             unsafe { Box::from_raw(std::alloc::alloc_zeroed(Layout::new::<ZoneTables>()).cast()) };
         zone.spaces.set_idle_ttbr(IDLE_TTBR);

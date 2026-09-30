@@ -159,12 +159,25 @@ impl IpcHostServices for Wakes {
 }
 
 fn world() -> World {
-    let dir =
-        unsafe { std::alloc::alloc_zeroed(Layout::new::<IpcDirectory>()).cast::<IpcDirectory>() };
+    let dir = unsafe {
+        std::alloc::alloc_zeroed(
+            Layout::from_size_align(carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES, 4096).unwrap(),
+        )
+        .cast::<IpcDirectory>()
+    };
     let pool_len = 4 << 20;
     let pool =
         unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
-    let region = unsafe { IpcRegion::initialize(dir, pool, pool_len, 9) }.unwrap();
+    let region = unsafe {
+        IpcRegion::initialize(
+            dir,
+            carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES,
+            pool,
+            pool_len,
+            9,
+        )
+    }
+    .unwrap();
     let region: &'static IpcRegion<'static> = Box::leak(Box::new(region));
     let w = World {
         region,

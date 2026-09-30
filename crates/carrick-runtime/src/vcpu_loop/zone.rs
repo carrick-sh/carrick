@@ -1066,7 +1066,7 @@ mod ipc_tests {
     //! boundary: syscall results, SIGPIPE, and the park decision.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use carrick_el1_abi::ipc::{EventMode, IpcDirectory, IpcOperation, IpcRegion};
+    use carrick_el1_abi::ipc::{EventMode, IpcOperation, IpcRegion};
     use carrick_kernel::dispatch::SyscallDispatcher;
     use std::alloc::Layout;
 
@@ -1090,12 +1090,26 @@ mod ipc_tests {
     }
 
     fn region() -> &'static IpcRegion<'static> {
-        let dir = unsafe { std::alloc::alloc_zeroed(Layout::new::<IpcDirectory>()).cast() };
+        let dir = unsafe {
+            std::alloc::alloc_zeroed(
+                Layout::from_size_align(carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES, 4096).unwrap(),
+            )
+            .cast()
+        };
         let pool_len = 1 << 20;
         let pool =
             unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
         Box::leak(Box::new(
-            unsafe { IpcRegion::initialize(dir, pool, pool_len, 3) }.unwrap(),
+            unsafe {
+                IpcRegion::initialize(
+                    dir,
+                    carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES,
+                    pool,
+                    pool_len,
+                    3,
+                )
+            }
+            .unwrap(),
         ))
     }
 
