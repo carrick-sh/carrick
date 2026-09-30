@@ -494,7 +494,7 @@ impl Task {
                                 child_script,
                                 shared,
                             )?;
-                            self.finish_syscall(syscall, Ok(child_tid as i64), outs, shared)?;
+                            self.finish_syscall(syscall, child_tid.map(i64::from), outs, shared)?;
                         }
                         InternalCompletion::Exit(code) => {
                             let pid = self.process.pid();
@@ -1097,11 +1097,19 @@ impl Task {
         clear_child_tid_addr: u64,
         child_script: &[Step],
         shared: &Arc<Shared>,
-    ) -> Result<i32, ExampleError> {
+    ) -> Result<Result<i32, LinuxErrno>, ExampleError> {
         let _dispatcher = self.dispatcher.lock();
         let parent = &self.context;
         let plan = ClonePlan::from_flags(LinuxCloneFlags::from_bits_retain(flags))?;
-        let reservation = parent.kernel().reserve_thread_clone(parent, plan, None)?;
+        // clone(2) EAGAIN when the real uid is at its RLIMIT_NPROC soft
+        // limit, lowered exactly as the HVPatch host clone lowers it.
+        let reservation = match parent.kernel().reserve_thread_clone(parent, plan, None) {
+            Ok(reservation) => reservation,
+            Err(KernelOperationError::ProcessLimitExceeded { .. }) => {
+                return Ok(Err(carrick_abi::LINUX_EAGAIN));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let child_tid = reservation.visible_tid();
         let thread_id = ThreadId::from_guest_supplied_tid(child_tid);
 
@@ -1137,7 +1145,7 @@ impl Task {
             .name(format!("linux-thread-{child_tid}"))
             .spawn(move || child.run_child(&script, &shared_for_child))?;
         shared.children.lock().push(handle);
-        Ok(child_tid)
+        Ok(Ok(child_tid))
     }
 
     /// Serialize process terminal publication through the per-process dispatcher mutex

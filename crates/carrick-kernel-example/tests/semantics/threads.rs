@@ -328,3 +328,73 @@ fn tgkill_wakes_the_exact_sibling_signal_waiter() {
         (2, 3, Ok(LINUX_SIGUSR1 as i64))
     );
 }
+
+fn nproc_payload(cur: u64, max: u64) -> [u8; 16] {
+    let mut payload = [0u8; 16];
+    payload[0..8].copy_from_slice(&cur.to_le_bytes());
+    payload[8..16].copy_from_slice(&max.to_le_bytes());
+    payload
+}
+
+/// `RLIMIT_NPROC` binds thread creation exactly like fork: with two live
+/// processes of real uid 1000 at a soft limit of two, the parent's thread
+/// clone fails with `EAGAIN` and publishes nothing.
+///
+/// Authority: setrlimit(2) `RLIMIT_NPROC` — a limit on the number of extant
+/// processes (on Linux, threads) for the caller's real user ID; while the
+/// count is greater than or equal to the limit, creation fails with `EAGAIN`
+/// (fork(2); clone(2) "Too many processes are already running"). Not
+/// enforced for `CAP_SYS_ADMIN`/`CAP_SYS_RESOURCE` or real uid 0, so the
+/// script drops to uid 1000 under the default capability set first.
+#[test]
+fn thread_clone_at_rlimit_nproc_is_eagain_across_two_live_processes() {
+    let limit_2 = nproc_payload(2, 64);
+    let script = vec![
+        pipe_to_slots(0, 1),
+        Step::Sys(sys::setresuid(1000, 1000, 1000).ret(0)),
+        Step::Sys(sys::prlimit64(0, LINUX_RLIMIT_NPROC, &limit_2[..], 0).ret(0)),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::read(slot(0), 1).ret(1)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::clone_thread(0).errno(LINUX_EAGAIN)),
+        Step::ChildMarker(vec![Step::Sys(sys::exit_thread(0))]),
+        Step::Sys(sys::write(slot(1), b"x").ret(1)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = run(script);
+    assert_eq!(run.exit_code(), 0);
+}
+
+/// A second live process addresses a thread by the tid its clone just
+/// returned: `kill(tid, 0)` and `tgkill(tgid, tid, 0)` both resolve while the
+/// thread is parked. Every membership reader settles the thread ledger
+/// first, so a thread is visible from the moment its clone returns whichever
+/// lane published it.
+#[test]
+fn second_process_kill_resolves_a_just_published_thread() {
+    let script = vec![
+        pipe_to_slots(0, 1),
+        pipe_to_slots(2, 3),
+        Step::Sys(sys::clone_thread(0).save(4)),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::read(slot(0), 1).ret(1)),
+            Step::Sys(sys::exit_thread(0)),
+        ]),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::Sys(sys::kill(slot(4), 0).ret(0)),
+            Step::Sys(sys::tgkill(1, slot(4), 0).ret(0)),
+            Step::Sys(sys::write(slot(3), b"k").ret(1)),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        Step::Sys(sys::read(slot(2), 1).ret(1)),
+        Step::Sys(sys::write(slot(1), b"t").ret(1)),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = run(script);
+    assert_eq!(run.exit_code(), 0);
+}

@@ -1927,6 +1927,21 @@ where
                     Err(carrick_kernel::kernel::KernelOperationError::TaskBusy(_)) => {
                         return Ok(wait_for_change(observed, None));
                     }
+                    Err(
+                        error
+                        @ carrick_kernel::kernel::KernelOperationError::ProcessLimitExceeded {
+                            ..
+                        },
+                    ) => {
+                        // clone(2) EAGAIN: the caller's real uid is at its
+                        // RLIMIT_NPROC soft limit (setrlimit(2)). The pool
+                        // claim is the enforcement point; nothing was
+                        // published or copied out.
+                        tracing::debug!(%error, "thread clone refused; clone(2) = EAGAIN");
+                        return Ok(PersistentHvpatchCloneAttempt::Complete(
+                            threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
+                        ));
+                    }
                     Err(error) => {
                         return Err(RuntimeError::Configuration(format!(
                             "reserve persistent HVPatch thread clone: {error}"

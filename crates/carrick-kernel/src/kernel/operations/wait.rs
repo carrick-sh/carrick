@@ -259,7 +259,7 @@ impl Kernel {
         // Under NO circumstance does the read lock return Exited or job control state changes in
         // WaitMode::Consume — check-and-consume must happen atomically under the write lock.
         {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             if mode == WaitMode::Consume {
                 ensure_task_unreserved(&state, parent_id)?;
             }
@@ -449,7 +449,7 @@ impl Kernel {
             }
         }
 
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         if mode == WaitMode::Consume {
             ensure_task_unreserved(&state, parent_id)?;
         }
@@ -1270,7 +1270,7 @@ mod tests {
             let Some(kernel) = self.kernel.upgrade() else {
                 return crate::observe::AuditVerdict::Continue;
             };
-            let state = kernel.registry().state.read();
+            let state = kernel.registry().settled().read();
             assert!(
                 state.zombies.contains_key(&task.id),
                 "zombie must be visible in registry when zombie_created fires"

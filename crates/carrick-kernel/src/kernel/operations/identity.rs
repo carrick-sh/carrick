@@ -59,7 +59,7 @@ pub struct ProcessIdentity {
 
 impl Kernel {
     pub fn task_identity(&self, task_id: TaskId) -> Result<TaskIdentity, KernelOperationError> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let record = state
             .tasks
             .get(&task_id)
@@ -89,7 +89,7 @@ impl Kernel {
     /// the table. Job-control shells rely on that: they look up a stopped or
     /// exited member's group before reaping it.
     pub fn process_identity(&self, task_id: TaskId) -> Option<ProcessIdentity> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         if let Some(record) = state.tasks.get(&task_id) {
             let container = record.task.container().id();
             let process_group = record.task.process_group();
@@ -130,7 +130,7 @@ impl Kernel {
     /// publication so CLONE_PARENT and orphan reparenting cannot target a stale
     /// creator captured at fork time.
     pub fn task_parent_key(&self, task: TaskKey) -> Result<Option<TaskKey>, KernelOperationError> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let record = state
             .tasks
             .get(&task.id)
@@ -142,7 +142,11 @@ impl Kernel {
     }
 
     pub fn task_is_live(&self, task_id: TaskId) -> bool {
-        self.registry().state.read().tasks.contains_key(&task_id)
+        self.registry()
+            .settled()
+            .read()
+            .tasks
+            .contains_key(&task_id)
     }
 
     /// Resolve a task id to the LIVE task itself, for the callers that must
@@ -155,14 +159,14 @@ impl Kernel {
     /// target's state. There was none: rlimits lived in the dispatcher's private
     /// `ProcState`, so the write landed on whoever called.
     pub(crate) fn live_task(&self, task_id: TaskId) -> Option<TaskRef> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         state.tasks.get(&task_id).and_then(|record| {
             (record.task.lifecycle() == TaskLifecycle::Live).then(|| Arc::clone(&record.task))
         })
     }
 
     pub(crate) fn live_task_key(&self, task_id: TaskId) -> Option<TaskKey> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         state.tasks.get(&task_id).and_then(|record| {
             (record.task.lifecycle() == TaskLifecycle::Live).then(|| record.task.key())
         })
@@ -172,7 +176,7 @@ impl Kernel {
     /// already been published. The registry lock is released before callers
     /// invoke the lane waker.
     pub(crate) fn current_parent_task(&self, task: &Task) -> Option<TaskRef> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         task.parent()
             .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
             .filter(|(key, record)| record.task.key() == *key)
@@ -181,7 +185,7 @@ impl Kernel {
 
     pub fn task_key_is_live(&self, task: TaskKey) -> bool {
         self.registry()
-            .state
+            .settled()
             .read()
             .tasks
             .get(&task.id)
@@ -189,7 +193,7 @@ impl Kernel {
     }
 
     pub fn task_exists(&self, task_id: TaskId) -> bool {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         state.tasks.contains_key(&task_id) || state.zombies.contains_key(&task_id)
     }
 
@@ -211,7 +215,7 @@ impl Kernel {
         let mut update = Some(update);
         loop {
             let observed = self.reservation_epoch();
-            let state = self.registry().state.write();
+            let state = self.registry().settled().write();
             if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
             {
                 drop(state);
@@ -280,7 +284,7 @@ impl Kernel {
         let task_id = context.task.key().id;
         loop {
             let observed = self.reservation_epoch();
-            let state = self.registry().state.write();
+            let state = self.registry().settled().write();
             match ensure_task_unreserved(&state, task_id) {
                 Ok(()) => {}
                 Err(KernelOperationError::TaskBusy(_)) => {
