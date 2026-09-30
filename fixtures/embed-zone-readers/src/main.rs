@@ -21,7 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const DIR: &str = "/tmp/zone-readers";
 const STATIC_FILES: u64 = 100;
@@ -29,6 +29,140 @@ const STATIC_FILES: u64 = 100;
 const SHAPE: [u64; 4] = [2, 4, 8, 40];
 
 static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Forensics for a mismatch, recorded on every read and consulted only when
+/// one fails: the destination buffer of each recent read in this process,
+/// so a wrong record can be traced to the buffer that legitimately held it.
+/// The difference between the two virtual addresses separates the
+/// mechanisms: a multiple of 2 MiB is one page table linked under two
+/// entries; anything else is one frame mapped (or cached in a TLB) at two
+/// addresses. Lock-free and racy by design: a torn entry misattributes a
+/// diagnostic, never a verdict.
+const RING: usize = 4096;
+static RING_NEXT: AtomicUsize = AtomicUsize::new(0);
+static SEQ: AtomicU64 = AtomicU64::new(1);
+static RING_VA: [AtomicU64; RING] = [const { AtomicU64::new(0) }; RING];
+/// `file id << 32 | buffer length`.
+static RING_META: [AtomicU64; RING] = [const { AtomicU64::new(0) }; RING];
+/// `start sequence << 32 | end sequence` (0 while the read runs).
+static RING_SEQ: [AtomicU64; RING] = [const { AtomicU64::new(0) }; RING];
+
+fn tid() -> u64 {
+    // SAFETY: gettid(2) takes no arguments and cannot fail.
+    unsafe { raw_syscall0(178) }
+}
+
+/// aarch64 Linux `svc #0` with no arguments (the fixture needs no crates).
+unsafe fn raw_syscall0(nr: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        std::arch::asm!("svc #0", in("x8") nr, lateout("x0") ret, options(nostack));
+    }
+    ret
+}
+
+/// Record a read's destination; returns the ring index to close.
+fn ring_open(id: u64, va: usize, len: usize) -> (usize, u64) {
+    let index = RING_NEXT.fetch_add(1, Ordering::Relaxed) % RING;
+    let start = SEQ.fetch_add(1, Ordering::Relaxed);
+    RING_VA[index].store(va as u64, Ordering::Relaxed);
+    RING_META[index].store((id << 32) | (len as u64 & 0xffff_ffff), Ordering::Relaxed);
+    RING_SEQ[index].store(start << 32, Ordering::Release);
+    (index, start)
+}
+
+fn ring_close(index: usize, start: u64) {
+    let end = SEQ.fetch_add(1, Ordering::Relaxed);
+    let _ = RING_SEQ[index].compare_exchange(
+        start << 32,
+        (start << 32) | (end & 0xffff_ffff),
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
+}
+
+/// Parse a `NNNNNNN:OOOOOOO\n` record into (file id, record index).
+fn parse_record(record: &[u8]) -> Option<(u64, u64)> {
+    if record.len() != 16 || record[7] != b':' || record[15] != b'\n' {
+        return None;
+    }
+    let id = std::str::from_utf8(&record[..7]).ok()?.parse().ok()?;
+    let index = u64::from_str_radix(std::str::from_utf8(&record[8..15]).ok()?, 16).ok()?;
+    Some((id, index))
+}
+
+/// Describe every run of wrong 16-byte records in `got` (at `got_va`): its
+/// buffer range, the file and offset its bytes really came from, and every
+/// recent read of that file in this process whose buffer held those bytes.
+fn forensics(got: &[u8], got_va: usize, want: &[u8], read_seq: u64) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "tid={} buf_va=0x{got_va:x} read_seq={read_seq} now_seq={}",
+        tid(),
+        SEQ.load(Ordering::Relaxed)
+    );
+    let records = got.len().min(want.len()) / 16;
+    let mut runs = 0;
+    let mut record = 0;
+    while record < records && runs < 8 {
+        let at = record * 16;
+        if got[at..at + 16] == want[at..at + 16] {
+            record += 1;
+            continue;
+        }
+        while record < records
+            && got[record * 16..record * 16 + 16] != want[record * 16..record * 16 + 16]
+        {
+            record += 1;
+        }
+        runs += 1;
+        let first = &got[at..at + 16];
+        let _ = write!(
+            out,
+            " | run [0x{:x},0x{:x}) page_off=0x{:x}",
+            at,
+            record * 16,
+            (got_va + at) & 0xfff
+        );
+        let Some((source_id, source_record)) = parse_record(first) else {
+            let _ = write!(out, " got={:02x?}", &first[..8]);
+            continue;
+        };
+        let source_off = source_record as usize * 16;
+        let _ = write!(
+            out,
+            " from id={source_id} off=0x{source_off:x} shift={}",
+            at as i64 - source_off as i64
+        );
+        let mut matches = 0;
+        for index in 0..RING {
+            let meta = RING_META[index].load(Ordering::Acquire);
+            if meta >> 32 != source_id || matches >= 4 {
+                continue;
+            }
+            let va = RING_VA[index].load(Ordering::Relaxed) as usize;
+            let seqs = RING_SEQ[index].load(Ordering::Acquire);
+            let source_va = va + source_off;
+            let ours = got_va + at;
+            let delta = ours as i64 - source_va as i64;
+            let _ = write!(
+                out,
+                " [holder va=0x{va:x} len={} seq={}..{} delta={}0x{:x} delta%2M=0x{:x}]",
+                meta & 0xffff_ffff,
+                seqs >> 32,
+                seqs & 0xffff_ffff,
+                if delta < 0 { "-" } else { "" },
+                delta.unsigned_abs(),
+                delta.unsigned_abs() % (2 << 20),
+            );
+            matches += 1;
+        }
+        if matches == 0 {
+            out.push_str(" [no holder in this process]");
+        }
+    }
+    out
+}
 
 fn content(id: u64, size: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(size + 16);
@@ -57,7 +191,7 @@ impl Rng {
     }
 }
 
-fn check(how: &str, path: &str, got: &[u8], want: &[u8]) {
+fn check(how: &str, path: &str, got: &[u8], want: &[u8], read_seq: u64) {
     if got == want {
         return;
     }
@@ -72,13 +206,20 @@ fn check(how: &str, path: &str, got: &[u8], want: &[u8]) {
         want.len(),
         String::from_utf8_lossy(got_record)
     );
+    eprintln!(
+        "FORENSICS pid={} {how} {path} {}",
+        std::process::id(),
+        forensics(got, got.as_ptr() as usize, want, read_seq)
+    );
 }
 
-/// read(2) in 4 KiB steps, or pread(2) in 8 KiB steps, to EOF.
-fn read_all(path: &str, positional: bool) -> std::io::Result<Vec<u8>> {
+/// read(2) in 4 KiB steps, or pread(2) in 8 KiB steps, to EOF. Returns the
+/// bytes and the read's forensic sequence number.
+fn read_all(id: u64, path: &str, positional: bool) -> std::io::Result<(Vec<u8>, u64)> {
     let mut file = File::open(path)?;
     let size = file.metadata()?.len() as usize;
     let mut buf = vec![0u8; size + 512];
+    let (ring, seq) = ring_open(id, buf.as_ptr() as usize, buf.len());
     let mut n = 0;
     loop {
         let step = if positional { 8192 } else { 4096 };
@@ -93,8 +234,9 @@ fn read_all(path: &str, positional: bool) -> std::io::Result<Vec<u8>> {
         }
         n += got;
     }
+    ring_close(ring, seq);
     buf.truncate(n);
-    Ok(buf)
+    Ok((buf, seq))
 }
 
 fn write_and_read_back(id: u64) {
@@ -116,8 +258,21 @@ fn write_and_read_back(id: u64) {
         eprintln!("MISMATCH pid={} write {path}: {error}", std::process::id());
         return;
     }
-    match read_all(&path, false) {
-        Ok(got) => check("readback", &path, &got, &data),
+    match read_all(id, &path, false) {
+        Ok((got, seq)) => {
+            check("readback", &path, &got, &data, seq);
+            if got != data {
+                // Where the wrong bytes live: the file, the written source,
+                // or only the destination of that one read.
+                let reread = read_all(id, &path, false).map(|(again, _)| again == data);
+                let source_intact = data == content(id, size_for(id));
+                eprintln!(
+                    "READBACK_SPLIT pid={} {path} reread_matches={reread:?} source_intact={source_intact} source_va=0x{:x}",
+                    std::process::id(),
+                    data.as_ptr() as usize
+                );
+            }
+        }
         Err(error) => {
             MISMATCHES.fetch_add(1, Ordering::Relaxed);
             eprintln!(
@@ -140,8 +295,10 @@ fn child(round: u64, threads: u64, iters: u64) {
                         0..=7 => {
                             let id = rng.below(STATIC_FILES);
                             let path = format!("{DIR}/s-{id}");
-                            match read_all(&path, rng.below(2) == 1) {
-                                Ok(got) => check("static", &path, &got, &content(id, size_for(id))),
+                            match read_all(id, &path, rng.below(2) == 1) {
+                                Ok((got, seq)) => {
+                                    check("static", &path, &got, &content(id, size_for(id)), seq)
+                                }
                                 Err(error) => {
                                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
                                     eprintln!("MISMATCH pid={pid} read {path}: {error}");
