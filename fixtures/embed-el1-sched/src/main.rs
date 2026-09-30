@@ -34,6 +34,12 @@
 //! - `pipe-pingpong <iters>` (EL1 plan 1d): two threads hand a byte back and
 //!   forth over two pipes, so every turn blocks one thread in a host-served
 //!   `read` and completes it from the other; prints the round-trip latency.
+//! - `sock-pingpong <iters> [pinned]`: the `pipe-pingpong` hand-off over two
+//!   `AF_UNIX` socketpairs. Sockets are host objects (`IpcBacking::Host`): EL1
+//!   forwards their `read`/`write`, so every turn blocks one thread in a
+//!   genuinely host-served `read` that the host completes. With `pinned`
+//!   both threads share guest CPU 0, so a completed read queues behind the
+//!   thread that is about to block in the next host wait.
 //! - `pipe-compute <ms>` (EL1 plan 1d): two threads pinned to one guest CPU;
 //!   one completes the other's host-served pipe `read`, then computes: the
 //!   woken thread must still run within the window.
@@ -898,6 +904,59 @@ fn pipe_pingpong(iters: usize) -> i32 {
     samples.sort_unstable();
     println!(
         "pipe-pingpong iters={iters} rt_p50_ns={:.0} rt_p99_ns={:.0}",
+        percentile(&samples, 0.5) as f64 * ns,
+        percentile(&samples, 0.99) as f64 * ns
+    );
+    0
+}
+
+fn socket_pair() -> (i32, i32) {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    assert_eq!(rc, 0, "socketpair");
+    (fds[0], fds[1])
+}
+
+/// `pipe_pingpong` over `AF_UNIX` socketpairs (host-served descriptors).
+fn sock_pingpong(iters: usize, pinned: bool) -> i32 {
+    const WARMUP: usize = 200;
+    // Each pair: `.0` is the end A uses, `.1` the end B uses.
+    let to_b = socket_pair();
+    let to_a = socket_pair();
+    let total = WARMUP + iters;
+    let b = std::thread::spawn(move || {
+        if pinned {
+            pin(0);
+        }
+        for _ in 0..total {
+            if read_byte(to_b.1) != 1 || write_byte(to_a.1) != 1 {
+                return false;
+            }
+        }
+        true
+    });
+    if pinned {
+        pin(0);
+    }
+    let mut samples = Vec::with_capacity(iters);
+    for i in 0..total {
+        let t0 = cntvct();
+        if write_byte(to_b.0) != 1 || read_byte(to_a.0) != 1 {
+            println!("sock-pingpong failed at {i}");
+            return 1;
+        }
+        if i >= WARMUP {
+            samples.push(cntvct() - t0);
+        }
+    }
+    if !b.join().expect("sock partner exits") {
+        println!("sock-pingpong partner failed");
+        return 1;
+    }
+    let ns = ns_per_tick();
+    samples.sort_unstable();
+    println!(
+        "sock-pingpong iters={iters} pinned={pinned} rt_p50_ns={:.0} rt_p99_ns={:.0}",
         percentile(&samples, 0.5) as f64 * ns,
         percentile(&samples, 0.99) as f64 * ns
     );
@@ -2996,6 +3055,10 @@ fn main() {
             args.get(4).and_then(|n| n.parse().ok()).unwrap_or(128),
         ),
         "pipe-pingpong" => pipe_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000)),
+        "sock-pingpong" => sock_pingpong(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000),
+            args.get(3).is_some_and(|mode| mode == "pinned"),
+        ),
         "pipe-compute" => pipe_compute(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
         "two-process" => two_process(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
         "mm-occupancy" => mm_occupancy(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),

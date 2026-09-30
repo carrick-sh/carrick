@@ -980,36 +980,34 @@ fn el1_ipc_pipe_blocking_roundtrips() {
     );
 }
 
-/// Contract `kernel.el1.guest-run-queue` (EL1 plan 1d), part (a): a thread
-/// blocked in a host-served syscall (a pipe `read`) is resumed by the guest's
-/// scheduler. Two threads hand a byte back and forth over two pipes, so every
-/// turn blocks one in a host read and completes it from the other. The
-/// completed read becomes a service record in an EL1 run queue, and the
-/// executor of the vCPU EL1 runs it on serves it: no host run queue holds
-/// the thread and no host executor parks on a run-queue condvar waiting for
-/// it. Over the difference of a long and a short run, host run-queue claims
-/// and host executor parks per round trip must be zero in steady state
-/// (below 0.01), and every round trip is served through service records.
-/// Red: the same binary with `CARRICK_EL1_SCHED=0`, where completions go to
-/// host run queues (about two claims and two parks per round trip).
-#[test]
-fn el1_sched_host_blocked_read_resumes_by_guest_scheduling() {
+/// Per-round-trip host-scheduling rates of `mode` over the difference of a
+/// long and a short run (two pairs, interleaved).
+struct PingPongRates {
+    claims: f64,
+    parks: f64,
+    services: f64,
+    handbacks: f64,
+}
+
+fn pingpong_rates(mode: &str) -> Vec<PingPongRates> {
     const SHORT: u64 = 1_000;
     const LONG: u64 = 6_000;
-    let _guard = common::guest_lock();
-    reset_el1_counters();
     let carrier = carrier_or_fail();
     let mut runs = Vec::new();
     for iters in [SHORT, LONG, SHORT, LONG] {
         let measured = run_fixture(
             &carrier,
-            &["pipe-pingpong", &iters.to_string()],
+            &[mode, &iters.to_string()],
             Duration::from_secs(120),
         );
         assert!(measured.result.success(), "{}", describe(&measured));
         let stdout = measured.result.stdout_utf8();
+        assert!(
+            stdout.contains(&format!("{mode} iters={iters}")),
+            "{mode} did not complete: {stdout}"
+        );
         println!(
-            "el1-sched pipe-pingpong iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            "el1-sched {mode} iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
             measured.exits,
             measured.cpu_ns,
             measured.wall.as_millis(),
@@ -1024,28 +1022,89 @@ fn el1_sched_host_blocked_read_resumes_by_guest_scheduling() {
         ));
     }
     let span = (LONG - SHORT) as f64;
-    for pair in runs.chunks(2) {
-        let (short, long) = (&pair[0], &pair[1]);
-        let per = |f: fn(&ZoneCounts) -> u64| (f(&long.1) as f64 - f(&short.1) as f64) / span;
-        let claims = per(|z| z.host_queue_claims);
-        let parks = per(|z| z.host_executor_parks);
-        let services = per(|z| z.service_adoptions);
-        let cpu = (long.2 as f64 - short.2 as f64) / span;
-        println!(
-            "el1-sched host-blocked-read host_queue_claims_per_rt={claims:.4} \
-             host_executor_parks_per_rt={parks:.4} service_adoptions_per_rt={services:.3} \
-             carrier_cpu_ns_per_rt={cpu:.0} rt_p50_ns={:.0}",
-            long.3
-        );
+    runs.chunks(2)
+        .map(|pair| {
+            let (short, long) = (&pair[0], &pair[1]);
+            let per = |f: fn(&ZoneCounts) -> u64| (f(&long.1) as f64 - f(&short.1) as f64) / span;
+            let rates = PingPongRates {
+                claims: per(|z| z.host_queue_claims),
+                parks: per(|z| z.host_executor_parks),
+                services: per(|z| z.service_adoptions),
+                handbacks: per(|z| z.host_handbacks),
+            };
+            let cpu = (long.2 as f64 - short.2 as f64) / span;
+            println!(
+                "el1-sched {mode} host_queue_claims_per_rt={:.4} \
+                 host_executor_parks_per_rt={:.4} service_adoptions_per_rt={:.3} \
+                 host_handbacks_per_rt={:.3} carrier_cpu_ns_per_rt={cpu:.0} rt_p50_ns={:.0}",
+                rates.claims, rates.parks, rates.services, rates.handbacks, long.3
+            );
+            rates
+        })
+        .collect()
+}
+
+/// Contract `kernel.el1.guest-run-queue` (EL1 plan 1d), part (a): a thread
+/// blocked in a host-served syscall is resumed by the guest's scheduler.
+/// Pipes are in-zone EL1 IPC objects and no longer host-served, so the
+/// witness is a `read` on an `AF_UNIX` socketpair (`IpcBacking::Host`: EL1
+/// forwards it and the host completes it). Two threads hand a byte back and
+/// forth over two socketpairs, so every turn blocks one in a host read and
+/// completes it from the other. The completed read becomes a service record
+/// in an EL1 run queue, and the executor of the vCPU EL1 runs it on serves
+/// it: no host run queue holds the thread and no host executor parks on a
+/// run-queue condvar waiting for it. Over the difference of a long and a
+/// short run, host run-queue claims and host executor parks per round trip
+/// must be zero in steady state (below 0.01), and every round trip is served
+/// through service records.
+/// Red: the same binary with `CARRICK_EL1_SCHED=0`, where completions go to
+/// host run queues (about two claims and two parks per round trip).
+#[test]
+fn el1_sched_host_blocked_read_resumes_by_guest_scheduling() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    for rates in pingpong_rates("sock-pingpong") {
         assert!(
-            claims < 0.01 && parks < 0.01,
+            rates.claims < 0.01 && rates.parks < 0.01,
             "a thread blocked in a host read went through host run queues: \
-             {claims:.3} claims and {parks:.3} executor parks per round trip"
+             {:.3} claims and {:.3} executor parks per round trip",
+            rates.claims,
+            rates.parks
         );
         assert!(
-            services >= 1.0,
+            rates.services >= 1.0,
             "completed host reads were not served through the guest's run queues \
-             ({services:.3} service adoptions per round trip)"
+             ({:.3} service adoptions per round trip)",
+            rates.services
+        );
+    }
+}
+
+/// The in-guest counterpart of the host-blocked-read witness: a pipe `read`
+/// is served entirely by EL1's IPC objects, so a pipe ping-pong needs no
+/// host service at all. Over the difference of a long and a short run,
+/// host run-queue claims, host executor parks and host handbacks per round
+/// trip are zero (below 0.01); the guest run queue serves no per-turn
+/// service record either (service adoptions stay a startup constant, so the
+/// per-round-trip rate is below 0.01).
+#[test]
+fn el1_sched_pipe_pingpong_stays_in_guest() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    for rates in pingpong_rates("pipe-pingpong") {
+        assert!(
+            rates.claims < 0.01 && rates.parks < 0.01 && rates.handbacks < 0.01,
+            "an in-guest pipe read reached the host scheduler: {:.3} claims, {:.3} executor \
+             parks and {:.3} handbacks per round trip",
+            rates.claims,
+            rates.parks,
+            rates.handbacks
+        );
+        assert!(
+            rates.services < 0.01,
+            "an in-guest pipe read was served as a host service record \
+             ({:.3} service adoptions per round trip)",
+            rates.services
         );
     }
 }
@@ -3092,6 +3151,14 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
 
 /// Feasibility witness for the deferred-capture auditor on real guest work.
 /// This does not establish retirement/reuse ordering or close the contract.
+///
+/// Captures happen when an executor vacates its zone slot (`step_away` for a
+/// blocking host wait, or `leave_slot`) while a host-owned record, such as a
+/// completed host-served read's service record, is still queued there. The
+/// workload is therefore the pinned host-served `sock-pingpong` (both threads
+/// on guest CPU 0, `AF_UNIX` socketpairs): the old `two-process` workload's
+/// blocking is a futex/pipe hand-off served in the guest, so it never
+/// produces a host-owned record to capture.
 #[test]
 fn el1_sched_deferred_handback_capture_observes_guest_records() {
     use carrick_kernel::observe::{AuditVerdict, KernelAuditor};
@@ -3116,13 +3183,13 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
         carrier
             .container(common::SMOKE_IMAGE)
             .pull_policy(PullPolicy::Missing)
-            .command([FIXTURE, "two-process", "200"])
+            .command([FIXTURE, "sock-pingpong", "2000", "pinned"])
             .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
             .auditor(capture.clone())
             .run_blocking(),
     );
     assert!(result.success(), "{}", result.stdout_utf8());
-    assert!(result.stdout_utf8().contains("child_ok=true"));
+    assert!(result.stdout_utf8().contains("sock-pingpong iters=2000"));
     let records = capture.records.lock().unwrap();
     println!("deferred handback real guest captures: {records:?}");
     assert!(
