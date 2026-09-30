@@ -40,83 +40,80 @@ status/order statements where explicitly corrected below.
 
 ## Current execution decision — impact reset, 2026-09-29
 
-### Delivery correction after renewed user review
+### Current work order after user-requested effectiveness review
 
-This work order supersedes the ordering of the earlier five-step table below.
-Live reinspection of adapter `09afdd4c5` confirms admission remains disabled
-(`host_copyout=false`, `backend_writers=false`). No new checkpoint is accepted.
-Repeated prerequisite commits and repeated impact-reset prose have not delivered
-an active descriptor lane. Do not count this plan edit as implementation progress.
+**Observed state:** adapter HEAD is `cdb5abd64`. Local sparse replacement is
+also implemented in an uncommitted five-file change with retained red/green
+model, compile, Clippy and image-build logs. Preserve that work; do not restart
+it. Production admission still has `host_copyout=false` and
+`backend_writers=false`. No new memory checkpoint or active descriptor lane
+has been accepted. Earlier progress reports overstated the delivery value of
+successive prerequisites even when their evidence limitations were accurate.
 
-**Split the next milestone into two independently observable deliveries:**
+**Planning defect:** the previous order deferred all signed integration evidence
+for the new descriptor service until every production writer was converted.
+That made an expanding caller-by-caller conversion depend on untested hardware
+composition. The existing finite worklist also mixed live writers, metadata-only
+hooks and offline construction. Do not infer equal implementation work for all
+rows, or mistake moving descriptor stores for moving Linux semantic ownership.
 
-1. **Active descriptor ownership.** Close the actual production descriptor-writer
-   census, then enable the complete lane and run a signed two-live-MM witness:
-   host copyout, fork/COW, permission changes and retirement must execute through
-   EL1 with authenticated backing and completion before reuse. Existing host
-   reservation policy may remain during this intermediate delivery; label it
-   explicitly. It is not checkpoint-2 acceptance. Do not wait for the entire
-   SharedReservations policy migration before seeking this execution evidence,
-   unless a concrete source dependency makes that ordering necessary.
-2. **Complete anonymous-memory ownership.** Move production brk/mmap reservation
-   decisions and fork/exec/exit lifecycle to SharedReservations, remove the
-   superseded authority, prove pause-free progress once all writers are converted,
-   then run full checkpoint correctness, structural and workload-cost acceptance.
+**Change in execution, effective now:**
 
-**Immediate implementation unit:** replacement-grant retirement and retired/sparse
-backing publication. Convert the actual writer and its rollback/completion route
-using existing descriptor transactions and retained backing authority. Then
-foreign-MM publication and the remaining engine/exec writers. The finite known
-caller worklist is adapter memory-integration `descriptor-writers.md`; reconcile
-it against live/offline construction and compiler evidence before enabling admission.
+1. **Preserve the finished sparse slice, then test the integration boundary.**
+   Review and record its actual limits without another broad model campaign.
+   Use the existing `carrick-aarch64::descriptor_drain::run_drain_call`, existing
+   signed HVF/embed test infrastructure and actual backing/receipt authority to
+   obtain a bounded hardware witness before extending more operations. Exercise
+   the joined publication path, bytes/permissions, exact-MM isolation and
+   completion-before-retirement. Do not fabricate a receipt or treat an EL1
+   image build as execution. An isolated test root may exercise only converted
+   paths; production admission remains guarded. This is diagnostic integration
+   evidence, explicitly not production activation or checkpoint acceptance.
+   Time-box locating the usable test entry to 30 minutes: if it requires a new
+   harness architecture, record the exact missing entry/caller and implement
+   only that prerequisite or return to its concrete writer dependency. Do not
+   start a general-purpose test framework.
+2. **Close remaining writers in ownership families, not one campaign per helper.**
+   Reconcile the known worklist with real callers before adding more operations.
+   Group (a) replacement grants, retired reuse and backing retirement;
+   (b) protection, bus-fault tags, discard/unmap and alias publication through
+   the existing engine edit boundary; (c) foreign-MM completion and exec/root
+   lifecycle. Distinguish offline construction and metadata-only hooks from
+   live stores. Reuse the transaction journal, driving-vCPU service and exact
+   receipts. Preserve each family's semantics; grouping does not authorize a
+   raw descriptor-write escape hatch. Each family ends with caller-connected
+   evidence and a reduced activation blocker list, not a new standalone framework.
+3. **Activate the complete lane and prove real use.** Only after every live and
+   rollback writer is accounted for, enable admission and run the signed
+   two-live-MM allocation/copyout/fork-COW/protection/retirement witness. Retain
+   exact-artifact provenance, entitlement negative control and scoped cleanup.
+   Host reservation policy may remain at this intermediate milestone; explicitly
+   label it. It is not complete anonymous-memory ownership.
+4. **Finish ownership, then qualify checkpoint 2.** Join production anonymous
+   brk/mmap policy and fork/exec/exit lifecycle to SharedReservations; delete the
+   replaced host semantic authority. EL1 descriptor execution alone does not
+   meet the design's host-free fault/COW and anonymous-policy objective. Remove
+   the page-table pause only after all live writers are gone. Run full applicable
+   correctness, structural and controlled workload-cost acceptance before landing.
+5. **Continue the remaining ARM64 plan.** Preserve batch-3 lifecycle and IPC
+   blockers, namespace cost, full descriptors/IPC/signals, names/page cache and
+   process lifecycle. X86 remains explicitly deferred. Do not silently narrow
+   completion to memory or one signed witness.
 
-**Alias callers connected, adapter `cdb5abd64`:** both engine private/shared
-repoint callers now use the driving-vCPU service on the guest lane. MapAlias
-protocol v5 uses existing grants/journal, preserves correctly aligned coarse
-outputs and performs break-before-make. All target mappings are authenticated and
-physical owners pinned under exact-MM exclusion before private seeding or
-publication. Metadata commits after exact receipts. Logical inventory extent and
-physical owner extent are checked independently. Red NotPrepared and missing-BBM
-controls, eight-store rollback, MMU 165, EL1 114, engine 75, backend 11, focused
-authority/bookkeeping, affected Clippy and hardware image build pass; see
-`alias-caller.md`. The engine source assertion was stale after the earlier COW
-service refactor and now verifies that ASID-scoped service. Admission remains
-disabled; full caller/hardware composition and checkpoint acceptance stay open.
+**Progress rule:** report capability delivered, the named blockers removed,
+remaining blockers, evidence level and the next executable check. A model pass,
+commit or controller edit is not a delivered capability. Two prerequisite-only
+intervals or 30 minutes without discriminating evidence require an actual
+implementation-order change, deletion of redundant work or a precise blocker
+report. Do not repeat an impact-reset paragraph and continue unchanged.
 
-**Writer removed, adapter `ec366760f`:** shared backend repoint no longer
-repeats the engine's descriptor edit. Its production hook checks the full expected
-translation before publishing metadata. The red witness caught silent creation
-of an unpublished leaf; green covers missing/partial/wrong-output/read-only
-mappings and success with host edits prohibited. Focused check, 11 backend tests
-and affected Clippy pass; see `repoint-publication.md`. This is one writer removed,
-not an active EL1 lane. The subsequent alias caller conversion is recorded above.
-The adapter is clean at `cdb5abd64`; no main advancement or signed acceptance.
+**Avoided work:** no unrelated broad IPC/boot captures; no repeated full CI or
+whole-suite qualification after every small intermediate edit; no new transport,
+second semantic implementation, partial production admission or relaxed budgets.
+Use focused checks during a family conversion and full gates at the connected
+milestone. This reordering is a plan correction, not migration progress.
 
-Finish each remaining writer with caller-connected rollback/refusal coverage.
-The alias conversion is committed prerequisite work; do not restart it or treat
-its lower-layer tests as execution evidence. No separate framework or new
-transport project. Every added abstraction must have its production caller
-in the same implementation unit. Do not remove ownership guards or enable partial
-admission to obtain an early green result.
-
-**Change the monitor's action, not just its wording:** retain a running list of
-remaining activation blockers; a removed blocker must identify the production
-call site and evidence. Two consecutive prerequisite-only intervals trigger a
-choice: finish the named integration, simplify/delete redundant orchestration, or
-stop that investigation and move to another required writer. Repeating that the
-prerequisite is necessary is not a course correction. Thirty minutes without new
-discriminating evidence triggers that choice sooner. Report elapsed effort and
-whether the blocker list shrank; tests/commits/documentation are not the metric.
-Do not invent a percentage or completion date from an incomplete writer census.
-
-Stop additional broad boot/IPC capture campaigns, repeated full qualification of
-disabled intermediate states, and expansion of helper fixtures without an actual
-caller defect. Keep focused red-first checks during conversion. Run the first
-signed descriptor-ownership witness at delivery 1, not only after delivery 2;
-retain full acceptance gates and exact-artifact provenance at their proper scope.
-Later ARM64 checkpoints remain required; x86 remains deferred.
-
-The delivery correction above is the current work order. The observations below
+The work order above supersedes the historical ordering below. The observations below
 preserve evidence; their older “next” statements are not competing work orders.
 
 **Diagnosis:** development has accumulated useful foundations and regression
