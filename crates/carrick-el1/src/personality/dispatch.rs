@@ -240,23 +240,31 @@ where
     let cur_task = current_tasks.get(slot);
     let nr = frame.x[8] as usize;
 
-    // Entry check: if pending_host_work is set, forward immediately without
-    // serving -- unless the slot's switched-in record owns a pending object
-    // operation. Its thread is re-issuing the SVC to resume that operation,
-    // which only the adapter may take (before any fd lookup); forwarding
-    // would let the host run the call afresh while the record kept the
-    // operation for the thread's next read or write. The adapter completes,
-    // parks or hands it back, and a served result still leaves with the
-    // pending work (`ServedWithWork`).
+    // Entry check: with host work pending (a kick, a signal, an owed
+    // wake), forward without serving -- except the calls the IPC adapter
+    // takes, which never park while host work is pending:
+    // - the slot's switched-in record owns a pending object operation. Its
+    //   thread is re-issuing the SVC to resume that operation, which only
+    //   the adapter may take (before any fd lookup); forwarding would let
+    //   the host run the call afresh while the record kept the operation
+    //   for the thread's next read or write.
+    // - a pipe or eventfd read/write that completes right now. Forwarding
+    //   it only moves a transfer EL1 can finish to the host (one served
+    //   read lost per fork in el1_ipc_two_processes_blocking).
+    // Either way the adapter completes the call and it leaves with the
+    // pending work (`ServedWithWork`), so the host delivers a signal after
+    // the call returns, as Linux does for one pending at entry; a call that
+    // would block is forwarded unchanged (no effect yet) or handed back
+    // (`IPC_HANDBACK_NR`), so the host delivers the signal before it can
+    // sleep. Nothing else is served past pending work.
+    let host_work = cur_task.is_some_and(CurrentTask::has_pending_host_work);
     let resumes_operation = zone.as_ref().is_some_and(|zone| {
         SlotId::from_index(slot)
             .and_then(|slot| zone.tables.slot(slot).current())
             .is_some_and(|record| zone.tables.record(record).has_object_operation())
     });
-    if let Some(task) = cur_task
-        && task.has_pending_host_work()
-        && !resumes_operation
-    {
+    let ipc_transfer = matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE) && ipc.is_some();
+    if host_work && !resumes_operation && !ipc_transfer {
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }
@@ -342,6 +350,14 @@ where
                 return Action::Forward;
             }
         }
+    }
+    // The adapter declined a call admitted past pending host work (a
+    // host-backed description, an unpublished table): the host runs it.
+    if host_work {
+        if nr < 512 {
+            counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+        }
+        return Action::Forward;
     }
 
     // Threads queued on this vCPU wait for the running one to block in a
