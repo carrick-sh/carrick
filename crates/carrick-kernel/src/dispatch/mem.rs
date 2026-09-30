@@ -999,6 +999,9 @@ pub(super) fn guest_vma_covers_locked(mem: &MemState, start: u64, len: u64) -> b
     let Some(end) = start.checked_add(len) else {
         return false;
     };
+    if let Some(covered) = mem.delegated_covers(start, end) {
+        return covered;
+    }
     let mut cursor = start;
     for vma in project_vma_summaries(mem) {
         if vma.end.raw() <= cursor {
@@ -1935,7 +1938,7 @@ impl<'a> MemView<'a> {
         if limit == 0 {
             return Err(LINUX_EPERM);
         }
-        let locked = locked_ranges_total(&self.mem().lock().locked_view());
+        let locked = self.mem().lock().locked_bytes();
         if locked.checked_add(length).is_none_or(|total| total > limit) {
             return Err(LINUX_ENOMEM);
         }

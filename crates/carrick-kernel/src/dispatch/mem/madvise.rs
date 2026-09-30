@@ -99,8 +99,7 @@ impl<'a> MemView<'a> {
         let mut any_special = false;
         let mut any_droppable = false;
 
-        let vmas = mem.observed_vmas();
-        for vma in vmas.overlapping(start, end) {
+        for vma in &mem.observed_vmas_within(start, end) {
             if vma.start > covered_to {
                 // Gap before this interval → unmapped hole. Keep walking:
                 // the VMAs past the hole still decide the per-VMA verdict.
@@ -153,10 +152,7 @@ impl<'a> MemView<'a> {
         if covered_to < end {
             fully_mapped = false;
         }
-        let locked = mem.locked_view().iter().any(|r| {
-            let (rs, re) = (r.start().raw(), r.end().raw());
-            rs < end && re > start
-        });
+        let locked = mem.locked_bytes_within(start, end) != 0;
         MadviseRangeMeta {
             fully_mapped,
             covered,
@@ -301,17 +297,23 @@ impl<'a> MemView<'a> {
         } else {
             Some(self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur)
         };
+        let Some(limit) = memlock_limit else {
+            return Ok(());
+        };
+        if limit == 0 {
+            return Err(LINUX_EPERM);
+        }
         let mem_authority_36 = self.mem();
         let mem = mem_authority_36.lock();
-        let mut next = mem.locked_view().into_owned();
-        locked_ranges_insert(&mut next, range);
-        if let Some(limit) = memlock_limit {
-            if limit == 0 {
-                return Err(LINUX_EPERM);
-            }
-            if locked_ranges_total(&next) > limit {
-                return Err(LINUX_ENOMEM);
-            }
+        // The union of what is locked and `range`: the range's own bytes
+        // plus everything locked outside it.
+        let (start, end) = (range.start().raw(), range.end().raw());
+        let next = mem
+            .locked_bytes()
+            .saturating_sub(mem.locked_bytes_within(start, end))
+            .saturating_add(range.len() as u64);
+        if next > limit {
+            return Err(LINUX_ENOMEM);
         }
         Ok(())
     }
@@ -456,9 +458,7 @@ impl<'a> MemView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             if flags & LINUX_MS_INVALIDATE != 0 {
-                let locked = this.mem().lock().locked_view().iter().any(|range| {
-                    range.start().raw() < end && range.end().raw() > address.0
-                });
+                let locked = this.mem().lock().locked_bytes_within(address.0, end) != 0;
                 if locked {
                     return Ok(DispatchOutcome::errno(LINUX_EBUSY));
                 }

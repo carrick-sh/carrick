@@ -283,40 +283,33 @@ pub(in crate::dispatch) fn opaque_flags(vma: &SemanticVma, mem: &MemState) -> Re
     flags
 }
 
-/// Union of `ranges` minus the union of `covered`, in bytes.
-fn uncovered_bytes(mut ranges: Vec<(u64, u64)>, covered: &[(u64, u64)]) -> u64 {
+/// Union of `ranges` minus every committed root node, in bytes.
+fn uncovered_bytes(ranges: Vec<(u64, u64)>, model: &mut Reservations<'_>) -> Result<u64, Refusal> {
+    let mut total = 0u64;
+    for (start, end) in union_of(ranges) {
+        // Host rows are page-granular Linux VMAs; a sub-page row cannot be
+        // a root node's range either.
+        let covered = match ReservationRange::new(start, end) {
+            Some(range) => model.charges_within(range).bytes,
+            None => 0,
+        };
+        total = total.saturating_add((end - start).saturating_sub(covered));
+    }
+    Ok(total)
+}
+
+/// The sorted, disjoint union of `ranges`.
+fn union_of(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     ranges.retain(|(start, end)| start < end);
     ranges.sort_unstable();
-    let mut total = 0u64;
-    let mut cover = covered.iter().peekable();
-    let mut cursor = 0u64;
+    let mut union: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
     for (start, end) in ranges {
-        let mut start = start.max(cursor);
-        if start >= end {
-            continue;
-        }
-        cursor = end;
-        while start < end {
-            // `covered` is the root's committed nodes: sorted and disjoint.
-            while cover
-                .peek()
-                .is_some_and(|(_, cover_end)| *cover_end <= start)
-            {
-                cover.next();
-            }
-            match cover.peek() {
-                Some(&&(cover_start, cover_end)) if cover_start < end => {
-                    total = total.saturating_add(cover_start.saturating_sub(start));
-                    start = start.max(cover_end);
-                }
-                _ => {
-                    total = total.saturating_add(end - start);
-                    start = end;
-                }
-            }
+        match union.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => union.push((start, end)),
         }
     }
-    total
+    union
 }
 
 /// The charges of every Linux-visible mapping the host projects, to be
@@ -336,15 +329,12 @@ impl HostCharges {
     }
 
     /// Charges outside the root's committed nodes: nothing the root holds
-    /// (anonymous or opaque) is charged twice.
+    /// (anonymous or opaque) is charged twice. One range-charge descent per
+    /// host row: O(host rows x log root nodes), never a walk of the root.
     fn beyond(self, model: &mut Reservations<'_>) -> Result<(u64, u64), Refusal> {
-        let mut nodes = Vec::new();
-        model.observe_mappings(&mut |mapping| {
-            nodes.push((mapping.range.start(), mapping.range.end()));
-        })?;
         Ok((
-            uncovered_bytes(self.address, &nodes),
-            uncovered_bytes(self.data, &nodes),
+            uncovered_bytes(self.address, model)?,
+            uncovered_bytes(self.data, model)?,
         ))
     }
 }
@@ -421,8 +411,13 @@ impl MemState {
             AnonymousAuthority::Delegated(delegated) => {
                 let base = self.layout.mmap_base;
                 let end = base.saturating_add(self.layout.mmap_size);
-                Self::root_mappings(&delegated.root, base, end)
-                    .last()
+                // One descent to the highest node, not a walk of the arena.
+                delegated
+                    .root
+                    .with_root(|model| Ok(model.last_mapping_within(reservation_range(base, end)?)))
+                    .unwrap_or_else(|refusal| {
+                        broken_root("an arena high-water observation", refusal)
+                    })
                     .map_or(base, |mapping| mapping.range.end().min(end))
             }
         }
@@ -514,6 +509,104 @@ impl MemState {
         }
     }
 
+    /// Every Linux-visible VMA row overlapping `[start, end)`, in address
+    /// order: the host rows there and the root's anonymous rows there. The
+    /// cost is the range's own rows, never the whole MM.
+    pub(in crate::dispatch) fn observed_vmas_within(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Vec<SemanticVma> {
+        let mut rows: Vec<SemanticVma> = self
+            .semantic_vmas
+            .overlapping(start, end)
+            .cloned()
+            .collect();
+        if let Some(root) = self.delegated_root()
+            && start < end
+        {
+            let layout = self.layout;
+            let (page_start, page_end) = (
+                start & !(LINUX_PAGE_SIZE - 1),
+                align_up_u64(end, LINUX_PAGE_SIZE).unwrap_or(!(LINUX_PAGE_SIZE - 1)),
+            );
+            for mapping in Self::root_mappings(root, page_start, page_end) {
+                if mapping.anonymous {
+                    rows.push(anonymous_row(&mapping, layout));
+                }
+            }
+            rows.sort_by_key(|vma| vma.start);
+        }
+        rows
+    }
+
+    /// Delegated MM: the bytes charged to `RLIMIT_AS` and `RLIMIT_DATA`, the
+    /// root's own aggregates plus the host rows the root does not hold (the
+    /// same charges every root proposal is decided against). `None` in host
+    /// setup. O(host rows x log root nodes).
+    pub(in crate::dispatch) fn delegated_charges(&self) -> Option<(u64, u64)> {
+        let root = self.delegated_root()?;
+        let host = HostCharges::of(self);
+        Some(
+            root.with_root(|model| {
+                let charges = model.charges();
+                let (address, data) = host.beyond(model)?;
+                Ok((
+                    charges.bytes.saturating_add(address),
+                    charges.data.saturating_add(data),
+                ))
+            })
+            .unwrap_or_else(|refusal| broken_root("a charge observation", refusal)),
+        )
+    }
+
+    /// Delegated MM: the mapped (root or host) bytes of `[start, end)`.
+    /// `None` in host setup.
+    pub(in crate::dispatch) fn delegated_mapped_within(&self, start: u64, end: u64) -> Option<u64> {
+        let root = self.delegated_root()?;
+        let host: Vec<(u64, u64)> = host_vma_ranges(self)
+            .into_iter()
+            .map(|(row_start, row_end)| (row_start.max(start), row_end.min(end)))
+            .collect();
+        let range = ReservationRange::new(
+            start & !(LINUX_PAGE_SIZE - 1),
+            align_up_u64(end, LINUX_PAGE_SIZE)?,
+        );
+        Some(
+            root.with_root(|model| {
+                let root_bytes = range.map_or(0, |range| model.charges_within(range).bytes);
+                Ok(root_bytes.saturating_add(uncovered_bytes(host, model)?))
+            })
+            .unwrap_or_else(|refusal| broken_root("a mapped-bytes observation", refusal)),
+        )
+    }
+
+    /// Delegated MM: whether `[start, end)` is fully mapped (root or host
+    /// rows). `None` in host setup.
+    pub(in crate::dispatch) fn delegated_covers(&self, start: u64, end: u64) -> Option<bool> {
+        let root = self.delegated_root()?;
+        let mut rows = host_vma_ranges(self);
+        if let (Some(page_end), true) = (align_up_u64(end, LINUX_PAGE_SIZE), start < end) {
+            for mapping in Self::root_mappings(root, start & !(LINUX_PAGE_SIZE - 1), page_end) {
+                rows.push((mapping.range.start(), mapping.range.end()));
+            }
+        }
+        let mut cursor = start;
+        for (row_start, row_end) in union_of(rows) {
+            if row_end <= cursor {
+                continue;
+            }
+            if row_start > cursor {
+                break;
+            }
+            cursor = row_end;
+            if cursor >= end {
+                break;
+            }
+        }
+        Some(cursor >= end)
+    }
+
     /// Every committed root anonymous node overlapping `[start, end)`,
     /// clipped to it.
     fn root_anonymous_pieces(root: &DelegatedRoot, start: u64, end: u64) -> Vec<Mapping> {
@@ -550,6 +643,52 @@ impl MemState {
         })
         .unwrap_or_else(|refusal| broken_root("a lock observation", refusal));
         Cow::Owned(ranges)
+    }
+
+    /// Bytes this MM holds locked: the host lock table plus the root's
+    /// `LOCKED` anonymous nodes (disjoint by construction, see
+    /// [`Self::set_locked`]), read from the root's aggregate.
+    pub(in crate::dispatch) fn locked_bytes(&self) -> u64 {
+        let host = super::locked_ranges_total(&self.locked_ranges);
+        let Some(root) = self.delegated_root() else {
+            return host;
+        };
+        let root_locked = root
+            .with_root(|model| Ok(model.charges().locked))
+            .unwrap_or_else(|refusal| broken_root("a lock charge observation", refusal));
+        host.saturating_add(root_locked)
+    }
+
+    /// Locked bytes inside `[start, end)`: O(log n) in the root.
+    pub(in crate::dispatch) fn locked_bytes_within(&self, start: u64, end: u64) -> u64 {
+        let host: u64 = self
+            .locked_ranges
+            .iter()
+            .map(|range| {
+                range
+                    .end()
+                    .raw()
+                    .min(end)
+                    .saturating_sub(range.start().raw().max(start))
+            })
+            .sum();
+        let Some(root) = self.delegated_root() else {
+            return host;
+        };
+        // Lock ranges are page-granular: round out to whole pages.
+        let (Some(page_start), Some(page_end)) = (
+            Some(start & !(LINUX_PAGE_SIZE - 1)),
+            align_up_u64(end, LINUX_PAGE_SIZE),
+        ) else {
+            return host;
+        };
+        let Some(range) = ReservationRange::new(page_start, page_end) else {
+            return host;
+        };
+        let root_locked = root
+            .with_root(|model| Ok(model.charges_within(range).locked))
+            .unwrap_or_else(|refusal| broken_root("a lock charge observation", refusal));
+        host.saturating_add(root_locked)
     }
 
     /// Set (or clear) `set`/`clear` attributes on the root-owned anonymous
@@ -1002,9 +1141,16 @@ impl MemView<'_> {
         root: &DelegatedRoot,
         step: impl FnOnce(&mut Reservations<'_>) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
-        let (address_limit, data_limit) = self
-            .address_space_limits_apply(true)
-            .unwrap_or((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY));
+        // Both limits infinite: no proposal can exceed them, so nothing is
+        // charged (and the guest venue sees zero external charges until a
+        // finite limit is pushed, which charges again).
+        let Some((address_limit, data_limit)) = self.address_space_limits_apply(true) else {
+            return root.with_root(|model| {
+                model.set_limits(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY);
+                model.set_external_charges(0, 0);
+                step(model)
+            });
+        };
         let host = HostCharges::of(mem);
         root.with_root(|model| {
             model.set_limits(address_limit, data_limit);
@@ -1469,7 +1615,7 @@ impl MemView<'_> {
         let locked = node.flags.contains(ReservationNodeFlags::LOCKED);
         if locked && new_size > old_size && !self.cred_snapshot().euid.is_root() {
             let limit = self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur;
-            let held = super::locked_ranges_total(&self.mem().lock().locked_view());
+            let held = self.mem().lock().locked_bytes();
             if held
                 .checked_add(new_size - old_size)
                 .is_none_or(|total| total > limit)
@@ -1746,14 +1892,16 @@ fn with_args<'a, 'm, 'x, M: CurrentMmMemory, R>(
 
 #[cfg(test)]
 mod tests {
-    use super::uncovered_bytes;
+    use super::union_of;
 
     #[test]
-    fn uncovered_bytes_subtracts_a_sorted_cover_from_a_union() {
-        assert_eq!(uncovered_bytes(vec![(0, 10)], &[]), 10);
-        assert_eq!(uncovered_bytes(vec![(0, 10), (5, 15)], &[]), 15);
-        assert_eq!(uncovered_bytes(vec![(0, 10)], &[(2, 4), (6, 8)]), 6);
-        assert_eq!(uncovered_bytes(vec![(0, 10), (20, 30)], &[(5, 25)]), 10);
-        assert_eq!(uncovered_bytes(vec![(20, 30), (0, 10)], &[(0, 30)]), 0);
+    fn union_of_merges_overlapping_and_abutting_rows() {
+        assert_eq!(union_of(vec![(0, 10)]), [(0, 10)]);
+        assert_eq!(union_of(vec![(0, 10), (5, 15)]), [(0, 15)]);
+        assert_eq!(
+            union_of(vec![(20, 30), (0, 10), (10, 12)]),
+            [(0, 12), (20, 30)]
+        );
+        assert_eq!(union_of(vec![(4, 4), (0, 2)]), [(0, 2)]);
     }
 }

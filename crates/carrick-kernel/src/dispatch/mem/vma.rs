@@ -825,6 +825,9 @@ fn vma_summaries_of(
 /// authority as `/proc/<pid>/maps` and the core publisher, so the limit and
 /// the reported size cannot disagree.
 pub(crate) fn committed_va_bytes(mem: &MemState) -> u64 {
+    if let Some((address, _)) = mem.delegated_charges() {
+        return address;
+    }
     project_vma_summaries(mem)
         .iter()
         .map(|vma| vma.end.0.saturating_sub(vma.start.0))
@@ -836,6 +839,9 @@ pub(crate) fn committed_va_bytes(mem: &MemState) -> u64 {
 /// unmapping the overlap.
 pub(crate) fn mapped_overlap_bytes(mem: &MemState, start: u64, len: u64) -> u64 {
     let end = start.saturating_add(len);
+    if let Some(mapped) = mem.delegated_mapped_within(start, end) {
+        return mapped;
+    }
     project_vma_summaries(mem)
         .iter()
         .map(|vma| vma.end.0.min(end).saturating_sub(vma.start.0.max(start)))
@@ -855,6 +861,9 @@ pub(crate) fn mapping_is_data(write: bool, private: bool, growsdown: bool) -> bo
 /// VMAs. A dynamic map overlapping a grow-down range is stack, not data. A
 /// delegated root's writable anonymous rows outside the heap count too.
 pub(crate) fn data_va_bytes(mem: &MemState) -> u64 {
+    if let Some((_, data)) = mem.delegated_charges() {
+        return data;
+    }
     let layout = mem.layout;
     let heap_end = layout.heap_base.saturating_add(layout.heap_size);
     let heap = mem.program_break().saturating_sub(layout.heap_base);

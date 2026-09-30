@@ -224,17 +224,13 @@ impl<'a> MemView<'a> {
     pub(in crate::dispatch) fn push_break_limits(&self) -> Result<(), DispatchError> {
         let authority = self.mem();
         let mem = authority.lock();
-        let Some(root) = mem.delegated_root() else {
+        let Some(root) = mem.delegated_root().cloned() else {
             return Ok(());
         };
-        let (address_limit, data_limit) = self
-            .address_space_limits_apply(true)
-            .unwrap_or((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY));
-        root.with_root(|model| {
-            model.set_limits(address_limit, data_limit);
-            Ok(())
-        })
-        .map_err(DispatchError::ReservationAuthority)
+        // The limits and, when finite, the charges of everything the root
+        // does not hold: the guest venue decides against both.
+        self.with_charged_root(&mem, &root, |_| Ok(()))
+            .map_err(DispatchError::ReservationAuthority)
     }
 
     /// No backend work happened: withdraw a delegated proposal and answer

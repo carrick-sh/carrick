@@ -185,6 +185,29 @@ steal attempt, even when a zone-held row contributes to lifecycle drain.
 Host-runnable rows must remain stealable. Signed execution, same-image Docker
 timing, and full promotion remain open for the integration director.
 
+## Delegated anonymous root contracts
+
+`kernel.mm.delegated-residency` covers `mincore(2)` and first-touch planning
+on an MM whose EL1 anonymous root is admitted. Linux authority: `man 2 mincore`,
+`man 2 munmap`: a new anonymous mapping holds none of the pages a previous
+mapping at the same address had. Structural invariant: a host residency fact
+names the root node incarnation it was observed under (`ResidencyOwner`), so a
+guest-venue retire kills it without any guest-to-host notification. VM-free
+bindings: `delegated_guest_venue_munmap_then_mmap_retires_host_residency` and
+`delegated_residency_of_two_adjacent_mappings_survives_only_where_unretired`
+(delegated MM against a host-setup twin).
+
+`kernel.mm.delegated-root-reader-cost` covers the host readers of a delegated
+root: proposal charging (`RLIMIT_AS`/`RLIMIT_DATA`), `mincore`, fault plans,
+`madvise` range metadata, lock accounting, the arena high water and the host
+`mmap`/`mprotect`/`munmap`/`mlock` paths. Structural invariant: root node reads
+scale with the queried range and the tree height, never with the unrelated
+node population. VM-free binding:
+`delegated_readers_cost_the_queried_range_not_the_root_population` at 16 and
+512 unrelated nodes; the budget is reads(512) <= 3 x reads(16) per query
+(heights double; a population walk grows 32x). Signed, Docker and timing
+layers remain open until the root is admitted in production.
+
 ## Futex example
 
 `kernel.futex.contention` is the first vertical contract. Its VM-free binding
