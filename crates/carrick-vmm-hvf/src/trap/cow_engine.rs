@@ -1748,7 +1748,13 @@ impl HvfVmState {
         requested_end: u64,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<Option<u64>, TrapError> {
-        require_host_cow_lane(&self.page_tables_authority())?;
+        let guest_lane = self.page_tables_authority().live_descriptor_owner()
+            == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
+        if guest_lane && !flush_stage1.guest_publication_available() {
+            return Err(TrapError::Hypervisor(
+                "guest retained reuse requires its driving vCPU".to_owned(),
+            ));
+        }
         const PAGE_SIZE: u64 = 4 * 1024;
         const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
         const VALID: u64 = 1;
@@ -1915,165 +1921,216 @@ impl HvfVmState {
         let mut owner_rollback = GlobalFrameOwnerRollback::new(custody);
         owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
 
-        let inventory_mapping = {
-            let mut inventory = self.frame_inventory.lock();
-            Self::stage_mapping_in(
-                self.custody(),
-                &mut inventory,
-                &mut reservation,
-                InventoryMappingStage {
-                    gpa: new_physical_ipa,
-                    length: CowArmedRanges::COMPOUND_SIZE,
-                    permissions: carrick_hal::MemPerms {
-                        read: true,
-                        write: true,
-                        exec: true,
-                    },
-                    backing,
-                    inherited_frame: None,
-                    stage2_lease: Some((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)),
-                    stage2_owner: InventoryStage2OwnerIdentity {
-                        host_addr: new_host_ptr as usize,
-                        generation: owner_generation,
-                    },
-                },
-            )?
+        let retained_stage = || InventoryMappingStage {
+            gpa: new_physical_ipa,
+            length: CowArmedRanges::COMPOUND_SIZE,
+            permissions: carrick_hal::MemPerms {
+                read: true,
+                write: true,
+                exec: true,
+            },
+            backing,
+            inherited_frame: None,
+            stage2_lease: Some((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)),
+            stage2_owner: InventoryStage2OwnerIdentity {
+                host_addr: new_host_ptr as usize,
+                generation: owner_generation,
+            },
         };
-        let inventory_entry = (
-            (new_physical_ipa, CowArmedRanges::COMPOUND_SIZE),
-            inventory_mapping,
-        );
-
-        // Journal this transaction's descriptor pre-images rather than
-        // cloning the whole 1.75 MiB table region (see `begin_undo`).
-        let publication = {
-            let page_tables_authority = self.page_tables_authority();
-            page_tables_authority
-                .edit(
-                    || {
-                        Err(TrapError::Hypervisor(
-                            "HVPatch retained reuse page tables are absent".to_owned(),
-                        ))
-                    },
-                    |editor| -> Result<(), TrapError> {
-                        editor.begin_undo().map_err(|error| match error {
-                            carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
-                                TrapError::MetadataAllocation
-                            }
-                            other => TrapError::Hypervisor(format!(
-                                "begin undo HVPatch retained reuse leaves: {other:?}"
-                            )),
-                        })?;
-                        Self::refresh_stage1_exclusivity(editor.manager);
-                        editor
-                            .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
-                            .map_err(|error| {
-                                TrapError::Hypervisor(format!(
-                                    "repoint HVPatch retained reuse leaves: {error:?}"
-                                ))
-                            })?;
-                        // `PtOp::Invalidate` intentionally preserves AP. A retired overlay
-                        // may therefore carry invalid+RW attributes, while the deferred
-                        // PROT_NONE publication is required to authenticate invalid+RO.
-                        // Normalize the unpublished leaves to fork-RO/nG now; a later RW
-                        // protect changes AP while preserving the exact fresh IPA.
-                        editor
-                            .set_fork_readonly(page_va, span_len)
-                            .map_err(|error| {
-                                TrapError::Hypervisor(format!(
-                                    "restrict HVPatch retained reuse leaves: {error:?}"
-                                ))
-                            })?;
-                        self.publish_stage1_extension_arenas(editor.manager)?;
-                        let page_table_resolver =
-                            self.page_table_resolver(editor.base(), Some(page_table_host));
-                        unsafe { editor.sync_to_host(page_table_resolver) }.map_err(|e| {
-                            TrapError::Hypervisor(format!("retained reuse sync_to_host failed: {e:?}"))
-                        })?;
-                        let mut current = page_va;
-                        while current < span_end {
-                            let expected_ipa = new_ipa.checked_add(current - page_va).ok_or_else(|| {
-                                TrapError::Hypervisor("retained reuse leaf IPA overflow".to_owned())
-                            })?;
-                            let shadow = editor.debug_walk(current);
-                            let live = unsafe { editor.debug_walk_host(page_table_resolver, current) }
-                                .map_err(|e| {
-                                    TrapError::Hypervisor(format!(
-                                        "retained reuse debug_walk_host failed: {e:?}"
-                                    ))
-                                })?;
-                            if shadow != live {
-                                return Err(TrapError::Hypervisor(format!(
-                                    "HVPatch retained reuse shadow/live mismatch at VA 0x{current:x}"
-                                )));
-                            }
-                            let leaf = live[3];
-                            if leaf & VALID != 0
-                                || leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
-                                || leaf & AP_MASK != AP_USER_RO
-                                || leaf & NON_GLOBAL == 0
-                            {
-                                return Err(TrapError::Hypervisor(format!(
-                                    "HVPatch retained reuse leaf authentication failed at VA 0x{current:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
-                                )));
-                            }
-                            current = current.saturating_add(PAGE_SIZE);
-                        }
-                        Ok::<(), TrapError>(())
+        let inventory_mapping = if guest_lane {
+            use carrick_mmu_core::aarch64::descriptor_txn::{AliasAccess, DescriptorOp, PageSpan};
+            let mm = std::num::NonZeroU64::new(identity.mm).ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch retained reuse has a zero MM".to_owned())
+            })?;
+            // Kernel grant, backend ledger and stage-2 owner roll back on drop
+            // until EL1's verified completion lets the replacement survive.
+            let mut prepared = GuestPreparedBacking::prepare_owned(
+                self.carrier_vm_custody(),
+                authority.clone(),
+                self.frame_inventory.ledger.clone(),
+                reservation,
+                mm,
+                retained_stage(),
+                owner_rollback,
+            )?;
+            // The deferred alias is the same invalid, read-only, nG leaf the
+            // host path authenticates; the following protection commit makes
+            // it resident. EL1 clears the retired output in the same journal.
+            let txn = self
+                .page_tables_authority()
+                .prepare_guest_descriptor_txn(
+                    mm,
+                    DescriptorOp::MapAlias {
+                        access: AliasAccess::Deferred,
+                        span: PageSpan::new(page_va, span_len as u64),
+                        target_ipa: carrick_mmu_core::aarch64::SubstrateGpa(new_ipa),
+                        backing: prepared.backing()?,
                     },
                 )
-        };
-        if let Err(error) = publication {
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("prepare guest retained reuse: {error:?}"))
+                })?;
+            let receipt = flush_stage1.publish(&txn).unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::cow",
+                    "guest retained reuse lacks a verified completion: {error}"
+                );
+            });
+            if *receipt.txn() != txn {
+                carrick_fatal!(
+                    "hvpatch::cow",
+                    "guest retained reuse receipt names another transaction"
+                );
+            }
+            prepared.commit();
+            prepared.extent
+        } else {
+            let inventory_mapping = {
+                let mut inventory = self.frame_inventory.lock();
+                Self::stage_mapping_in(
+                    self.custody(),
+                    &mut inventory,
+                    &mut reservation,
+                    retained_stage(),
+                )?
+            };
+            let inventory_entry = (
+                (new_physical_ipa, CowArmedRanges::COMPOUND_SIZE),
+                inventory_mapping,
+            );
+
+            // Journal this transaction's descriptor pre-images rather than
+            // cloning the whole 1.75 MiB table region (see `begin_undo`).
+            let publication = {
+                let page_tables_authority = self.page_tables_authority();
+                page_tables_authority
+                    .edit(
+                        || {
+                            Err(TrapError::Hypervisor(
+                                "HVPatch retained reuse page tables are absent".to_owned(),
+                            ))
+                        },
+                        |editor| -> Result<(), TrapError> {
+                            editor.begin_undo().map_err(|error| match error {
+                                carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
+                                    TrapError::MetadataAllocation
+                                }
+                                other => TrapError::Hypervisor(format!(
+                                    "begin undo HVPatch retained reuse leaves: {other:?}"
+                                )),
+                            })?;
+                            Self::refresh_stage1_exclusivity(editor.manager);
+                            editor
+                                .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
+                                .map_err(|error| {
+                                    TrapError::Hypervisor(format!(
+                                        "repoint HVPatch retained reuse leaves: {error:?}"
+                                    ))
+                                })?;
+                            // `PtOp::Invalidate` intentionally preserves AP. A retired overlay
+                            // may therefore carry invalid+RW attributes, while the deferred
+                            // PROT_NONE publication is required to authenticate invalid+RO.
+                            // Normalize the unpublished leaves to fork-RO/nG now; a later RW
+                            // protect changes AP while preserving the exact fresh IPA.
+                            editor
+                                .set_fork_readonly(page_va, span_len)
+                                .map_err(|error| {
+                                    TrapError::Hypervisor(format!(
+                                        "restrict HVPatch retained reuse leaves: {error:?}"
+                                    ))
+                                })?;
+                            self.publish_stage1_extension_arenas(editor.manager)?;
+                            let page_table_resolver =
+                                self.page_table_resolver(editor.base(), Some(page_table_host));
+                            unsafe { editor.sync_to_host(page_table_resolver) }.map_err(|e| {
+                                TrapError::Hypervisor(format!("retained reuse sync_to_host failed: {e:?}"))
+                            })?;
+                            let mut current = page_va;
+                            while current < span_end {
+                                let expected_ipa = new_ipa.checked_add(current - page_va).ok_or_else(|| {
+                                    TrapError::Hypervisor("retained reuse leaf IPA overflow".to_owned())
+                                })?;
+                                let shadow = editor.debug_walk(current);
+                                let live = unsafe { editor.debug_walk_host(page_table_resolver, current) }
+                                    .map_err(|e| {
+                                        TrapError::Hypervisor(format!(
+                                            "retained reuse debug_walk_host failed: {e:?}"
+                                        ))
+                                    })?;
+                                if shadow != live {
+                                    return Err(TrapError::Hypervisor(format!(
+                                        "HVPatch retained reuse shadow/live mismatch at VA 0x{current:x}"
+                                    )));
+                                }
+                                let leaf = live[3];
+                                if leaf & VALID != 0
+                                    || leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                                    || leaf & AP_MASK != AP_USER_RO
+                                    || leaf & NON_GLOBAL == 0
+                                {
+                                    return Err(TrapError::Hypervisor(format!(
+                                        "HVPatch retained reuse leaf authentication failed at VA 0x{current:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
+                                    )));
+                                }
+                                current = current.saturating_add(PAGE_SIZE);
+                            }
+                            Ok::<(), TrapError>(())
+                        },
+                    )
+            };
+            if let Err(error) = publication {
+                let _ = self.page_tables_authority().edit(
+                    || Err(()),
+                    |editor| {
+                        let manager_base = editor.base();
+                        let page_table_resolver =
+                            self.page_table_resolver(manager_base, Some(page_table_host));
+                        // SAFETY: the COW quiesce and topology guards remain held.
+                        let _ = unsafe { editor.rollback_undo(page_table_resolver) };
+                        Ok::<(), ()>(())
+                    },
+                );
+                if let Err(flush_error) = flush_stage1.flush() {
+                    carrick_fatal!(
+                        "hvpatch::mm_authority",
+                        "retained reuse rollback TLBI failed: {flush_error}"
+                    );
+                }
+                Self::rollback_unpublished_mappings(
+                    &mut self.frame_inventory.lock(),
+                    &[inventory_entry],
+                )?;
+                return Err(error);
+            }
+            // Publication succeeded: the journalled pre-images are no longer needed.
             let _ = self.page_tables_authority().edit(
                 || Err(()),
                 |editor| {
-                    let manager_base = editor.base();
-                    let page_table_resolver =
-                        self.page_table_resolver(manager_base, Some(page_table_host));
-                    // SAFETY: the COW quiesce and topology guards remain held.
-                    let _ = unsafe { editor.rollback_undo(page_table_resolver) };
+                    editor.commit_undo();
                     Ok::<(), ()>(())
                 },
             );
-            if let Err(flush_error) = flush_stage1.flush() {
+            if let Err(error) = flush_stage1.flush() {
                 carrick_fatal!(
                     "hvpatch::mm_authority",
-                    "retained reuse rollback TLBI failed: {flush_error}"
+                    "retained reuse stage-1 TLBI failed: {error}"
                 );
             }
-            Self::rollback_unpublished_mappings(
-                &mut self.frame_inventory.lock(),
-                &[inventory_entry],
-            )?;
-            return Err(error);
-        }
-        // Publication succeeded: the journalled pre-images are no longer needed.
-        let _ = self.page_tables_authority().edit(
-            || Err(()),
-            |editor| {
-                editor.commit_undo();
-                Ok::<(), ()>(())
-            },
-        );
-        if let Err(error) = flush_stage1.flush() {
-            carrick_fatal!(
-                "hvpatch::mm_authority",
-                "retained reuse stage-1 TLBI failed: {error}"
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
+                identity.linux_pid,
+                identity.linux_tid,
             );
-        }
-        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
-            carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
-            identity.linux_pid,
-            identity.linux_tid,
-        );
-        if let Err(error) = authority.apply(reservation.commit(())) {
-            carrick_fatal!(
-                "hvpatch::frame_inventory",
-                "retained reuse inventory commit failed: {error}"
-            );
-        }
-        drop(registry);
-        owner_rollback.commit();
+            if let Err(error) = authority.apply(reservation.commit(())) {
+                carrick_fatal!(
+                    "hvpatch::frame_inventory",
+                    "retained reuse inventory commit failed: {error}"
+                );
+            }
+            drop(registry);
+            owner_rollback.commit();
+            inventory_mapping
+        };
 
         match authority.mapping_is_live(
             inventory_mapping.mapping,
