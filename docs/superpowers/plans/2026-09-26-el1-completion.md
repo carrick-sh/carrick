@@ -7,7 +7,7 @@
 
 **Updated:** 2026-09-29, from local Git state, source inspection and retained
 receipts. After requesting the refresh, the user explicitly said "Set the
-goal and go." The end-to-end goal is active; execution now advances B+D memory ownership after the bounded C coherence slice below; A and full C remain unaccepted.
+goal and go." The end-to-end goal is paused at the user-requested local-main consolidation. Migration acceptance remains incomplete; see the stopping receipt below.
 
 **Goal:** Complete the accepted AArch64/macOS EL1 migration,
 with one authoritative owner and one semantic implementation per object,
@@ -37,6 +37,14 @@ and real KVM/bhyve/NVMM venue remain a deferred follow-up.
 historical campaign verbatim. The local handoff is
 `.worktrees/EL1-HANDOFF-2026-09-29.md`; this controller supersedes its stale
 status/order statements where explicitly corrected below.
+
+**Execution status: PAUSED by user request.** Current implementation and
+controller are consolidated on local main. The signed descriptor-service test
+passed on source `4d3484cc2`; domain lint remains red on unreviewed IPC inventory
+classifications. Main's [stopping receipt](../../perf-results/2026-09-29-el1-memory-integration/stopping-point.md)
+records scope, evidence, excluded branches and resume obligations. This status
+supersedes all historical active/next statements below; do not resume without
+a user request. No checkpoint or end-to-end completion is claimed.
 
 ## User-requested consolidation and stopping point
 
