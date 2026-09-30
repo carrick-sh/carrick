@@ -657,6 +657,39 @@ impl Stage1Authority {
         }
     }
 
+    /// Load the software manager from `builder()` when it is absent, without
+    /// editing anything. Returns whether this call installed it.
+    ///
+    /// This is the read-only counterpart of the lazy build inside
+    /// [`Self::edit`]: it stages and stores no descriptor, so it is valid on
+    /// every lane, including a guest-owned MM (whose manager may be absent
+    /// after persistent exec) where `edit` would refuse. The installed manager
+    /// carries this authority's live owner exactly as `edit` applies it.
+    pub fn load_manager_if_absent<B, E>(&self, builder: B) -> Result<bool, E>
+    where
+        B: FnOnce() -> Result<PageTableManager, E>,
+    {
+        let authority = self.authority_id();
+        let mut inner = self.inner.lock();
+        if inner.manager.is_some() {
+            return Ok(false);
+        }
+        let mut manager = builder()?;
+        if let Some(ref resolver) = inner.host_resolver {
+            unsafe { manager.make_live(Arc::clone(resolver)) };
+        }
+        manager.declare_live_hardware_image();
+        manager.set_live_descriptor_owner(inner.live_owner);
+        carrick_observability::probes::stage1_arena_install(
+            4,
+            u32::from(inner.arena_source.is_some()),
+            0,
+            authority,
+        );
+        *inner.manager = Some(manager);
+        Ok(true)
+    }
+
     /// Perform a scoped, locked edit over the stage-1 page tables via [`Stage1Editor`].
     ///
     /// If the `PageTableManager` is not yet present, lazily constructs it using `builder()`,
@@ -2361,6 +2394,31 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn guest_owned_authority_loads_an_absent_manager_without_an_edit() {
+        let authority = Stage1Authority::new_with_manager(None);
+        authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        assert!(authority.is_none());
+        // `edit` would refuse the guest lane at the engine funnel; the load
+        // path is valid there and stores nothing.
+        let loaded = authority
+            .load_manager_if_absent(|| Ok::<_, PageTableError>(test_manager()))
+            .unwrap();
+        assert!(loaded);
+        assert!(authority.is_present());
+        assert_eq!(
+            authority.with_manager(|m| m.live_descriptor_owner()),
+            Some(LiveDescriptorOwner::Guest)
+        );
+        // Present: the builder is not consulted and nothing is replaced.
+        let again = authority
+            .load_manager_if_absent(|| -> Result<PageTableManager, PageTableError> {
+                panic!("builder must not run when the manager is present")
+            })
+            .unwrap();
+        assert!(!again);
     }
 
     #[test]
