@@ -15146,7 +15146,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "line": 1278,
+      "line": 1279,
       "categories": [
         "mapping"
       ],
@@ -15155,7 +15155,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "line": 2048,
+      "line": 2060,
       "categories": [
         "mapping"
       ],
@@ -19296,7 +19296,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 974,
+      "line": 975,
       "categories": [
         "lifecycle"
       ],
@@ -19305,7 +19305,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1009,
+      "line": 1010,
       "categories": [
         "lifecycle"
       ],
@@ -19314,7 +19314,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1070,
+      "line": 1071,
       "categories": [
         "lifecycle"
       ],
@@ -19323,7 +19323,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1950,
+      "line": 1890,
       "categories": [
         "table_guard"
       ],
@@ -19332,7 +19332,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1981,
+      "line": 1921,
       "categories": [
         "table_guard"
       ],
@@ -19341,7 +19341,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2227,
+      "line": 2167,
       "categories": [
         "mapping"
       ],
@@ -19350,7 +19350,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2236,
+      "line": 2176,
       "categories": [
         "mapping"
       ],
@@ -19359,7 +19359,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2238,
+      "line": 2178,
       "categories": [
         "mapping"
       ],
@@ -19368,7 +19368,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2270,
+      "line": 2210,
       "categories": [
         "mapping"
       ],
@@ -19377,7 +19377,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2272,
+      "line": 2212,
       "categories": [
         "mapping"
       ],
@@ -20223,7 +20223,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/tests.rs",
-      "line": 702,
+      "line": 708,
       "categories": [
         "mapping"
       ],
@@ -20232,7 +20232,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/tests.rs",
-      "line": 707,
+      "line": 713,
       "categories": [
         "mapping"
       ],
@@ -21186,7 +21186,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5890,
+      "line": 5905,
       "categories": [
         "mapping"
       ],
@@ -21195,7 +21195,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5898,
+      "line": 5913,
       "categories": [
         "mapping"
       ],
@@ -21204,7 +21204,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5914,
+      "line": 5929,
       "categories": [
         "mapping"
       ],

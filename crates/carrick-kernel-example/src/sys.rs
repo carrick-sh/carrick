@@ -1539,6 +1539,22 @@ pub fn renameat2(
     )
 }
 
+/// `setresuid(2)`: set the real, effective and saved user IDs.
+pub fn setresuid(ruid: u32, euid: u32, suid: u32) -> Syscall {
+    call(
+        "setresuid",
+        nr::SETRESUID,
+        [
+            i64::from(ruid).into(),
+            i64::from(euid).into(),
+            i64::from(suid).into(),
+            0.into(),
+            0.into(),
+            0.into(),
+        ],
+    )
+}
+
 /// `prlimit64(2)`: get and/or set resource limits of a process.
 pub fn prlimit64(
     pid: impl Into<Operand>,

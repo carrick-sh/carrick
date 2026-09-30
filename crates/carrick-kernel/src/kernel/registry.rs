@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::num::NonZeroI32;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use super::core::RegistryState;
+use super::thread_ledger::ThreadLedger;
 
 use super::ids::{LinuxTid, ProcessGroupId, SessionId, TaskId};
 
@@ -395,6 +398,133 @@ pub enum IdError {
     UnknownNamespaceId(i32),
     #[error("Linux namespace identity {0} has too many live claims")]
     ClaimCountExhausted(i32),
+}
+
+/// Authoritative object index. Multi-object mutations take this lock first and
+/// may then take at most one Task or subsystem leaf lock.
+///
+/// The lock is private: the only way to read or write the task graph is a
+/// [`SettledRegistryView`], and the only way to get one is
+/// [`Registry::settled`], which first publishes every thread birth the
+/// [`ThreadLedger`] holds. No membership reader can therefore observe a
+/// thread-group without its born-but-unpublished threads — a thread's
+/// visibility never depends on which lane created it.
+#[derive(Debug)]
+pub struct Registry {
+    state: RegistryLock,
+    ledger: ThreadLedger,
+}
+
+impl Registry {
+    pub(super) fn new(state: RegistryState, ledger: ThreadLedger) -> Self {
+        Self {
+            state: RegistryLock::new(state),
+            ledger,
+        }
+    }
+
+    /// Settle pending thread births, then hand out the task graph.
+    pub(super) fn settled(&self) -> SettledRegistryView<'_> {
+        self.ledger.settle(&self.state);
+        SettledRegistryView { lock: &self.state }
+    }
+
+    /// The thread-identity ledger that owns pending births and the
+    /// `RLIMIT_NPROC` credits of in-flight thread clones.
+    pub(crate) const fn thread_ledger(&self) -> &ThreadLedger {
+        &self.ledger
+    }
+}
+
+/// The task graph after [`Registry::settled`]: every thread birth recorded
+/// before the view was created is published in it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SettledRegistryView<'a> {
+    lock: &'a RegistryLock,
+}
+
+impl<'a> SettledRegistryView<'a> {
+    pub(super) fn read(self) -> RwLockReadGuard<'a, RegistryState> {
+        self.lock.read()
+    }
+
+    pub(super) fn try_read_until(
+        self,
+        deadline: std::time::Instant,
+    ) -> Option<RwLockReadGuard<'a, RegistryState>> {
+        self.lock.try_read_until(deadline)
+    }
+
+    pub(super) fn write(self) -> RwLockWriteGuard<'a, RegistryState> {
+        self.lock.write()
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_write(self) -> Option<RwLockWriteGuard<'a, RegistryState>> {
+        self.lock.try_write()
+    }
+
+    pub(super) fn write_unpublished(self) -> RwLockWriteGuard<'a, RegistryState> {
+        self.lock.write_unpublished()
+    }
+
+    pub(super) fn try_write_unpublished_until(
+        self,
+        deadline: std::time::Instant,
+    ) -> Option<RwLockWriteGuard<'a, RegistryState>> {
+        self.lock.try_write_unpublished_until(deadline)
+    }
+}
+
+/// The registry's reader/writer lock. Reachable only through [`Registry`]'s
+/// private field: the [`ThreadLedger`] receives it by reference to publish
+/// births, and every other user goes through [`SettledRegistryView`].
+#[derive(Debug)]
+pub(super) struct RegistryLock {
+    inner: RwLock<RegistryState>,
+}
+
+impl RegistryLock {
+    fn new(state: RegistryState) -> Self {
+        Self {
+            inner: RwLock::new(state),
+        }
+    }
+
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, RegistryState> {
+        self.inner.read()
+    }
+
+    fn try_read_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<RwLockReadGuard<'_, RegistryState>> {
+        self.inner.try_read_until(deadline)
+    }
+
+    pub(super) fn write(&self) -> RwLockWriteGuard<'_, RegistryState> {
+        let mut state = self.inner.write();
+        state.publish_epoch();
+        state
+    }
+
+    #[cfg(test)]
+    fn try_write(&self) -> Option<RwLockWriteGuard<'_, RegistryState>> {
+        let mut state = self.inner.try_write()?;
+        state.publish_epoch();
+        Some(state)
+    }
+
+    fn write_unpublished(&self) -> RwLockWriteGuard<'_, RegistryState> {
+        self.inner.write()
+    }
+
+    fn try_write_unpublished_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<RwLockWriteGuard<'_, RegistryState>> {
+        self.inner.try_write_until(deadline)
+    }
 }
 
 #[cfg(test)]

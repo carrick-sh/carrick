@@ -31,6 +31,7 @@ pub mod process_lifecycle;
 pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
+pub mod thread_ledger;
 pub mod tty;
 pub mod wait_set;
 
@@ -73,8 +74,8 @@ pub use carrier_process::{
 };
 pub use core::ReservationChangeSubscription;
 pub use core::{
-    Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,
-    RootBootstrap, TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
+    Kernel, KernelContext, KernelError, KernelTaskBinding, RegistryInvariantError, RootBootstrap,
+    TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
 };
 pub use debug::{
     ClientError as KernelDebugClientError, DebugEndpoint,
@@ -136,6 +137,7 @@ pub use operations::{ExactSignalTargetAuthorization, ExactThreadSignalPost};
 pub use process_lifecycle::ProcessThreadExit;
 pub(crate) use process_lifecycle::RetiredThreadResources;
 pub use process_lifecycle::{ChildExit, StopKind, WaitResult, identity_operation_errno};
+pub use registry::Registry;
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,
@@ -159,4 +161,5 @@ pub use snapshot::{
     ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow, VmaSnapshotRow,
     ZombieSnapshotRow,
 };
+pub use thread_ledger::ThreadLedger;
 pub use wait_set::{WaitCallbackEnrollment, WaitEnrollment, WaitQueue, WaitSet, WaitSetOutcome};

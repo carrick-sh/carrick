@@ -201,7 +201,7 @@ impl CpuLimitWatch {
     pub(crate) fn scan_once(&self, kernel: &Kernel) -> Option<Duration> {
         let tasks: Vec<Arc<Task>> = kernel
             .registry()
-            .state
+            .settled()
             .read()
             .tasks
             .values()

@@ -218,14 +218,14 @@ fn two_container_roots_share_one_kernel_graph() {
         "the retained child context keeps its weak observation live before container retirement",
     );
 
-    let epoch_before_rejected_retire = kernel.registry().state.read().epoch;
+    let epoch_before_rejected_retire = kernel.registry().settled().read().epoch;
     let alpha_teardown = kernel
         .retire_container_root(alpha.id(), Some(KernelFailpoint::AfterObjects))
         .expect_err("injected retirement failure must preserve alpha");
     assert!(alpha_teardown.to_string().contains("injected"));
     assert_eq!(kernel.container_count(), 2);
     assert_eq!(
-        kernel.registry().state.read().epoch,
+        kernel.registry().settled().read().epoch,
         epoch_before_rejected_retire,
         "rejected retirement must not publish an epoch"
     );
@@ -336,7 +336,7 @@ fn container_root_publication_is_all_or_nothing_for_concurrent_readers() {
     assert!(
         kernel
             .registry()
-            .state
+            .settled()
             .try_read_until(std::time::Instant::now())
             .is_none(),
         "the staged registry graph must remain write-locked until PID membership commits"
@@ -403,7 +403,7 @@ fn failed_pid_membership_commit_rolls_back_every_staged_root_edge() {
     let baseline_tasks = kernel.registry().task_count();
     let baseline_groups = kernel.registry().process_group_count();
     let baseline_sessions = kernel.registry().session_count();
-    let baseline_epoch = kernel.registry().state.read().epoch;
+    let baseline_epoch = kernel.registry().settled().read().epoch;
 
     let beta = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
         "rollback-beta",
@@ -447,7 +447,7 @@ fn failed_pid_membership_commit_rolls_back_every_staged_root_edge() {
     assert_eq!(kernel.registry().task_count(), baseline_tasks);
     assert_eq!(kernel.registry().process_group_count(), baseline_groups);
     assert_eq!(kernel.registry().session_count(), baseline_sessions);
-    assert_eq!(kernel.registry().state.read().epoch, baseline_epoch);
+    assert_eq!(kernel.registry().settled().read().epoch, baseline_epoch);
     assert!(
         kernel
             .context(
@@ -675,7 +675,13 @@ fn fork_and_thread_clone_allocate_namespace_local_identity() {
         .expect("start child thread");
     let child_thread_internal =
         u32::try_from(child_thread.thread().key().tid.raw()).expect("child thread internal tid");
-    assert_eq!(region.host_to_ns(child_thread_internal), Some(4));
+    // The root's first thread clone primed its identity pool: the standing
+    // entries hold namespace-visible ids 4.. ahead of any other process, so
+    // the child's first thread is numbered after them. With
+    // `CARRICK_THREAD_POOL=0` (depth 0) this is the clone-time 4.
+    let standing = u32::try_from(kernel.registry().thread_ledger().pool_depth())
+        .expect("pool depth fits the namespace id space");
+    assert_eq!(region.host_to_ns(child_thread_internal), Some(4 + standing));
     kernel
         .exit_task_key_eventually(child.task().key(), LinuxWaitStatus::from_wait_encoding(0))
         .expect("exit child");
@@ -716,7 +722,7 @@ fn failed_container_root_preparation_publishes_no_identity_or_epoch() {
     use crate::namespace::pid::{NS_INIT_PID, NsSharedRegion};
 
     let (kernel, root) = bootstrap(4_300);
-    let epoch = kernel.registry().state.read().epoch;
+    let epoch = kernel.registry().settled().read().epoch;
     let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
     let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
         "failed-root",
@@ -738,7 +744,7 @@ fn failed_container_root_preparation_publishes_no_identity_or_epoch() {
     assert!(error.to_string().contains("injected"));
     assert_eq!(container.pid_root(), None);
     assert_eq!(region.ns_to_host(NS_INIT_PID), None);
-    assert_eq!(kernel.registry().state.read().epoch, epoch);
+    assert_eq!(kernel.registry().settled().read().epoch, epoch);
     assert!(
         kernel
             .context(root.task().key().id, root.thread().key().tid)
@@ -818,7 +824,7 @@ fn container_retirement_uses_task_exit_settlement_before_reaping() {
         .expect("exit orphan");
     kernel
         .registry()
-        .state
+        .settled()
         .write()
         .zombies
         .get_mut(&orphan.task().key().id)
@@ -826,13 +832,13 @@ fn container_retirement_uses_task_exit_settlement_before_reaping() {
         .zombie
         .parent = None;
 
-    let epoch = kernel.registry().state.read().epoch;
+    let epoch = kernel.registry().settled().read().epoch;
     assert!(
         kernel
             .retire_container_root(container.id(), Some(KernelFailpoint::AfterObjects))
             .is_err()
     );
-    assert_eq!(kernel.registry().state.read().epoch, epoch);
+    assert_eq!(kernel.registry().settled().read().epoch, epoch);
     assert_eq!(subscriber.0.load(Ordering::Acquire), 0);
     assert_eq!(wait.released_reason(), None);
     let refreshed_root = kernel

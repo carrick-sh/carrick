@@ -366,7 +366,7 @@ impl Kernel {
     /// [`Self::snapshot`] fails with `Busy`/`TimedOut`.
     pub fn degraded_snapshot(&self, deadline: Instant) -> DegradedKernelSnapshot {
         let mut unreadable = Vec::new();
-        let Some(state) = self.registry().state.try_read_until(deadline) else {
+        let Some(state) = self.registry().settled().try_read_until(deadline) else {
             unreadable.push("task registry".to_owned());
             return DegradedKernelSnapshot {
                 tasks: Vec::new(),
@@ -1098,7 +1098,7 @@ impl Kernel {
     }
 
     fn copy_registry(&self, deadline: Instant) -> Result<RegistryCopy, AttemptError> {
-        let state = lock_result(self.registry().state.try_read_until(deadline), deadline)?;
+        let state = lock_result(self.registry().settled().try_read_until(deadline), deadline)?;
         let tasks = state
             .tasks
             .values()
@@ -1224,7 +1224,7 @@ impl Kernel {
         copied: &RegistryCopy,
         deadline: Instant,
     ) -> Result<(), AttemptError> {
-        let state = lock_result(self.registry().state.try_read_until(deadline), deadline)?;
+        let state = lock_result(self.registry().settled().try_read_until(deadline), deadline)?;
         if state.epoch != copied.epoch || state.tasks.len() != copied.tasks.len() {
             return Err(AttemptError::Race);
         }
@@ -2047,7 +2047,7 @@ mod tests {
                 && let Some(kernel) = self.kernel.lock().expect("kernel slot").as_ref()
                 && let Some(kernel) = kernel.upgrade()
             {
-                drop(kernel.registry().state.write());
+                drop(kernel.registry().settled().write());
             }
             match self.mode {
                 BackendMode::Unavailable => {
@@ -2357,7 +2357,7 @@ mod tests {
             ))
         );
         let (kernel, _) = bootstrap(TestBackend::new(BackendMode::Good));
-        let _held = kernel.registry().state.write();
+        let _held = kernel.registry().settled().write();
         assert_eq!(
             kernel.snapshot(Instant::now() + Duration::from_millis(5)),
             Err(KernelSnapshotError::TimedOut)

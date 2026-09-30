@@ -27,7 +27,7 @@ pub enum TtyControlError {
 impl Kernel {
     pub(crate) fn initialize_launch_controlling_tty(&self, caller: &KernelContext) {
         let container = caller.container().id();
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let session = state
             .sessions
             .get(&caller.task().session())
@@ -71,7 +71,7 @@ impl Kernel {
         if session.raw() != caller.task().key().id.raw() {
             return Err(TtyControlError::Permission);
         }
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let Some(session_object) = state
             .sessions
             .get(&session)
@@ -151,7 +151,7 @@ impl Kernel {
     ) -> Result<(), TtyControlError> {
         let container = caller.container().id();
         let session = caller.task().session();
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let Some(group) = state.process_groups.get(&foreground) else {
             return Err(TtyControlError::Permission);
         };
@@ -208,7 +208,7 @@ impl Kernel {
         let container = caller.container().id();
         let session = caller.task().session();
         let group_id = caller.task().process_group();
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let Some(group) = state.process_groups.get(&group_id) else {
             return true;
         };
@@ -252,7 +252,7 @@ impl Kernel {
         group_id: ProcessGroupId,
         signal: LinuxSignal,
     ) -> usize {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let mut tasks = state
             .process_groups
             .get(&group_id)
@@ -316,7 +316,7 @@ impl Kernel {
             None
         };
 
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         ensure_task_unreserved(&state, target_id)?;
         let caller = state
             .tasks
@@ -415,7 +415,7 @@ impl Kernel {
         target_group: ProcessGroupId,
     ) -> Result<(), KernelOperationError> {
         self.sweep_retired_threads();
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         ensure_task_unreserved(&state, task_id)?;
         let Some((task, revision)) = state
             .tasks
@@ -467,7 +467,7 @@ impl Kernel {
         }
         let task_id = reservation.task.id;
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             ensure_task_unreserved(&state, task_id)?;
             let record = state
                 .tasks
@@ -487,7 +487,7 @@ impl Kernel {
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         ensure_task_unreserved(&state, task_id)?;
         let Some(current) = state
             .tasks
@@ -554,7 +554,7 @@ impl Kernel {
         }
         let task_id = reservation.task.id;
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             ensure_task_unreserved(&state, task_id)?;
             let record = state
                 .tasks
@@ -586,7 +586,7 @@ impl Kernel {
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         ensure_task_unreserved(&state, task_id)?;
         let Some(current) = state
             .tasks
