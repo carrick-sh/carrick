@@ -550,6 +550,7 @@ impl MemState {
             if !heap {
                 insert_dynamic_map_coalescing(self, entry);
             }
+            self.adopt_root_first_touch(mapping);
         }
     }
 
@@ -749,17 +750,19 @@ impl MemView<'_> {
             }
             // A fixed placement replaces whatever the root held there; the
             // caller demoted the root-owned part first.
+            let holes = super::fault::root_holes(model, placed)?;
             model.retire_opaque(placed)?;
             model.insert_opaque(
                 placed,
                 ReservationProtection::NONE,
                 ReservationNodeFlags::EMPTY,
             )?;
-            Ok(placed)
+            Ok((placed, holes))
         });
         match placed {
-            Ok(placed) => {
+            Ok((placed, holes)) => {
                 mem.open_venue(HostVenue::Reserved(placed));
+                mem.retire_stale_first_touch(&holes);
                 Ok(Ok(placed.start()))
             }
             Err(refusal @ (Refusal::Limit | Refusal::Collision | Refusal::ForeignMapping)) => {
@@ -820,7 +823,15 @@ impl MemView<'_> {
             match self.propose(mem, &root, |model| {
                 model.mmap(placement, length, reservation_prot)
             })? {
-                Ok(request) => return Ok(grant(mem, request.range.start())),
+                Ok(request) => {
+                    // What the root held no node for is fresh memory, however
+                    // the host last saw it.
+                    let holes = root
+                        .with_root(|model| super::fault::root_holes(model, request.range))
+                        .unwrap_or_else(|refusal| broken_root("a placement observation", refusal));
+                    mem.retire_stale_first_touch(&holes);
+                    return Ok(grant(mem, request.range.start()));
+                }
                 Err(Refusal::Limit | Refusal::Collision) => return Ok(None),
                 // The root cannot own it (outside the layout, or a fixed
                 // range over host-owned nodes): the host serves it.

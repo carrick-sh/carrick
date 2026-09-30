@@ -626,6 +626,20 @@ impl Twin {
             .guest_mprotect(address, len, reservation_prot(prot));
     }
 
+    fn host_mprotect(&mut self, address: u64, len: u64, prot: u64) {
+        self.both(|dispatcher, memory| {
+            assert_eq!(
+                returned(call(
+                    dispatcher,
+                    memory,
+                    SYS_MPROTECT,
+                    [address, len, prot, 0, 0, 0],
+                )),
+                0
+            );
+        });
+    }
+
     fn munmap(&mut self, address: u64, len: u64) {
         assert_eq!(
             returned(call(
@@ -754,6 +768,83 @@ fn delegated_mincore_across_root_and_file_mappings_reads_the_root() {
     twin.touch(base + PAGE);
     twin.same("after the first touch of one anonymous page", |d, m| {
         mincore(d, m, base, 3)
+    });
+}
+
+#[test]
+fn delegated_remap_after_a_guest_venue_munmap_starts_fresh() {
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.host_anonymous(base, 2 * PAGE, RW);
+    twin.touch(base);
+    twin.same("touched page", |d, m| mincore(d, m, base, 2));
+    // The guest venue retires the mapping; the host never saw it go.
+    twin.munmap(base, 2 * PAGE);
+    // A new (hinted, not MAP_FIXED) mapping at the same address holds none of
+    // the old pages.
+    twin.both(|dispatcher, memory| {
+        assert_eq!(
+            returned(host_mmap(
+                dispatcher,
+                memory,
+                base,
+                2 * PAGE,
+                RW,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                -1,
+            )) as u64,
+            base
+        );
+    });
+    twin.same("a fresh mapping over retired pages", |d, m| {
+        mincore(d, m, base, 2)
+    });
+    twin.same("its first touch", |d, _| {
+        fault_answers(d, &[base, base + PAGE])
+    });
+}
+
+#[test]
+fn delegated_demotion_hands_first_touch_to_the_host() {
+    const SYS_MADVISE: u64 = 233;
+    const MADV_DONTFORK: u64 = 10;
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.anonymous(base, 2 * PAGE, RW);
+    twin.touch(base);
+    // A policy edit the root cannot express makes the rows host-owned.
+    twin.both(|dispatcher, memory| {
+        assert_eq!(
+            returned(call(
+                dispatcher,
+                memory,
+                SYS_MADVISE,
+                [base, 2 * PAGE, MADV_DONTFORK, 0, 0, 0],
+            )),
+            0
+        );
+    });
+    twin.same("first touch of demoted pages", |d, _| {
+        fault_answers(d, &[base, base + PAGE])
+    });
+    twin.same("mincore of demoted pages", |d, m| mincore(d, m, base, 2));
+}
+
+#[test]
+fn delegated_host_mprotect_keeps_untouched_root_pages_observable() {
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.anonymous(base, 2 * PAGE, RW);
+    twin.touch(base);
+    twin.both(|_, memory| memory.protect_log.borrow_mut().clear());
+    // A host-served mprotect of root-owned memory: the untouched page's leaf
+    // must go back to invalid so its first touch is still observed.
+    twin.host_mprotect(base, 2 * PAGE, LINUX_PROT_READ);
+    twin.same("leaf edits of the host mprotect", |_, memory| {
+        memory.protect_log.borrow().clone()
+    });
+    twin.same("first touch after the mprotect", |d, _| {
+        fault_answers(d, &[base, base + PAGE])
     });
 }
 
