@@ -7,7 +7,7 @@
     "description_backing": 24,
     "epoll": 422,
     "stream": 176,
-    "mapping": 1316,
+    "mapping": 1358,
     "lifecycle": 32
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 9,
     "epoll": 161,
     "stream": 120,
-    "mapping": 859,
+    "mapping": 891,
     "lifecycle": 16
   },
   "files": {
@@ -25,7 +25,7 @@
     "description_backing": 8,
     "epoll": 44,
     "stream": 21,
-    "mapping": 105,
+    "mapping": 106,
     "lifecycle": 10
   },
   "entries": [
@@ -4625,7 +4625,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 569,
+      "line": 553,
+      "categories": [
+        "mapping"
+      ],
+      "text": "self.adopt_root_first_touch(mapping);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "line": 570,
       "categories": [
         "mapping"
       ],
@@ -4634,7 +4643,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 575,
+      "line": 576,
       "categories": [
         "mapping"
       ],
@@ -4643,7 +4652,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 576,
+      "line": 577,
       "categories": [
         "mapping"
       ],
@@ -4652,7 +4661,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 577,
+      "line": 578,
       "categories": [
         "mapping"
       ],
@@ -4661,7 +4670,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 578,
+      "line": 579,
       "categories": [
         "mapping"
       ],
@@ -4670,7 +4679,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 697,
+      "line": 698,
       "categories": [
         "mapping"
       ],
@@ -4679,7 +4688,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 709,
+      "line": 710,
       "categories": [
         "mapping"
       ],
@@ -4688,7 +4697,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 721,
+      "line": 722,
       "categories": [
         "mapping"
       ],
@@ -4697,7 +4706,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 773,
+      "line": 776,
       "categories": [
         "mapping"
       ],
@@ -4706,7 +4715,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 806,
+      "line": 809,
       "categories": [
         "mapping"
       ],
@@ -4715,7 +4724,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 821,
+      "line": 824,
       "categories": [
         "mapping"
       ],
@@ -4724,7 +4733,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 868,
+      "line": 879,
       "categories": [
         "mapping"
       ],
@@ -4733,7 +4742,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 922,
+      "line": 933,
       "categories": [
         "mapping"
       ],
@@ -4742,7 +4751,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 955,
+      "line": 966,
       "categories": [
         "mapping"
       ],
@@ -4751,7 +4760,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 974,
+      "line": 985,
       "categories": [
         "mapping"
       ],
@@ -5560,6 +5569,96 @@
       "scope_kind": "test_or_definition"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 557,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Anonymous private memory at `address`: a host `mmap(MAP_FIXED)` on",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 579,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Host-venue anonymous `mmap(MAP_FIXED)` on both MMs.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 597,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// A host private file mapping at `address` on both MMs.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 719,
+      "categories": [
+        "mapping"
+      ],
+      "text": "answers(&twin, \"a fresh root-owned mapping beside a file mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 742,
+      "categories": [
+        "mapping"
+      ],
+      "text": "twin.same(\"host-venue mapping\", |d, _| fault_answers(d, &pages));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 781,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// The guest venue retires the mapping; the host never saw it go.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 783,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A new (hinted, not MAP_FIXED) mapping at the same address holds none of",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 799,
+      "categories": [
+        "mapping"
+      ],
+      "text": "twin.same(\"a fresh mapping over retired pages\", |d, m| {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 872,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A root-owned mapping inside the stack's growth window.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs",
+      "line": 883,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"the stack cannot grow over a root-owned mapping\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/projection.rs",
       "line": 58,
       "categories": [
@@ -5633,7 +5732,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 521,
+      "line": 524,
       "categories": [
         "mapping"
       ],
@@ -5642,7 +5741,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 566,
+      "line": 569,
       "categories": [
         "mapping"
       ],
@@ -5651,7 +5750,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 629,
+      "line": 632,
       "categories": [
         "mapping"
       ],
@@ -5660,7 +5759,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 638,
+      "line": 641,
       "categories": [
         "mapping"
       ],
@@ -5669,16 +5768,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 658,
-      "categories": [
-        "mapping"
-      ],
-      "text": "assert!(model.mapping(mem.layout.mmap_base).is_none());",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 660,
+      "line": 661,
       "categories": [
         "mapping"
       ],
@@ -5691,8 +5781,296 @@
       "categories": [
         "mapping"
       ],
+      "text": "assert!(model.mapping(mem.layout.mmap_base).is_none());",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
+      "line": 666,
+      "categories": [
+        "mapping"
+      ],
       "text": "assert!(model.mapping(mem.layout.mmap_base).is_some());",
       "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 5,
+      "categories": [
+        "mapping"
+      ],
+      "text": "use carrick_el1::memory::reservations::{Mapping, Refusal, Reservations};",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 218,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// whatever the host recorded there describes a mapping the guest venue has",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 226,
+      "categories": [
+        "mapping"
+      ],
+      "text": "Root(Mapping),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 240,
+      "categories": [
+        "mapping"
+      ],
+      "text": "model.observe_range(range, &mut |mapping| {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 241,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if mapping.range.start() > cursor {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 242,
+      "categories": [
+        "mapping"
+      ],
+      "text": "holes.push((cursor, mapping.range.start()));",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 244,
+      "categories": [
+        "mapping"
+      ],
+      "text": "cursor = cursor.max(mapping.range.end());",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 261,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = root",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 262,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".with_root(|model| Ok(model.mapping(page)))",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 264,
+      "categories": [
+        "mapping"
+      ],
+      "text": "match mapping {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 266,
+      "categories": [
+        "mapping"
+      ],
+      "text": "Some(mapping)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 267,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if mapping.anonymous",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 269,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping.range.start(),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 270,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping.range.end(),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 274,
+      "categories": [
+        "mapping"
+      ],
+      "text": "FirstTouchOwner::Root(mapping)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 297,
+      "categories": [
+        "mapping"
+      ],
+      "text": "model.observe_range(range, &mut |mapping| {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 298,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let (node_start, node_end) = (mapping.range.start(), mapping.range.end());",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 299,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if !mapping.anonymous || super::anonymous::in_heap(node_start, node_end, layout) {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 306,
+      "categories": [
+        "mapping"
+      ],
+      "text": "extents.push((clipped, mapping.protection));",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 316,
+      "categories": [
+        "mapping"
+      ],
+      "text": "fn root_armed_prot(&self, mapping: &Mapping, page: u64) -> Option<LinuxProtFlags> {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 320,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let prot = LinuxProtFlags::from_bits_truncate(mapping.protection.bits());",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 329,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping: &Mapping,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 336,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let prot = self.root_armed_prot(mapping, page)?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 341,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if protection != mapping.protection {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 364,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// no node for, now handed out again. They describe pages of a mapping",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 366,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// into the new mapping.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 386,
+      "categories": [
+        "mapping"
+      ],
+      "text": "pub(in crate::dispatch) fn adopt_root_first_touch(&mut self, mapping: &Mapping) {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 387,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let (start, end) = (mapping.range.start(), mapping.range.end());",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 396,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let prot = LinuxProtFlags::from_bits_truncate(mapping.protection.bits());",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 735,
+      "categories": [
+        "mapping"
+      ],
+      "text": "FirstTouchOwner::Root(mapping) => mem.root_armed_prot(&mapping, page)?,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "line": 762,
+      "categories": [
+        "mapping"
+      ],
+      "text": "FirstTouchOwner::Root(mapping) => mem.root_grant_for_page(&mapping, page, max_len)?,",
+      "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs",
@@ -8829,7 +9207,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "line": 1790,
+      "line": 1798,
       "categories": [
         "mapping"
       ],
@@ -8838,7 +9216,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "line": 1973,
+      "line": 1981,
       "categories": [
         "mapping"
       ],
@@ -8847,7 +9225,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "line": 1997,
+      "line": 2005,
       "categories": [
         "mapping"
       ],
@@ -8856,7 +9234,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "line": 2083,
+      "line": 2091,
       "categories": [
         "mapping"
       ],
@@ -8865,7 +9243,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "line": 2532,
+      "line": 2540,
       "categories": [
         "mapping"
       ],
@@ -8874,7 +9252,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "line": 2535,
+      "line": 2543,
       "categories": [
         "mapping"
       ],
