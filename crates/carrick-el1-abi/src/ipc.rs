@@ -62,11 +62,16 @@
 //!
 //! # Locks
 //!
-//! One lock word per fd table (inside the fd core) and one per object. Order:
-//! a brief table lock to pin a description (released before any object
-//! work), then one object lock. The `LockWait` policy is the venue's: EL1
-//! spins a bounded while and forwards on `Contended` before effects; the host
-//! waits. No lock is held across I/O, a WFI, a context switch or a host wait,
+//! One lock word per fd table (inside the fd core) and one per object; an
+//! object's lock word names its holder ([`IpcLockHolder`]). Descriptor
+//! lookups and pins take no table lock (they validate the table's sequence
+//! count), so a description is pinned before any object work; then one
+//! object lock. Both venues wait for an object lock's holder: every object
+//! section is short and never waits on another vCPU's progress, and an EL1
+//! holder a host kick stops mid-section is resumed to completion on its
+//! vCPU, so a contended object never turns a transfer into a host round
+//! trip. Table mutations stay the host's, and a bounded `LockWait` still
+//! refuses with `Contended` before effects. No lock is held across I/O, a WFI, a context switch or a host wait,
 //! and nothing allocates under a lock: pool storage is provisioned by the
 //! host before it takes any lock. A write to an unbacked pipe refuses with
 //! `pipe::Error::Storage` before any effect; EL1 then forwards the call and
@@ -787,7 +792,35 @@ pub struct IpcRegion<'a> {
     base: *mut u8,
     pool: *mut u8,
     pool_len: u64,
+    /// Who this view's object locks name as their holder.
+    holder: IpcLockHolder,
     _pool: PhantomData<&'a UnsafeCell<[u8]>>,
+}
+
+/// Who holds an object lock, as its lock word records it (0 = free).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpcLockHolder {
+    /// A host thread (every host view).
+    Host,
+    /// EL1 on the vCPU of this mailbox slot.
+    El1 { slot: u32 },
+}
+const LOCK_FREE: u32 = 0;
+const LOCK_HOST: u32 = u32::MAX;
+impl IpcLockHolder {
+    const fn word(self) -> u32 {
+        match self {
+            Self::Host => LOCK_HOST,
+            Self::El1 { slot } => slot.saturating_add(1),
+        }
+    }
+    const fn from_word(word: u32) -> Option<Self> {
+        match word {
+            LOCK_FREE => None,
+            LOCK_HOST => Some(Self::Host),
+            n => Some(Self::El1 { slot: n - 1 }),
+        }
+    }
 }
 // SAFETY: the pool is shared memory whose bytes are accessed only under the
 // owning table/object lock, through slices bounded by authenticated extents.
@@ -843,6 +876,7 @@ impl<'a> IpcRegion<'a> {
             base: dir.cast(),
             pool,
             pool_len: pool_len as u64,
+            holder: IpcLockHolder::Host,
             _pool: PhantomData,
         };
         region.grow_ofds()?;
@@ -892,8 +926,25 @@ impl<'a> IpcRegion<'a> {
             base: dir.cast(),
             pool,
             pool_len: pool_len as u64,
+            holder: IpcLockHolder::Host,
             _pool: PhantomData,
         })
+    }
+
+    /// This view as EL1 on the vCPU of mailbox `slot` uses it: its object
+    /// locks name that slot as their holder.
+    pub fn for_el1_slot(self, slot: u32) -> Self {
+        Self {
+            holder: IpcLockHolder::El1 { slot },
+            ..self
+        }
+    }
+
+    /// Who holds `object`'s lock right now (`None`: free), for a caller
+    /// that gave up waiting for it.
+    pub fn lock_holder(&self, object: IpcObjectHandle) -> Option<IpcLockHolder> {
+        self.record(object.index)
+            .and_then(|r| IpcLockHolder::from_word(r.lock.load(Ordering::Acquire)))
     }
 
     /// The shared descriptor authority, with this venue's lock policy.
@@ -1131,7 +1182,12 @@ impl<'a> IpcRegion<'a> {
         for _ in 0..64 {
             if record
                 .lock
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(
+                    LOCK_FREE,
+                    self.holder.word(),
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 locked = true;
@@ -1181,7 +1237,12 @@ impl<'a> IpcRegion<'a> {
         let mut attempt = 0;
         while record
             .lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(
+                LOCK_FREE,
+                self.holder.word(),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_err()
         {
             attempt += 1;
@@ -1238,7 +1299,12 @@ impl<'a> IpcRegion<'a> {
         let mut attempt = 0;
         while record
             .lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(
+                LOCK_FREE,
+                self.holder.word(),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_err()
         {
             attempt += 1;
@@ -1609,7 +1675,7 @@ pub struct IpcObjectGuard<'a> {
 }
 impl Drop for IpcObjectGuard<'_> {
     fn drop(&mut self) {
-        self.record.lock.store(0, Ordering::Release);
+        self.record.lock.store(LOCK_FREE, Ordering::Release);
     }
 }
 

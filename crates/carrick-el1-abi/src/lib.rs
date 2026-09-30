@@ -2397,8 +2397,13 @@ pub enum IpcLeave {
     ForeignOperation,
     /// The pinned description's flags could not be read.
     FlagsRefused,
-    /// The object lock stayed contended past EL1's bounded spin.
+    /// The object lock stayed contended past EL1's bounded spin (and was
+    /// free again when EL1 looked at its holder).
     ObjectBusy,
+    /// ... held by a host thread.
+    ObjectBusyHost,
+    /// ... held by EL1 on another vCPU.
+    ObjectBusyEl1,
     /// The object refused the transfer (e.g. a pipe with no ring).
     TransferRefused,
     /// A would-block call could not be parked.
@@ -2414,7 +2419,7 @@ pub enum IpcLeave {
 }
 
 impl IpcLeave {
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 19;
 }
 
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
