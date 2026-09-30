@@ -46,15 +46,24 @@ Shared-record rules (VM-free bindings: this crate's `el1_ipc_*` tests):
   `Core::initialize(identity)`, which links the free lists and then publishes
   the nonzero identity with Release. A table becomes visible when its record's
   generation and then `state` (Release) are stored, under its lock.
-- **Synchronization.** One lock word per table covers that table's slots,
-  limit and extent; there is no whole-core lock, and no operation holds a lock
-  across I/O. OFD reference/pin counts, status flags and offsets are atomic
+- **Synchronization.** One lock word per table serializes every change to
+  that table's slots, limit and extent; there is no whole-core lock, and no
+  operation holds a lock across I/O. Lookups (`get`, `pin`) take no lock:
+  they read the table's identity and extent under its sequence count `seq`
+  (odd while a writer changes them), read the slot, and validate. A lock
+  holder stopped mid-section (a vCPU the host took out of the guest) never
+  stalls or refuses a lookup; only an extent or identity change in progress
+  makes one wait. OFD reference/pin counts, status flags and offsets are atomic
   words shared by every table naming the description (fork, CLONE_FILES); the
   OFD and table free lists are tagged lock-free stacks. Lock order: at most one
   published table lock, plus the lock of an unpublished fork/create target.
-- **Pins.** `pin(table, fd)` resolves a descriptor (one slot read, one OFD
-  word) and returns an owned, non-Copy `OfdPin` retaining that exact
-  description incarnation. Closing or reusing the fd, closing every alias, or
+- **Pins.** `pin(table, fd)` resolves a descriptor without a lock (the slot,
+  the named record's generation, the slot again, then one OFD word; the
+  generation is rechecked after the pin, so it holds the incarnation the fd
+  named, linearized at the second slot read like `fget` racing `close`) and
+  returns an owned, non-Copy `OfdPin` retaining that exact description
+  incarnation. A pin that landed on a record freed and reused meanwhile is
+  handed to the caller as `PinRaced` (its ownership, to release and retry). Closing or reusing the fd, closing every alias, or
   destroying the table never finalizes a pinned description: `holds` packs
   descriptor references (high 32 bits) and pins (low 32 bits), and whoever
   moves it to zero receives the description exactly once (from `close`,
@@ -70,7 +79,7 @@ Shared-record rules (VM-free bindings: this crate's `el1_ipc_*` tests):
 - **Generations.** Table IDs carry authority, index and a non-wrapping
   generation; OFD records advance their generation when freed, so reused
   indices never match stale keys. Exhausted generations retire the slot.
-- **Budgets.** Lookup/pin reads exactly one descriptor slot at 65, 4096 and
+- **Budgets.** A pin reads exactly one descriptor slot twice at 65, 4096 and
   65,536 populated descriptors; allocation keeps the logarithmic bitmap budget
   below; zero allocation (no `alloc`). A contended lock with a bounded policy
   refuses with `Contended` before any effect. Concurrent pin/unpin/close from

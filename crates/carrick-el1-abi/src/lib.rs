@@ -387,6 +387,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<Counters>() as u64,
         core::mem::offset_of!(Counters, irq_taken) as u64,
         core::mem::offset_of!(Counters, fault_taken) as u64,
+        core::mem::offset_of!(Counters, ipc_leaves) as u64,
         core::mem::size_of::<CurrentTask>() as u64,
         core::mem::offset_of!(CurrentTask, file_table) as u64,
         core::mem::offset_of!(CurrentTask, pending_host_work) as u64,
@@ -2370,6 +2371,52 @@ impl El1ExitReason {
     pub const COUNT: usize = 4;
 }
 
+/// Why the EL1 pipe/eventfd adapter left a read or write for the host:
+/// forwarded unchanged before any effect, or its owned operation handed
+/// back. The normal routing of a host-backed description is not counted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum IpcLeave {
+    /// The task's descriptor table is not published to EL1.
+    NoTable,
+    /// The table lock stayed contended past EL1's bounded spin (lookup).
+    TableContended,
+    /// The table lookup was refused otherwise (stale table), not EBADF.
+    TableRefused,
+    /// The table lock stayed contended past EL1's bounded spin (pin).
+    PinContended,
+    /// The description could not be pinned otherwise (stale table).
+    PinRefused,
+    /// No operation record was free (or one could not be taken back).
+    NoOperationRecord,
+    /// An eventfd write's value could not be copied in.
+    CopyInFault,
+    /// A resumed operation's token or record did not resolve.
+    StaleOperation,
+    /// A resumed operation belongs to another task or address space.
+    ForeignOperation,
+    /// The pinned description's flags could not be read.
+    FlagsRefused,
+    /// The object lock stayed contended past EL1's bounded spin.
+    ObjectBusy,
+    /// The object refused the transfer (e.g. a pipe with no ring).
+    TransferRefused,
+    /// A would-block call could not be parked.
+    ParkRefused,
+    /// EPIPE with no progress: the host re-runs the call (SIGPIPE).
+    BrokenFirst,
+    /// A first copy faulted: the host resolves it.
+    FaultFirst,
+    /// A broken pipe after progress: handed back for SIGPIPE.
+    SigpipeHandback,
+    /// A description replaced by a host-backed one since the snapshot.
+    Restart,
+}
+
+impl IpcLeave {
+    pub const COUNT: usize = 17;
+}
+
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
 #[repr(C)]
 pub struct Counters {
@@ -2384,6 +2431,8 @@ pub struct Counters {
     pub fault_taken: AtomicU64,
     /// EL1 scheduler exits indexed by [`El1ExitReason`].
     pub exit_reasons: [AtomicU64; El1ExitReason::COUNT],
+    /// Pipe/eventfd calls the EL1 adapter left for the host, by [`IpcLeave`].
+    pub ipc_leaves: [AtomicU64; IpcLeave::COUNT],
 }
 
 impl Counters {
@@ -2394,6 +2443,7 @@ impl Counters {
             irq_taken: [const { AtomicU64::new(0) }; 32],
             fault_taken: AtomicU64::new(0),
             exit_reasons: [const { AtomicU64::new(0) }; El1ExitReason::COUNT],
+            ipc_leaves: [const { AtomicU64::new(0) }; IpcLeave::COUNT],
         }
     }
 
@@ -2414,6 +2464,12 @@ impl Counters {
         for i in 0..El1ExitReason::COUNT {
             snapshot.exit_reasons[i].store(
                 self.exit_reasons[i].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+        for i in 0..IpcLeave::COUNT {
+            snapshot.ipc_leaves[i].store(
+                self.ipc_leaves[i].load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
         }
@@ -3650,7 +3706,7 @@ mod tests {
     fn test_counters_layout() {
         assert_eq!(
             core::mem::size_of::<Counters>(),
-            (1024 + 32 + 1 + El1ExitReason::COUNT) * 8
+            (1024 + 32 + 1 + El1ExitReason::COUNT + IpcLeave::COUNT) * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);

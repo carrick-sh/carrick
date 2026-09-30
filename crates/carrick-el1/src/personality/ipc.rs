@@ -26,6 +26,9 @@
 //! - An unchanged `Forward` happens only before any effect of a call that
 //!   never parked (host-backed descriptions, unpublished tables, contended
 //!   locks, a first copy that faults, EPIPE with no progress).
+//! - A call that would block parks in the zone even with host work pending
+//!   on the vCPU; the vCPU then leaves at once (`Idle`) so the host settles
+//!   the parked thread, delivering a pending signal to it there.
 //! - After progress, or for any resumed operation, EL1 never forwards the
 //!   original call. It completes it, or hands the owned operation to the host
 //!   with an [`IPC_HANDBACK_NR`] frame: `x0` holds the packed raw token, every
@@ -43,10 +46,11 @@ use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
     IpcBacking, IpcEventValue, IpcHandback, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken,
-    IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawTableId, WriteProgress,
+    IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawOfdPin, RawTableId,
+    WriteProgress,
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
-use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, TrapFrame};
+use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave, TrapFrame};
 use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
 use carrick_sched_core::{BoundedSpin, LockWait, WakeEffects};
 use core::sync::atomic::Ordering;
@@ -166,16 +170,17 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
     }
     let (token, op, resumed) = match sched.take_object_operation() {
         // The slot's record is not this task's: the host settles it.
-        Err(_) => return IpcServed::Forward,
+        Err(_) => return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
         Ok(Some(t)) => {
             let Some(token) = from_sched_token(t) else {
-                return IpcServed::Forward;
+                return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward);
             };
             let Ok(op) = venue.region.operation(&token) else {
-                return IpcServed::Forward;
+                return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward);
             };
             if op.task != task_key(sched.task) || op.mm != mm_key(sched.task) {
-                return handback(frame, token, op, IpcHandback::Continue, 0, venue);
+                let served = handback(frame, token, op, IpcHandback::Continue, 0, venue);
+                return leave(sched, IpcLeave::ForeignOperation, served);
             }
             (token, op, true)
         }
@@ -187,7 +192,8 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             Admission::Forward => return IpcServed::Forward,
             Admission::Restart(token, op) => {
-                return handback(frame, token, op, IpcHandback::Restart, 0, venue);
+                let served = handback(frame, token, op, IpcHandback::Restart, 0, venue);
+                return leave(sched, IpcLeave::Restart, served);
             }
         },
     };
@@ -234,7 +240,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     let task = sched.task;
     let region = &venue.region;
     let Some(table) = venue.tables.table_of(task) else {
-        return Admission::Forward;
+        return refuse(sched, IpcLeave::NoTable);
     };
     let table = TableId::from_raw(table);
     let fd = Fd(frame.x[0] as i32);
@@ -246,16 +252,11 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         Ok(snapshot) if op_kind(snapshot.backing, reading).is_some() => {}
         Ok(_) => return Admission::Forward,
         Err(FdError::BadFd) => return Admission::Immediate(linux::EBADF),
-        Err(_) => return Admission::Forward,
+        Err(FdError::Contended) => return refuse(sched, IpcLeave::TableContended),
+        Err(_) => return refuse(sched, IpcLeave::TableRefused),
     }
-    let (pin, desc) = match fda.pin(table, fd) {
-        Ok(found) => found,
-        // Closed since the snapshot: the call ran after the close.
-        Err(FdError::BadFd) => return Admission::Immediate(linux::EBADF),
-        Err(_) => return Admission::Forward,
-    };
-    let mut op = IpcOperation {
-        pin: pin.into_raw(),
+    let operation = |pin: RawOfdPin| IpcOperation {
+        pin,
         task: task_key(task),
         mm: mm_key(task),
         buf: IpcUserVa(frame.x[1]),
@@ -263,6 +264,27 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         nr: frame.x[8] as u32,
         ..IpcOperation::EMPTY
     };
+    let (pin, desc) = match fda.pin(table, fd) {
+        Ok(found) => found,
+        // Closed since the snapshot: the call ran after the close.
+        Err(FdError::BadFd) => return Admission::Immediate(linux::EBADF),
+        Err(FdError::Contended) => return refuse(sched, IpcLeave::PinContended),
+        // The lock-free pin landed on a reused record the fd did not name:
+        // the host drops that pin (possibly a final release of a host
+        // resource EL1 cannot release) and runs the call afresh.
+        Err(FdError::PinRaced(raw)) => {
+            let op = operation(raw);
+            return match region.begin_operation(op) {
+                Ok(token) => Admission::Restart(token, op),
+                Err(_) => {
+                    release_pin(sched, OfdPin::from_raw(raw), region);
+                    refuse(sched, IpcLeave::NoOperationRecord)
+                }
+            };
+        }
+        Err(_) => return refuse(sched, IpcLeave::PinRefused),
+    };
+    let mut op = operation(pin.into_raw());
     let Some((kind, object)) = op_kind(desc.backing, reading) else {
         // Replaced by a host-backed description since the snapshot: the
         // host owns its release.
@@ -270,7 +292,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
             Ok(token) => Admission::Restart(token, op),
             Err(_) => {
                 release_pin(sched, OfdPin::from_raw(op.pin), region);
-                Admission::Forward
+                refuse(sched, IpcLeave::NoOperationRecord)
             }
         };
     };
@@ -302,7 +324,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     {
         // No effect yet: the host resolves the fault (first touch or EFAULT).
         release_pin(sched, OfdPin::from_raw(op.pin), region);
-        return Admission::Forward;
+        return refuse(sched, IpcLeave::CopyInFault);
     }
     op.kind = kind;
     op.object = object.to_raw();
@@ -312,7 +334,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         Ok(token) => Admission::Admitted(token, op),
         Err(_) => {
             release_pin(sched, OfdPin::from_raw(op.pin), region);
-            Admission::Forward
+            refuse(sched, IpcLeave::NoOperationRecord)
         }
     }
 }
@@ -369,18 +391,46 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             op.pin = pin.into_raw();
             match flags {
                 Ok(nonblock) => nonblock,
-                Err(_) => return bail(sched, frame, token, op, resumed, venue),
+                Err(_) => {
+                    return bail(
+                        sched,
+                        frame,
+                        token,
+                        op,
+                        resumed,
+                        venue,
+                        IpcLeave::FlagsRefused,
+                    );
+                }
             }
         };
         let mut guard = match region.lock(object, &EL1_WAIT) {
             Ok(guard) => guard,
-            Err(_) => return bail(sched, frame, token, op, resumed, venue),
+            Err(_) => {
+                return bail(
+                    sched,
+                    frame,
+                    token,
+                    op,
+                    resumed,
+                    venue,
+                    IpcLeave::ObjectBusy,
+                );
+            }
         };
         let (status, wake) = match transfer(&mut guard, &mut op, &mut copy) {
             Ok(step) => step,
             Err(_) => {
                 drop(guard);
-                return bail(sched, frame, token, op, resumed, venue);
+                return bail(
+                    sched,
+                    frame,
+                    token,
+                    op,
+                    resumed,
+                    venue,
+                    IpcLeave::TransferRefused,
+                );
             }
         };
         let published = guard.publish(wake);
@@ -388,15 +438,15 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             sched.task.mark_pending_host_work();
         }
         let effects = notify(sched, object, wake);
-        // Never park while host work is pending: it may be a signal for
-        // this thread, which the host must deliver before the call sleeps
-        // (Linux checks for one before it blocks). The call leaves instead,
-        // forwarded unchanged or handed back ([`bail`]).
-        let host_work = sched.task.has_pending_host_work();
+        // A call that would block parks in the zone even with host work
+        // pending (a kick, an owed host wake, possibly a signal for this
+        // thread): `park` then leaves for the host at once, which settles the
+        // parked thread there and interrupts it for a pending signal (Linux
+        // checks for one before it sleeps). Moving the wait to the host
+        // instead gives the object a host subscriber, whose owed wakes mark
+        // pending host work on every later writer's vCPU.
         let parking = match status {
-            StepStatus::Blocked(lane) if !nonblock && !host_work => {
-                Some((lane, snapshot(sched, object, lane)))
-            }
+            StepStatus::Blocked(lane) if !nonblock => Some((lane, snapshot(sched, object, lane))),
             _ => None,
         };
         drop(guard);
@@ -415,12 +465,17 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     linux::EAGAIN
                 }
             }
-            StepStatus::Blocked(_) if host_work => {
-                return bail(sched, frame, token, op, resumed, venue);
-            }
             StepStatus::Blocked(lane) => {
                 let Some((_, Some(snap))) = parking else {
-                    return bail(sched, frame, token, op, resumed, venue);
+                    return bail(
+                        sched,
+                        frame,
+                        token,
+                        op,
+                        resumed,
+                        venue,
+                        IpcLeave::ParkRefused,
+                    );
                 };
                 match park(sched, frame, region, token, op, object, lane, snap) {
                     Parked::Done(served) => return served,
@@ -428,13 +483,15 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         token = t;
                         continue;
                     }
-                    Parked::Refused(t) => return bail(sched, frame, t, op, resumed, venue),
+                    Parked::Refused(t) => {
+                        return bail(sched, frame, t, op, resumed, venue, IpcLeave::ParkRefused);
+                    }
                 }
             }
             StepStatus::Broken if written == 0 && !resumed => {
                 // No effect yet: the host re-runs the call (EPIPE + SIGPIPE).
                 finish(sched, token, region);
-                return IpcServed::Forward;
+                return leave(sched, IpcLeave::BrokenFirst, IpcServed::Forward);
             }
             StepStatus::Broken => {
                 let result = if written > 0 {
@@ -442,15 +499,26 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 } else {
                     linux::EPIPE
                 };
-                return handback(frame, token, op, IpcHandback::Sigpipe, result, venue);
+                let served = handback(frame, token, op, IpcHandback::Sigpipe, result, venue);
+                return leave(sched, IpcLeave::SigpipeHandback, served);
             }
             StepStatus::Fault if written == 0 && !resumed => {
                 // The host resolves the fault (first touch or EFAULT).
                 finish(sched, token, region);
-                return IpcServed::Forward;
+                return leave(sched, IpcLeave::FaultFirst, IpcServed::Forward);
             }
             StepStatus::Fault if op.kind == IpcOpKind::PipeRead => written as i64,
-            StepStatus::Fault => return bail(sched, frame, token, op, resumed, venue),
+            StepStatus::Fault => {
+                return bail(
+                    sched,
+                    frame,
+                    token,
+                    op,
+                    resumed,
+                    venue,
+                    IpcLeave::FaultFirst,
+                );
+            }
         };
         finish(sched, token, region);
         frame.x[0] = result as u64;
@@ -548,10 +616,17 @@ fn park<C: ThreadCpu, U: UserWord>(
         Err(token) => return Parked::Refused(token),
     };
     match sched.park_object(frame, key, snap, resume, sched_token) {
-        Ok(parked) => Parked::Done(match sched.resume_after_object_park(frame, parked, 0) {
-            Some(Served::Returned { switched }) => IpcServed::Returned { switched },
-            Some(Served::Idle) | None => IpcServed::Idle,
-        }),
+        Ok(parked) => {
+            let served = if sched.task.has_pending_host_work() {
+                sched.leave_after_object_park(parked)
+            } else {
+                sched.resume_after_object_park(frame, parked, 0)
+            };
+            Parked::Done(match served {
+                Some(Served::Returned { switched }) => IpcServed::Returned { switched },
+                Some(Served::Idle) | None => IpcServed::Idle,
+            })
+        }
         Err((error, t)) => {
             let Some(token) = from_sched_token(t) else {
                 // Unreachable for a token this adapter converted.
@@ -577,8 +652,28 @@ fn finish<C: ThreadCpu, U: UserWord>(
     }
 }
 
+/// Count why a call leaves for the host (`Counters::ipc_leaves`).
+fn note<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) {
+    sched.counters.ipc_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+fn leave<C: ThreadCpu, U: UserWord>(
+    sched: &Sched<'_, C, U>,
+    why: IpcLeave,
+    served: IpcServed,
+) -> IpcServed {
+    note(sched, why);
+    served
+}
+
+fn refuse<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) -> Admission {
+    note(sched, why);
+    Admission::Forward
+}
+
 /// The call cannot continue in EL1: before any effect of a never-parked
 /// call, forward it unchanged; otherwise hand the owned operation back.
+#[allow(clippy::too_many_arguments)]
 fn bail<C: ThreadCpu, U: UserWord>(
     sched: &mut Sched<'_, C, U>,
     frame: &mut TrapFrame,
@@ -586,7 +681,9 @@ fn bail<C: ThreadCpu, U: UserWord>(
     op: IpcOperation,
     resumed: bool,
     venue: &IpcVenue<'_>,
+    why: IpcLeave,
 ) -> IpcServed {
+    note(sched, why);
     if op.progress.written == 0 && !resumed {
         finish(sched, token, &venue.region);
         return IpcServed::Forward;
@@ -1757,13 +1854,17 @@ mod tests {
         assert_eq!(host_calls(&w), 0);
     }
 
-    /// A read that would block while host work (possibly a signal) is
-    /// pending never parks in EL1: a parked thread's signal would wait for
-    /// a wake that may never come. A fresh call with no effect forwards
-    /// unchanged; the host blocks it and delivers the signal first, as
-    /// Linux checks for a signal before it sleeps.
+    /// A read that would block while host work is pending (a kick of this
+    /// vCPU, an owed host wake, possibly a signal) parks in the zone and the
+    /// vCPU leaves for the host at once, running nothing else here: the host
+    /// settles the parked thread at this boundary, and its enrollment samples
+    /// pending signals, so a signal still interrupts the wait (Linux checks
+    /// for one before it sleeps). Forwarding the read instead moved the wait
+    /// to the host, and its host subscription owed every later peer write a
+    /// host wake, marking more slots: under 64 concurrent pairs whole-run
+    /// witnesses lost served reads (el1_ipc_pairs_blocking, 18687/18688).
     #[test]
-    fn el1_ipc_io_pending_host_work_forwards_a_fresh_read_that_would_block() {
+    fn el1_ipc_io_pending_host_work_parks_a_fresh_read_that_would_block() {
         let w = world();
         let t = w.table(w.a_tid);
         let (r, _wfd, _) = w.pipe(t, BLOCK);
@@ -1776,24 +1877,30 @@ mod tests {
         let task = &tasks[SLOT.raw() as usize];
         let mut buf = [0u8; 1];
         let mut f = syscall(SYS_READ, r, buf.as_mut_ptr() as u64, 1, A_SVC);
-        let before = f;
         assert_eq!(
             dispatch(&w, &mut f, &tasks),
-            carrick_el1_abi::Action::Forward
+            carrick_el1_abi::Action::Idle,
+            "parked in the zone; the vCPU leaves for the host"
         );
-        assert_eq!((f.x, f.elr), (before.x, before.elr), "forwarded unchanged");
-        assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
-        assert!(task.has_pending_host_work(), "the signal is still owed");
+        assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            w.zone.slot(SLOT).current(),
+            None,
+            "nothing else was switched in"
+        );
+        assert!(task.has_pending_host_work(), "the host still sees its work");
         assert_eq!(task.served_with_work.load(Ordering::Acquire), 0);
-        assert_eq!(w.counters.forwarded[SYS_READ].load(Ordering::Relaxed), 1);
+        assert_eq!(w.counters.forwarded[SYS_READ].load(Ordering::Relaxed), 0);
+        assert_eq!(host_calls(&w), 0);
     }
 
     /// A woken read re-enters to resume its owned operation and finds the
-    /// pipe empty again while host work (possibly a signal) is pending: it
-    /// hands the operation back to the host instead of parking again, so
-    /// the host delivers the signal before the call can block.
+    /// pipe empty again while host work is pending: it parks again in the
+    /// zone with its operation and leaves for the host, which settles it (a
+    /// pending signal interrupts it there). No handback moves the wait to
+    /// the host.
     #[test]
-    fn el1_ipc_io_pending_host_work_hands_back_a_resumed_read_that_would_block() {
+    fn el1_ipc_io_pending_host_work_reparks_a_resumed_read_that_would_block() {
         let mut w = world();
         let a = w.table(w.a_tid);
         let (r, wfd, _) = w.pipe(a, BLOCK);
@@ -1820,25 +1927,16 @@ mod tests {
         let task = &tasks[SLOT.raw() as usize];
         assert_eq!(
             dispatch(&w, &mut g, &tasks),
-            carrick_el1_abi::Action::Forward
+            carrick_el1_abi::Action::Idle,
+            "parked again with its operation; the vCPU leaves"
         );
-        assert_eq!(
-            g.x[8], IPC_HANDBACK_NR,
-            "the owned operation goes to the host"
+        assert_ne!(g.x[8], IPC_HANDBACK_NR, "nothing is handed back");
+        assert!(
+            w.zone.record(current).has_object_operation(),
+            "the parked record still owns the read"
         );
-        let op = handed_back(&w, &g);
-        assert_eq!(
-            (op.kind, op.handback, op.orig_x0, op.nr, op.progress.written),
-            (
-                IpcOpKind::PipeRead,
-                IpcHandback::Continue,
-                r as u64,
-                SYS_READ as u32,
-                0
-            )
-        );
-        assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), parks);
-        assert!(task.has_pending_host_work(), "the signal is still owed");
+        assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), parks + 1);
+        assert!(task.has_pending_host_work(), "the host still sees its work");
         assert_eq!(task.served_with_work.load(Ordering::Acquire), 0);
     }
 

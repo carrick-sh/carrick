@@ -753,6 +753,12 @@ fn el1_ipc_unpublished_core_fails_closed_and_initializes_in_place() {
     assert_eq!(host_view.get(t, Fd(0)).unwrap().backing, BackingToken(1));
 }
 
+/// Mutations take the table lock and refuse before effects when a bounded
+/// wait gives up. Lookups take no lock: a holder the host stopped
+/// mid-section (a vCPU taken out of the guest while it held the lock) never
+/// makes EL1 forward a read or write it could serve (`el1_ipc_pairs_
+/// blocking` lost served writes to `table_contended` under 64 pairs). Only a
+/// writer changing the table's extent or identity makes lookups wait.
 #[test]
 fn el1_ipc_contended_table_lock_refuses_before_effects() {
     let (core, arena) = core_with::<1>(2);
@@ -762,8 +768,20 @@ fn el1_ipc_contended_table_lock_refuses_before_effects() {
     host.open(t, Fd(0), description(1), false).unwrap();
     core.tables[0].lock.store(1, Ordering::Release); // another venue holds it
     assert_eq!(el1.dup(t, Fd(0)).map(|_| ()), Err(Error::Contended));
+    assert_eq!(el1.get(t, Fd(0)).map(|d| d.backing), Ok(BackingToken(1)));
+    let (pin, _) = el1
+        .pin(t, Fd(0))
+        .expect("a held lock does not stall a lookup");
+    assert_eq!(el1.get(t, Fd(1)), Err(Error::BadFd));
+    assert_eq!(el1.pin(t, Fd(1)).map(|_| ()), Err(Error::BadFd));
+    // A writer mid-change of the extent (odd sequence) holds lookups off.
+    let seq = core.tables[0].seq.load(Ordering::Relaxed);
+    core.tables[0].seq.store(seq | 1, Ordering::Release);
+    assert_eq!(el1.get(t, Fd(0)).map(|_| ()), Err(Error::Contended));
     assert_eq!(el1.pin(t, Fd(0)).map(|_| ()), Err(Error::Contended));
+    core.tables[0].seq.store(seq, Ordering::Release);
     core.tables[0].lock.store(0, Ordering::Release);
+    assert_eq!(el1.unpin(pin), Ok(None));
     assert_eq!(el1.refcount(t, Fd(0)), Ok(1));
     assert_eq!(el1.getfd(t, Fd(1)), Err(Error::BadFd));
 }
@@ -780,7 +798,8 @@ fn el1_ipc_direct_lookup_reads_one_slot_at_every_scale() {
         for fd in [0, scale / 2, scale - 1] {
             let before = SLOT_READS.with(|n| n.get());
             let (pin, _) = c.pin(t, Fd(fd as i32)).unwrap();
-            assert_eq!(SLOT_READS.with(|n| n.get()) - before, 1, "scale {scale}");
+            // The slot, then the same slot again to confirm the incarnation.
+            assert_eq!(SLOT_READS.with(|n| n.get()) - before, 2, "scale {scale}");
             assert_eq!(c.unpin(pin), Ok(None));
         }
     }
@@ -989,4 +1008,64 @@ fn el1_ipc_ofd_records_grow_in_published_segments() {
     assert_eq!(c.unpin(pin).unwrap().unwrap().backing, BackingToken(7));
     assert_eq!(c.open(t, Fd(0), description(70), false), Ok(Fd(7)));
     assert_eq!(c.get(t, Fd(7)).unwrap().backing, BackingToken(70));
+}
+
+/// Lock-free pins racing closes, reopens that reuse the same records, and
+/// storage growth: every pin names a description the fd named during the
+/// call (its backing token is one the fd held), and every description is
+/// finally released exactly once, including a raced pin's (`PinRaced`).
+#[test]
+fn el1_ipc_lock_free_pins_race_close_reuse_and_growth() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let (core, arena) = core_with::<1>(4);
+    let host = core.bind(arena, Spin);
+    let t = host.create_table(1024, &mut storage(4)).unwrap();
+    let opened = AtomicUsize::new(0);
+    let released = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            s.spawn(|| {
+                let el1 = core.bind(arena, BoundedSpin(1 << 20));
+                while !stop.load(Ordering::Acquire) {
+                    match el1.pin(t, Fd(1)) {
+                        Ok((pin, d)) => {
+                            assert!(d.backing.0 >= 1, "a description the fd named");
+                            if el1.unpin(pin).unwrap().is_some() {
+                                released.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(Error::PinRaced(raw)) => {
+                            // The reuse's pin is ours to release.
+                            if el1.unpin(OfdPin::from_raw(raw)).unwrap().is_some() {
+                                released.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(Error::BadFd) | Err(Error::Contended) => {}
+                        Err(other) => panic!("pin: {other:?}"),
+                    }
+                }
+            });
+        }
+        let mut capacity = 4;
+        for round in 1..=4000u64 {
+            let fd = host.open(t, Fd(1), description(round), false).unwrap();
+            assert_eq!(fd, Fd(1));
+            opened.fetch_add(1, Ordering::Relaxed);
+            if round % 500 == 0 && capacity < 64 {
+                capacity *= 2;
+                let mut larger = storage(capacity);
+                host.grow_table(t, &mut larger).unwrap();
+            }
+            if host.close(t, fd).unwrap().is_some() {
+                released.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        stop.store(true, Ordering::Release);
+    });
+    assert_eq!(
+        released.load(Ordering::Relaxed),
+        opened.load(Ordering::Relaxed),
+        "every description released exactly once"
+    );
 }

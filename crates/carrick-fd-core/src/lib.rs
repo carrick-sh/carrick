@@ -75,6 +75,12 @@ pub enum Error {
     /// A pin that does not name a live pinned description (released twice,
     /// forged, or from another authority). A venue ownership bug.
     StalePin,
+    /// A lock-free [`Authority::pin`] raced a close that freed and reused the
+    /// description record: the pin it took holds the reuse, which the fd did
+    /// not name. Its ownership moves to the caller (rebuild it with
+    /// [`OfdPin::from_raw`]), who releases it through its normal unpin path
+    /// (which may be that description's final release) and may retry.
+    PinRaced(RawOfdPin),
 }
 /// Generation-checked identity; IDs from another Core are rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -429,9 +435,13 @@ const FREE_INDEX: u64 = u32::MAX as u64;
 const REF: u64 = 1 << 32;
 const PIN: u64 = 1;
 
-/// One table identity in shared memory. `lock` serializes every operation on
-/// the table's slots; the other words are written only under it (and
-/// `state`/`generation` published with Release when a table is created).
+/// One table identity in shared memory. `lock` serializes every operation
+/// that changes the table's slots; the other words are written only under
+/// it. `seq` is a sequence count over `state`, `generation` and the extent
+/// (odd while a writer changes them): descriptor lookups ([`Authority::get`],
+/// [`Authority::pin`]) take no lock, they read those words and the slot and
+/// validate `seq`, so a lock holder stopped mid-section (a vCPU the host
+/// took out of the guest) never stalls or refuses a lookup.
 #[repr(C, align(64))]
 #[derive(Debug, Default)]
 pub struct TableRecord {
@@ -442,7 +452,27 @@ pub struct TableRecord {
     extent_token: AtomicU64,
     extent_capacity: AtomicU64,
     next_free: AtomicU64,
-    _reserved: [u64; 2],
+    seq: AtomicU64,
+    _reserved: u64,
+}
+impl TableRecord {
+    /// Under the table lock, before changing `state`, `generation` or the
+    /// extent: lookups from here on retry.
+    fn begin_write(&self) {
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.seq.store(seq | 1, Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Release);
+    }
+    /// Under the table lock, after the change: publish it.
+    fn end_write(&self) {
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.seq.store((seq | 1) + 1, Ordering::Release);
+    }
+    /// A lookup that began at `seq` saw no concurrent writer.
+    fn unchanged_since(&self, seq: u64) -> bool {
+        core::sync::atomic::fence(Ordering::Acquire);
+        self.seq.load(Ordering::Relaxed) == seq
+    }
 }
 
 /// One open file description in shared memory. `holds` packs descriptor
@@ -532,7 +562,7 @@ pub struct Core<const T: usize> {
 }
 
 /// Layout facts a shared-memory venue folds into its ABI layout hash.
-pub const LAYOUT_FACTS: [u64; 12] = [
+pub const LAYOUT_FACTS: [u64; 13] = [
     core::mem::size_of::<TableRecord>() as u64,
     core::mem::align_of::<TableRecord>() as u64,
     core::mem::size_of::<OfdRecord>() as u64,
@@ -544,6 +574,7 @@ pub const LAYOUT_FACTS: [u64; 12] = [
     SLOT_CLOEXEC,
     MODE_MUTABLE,
     core::mem::offset_of!(Core<1>, ofd_count) as u64,
+    core::mem::offset_of!(TableRecord, seq) as u64,
     core::mem::offset_of!(Core<1>, tables) as u64,
 ];
 
@@ -862,6 +893,36 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
     }
 
+    /// [`Self::retain`] for a lookup that may race the final release:
+    /// `Ok(false)` when the record was already finalized (nothing changed),
+    /// `NoMemory` only when the live description's half is saturated.
+    fn retain_unless_final(&self, index: u32, amount: u64) -> Result<bool, Error> {
+        let holds = &self.ofd(index)?.holds;
+        let mut current = holds.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return Ok(false);
+            }
+            let half = if amount == REF {
+                current >> 32
+            } else {
+                current & FREE_INDEX
+            };
+            if half == FREE_INDEX {
+                return Err(Error::NoMemory);
+            }
+            match holds.compare_exchange_weak(
+                current,
+                current + amount,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(true),
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
     /// Drop one reference or pin; the caller that reaches zero receives the
     /// description and frees the record (exactly once).
     fn drop_hold(&self, index: u32, amount: u64) -> Result<Option<Description>, Error> {
@@ -903,6 +964,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     fn publish(&self, index: usize, limit: usize, storage: Extent) -> TableId {
         let record = &self.core.tables[index];
         let generation = record.generation.load(Ordering::Relaxed) + 1;
+        record.begin_write();
         record.limit.store(limit as u64, Ordering::Relaxed);
         record.extent_token.store(storage.token, Ordering::Relaxed);
         record
@@ -910,6 +972,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             .store(storage.capacity, Ordering::Relaxed);
         record.generation.store(generation, Ordering::Relaxed);
         record.state.store(TABLE_LIVE, Ordering::Release);
+        record.end_write();
         TableId {
             authority: self.core.identity.load(Ordering::Relaxed),
             index,
@@ -982,10 +1045,56 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         t.storage.set(fd, Some(Entry { ofd, cloexec }));
         Ok(Fd(fd as i32))
     }
-    /// O(1) read-only snapshot; it does not retain the backing beyond the lock.
+    /// O(1) read-only snapshot, taking no lock (see [`TableRecord`]); it
+    /// retains nothing. `Contended` only while a writer keeps changing the
+    /// table's extent or identity past the wait policy.
     pub fn get(&self, table: TableId, fd: Fd) -> Result<Description, Error> {
-        let (_guard, t) = self.lock(table)?;
-        self.snapshot(t.entry(fd)?.ofd)
+        let mut attempt = 0;
+        loop {
+            let (record, seq, storage) = self.read_table(table)?;
+            let entry = Self::slot(&storage, fd);
+            let snapshot = entry.map(|e| self.snapshot(e.ofd)).transpose();
+            if Self::slot(&storage, fd) == entry && record.unchanged_since(seq) {
+                return snapshot?.ok_or(Error::BadFd);
+            }
+            attempt += 1;
+            if !self.wait.wait(attempt) {
+                return Err(Error::Contended);
+            }
+        }
+    }
+
+    /// The lock-free view of `id`'s table: its record, the `seq` it was read
+    /// at, and its slots. Every use validates with `unchanged_since(seq)`;
+    /// a retired extent's bytes are never trusted past that check.
+    fn read_table(&self, id: TableId) -> Result<(&'a TableRecord, u64, TableStorage<'a>), Error> {
+        if id.authority != self.identity()? {
+            return Err(Error::StaleTable);
+        }
+        let record = self.core.tables.get(id.index).ok_or(Error::StaleTable)?;
+        let mut attempt = 0;
+        loop {
+            let seq = record.seq.load(Ordering::Acquire);
+            if seq & 1 == 0 {
+                let live = record.state.load(Ordering::Relaxed) == TABLE_LIVE
+                    && record.generation.load(Ordering::Relaxed) == id.generation;
+                let extent = Self::record_extent(record);
+                if record.unchanged_since(seq) {
+                    if !live {
+                        return Err(Error::StaleTable);
+                    }
+                    return Ok((record, seq, self.storage(extent)?));
+                }
+            }
+            attempt += 1;
+            if !self.wait.wait(attempt) {
+                return Err(Error::Contended);
+            }
+        }
+    }
+
+    fn slot(storage: &TableStorage<'_>, fd: Fd) -> Option<Entry> {
+        usize::try_from(fd.0).ok().and_then(|fd| storage.get(fd))
     }
     /// Descriptor references to `fd`'s description (pins are not counted).
     pub fn refcount(&self, table: TableId, fd: Fd) -> Result<usize, Error> {
@@ -1208,6 +1317,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
         larger.rebuild();
         let retired = Self::record_extent(guard.record);
+        guard.record.begin_write();
         guard
             .record
             .extent_token
@@ -1216,6 +1326,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             .record
             .extent_capacity
             .store(storage.capacity, Ordering::Relaxed);
+        guard.record.end_write();
         *storage = retired;
         Ok(())
     }
@@ -1295,32 +1406,73 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             }
         }
         let extent = Self::record_extent(guard.record);
+        guard.record.begin_write();
         guard.record.extent_token.store(0, Ordering::Relaxed);
         guard.record.extent_capacity.store(0, Ordering::Relaxed);
         guard.record.state.store(TABLE_FREE, Ordering::Release);
+        guard.record.end_write();
         drop(guard);
         self.push_table(table.index);
         Ok(extent)
     }
 
     /// Resolve `fd` and retain its exact description for an in-flight
-    /// operation: one slot read, one OFD word update, under the table's lock
-    /// only for the lookup. Closing or reusing `fd` afterwards does not
-    /// affect the pin; the description's final release waits for
-    /// [`Authority::unpin`].
+    /// operation, taking no lock: read the slot, the named record's
+    /// generation, the slot again (so that incarnation was the fd's), then
+    /// add the pin and confirm the generation did not move (so the pin holds
+    /// that incarnation, not a reuse). The pin linearizes at the second slot
+    /// read, like a Linux `fget` racing `close`. Closing or reusing `fd`
+    /// afterwards does not affect the pin; the description's final release
+    /// waits for [`Authority::unpin`]. A pin that landed on a reused record
+    /// is handed to the caller as [`Error::PinRaced`].
     pub fn pin(&self, table: TableId, fd: Fd) -> Result<(OfdPin, Description), Error> {
-        let (_guard, t) = self.lock(table)?;
-        let entry = t.entry(fd)?;
-        self.retain(entry.ofd, PIN)?;
-        let generation = self.ofd(entry.ofd)?.generation.load(Ordering::Acquire);
-        let pin = OfdPin {
-            authority: self.core.identity.load(Ordering::Relaxed),
-            key: OfdKey {
-                index: entry.ofd,
-                generation,
-            },
-        };
-        Ok((pin, self.snapshot(entry.ofd)?))
+        let mut attempt = 0;
+        loop {
+            let (record, seq, storage) = self.read_table(table)?;
+            let settled = |entry: Option<Entry>| {
+                Self::slot(&storage, fd) == entry && record.unchanged_since(seq)
+            };
+            let entry = Self::slot(&storage, fd);
+            let generation = match entry.map(|e| self.ofd(e.ofd)).transpose() {
+                Ok(ofd) => ofd.map(|ofd| ofd.generation.load(Ordering::Acquire)),
+                Err(error) if settled(entry) => return Err(error),
+                Err(_) => None,
+            };
+            if settled(entry) {
+                let (Some(entry), Some(generation)) = (entry, generation) else {
+                    return Err(Error::BadFd);
+                };
+                match self.retain_unless_final(entry.ofd, PIN) {
+                    Ok(true) => {
+                        let ofd = self.ofd(entry.ofd)?;
+                        if ofd.generation.load(Ordering::Acquire) == generation {
+                            let pin = OfdPin {
+                                authority: self.core.identity.load(Ordering::Relaxed),
+                                key: OfdKey {
+                                    index: entry.ofd,
+                                    generation,
+                                },
+                            };
+                            return Ok((pin, self.snapshot(entry.ofd)?));
+                        }
+                        // Freed and reused between the slot read and the pin.
+                        return Err(Error::PinRaced(RawOfdPin {
+                            authority: self.core.identity.load(Ordering::Relaxed),
+                            index: u64::from(entry.ofd),
+                            generation: ofd.generation.load(Ordering::Acquire),
+                        }));
+                    }
+                    // Finalized since the slot read: the slot has moved on.
+                    Ok(false) => {}
+                    // Pins of a live description saturated: a real refusal.
+                    Err(error) => return Err(error),
+                }
+            }
+            attempt += 1;
+            if !self.wait.wait(attempt) {
+                return Err(Error::Contended);
+            }
+        }
     }
 
     fn check_pin(&self, pin: &OfdPin) -> Result<(), Error> {
