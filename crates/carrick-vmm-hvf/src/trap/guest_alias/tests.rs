@@ -139,7 +139,10 @@ impl Stage1Services for El1<'_> {
     fn guest_publication_available(&self) -> bool {
         true
     }
-    fn publish(&mut self, txn: &DescriptorTxn) -> Result<VerifiedDescriptorReceipt, TrapError> {
+    fn publish(
+        &mut self,
+        txn: &DescriptorTxn,
+    ) -> Result<VerifiedDescriptorReceipt, carrick_aarch64::vmm::GuestPublishError> {
         match txn.op {
             DescriptorOp::MapAlias {
                 access,
@@ -154,7 +157,7 @@ impl Stage1Services for El1<'_> {
                     // EL1 refused before its first store: grants return.
                     self.log.lock().push("el1:map-alias-refused".to_owned());
                     self.mm.tables.abandon_guest_descriptor_txn(txn).unwrap();
-                    return Err(TrapError::Hypervisor("EL1 refused MapAlias".to_owned()));
+                    return Err(TrapError::Hypervisor("EL1 refused MapAlias".to_owned()).into());
                 }
                 self.log.lock().push("el1:map-alias".to_owned());
             }
@@ -176,7 +179,9 @@ impl Stage1Services for El1<'_> {
         self.mm
             .tables
             .settle_guest_descriptor_receipt(txn, &receipt)
-            .map_err(|error| TrapError::Hypervisor(format!("model EL1 receipt: {error:?}")))
+            .map_err(|error| {
+                carrick_aarch64::vmm::GuestPublishError::from_settle(error, "model EL1 receipt")
+            })
     }
 }
 

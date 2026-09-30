@@ -469,11 +469,18 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
         &mut self,
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-    {
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        crate::descriptor_drain::GuestPublishError,
+    > {
         self.tables
             .settle_guest_descriptor_receipt(txn, receipt)
-            .map_err(|error| TrapError::Hypervisor(format!("settle COW descriptor: {error:?}")))
+            .map_err(|error| {
+                crate::descriptor_drain::GuestPublishError::from_settle(
+                    error,
+                    "settle COW descriptor",
+                )
+            })
     }
 }
 impl<V: Aarch64Vmm> crate::vmm::Stage1Services for EngineStage1Services<'_, V> {
@@ -490,13 +497,15 @@ impl<V: Aarch64Vmm> crate::vmm::Stage1Services for EngineStage1Services<'_, V> {
     fn publish(
         &mut self,
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-    {
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        crate::descriptor_drain::GuestPublishError,
+    > {
         let slots = carrick_el1_abi::descriptor_txn_slots_host()
             .ok_or_else(|| TrapError::Hypervisor("COW descriptor slots absent".to_owned()))?;
         crate::descriptor_drain::apply_guest_descriptor_txns_now(self, slots, &[*txn])?
             .pop()
-            .ok_or_else(|| TrapError::Hypervisor("COW descriptor receipt absent".to_owned()))
+            .ok_or_else(|| TrapError::Hypervisor("COW descriptor receipt absent".to_owned()).into())
     }
 }
 

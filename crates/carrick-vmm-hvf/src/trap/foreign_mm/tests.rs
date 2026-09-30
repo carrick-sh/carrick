@@ -1023,6 +1023,10 @@ struct ModelCallerEl1 {
     drains: usize,
     submitted: Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp>,
     before_apply: Box<dyn FnMut()>,
+    /// Answer every claimed transaction with this outcome instead of
+    /// executing it: EL1 refusing (or rolling back) an authenticated
+    /// submission, leaving nothing live.
+    not_applied: Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome>,
 }
 
 impl ModelCallerEl1 {
@@ -1038,6 +1042,7 @@ impl ModelCallerEl1 {
             drains: 0,
             submitted: Vec::new(),
             before_apply,
+            not_applied: None,
         }
     }
 }
@@ -1102,6 +1107,10 @@ impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
             let outcome = match claimed.txn() {
                 Err(refusal) => {
                     carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal)
+                }
+                Ok(txn) if self.not_applied.is_some() => {
+                    self.submitted.push(txn.op);
+                    self.not_applied.expect("checked by the guard")
                 }
                 Ok(txn) => {
                     self.submitted.push(txn.op);
@@ -1502,6 +1511,84 @@ fn guest_owned_foreign_cow_refusal_before_submission_rolls_back_every_stage() {
     }
 }
 
+/// EL1 authenticates the submission and refuses it before its first store
+/// (or rolls every store back): nothing is live, so the foreign COW is an
+/// ordinary refusal that rolls back grant, ledger and owner, never a fatal.
+#[test]
+fn guest_owned_foreign_cow_el1_refusal_rolls_back_every_stage() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorOutcome, DescriptorRefusal};
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    for (index, outcome) in [
+        DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking),
+        DescriptorOutcome::RolledBack(DescriptorRefusal::Contended),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let _stub = ScopedStage2MapTestStub::enable();
+        let transport = CarrierForeignMmTransport::new();
+        let installed = install_mm(
+            &transport,
+            720 + index as u64,
+            0x9a01_4000_0000 + index as u64 * 0x0200_0000,
+            0x9b01_4000_0000 + index as u64 * 0x0200_0000,
+            *b"same",
+        );
+        let (authority, lease, invalidator) = prepare_foreign_cow(&installed);
+        installed
+            .state
+            .page_tables_authority()
+            .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+        let before = foreign_cow_fingerprint(&installed);
+        let live_before = installed.live.0.read().clone();
+        let aliases_before = alias_registry().lock().ordered();
+        let mut caller = ModelCallerEl1::new(&installed, Box::new(|| {}));
+        caller.not_applied = Some(outcome);
+        let mut lending = LendingInvalidator {
+            residency: ModelAsidResidency::default(),
+            inner: invalidator,
+            caller: Some(caller),
+        };
+        install_test_slots(&installed, lending.caller.as_ref().unwrap());
+        let result = lease.break_cow(
+            &mut lending,
+            &installed.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(carrick_hal::ForeignMmTransportError::MutationFailed)
+            ),
+            "{outcome:?}: {result:?}"
+        );
+        let caller = lending.caller.as_ref().unwrap();
+        assert_eq!(caller.drains, 1, "{outcome:?}: EL1 answered the submission");
+        assert_eq!(caller.submitted.len(), 1, "{outcome:?}");
+        assert_eq!(foreign_cow_fingerprint(&installed), before, "{outcome:?}");
+        assert_eq!(
+            installed.live.0.read().mapping_ids,
+            live_before.mapping_ids,
+            "{outcome:?}: the kernel grant must be rolled back"
+        );
+        assert!(authority.published.lock().is_none(), "{outcome:?}");
+        assert_eq!(
+            alias_registry().lock().ordered(),
+            aliases_before,
+            "{outcome:?}"
+        );
+        assert!(installed.state.cow_armed.lock().span_for(TEST_VA).is_some());
+        assert!(
+            caller.slots.as_slice().iter().all(|slot| slot.state() == 0),
+            "{outcome:?}: the answered slot is free"
+        );
+        assert_eq!(lending.inner.calls, 0, "{outcome:?}");
+    }
+}
+
 #[test]
 fn guest_owned_foreign_cow_refuses_a_retiring_target_before_borrowing_its_ttbr0() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
@@ -1816,7 +1903,10 @@ fn guest_sparse_publication_executes_before_retirement_and_preserves_old_owner()
         fn guest_publication_available(&self) -> bool {
             true
         }
-        fn publish(&mut self, txn: &DescriptorTxn) -> Result<VerifiedDescriptorReceipt, TrapError> {
+        fn publish(
+            &mut self,
+            txn: &DescriptorTxn,
+        ) -> Result<VerifiedDescriptorReceipt, carrick_aarch64::vmm::GuestPublishError> {
             assert!(!self.retired.get());
             assert!(
                 self.authority.published.lock().is_some(),
@@ -1956,8 +2046,10 @@ fn guest_sparse_plan_refusal_returns_grant_without_retiring_predecessor() {
         fn publish(
             &mut self,
             _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-        {
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            carrick_aarch64::vmm::GuestPublishError,
+        > {
             panic!("an invalid semantic span must refuse before submission")
         }
     }
@@ -11460,6 +11552,9 @@ struct RetainedReuseGuestService<'a> {
     published:
         &'a std::cell::RefCell<Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>>,
     maintenance: RetainedReuseMaintenance,
+    /// Answer with this outcome instead of executing: EL1 refused (or rolled
+    /// back) the authenticated submission and left nothing live.
+    not_applied: Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome>,
 }
 
 struct RetainedReuseMaintenance(std::cell::Cell<usize>);
@@ -11481,8 +11576,10 @@ impl carrick_aarch64::vmm::Stage1Services for RetainedReuseGuestService<'_> {
     fn publish(
         &mut self,
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-    {
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        carrick_aarch64::vmm::GuestPublishError,
+    > {
         use carrick_mmu_core::aarch64::descriptor_txn::{
             InlineJournal, PrimaryTableWords, execute_descriptor_txn,
         };
@@ -11491,6 +11588,22 @@ impl carrick_aarch64::vmm::Stage1Services for RetainedReuseGuestService<'_> {
             "kernel grant must precede descriptors"
         );
         self.published.borrow_mut().push(*txn);
+        if let Some(outcome) = self.not_applied {
+            let receipt = carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt {
+                id: txn.id,
+                digest: txn.digest(),
+                outcome,
+            };
+            return self
+                .tables
+                .settle_guest_descriptor_receipt(txn, &receipt)
+                .map_err(|error| {
+                    carrick_aarch64::vmm::GuestPublishError::from_settle(
+                        error,
+                        "model guest receipt",
+                    )
+                });
+        }
         let words = unsafe {
             PrimaryTableWords::new(
                 self.host as *mut _,
@@ -11508,7 +11621,9 @@ impl carrick_aarch64::vmm::Stage1Services for RetainedReuseGuestService<'_> {
         );
         self.tables
             .settle_guest_descriptor_receipt(txn, &receipt)
-            .map_err(|error| TrapError::Hypervisor(format!("model guest receipt: {error:?}")))
+            .map_err(|error| {
+                carrick_aarch64::vmm::GuestPublishError::from_settle(error, "model guest receipt")
+            })
     }
 }
 
@@ -11556,6 +11671,7 @@ fn guest_retained_reuse_publishes_one_deferred_alias_without_host_writes() {
         available: true,
         published: &published,
         maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+        not_applied: None,
     };
     let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
     let end = fixture
@@ -11655,6 +11771,7 @@ fn guest_retained_reuse_without_driving_vcpu_refuses_before_allocation() {
         available: false,
         published: &published,
         maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+        not_applied: None,
     };
     let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
     let error = fixture
@@ -11721,6 +11838,7 @@ fn guest_retained_reuse_plan_refusal_rolls_back_grant_and_owner() {
         available: true,
         published: &published,
         maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+        not_applied: None,
     };
     let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
     let error = fixture
@@ -11745,6 +11863,61 @@ fn guest_retained_reuse_plan_refusal_rolls_back_grant_and_owner() {
     assert_eq!(live_table_words(&fixture), stage1_before);
     assert!(fixture.task.cow_deferred_publications.lock().is_empty());
     unsafe { l2_host.write(saved) };
+}
+
+/// EL1 refuses the authenticated retained-reuse `MapAlias` before its first
+/// store: nothing is live, so the replacement grant, ledger row and owner
+/// roll back and the fault sees an ordinary error, never a fatal.
+#[test]
+fn guest_retained_reuse_el1_refusal_rolls_back_grant_and_owner() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorOutcome, DescriptorRefusal};
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        709,
+        0x9a01_2400_0000,
+        0x9b01_2400_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+    );
+    let tables = fixture.installed.state.page_tables_authority();
+    let stage1_before = live_table_words(&fixture);
+    let inventory_before =
+        inventory_fingerprint(&fixture.installed.state.frame_inventory.ledger.lock());
+    let owners_before = owner_keys();
+    let aliases_before = alias_registry().lock().ordered();
+    let published = std::cell::RefCell::new(Vec::new());
+    let mut service = RetainedReuseGuestService {
+        tables: tables.clone(),
+        authority: fixture.authority.clone(),
+        root: fixture.root_key,
+        host: fixture.root_host,
+        available: true,
+        published: &published,
+        maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+        not_applied: Some(DescriptorOutcome::Refused(DescriptorRefusal::Occupied)),
+    };
+    let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+    let error = fixture
+        .task
+        .materialize_retired_reuse(&custody, TEST_VA, TEST_VA + OWNER_LEN as u64, &mut service)
+        .expect_err("EL1 refusal is an ordinary error");
+    assert!(error.to_string().contains("did not apply"), "{error}");
+    assert_eq!(published.borrow().len(), 1, "EL1 answered one submission");
+    assert!(
+        fixture.authority.published.lock().is_none(),
+        "kernel grant rolled back"
+    );
+    assert_eq!(owner_keys(), owners_before, "replacement owner rolled back");
+    assert_eq!(
+        inventory_fingerprint(&fixture.installed.state.frame_inventory.ledger.lock()),
+        inventory_before
+    );
+    assert_eq!(alias_registry().lock().ordered(), aliases_before);
+    assert_eq!(live_table_words(&fixture), stage1_before);
+    assert!(fixture.task.cow_deferred_publications.lock().is_empty());
 }
 
 #[test]
@@ -11773,8 +11946,10 @@ fn host_retained_reuse_repoints_through_the_host_editor() {
         fn publish(
             &mut self,
             _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-        ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-        {
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            carrick_aarch64::vmm::GuestPublishError,
+        > {
             panic!("host lane must not submit guest descriptors")
         }
     }

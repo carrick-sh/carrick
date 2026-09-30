@@ -1,6 +1,107 @@
 //! Shared host-to-EL1 descriptor drain, used by fork and host copyout.
 
 use carrick_hal::{ThreadedEngine, TrapError};
+use carrick_mmu_core::aarch64::GuestTxnSettleError;
+use carrick_mmu_core::aarch64::descriptor_txn::{
+    DescriptorOutcome, DescriptorRefusal, ReceiptError,
+};
+
+/// The two EL1 answers that leave no store of a transaction live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanRefusal {
+    /// Refused before the first live store.
+    Refused(DescriptorRefusal),
+    /// Every journaled store restored; EL1 invalidated the ASID.
+    RolledBack(DescriptorRefusal),
+}
+
+/// Why a guest descriptor publication produced no verified completion.
+///
+/// The distinction is what EL1 left live, not how the failure is worded: a
+/// caller holding prepared backing may roll it back only when EL1 provably
+/// left nothing that could name it.
+#[derive(Debug)]
+pub enum GuestPublishError {
+    /// EL1 answered this exact transaction (id and digest authenticated) and
+    /// left no store live: `Refused` before its first store, or `RolledBack`
+    /// with every journaled store restored and the ASID invalidated by EL1
+    /// before it answered. Its table grants are returned, and no earlier
+    /// transaction of the same publication was applied.
+    NotApplied {
+        outcome: CleanRefusal,
+        error: TrapError,
+    },
+    /// Anything else: an indeterminate rollback, an unauthenticated or
+    /// inconsistent receipt, a lost drain, or a refusal after an earlier
+    /// transaction of the same publication applied. Live state is unknown.
+    Unsettled(TrapError),
+}
+
+impl GuestPublishError {
+    /// Classify a settlement failure by its typed receipt error.
+    #[must_use]
+    pub fn from_settle(error: GuestTxnSettleError, context: &str) -> Self {
+        let trap = TrapError::Hypervisor(format!("{context}: {error:?}"));
+        match error {
+            GuestTxnSettleError::Receipt(ReceiptError::NotApplied(DescriptorOutcome::Refused(
+                refusal,
+            ))) => Self::NotApplied {
+                outcome: CleanRefusal::Refused(refusal),
+                error: trap,
+            },
+            GuestTxnSettleError::Receipt(ReceiptError::NotApplied(
+                DescriptorOutcome::RolledBack(refusal),
+            )) => Self::NotApplied {
+                outcome: CleanRefusal::RolledBack(refusal),
+                error: trap,
+            },
+            GuestTxnSettleError::Receipt(_) | GuestTxnSettleError::Manager(_) => {
+                Self::Unsettled(trap)
+            }
+        }
+    }
+
+    /// The one classification every guest publication site applies after
+    /// preparing backing: `Ok` is a clean refusal the caller returns as an
+    /// ordinary error (dropping its prepared backing rolls it back); `Err`
+    /// is an unknown outcome the caller must fail-stop on.
+    pub fn into_clean_refusal(self) -> Result<TrapError, TrapError> {
+        match self {
+            Self::NotApplied { outcome, error } => Ok(TrapError::Hypervisor(format!(
+                "EL1 did not apply the guest descriptor transaction ({outcome:?}): {error}"
+            ))),
+            Self::Unsettled(error) => Err(error),
+        }
+    }
+}
+
+impl From<TrapError> for GuestPublishError {
+    /// An untyped failure is never proof that nothing was stored.
+    fn from(error: TrapError) -> Self {
+        Self::Unsettled(error)
+    }
+}
+
+impl From<GuestPublishError> for TrapError {
+    fn from(error: GuestPublishError) -> Self {
+        match error {
+            GuestPublishError::NotApplied { error, .. } | GuestPublishError::Unsettled(error) => {
+                error
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for GuestPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotApplied { outcome, error } => {
+                write!(formatter, "not applied ({outcome:?}): {error}")
+            }
+            Self::Unsettled(error) => write!(formatter, "unsettled: {error}"),
+        }
+    }
+}
 
 /// The venue a synchronous guest descriptor drain runs on: the exact vCPU
 /// (slot, TTBR0) of the MM, the host-driven EL1 call, and receipt settlement.
@@ -17,7 +118,10 @@ pub trait GuestDrainVenue {
         &mut self,
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        GuestPublishError,
+    >;
 }
 
 /// The production venue: the engine's own vCPU and the shared EL1 region.
@@ -45,9 +149,14 @@ impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
         &mut self,
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-    {
-        self.0.settle_el1_descriptor_receipt(txn, receipt)
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        GuestPublishError,
+    > {
+        // The engine's settlement is untyped: never treated as a clean refusal.
+        self.0
+            .settle_el1_descriptor_receipt(txn, receipt)
+            .map_err(GuestPublishError::Unsettled)
     }
 }
 
@@ -56,12 +165,17 @@ impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
 /// through the host-driven drain call under the host's delegated custody, and
 /// its exact receipt is settled before the next one is submitted. Any
 /// refusal, blocked drain or unauthenticated receipt is an error; the caller
-/// decides whether that is fatal.
+/// decides whether that is fatal. Only a clean refusal of the FIRST
+/// transaction is [`GuestPublishError::NotApplied`]: once one applied, a later
+/// refusal leaves the publication partial.
 pub fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
     venue: &mut V,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     txns: &[carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn],
-) -> Result<Vec<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt>, TrapError> {
+) -> Result<
+    Vec<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt>,
+    GuestPublishError,
+> {
     let fail = |what: String| TrapError::Hypervisor(format!("guest descriptor drain: {what}"));
     let own = venue
         .slot()
@@ -70,10 +184,10 @@ pub fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
     for txn in txns {
         let ttbr0 = venue.live_ttbr0()?;
         if ttbr0 & 0x0000_FFFF_FFFF_F000 != txn.root.raw() {
-            return Err(fail(format!(
+            return Err(GuestPublishError::Unsettled(fail(format!(
                 "vCPU TTBR0 0x{ttbr0:x} is not the transaction root 0x{:x}",
                 txn.root.raw()
-            )));
+            ))));
         }
         let used = (0..slots.as_slice().len())
             .map(|offset| (own + offset) % slots.as_slice().len())
@@ -84,17 +198,29 @@ pub fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
             Ok(answered) => answered,
             Err(error) => {
                 let _ = slots.withdraw(used, txn.id);
-                return Err(error);
+                return Err(error.into());
             }
         };
         if answered.x[0] & carrick_el1_abi::DESCRIPTOR_DRAIN_BLOCKED != 0 {
             let _ = slots.withdraw(used, txn.id);
-            return Err(fail("EL1 could not claim the MM".to_owned()));
+            return Err(fail("EL1 could not claim the MM".to_owned()).into());
         }
         let receipt = slots
             .take_receipt(used, txn.id)
             .ok_or_else(|| fail(format!("no receipt for {:?}", txn.id)))?;
-        verified.push(venue.settle(txn, &receipt)?);
+        match venue.settle(txn, &receipt) {
+            Ok(receipt) => verified.push(receipt),
+            Err(GuestPublishError::NotApplied { outcome, error }) if !verified.is_empty() => {
+                return Err(GuestPublishError::Unsettled(TrapError::Hypervisor(
+                    format!(
+                        "guest descriptor {:?} not applied ({outcome:?}) after {} applied: {error}",
+                        txn.id,
+                        verified.len()
+                    ),
+                )));
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(verified)
 }
