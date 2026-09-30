@@ -448,6 +448,30 @@ impl AddressSpaces {
         Some(SpaceEditor { entry, owner })
     }
 
+    /// Guest EL1: [`Self::try_begin_edit`], waiting up to `spins` attempts
+    /// while only another EL1 editor (a bounded critical section on another
+    /// vCPU) holds the space. A raised or closed gate (the host) refuses at
+    /// once: the host must not wait on a guest that waits on it.
+    pub fn try_begin_edit_bounded(
+        &self,
+        index: SpaceIndex,
+        key: u64,
+        owner: NonZeroU64,
+        spins: u32,
+    ) -> Option<SpaceEditor<'_>> {
+        let entry = self.entry(index);
+        for _ in 0..spins.max(1) {
+            if let Some(editor) = self.try_begin_edit(index, key, owner) {
+                return Some(editor);
+            }
+            if entry.gate.load(Ordering::SeqCst) != 0 || entry.key.load(Ordering::SeqCst) != key {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+
     /// Exact active guest editor (tests and diagnostics).
     pub fn active_editor(&self, index: SpaceIndex) -> Option<NonZeroU64> {
         NonZeroU64::new(self.entry(index).active_editor.load(Ordering::SeqCst))
@@ -459,6 +483,37 @@ mod tests {
     use super::*;
     use core::num::NonZeroU64;
     use std::sync::{Arc, mpsc};
+
+    #[test]
+    fn a_bounded_edit_waits_for_a_guest_editor_but_never_for_the_host() {
+        let spaces = Arc::new(AddressSpaces::new());
+        let index = spaces.publish_closed(7, 0x1_0000, 0x1_0000).unwrap();
+        spaces.open(index);
+        let nz = |v| NonZeroU64::new(v).unwrap();
+        // Another EL1 editor holds it for a bounded section, then leaves.
+        let held = spaces.try_begin_edit(index, 7, nz(1)).unwrap();
+        assert!(spaces.try_begin_edit_bounded(index, 7, nz(2), 16).is_none());
+        let (tx, rx) = mpsc::channel();
+        let waiter = {
+            let spaces = Arc::clone(&spaces);
+            std::thread::spawn(move || {
+                tx.send(()).unwrap();
+                spaces
+                    .try_begin_edit_bounded(index, 7, nz(2), u32::MAX)
+                    .is_some()
+            })
+        };
+        rx.recv().unwrap();
+        drop(held);
+        assert!(waiter.join().unwrap(), "the waiter gets the editor");
+        // A raised gate refuses at once, however many spins are allowed.
+        spaces.raise(index);
+        assert!(
+            spaces
+                .try_begin_edit_bounded(index, 7, nz(3), u32::MAX)
+                .is_none()
+        );
+    }
 
     #[test]
     fn exclusion_proofs_name_exactly_the_excluded_space() {

@@ -756,10 +756,19 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         };
         // A closed gate (host pause or retirement) or another EL1 editor:
         // the host resolves this fault.
-        let Some((grant, _editor)) = spaces
-            .grant(index, mm_key)
-            .and_then(|grant| Some((grant, spaces.try_begin_edit(index, mm_key, owner)?)))
-        else {
+        // Sibling threads fault on the same forked MM together; each COW
+        // holds the editor only for one compound copy and repoint.
+        let Some((grant, _editor)) = spaces.grant(index, mm_key).and_then(|grant| {
+            Some((
+                grant,
+                spaces.try_begin_edit_bounded(
+                    index,
+                    mm_key,
+                    owner,
+                    carrick_el1_abi::EL1_GUEST_LOCK_SPINS,
+                )?,
+            ))
+        }) else {
             cow_resolver.editor_busy();
             return Action::Forward;
         };
