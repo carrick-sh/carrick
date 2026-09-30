@@ -636,28 +636,129 @@ fn fill_pages(base: usize, ps: usize, pages: std::ops::Range<usize>, round: usiz
     }
 }
 
-fn pages_match(base: usize, ps: usize, pages: std::ops::Range<usize>, round: usize) -> bool {
-    for page in pages {
-        let ptr = (base + page * ps) as *const u64;
-        for word in 0..ps / 8 {
-            if unsafe { ptr.add(word).read_volatile() } != pattern(round, page, word) {
-                return false;
-            }
-        }
-    }
-    true
+/// The first word of `pages` that differs from `want(page, word)`.
+#[derive(Clone, Copy)]
+struct Mismatch {
+    page: usize,
+    word: usize,
+    got: u64,
+    want: u64,
 }
 
-fn pages_hold(base: usize, ps: usize, pages: std::ops::Range<usize>, value: u64) -> bool {
+fn first_mismatch(
+    base: usize,
+    ps: usize,
+    pages: std::ops::Range<usize>,
+    want: impl Fn(usize, usize) -> u64,
+) -> Option<Mismatch> {
     for page in pages {
         let ptr = (base + page * ps) as *const u64;
         for word in 0..ps / 8 {
-            if unsafe { ptr.add(word).read_volatile() } != value {
-                return false;
+            let got = unsafe { ptr.add(word).read_volatile() };
+            let expected = want(page, word);
+            if got != expected {
+                return Some(Mismatch {
+                    page,
+                    word,
+                    got,
+                    want: expected,
+                });
             }
         }
     }
-    true
+    None
+}
+
+/// Name a word the fixture could have written at word index `word` of a
+/// page: a round pattern decodes to the round and page that wrote it (bytes
+/// moved within a page would not decode); the marks and zero are named.
+fn describe_word(value: u64, word: usize) -> String {
+    match value {
+        0 => "zero".to_owned(),
+        CHILD_MARK => "child-mark".to_owned(),
+        PARENT_MARK => "parent-mark".to_owned(),
+        v if v == CHILD_MARK ^ 1 => "child-cow-mark".to_owned(),
+        v if v & 0xFFFF_0000_0000_0000 == 0xC0DE_0000_0000_0000 => {
+            let low = v ^ 0xC0DE_0000_0000_0000 ^ word as u64;
+            if low & 0xFF == 0 {
+                format!(
+                    "pattern(round={},page={})",
+                    low >> 32,
+                    (low >> 8) & 0xFF_FFFF
+                )
+            } else {
+                "pattern(other-word)".to_owned()
+            }
+        }
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// One failed check, reported as a single line a signed run can read.
+struct Failure {
+    step: &'static str,
+    mismatch: Option<Mismatch>,
+}
+
+impl Failure {
+    fn step(step: &'static str) -> Self {
+        Self {
+            step,
+            mismatch: None,
+        }
+    }
+
+    fn report(&self, side: &str, round: usize, base: usize) {
+        let detail = match self.mismatch {
+            Some(m) => format!(
+                " page={} word={} got=0x{:x}({}) want=0x{:x}({})",
+                m.page,
+                m.word,
+                m.got,
+                describe_word(m.got, m.word),
+                m.want,
+                describe_word(m.want, m.word)
+            ),
+            None => String::new(),
+        };
+        println!(
+            "delegated-root-fixed-cow mismatch side={side} round={round} step={} base=0x{base:x} base_in_16k=0x{:x}{detail}",
+            self.step,
+            base % 16_384
+        );
+    }
+}
+
+fn expect_pattern(
+    step: &'static str,
+    base: usize,
+    ps: usize,
+    pages: std::ops::Range<usize>,
+    round: usize,
+) -> Result<(), Failure> {
+    match first_mismatch(base, ps, pages, |page, word| pattern(round, page, word)) {
+        None => Ok(()),
+        Some(mismatch) => Err(Failure {
+            step,
+            mismatch: Some(mismatch),
+        }),
+    }
+}
+
+fn expect_value(
+    step: &'static str,
+    base: usize,
+    ps: usize,
+    pages: std::ops::Range<usize>,
+    value: u64,
+) -> Result<(), Failure> {
+    match first_mismatch(base, ps, pages, |_, _| value) {
+        None => Ok(()),
+        Some(mismatch) => Err(Failure {
+            step,
+            mismatch: Some(mismatch),
+        }),
+    }
 }
 
 fn set_pages(base: usize, ps: usize, pages: std::ops::Range<usize>, value: u64) {
@@ -669,17 +770,31 @@ fn set_pages(base: usize, ps: usize, pages: std::ops::Range<usize>, value: u64) 
     }
 }
 
-fn replace_fixed(base: usize, ps: usize, pages: std::ops::Range<usize>) -> bool {
+fn replace_fixed(
+    step: &'static str,
+    base: usize,
+    ps: usize,
+    pages: std::ops::Range<usize>,
+) -> Result<(), Failure> {
     let addr = base + pages.start * ps;
-    anon(addr, pages.len() * ps, PROT_RW, true) == Some(addr)
+    if anon(addr, pages.len() * ps, PROT_RW, true) == Some(addr) {
+        Ok(())
+    } else {
+        Err(Failure::step(step))
+    }
+}
+
+fn require(step: &'static str, ok: bool) -> Result<(), Failure> {
+    if ok { Ok(()) } else { Err(Failure::step(step)) }
 }
 
 const CHILD_MARK: u64 = 0x4348_494c_4449_4646;
 const PARENT_MARK: u64 = 0x5041_5245_4449_4646;
 
-/// Returns whether the child behaved. `r1` is replaced while still shared and
-/// untouched; `r2` is first written (COW-broken) and then replaced; `r3` is
-/// left for the parent to replace while the child still shares it.
+/// The child's side. `r1` is replaced while still shared and untouched; `r2`
+/// is first written (COW-broken) and then replaced; `r3` is left for the
+/// parent to replace while the child still shares it. A failure names the
+/// first check that differed from Linux.
 fn fixed_cow_child(
     base: usize,
     ps: usize,
@@ -687,34 +802,66 @@ fn fixed_cow_child(
     round: usize,
     to_parent: libc::c_int,
     from_parent: libc::c_int,
-) -> bool {
+) -> Result<(), Failure> {
     let r1 = pages / 4..pages / 2;
     let r2 = pages / 2..pages / 2 + pages / 4;
     let r3 = 0..pages / 8;
     let untouched = pages / 2 + pages / 4..pages;
 
     set_pages(base, ps, r2.clone(), CHILD_MARK ^ 1);
-    if !replace_fixed(base, ps, r1.clone()) || !pages_hold(base, ps, r1.clone(), 0) {
-        return false;
-    }
+    replace_fixed("child-replace-r1", base, ps, r1.clone())?;
+    expect_value("child-r1-zero", base, ps, r1.clone(), 0)?;
     set_pages(base, ps, r1.clone(), CHILD_MARK);
-    if !replace_fixed(base, ps, r2.clone()) || !pages_hold(base, ps, r2.clone(), 0) {
-        return false;
-    }
+    replace_fixed("child-replace-r2", base, ps, r2.clone())?;
+    expect_value("child-r2-zero", base, ps, r2.clone(), 0)?;
     set_pages(base, ps, r2.clone(), CHILD_MARK);
-    if !pages_match(base, ps, r3.clone(), round) || !pages_match(base, ps, untouched.clone(), round)
-    {
-        return false;
-    }
-    if !write_signal_byte(to_parent, b'F') || !poll_read_byte(from_parent, 5_000) {
-        return false;
-    }
+    expect_pattern("child-r3-before", base, ps, r3.clone(), round)?;
+    expect_pattern("child-untouched-before", base, ps, untouched.clone(), round)?;
+    require(
+        "child-signal-f",
+        write_signal_byte(to_parent, b'F') && poll_read_byte(from_parent, 5_000),
+    )?;
     // The parent replaced r3 and wrote; the child's view must be unchanged.
-    pages_hold(base, ps, r1, CHILD_MARK)
-        && pages_hold(base, ps, r2, CHILD_MARK)
-        && pages_match(base, ps, r3, round)
-        && pages_match(base, ps, untouched, round)
-        && write_signal_byte(to_parent, b'D')
+    expect_value("child-r1-after", base, ps, r1, CHILD_MARK)?;
+    expect_value("child-r2-after", base, ps, r2, CHILD_MARK)?;
+    expect_pattern("child-r3-after", base, ps, r3, round)?;
+    expect_pattern("child-untouched-after", base, ps, untouched, round)?;
+    require("child-signal-d", write_signal_byte(to_parent, b'D'))
+}
+
+/// The parent's side after the fork: everything it checks is its own mm.
+fn fixed_cow_parent(
+    base: usize,
+    ps: usize,
+    pages: usize,
+    round: usize,
+    maps: &mut Maps,
+    to_child: libc::c_int,
+    from_child: libc::c_int,
+) -> Result<(), Failure> {
+    let r1 = pages / 4..pages / 2;
+    let r2 = pages / 2..pages / 2 + pages / 4;
+    let r3 = 0..pages / 8;
+    require("parent-wait-f", poll_read_byte(from_child, 5_000))?;
+    // The child replaced r1 and r2 in its own mm only.
+    expect_pattern("parent-all-before", base, ps, 0..pages, round)?;
+    require(
+        "parent-maps-row",
+        maps.snapshot()
+            && maps.rows.iter().any(|row| {
+                row.start <= base && row.end >= base + pages * ps && row.perm == perm_bits(PROT_RW)
+            }),
+    )?;
+    replace_fixed("parent-replace-r3", base, ps, r3.clone())?;
+    expect_value("parent-r3-zero", base, ps, r3.clone(), 0)?;
+    set_pages(base, ps, r3.clone(), PARENT_MARK);
+    require(
+        "parent-signal-p",
+        write_signal_byte(to_child, b'P') && poll_read_byte(from_child, 5_000),
+    )?;
+    expect_pattern("parent-r1-after", base, ps, r1, round)?;
+    expect_pattern("parent-r2-after", base, ps, r2, round)?;
+    expect_value("parent-r3-after", base, ps, r3, PARENT_MARK)
 }
 
 pub fn fixed_over_cow(pages: usize, rounds: usize) -> i32 {
@@ -728,9 +875,6 @@ pub fn fixed_over_cow(pages: usize, rounds: usize) -> i32 {
         println!("delegated-root-fixed-cow mmap failed");
         return 1;
     };
-    let r1 = pages / 4..pages / 2;
-    let r2 = pages / 2..pages / 2 + pages / 4;
-    let r3 = 0..pages / 8;
     let mut maps = Maps::new();
     let mut fixed_maps = 0u64;
     for round in 0..rounds {
@@ -754,29 +898,18 @@ pub fn fixed_over_cow(pages: usize, rounds: usize) -> i32 {
                 libc::close(c2p[0]);
                 libc::alarm(60);
             }
-            let ok = fixed_cow_child(base, ps, pages, round, c2p[1], p2c[0]);
+            let outcome = fixed_cow_child(base, ps, pages, round, c2p[1], p2c[0]);
+            if let Err(failure) = &outcome {
+                failure.report("child", round, base);
+            }
             let _ = std::io::stdout().flush();
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+            unsafe { libc::_exit(if outcome.is_ok() { 0 } else { 1 }) };
         }
         unsafe {
             libc::close(p2c[0]);
             libc::close(c2p[1]);
         }
-        let mut parent_ok = poll_read_byte(c2p[0], 5_000);
-        // The child replaced r1 and r2 in its own mm only.
-        parent_ok &= pages_match(base, ps, 0..pages, round);
-        parent_ok &= maps.snapshot()
-            && maps.rows.iter().any(|row| {
-                row.start <= base && row.end >= base + pages * ps && row.perm == perm_bits(PROT_RW)
-            });
-        if parent_ok {
-            parent_ok &= replace_fixed(base, ps, r3.clone()) && pages_hold(base, ps, r3.clone(), 0);
-            set_pages(base, ps, r3.clone(), PARENT_MARK);
-            parent_ok &= write_signal_byte(p2c[1], b'P') && poll_read_byte(c2p[0], 5_000);
-            parent_ok &= pages_match(base, ps, r1.clone(), round);
-            parent_ok &= pages_match(base, ps, r2.clone(), round);
-            parent_ok &= pages_hold(base, ps, r3.clone(), PARENT_MARK);
-        }
+        let parent = fixed_cow_parent(base, ps, pages, round, &mut maps, p2c[1], c2p[0]);
         unsafe {
             libc::close(p2c[1]);
             libc::close(c2p[0]);
@@ -784,9 +917,13 @@ pub fn fixed_over_cow(pages: usize, rounds: usize) -> i32 {
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
         let child_ok = waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
-        if !parent_ok || !child_ok {
+        if let Err(failure) = &parent {
+            failure.report("parent", round, base);
+        }
+        if parent.is_err() || !child_ok {
             println!(
-                "delegated-root-fixed-cow failed round={round} parent_ok={parent_ok} child_ok={child_ok}"
+                "delegated-root-fixed-cow failed round={round} parent_ok={} child_ok={child_ok}",
+                parent.is_ok()
             );
             return 1;
         }
