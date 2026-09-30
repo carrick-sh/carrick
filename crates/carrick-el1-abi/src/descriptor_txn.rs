@@ -106,6 +106,29 @@ impl DescriptorTxnSlots {
             .filter(move |slot| slot.submitted_for(mm_key))
     }
 
+    /// Either venue: a transaction for `mm_key` is submitted or still being
+    /// applied, so a receipt (and the invalidation before it) is to come.
+    /// A slot keeps its summary bit until the host consumes the receipt.
+    #[must_use]
+    pub fn in_flight_for(&self, mm_key: u64) -> bool {
+        self.submitted
+            .iter()
+            .enumerate()
+            .flat_map(|(word, bits)| {
+                let mut bits = bits.load(Ordering::Acquire);
+                core::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    Some(word * 64 + bit)
+                })
+            })
+            .filter_map(|index| self.slots.get(index))
+            .any(|slot| slot.in_flight_for(mm_key))
+    }
+
     /// Either venue: an in-flight transaction for `mm_key` covers `va`.
     #[must_use]
     pub fn pending_covering(&self, mm_key: u64, va: u64) -> bool {
@@ -274,7 +297,10 @@ mod tests {
         assert!(slots.pending_covering(7, 0x4000_1abc));
         assert!(!slots.pending_covering(7, 0x4000_2000));
         let claimed = slots.slot(3).unwrap().claim_for_mm(7).unwrap();
-        let _ = claimed.complete(DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot));
+        let _ = claimed.complete(
+            DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+            || {},
+        );
         assert_eq!(
             slots.submitted_for(7).count(),
             0,

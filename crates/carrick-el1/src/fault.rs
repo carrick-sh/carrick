@@ -168,7 +168,8 @@ impl CowResolver for HardwareCowResolver {
 pub trait DescriptorTxnApplier {
     /// Claim and execute the submission in `slot` for `mm_key` against the
     /// live graph rooted at `ttbr0`'s table base, invalidating `ttbr0`'s ASID
-    /// when the outcome stored anything. The caller holds the exact editor.
+    /// when the outcome stored anything, before the receipt is published
+    /// (`ClaimedDescriptorTxn::complete`). The caller holds the exact editor.
     fn apply(
         &mut self,
         slot: &DescriptorTxnSlot,
@@ -223,7 +224,7 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
     ) -> Option<DescriptorReceipt> {
         use carrick_mmu_core::aarch64::descriptor_txn::{
             DescriptorOp, InlineJournal, PrimaryTableWords, execute_descriptor_txn,
-            outcome_requires_invalidation, plan_descriptor_op,
+            plan_descriptor_op,
         };
         let maintenance = El1TableMaintenance { ttbr0 };
         let words = unsafe {
@@ -291,13 +292,12 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
                 }
             }
         };
-        let receipt = claimed.complete(outcome);
-        if let DescriptorOutcome::Indeterminate(refusal) = receipt.outcome {
-            panic!("EL1 descriptor transaction rollback failed: {refusal:?}");
-        }
-        if outcome_requires_invalidation(&receipt.outcome) {
+        let receipt = claimed.complete(outcome, || {
             let mut cpu = crate::sched::HardwareCpu;
             crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+        });
+        if let DescriptorOutcome::Indeterminate(refusal) = receipt.outcome {
+            panic!("EL1 descriptor transaction rollback failed: {refusal:?}");
         }
         Some(receipt)
     }
@@ -442,6 +442,12 @@ pub enum DrainOutcome {
 /// the host holds this MM's pause, has excluded every EL1 editor, and
 /// delegates the edit to this vCPU, so a closed gate is its custody rather
 /// than a refusal.
+///
+/// Nothing is reported drained while any of the MM's submissions is still
+/// submitted or being applied by another editor: its receipt, and the ASID
+/// invalidation that precedes it, are still to come, and a caller that
+/// settled or resumed EL0 on the report would run against stale
+/// translations.
 pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
     spaces: &AddressSpaces,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
@@ -451,11 +457,32 @@ pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
     applier: &mut X,
     host_custody: bool,
 ) -> DrainOutcome {
-    if mm_key == 0 || slots.submitted_for(mm_key).next().is_none() {
+    if mm_key == 0 || !slots.in_flight_for(mm_key) {
         return DrainOutcome::Clean;
     }
+    loop {
+        if let Some(outcome) =
+            try_drain_mm_descriptor_txns(spaces, slots, mm_key, ttbr0, owner, applier, host_custody)
+        {
+            return outcome;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// One attempt of [`drain_mm_descriptor_txns`]. `None`: another EL1 editor
+/// holds the MM while some of its submissions are still in flight; retry.
+fn try_drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
+    spaces: &AddressSpaces,
+    slots: &carrick_el1_abi::DescriptorTxnSlots,
+    mm_key: u64,
+    ttbr0: u64,
+    owner: NonZeroU64,
+    applier: &mut X,
+    host_custody: bool,
+) -> Option<DrainOutcome> {
     let Some(index) = spaces.find(mm_key) else {
-        return DrainOutcome::Blocked;
+        return Some(DrainOutcome::Blocked);
     };
     let apply_all = |applier: &mut X| {
         let mut applied = 0;
@@ -466,23 +493,19 @@ pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
         }
         DrainOutcome::Drained(applied)
     };
-    loop {
-        if spaces.grant(index, mm_key).is_none() {
-            return if host_custody {
-                apply_all(applier)
-            } else {
-                DrainOutcome::Blocked
-            };
-        }
-        if let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) {
-            return apply_all(applier);
-        }
-        if slots.submitted_for(mm_key).next().is_none() {
-            // The other editor applied them.
-            return DrainOutcome::Drained(0);
-        }
-        core::hint::spin_loop();
+    if spaces.grant(index, mm_key).is_none() {
+        return Some(if host_custody {
+            apply_all(applier)
+        } else {
+            DrainOutcome::Blocked
+        });
     }
+    if let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) {
+        return Some(apply_all(applier));
+    }
+    // Another editor applied them and published every receipt, each after
+    // its invalidation.
+    (!slots.in_flight_for(mm_key)).then_some(DrainOutcome::Drained(0))
 }
 
 fn is_syscall(frame: &TrapFrame) -> bool {
@@ -515,7 +538,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
         return action;
     };
     let mm_key = task.zone_mm.load(Ordering::Acquire);
-    if mm_key == 0 || slots.submitted_for(mm_key).next().is_none() {
+    if mm_key == 0 || !slots.in_flight_for(mm_key) {
         return action;
     }
     let (Some(owner), Some(index)) = (NonZeroU64::new(frame.slot + 1), spaces.find(mm_key)) else {
@@ -1297,7 +1320,7 @@ mod tests {
         use carrick_mmu_core::aarch64::descriptor_txn::{
             BackingIdentity, DescriptorOp, DescriptorRefusal, DescriptorTxn, DescriptorTxnId,
             InlineJournal, PageSpan, PrimaryTableWords, TableGrants, TableMaintenance,
-            apply_submitted_descriptor_txn, outcome_requires_invalidation,
+            apply_submitted_descriptor_txn,
         };
         use carrick_mmu_core::aarch64::{
             El1PrivateLeafState, GuestLeafPublication, SubstrateGpa, el1_private_leaf_state,
@@ -1341,10 +1364,22 @@ mod tests {
             fn invalidate_range(&self, _va: u64, _len: u64) {}
         }
 
-        /// The EL1 applier over host memory, recording ASID invalidations.
+        /// The EL1 applier over host memory, recording ASID invalidations
+        /// and whether the host could already see the receipt when each ran.
         struct ArenaApplier<'a> {
             arena: &'a Arena,
             invalidated: RefCell<Vec<u64>>,
+            receipt_visible_at_invalidation: RefCell<Vec<bool>>,
+        }
+
+        impl<'a> ArenaApplier<'a> {
+            fn new(arena: &'a Arena) -> Self {
+                Self {
+                    arena,
+                    invalidated: RefCell::new(Vec::new()),
+                    receipt_visible_at_invalidation: RefCell::new(Vec::new()),
+                }
+            }
         }
 
         impl DescriptorTxnApplier for ArenaApplier<'_> {
@@ -1364,17 +1399,20 @@ mod tests {
                 }
                 .unwrap();
                 let mut journal = InlineJournal::new();
-                let receipt = apply_submitted_descriptor_txn(
+                apply_submitted_descriptor_txn(
                     slot,
                     mm_key,
                     &words,
                     SubstrateGpa(ttbr0 & 0x0000_FFFF_FFFF_F000),
                     &mut journal,
-                )?;
-                if outcome_requires_invalidation(&receipt.outcome) {
-                    self.invalidated.borrow_mut().push(ttbr0);
-                }
-                Some(receipt)
+                    || {
+                        self.invalidated.borrow_mut().push(ttbr0);
+                        self.receipt_visible_at_invalidation.borrow_mut().push(
+                            slot.state()
+                                == carrick_mmu_core::aarch64::descriptor_txn::DESCRIPTOR_TXN_RECEIPT,
+                        );
+                    },
+                )
             }
         }
 
@@ -1441,10 +1479,7 @@ mod tests {
             let slots = carrick_el1_abi::DescriptorTxnSlots::new();
             assert!(slots.submit(1, &txn));
             let spaces = published_space(mm, ROOT | ASID);
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             let counters = Counters::default();
             assert_eq!(
                 dispatch(mm, &spaces, &slots, &mut applier, fault, &counters),
@@ -1475,10 +1510,7 @@ mod tests {
             let txn = grant_txn(77, ROOT, VA);
             let slots = carrick_el1_abi::DescriptorTxnSlots::new();
             assert!(slots.submit(0, &txn));
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             // A different MM's fault takes the ordinary path.
             let other = published_space(78, ROOT | ASID);
             assert_eq!(
@@ -1507,10 +1539,7 @@ mod tests {
             let txn = grant_txn(mm, ROOT + 0x4000, VA);
             let slots = carrick_el1_abi::DescriptorTxnSlots::new();
             assert!(slots.submit(0, &txn));
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             let spaces = published_space(mm, ROOT | ASID);
             assert_eq!(
                 dispatch(mm, &spaces, &slots, &mut applier, VA, &Counters::default()),
@@ -1587,10 +1616,7 @@ mod tests {
             let slots = carrick_el1_abi::DescriptorTxnSlots::new();
             assert!(slots.submit(3, &txn));
             let spaces = published_space(77, ROOT | ASID);
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             assert!(writable(&arena));
             assert_eq!(
                 drain_before_el0(
@@ -1615,10 +1641,7 @@ mod tests {
             let slots = carrick_el1_abi::DescriptorTxnSlots::new();
             assert!(slots.submit(0, &txn));
             let spaces = published_space(77, ROOT | ASID);
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             assert_eq!(
                 drain_before_el0(
                     &frame(0),
@@ -1635,10 +1658,7 @@ mod tests {
             let (arena, txn) = armable();
             let slots = carrick_el1_abi::DescriptorTxnSlots::new();
             assert!(slots.submit(0, &txn));
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             assert_eq!(
                 drain_before_el0(
                     &frame(0),
@@ -1655,10 +1675,7 @@ mod tests {
             let (arena, txn) = armable();
             let slots = carrick_el1_abi::DescriptorTxnSlots::new();
             assert!(slots.submit(0, &txn));
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             assert_eq!(
                 drain_before_el0(
                     &frame(SVC),
@@ -1686,10 +1703,7 @@ mod tests {
             assert!(slots.submit(0, &txn));
             let closed = AddressSpaces::new();
             closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
-            let mut applier = ArenaApplier {
-                arena: &_arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&_arena);
             let tasks = [task(77)];
             assert_eq!(
                 drain_before_el0(
@@ -1716,10 +1730,7 @@ mod tests {
             assert!(slots.submit(0, &txn));
             let closed = AddressSpaces::new();
             closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             let tasks = [task(77)];
             assert_eq!(
                 drain_before_el0(
@@ -1776,10 +1787,7 @@ mod tests {
                 let index = spaces.publish_closed(mm, root | ASID, root | ASID).unwrap();
                 spaces.open(index);
             }
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             // The slot's task record names the switched-in thread (MM 77).
             assert_eq!(
                 drain_before_el0(
@@ -1808,10 +1816,7 @@ mod tests {
             // The host holds the MM's pause: the gate is closed.
             let closed = AddressSpaces::new();
             closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
-            let mut applier = ArenaApplier {
-                arena: &arena,
-                invalidated: RefCell::new(Vec::new()),
-            };
+            let mut applier = ArenaApplier::new(&arena);
             let mut call = TrapFrame {
                 esr: carrick_el1_abi::DESCRIPTOR_DRAIN_ESR,
                 slot: 5,
@@ -1828,6 +1833,87 @@ mod tests {
             assert!(!writable(&arena));
             let receipt = slots.take_receipt(5, txn.id).unwrap();
             assert!(txn.verify_receipt(&receipt).is_ok());
+        }
+
+        /// The host settles a receipt and may then retire or reuse the
+        /// backing and tables the edit removed. The receipt must therefore
+        /// be observable only after the ASID invalidation that makes the
+        /// applied edit exclusive, never before it.
+        #[test]
+        fn a_receipt_is_published_only_after_its_asid_invalidation() {
+            let (arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(3, &txn));
+            let spaces = published_space(77, ROOT | ASID);
+            let mut applier = ArenaApplier::new(&arena);
+            drain_before_el0(
+                &frame(SVC),
+                Action::Served,
+                &[task(77)],
+                &spaces,
+                &slots,
+                &mut applier,
+            );
+            assert_eq!(*applier.invalidated.borrow(), vec![ROOT | ASID]);
+            assert_eq!(
+                *applier.receipt_visible_at_invalidation.borrow(),
+                vec![false],
+                "the host could settle the arm before its TLBI ran"
+            );
+            assert!(slots.take_receipt(3, txn.id).is_some());
+        }
+
+        /// Another EL1 editor claimed the host's submission and is still
+        /// applying it (its TLBI has not run). The drain must not report
+        /// the MM drained: the host would settle before that invalidation.
+        #[test]
+        fn a_drain_never_reports_drained_while_another_editor_is_applying() {
+            let (_arena, txn) = armable();
+            let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+            assert!(slots.submit(0, &txn));
+            let spaces = published_space(77, ROOT | ASID);
+            let index = spaces.find(77).unwrap();
+            let other = spaces.try_begin_edit(index, 77, nz(9)).unwrap();
+            let claimed = slots.slot(0).unwrap().claim_for_mm(77).unwrap();
+            let mut applier = ArenaApplier::new(&_arena);
+            let mut step = || {
+                try_drain_mm_descriptor_txns(
+                    &spaces,
+                    &slots,
+                    77,
+                    ROOT | ASID,
+                    nz(1),
+                    &mut applier,
+                    false,
+                )
+            };
+            assert_eq!(
+                step(),
+                None,
+                "reported drained while the claim is unfinished"
+            );
+            // The other editor finishes: invalidation, then the receipt.
+            let invalidated = core::cell::Cell::new(false);
+            claimed.complete(
+                DescriptorOutcome::RolledBack(DescriptorRefusal::Contended),
+                || invalidated.set(true),
+            );
+            assert!(invalidated.get());
+            assert_eq!(step(), Some(DrainOutcome::Drained(0)));
+            drop(other);
+            assert_eq!(
+                drain_mm_descriptor_txns(
+                    &spaces,
+                    &slots,
+                    77,
+                    ROOT | ASID,
+                    nz(1),
+                    &mut applier,
+                    false
+                ),
+                DrainOutcome::Clean,
+                "a published receipt is not in flight"
+            );
         }
 
         struct Frames {

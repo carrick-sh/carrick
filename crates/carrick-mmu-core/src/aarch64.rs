@@ -11397,6 +11397,7 @@ mod tests {
             &words,
             SubstrateGpa(LINUX_PAGE_TABLES_BASE),
             &mut journal,
+            || {},
         )
     }
 

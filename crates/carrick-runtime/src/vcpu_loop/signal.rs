@@ -2443,6 +2443,7 @@ mod guest_descriptor_lane_tests {
             &words,
             SubstrateGpa(LINUX_PAGE_TABLES_BASE),
             &mut InlineJournal::new(),
+            || {},
         )
     }
 
@@ -2903,6 +2904,7 @@ mod guest_descriptor_lane_tests {
             &words,
             SubstrateGpa(LINUX_PAGE_TABLES_BASE),
             &mut InlineJournal::new(),
+            || {},
         )
     }
 

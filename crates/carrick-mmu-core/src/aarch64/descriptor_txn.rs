@@ -320,7 +320,8 @@ pub struct TerminalEdit {
     /// break-before-make in the same journal as the rule and names the freed
     /// pages in [`DescriptorApplied::reclaimed`]; the host returns them to its
     /// allocator only from a verified receipt, i.e. after EL1's
-    /// inner-shareable ASID invalidation completed. That invalidation is what
+    /// inner-shareable ASID invalidation completed (a receipt is never
+    /// published before it: [`ClaimedDescriptorTxn::complete`]). That invalidation is what
     /// the host editor's single-vCPU gate stands in for (it has no all-vCPU
     /// TLBI), so the guest lane needs no such gate.
     pub reclaim_budget: u8,
@@ -1373,6 +1374,17 @@ impl DescriptorTxnSlot {
             && self.mm_key.load(Ordering::Relaxed) == mm_key
     }
 
+    /// Either venue: a transaction for `mm_key` is submitted or being
+    /// applied, so its receipt (and the invalidation before it) is still
+    /// to come.
+    #[must_use]
+    pub fn in_flight_for(&self, mm_key: u64) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            DESCRIPTOR_TXN_SUBMITTED | DESCRIPTOR_TXN_GUEST_APPLYING
+        ) && self.mm_key.load(Ordering::Relaxed) == mm_key
+    }
+
     /// Either venue: an in-flight transaction for `mm_key` covers `va`.
     #[must_use]
     pub fn pending_covering(&self, mm_key: u64, va: u64) -> bool {
@@ -1591,7 +1603,19 @@ impl ClaimedDescriptorTxn<'_> {
 
     /// Publish EL1's outcome. A malformed submission receives a
     /// `BadEncoding` refusal regardless of `outcome`.
-    pub fn complete(self, outcome: DescriptorOutcome) -> DescriptorReceipt {
+    ///
+    /// The host may settle a receipt and then retire or reuse whatever the
+    /// edit removed (backing, table pages, an old owner) as soon as it can
+    /// observe it. So when the outcome stored anything
+    /// ([`outcome_requires_invalidation`]), `invalidate_asid` (ASID TLBI on
+    /// every PE, completed before it returns) runs first, and the receipt
+    /// is published only after it: there is no way to publish an applied
+    /// edit's receipt while stale translations of it are still cachable.
+    pub fn complete(
+        self,
+        outcome: DescriptorOutcome,
+        invalidate_asid: impl FnOnce(),
+    ) -> DescriptorReceipt {
         let receipt = match self.txn {
             Ok(txn) => DescriptorReceipt {
                 id: txn.id,
@@ -1609,6 +1633,9 @@ impl ClaimedDescriptorTxn<'_> {
                 outcome: DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding),
             },
         };
+        if outcome_requires_invalidation(&receipt.outcome) {
+            invalidate_asid();
+        }
         self.slot.publish_receipt(&receipt);
         receipt
     }
@@ -2585,15 +2612,17 @@ where
 }
 
 /// EL1: claim, execute and answer the submission in `slot` for `mm_key`.
-/// The caller holds `mm_key`'s exact editor, passes the root it
-/// authenticated for that MM, and invalidates the ASID when the returned
-/// receipt's outcome stored anything.
+/// The caller holds `mm_key`'s exact editor and passes the root it
+/// authenticated for that MM. `invalidate_asid` runs when the outcome
+/// stored anything, before the receipt becomes visible to the host
+/// ([`ClaimedDescriptorTxn::complete`]).
 pub fn apply_submitted_descriptor_txn<W, J>(
     slot: &DescriptorTxnSlot,
     mm_key: u64,
     words: &W,
     root: SubstrateGpa,
     journal: &mut J,
+    invalidate_asid: impl FnOnce(),
 ) -> Option<DescriptorReceipt>
 where
     W: LiveDescriptorWords + ?Sized,
@@ -2604,7 +2633,7 @@ where
         Ok(txn) => execute_descriptor_txn(words, root, txn, journal).outcome,
         Err(refusal) => DescriptorOutcome::Refused(refusal),
     };
-    Some(claimed.complete(outcome))
+    Some(claimed.complete(outcome, invalidate_asid))
 }
 
 /// One guest COW copy the host granted: the faulting page, the shared frame
@@ -2850,10 +2879,50 @@ mod tests {
             assert!(!slot.submit(&txn), "single flight");
             let claimed = slot.claim_for_mm(7).expect("claim");
             assert_eq!(claimed.txn(), Ok(&txn));
-            let receipt = claimed.complete(applied(&txn, 1).outcome);
+            let receipt = claimed.complete(applied(&txn, 1).outcome, || {});
             assert_eq!(slot.take_receipt(txn.id), Some(receipt));
             assert_eq!(slot.state(), DESCRIPTOR_TXN_IDLE);
             assert!(txn.verify_receipt(&receipt).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_receipt_that_stored_becomes_visible_only_after_its_invalidation() {
+        let stored = DescriptorOutcome::Applied(DescriptorApplied {
+            pages: 1,
+            resident: PageSpan::EMPTY,
+            tables_linked: 0,
+            reclaimed: ReclaimedTables::NONE,
+            live_stores: 1,
+            flush_required: true,
+        });
+        let cases = [
+            (stored, true),
+            (
+                DescriptorOutcome::RolledBack(DescriptorRefusal::Contended),
+                true,
+            ),
+            (
+                DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+                false,
+            ),
+        ];
+        for (outcome, invalidates) in cases {
+            let txn = prepare_txn(3);
+            let slot = DescriptorTxnSlot::new();
+            assert!(slot.submit(&txn));
+            let claimed = slot.claim_for_mm(7).unwrap();
+            let seen = core::cell::Cell::new(None);
+            claimed.complete(outcome, || {
+                seen.set(Some(slot.state()));
+                assert!(slot.take_receipt(txn.id).is_none());
+            });
+            assert_eq!(
+                seen.get(),
+                invalidates.then_some(DESCRIPTOR_TXN_GUEST_APPLYING),
+                "{outcome:?}"
+            );
+            assert!(slot.take_receipt(txn.id).is_some());
         }
     }
 
@@ -2962,7 +3031,10 @@ mod tests {
             !slot.withdraw(txn.id),
             "a claimed transaction cannot be withdrawn"
         );
-        let _ = claimed.complete(DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot));
+        let _ = claimed.complete(
+            DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+            || {},
+        );
         assert!(!slot.pending_covering(7, 0x4000_0000));
         let stale = DescriptorTxnId {
             mm_key: nz(7),
@@ -3001,14 +3073,17 @@ mod tests {
         slot.kind.store(99, Ordering::Relaxed);
         let claimed = slot.claim_for_mm(7).unwrap();
         assert_eq!(claimed.txn(), Err(DescriptorRefusal::BadEncoding));
-        let receipt = claimed.complete(DescriptorOutcome::Applied(DescriptorApplied {
-            pages: 4,
-            resident: PageSpan::EMPTY,
-            tables_linked: 0,
-            reclaimed: ReclaimedTables::NONE,
-            live_stores: 0,
-            flush_required: false,
-        }));
+        let receipt = claimed.complete(
+            DescriptorOutcome::Applied(DescriptorApplied {
+                pages: 4,
+                resident: PageSpan::EMPTY,
+                tables_linked: 0,
+                reclaimed: ReclaimedTables::NONE,
+                live_stores: 0,
+                flush_required: false,
+            }),
+            || {},
+        );
         assert_eq!(
             receipt.outcome,
             DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding)
@@ -3763,13 +3838,26 @@ mod tests {
             };
             assert!(slot.submit(&txn));
             assert!(
-                apply_submitted_descriptor_txn(&slot, 8, &words, SubstrateGpa(ROOT), &mut journal)
-                    .is_none()
+                apply_submitted_descriptor_txn(
+                    &slot,
+                    8,
+                    &words,
+                    SubstrateGpa(ROOT),
+                    &mut journal,
+                    || {}
+                )
+                .is_none()
             );
             assert_eq!(words.image(), before);
-            let receipt =
-                apply_submitted_descriptor_txn(&slot, 7, &words, SubstrateGpa(ROOT), &mut journal)
-                    .unwrap();
+            let receipt = apply_submitted_descriptor_txn(
+                &slot,
+                7,
+                &words,
+                SubstrateGpa(ROOT),
+                &mut journal,
+                || {},
+            )
+            .unwrap();
             let host_receipt = slot.take_receipt(txn.id).unwrap();
             assert_eq!(host_receipt, receipt);
             assert!(txn.verify_receipt(&host_receipt).is_ok());
@@ -4810,9 +4898,15 @@ mod tests {
             let slot = DescriptorTxnSlot::new();
             assert!(slot.submit(&txn));
             let mut journal = InlineJournal::new();
-            let published =
-                apply_submitted_descriptor_txn(&slot, 7, &words, SubstrateGpa(ROOT), &mut journal)
-                    .unwrap();
+            let published = apply_submitted_descriptor_txn(
+                &slot,
+                7,
+                &words,
+                SubstrateGpa(ROOT),
+                &mut journal,
+                || {},
+            )
+            .unwrap();
             let taken = slot.take_receipt(txn.id).unwrap();
             assert_eq!(taken, published);
             assert_eq!(
@@ -4824,7 +4918,7 @@ mod tests {
             // as applied: which tables EL1 unlinked is unknown.
             assert!(slot.submit(&txn));
             let claimed = slot.claim_for_mm(7).unwrap();
-            let _ = claimed.complete(published.outcome);
+            let _ = claimed.complete(published.outcome, || {});
             slot.receipt_reclaimed_len
                 .store(MAX_RECLAIMED_TABLES as u64 + 1, Ordering::Relaxed);
             assert_eq!(

@@ -1124,7 +1124,7 @@ impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
                     execute_descriptor_txn(&words, root, txn, &mut InlineJournal::new()).outcome
                 }
             };
-            claimed.complete(outcome);
+            claimed.complete(outcome, || {});
             applied += 1;
         }
         Ok(applied)
