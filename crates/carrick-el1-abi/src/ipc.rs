@@ -140,6 +140,52 @@ pub fn object_wait_key(
     carrick_sched_core::object_wait::ObjectWaitKey::new(index, u64::from(object.generation()) + 1)
 }
 
+/// The object index and readiness direction whose waits queue `queue`
+/// holds (the inverse of [`object_wait_key`]'s index), for a census.
+pub fn object_of_wait_queue(queue: u32) -> Option<(u32, pipe::WaitFor)> {
+    let slot = queue.checked_sub(1)?;
+    let lane = if slot % 2 == 0 {
+        pipe::WaitFor::Readable
+    } else {
+        pipe::WaitFor::Writable
+    };
+    Some((slot / 2, lane))
+}
+
+/// For a wedge post-mortem: every object queue a live zone record waits on,
+/// with its object's incarnation and readiness. Read-only; each object lock
+/// is taken only if it is free within a few spins, never waited for.
+pub fn write_ipc_wait_census(
+    zone: &carrick_sched_core::ZoneTables,
+    region: &IpcRegion<'_>,
+    out: &mut impl core::fmt::Write,
+) -> core::fmt::Result {
+    let mut seen = [0u64; IPC_OBJECTS / 64];
+    for id in 1..carrick_sched_core::ZONE_RECORDS as u32 {
+        let Some(record) = carrick_sched_core::RecordId::from_raw(id) else {
+            continue;
+        };
+        let rec = zone.record(record);
+        if rec.claim() == carrick_sched_core::Claim::Free {
+            continue;
+        }
+        let Some(wait) = rec.object_wait_census() else {
+            continue;
+        };
+        let Some((object, lane)) = object_of_wait_queue(wait.queue) else {
+            continue;
+        };
+        let o = object as usize;
+        if o >= IPC_OBJECTS || seen[o / 64] & (1 << (o % 64)) != 0 {
+            continue;
+        }
+        seen[o / 64] |= 1 << (o % 64);
+        write!(out, "ipc object {object} (queue {} {lane:?}): ", wait.queue)?;
+        region.write_object_census(object, out)?;
+    }
+    Ok(())
+}
+
 /// Plain-data [`IpcObjectHandle`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -739,6 +785,77 @@ impl<'a> IpcRegion<'a> {
 
     fn record(&self, index: u32) -> Option<&'a IpcObjectRecord> {
         self.dir.objects.get(index as usize)
+    }
+
+    /// One census line for the object at `index`, whatever its incarnation:
+    /// kind, generation, readiness sequences, host subscribers and owed
+    /// wake, and (only when its lock is free within a few spins) its pipe
+    /// bytes and endpoint counts or eventfd counter. Never waits on a holder.
+    pub fn write_object_census(
+        &self,
+        index: u32,
+        out: &mut impl core::fmt::Write,
+    ) -> core::fmt::Result {
+        let Some(record) = self.record(index) else {
+            return writeln!(out, "no such object");
+        };
+        let kind = record.kind.load(Ordering::Acquire);
+        let generation = record.generation.load(Ordering::Acquire);
+        write!(
+            out,
+            "kind={} generation={generation} read_seq={} write_seq={} host_subscribers={} host_wake_owed={}",
+            match kind {
+                KIND_PIPE => "pipe",
+                KIND_EVENTFD => "eventfd",
+                KIND_FREE => "free",
+                _ => "?",
+            },
+            record.read_seq.load(Ordering::Acquire),
+            record.write_seq.load(Ordering::Acquire),
+            record.host_subscribers.load(Ordering::Acquire),
+            record.host_wake_owed.load(Ordering::Acquire),
+        )?;
+        let mut locked = false;
+        for _ in 0..64 {
+            if record
+                .lock
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                locked = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !locked {
+            return writeln!(out, " state=<locked>");
+        }
+        let mut guard = IpcObjectGuard {
+            region: *self,
+            record,
+            handle: IpcObjectHandle {
+                index,
+                generation: generation as u32,
+            },
+        };
+        match guard.kind() {
+            Some(IpcObjectKind::Pipe) => match guard.pipe() {
+                Ok(p) => writeln!(
+                    out,
+                    " unread={} capacity={} readers={} writers={}",
+                    p.unread_bytes(),
+                    p.capacity(),
+                    p.references(End::Reader),
+                    p.references(End::Writer),
+                ),
+                Err(e) => writeln!(out, " pipe={e:?}"),
+            },
+            Some(IpcObjectKind::EventFd) => match guard.eventfd() {
+                Ok(e) => writeln!(out, " counter={} mode={:?}", e.value(), e.mode()),
+                Err(e) => writeln!(out, " eventfd={e:?}"),
+            },
+            None => writeln!(out),
+        }
     }
 
     /// Lock `object` for exclusive use. Authenticates kind and generation

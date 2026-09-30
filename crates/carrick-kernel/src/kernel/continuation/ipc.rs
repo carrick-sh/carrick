@@ -23,7 +23,7 @@ pub use carrick_el1::substrate::ipc::{from_sched_token, to_sched_token, wait_key
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
     IpcError, IpcHandback, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
-    IpcRegion, IpcReleased, OfdPin, RawIpcOpToken,
+    IpcRegion, IpcReleased, IpcWake, OfdPin, RawIpcOpToken,
 };
 pub use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
 
@@ -36,7 +36,10 @@ pub use crate::el1_zone::HostLockWait as HostIpcWait;
 pub trait IpcHostServices {
     fn validate_region(&self, region: &IpcRegion<'_>) -> Result<(), IpcError>;
     fn release_host(&self, token: carrick_el1_abi::ipc::HostResourceToken) -> Result<(), IpcError>;
-    fn wake(&self, object: IpcObjectHandle, lanes: WakeSet);
+    /// Deliver a published change after every IPC lock is released: the
+    /// object's guest waiters on the advanced lanes, and its host
+    /// subscribers when the publication owed them (`host_owed`).
+    fn wake(&self, wake: IpcWake);
 }
 
 /// The production completion owner and scheduler's host placement for object
@@ -76,7 +79,17 @@ impl IpcHostServices for ZoneHostServices {
             .release(carrick_el1_abi::ipc::IpcBacking::Host(token).encode())
             .map(|_| ())
     }
-    fn wake(&self, object: IpcObjectHandle, lanes: WakeSet) {
+    fn wake(&self, wake: IpcWake) {
+        // The owed host wake goes through the same owner delivery as a
+        // host-side pipe/eventfd change (`service_host_wake`).
+        if wake.host_owed {
+            self.owner.service_host_wake(wake.object);
+        }
+        let object = wake.object;
+        let lanes = WakeSet {
+            readers: wake.readers,
+            writers: wake.writers,
+        };
         let Some(zone) = crate::el1_zone::zone() else {
             return;
         };
@@ -254,13 +267,7 @@ pub fn finish(
                 IpcReleased::Object {
                     wake: w,
                     freed: false,
-                } => wake.wake(
-                    w.object,
-                    WakeSet {
-                        readers: w.readers,
-                        writers: w.writers,
-                    },
-                ),
+                } => wake.wake(w),
                 IpcReleased::Host(token) => wake.release_host(token)?,
                 IpcReleased::Object { freed: true, .. } => {}
             }
@@ -410,17 +417,16 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         let va = op.buf.0.wrapping_add(op.progress.written);
         user.prefetch(va, (op.progress.remaining() as u64).min(HOST_STEP_BYTES));
     }
-    let (status, wake_set) = {
+    let (status, published) = {
         let mut guard = region.lock(object, &HostIpcWait)?;
         let mut copy = PrefixCopy::new(&mut user);
-        let step = transfer(&mut guard, &mut op, &mut copy)?;
-        guard.publish(step.1);
-        step
+        let (status, wake_set) = transfer(&mut guard, &mut op, &mut copy)?;
+        (status, guard.publish(wake_set))
     };
     let landed = user.land();
     region.update_operation(&token, op)?;
-    if wake_set.readers || wake_set.writers {
-        wake.wake(object, wake_set);
+    if published.readers || published.writers {
+        wake.wake(published);
     }
     let written = op.progress.written as i64;
     let outcome = |result: i64| IpcHostOutcome::Complete {
