@@ -2356,6 +2356,61 @@
       "rationale": "The kernel's foreign sparse grant proof must name the MM the publication targets; a proof for another MM means the grant and the descriptors would bind different address spaces. Re-reviewed 2026-09-30: a clean EL1 refusal (receipt NotApplied Refused/RolledBack) now returns an error and rolls the prepared backing back; this abort fires only for an unsettled or unauthenticated outcome.",
       "sink": "fatal",
       "domain": "hvpatch::sparse_materialization"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_cow.rs",
+      "function": "settle_guest_cow_completions",
+      "ordinal_in_function": 1,
+      "fingerprint": "162955f54a7a2d84b74c0083d944ebe4f1708b46797013f5b00391f573fd51c0",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_cow",
+      "rationale": "Settlement runs only while the MM's EL1 editor is excluded; a grant still CLAIMED then means an EL1 COW is mid-flight under exclusion, so settling would race the copy/repoint.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_cow.rs",
+      "function": "settle_guest_cow_completions",
+      "ordinal_in_function": 2,
+      "fingerprint": "2b063f6239348740d372eebe2bf026a03a632908d8c086660d58f814a458b496",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_cow",
+      "rationale": "Completions exist only for MMs whose COW runtime provisioned the grants; completions for an MM without one mean the pool and the MM registry disagree.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_cow.rs",
+      "function": "settle_guest_cow_completions",
+      "ordinal_in_function": 3,
+      "fingerprint": "88bd4365ac9e55a48a5137931d144054b8c3c2e077fbd777822c26572934fdf3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_cow",
+      "rationale": "Completions are settled against the exact MM's state; running them on another MM's state would split, retire and alias the wrong address space's frames.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_cow.rs",
+      "function": "settle_guest_cow_completions",
+      "ordinal_in_function": 4,
+      "fingerprint": "78ac0ff22ade20777a7861f3ca4b9106564cc759293510ff4fc12854d6938faf",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_cow",
+      "rationale": "EL1 already repointed live leaves to the grant; if the host cannot settle inventory split, old-frame retirement and alias publication, live translations name frames without kernel authority.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/guest_cow.rs",
+      "function": "settle_guest_cow_completions",
+      "ordinal_in_function": 5,
+      "fingerprint": "78ac0ff22ade20777a7861f3ca4b9106564cc759293510ff4fc12854d6938faf",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_cow",
+      "rationale": "A settled grant's record must return to the pool exactly once; failure means the pool's single-owner state machine was violated and the record could be reissued while referenced.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_cow"
     }
   ]
 }

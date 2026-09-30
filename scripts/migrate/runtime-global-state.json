@@ -3736,6 +3736,14 @@
       "fingerprint": "6670038873952da70b2429e36f8428f963e5bffa09786ff2a3e2e71bd62d8f93",
       "classification": "carrier_infra",
       "rationale": "Host-retained copies of guest descriptor transactions submitted through the carrier-wide shared EL1 DescriptorTxnSlots, one entry per persistent vCPU slot, keyed by exact MM and transaction id; carrier VM scope like the shared EL1 region it mirrors. Entries are settled only under the exact MM mutation guard."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "GUEST_COW_SETTLEMENT",
+      "fingerprint": "d10d556c47439ffc179c5b09ab0b1020b8b4cfbe772087ad1bd5a542a7a7caca",
+      "classification": "carrier_infra",
+      "rationale": "The carrier's guest COW settlement hook: installed once per carrier before any executor starts (latest carrier wins, like the IPC window offer) and read only to settle EL1 COW completions while an MM's EL1 editor is excluded. It stores no current-container or current-MM identity; settlement is keyed by the exact MM passed in."
     }
   ]
 }
