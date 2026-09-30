@@ -10,8 +10,8 @@ fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
     let parent = crate::hvf_aarch64_engine::HostCowStats::default();
     let sibling = parent.clone();
     let child = crate::hvf_aarch64_engine::HostCowStats::default();
-    parent.record_host_cow_resolution();
-    sibling.record_host_cow_resolution();
+    parent.record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::StageFault);
+    sibling.record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::StageFault);
     assert_eq!(parent.host_cow_resolutions(), 2);
     assert_eq!(child.host_cow_resolutions(), 0);
     drop(parent);
@@ -28,11 +28,11 @@ fn carrier_host_cow_ledger_aggregates_admitted_mms_and_survives_retirement() {
     let child = carrier.admit_mm();
     let foreign = other_carrier.admit_mm();
     let detached = HostCowStats::default();
-    parent.record_host_cow_resolution();
-    child.record_host_cow_resolution();
-    child.record_host_cow_resolution();
-    foreign.record_host_cow_resolution();
-    detached.record_host_cow_resolution();
+    parent.record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::StageFault);
+    child.record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::StageFault);
+    child.record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::StageFault);
+    foreign.record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::StageFault);
+    detached.record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::StageFault);
     drop((parent, child));
     let delta = carrier.snapshot().checked_delta(&before).unwrap();
     assert_eq!(delta.host_cow_resolutions, 3, "only this carrier's MMs");
@@ -54,7 +54,8 @@ fn host_cow_snapshot_delta_rejects_incomplete_or_cross_carrier_readings() {
     assert!(a.snapshot().checked_delta(&absent).is_none());
     assert!(absent.checked_delta(&a.snapshot()).is_none());
     assert!(a.snapshot().checked_delta(&b.snapshot()).is_none());
-    a.admit_mm().record_host_cow_resolution();
+    a.admit_mm()
+        .record_host_cow_resolution(crate::hvf_aarch64_engine::HostCowPath::StageFault);
     let later = a.snapshot();
     assert!(
         HostCowLedger::default()
@@ -156,10 +157,10 @@ fn host_cow_counter_counts_only_completed_local_and_foreign_transactions() {
         let body = source.split_once(entry).unwrap().1;
         let body = body.split("\n    pub(crate) fn ").next().unwrap();
         let count = body
-            .find("record_host_cow_resolution()")
+            .find("record_host_cow_resolution(")
             .expect("completed COW needs its own counter");
         assert!(count > body.find(completion).unwrap());
-        assert_eq!(body.matches("record_host_cow_resolution()").count(), 1);
+        assert_eq!(body.matches("record_host_cow_resolution(").count(), 1);
     }
 }
 
@@ -970,4 +971,31 @@ fn el1_frame_grant_rollback_retires_through_the_unmap_path_then_restores_pristin
         .expect("unmap retirement");
     let pristine = body.find(".restore_pristine(").expect("pristine restore");
     assert!(guard < retire && retire < pristine);
+}
+
+#[test]
+fn host_cow_resolutions_are_classified_by_the_path_that_completed_them() {
+    use crate::hvf_aarch64_engine::{HostCowLedger, HostCowPath};
+    use carrick_observability::probes::HvpatchFrameCowTriggerClass as Class;
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let carrier = HostCowLedger::default();
+    let before = carrier.snapshot();
+    let mm = carrier.admit_mm();
+    for class in [
+        Class::Stage1PermissionFault,
+        Class::SyscallGuestWrite,
+        Class::SyscallGuestWrite,
+        Class::BackingMaintenance,
+        Class::PrivilegedInternal,
+    ] {
+        mm.record_host_cow_resolution(HostCowPath::of_trigger(class));
+    }
+    mm.record_host_cow_resolution(HostCowPath::ForeignPublication);
+    let delta = carrier.snapshot().checked_delta(&before).unwrap();
+    assert_eq!(delta.host_cow_by_path, [1, 2, 1, 1, 1]);
+    assert_eq!(
+        delta.host_cow_by_path.iter().sum::<u64>(),
+        delta.host_cow_resolutions,
+        "every resolution has exactly one path"
+    );
 }

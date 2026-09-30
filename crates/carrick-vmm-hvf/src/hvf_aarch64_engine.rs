@@ -54,6 +54,40 @@ struct HostCowLedgerInner {
     guest_lane_deferred: std::sync::atomic::AtomicU64,
     guest_cow_settled: std::sync::atomic::AtomicU64,
     guest_cow_provisioned: std::sync::atomic::AtomicU64,
+    host_cow_by_path: [std::sync::atomic::AtomicU64; HostCowPath::COUNT],
+}
+
+/// Which host path completed a host COW resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum HostCowPath {
+    /// A stage-1 write permission fault the host resolved (`resolve_frame_cow_fault`).
+    StageFault = 0,
+    /// A host write into guest memory for a syscall (pipe `read()`, `poll`
+    /// revents, `waitpid` status...) through `ensure_frame_cow_write`.
+    SyscallCopyOut = 1,
+    /// Host backing maintenance writing through an armed span.
+    BackingMaintenance = 2,
+    /// A privileged host-internal write (the fork child's vvar refresh).
+    PrivilegedInternal = 3,
+    /// A foreign-MM publication (`finish_foreign_cow_publication`).
+    ForeignPublication = 4,
+}
+
+impl HostCowPath {
+    pub const COUNT: usize = 5;
+
+    pub(crate) fn of_trigger(
+        class: carrick_observability::probes::HvpatchFrameCowTriggerClass,
+    ) -> Self {
+        use carrick_observability::probes::HvpatchFrameCowTriggerClass as Class;
+        match class {
+            Class::Stage1PermissionFault => Self::StageFault,
+            Class::SyscallGuestWrite => Self::SyscallCopyOut,
+            Class::BackingMaintenance => Self::BackingMaintenance,
+            Class::PrivilegedInternal => Self::PrivilegedInternal,
+        }
+    }
 }
 
 /// Carrier-owned host COW accounting. Each carrier custody owns exactly one;
@@ -97,6 +131,8 @@ pub struct HostCowSnapshot {
     pub guest_cow_settled: u64,
     /// Replacement grants the host provisioned into the EL1 pool.
     pub guest_cow_provisioned: u64,
+    /// `host_cow_resolutions` by [`HostCowPath`].
+    pub host_cow_by_path: [u64; HostCowPath::COUNT],
 }
 
 impl HostCowSnapshot {
@@ -136,6 +172,16 @@ impl HostCowSnapshot {
             guest_cow_provisioned: self
                 .guest_cow_provisioned
                 .checked_sub(before.guest_cow_provisioned)?,
+            host_cow_by_path: {
+                let mut delta = [0; HostCowPath::COUNT];
+                for (slot, (now, then)) in delta
+                    .iter_mut()
+                    .zip(self.host_cow_by_path.iter().zip(&before.host_cow_by_path))
+                {
+                    *slot = now.checked_sub(*then)?;
+                }
+                delta
+            },
         })
     }
 }
@@ -174,6 +220,9 @@ impl HostCowLedger {
             guest_lane_deferred: self.inner.guest_lane_deferred.load(Ordering::Relaxed),
             guest_cow_settled: self.inner.guest_cow_settled.load(Ordering::Relaxed),
             guest_cow_provisioned: self.inner.guest_cow_provisioned.load(Ordering::Relaxed),
+            host_cow_by_path: core::array::from_fn(|path| {
+                self.inner.host_cow_by_path[path].load(Ordering::Relaxed)
+            }),
         }
     }
 
@@ -247,8 +296,11 @@ impl HostCowStats {
         }
     }
 
-    pub(crate) fn record_host_cow_resolution(&self) {
+    pub(crate) fn record_host_cow_resolution(&self, path: HostCowPath) {
         use std::sync::atomic::Ordering;
+        if let Some(ledger) = &self.ledger {
+            ledger.inner.host_cow_by_path[path as usize].fetch_add(1, Ordering::Relaxed);
+        }
         let bump = |n: u64| n.checked_add(1);
         let own =
             self.host_cow_resolutions

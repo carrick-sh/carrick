@@ -285,6 +285,7 @@ pub struct HostCowSnapshot {
     pub guest_lane_deferred: u64,
     pub guest_cow_settled: u64,
     pub guest_cow_provisioned: u64,
+    pub host_cow_by_path: [u64; 5],
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

@@ -58,9 +58,25 @@ pub enum GuestCowClass {
     /// stale TLB entry faulted): retry after invalidating.
     AlreadyWritable,
     /// Not an EL1-private, COW-armed, Linux-writable 4 KiB leaf: forward.
-    NotArmed,
+    NotArmed(GuestCowNotArmed),
     /// The walk left the reachable primary arena.
     Unreachable(DescriptorRefusal),
+}
+
+/// Why a leaf is not one EL1 resolves as fork COW, in test order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestCowNotArmed {
+    /// No valid L3 page: nothing mapped, an invalid leaf, or a block terminal
+    /// above L3.
+    Unmapped,
+    /// A valid page that is not COW-armed (an untagged backend leaf, or a
+    /// private page `mprotect`ed read-only).
+    NotCowArmed,
+    /// COW-armed but not EL1-private state.
+    NotEl1Private,
+    /// COW-armed and private, but Linux never granted write (a real
+    /// protection fault).
+    NoWriteIntent,
 }
 
 /// The L3 leaf mapping `va`, or `None` when a level above is not a table
@@ -107,12 +123,24 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     let page = far & !(PT_PAGE - 1);
     let leaf = l3_leaf(words, root, page)
         .map_err(GuestCowClass::Unreachable)?
-        .ok_or(GuestCowClass::NotArmed)?;
+        .ok_or(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped))?;
     if terminal_descriptor_permits_el0(leaf, LeafAccess::Write) {
         return Err(GuestCowClass::AlreadyWritable);
     }
+    if leaf & VALID == 0 {
+        return Err(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped));
+    }
+    if !armed_page(leaf) {
+        return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed));
+    }
+    if leaf & SW_EL1_PRIVATE == 0 {
+        return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotEl1Private));
+    }
+    if leaf & SW_EL1_MAY_WRITE == 0 {
+        return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent));
+    }
     if !is_guest_cow_write_leaf(3, leaf) {
-        return Err(GuestCowClass::NotArmed);
+        return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed));
     }
     let output = leaf & PA_MASK_4KIB;
     let compound = output & !(GUEST_COW_COMPOUND - 1);
@@ -304,30 +332,30 @@ mod tests {
         words.leaf_at(VA, OLD | 3 | AF | AP_RO_EL0 | NG);
         assert_eq!(
             classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
-            Err(GuestCowClass::NotArmed)
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed))
         );
         // Armed page without Linux write intent: a real protection fault.
         words.leaf_at(VA, armed(OLD, false));
         assert_eq!(
             classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
-            Err(GuestCowClass::NotArmed)
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent))
         );
         // mprotect(PROT_READ) of a private page (not COW-armed).
         words.leaf_at(VA, OLD | 3 | AF | AP_RO_EL0 | NG | PRIVATE | MAY_WRITE);
         assert_eq!(
             classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
-            Err(GuestCowClass::NotArmed)
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed))
         );
         // Nothing mapped.
         assert_eq!(
             classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 0x10_0000),
-            Err(GuestCowClass::NotArmed)
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped))
         );
         // A block terminal above L3 needs a split: not EL1's.
         words.set(0x3000 + ((VA >> 21) & 511) * 8, OLD | 1 | AF);
         assert_eq!(
             classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
-            Err(GuestCowClass::NotArmed)
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped))
         );
     }
 

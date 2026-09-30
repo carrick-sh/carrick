@@ -61,20 +61,29 @@ const PAGE: u64 = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum CowDecline {
-    /// The leaf is not a valid, EL1-private, COW-armed page EL1 may write
-    /// (untagged backend leaf, kernel-only, block, mprotect'd read-only).
-    Unclassified = 0,
+    /// No valid L3 page: nothing mapped, an invalid leaf, or a block terminal.
+    Unmapped = 0,
+    /// A valid page that is not COW-armed (untagged backend leaf, or a
+    /// private page `mprotect`ed read-only).
+    NotCowArmed = 1,
+    /// COW-armed but not EL1-private state.
+    NotEl1Private = 2,
+    /// COW-armed and private but Linux never granted write (a real
+    /// protection fault).
+    NoWriteIntent = 3,
+    /// The table walk left the reachable primary arena.
+    Unreachable = 4,
     /// No grant for this MM was ready.
-    PoolEmpty = 1,
+    PoolEmpty = 5,
     /// Another EL1 editor held the MM, or a host pause closed its gate.
-    EditorBusy = 2,
+    EditorBusy = 6,
     /// The copy or the repoint refused (stale leaf, window absent, split
     /// needed); the grant went back to the pool untouched semantically.
-    Refused = 3,
+    Refused = 7,
 }
 
 /// Number of [`CowDecline`] reasons.
-pub const COW_DECLINE_REASONS: usize = 4;
+pub const COW_DECLINE_REASONS: usize = 8;
 
 /// One ready grant as EL1 claimed it, or as the host published it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -766,7 +775,7 @@ mod tests {
         let pool = CowGrantPool::new();
         pool.note_declined(CowDecline::PoolEmpty);
         pool.note_declined(CowDecline::PoolEmpty);
-        pool.note_declined(CowDecline::Unclassified);
-        assert_eq!(pool.declined(), [1, 2, 0, 0]);
+        pool.note_declined(CowDecline::NotCowArmed);
+        assert_eq!(pool.declined(), [0, 1, 0, 0, 0, 2, 0, 0]);
     }
 }

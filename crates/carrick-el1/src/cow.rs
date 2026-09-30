@@ -14,7 +14,7 @@ use carrick_el1_abi::{CowDecline, CowGrantCompletion, CowGrantPool};
 use carrick_mmu_core::aarch64::SubstrateGpa;
 use carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_copy_aliases;
 use carrick_mmu_core::aarch64::descriptor_txn::guest_cow::{
-    GuestCowClass, classify_guest_cow_write,
+    GuestCowClass, GuestCowNotArmed, classify_guest_cow_write,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::{
     CowRepointAccess, DescriptorOp, DescriptorOutcome, InlineJournal, LiveDescriptorWords,
@@ -78,9 +78,20 @@ where
             invalidate_asid();
             return GuestCowOutcome::AlreadyWritable;
         }
-        Err(GuestCowClass::NotArmed | GuestCowClass::Unreachable(_)) => {
-            pool.note_declined(CowDecline::Unclassified);
-            return GuestCowOutcome::Declined(CowDecline::Unclassified);
+        Err(class @ (GuestCowClass::NotArmed(_) | GuestCowClass::Unreachable(_))) => {
+            let reason = match class {
+                GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped) => CowDecline::Unmapped,
+                GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed) => CowDecline::NotCowArmed,
+                GuestCowClass::NotArmed(GuestCowNotArmed::NotEl1Private) => {
+                    CowDecline::NotEl1Private
+                }
+                GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent) => {
+                    CowDecline::NoWriteIntent
+                }
+                _ => CowDecline::Unreachable,
+            };
+            pool.note_declined(reason);
+            return GuestCowOutcome::Declined(reason);
         }
     };
     let Some(grant) = pool.claim(mm_key) else {
@@ -473,13 +484,13 @@ mod tests {
         let before = arena.image();
         assert_eq!(
             resolve(&arena, &memory, &pool, VA, &Cell::new(0)),
-            GuestCowOutcome::Declined(CowDecline::Unclassified)
+            GuestCowOutcome::Declined(CowDecline::NoWriteIntent)
         );
         // An untagged backend leaf.
         arena.set_leaf(VA, OLD | 3 | AF | SH | AP_RO_EL0 | NG);
         assert_eq!(
             resolve(&arena, &memory, &pool, VA, &Cell::new(0)),
-            GuestCowOutcome::Declined(CowDecline::Unclassified)
+            GuestCowOutcome::Declined(CowDecline::NotCowArmed)
         );
         assert_eq!(pool.ready(MM).count(), 1);
         arena.set_leaf(VA, before[((Arena::leaf_pa(VA) - ROOT) / 8) as usize]);
