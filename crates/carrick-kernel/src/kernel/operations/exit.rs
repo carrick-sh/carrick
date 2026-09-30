@@ -94,7 +94,7 @@ impl Kernel {
     pub(crate) fn retire_mm_io_state_if_unreferenced(&self, target: &Arc<Mm>) {
         let live = self
             .registry()
-            .state
+            .settled()
             .read()
             .tasks
             .values()
@@ -114,7 +114,7 @@ impl Kernel {
         target: &Arc<FileTable>,
         excluded: Option<TaskKey>,
     ) -> bool {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         state
             .tasks
             .values()
@@ -133,7 +133,7 @@ impl Kernel {
     /// lifecycle glue uses this to authenticate a notification's owner-local
     /// alias after an old shared table changes concurrently with exec.
     pub(crate) fn task_file_tables_exact(&self, target: TaskKey) -> Vec<Arc<FileTable>> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let Some(task) = state
             .tasks
             .get(&target.id)
@@ -236,7 +236,7 @@ impl Kernel {
     where
         T: TaskExitSubscriber + 'static,
     {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         if let Some(record) = state.tasks.get(&task_id) {
             let task = record.task.key();
             self.exit_subscribers.register(task, subscriber);
@@ -269,7 +269,7 @@ impl Kernel {
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
         let files = context.resources.files();
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         ensure_task_unreserved(&state, context.task.key().id)?;
         let record = state
             .tasks
@@ -366,7 +366,7 @@ impl Kernel {
     ) -> Result<PreparedTaskExit, KernelOperationError> {
         let task = self
             .registry()
-            .state
+            .settled()
             .read()
             .tasks
             .get(&task_id)
@@ -409,7 +409,7 @@ impl Kernel {
         self.sweep_retired_threads();
         let task_id = task_key.id;
         let transaction = self.object_ids().transaction_id()?;
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         ensure_task_unreserved(&state, task_id)?;
         let Some(task_record) = state.tasks.get(&task_id) else {
             return Err(KernelOperationError::UnknownTask(task_id));
@@ -644,7 +644,7 @@ impl Kernel {
         // is told who will consume it, and that judgement belongs to the same
         // reserved snapshot that chose the adopter.
         let zombie_reaper = prepared.zombie_reaper();
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         prepared.reservation.validate(&state)?;
         let Some(exiting_record) = state.tasks.get(&prepared.task.id) else {
             return Err(KernelOperationError::ExitTopologyChanged(prepared.task.id));
@@ -734,6 +734,7 @@ impl Kernel {
             vfork_release,
             has_execed: _,
             diagnostic_name: _,
+            thread_pool: _,
         } = record;
         let leader_tid = LinuxTid::for_task_leader(task.key().id);
         let pid_region = task.pid_ns_region();
@@ -818,7 +819,7 @@ impl Kernel {
         } else {
             self.auditors().zombie_created(prepared.task, zombie_reaper);
         }
-        if self.registry().state.read().tasks.is_empty() {
+        if self.registry().settled().read().tasks.is_empty() {
             self.auditors().process_graph_empty(self.unpublished_jobs());
         }
         if let Some(region) = pid_region {
@@ -859,7 +860,7 @@ impl Kernel {
         // wedging forever.
         if let Some(parent_key) = prepared.result_zombie.parent {
             let parent_task = {
-                let state = self.registry().state.read();
+                let state = self.registry().settled().read();
                 state
                     .tasks
                     .get(&parent_key.id)
@@ -981,7 +982,7 @@ impl Kernel {
                     self.wait_for_reservation_change(observed);
                 }
                 Err(KernelOperationError::UnknownTask(_)) => {
-                    let state = self.registry().state.read();
+                    let state = self.registry().settled().read();
                     if let Some(record) = state
                         .zombies
                         .get(&task.id)
@@ -2024,7 +2025,7 @@ mod tests {
             current_gen,
             Arc::new(move |_gen| {
                 // If the registry lock is not held, try_write will succeed (None if any read or write lock held).
-                if kernel_cb.registry().state.try_write().is_some() {
+                if kernel_cb.registry().settled().try_write().is_some() {
                     unposted_lock_cb.store(true, Ordering::SeqCst);
                 }
             }),
@@ -2059,7 +2060,7 @@ mod tests {
         let _sub2 = root.task().subscribe_wake(
             current_gen2,
             Arc::new(move |_gen| {
-                if kernel_cb2.registry().state.try_write().is_some() {
+                if kernel_cb2.registry().settled().try_write().is_some() {
                     posted_lock_cb.store(true, Ordering::SeqCst);
                 }
             }),

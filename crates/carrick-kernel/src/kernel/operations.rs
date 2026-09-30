@@ -343,7 +343,7 @@ impl Drop for TaskSetReservation {
         if !self.active {
             return;
         }
-        let mut state = self.kernel.registry().state.write();
+        let mut state = self.kernel.registry().settled().write();
         let mut changed = false;
         for task_id in &self.task_ids {
             if state.reservations.get(task_id) == Some(&self.transaction) {
@@ -682,7 +682,7 @@ impl PreparedFork {
             None => (None, None),
         };
         {
-            let mut state = kernel.registry().state.write();
+            let mut state = kernel.registry().settled().write();
             operation.validate(&state)?;
             let Some(caller_record) = state.tasks.get(&caller_task.key().id) else {
                 return Err(KernelOperationError::ParentExited);
@@ -734,6 +734,7 @@ impl PreparedFork {
                     vfork_release,
                     has_execed: false,
                     diagnostic_name,
+                    thread_pool: Default::default(),
                 },
             );
             kernel.observe_task_publication(
@@ -810,7 +811,7 @@ impl Kernel {
         }
         let transaction = self.object_ids().transaction_id()?;
         let (caller_revision, child_parent_task, child_parent_revision, operation) = {
-            let mut state = self.registry().state.write();
+            let mut state = self.registry().settled().write();
             let caller_record = state
                 .tasks
                 .get(&parent.task.key().id)
@@ -856,7 +857,7 @@ impl Kernel {
                 return Err(KernelOperationError::StaleContext);
             }
             let caller_revision = caller_record.revision;
-            enforce_rlimit_nproc(&state, parent)?;
+            enforce_rlimit_nproc(self, &state, parent)?;
             let (child_parent_task, child_parent_revision) = match plan.fork_parent() {
                 ForkParentMode::Caller => (Arc::clone(&parent.task), caller_revision),
                 ForkParentMode::InheritCallerParent => {
@@ -982,7 +983,7 @@ impl Kernel {
         let task_id = context.task.key().id;
         loop {
             let observed = self.reservation_epoch();
-            let state = self.registry().state.write();
+            let state = self.registry().settled().write();
             if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
             {
                 drop(state);
@@ -1043,7 +1044,7 @@ impl Kernel {
         let task_id = context.task.key().id;
         loop {
             let observed = self.reservation_epoch();
-            let state = self.registry().state.write();
+            let state = self.registry().settled().write();
             if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
             {
                 drop(state);
@@ -1103,7 +1104,7 @@ impl Kernel {
         shared: Arc<TaskShared>,
         resources: Arc<ThreadResources>,
     ) -> Result<TaskRevision, KernelOperationError> {
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         ensure_task_unreserved(&state, task_id)?;
         let record = state
             .tasks
@@ -1127,7 +1128,7 @@ impl Kernel {
         task_id: TaskId,
     ) -> Result<TaskOperationReservation, KernelOperationError> {
         self.sweep_retired_threads();
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         ensure_task_unreserved(&state, task_id)?;
         let record = state
             .tasks
@@ -1147,27 +1148,13 @@ pub(super) fn next_revision(revision: TaskRevision) -> Result<TaskRevision, Kern
         .ok_or(KernelOperationError::RevisionExhausted)
 }
 
-/// `RLIMIT_NPROC` at fork reservation — setrlimit(2): while the number of
-/// extant threads for the caller's REAL user ID is greater than or equal to
-/// the soft limit, `fork(2)` fails with `EAGAIN`.
+/// `RLIMIT_NPROC` at fork reservation. The rule, its exemptions and the
+/// count live in [`super::thread_ledger`] and are shared with thread clones.
 ///
-/// Two exemptions, both measured against the native-arm64 Docker oracle on
-/// 2026-08-26 rather than assumed from the man page (which documents only the
-/// capability one):
-///
-/// - **real uid 0 is exempt outright.** A container running as root with
-///   Docker's DEFAULT capability set — `CapEff: 00000000a80425fb`, which
-///   contains neither `CAP_SYS_ADMIN` (21) nor `CAP_SYS_RESOURCE` (24) — and a
-///   soft limit of 3 forked 12 live children with no `EAGAIN`. Exempting only
-///   by capability would therefore refuse forks that Linux allows, in the
-///   configuration every default carrick guest runs in.
-/// - effective `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE` exempts any uid, per
-///   setrlimit(2).
-///
-/// The same oracle pins the counting rule for the enforced case: as uid 1000
-/// with a soft limit of 3, exactly 2 live children were created before the
-/// third `fork(2)` returned `EAGAIN` — so the count INCLUDES the caller, and
-/// the comparison is `count >= limit`.
+/// The oracle (native-arm64 Docker, 2026-08-26) pins the counting rule for the
+/// enforced case: as uid 1000 with a soft limit of 3, exactly 2 live children
+/// were created before the third `fork(2)` returned `EAGAIN` — so the count
+/// INCLUDES the caller, and the comparison is `count >= limit`.
 ///
 /// Reservation, not `PreparedFork::commit`, is the enforcement point: by the
 /// time `commit` runs, the frame inventory and the parent's backend
@@ -1176,13 +1163,11 @@ pub(super) fn next_revision(revision: TaskRevision) -> Result<TaskRevision, Kern
 /// `EAGAIN` there, and this runs under the same registry write lock `commit`
 /// validates under.
 ///
-/// Counting rule (Linux counts threads, not thread-group leaders): every live
-/// thread claim of every live task in the registry whose thread's own real
-/// uid equals the caller's — credentials are per thread. Zombies, retired
-/// threads and in-flight reservations are NOT counted, so two forks racing
-/// exactly at the limit can both win by one; `clone_thread` is not gated.
-/// Both are deliberate approximations.
+/// The count covers published threads and every claimed or born thread clone
+/// (the ledger's in-flight credits). An in-flight FORK reservation is still
+/// not counted, so two forks racing exactly at the limit can both win by one.
 fn enforce_rlimit_nproc(
+    kernel: &Kernel,
     state: &RegistryState,
     caller: &KernelContext,
 ) -> Result<(), KernelOperationError> {
@@ -1199,52 +1184,7 @@ fn enforce_rlimit_nproc(
             }
         }
     }
-    if ruid == NsUid::ROOT {
-        return Ok(());
-    }
-    let limit = caller
-        .task()
-        .rlimit(carrick_abi::LinuxResource::Nproc)
-        .rlim_cur;
-    if limit == carrick_abi::LINUX_RLIM_INFINITY {
-        return Ok(());
-    }
-    let caps = caller.task().caps();
-    if caps.has_effective(crate::namespace::process::CAP_SYS_ADMIN)
-        || caps.has_effective(crate::namespace::process::CAP_SYS_RESOURCE)
-    {
-        return Ok(());
-    }
-    // Fast path for the default (8192): fewer live threads in the whole
-    // kernel graph than the limit means no uid can be at it — the ordinary
-    // fork reads no per-thread credentials.
-    let total_threads: usize = state
-        .tasks
-        .values()
-        .map(|record| record.thread_claims.len())
-        .sum();
-    if u64::try_from(total_threads).is_ok_and(|total| total < limit) {
-        return Ok(());
-    }
-    let count = state
-        .tasks
-        .values()
-        .flat_map(|record| {
-            record
-                .thread_claims
-                .keys()
-                .filter_map(|tid| record.task.thread(*tid))
-        })
-        .filter(|thread| thread.resources().credentials().ruid() == ruid)
-        .count();
-    if u64::try_from(count).is_ok_and(|count| count < limit) {
-        return Ok(());
-    }
-    Err(KernelOperationError::ProcessLimitExceeded {
-        uid: ruid,
-        count,
-        limit,
-    })
+    kernel.registry().thread_ledger().admit_fork(state, caller)
 }
 
 pub(super) fn ensure_task_unreserved(
@@ -1468,7 +1408,7 @@ pub(super) mod tests {
         MmBinding::for_aarch64(asid, root)
     }
 
-    pub(super) fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
+    pub(in crate::kernel) fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let input = RootBootstrap::for_reference_model(
             pid,
             ThreadId::synthetic_for_tests(pid),

@@ -14,12 +14,12 @@ use super::{
     check_failpoint, ensure_task_unreserved, next_revision,
 };
 use crate::kernel::clone_plan::{ClonePlan, CloneTaskMode};
-use crate::kernel::core::{Kernel, KernelContext};
+use crate::kernel::core::{Kernel, KernelContext, RegistryState};
 use crate::kernel::ids::{LinuxTid, MmId, TaskId};
 use crate::kernel::objects::{
     TaskKey, TaskLifecycle, TaskRef, TaskShared, ThreadKey, ThreadRef, ThreadResources,
 };
-use crate::kernel::registry::ThreadReservation;
+use crate::kernel::thread_ledger::{ClaimedThreadIdentity, ThreadIdentity};
 
 #[derive(Debug)]
 pub struct StartedThreadClone {
@@ -90,21 +90,22 @@ pub struct ThreadCloneReservation {
     shared: Arc<TaskShared>,
     parent_resources: Arc<ThreadResources>,
     plan: ClonePlan,
-    tid: LinuxTid,
-    reservation: ThreadReservation,
-    pid_identity: Option<crate::namespace::pid::PreparedNamespaceIdentity>,
+    /// The pool entry this clone claimed, with its `RLIMIT_NPROC` charge.
+    identity: ClaimedThreadIdentity,
     failpoint: Option<KernelFailpoint>,
 }
 
 impl ThreadCloneReservation {
     pub const fn tid(&self) -> LinuxTid {
-        self.tid
+        self.identity.identity.tid
     }
 
     pub fn visible_tid(&self) -> i32 {
-        self.pid_identity
+        self.identity
+            .identity
+            .pid_identity
             .as_ref()
-            .map_or(self.tid.raw(), |identity| identity.visible_id() as i32)
+            .map_or(self.tid().raw(), |identity| identity.visible_id() as i32)
     }
 
     pub fn prepare(
@@ -118,7 +119,7 @@ impl ThreadCloneReservation {
         )?);
         let thread = self.task.prepare_clone_thread(
             ThreadKey {
-                tid: self.tid,
+                tid: self.tid(),
                 serial: self.kernel.object_ids().thread_serial()?,
             },
             registry_id,
@@ -157,7 +158,7 @@ pub enum ThreadPublicationReservationAttempt {
 
 impl PreparedThreadClone {
     pub const fn tid(&self) -> LinuxTid {
-        self.reservation.tid
+        self.reservation.tid()
     }
 
     pub fn visible_tid(&self) -> i32 {
@@ -196,7 +197,7 @@ impl PreparedThreadClone {
         let transaction = kernel.object_ids().transaction_id()?;
         loop {
             let observed = kernel.reservation_epoch();
-            let mut state = kernel.registry().state.write();
+            let mut state = kernel.registry().settled().write();
             if state
                 .tasks
                 .get(&task_id)
@@ -229,7 +230,7 @@ impl PreparedThreadClone {
         let task = self.reservation.task.key();
         let task_id = task.id;
         let transaction = kernel.object_ids().transaction_id()?;
-        let mut state = kernel.registry().state.write();
+        let mut state = kernel.registry().settled().write();
         if state
             .tasks
             .get(&task_id)
@@ -254,7 +255,51 @@ impl PreparedThreadClone {
         }
     }
 
+    /// Host-lane publication: take the registry write lock through a settled
+    /// view and publish through [`Self::publish_reserved`], then bring the
+    /// task's identity pool back to depth.
     pub fn commit(self) -> Result<PublishedThreadClone, KernelOperationError> {
+        let kernel = Arc::clone(&self.reservation.kernel);
+        let publication = {
+            let mut state = kernel.registry().settled().write();
+            self.publish_reserved(&mut state, PublicationLane::HostClone)?
+        };
+        let published = publication.finish();
+        if let Some(context) = published.context() {
+            let state = kernel.registry().settled().read();
+            kernel
+                .registry()
+                .thread_ledger()
+                .replenish(&kernel, &state, context);
+        }
+        Ok(published)
+    }
+
+    /// Hand this prepared thread to the ledger as a birth: it exists before
+    /// its publication, and the next settled registry view publishes it
+    /// through [`Self::publish_reserved`] — the same body as [`Self::commit`].
+    pub fn record_birth(self) -> ThreadKey {
+        let key = self.thread.key();
+        let kernel = Arc::clone(&self.reservation.kernel);
+        kernel.registry().thread_ledger().record_birth(self);
+        key
+    }
+
+    /// The one publication body shared by the host clone and ledger
+    /// settlement. The caller holds the registry write lock.
+    ///
+    /// - [`PublicationLane::HostClone`] publishes on behalf of a caller that is
+    ///   still blocked in `clone(2)`: the caller's thread, shared state and
+    ///   resources must be the ones the clone captured, and the task must be
+    ///   free of (or hold) the publication reservation.
+    /// - [`PublicationLane::Settle`] publishes a birth, which already happened:
+    ///   only the task's identity is checked. Births must not race a task
+    ///   transaction; the ForkClosing gate (stage L4) is what excludes them.
+    pub(in crate::kernel) fn publish_reserved(
+        self,
+        state: &mut RegistryState,
+        lane: PublicationLane,
+    ) -> Result<ReservedThreadPublication, KernelOperationError> {
         let Self {
             reservation,
             thread,
@@ -270,27 +315,32 @@ impl PreparedThreadClone {
             shared,
             parent_resources,
             plan: _,
+            identity,
+            failpoint,
+        } = reservation;
+        let ClaimedThreadIdentity { identity, credit } = identity;
+        let ThreadIdentity {
             tid,
             reservation,
             pid_identity,
-            failpoint,
-        } = reservation;
+        } = identity;
         let visible_tid = pid_identity
             .as_ref()
             .map_or(tid.raw(), |identity| identity.visible_id() as i32);
-        let published_and_pending = {
-            let mut state = kernel.registry().state.write();
+        if lane == PublicationLane::HostClone {
             if let Some(publication) = publication.as_ref() {
-                publication.validate(&state)?;
+                publication.validate(state)?;
             } else {
-                ensure_task_unreserved(&state, task.key().id)?;
+                ensure_task_unreserved(state, task.key().id)?;
             }
-            let Some(record) = state.tasks.get_mut(&task.key().id) else {
-                return Err(KernelOperationError::ParentExited);
-            };
-            if record.task.key() != task.key() {
-                return Err(KernelOperationError::ParentExited);
-            }
+        }
+        let Some(record) = state.tasks.get_mut(&task.key().id) else {
+            return Err(KernelOperationError::ParentExited);
+        };
+        if record.task.key() != task.key() {
+            return Err(KernelOperationError::ParentExited);
+        }
+        if lane == PublicationLane::HostClone {
             let current_shared = task.shared();
             let current_caller = task
                 .thread(caller.key().tid)
@@ -302,55 +352,91 @@ impl PreparedThreadClone {
             {
                 return Err(KernelOperationError::StaleContext);
             }
-            let published_revision = next_revision(record.revision)?;
-            check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
-            if pid_identity.is_some_and(|identity| !identity.commit()) {
-                return Err(KernelOperationError::PidNamespaceMembership(task.key().id));
-            }
-            let claim = reservation.commit();
-            // The task, key and unique numeric claim were validated while the
-            // registry write lock was held. Publication has no recoverable
-            // failure left after namespace membership commits; treating an
-            // invariant violation as an ordinary error would leave a ghost
-            // namespace member behind.
-            task.publish_thread(Arc::clone(&thread))
-                .unwrap_or_else(|_| {
-                    carrick_fatal!(
-                        "kernel::thread_publication",
-                        "publish_thread failed in PreparedThreadClone::commit"
-                    );
-                });
-            record.thread_claims.insert(tid, claim);
-            record.revision = published_revision;
-            kernel.observe_thread_publication(&thread, &resources, published_revision);
-            let pending_publication = match publication.as_mut() {
-                Some(publication) => Some(publication.commit(&mut state)?),
-                None => None,
-            };
-            (published_revision, pending_publication)
+        }
+        let published_revision = next_revision(record.revision)?;
+        check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
+        if pid_identity.is_some_and(|identity| !identity.commit()) {
+            return Err(KernelOperationError::PidNamespaceMembership(task.key().id));
+        }
+        let claim = reservation.commit();
+        // The task, key and unique numeric claim were validated while the
+        // registry write lock was held. Publication has no recoverable
+        // failure left after namespace membership commits; treating an
+        // invariant violation as an ordinary error would leave a ghost
+        // namespace member behind.
+        task.publish_thread(Arc::clone(&thread))
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "kernel::thread_publication",
+                    "publish_thread failed in PreparedThreadClone::publish_reserved"
+                );
+            });
+        record.thread_claims.insert(tid, claim);
+        record.revision = published_revision;
+        // The thread claim inserted above now carries this thread in the
+        // `RLIMIT_NPROC` count; release the in-flight charge in the same
+        // critical section so no admission sees it twice or not at all.
+        drop(credit);
+        kernel.observe_thread_publication(&thread, &resources, published_revision);
+        let pending = match publication.as_mut() {
+            Some(publication) => Some(publication.commit(state)?),
+            None => None,
         };
-        let (published_revision, pending_publication) = published_and_pending;
-        if let Some(pending) = pending_publication {
+        let task_key = task.key();
+        Ok(ReservedThreadPublication {
+            published: PublishedThreadClone {
+                started: Some(StartedThreadClone {
+                    context: KernelContext::from_parts(
+                        Arc::clone(&kernel),
+                        task,
+                        thread,
+                        shared,
+                        resources,
+                        published_revision,
+                    ),
+                }),
+                visible_tid,
+                start_wait,
+                start_release,
+            },
+            pending,
+            kernel,
+            task: task_key,
+        })
+    }
+}
+
+/// Which lane is publishing a prepared thread; see
+/// [`PreparedThreadClone::publish_reserved`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationLane {
+    HostClone,
+    Settle,
+}
+
+/// A thread published under the registry write lock whose after-lock work —
+/// the reservation-change wake and the fork auditor — has not run yet.
+#[must_use = "finish the publication after releasing the registry lock"]
+pub(crate) struct ReservedThreadPublication {
+    published: PublishedThreadClone,
+    pending: Option<super::PendingReservationPublication>,
+    kernel: Arc<Kernel>,
+    task: TaskKey,
+}
+
+impl ReservedThreadPublication {
+    /// Run the after-lock work. Callers must not hold the registry lock:
+    /// reservation-change subscribers take it shared.
+    pub(crate) fn finish(self) -> PublishedThreadClone {
+        if let Some(pending) = self.pending {
             pending.publish();
         }
-        kernel
-            .auditors()
-            .fork_admitted(task.key(), task.key(), crate::observe::ForkKind::Thread);
-        Ok(PublishedThreadClone {
-            started: Some(StartedThreadClone {
-                context: KernelContext::from_parts(
-                    kernel,
-                    task,
-                    thread,
-                    shared,
-                    resources,
-                    published_revision,
-                ),
-            }),
-            visible_tid,
-            start_wait,
-            start_release,
-        })
+        self.kernel.auditors().fork_admitted(
+            self.task,
+            self.task,
+            crate::observe::ForkKind::Thread,
+        );
+        self.published
     }
 }
 
@@ -372,7 +458,7 @@ impl Kernel {
         required_task: Option<TaskId>,
         tid: LinuxTid,
     ) -> Option<(TaskKey, ThreadKey)> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         if let Some(task_id) = required_task {
             let record = state.tasks.get(&task_id)?;
             let thread = record.task.thread(tid)?;
@@ -393,7 +479,7 @@ impl Kernel {
         &self,
         key: ThreadKey,
     ) -> Option<Arc<crate::kernel::objects::Thread>> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         state.tasks.values().find_map(|record| {
             let thread = record.task.thread(key.tid)?;
             (thread.key() == key).then_some(thread)
@@ -409,7 +495,7 @@ impl Kernel {
         generation: crate::kernel::objects::ExecutionGeneration,
         commit: impl FnOnce() -> R,
     ) -> Option<R> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let thread = state.tasks.values().find_map(|record| {
             let thread = record.task.thread(key.tid)?;
             (thread.key() == key).then_some(thread)
@@ -424,7 +510,7 @@ impl Kernel {
     /// absent from registry` carrier abort.
     #[cfg(any(test, feature = "test-support"))]
     pub fn reap_task_record_for_test(&self, task: TaskId) -> bool {
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         let Some(record) = state.tasks.remove(&task) else {
             return false;
         };
@@ -481,7 +567,7 @@ impl Kernel {
         ) {
             return Liveness::Terminal;
         }
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         if state
             .retired_threads
             .iter()
@@ -507,7 +593,12 @@ impl Kernel {
     /// reap, and this helper exists so the two can be told apart.
     #[cfg(test)]
     pub(crate) fn drop_task_record_for_test(&self, task: TaskId) -> bool {
-        self.registry().state.write().tasks.remove(&task).is_some()
+        self.registry()
+            .settled()
+            .write()
+            .tasks
+            .remove(&task)
+            .is_some()
     }
 
     /// Diagnostic projection of one scheduler thread's execution state for the
@@ -515,7 +606,7 @@ impl Kernel {
     /// and which execution generation it considers active. Read-only; taken
     /// on the abort path only.
     pub(crate) fn scheduler_thread_execution_diagnostic(&self, key: ThreadKey) -> String {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let Some(thread) = state.tasks.values().find_map(|record| {
             let thread = record.task.thread(key.tid)?;
             (thread.key() == key).then_some(thread)
@@ -543,7 +634,7 @@ impl Kernel {
         target_generation: crate::kernel::objects::ExecutionGeneration,
         commit: impl FnOnce() -> R,
     ) -> Option<R> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let resolve = |key: ThreadKey| {
             state.tasks.values().find_map(|record| {
                 let thread = record.task.thread(key.tid)?;
@@ -595,7 +686,7 @@ impl Kernel {
         target_generation: crate::kernel::objects::ExecutionGeneration,
         commit: impl FnOnce() -> R,
     ) -> Option<R> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let resolve = |key: ThreadKey| {
             state.tasks.values().find_map(|record| {
                 let thread = record.task.thread(key.tid)?;
@@ -623,7 +714,7 @@ impl Kernel {
         target_generation: crate::kernel::objects::ExecutionGeneration,
         commit: impl FnOnce() -> R,
     ) -> Option<R> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let record = state.tasks.values().find(|record| {
             record.task.lifecycle() == TaskLifecycle::Live
                 && record.task.parent().is_none()
@@ -647,7 +738,7 @@ impl Kernel {
         target_generation: crate::kernel::objects::ExecutionGeneration,
         commit: impl FnOnce() -> R,
     ) -> Option<R> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let resolve = |key: ThreadKey| {
             state.tasks.values().find_map(|record| {
                 let thread = record.task.thread(key.tid)?;
@@ -670,9 +761,14 @@ impl Kernel {
             .flatten()
     }
 
-    /// Reserve a Linux TID while keeping the thread undiscoverable. The
-    /// execution adapter prepares its host registry/vCPU state from the typed
-    /// TID, then supplies the distinct registry identity to `prepare`.
+    /// Claim a thread identity from the parent task's pool while keeping the
+    /// thread undiscoverable. The execution adapter prepares its host
+    /// registry/vCPU state from the typed TID, then supplies the distinct
+    /// registry identity to `prepare`.
+    ///
+    /// This is also the `RLIMIT_NPROC` enforcement point for thread clones:
+    /// the claim charges the caller's real uid in the ledger, so the count
+    /// covers published threads and every claimed or born clone exactly.
     pub fn reserve_thread_clone(
         self: &Arc<Self>,
         parent: &KernelContext,
@@ -686,8 +782,8 @@ impl Kernel {
         if plan.task() != CloneTaskMode::JoinThreadGroup {
             return Err(KernelOperationError::ExpectedThreadGroup);
         }
-        {
-            let state = self.registry().state.read();
+        let identity = {
+            let state = self.registry().settled().read();
             ensure_task_unreserved(&state, parent.task.key().id)?;
             let record = state
                 .tasks
@@ -711,21 +807,9 @@ impl Kernel {
             {
                 return Err(KernelOperationError::StaleContext);
             }
-        }
-        let (tid, reservation) = self.ids().reserve_thread()?;
-        let pid_identity = match parent.task().pid_ns_region() {
-            Some(region) => {
-                let internal = u32::try_from(tid.raw()).map_err(|_| {
-                    KernelOperationError::PidNamespaceMembership(parent.task().key().id)
-                })?;
-                let parent_id = u32::try_from(parent.task().key().id.raw()).map_err(|_| {
-                    KernelOperationError::PidNamespaceMembership(parent.task().key().id)
-                })?;
-                Some(region.reserve_identity(internal, parent_id).ok_or(
-                    KernelOperationError::PidNamespaceMembership(parent.task().key().id),
-                )?)
-            }
-            None => None,
+            self.registry()
+                .thread_ledger()
+                .claim(self, &state, record, parent)?
         };
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         Ok(ThreadCloneReservation {
@@ -735,9 +819,7 @@ impl Kernel {
             shared: Arc::clone(&parent.shared),
             parent_resources: Arc::clone(&parent.resources),
             plan,
-            tid,
-            reservation,
-            pid_identity,
+            identity,
             failpoint,
         })
     }
@@ -999,6 +1081,10 @@ mod tests {
     #[test]
     fn thread_exit_unpublishes_before_draining_its_tid_claim() {
         let (kernel, root) = bootstrap(195);
+        // Exact id accounting of the retired claim alone: no standing pool
+        // entries (the `CARRICK_THREAD_POOL=0` shape). Pool release is pinned
+        // by `task_exit_releases_standing_pool_identities`.
+        kernel.registry().thread_ledger().set_pool_depth_for_test(0);
         let root_counts = kernel.ids().counts();
         let plan = ClonePlan::from_flags(
             LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,

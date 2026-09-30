@@ -1296,7 +1296,7 @@ impl BlockedContinuation {
                         // For live tasks, the waiting process may be either the parent or an
                         // attached ptrace tracer. For zombies, ptrace has already detached at exit
                         // so only the parent may reap.
-                        let state = kernel.registry().state.read();
+                        let state = kernel.registry().settled().read();
                         let child_key = if let Some(record) = state.tasks.get(&id) {
                             let child_key = record.task.key();
                             let parent = record.task.parent();

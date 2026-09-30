@@ -35,7 +35,7 @@ impl Drop for ExecReservation {
         if !self.active {
             return;
         }
-        let mut state = self.kernel.registry().state.write();
+        let mut state = self.kernel.registry().settled().write();
         if state.reservations.get(&self.task.id) == Some(&self.transaction) {
             state.reservations.remove(&self.task.id);
         }
@@ -271,7 +271,7 @@ impl Kernel {
         }
         let transaction = self.object_ids().transaction_id()?;
         let context = {
-            let mut state = self.registry().state.write();
+            let mut state = self.registry().settled().write();
             let (task, thread, shared, resources, revision) = {
                 let record = state
                     .tasks
@@ -332,7 +332,7 @@ impl Kernel {
         }
         let transaction = self.object_ids().transaction_id()?;
         let revision = {
-            let mut state = self.registry().state.write();
+            let mut state = self.registry().settled().write();
             let record = state
                 .tasks
                 .get(&context.task.key().id)
@@ -477,7 +477,7 @@ impl Kernel {
         let transaction = reservation.transaction;
         let leader_tid = LinuxTid::for_task_leader(prepared.task.id);
         let (task, revision) = {
-            let mut state = self.registry().state.write();
+            let mut state = self.registry().settled().write();
             if state.reservations.get(&prepared.task.id) != Some(&transaction) {
                 return Err(ExecError::ReservationLost);
             }
@@ -520,7 +520,7 @@ impl Kernel {
         // object lock held. Publication below is then an infallible transition.
         prepared.guard.terminate_siblings();
 
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         debug_assert_eq!(
             state.reservations.get(&prepared.task.id),
             Some(&transaction)
@@ -627,7 +627,7 @@ impl Kernel {
             return Err(ExecError::StalePublication);
         }
         let release = {
-            let mut state = self.registry().state.write();
+            let mut state = self.registry().settled().write();
             let record = state
                 .tasks
                 .get_mut(&receipt.task.id)
@@ -662,7 +662,7 @@ impl Kernel {
     /// optionally scoped to a single process.
     pub fn sweep_retired_threads_for_process(&self, process: Option<TaskId>) -> usize {
         {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let has_drainable = state.retired_threads.iter().any(|retired| {
                 process.is_none_or(|pid| retired._task.id == pid)
                     && retired.thread.strong_count() == 0
@@ -671,7 +671,7 @@ impl Kernel {
                 return 0;
             }
         }
-        let mut state = self.registry().state.write();
+        let mut state = self.registry().settled().write();
         let before = state.retired_threads.len();
         state.retired_threads.retain(|retired| {
             if process.is_none_or(|pid| retired._task.id == pid) {
