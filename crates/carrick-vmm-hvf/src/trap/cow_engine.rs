@@ -68,7 +68,19 @@ pub(super) struct GuestPreparedBacking {
     pub(super) extent: InventoryExtent,
     receipt: carrick_hal::FrameInventoryApplyReceipt,
     owner: Option<GlobalFrameOwnerRollback>,
+    foreign: Option<ForeignGrantProof>,
     armed: bool,
+}
+
+/// The kernel's foreign-MM proof for a grant that is itself the final
+/// inventory commit of a foreign publication (a sparse first write). The
+/// proof binds the grant's revision, so no later commit may follow it.
+pub(super) struct ForeignGrantProof {
+    pub(super) kernel_proof: carrick_hal::ForeignCowKernelProof,
+    pub(super) owner_generation: carrick_hal::ForeignOwnerGeneration,
+    /// The grant commit's mapping-population delta, for the snapshot.
+    pub(super) prepared: Vec<carrick_hal::MappingId>,
+    pub(super) unmapped: Vec<carrick_hal::MappingId>,
 }
 impl GuestPreparedBacking {
     fn prepare(
@@ -87,10 +99,57 @@ impl GuestPreparedBacking {
         custody: std::sync::Arc<CarrierVmCustody>,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        reservation: carrick_hal::FrameInventoryReservation,
+        mm: std::num::NonZeroU64,
+        stage: InventoryMappingStage,
+        owner: GlobalFrameOwnerRollback,
+    ) -> Result<Self, TrapError> {
+        Self::prepare_owned_for(
+            custody,
+            authority,
+            inventory,
+            reservation,
+            mm,
+            stage,
+            owner,
+            None,
+        )
+    }
+    /// [`Self::prepare_owned`] for a foreign MM whose grant is the final
+    /// inventory commit: the kernel applies it through `apply_foreign_cow`
+    /// and mints the proof for `semantic` at the grant's revision.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_owned_foreign(
+        custody: std::sync::Arc<CarrierVmCustody>,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        reservation: carrick_hal::FrameInventoryReservation,
+        mm: std::num::NonZeroU64,
+        stage: InventoryMappingStage,
+        owner: GlobalFrameOwnerRollback,
+        semantic: (carrick_guest_mem::GuestVa, std::num::NonZeroUsize),
+    ) -> Result<Self, TrapError> {
+        Self::prepare_owned_for(
+            custody,
+            authority,
+            inventory,
+            reservation,
+            mm,
+            stage,
+            owner,
+            Some(semantic),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_owned_for(
+        custody: std::sync::Arc<CarrierVmCustody>,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
         mut reservation: carrick_hal::FrameInventoryReservation,
         mm: std::num::NonZeroU64,
         stage: InventoryMappingStage,
         owner: GlobalFrameOwnerRollback,
+        foreign: Option<(carrick_guest_mem::GuestVa, std::num::NonZeroUsize)>,
     ) -> Result<Self, TrapError> {
         let length = carrick_hal::FrameLength::from_mapping_extent(
             std::num::NonZeroU64::new(stage.length)
@@ -100,13 +159,52 @@ impl GuestPreparedBacking {
             HvfVmState::stage_mapping_in(&custody, &mut inventory.lock(), &mut reservation, stage)?;
         let commit = reservation.commit(());
         let challenge = commit.receipt_challenge();
-        let (receipt, generation) = match authority.apply_frame_grant(
-            commit,
-            extent.mapping,
-            extent.frame,
-            carrick_guest_mem::Gpa(stage.gpa),
-            length,
-        ) {
+        let (mut prepared_ids, mut unmapped_ids) = (Vec::new(), Vec::new());
+        for event in commit.batch().events() {
+            match *event {
+                carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
+                    unmapped_ids.push(mapping)
+                }
+                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
+                    prepared_ids.push(mapping)
+                }
+                _ => {}
+            }
+        }
+        let applied = match foreign {
+            None => authority
+                .apply_frame_grant(
+                    commit,
+                    extent.mapping,
+                    extent.frame,
+                    carrick_guest_mem::Gpa(stage.gpa),
+                    length,
+                )
+                .map(|(receipt, generation)| (receipt, generation, None)),
+            Some((start, len)) => authority
+                .apply_foreign_cow(
+                    commit,
+                    start,
+                    len,
+                    extent.mapping,
+                    extent.frame,
+                    carrick_guest_mem::Gpa(stage.gpa),
+                    length,
+                )
+                .map(|(receipt, proof, generation)| {
+                    (
+                        receipt,
+                        generation,
+                        Some(ForeignGrantProof {
+                            kernel_proof: proof,
+                            owner_generation: generation,
+                            prepared: prepared_ids,
+                            unmapped: unmapped_ids,
+                        }),
+                    )
+                }),
+        };
+        let (receipt, generation, foreign) = match applied {
             Ok(applied) => applied,
             Err(error) => {
                 HvfVmState::rollback_unpublished_mappings(
@@ -127,6 +225,7 @@ impl GuestPreparedBacking {
             extent,
             receipt,
             owner: Some(owner),
+            foreign,
             armed: true,
         };
         if !challenge.authenticate_apply(&prepared.receipt, mm)
@@ -152,6 +251,14 @@ impl GuestPreparedBacking {
             owner_generation: nonzero(self.extent.stage2_owner.generation)?,
             inventory_revision: nonzero(self.receipt.revision())?,
         })
+    }
+    /// The kernel inventory revision the grant published at.
+    pub(super) fn revision(&self) -> u64 {
+        self.receipt.revision()
+    }
+    /// The foreign proof minted with the grant, taken once after commit.
+    pub(super) fn take_foreign_proof(&mut self) -> Option<ForeignGrantProof> {
+        self.foreign.take()
     }
     pub(super) fn commit(&mut self) {
         self.armed = false;
