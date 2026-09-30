@@ -212,6 +212,160 @@
       "migration_family": "write_attempt"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1201,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".write_fd_open_paths()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "record_fd_open_path",
+      "migration_family": "create_install"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1207,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".read_fd_open_paths()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "lookup_recorded_fd_open_path",
+      "migration_family": "create_install"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1392,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "write_shared_supported",
+      "migration_family": "write_attempt"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1403,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let table = files.read_open_files();",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_pipe_read_end_for_pipe_id",
+      "migration_family": "read_attempt"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1405,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(other_open) = other.description.inspect() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_pipe_read_end_for_pipe_id",
+      "migration_family": "read_attempt"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1432,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let table = files.read_open_files();",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_pipe_write_end_for_pipe_id",
+      "migration_family": "write_attempt"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1434,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(other_open) = other.description.inspect() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_pipe_write_end_for_pipe_id",
+      "migration_family": "write_attempt"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1485,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let table = files.read_open_files();",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_pipe_read_end_buffered_bytes",
+      "migration_family": "read_attempt"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1487,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(other_open) = other.description.try_inspect() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_pipe_read_end_buffered_bytes",
+      "migration_family": "read_attempt"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1513,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "of.description.inspect().as_deref(),",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "fd_lacks_fsync",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 1849,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "fallocate",
+      "migration_family": "create_install"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 2062,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "ftruncate",
+      "migration_family": "create_install"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 2270,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "open_file.description.inspect().as_deref(),",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "sync_file_range",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "line": 2318,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_file_fd_for_flush",
+      "migration_family": "inspect_misc"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/fs/access.rs",
       "line": 516,
       "categories": [
@@ -1622,160 +1776,6 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1200,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".write_fd_open_paths()",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "record_fd_open_path",
-      "migration_family": "create_install"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1206,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".read_fd_open_paths()",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "lookup_recorded_fd_open_path",
-      "migration_family": "create_install"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1391,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read_for_io() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "write_shared_supported",
-      "migration_family": "write_attempt"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1402,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let table = files.read_open_files();",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "host_pipe_read_end_for_pipe_id",
-      "migration_family": "read_attempt"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1404,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(other_open) = other.description.inspect() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "host_pipe_read_end_for_pipe_id",
-      "migration_family": "read_attempt"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1431,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let table = files.read_open_files();",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "host_pipe_write_end_for_pipe_id",
-      "migration_family": "write_attempt"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1433,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(other_open) = other.description.inspect() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "host_pipe_write_end_for_pipe_id",
-      "migration_family": "write_attempt"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1484,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let table = files.read_open_files();",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "host_pipe_read_end_buffered_bytes",
-      "migration_family": "read_attempt"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1486,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(other_open) = other.description.try_inspect() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "host_pipe_read_end_buffered_bytes",
-      "migration_family": "read_attempt"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1512,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "of.description.inspect().as_deref(),",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "fd_lacks_fsync",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 1848,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "fallocate",
-      "migration_family": "create_install"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 2061,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "ftruncate",
-      "migration_family": "create_install"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 2269,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "open_file.description.inspect().as_deref(),",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "sync_file_range",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "line": 2317,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read_for_io() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "host_file_fd_for_flush",
-      "migration_family": "inspect_misc"
-    },
-    {
       "file": "crates/carrick-kernel/src/dispatch/ioring.rs",
       "line": 837,
       "categories": [
@@ -2313,6 +2313,28 @@
       "text": ".read_open_files()",
       "scope_kind": "test_or_definition",
       "enclosing_function": "shared_file_table_owner_exit_purges_without_closing_shared_alias",
+      "migration_family": "create_install"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net.rs",
+      "line": 628,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.inspect() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "wait_source_kind",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net.rs",
+      "line": 959,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "f.description.inspect().as_deref(),",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "fd_is_eventfd",
       "migration_family": "create_install"
     },
     {
@@ -3085,28 +3107,6 @@
       "scope_kind": "production_callsite",
       "enclosing_function": "getsockopt",
       "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 628,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.inspect() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "wait_source_kind",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 959,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "f.description.inspect().as_deref(),",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "fd_is_eventfd",
-      "migration_family": "create_install"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/perf.rs",
@@ -4215,17 +4215,6 @@
       "migration_family": "slot_description_mutation"
     },
     {
-      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "line": 197,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let successor_slots = successor.map(|table| table.read_open_files());",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "retire_file_table_generation",
-      "migration_family": "lifecycle"
-    },
-    {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
       "line": 1950,
       "categories": [
@@ -4246,6 +4235,17 @@
       "scope_kind": "test_or_definition",
       "enclosing_function": "external_peer_root_has_no_init_wait_edge_and_retains_only_stdio_files",
       "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
+      "line": 197,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let successor_slots = successor.map(|table| table.read_open_files());",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "retire_file_table_generation",
+      "migration_family": "lifecycle"
     }
   ]
 }
