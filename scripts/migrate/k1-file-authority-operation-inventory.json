@@ -7,7 +7,7 @@
     "description_backing": 24,
     "epoll": 422,
     "stream": 176,
-    "mapping": 1443,
+    "mapping": 1447,
     "lifecycle": 32
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 9,
     "epoll": 161,
     "stream": 120,
-    "mapping": 927,
+    "mapping": 928,
     "lifecycle": 16
   },
   "files": {
@@ -4553,7 +4553,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 494,
+      "line": 453,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// The hidden mmap arena, shared aperture and private overlay are",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "line": 507,
       "categories": [
         "mapping"
       ],
@@ -4562,7 +4571,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 533,
+      "line": 546,
       "categories": [
         "mapping"
       ],
@@ -4571,7 +4580,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 534,
+      "line": 547,
       "categories": [
         "mapping"
       ],
@@ -4580,7 +4589,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 535,
+      "line": 548,
       "categories": [
         "mapping"
       ],
@@ -4589,7 +4598,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 590,
+      "line": 603,
       "categories": [
         "mapping"
       ],
@@ -4598,7 +4607,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 591,
+      "line": 604,
       "categories": [
         "mapping"
       ],
@@ -4607,7 +4616,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 612,
+      "line": 625,
       "categories": [
         "mapping"
       ],
@@ -4616,7 +4625,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 614,
+      "line": 627,
       "categories": [
         "mapping"
       ],
@@ -4625,7 +4634,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 615,
+      "line": 628,
       "categories": [
         "mapping"
       ],
@@ -4634,7 +4643,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 616,
+      "line": 629,
       "categories": [
         "mapping"
       ],
@@ -4643,7 +4652,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 617,
+      "line": 630,
       "categories": [
         "mapping"
       ],
@@ -4652,7 +4661,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 618,
+      "line": 631,
       "categories": [
         "mapping"
       ],
@@ -4661,7 +4670,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 635,
+      "line": 648,
       "categories": [
         "mapping"
       ],
@@ -4670,7 +4679,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 636,
+      "line": 649,
       "categories": [
         "mapping"
       ],
@@ -4679,7 +4688,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 637,
+      "line": 650,
       "categories": [
         "mapping"
       ],
@@ -4688,7 +4697,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 638,
+      "line": 651,
       "categories": [
         "mapping"
       ],
@@ -4697,7 +4706,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 761,
+      "line": 774,
       "categories": [
         "mapping"
       ],
@@ -4706,7 +4715,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 762,
+      "line": 775,
       "categories": [
         "mapping"
       ],
@@ -4715,7 +4724,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 763,
+      "line": 776,
       "categories": [
         "mapping"
       ],
@@ -4724,7 +4733,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 925,
+      "line": 938,
       "categories": [
         "mapping"
       ],
@@ -4733,56 +4742,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 926,
+      "line": 939,
       "categories": [
         "mapping"
       ],
       "text": "if mapping.anonymous {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 927,
-      "categories": [
-        "mapping"
-      ],
-      "text": "demoted.push(mapping);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 930,
-      "categories": [
-        "mapping"
-      ],
-      "text": "for mapping in &mut demoted {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 932,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping.range.start().max(start),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 933,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping.range.end().min(end),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 935,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping.range = clipped;",
       "scope_kind": "production_callsite"
     },
     {
@@ -4791,25 +4755,34 @@
       "categories": [
         "mapping"
       ],
-      "text": "mapping.protection,",
+      "text": "demoted.push(mapping);",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 941,
+      "line": 943,
       "categories": [
         "mapping"
       ],
-      "text": "mapping.flags.difference(ReservationNodeFlags::LOCKED),",
+      "text": "for mapping in &mut demoted {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 947,
+      "line": 945,
       "categories": [
         "mapping"
       ],
-      "text": "for mapping in &demoted {",
+      "text": "mapping.range.start().max(start),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "line": 946,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping.range.end().min(end),",
       "scope_kind": "production_callsite"
     },
     {
@@ -4818,12 +4791,48 @@
       "categories": [
         "mapping"
       ],
+      "text": "mapping.range = clipped;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "line": 953,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping.protection,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "line": 954,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping.flags.difference(ReservationNodeFlags::LOCKED),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "line": 960,
+      "categories": [
+        "mapping"
+      ],
+      "text": "for mapping in &demoted {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
+      "line": 961,
+      "categories": [
+        "mapping"
+      ],
       "text": "let row = anonymous_row(mapping, layout);",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 955,
+      "line": 968,
       "categories": [
         "mapping"
       ],
@@ -4832,7 +4841,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 956,
+      "line": 969,
       "categories": [
         "mapping"
       ],
@@ -4841,7 +4850,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 979,
+      "line": 992,
       "categories": [
         "mapping"
       ],
@@ -4850,7 +4859,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 985,
+      "line": 998,
       "categories": [
         "mapping"
       ],
@@ -4859,7 +4868,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 986,
+      "line": 999,
       "categories": [
         "mapping"
       ],
@@ -4868,7 +4877,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 987,
+      "line": 1000,
       "categories": [
         "mapping"
       ],
@@ -4877,7 +4886,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 988,
+      "line": 1001,
       "categories": [
         "mapping"
       ],
@@ -4886,7 +4895,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 997,
+      "line": 1010,
       "categories": [
         "mapping"
       ],
@@ -4895,7 +4904,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1222,
+      "line": 1235,
       "categories": [
         "mapping"
       ],
@@ -4904,7 +4913,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1226,
+      "line": 1239,
       "categories": [
         "mapping"
       ],
@@ -4913,7 +4922,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1262,
+      "line": 1275,
       "categories": [
         "mapping"
       ],
@@ -4922,7 +4931,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1274,
+      "line": 1287,
       "categories": [
         "mapping"
       ],
@@ -4931,7 +4940,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1287,
+      "line": 1300,
       "categories": [
         "mapping"
       ],
@@ -4940,7 +4949,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1344,
+      "line": 1357,
       "categories": [
         "mapping"
       ],
@@ -4949,7 +4958,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1377,
+      "line": 1390,
       "categories": [
         "mapping"
       ],
@@ -4958,7 +4967,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1392,
+      "line": 1405,
       "categories": [
         "mapping"
       ],
@@ -4967,7 +4976,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1454,
+      "line": 1467,
       "categories": [
         "mapping"
       ],
@@ -4976,7 +4985,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1514,
+      "line": 1527,
       "categories": [
         "mapping"
       ],
@@ -4985,7 +4994,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1549,
+      "line": 1562,
       "categories": [
         "mapping"
       ],
@@ -4994,7 +5003,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1571,
+      "line": 1584,
       "categories": [
         "mapping"
       ],
@@ -5003,7 +5012,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1641,
+      "line": 1654,
       "categories": [
         "mapping"
       ],
@@ -5012,7 +5021,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1678,
+      "line": 1691,
       "categories": [
         "mapping"
       ],
@@ -5021,7 +5030,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1681,
+      "line": 1694,
       "categories": [
         "mapping"
       ],
@@ -5030,7 +5039,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1698,
+      "line": 1711,
       "categories": [
         "mapping"
       ],
@@ -5039,7 +5048,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1701,
+      "line": 1714,
       "categories": [
         "mapping"
       ],
@@ -5048,7 +5057,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1726,
+      "line": 1739,
       "categories": [
         "mapping"
       ],
@@ -5057,7 +5066,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1739,
+      "line": 1752,
       "categories": [
         "mapping"
       ],
@@ -5066,7 +5075,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1823,
+      "line": 1836,
       "categories": [
         "mapping"
       ],
@@ -5075,7 +5084,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1871,
+      "line": 1884,
       "categories": [
         "mapping"
       ],
@@ -5084,7 +5093,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/anonymous.rs",
-      "line": 1923,
+      "line": 1936,
       "categories": [
         "mapping"
       ],
@@ -9239,6 +9248,33 @@
         "mapping"
       ],
       "text": "// old_size=0 duplicates a shareable mapping; it is not an empty source.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
+      "line": 7039,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// guest mapped. Carrick's hidden mmap-arena reservation is `rwx`, spans the",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
+      "line": 7040,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// whole arena and is labelled `[carrick-mmap]`; Linux has no such VMA, and",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
+      "line": 7042,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// mapping read back as `rwxp` with a path and extra rows",
       "scope_kind": "test_or_definition"
     },
     {
