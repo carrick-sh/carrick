@@ -345,7 +345,7 @@ pub(crate) fn settle_guest_cow_completions(
     completions.len()
 }
 
-fn settle_one(
+pub(crate) fn settle_one(
     state: &MmAccessState,
     custody: &std::sync::Arc<CarrierVmCustody>,
     runtime: &MmCowRuntimeBinding,
@@ -358,7 +358,6 @@ fn settle_one(
     }
     let span_len = usize::try_from(completion.span_len)
         .map_err(|_| TrapError::Hypervisor("span length".to_owned()))?;
-    let span_end = completion.span_va + completion.span_len;
     let new_physical_ipa = completion.grant.physical_ipa;
     let new_key = (new_physical_ipa, CowArmedRanges::COMPOUND_SIZE);
     let old_ipa = completion.old_ipa;
@@ -418,25 +417,23 @@ fn settle_one(
         kernel_only: false,
     };
 
-    // The source alias: the VMA's Linux write permission rides on the
-    // replacement's alias, exactly as on the host COW path.
-    let source_guest_writable = alias_registry()
-        .lock()
-        .newest_matching_for_process(runtime.mm_root_slot, runtime.container_root, |alias| {
-            let Some(offset) = span.va.checked_sub(alias.start) else {
-                return false;
-            };
-            offset < alias.size as u64
-                && alias
-                    .start
-                    .checked_add(alias.size as u64)
-                    .is_some_and(|end| span_end <= end)
-                && alias.ipa.checked_add(offset) == Some(old_ipa)
-                && alias.physical_ipa <= old_physical_ipa
-                && old_physical_ipa < alias.physical_ipa + alias.physical_size as u64
+    // The VMA's Linux write permission rides on the replacement's alias,
+    // exactly as on the host COW path. Its source is the leaf itself, not a
+    // registry alias: fork arming recorded Linux's write intent in
+    // `SW_EL1_MAY_WRITE`, and EL1's repoint keeps it. A leaf the host
+    // published (stack, image) has no registry alias at all, so requiring one
+    // made every such span unsettleable.
+    let source_guest_writable = tables
+        .with_manager(|manager| {
+            (0..completion.span_len / PAGE).any(|index| {
+                carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+                    carrick_mmu_core::aarch64::terminal_descriptor(
+                        manager.debug_walk(completion.span_va + index * PAGE),
+                    ),
+                )
+            })
         })
-        .map(|alias| alias.guest_writable)
-        .ok_or_else(|| TrapError::Hypervisor("no source alias for the span".to_owned()))?;
+        .ok_or_else(|| TrapError::Hypervisor("page tables are absent".to_owned()))?;
 
     let retention_aliases = authenticated_cow_retention_aliases_in(
         custody,
