@@ -74,6 +74,7 @@ fn isolated_alias_registry() -> crate::trap::foreign_mm::tests::ExternalAliasSta
 
 #[test]
 fn zero_guest_backing_fallback_task_rows_are_bounded_per_page() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _registry = isolated_alias_registry();
     let mut task = HvfTaskState::neutral();
     let total_size = LARGE_PAGES * PAGE_SIZE;
@@ -105,6 +106,7 @@ fn zero_guest_backing_fallback_task_rows_are_bounded_per_page() {
 
 #[test]
 fn zero_guest_backing_two_mappings_task_rows_are_bounded_per_page() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // macOS host VM pages are 16 KiB; a one-Linux-page guard would also
     // protect the beginning of the second extent.
     for gap_pages in [0, 4] {
@@ -191,6 +193,7 @@ fn zero_guest_backing_two_mappings_with_host_gap(gap_pages: usize) {
 
 #[test]
 fn zero_guest_backing_unaligned_partial_range_preserves_surrounding_bytes() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _registry = isolated_alias_registry();
     let mut task = HvfTaskState::neutral();
     let total_size = 4 * PAGE_SIZE;
@@ -238,6 +241,7 @@ fn zero_guest_backing_unaligned_partial_range_preserves_surrounding_bytes() {
 
 #[test]
 fn zero_guest_backing_unmapped_hole_leaves_neighbors_zeroed() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _registry = isolated_alias_registry();
     let mut task = HvfTaskState::neutral();
     let extent1_len = 2 * PAGE_SIZE;

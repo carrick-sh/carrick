@@ -12,6 +12,7 @@ use super::*;
 
 #[test]
 fn decodes_el0_counter_register_traps() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let cntfrq = (AARCH64_SYS64_EXCEPTION_CLASS << AARCH64_EXCEPTION_CLASS_SHIFT)
         | AARCH64_SYS64_ISS_SYS_CNTFRQ
         | (1 << AARCH64_SYS64_ISS_RT_SHIFT);
@@ -46,6 +47,7 @@ fn decodes_el0_counter_register_traps() {
 
 #[test]
 fn shared_mm_task_projection_preserves_structural_owner() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let size = 0x4000usize;
     let ipa = 0x8800_3100_0000u64;
     let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -105,6 +107,7 @@ fn shared_mm_task_projection_preserves_structural_owner() {
 
 #[test]
 fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // `into_unowned_region` (the surviving half of the old `ThreadMappingDesc`
     // round-trip; `from_region` moved to the engine's sibling-builder seam)
     // must re-materialise the syscall-path metadata UNOWNED (memory/host_mapping
@@ -143,6 +146,7 @@ fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
 
 #[test]
 fn global_frame_futex_resolves_raw_backing_ipa_not_semantic_va() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // Global-frame HVPatch deliberately has start != ipa. The neutral
     // AArch64 engine passes the translated backing GPA to the VMM seam, so
     // subtracting the semantic VA selects no word (and routes a shared
@@ -166,6 +170,7 @@ fn global_frame_futex_resolves_raw_backing_ipa_not_semantic_va() {
 
 #[test]
 fn shared_futex_route_skips_private_row_at_recycled_ipa() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let backing_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x80_0000;
     let mut shared = mapped_region(0x100_0080_0000, 0x100_0080_4000, backing_ipa);
     shared.host_addr = 0x1046_78000usize as *mut u8;
@@ -357,6 +362,7 @@ impl FakeStageCopyHarness {
 
 #[test]
 fn high_va_mapping_lookup_prefers_stage1_ipa_owner_over_newer_va_overlap() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let b_start = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x3000;
     let b_ipa = crate::memory::LINUX_ALIAS_IPA_BASE + 0x20_0000;
     let mappings = vec![
@@ -379,6 +385,7 @@ fn high_va_mapping_lookup_prefers_stage1_ipa_owner_over_newer_va_overlap() {
 
 #[test]
 fn guest_copy_chunks_reselect_stage1_owner_across_alias_boundary() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let old_ipa = crate::memory::LINUX_ALIAS_IPA_BASE;
     let new_start = old_start + 0x3000;
@@ -431,6 +438,7 @@ fn guest_copy_chunks_reselect_stage1_owner_across_alias_boundary() {
 
 #[test]
 fn fake_stage1_copy_writes_tail_to_live_owner_backing() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let old_ipa = crate::memory::LINUX_ALIAS_IPA_BASE;
     let new_start = old_start + 0x3000;
@@ -470,6 +478,7 @@ fn fake_stage1_copy_writes_tail_to_live_owner_backing() {
 
 #[test]
 fn zero_copy_declines_cross_fragment_stage1_range() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let old_ipa = crate::memory::LINUX_ALIAS_IPA_BASE;
     let new_start = old_start + 0x3000;
@@ -491,6 +500,7 @@ fn zero_copy_declines_cross_fragment_stage1_range() {
 
 #[test]
 fn fake_stage1_checked_write_rejects_readonly_tail_without_partial_write() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let old_start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let old_ipa = crate::memory::LINUX_ALIAS_IPA_BASE;
     let new_start = old_start + 0x3000;
@@ -517,6 +527,7 @@ fn fake_stage1_checked_write_rejects_readonly_tail_without_partial_write() {
 
 #[test]
 fn mapping_lookup_falls_back_to_newest_overlap_without_stage1_ipa() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let old = mapped_region(start, start + 0x4000, crate::memory::LINUX_ALIAS_IPA_BASE);
     let new = mapped_region(
@@ -533,6 +544,7 @@ fn mapping_lookup_falls_back_to_newest_overlap_without_stage1_ipa() {
 
 #[test]
 fn raw_ipa_lookup_selects_rebased_mm_global_frame_backing() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let guest_va = crate::memory::LINUX_PAGE_TABLES_BASE;
     let root_slot_ipa = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
     let mappings = TaskMappingIndex::from_region(mapped_region(
@@ -554,6 +566,7 @@ fn raw_ipa_lookup_selects_rebased_mm_global_frame_backing() {
 
 #[test]
 fn mailbox_route_rejects_unrelated_retired_row_at_recycled_ipa() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mailbox_va = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
     let recycled_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x3c_000;
     let mut mailbox = mapped_region(mailbox_va, mailbox_va + 0x1_0000, recycled_ipa);
@@ -583,6 +596,7 @@ fn mailbox_route_rejects_unrelated_retired_row_at_recycled_ipa() {
 
 #[test]
 fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let carrier_region = |start: u64, size: u64, host: usize| {
         let mut region = mapped_region(start, start + size, start);
         region.host_addr = host as *mut u8;
@@ -674,6 +688,7 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
 
 #[test]
 fn fd_ceiling_publication_activates_once_and_disable_is_permanent() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ceiling = std::sync::atomic::AtomicU32::new(2);
     let gate = std::sync::atomic::AtomicU32::new(crate::memory::FD_CEILING_GATE_UNINITIALIZED);
 
@@ -695,7 +710,9 @@ fn fd_ceiling_publication_activates_once_and_disable_is_permanent() {
 }
 
 #[test]
-fn persistent_carrier_authority_outlives_terminal_task_cleanup_and_drops_stage2_first() {
+fn serial_host_persistent_carrier_authority_outlives_terminal_task_cleanup_and_drops_stage2_first()
+{
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut task_mappings =
         TaskMappingIndex::from_region(mapped_region(0x0040_0000, 0x0040_4000, 0x0040_0000));
     let mut drop_observations = Vec::new();
@@ -805,6 +822,7 @@ fn persistent_carrier_authority_outlives_terminal_task_cleanup_and_drops_stage2_
 
 #[test]
 fn persistent_carrier_mapping_drop_after_exact_custody_destroy_skips_live_unmap() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
     let start = crate::memory::LINUX_EL0_TRAMPOLINE_BASE;
     let mut mapping = mapped_region(
@@ -835,6 +853,7 @@ fn persistent_carrier_mapping_drop_after_exact_custody_destroy_skips_live_unmap(
 
 #[test]
 fn persistent_worker_invariant_configuration_is_complete_and_audited() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mailbox_sp = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
     let mut registers = std::collections::HashMap::new();
     configure_persistent_executor_invariant_registers(|register, value| {
@@ -909,6 +928,7 @@ fn persistent_worker_invariant_configuration_is_complete_and_audited() {
 
 #[test]
 fn reservation_metadata_access_retains_exact_carrier_and_rejects_retirement() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
     let start = carrick_el1_abi::EL1_REGION_BASE;
     let size = carrick_el1_abi::EL1_REGION_SIZE as usize;
@@ -948,4 +968,36 @@ fn reservation_metadata_access_retains_exact_carrier_and_rejects_retirement() {
     );
     drop(access);
     assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn negative_host_address_probes_live_in_the_serial_lane() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let probe = format!("!{}", "alias_backing_is_live");
+    let probe_super = format!("!super::{}", "alias_backing_is_live");
+    for source in [
+        include_str!("foreign_mm/tests.rs"),
+        include_str!("carrier_custody.rs"),
+        include_str!("frame_inventory/tests.rs"),
+        include_str!("task_only_carrier_directory_tests.rs"),
+        include_str!("thread_sibling_tests.rs"),
+    ] {
+        for block in source.split("#[test]").skip(1) {
+            let body = block.split("\n}\n").next().unwrap_or(block);
+            if !body.contains(&probe) && !body.contains(&probe_super) {
+                continue;
+            }
+            let fn_name = block
+                .split("fn ")
+                .nth(1)
+                .and_then(|tail| tail.split('(').next())
+                .unwrap_or("unknown")
+                .trim();
+            assert!(
+                fn_name.starts_with("serial_host_"),
+                "test `{fn_name}` asserts a host address is unmapped; another thread's mmap \
+                 can reuse it, so it must be named `serial_host_*`"
+            );
+        }
+    }
 }

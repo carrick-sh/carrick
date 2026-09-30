@@ -3212,7 +3212,7 @@ fn structural_backing_owner_lifecycle_and_retained_backing() {
 }
 
 #[test]
-fn structural_backing_owner_invalid_arguments_and_exact_drop_order() {
+fn serial_host_structural_backing_owner_invalid_arguments_and_exact_drop_order() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let size = 0x4000usize;
     let ipa = 0x8800_2000_0000u64;
@@ -3271,7 +3271,7 @@ fn structural_backing_owner_invalid_arguments_and_exact_drop_order() {
 }
 
 #[test]
-fn global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_releases_backing() {
+fn serial_host_global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_releases_backing() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let size = 0x4000usize;
@@ -7285,7 +7285,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
 }
 
 #[test]
-fn releasable_stage2_lease_lifecycle_and_deterministic_allocator_reuse() {
+fn serial_host_releasable_stage2_lease_lifecycle_and_deterministic_allocator_reuse() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let size = 0x4000usize;
@@ -9250,7 +9250,7 @@ fn full_vm_partial_map_failure_uses_exact_fail_stop_rollback_static_audit() {
 }
 
 #[test]
-fn foreign_mm_failure_injection_at_composition_boundaries() {
+fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
 

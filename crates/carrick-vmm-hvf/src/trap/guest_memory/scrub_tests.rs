@@ -62,14 +62,17 @@ fn translation_after_hole(reusable: bool, retained: bool) {
 
 #[test]
 fn fallback_stops_before_live_translation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     translation_after_hole(false, false);
 }
 #[test]
 fn fallback_stops_before_retained_translation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     translation_after_hole(false, true);
 }
 #[test]
 fn reusable_skip_stops_before_live_translation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     translation_after_hole(true, false);
 }
 #[test]
@@ -79,6 +82,7 @@ fn reusable_skip_stops_before_retained_translation() {
 
 #[test]
 fn retained_interior_pages_republish_lifetime_edges() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _restore = crate::trap::foreign_mm::tests::ExternalAliasStateRestore::capture();
     let backing = MmapBuffer::new(LEN);
     let ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x7880_0000;
@@ -343,6 +347,7 @@ impl HvfVmState {
 
 #[test]
 fn enumerated_layouts_match_pre_batch_page_reference() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // Four states per page: hole, first backing, second backing, retained
     // second backing. Enumerate all four-page layouts, including alternating
     // non-identity translations and a mapping-selection boundary at page 1.

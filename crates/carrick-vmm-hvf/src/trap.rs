@@ -410,7 +410,23 @@ pub enum TrapBackend {
 #[cfg(test)]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod foreign_mm_tests {
-    pub(super) static FOREIGN_MM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    /// The one lock for every test that observes or mutates process-global
+    /// authority state (the alias registry, the global-frame host-owner
+    /// directory, the global stage-2 lease allocator, the stage-2 map test
+    /// stub). Distinct locks over these overlapping globals let a test that
+    /// asserts exact global contents run against another test's writes.
+    ///
+    /// A test that asserts a host address is UNMAPPED (`!alias_backing_is_live`)
+    /// cannot be protected by any lock: every other thread's `mmap` may
+    /// legally reuse the freed range. Those tests are named `serial_host_*` and
+    /// run in the single-threaded lane (audited by
+    /// `negative_host_address_probes_live_in_the_serial_lane`).
+    pub(crate) static FOREIGN_MM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    pub(crate) fn global_state_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+        FOREIGN_MM_TEST_LOCK.lock()
+    }
+
     pub(crate) use super::foreign_mm::tests::ExternalAliasStateRestore;
 }
 
@@ -8256,8 +8272,7 @@ pub(crate) mod frame_inventory_backend_tests {
         std::sync::atomic::AtomicU64::new(0x0000_00a1_0000_0000);
 
     pub(crate) fn global_frame_allocator_test_lock() -> &'static parking_lot::Mutex<()> {
-        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        &LOCK
+        &super::foreign_mm_tests::FOREIGN_MM_TEST_LOCK
     }
 }
 

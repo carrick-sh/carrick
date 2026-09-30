@@ -11,6 +11,7 @@ mod alias_remap_limiter_tests {
 
     #[test]
     fn exact_replay_marker_turns_a_sibling_race_into_success() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let backing = AliasBacking {
             start: 0x1000,
             ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7f00_0000,
@@ -48,6 +49,7 @@ mod alias_remap_limiter_tests {
 
     #[test]
     fn caps_repeated_faults_on_one_alias_backing() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mut limiter = AliasRemapLimiter::default();
         let ipa = crate::memory::LINUX_ALIAS_IPA_BASE + 0x20_0000;
 
@@ -59,6 +61,7 @@ mod alias_remap_limiter_tests {
 
     #[test]
     fn alias_replacement_keeps_one_replay_identity_per_ipa() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let original = AliasBacking {
             start: 0x1000,
             ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7e00_0000,
@@ -104,6 +107,7 @@ mod alias_remap_limiter_tests {
 
     #[test]
     fn permits_many_distinct_alias_backings() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mut limiter = AliasRemapLimiter::default();
 
         for i in 0..64 {
@@ -117,6 +121,7 @@ mod alias_remap_limiter_tests {
 
     #[test]
     fn exhausted_alias_does_not_block_a_different_alias() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mut limiter = AliasRemapLimiter::default();
         let first = crate::memory::LINUX_ALIAS_IPA_BASE;
         let second = first + 0x20_0000;
@@ -138,6 +143,7 @@ mod memory_protection_tests {
 
     #[test]
     fn exec_level_classifies_el0_as_guest_el1_as_kernel() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // PSTATE M[3:0]: EL0t=0b0000, EL1t=0b0100, EL1h=0b0101.
         assert_eq!(ExecLevel::from_pstate(0b0000), ExecLevel::Guest);
         assert!(ExecLevel::from_pstate(0b0000).is_guest());
@@ -150,6 +156,7 @@ mod memory_protection_tests {
 
     #[test]
     fn deferred_cow_block_authentication_visits_each_descriptor_once() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let base = 0x6000_0000_u64;
         let end = base + 4 * 1024 * 1024;
         let mut page = base;
@@ -166,6 +173,7 @@ mod memory_protection_tests {
 
     #[test]
     fn deferred_cow_authentication_stops_at_cow_and_leaf_boundaries() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         use carrick_aarch64::vmm::{CowGranule, ForkCowRange};
         let base = 0x6000_0000_u64;
         let end = base + 2 * 1024 * 1024;
@@ -209,6 +217,7 @@ mod memory_protection_tests {
 
     #[test]
     fn deferred_cow_block_step_preserves_overlapping_unaligned_arm_classification() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         use carrick_aarch64::vmm::{CowGranule, ForkCowRange};
         let base = 0x6000_0000_u64;
         let end = base + 65536;
@@ -253,6 +262,7 @@ mod memory_protection_tests {
 
     #[test]
     fn deferred_cow_walk_detects_interior_live_leaf_corruption() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let base = crate::memory::LINUX_MMAP_BASE;
         let bad_va = base + 4096;
         let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
@@ -292,6 +302,7 @@ mod memory_protection_tests {
 
     #[test]
     fn deferred_prot_none_accepts_retained_rw_ap_on_invalid_leaf() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         const AP_USER_RO: u64 = 0b11 << 6;
         let va = crate::memory::LINUX_MMAP_BASE;
         let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
@@ -327,6 +338,7 @@ mod memory_protection_tests {
 
     #[test]
     fn deferred_executable_protection_rejects_valid_uxn_leaf() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         const AP_USER_RW: u64 = 0b01 << 6;
         const UXN: u64 = 1 << 54;
         let va = crate::memory::LINUX_MMAP_BASE;
@@ -358,6 +370,7 @@ mod memory_protection_tests {
 
     #[test]
     fn cloned_protection_metadata_shares_updates_across_thread_engines() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let protections = std::sync::Arc::new(MemoryProtections::default());
         let sibling = std::sync::Arc::clone(&protections);
 
@@ -373,6 +386,7 @@ mod memory_protection_tests {
 
     #[test]
     fn protection_ranges_are_sorted_coalesced_and_split_on_clear() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let protections = MemoryProtections::default();
 
         protections.set_no_access(0x3000, 0x1000, true);
@@ -414,6 +428,7 @@ mod alias_registry_tests {
 
     #[test]
     fn private_alias_scope_separates_root_and_child_mm_root_slots() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root_slot = (
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
             2 * 1024 * 1024,
@@ -473,6 +488,7 @@ mod alias_registry_tests {
 
     #[test]
     fn fork_shared_anonymous_alias_stays_process_scoped() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let parent_root_slot = (
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
             2 * 1024 * 1024,
@@ -536,6 +552,7 @@ mod alias_registry_tests {
 
     #[test]
     fn address_space_replacement_drops_only_its_private_alias_scope() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root_slot = (0x9000_0000, 0x20_0000);
         let container_a = ContainerRootToken::ROOT;
         let container_b = ContainerRootToken::from_raw(2);
@@ -579,6 +596,7 @@ mod alias_registry_tests {
 
     #[test]
     fn fork_shared_anonymous_alias_survives_a_second_fork_without_global_scope() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let parent_root_slot = (
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
             2 * 1024 * 1024,
@@ -685,6 +703,7 @@ mod alias_registry_tests {
 
     #[test]
     fn alias_registry_partial_unmap_preserves_exact_live_fragments() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_0000_0000;
         let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7d00_0000;
         let alias = AliasBacking {
@@ -807,6 +826,7 @@ mod alias_registry_tests {
 
     #[test]
     fn retained_private_reuse_republishes_semantic_fragment_before_sibling_unmap() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_0800_0000;
         let physical_ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7c80_0000;
         let root_slot = (
@@ -884,6 +904,7 @@ mod alias_registry_tests {
 
     #[test]
     fn alias_registry_prefix_unmap_preserves_exact_suffix() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_1000_0000;
         let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7c00_0000;
         let alias = AliasBacking {
@@ -951,6 +972,7 @@ mod alias_registry_tests {
 
     #[test]
     fn alias_registry_suffix_unmap_preserves_exact_prefix() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_2000_0000;
         let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7b00_0000;
         let alias = AliasBacking {
@@ -1018,6 +1040,7 @@ mod alias_registry_tests {
 
     #[test]
     fn alias_registry_full_semantic_unmap_rejects_hvf_padding() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_3000_0000;
         let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7a00_0000;
         let guest_size = 0x1000;
@@ -1108,6 +1131,7 @@ mod alias_registry_tests {
 
     #[test]
     fn fork_source_uses_live_alias_inventory_not_retired_mapping_owners() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root_slot = (
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
             2 * 1024 * 1024,
@@ -1189,6 +1213,7 @@ mod alias_registry_tests {
 
     #[test]
     fn sparse_shared_aperture_owner_does_not_require_a_base_leaf() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         assert!(!super::fork_mapping_requires_base_translation(
             crate::memory::LINUX_SHARED_FILE_BASE,
             crate::memory::LINUX_SHARED_FILE_SIZE as usize,
@@ -1208,6 +1233,7 @@ mod alias_registry_tests {
 
     #[test]
     fn next_generation_fork_deduplicates_exact_private_alias_but_keeps_overlay() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root_slot = (0x9000_0000, 0x20_0000);
         let start = 0x0040_0000;
         let ipa = 0x0020_0000;
@@ -1281,6 +1307,7 @@ mod alias_registry_tests {
 
     #[test]
     fn process_fork_includes_sibling_owned_private_aliases() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root_slot = (
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
             2 * 1024 * 1024,
@@ -1335,6 +1362,7 @@ mod alias_registry_tests {
 
     #[test]
     fn retired_local_alias_row_does_not_mask_live_fragment_at_same_ipa() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root_slot = (0x9000_0000, 0x20_0000);
         let va = 0x0060_000a_8000;
         let ipa = 0x009b_0033_8000;
@@ -1401,6 +1429,7 @@ mod alias_registry_tests {
 
     #[test]
     fn container_root_isolation_prevents_cross_container_alias_visibility() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let container_1 = ContainerRootToken::ROOT;
         let container_2 = ContainerRootToken::from_raw(2);
         let root_slot_1 = (
@@ -1511,6 +1540,7 @@ mod alias_registry_tests {
 
     #[test]
     fn container_child_nonpersistent_cow_physical_source_lookup() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let container_1 = ContainerRootToken::from_raw(2);
         let child_root_slot = (
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x20_0000,
@@ -1563,6 +1593,7 @@ mod alias_registry_tests {
 
     #[test]
     fn cow_physical_source_accepts_compound_prefix_before_an_offset_view() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let physical_ipa = 0x9b03_b60000_u64;
         let semantic_ipa = physical_ipa + 0x1000;
         let compound_va = 0x6001_17c000_u64;
@@ -1604,8 +1635,7 @@ mod alias_registry_tests {
 
     #[test]
     fn thread_mapping_desc_from_region_and_fork_inheritance_with_offset() {
-        static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let _test_lock = TEST_LOCK.lock();
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
         let physical_len = 0x8000_usize;
         let semantic_offset = 0x4000_u64;
@@ -1701,6 +1731,7 @@ mod alias_registry_tests {
 
     #[test]
     fn scrub_run_remap_and_fallback() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         static ZERO_REMAP_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _env_guard = ZERO_REMAP_ENV_LOCK.lock();
 
@@ -1898,6 +1929,7 @@ mod alias_registry_tests {
 
     #[test]
     fn forked_stack_grant_keeps_neighbor_and_child_leases_during_partial_discard() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x0060_0269_0000_u64;
         let ipa = 0x009b_0443_4000_u64;
         let stack_len = 8 * 1024 * 1024;
@@ -1960,6 +1992,7 @@ mod alias_registry_tests {
 
     #[test]
     fn planned_unmap_matches_legacy_snapshot_oracle() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root_slot = Some((0x5000_0000, 0x4000));
         let owned_scope = AliasOwnershipScope::MmRootSlot {
             base: 0x5000_0000,
@@ -2202,6 +2235,7 @@ mod alias_registry_tests {
     /// `rlimitnproc`).
     #[test]
     fn unmap_row_selection_agrees_between_the_scope_scan_and_the_window_query() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         const PAGE: u64 = 0x1000;
         let root_slot = Some((0x5000_0000, 0x4000));
         let owned = AliasOwnershipScope::MmRootSlot {
@@ -2354,6 +2388,7 @@ mod alias_registry_tests {
 
     #[test]
     fn containing_physical_query_wider_than_any_recorded_row_does_not_panic() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // The scope's widest recorded physical size bounds the range's lower
         // end; a query longer than every recorded row put the lower bound
         // ABOVE the query start and `BTreeMap::range` panicked on a reversed
@@ -2393,6 +2428,7 @@ mod alias_registry_tests {
 
     #[test]
     fn planned_unmap_matches_actual_across_split_fragments() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // `mincoreedge`: a three-page private mapping whose middle page is
         // unmapped first, then the head, then the tail. Both fragments of the
         // split keep the original row's sequence number, so a co-holder scan
@@ -2450,6 +2486,7 @@ mod alias_registry_tests {
 
     #[test]
     fn unmap_single_row_in_5000_row_registry_is_fast() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mut registry = AliasRegistry::default();
         let scope = AliasOwnershipScope::MmRootSlot {
             base: 0x5000_0000,
@@ -2502,6 +2539,7 @@ mod alias_registry_tests {
     #[test]
     #[ignore = "director perf benchmark: single-row unmap in 5000-row registry"]
     fn perf_unmap_single_row_in_5000_row_registry() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mut registry = AliasRegistry::default();
         let scope = AliasOwnershipScope::MmRootSlot {
             base: 0x5000_0000,
@@ -2552,6 +2590,7 @@ mod alias_registry_tests {
 
     #[test]
     fn unregister_alias_entries_does_not_memmove_scope_bucket_per_row() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mut registry = AliasRegistry::default();
         let scope = AliasOwnershipScope::MmRootSlot {
             base: 0x5000_0000,
@@ -2596,6 +2635,7 @@ mod alias_registry_tests {
 
 #[test]
 fn retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let template = AliasBacking {
         start: 0x1000_0000,
         ipa: 0x2000_0000,

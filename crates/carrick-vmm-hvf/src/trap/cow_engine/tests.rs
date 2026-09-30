@@ -6,6 +6,7 @@ use std::path::Path;
 
 #[test]
 fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let parent = crate::hvf_aarch64_engine::HostCowStats::default();
     let sibling = parent.clone();
     let child = crate::hvf_aarch64_engine::HostCowStats::default();
@@ -19,6 +20,7 @@ fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
 
 #[test]
 fn guest_lane_refuses_host_cow_before_copy_or_publication() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // Converted writers publish through EL1 and must refuse a missing
     // driving vCPU before any allocation or inventory staging.
     let source = include_str!("../cow_engine.rs");
@@ -60,6 +62,7 @@ fn guest_lane_refuses_host_cow_before_copy_or_publication() {
 
 #[test]
 fn host_cow_counter_counts_only_completed_local_and_foreign_transactions() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     for (source, entry, completion) in [
         (
             include_str!("../cow_engine.rs"),
@@ -84,6 +87,7 @@ fn host_cow_counter_counts_only_completed_local_and_foreign_transactions() {
 
 #[test]
 fn alias_unmap_takes_frame_registry_guard_only_for_inventory_publication() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let source = include_str!("../cow_engine.rs");
     let unmap = source
         .split("pub(crate) fn unregister_process_alias(")
@@ -103,6 +107,7 @@ fn alias_unmap_takes_frame_registry_guard_only_for_inventory_publication() {
 
 #[test]
 fn frame_publication_sites_contain_no_carrier_topology_lock() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let cow_engine_src = include_str!("../cow_engine.rs");
     let foreign_mm_src = include_str!("../foreign_mm.rs");
 
@@ -184,6 +189,7 @@ fn frame_publication_sites_contain_no_carrier_topology_lock() {
 
 #[test]
 fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let vcpu_loop_src =
         std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/mod.rs"))
@@ -329,6 +335,7 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
 
 #[test]
 fn fork_exec_exit_and_unmap_sites_contain_no_carrier_topology_lock() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let quiesce_src =
         std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/quiesce.rs"))
@@ -422,6 +429,7 @@ fn fork_exec_exit_and_unmap_sites_contain_no_carrier_topology_lock() {
 /// executor and wedged the guest.
 #[test]
 fn alias_retirement_commit_takes_the_callers_registry_guard_and_never_locks_the_leaf() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let cow_engine_src = include_str!("../cow_engine.rs");
     let (_, after_sig) = cow_engine_src
         .split_once("pub(crate) fn commit_process_alias_retirement(")
@@ -470,6 +478,7 @@ fn alias_retirement_commit_takes_the_callers_registry_guard_and_never_locks_the_
 /// returned candidates after the lock is released.
 #[test]
 fn alias_registry_queries_never_authenticate_frame_owners_under_the_lock() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let cow_engine_src = include_str!("../cow_engine.rs");
     let mut offenders = Vec::new();
     let mut search = 0;
@@ -510,6 +519,7 @@ fn alias_registry_queries_never_authenticate_frame_owners_under_the_lock() {
 
 #[test]
 fn guest_cow_caller_requires_driving_vcpu_before_touching_backing() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     use super::*;
     let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
     let mut task = HvfTaskState::neutral();

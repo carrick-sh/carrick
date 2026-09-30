@@ -542,6 +542,7 @@ mod tests {
 
     #[test]
     fn frame_grant_backend_accepts_only_one_exact_coherent_mm_span() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let identity = carrick_hal::FrameCowIdentity {
             linux_pid: 7,
             linux_tid: 8,
@@ -591,6 +592,7 @@ mod tests {
 
     #[test]
     fn anonymous_first_touch_never_allocates_a_block_of_padding() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         for page in (0..512_u32).rev() {
             let start = u64::from(page) * 4096;
             let layout = allocation_layout(start, start + 4096, false).unwrap();
@@ -602,6 +604,7 @@ mod tests {
 
     #[test]
     fn bulk_anonymous_views_preserve_block_congruence() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         for start in [0, 4096, TWO_MIB - 4096, TWO_MIB] {
             let layout = allocation_layout(start, start + 3 * TWO_MIB, true).unwrap();
@@ -614,6 +617,7 @@ mod tests {
 
     #[test]
     fn file_view_layout_is_one_host_mapping_with_semantic_delta() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         for (start, offset, semantic_len, expected_len) in [
             (0, 0, 4096, HVF_PAGE_SIZE),
             (4096, 4096, 4096, HVF_PAGE_SIZE),
@@ -633,6 +637,7 @@ mod tests {
 
     #[test]
     fn sparse_allocation_rejects_invalid_semantic_ranges() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         for (start, end) in [(0, 0), (4096, 0), (1, 4096), (0, 4097)] {
             assert!(allocation_layout(start, end, false).is_err());
         }
@@ -1595,16 +1600,19 @@ mod arena_pin_tests {
 
     #[test]
     fn publication_resolver_pins_exact_primary_owner_until_edit_finishes() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         check_pinned_arena(carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize);
     }
 
     #[test]
     fn publication_resolver_pins_exact_full_slot_until_edit_finishes() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         check_pinned_arena(2 * 1024 * 1024);
     }
 
     #[test]
     fn publication_resolver_pins_relocated_root_global_owner() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let carrier_generation = custody.begin_create().unwrap();
         custody.commit_create(carrier_generation).unwrap();
@@ -1643,6 +1651,7 @@ mod arena_pin_tests {
 
     #[test]
     fn rollback_arena_retirement_preserves_pinned_or_failed_backing_until_retry() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         for fail_backend in [false, true] {
             let (state, custody, owner) = rollback_fixture();
             let base = owner.physical_ipa;
@@ -1689,6 +1698,7 @@ mod arena_pin_tests {
 
     #[test]
     fn rollback_arena_retirement_rejects_missing_journal_and_missing_mm_owner() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (state, custody, owner) = rollback_fixture();
         let base = owner.physical_ipa;
         let journal = std::collections::BTreeMap::from([(base, owner.clone())]);
@@ -1729,6 +1739,7 @@ mod arena_pin_tests {
 
     #[test]
     fn local_publication_permit_requires_the_bound_mm_and_asid() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (state, custody, owner) = rollback_fixture();
         let identity = carrick_hal::FrameCowIdentity {
             linux_pid: 7,
@@ -1854,6 +1865,7 @@ mod arena_pin_tests {
     /// genuine MM identity change.
     #[test]
     fn local_publication_tolerates_equivalent_rebind_during_quiesce() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (state, custody, owner) = rollback_fixture();
         let identity = carrick_hal::FrameCowIdentity {
             linux_pid: 7,
