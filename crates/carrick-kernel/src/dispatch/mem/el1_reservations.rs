@@ -1,323 +1,321 @@
-//! Host venue of the shared EL1 anonymous reservation authority.
+//! Host venue of the shared EL1 anonymous reservation authority, and the ONE
+//! production admission of an MM's delegated anonymous root.
 //!
-//! T2 integration: before enabling `decide_anonymous_syscall` for an MM, call
-//! `admit_el1_reservations` under its mutation permit. Thereafter grant service
-//! uses `el1_reservation_fault_plan`, NOT `resident_frame_grant_plan`: backing
-//! eligibility comes from the shared root, not FirstTouchArming. The plan owns
-//! exact-MM alias exclusion and a borrowed owned-pin storage view across backing service.
-//! Refresh `ResolvedReservationNodes` through the carrier metadata resolver before
-//! acquiring the MM permit; pass that view to `el1_reservation_fault_plan`. Reauthenticate immediately
-//! before publishing the grant receipt. A generation mismatch is refusal, never
-//! permission to replay the Linux syscall or revive an old mapping.
+//! [`SyscallDispatcher::admit_el1_reservations`] seals the MM's published
+//! root as the single owner of its anonymous-private memory
+//! ([`anonymous::AnonymousAuthority::Delegated`]). The runtime calls it under
+//! the MM's [`HostAliasPermit`]:
+//! - at the initial MM bind and at exec ([`El1AdmissionOrigin::Bind`]): the
+//!   MM's own host-setup rows are imported: plain private anonymous rows
+//!   inside the heap/arena layout as EL1-editable nodes that then leave
+//!   `MemState`, everything else as opaque placement obstacles the host
+//!   keeps;
+//! - at fork commit ([`El1AdmissionOrigin::ForkCommit`]), holding both MM
+//!   permits: the child's root is seeded from the parent's committed root
+//!   (`clone_into`), so a fork child stays delegated. Its host-setup twin
+//!   (`MemState::fork_materialized`) only bridges fork preparation, where
+//!   the child's root is not yet published.
 //!
-//! Production admission currently fails closed with `ForeignMapping`. Once a
-//! root is admitted (today only by the conformance fixture), brk, mmap, munmap,
-//! mprotect, mremap placement, the anonymous-private rows and their
-//! mlock/madvise attributes have one owner, the root
-//! (`anonymous::AnonymousAuthority`). Fault planning and mincore ask the root
-//! which anonymous pages exist and at which protection
-//! (`fault::FirstTouchOwner`); the host keeps only the residency its own
-//! venue committed, retired where the root hands a hole out again and handed
-//! over when a root row is demoted. The snapshot importer below
-//! is a host-only conformance fixture, not a second production authority or an
-//! activation mechanism.
+//! `CARRICK_EL1_RESERVATIONS=0` makes every admission answer
+//! [`El1Admission::HostSetup`] through the same entry point: the host keeps
+//! the anonymous facts, exactly as before admission existed.
+//!
+//! Once admitted, brk, mmap, munmap, mprotect, mremap placement, the
+//! anonymous-private rows and their mlock/madvise attributes have one owner,
+//! the root. Fault planning and mincore ask the root which anonymous pages
+//! exist and at which protection (`fault::FirstTouchOwner`); the host keeps
+//! only the residency its own venue committed, retired where the root hands
+//! a hole out again and handed over when a root row is demoted.
 
-use super::*;
-#[cfg(test)]
-use carrick_el1::memory::reservations::Layout;
-use carrick_el1::memory::reservations::{
-    Refusal, ReservationFaultPlan, Reservations, ResolvedReservationNodes, shared_host,
+use super::anonymous::{
+    AnonymousAuthority, HostCharges, broken_root, carried_flags, opaque_flags, root_owned_row,
 };
-#[cfg(test)]
-use carrick_el1_abi::ReservationRange;
-use carrick_el1_abi::{PinnedMetadataExtent, ReservationMm, ReservationProtection};
+use super::*;
+use crate::dispatch::mm_mutation::HostAliasPermit;
+use carrick_el1::memory::reservations::{Refusal, Reservations};
+use carrick_el1_abi::{
+    ReservationGeneration, ReservationMm, ReservationNodeFlags, ReservationProtection,
+    ReservationRange,
+};
+use std::sync::OnceLock;
 
-pub struct El1ReservationFaultPlan<'permit, P: PinnedMetadataExtent> {
-    nodes: &'permit ResolvedReservationNodes<P>,
-    plan: ReservationFaultPlan,
-    index: usize,
-    exclusion: HostAliasDispatchGuard<'permit>,
+/// Where an admitted root's contents come from.
+pub enum El1AdmissionOrigin<'a, 'p> {
+    /// Initial MM bind, or the new MM of an exec: this MM's own host-setup
+    /// rows are the root's contents.
+    Bind,
+    /// Fork commit of a copied MM: the child (the admitting dispatcher) is
+    /// seeded from `parent`'s committed root. `parent_permit` must be the
+    /// parent MM's permit, held with the child's for the whole admission.
+    ForkCommit {
+        parent: &'a SyscallDispatcher,
+        parent_permit: &'a HostAliasPermit<'p>,
+    },
 }
 
-impl<P: PinnedMetadataExtent> El1ReservationFaultPlan<'_, P> {
-    pub fn reservation(&self) -> ReservationFaultPlan {
-        self.plan
-    }
+/// The owner of an MM's anonymous memory after an admission request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum El1Admission {
+    /// The root owns the anonymous-private facts (now, or already).
+    Delegated,
+    /// The host keeps them: `CARRICK_EL1_RESERVATIONS=0`, or this carrier
+    /// installed no reservation provider (no zone).
+    HostSetup,
 }
 
-fn index_for(mm: ReservationMm) -> Result<usize, Refusal> {
-    let zone = carrick_el1_abi::zone_tables().ok_or(Refusal::Stale)?;
-    zone.spaces
-        .find(mm.raw())
-        .map(|index| index.index())
-        .ok_or(Refusal::Stale)
+/// The fork a host-setup twin was materialized from: its parent's root and
+/// that root's committed generation. A fork-commit admission seeds the child
+/// root only from exactly this parent generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::dispatch) struct ForkSeed {
+    pub(in crate::dispatch) parent: ReservationMm,
+    pub(in crate::dispatch) generation: ReservationGeneration,
 }
 
-fn admit_host_snapshot(
-    _model: &mut Reservations<'_>,
-    _mem: &MemState,
-    _limits: (u64, u64),
-) -> Result<(), Refusal> {
-    // The presence of an accessible MemState means these facts still have a
-    // host writer. Sealing a snapshot here would create two Linux answers.
-    Err(Refusal::ForeignMapping)
+/// `CARRICK_EL1_RESERVATIONS=0` keeps every MM in host setup.
+pub fn el1_reservations_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CARRICK_EL1_RESERVATIONS").map_or(true, |value| value.trim() != "0")
+    })
 }
 
-#[cfg(test)]
-fn import_snapshot(
-    model: &mut Reservations<'_>,
-    mem: &MemState,
-    limits: (u64, u64),
-) -> Result<(), Refusal> {
-    if model.is_admitted() {
-        return Err(Refusal::Stale);
-    }
-    let heap = mem
-        .layout
-        .heap_base
-        .checked_add(mem.layout.heap_size)
-        .and_then(|end| ReservationRange::new(mem.layout.heap_base, end))
-        .ok_or(Refusal::Invalid)?;
-    let arena = mem
-        .layout
-        .mmap_base
-        .checked_add(mem.layout.mmap_size)
-        .and_then(|end| ReservationRange::new(mem.layout.mmap_base, end))
-        .ok_or(Refusal::Invalid)?;
-    let mut modeled_address = 0u64;
-    let mut modeled_data = 0u64;
-    for vma in &mem.semantic_vmas {
-        modeled_address = modeled_address
-            .checked_add(vma.end - vma.start)
-            .ok_or(Refusal::Invalid)?;
-        if eligible(vma, mem) && vma.write {
-            modeled_data = modeled_data
-                .checked_add(vma.end - vma.start)
-                .ok_or(Refusal::Invalid)?;
-        }
-    }
-    model.configure_import(Layout {
-        heap,
-        arena,
-        brk: mem.program_break(),
-        address_limit: limits.0,
-        data_limit: limits.1,
-        external_address_bytes: committed_va_bytes(mem).saturating_sub(modeled_address),
-        external_data_bytes: data_va_bytes(mem).saturating_sub(modeled_data),
-    })?;
-    for vma in &mem.semantic_vmas {
-        let range = ReservationRange::new(vma.start, vma.end).ok_or(Refusal::Invalid)?;
-        let bits =
-            u64::from(vma.read) | (u64::from(vma.write) << 1) | (u64::from(vma.execute) << 2);
-        model.import(
-            range,
-            ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?,
-            eligible(vma, mem),
-        )?;
-    }
-    model.finish_import()
+/// A root row to import: range, protection and insertion-time attributes.
+type ImportRow = (
+    ReservationRange,
+    ReservationProtection,
+    ReservationNodeFlags,
+);
+
+/// Every host row as a root node, and the rows the root will own (which then
+/// leave `MemState`).
+struct AdmissionRows {
+    rows: Vec<ImportRow>,
+    owned: Vec<(u64, u64)>,
 }
 
-#[cfg(test)]
-fn eligible(vma: &SemanticVma, mem: &MemState) -> bool {
-    vma.provenance.is_private_anonymous()
-        && vma.fork_policy == carrick_abi::VmaForkPolicy::DEFAULT
-        && vma.dump_policy == carrick_abi::VmaDumpPolicy::Include
-        && !vma.droppable
-        && !mem
-            .growdown_ranges
-            .iter()
-            .any(|(low, _, end)| vma.start < *end && *low < vma.end)
-}
-
-impl MemView<'_> {
-    fn admit_el1_reservations(
-        &self,
-        permit: &super::super::mm_mutation::HostAliasPermit<'_>,
-    ) -> Result<(), Refusal> {
-        if permit.mm() != self.mm_authority().mm_id {
-            return Err(Refusal::Stale);
-        }
-        if !self.mm_authority().has_reservation_provider() {
-            return Err(Refusal::ForeignMapping);
-        }
-        let _exclusion = self.begin_host_alias_dispatch(permit);
-        let mm = ReservationMm::new(permit.mm().raw()).ok_or(Refusal::Invalid)?;
-        let table = shared_host().ok_or(Refusal::Stale)?;
-        let mut model = table.lock(index_for(mm)?, mm)?;
-        let limits = self
-            .address_space_limits_apply(true)
-            .unwrap_or((u64::MAX, u64::MAX));
-        let authority = self.mem();
-        let mem = authority.lock();
-        let result = admit_host_snapshot(&mut model, &mem, limits);
-        if result.is_err() && !model.is_admitted() {
-            model.abort_import()?;
-        }
-        result
-    }
-
-    fn el1_reservation_fault_plan<'permit, P: PinnedMetadataExtent>(
-        &self,
-        permit: &'permit super::super::mm_mutation::HostAliasPermit<'_>,
-        nodes: &'permit ResolvedReservationNodes<P>,
-        address: u64,
-        max_len: u64,
-        access: ReservationProtection,
-    ) -> Result<El1ReservationFaultPlan<'permit, P>, Refusal> {
-        if permit.mm() != self.mm_authority().mm_id {
-            return Err(Refusal::Stale);
-        }
-        let exclusion = self.begin_host_alias_dispatch(permit);
-        let mm = ReservationMm::new(permit.mm().raw()).ok_or(Refusal::Invalid)?;
-        let index = index_for(mm)?;
-        let plan = shared_host()
-            .ok_or(Refusal::Stale)?
-            .lock_resolved(index, mm, nodes)?
-            .fault_plan(address, max_len, access)?;
-        Ok(El1ReservationFaultPlan {
-            nodes,
-            plan,
-            index,
-            exclusion,
+fn admission_rows(mem: &MemState) -> Result<AdmissionRows, Refusal> {
+    let mut owned = Vec::new();
+    let rows = mem
+        .semantic_vmas
+        .iter()
+        .map(|vma| {
+            let range = ReservationRange::new(vma.start, vma.end).ok_or(Refusal::Invalid)?;
+            let bits =
+                u64::from(vma.read) | (u64::from(vma.write) << 1) | (u64::from(vma.execute) << 2);
+            let prot = ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?;
+            let flags = if root_owned_row(vma, mem) {
+                owned.push((vma.start, vma.end));
+                ReservationNodeFlags::ANONYMOUS_PRIVATE.union(carried_flags(vma))
+            } else {
+                opaque_flags(vma, mem)
+            };
+            Ok((range, prot, flags))
         })
-    }
+        .collect::<Result<_, Refusal>>()?;
+    Ok(AdmissionRows { rows, owned })
+}
 
-    fn authenticate_el1_reservation_fault<P: PinnedMetadataExtent>(
-        &self,
-        plan: &El1ReservationFaultPlan<'_, P>,
-    ) -> bool {
-        self.owns_host_alias_dispatch(&plan.exclusion)
-            && shared_host()
-                .and_then(|table| {
-                    table
-                        .lock_resolved(plan.index, plan.plan.mm, plan.nodes)
-                        .ok()
-                })
-                .is_some_and(|mut model| model.authenticate_fault(plan.plan))
+/// An admission of an MM that is already delegated: idempotent for its own
+/// root, stale for any other.
+fn already_delegated(mem: &MemState, root: &DelegatedRoot) -> Result<El1Admission, Refusal> {
+    match mem.delegated_root() {
+        Some(own) if own.mm() == root.mm() => Ok(El1Admission::Delegated),
+        _ => Err(Refusal::Stale),
     }
 }
 
-impl MemView<'_> {
-    /// Conformance fixture: seal this MM's published root as the one owner of
-    /// its anonymous memory. Every host row is imported: plain private
-    /// anonymous rows inside the heap/arena layout as EL1-editable nodes that
-    /// then leave `MemState`, everything else as opaque placement obstacles
-    /// the host keeps. Production admission still refuses
-    /// (`admit_host_snapshot`).
-    #[cfg(test)]
-    pub(in crate::dispatch) fn delegate_anonymous_for_test(&self) -> Result<(), Refusal> {
-        use super::anonymous::{carried_flags, opaque_flags, root_owned_row};
-        use carrick_el1_abi::ReservationNodeFlags;
-        let root = self.mm_authority().delegated_root()?;
-        let (address_limit, data_limit) = self
-            .address_space_limits_apply(true)
-            .unwrap_or((u64::MAX, u64::MAX));
-        let authority = self.mem();
-        let mut mem = authority.lock();
-        let Some(host_break) = mem.host_arena().map(|arena| arena.brk) else {
+/// Seal `mem`'s own rows into its published root.
+fn admit_bind(
+    mem: &mut MemState,
+    root: &DelegatedRoot,
+    (address_limit, data_limit): (u64, u64),
+) -> Result<El1Admission, Refusal> {
+    match mem.anonymous_authority() {
+        AnonymousAuthority::Delegated(_) => return already_delegated(mem, root),
+        // A fork twin carries its parent's incarnations: only its fork
+        // commit may seal it.
+        AnonymousAuthority::HostSetup(arena) if arena.fork_seed.is_some() => {
             return Err(Refusal::Stale);
-        };
-        let mut owned = Vec::new();
-        let rows: Vec<_> = mem
-            .semantic_vmas
-            .iter()
-            .map(|vma| {
-                let range = ReservationRange::new(vma.start, vma.end).ok_or(Refusal::Invalid)?;
-                let bits = u64::from(vma.read)
-                    | (u64::from(vma.write) << 1)
-                    | (u64::from(vma.execute) << 2);
-                let prot = ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?;
-                let flags = if root_owned_row(vma, &mem) {
-                    owned.push((vma.start, vma.end));
-                    ReservationNodeFlags::ANONYMOUS_PRIVATE.union(carried_flags(vma))
-                } else {
-                    opaque_flags(vma, &mem)
-                };
-                Ok((range, prot, flags))
-            })
-            .collect::<Result<_, Refusal>>()?;
-        root.with_root_for_import(|model| {
-            let mut layout = model.layout();
-            layout.brk = host_break;
-            layout.address_limit = address_limit;
-            layout.data_limit = data_limit;
-            layout.external_address_bytes = 0;
-            layout.external_data_bytes = 0;
-            model.configure_import(layout)?;
+        }
+        AnonymousAuthority::HostSetup(_) => {}
+    }
+    let brk = mem.program_break();
+    let layout = mem.layout;
+    let heap = layout
+        .heap_base
+        .checked_add(layout.heap_size)
+        .and_then(|end| ReservationRange::new(layout.heap_base, end))
+        .ok_or(Refusal::Invalid)?;
+    let arena = layout
+        .mmap_base
+        .checked_add(layout.mmap_size)
+        .and_then(|end| ReservationRange::new(layout.mmap_base, end))
+        .ok_or(Refusal::Invalid)?;
+    let AdmissionRows { rows, owned } = admission_rows(mem)?;
+    // Taken before the root guard (the projection must not read the root).
+    // Every owned row becomes a root node, so it is never charged here.
+    let host = HostCharges::at_admission(mem);
+    root.with_root_for_import(|model| {
+        let result = (|| {
+            let mut import = model.layout();
+            import.heap = heap;
+            import.arena = arena;
+            import.brk = brk;
+            import.address_limit = address_limit;
+            import.data_limit = data_limit;
+            import.external_address_bytes = 0;
+            import.external_data_bytes = 0;
+            model.configure_import(import)?;
             for (range, prot, flags) in rows {
                 model.import_with(range, prot, flags)?;
             }
+            // Sealed with the exact charges of everything it does not hold:
+            // the guest venue decides against them from its first proposal.
+            let (address, data) = host.beyond(model)?;
+            model.set_external_charges(address, data);
             model.finish_import()
-        })?;
-        // The root now owns these rows; the host keeps no second copy.
-        for &(start, end) in &owned {
-            mem.semantic_vmas.remove_range(start, end);
-            trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, end - start);
-            // A visible boot region is a host row too (hidden backing rows
-            // are carrick's own and never trimmed).
-            trim_live_boot_regions_for_range(&mut mem, start, end - start);
+        })();
+        if result.is_err() && !model.is_admitted() {
+            // A failed import exposes no partial authority.
+            model.abort_import()?;
         }
-        mem.delegate_anonymous(root.clone());
-        // Their residency facts now describe the incarnations just imported.
-        for &(start, end) in &owned {
-            for piece in mem.root_first_touch_pieces(start, end) {
-                mem.resident
-                    .hand_over(piece.range, super::ResidencyOwner::Host, piece.owner());
-            }
+        result
+    })?;
+    mem.seal_delegated(root, &owned);
+    Ok(El1Admission::Delegated)
+}
+
+/// Seed the fork child `mem`'s root from `parent`'s committed root.
+fn admit_fork(
+    parent: &MemState,
+    mem: &mut MemState,
+    root: &DelegatedRoot,
+    (address_limit, data_limit): (u64, u64),
+    unchanged: bool,
+) -> Result<El1Admission, Refusal> {
+    let seed = match mem.anonymous_authority() {
+        AnonymousAuthority::Delegated(_) => return already_delegated(mem, root),
+        AnonymousAuthority::HostSetup(arena) => arena.fork_seed.ok_or(Refusal::Stale)?,
+    };
+    let parent_root = parent.delegated_root().ok_or(Refusal::Stale)?;
+    // The twin must still be exactly the fork's: neither MM edited since.
+    if seed.parent != parent_root.mm() || !unchanged {
+        return Err(Refusal::Stale);
+    }
+    // The parent's permit excludes its host venue; one still open is a
+    // syscall that never settled.
+    if parent.host_venue_open() {
+        return Err(Refusal::Busy);
+    }
+    let host = HostCharges::at_admission(mem);
+    let mut owned = Vec::new();
+    root.seed_from(parent_root, |parent, child| {
+        if parent.generation() != seed.generation {
+            return Err(Refusal::Stale);
         }
-        // Their locks become root attributes (`set_locked` routes each
-        // piece to its owner).
-        for (start, end) in owned {
-            let locked: Vec<_> = mem
-                .locked_ranges
-                .iter()
-                .filter_map(|range| {
-                    carrick_vfs::GuestMemoryRange::new(
-                        GuestVa(range.start().raw().max(start)),
-                        GuestVa(range.end().raw().min(end)),
+        // Busy while a guest-venue proposal is pending on the parent: its
+        // backend work must settle first, never be copied half-done.
+        parent.clone_into(child)?;
+        // The child root is admitted: nothing below may refuse.
+        child.set_limits(address_limit, data_limit);
+        let (address, data) = host
+            .beyond(child)
+            .unwrap_or_else(|refusal| broken_root("a fork admission charge", refusal));
+        child.set_external_charges(address, data);
+        child
+            .observe_mappings(&mut |mapping| {
+                if mapping.anonymous {
+                    owned.push((mapping.range.start(), mapping.range.end()));
+                }
+            })
+            .unwrap_or_else(|refusal| broken_root("a fork admission observation", refusal));
+        Ok(())
+    })?;
+    mem.seal_delegated(root, &owned);
+    Ok(El1Admission::Delegated)
+}
+
+impl MemView<'_> {
+    /// See [`SyscallDispatcher::admit_el1_reservations`]; `enabled` is the
+    /// `CARRICK_EL1_RESERVATIONS` hatch.
+    pub(in crate::dispatch) fn admit_el1_reservations(
+        &self,
+        permit: &HostAliasPermit<'_>,
+        origin: El1AdmissionOrigin<'_, '_>,
+        enabled: bool,
+    ) -> Result<El1Admission, Refusal> {
+        let authority = self.mm_authority();
+        if permit.mm() != authority.mm_id {
+            return Err(Refusal::Stale);
+        }
+        if !enabled || !authority.has_reservation_provider() {
+            return Ok(El1Admission::HostSetup);
+        }
+        let _exclusion = self.begin_host_alias_dispatch(permit);
+        let root = authority.delegated_root()?;
+        let limits = self
+            .address_space_limits_apply(true)
+            .unwrap_or((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY));
+        match origin {
+            El1AdmissionOrigin::Bind => admit_bind(&mut authority.lock(), &root, limits),
+            El1AdmissionOrigin::ForkCommit {
+                parent,
+                parent_permit,
+            } => {
+                let parent_authority = parent.mm_authority();
+                if parent_authority.mm_id == authority.mm_id
+                    || !parent_permit.authorizes(
+                        &parent_authority.mutation_coordinator,
+                        parent_authority.mm_id,
                     )
-                })
-                .collect();
-            for range in locked {
-                locked_ranges_remove(&mut mem.locked_ranges, range);
-                mem.set_locked(range, true);
+                {
+                    return Err(Refusal::Stale);
+                }
+                // The child's host-setup twin starts at the parent's VMA
+                // revision; any host edit of either since moves it.
+                let unchanged = authority.vma_revision() == parent_authority.vma_revision();
+                // Parent before child, the fork's own order.
+                let parent_mem = parent_authority.lock();
+                let mut mem = authority.lock();
+                admit_fork(&parent_mem, &mut mem, &root, limits, unchanged)
             }
         }
-        self.with_charged_root(&mem, &root, |_| Ok(()))
     }
 }
 
 impl SyscallDispatcher {
+    /// The ONE production admission of this MM's delegated anonymous root.
+    ///
+    /// Locking contract: the caller holds THIS MM's `permit` (and, for
+    /// [`El1AdmissionOrigin::ForkCommit`], the parent MM's permit too, with
+    /// the parent quiesced at its fork commit and the child not yet run).
+    /// The root must be published (the MM's address space) and no root guard
+    /// may be held. Inside, the MM's host-alias dispatch is begun, then the
+    /// parent's `MemState` lock (fork), this MM's `MemState` lock, the
+    /// parent's and this MM's host queues, and the root guards; no backend
+    /// service runs under any of them.
+    ///
+    /// `Ok(HostSetup)`: `CARRICK_EL1_RESERVATIONS=0` or no carrier
+    /// provider; nothing changed. `Ok(Delegated)`: the root owns the MM's
+    /// anonymous memory (idempotent). `Err`: nothing changed; the MM stays
+    /// in host setup (`Stale`: wrong permit, unpublished root, a fork twin
+    /// admitted as a bind, or a fork parent that moved on; `Busy`: a root
+    /// proposal is still pending; `MetadataRequired`: node storage must be
+    /// provisioned first).
     pub fn admit_el1_reservations(
         &self,
-        permit: &super::super::mm_mutation::HostAliasPermit<'_>,
-    ) -> Result<(), Refusal> {
-        self.mem_view().admit_el1_reservations(permit)
-    }
-    pub fn el1_reservation_fault_plan<'permit, P: PinnedMetadataExtent>(
-        &self,
-        permit: &'permit super::super::mm_mutation::HostAliasPermit<'_>,
-        nodes: &'permit ResolvedReservationNodes<P>,
-        address: u64,
-        max_len: u64,
-        access: ReservationProtection,
-    ) -> Result<El1ReservationFaultPlan<'permit, P>, Refusal> {
+        permit: &HostAliasPermit<'_>,
+        origin: El1AdmissionOrigin<'_, '_>,
+    ) -> Result<El1Admission, Refusal> {
         self.mem_view()
-            .el1_reservation_fault_plan(permit, nodes, address, max_len, access)
-    }
-    pub fn authenticate_el1_reservation_fault<P: PinnedMetadataExtent>(
-        &self,
-        plan: &El1ReservationFaultPlan<'_, P>,
-    ) -> bool {
-        self.mem_view().authenticate_el1_reservation_fault(plan)
+            .admit_el1_reservations(permit, origin, el1_reservations_enabled())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_el1::memory::reservations::{Decision, SharedReservations};
+    use carrick_el1::memory::reservations::{Decision, Layout, SharedReservations};
     use carrick_el1_abi::{ReservationBackingReceipt, ReservationCompletion};
 
     fn shared() -> Box<SharedReservations> {
@@ -345,6 +343,22 @@ mod tests {
             })
             .unwrap();
         mem
+    }
+    /// The el1 model's own import API over a hand-built snapshot: a fixture
+    /// of the root model, not a host admission (that is
+    /// `SyscallDispatcher::admit_el1_reservations`).
+    fn seal(model: &mut Reservations<'_>, mem: &MemState) -> Result<(), Refusal> {
+        for vma in &mem.semantic_vmas {
+            let range = ReservationRange::new(vma.start, vma.end).ok_or(Refusal::Invalid)?;
+            let bits =
+                u64::from(vma.read) | (u64::from(vma.write) << 1) | (u64::from(vma.execute) << 2);
+            model.import(
+                range,
+                ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?,
+                vma.provenance.is_private_anonymous(),
+            )?;
+        }
+        model.finish_import()
     }
     fn publish(table: &SharedReservations, mem: &MemState, index: usize) -> ReservationMm {
         let mm = ReservationMm::new(index as u64 + 41).unwrap();
@@ -391,12 +405,7 @@ mod tests {
         let a = publish(&table, &mem, 0);
         let b = publish(&table, &mem, 1);
         for (index, mm) in [(0, a), (1, b)] {
-            import_snapshot(
-                &mut table.lock(index, mm).unwrap(),
-                &mem,
-                (u64::MAX, u64::MAX),
-            )
-            .unwrap();
+            seal(&mut table.lock(index, mm).unwrap(), &mem).unwrap();
         }
         let mm_id = |key: ReservationMm| {
             crate::kernel::MmId::from_registry_allocation(
@@ -501,12 +510,7 @@ mod tests {
         let b = publish(&table, &mem, 1);
         let host = NonAnonymousVmas::try_from((a, VmaMap::new())).unwrap();
         for (index, mm) in [(0, a), (1, b)] {
-            import_snapshot(
-                &mut table.lock(index, mm).unwrap(),
-                &mem,
-                (u64::MAX, u64::MAX),
-            )
-            .unwrap();
+            seal(&mut table.lock(index, mm).unwrap(), &mem).unwrap();
         }
         let initial = ReservationProcMaps::capture(&mut table.lock(0, a).unwrap(), &host).unwrap();
         let mut guest = table.lock(0, a).unwrap();
@@ -582,36 +586,13 @@ mod tests {
     }
 
     #[test]
-    fn reservation_legacy_host_authority_refuses_both_mm_admissions() {
-        let table = shared();
-        let mem = snapshot();
-        for index in 0..2 {
-            let mm = publish(&table, &mem, index);
-            let mut model = table.lock(index, mm).unwrap();
-            assert_eq!(
-                admit_host_snapshot(&mut model, &mem, (u64::MAX, u64::MAX)),
-                Err(Refusal::ForeignMapping)
-            );
-            assert!(!model.is_admitted());
-            assert!(model.pending().is_none());
-            assert!(model.mapping(mem.layout.mmap_base).is_none());
-        }
-        assert_eq!(mem.semantic_vmas.len(), 1);
-    }
-
-    #[test]
     fn reservation_host_import_two_mm_observers_share_fault_generation() {
         let table = shared();
         let mem = snapshot();
         let a = publish(&table, &mem, 0);
         let b = publish(&table, &mem, 1);
         for (index, mm) in [(0, a), (1, b)] {
-            import_snapshot(
-                &mut table.lock(index, mm).unwrap(),
-                &mem,
-                (u64::MAX, u64::MAX),
-            )
-            .unwrap();
+            seal(&mut table.lock(index, mm).unwrap(), &mem).unwrap();
         }
         let va = mem.layout.mmap_base;
         let original = table
@@ -682,15 +663,12 @@ mod tests {
         mem.semantic_vmas.insert(invalid).unwrap();
         let mm = publish(&table, &mem, 0);
         let mut model = table.lock(0, mm).unwrap();
-        assert_eq!(
-            import_snapshot(&mut model, &mem, (u64::MAX, u64::MAX)),
-            Err(Refusal::Invalid)
-        );
+        assert_eq!(seal(&mut model, &mem), Err(Refusal::Invalid));
         assert!(model.mapping(mem.layout.mmap_base).is_none());
         model.abort_import().unwrap();
         assert!(model.mapping(mem.layout.mmap_base).is_none());
         let mem = snapshot();
-        import_snapshot(&mut model, &mem, (u64::MAX, u64::MAX)).unwrap();
+        seal(&mut model, &mem).unwrap();
         assert!(model.mapping(mem.layout.mmap_base).is_some());
     }
 }

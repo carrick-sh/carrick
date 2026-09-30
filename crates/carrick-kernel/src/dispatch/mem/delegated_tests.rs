@@ -6,7 +6,9 @@
 
 use super::tests::{CountingMmapMemory, install_host_file_fd, returned};
 use super::*;
-use crate::dispatch::mem::el1_reservations::{HostReservationProvider, PreparedHostReservations};
+use crate::dispatch::mem::el1_reservations::{
+    El1Admission, El1AdmissionOrigin, HostReservationProvider, PreparedHostReservations,
+};
 use crate::linux_abi::LINUX_PAGE_SIZE;
 use crate::memory::LINUX_MMAP_BASE;
 use carrick_el1::memory::reservations::{
@@ -24,25 +26,104 @@ const SYS_MPROTECT: u64 = 226;
 const PAGE: u64 = LINUX_PAGE_SIZE;
 const FILE_FD: i32 = 40;
 
-pub(in crate::dispatch) struct Root {
+/// The carrier's reservation table and its published roots, slot by slot
+/// (the zone's `AddressSpaces` index of each MM key).
+#[derive(Clone)]
+struct Carrier {
     table: Arc<SharedReservations>,
+    slots: Arc<std::sync::Mutex<Vec<ReservationMm>>>,
+}
+
+impl Carrier {
+    fn new() -> Self {
+        // Same zeroed-region initialization as EL1 bootstrap.
+        let ptr =
+            unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::new::<SharedReservations>()) };
+        assert!(!ptr.is_null());
+        Self {
+            table: Arc::from(unsafe { Box::<SharedReservations>::from_raw(ptr.cast()) }),
+            slots: Arc::default(),
+        }
+    }
+
+    fn slot(&self, mm: ReservationMm) -> Result<usize, Refusal> {
+        self.slots
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|published| *published == mm)
+            .ok_or(Refusal::Stale)
+    }
+
+    /// Publish `dispatcher`'s MM root as the carrier does at address-space
+    /// publication (`mm_occupancy::publish_in_with_layout`).
+    fn publish(&self, dispatcher: &SyscallDispatcher) -> ReservationMm {
+        let mm = ReservationMm::new(dispatcher.mm_authority().mm_id.raw()).unwrap();
+        let layout = dispatcher.mem().lock().layout;
+        let index = {
+            let mut slots = self.slots.lock().unwrap();
+            slots.push(mm);
+            slots.len() - 1
+        };
+        self.table
+            .publish(
+                index,
+                mm,
+                Layout {
+                    heap: ReservationRange::new(
+                        layout.heap_base,
+                        layout.heap_base + layout.heap_size,
+                    )
+                    .unwrap(),
+                    arena: ReservationRange::new(
+                        layout.mmap_base,
+                        layout.mmap_base + layout.mmap_size,
+                    )
+                    .unwrap(),
+                    brk: layout.heap_base,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+        mm
+    }
+}
+
+pub(in crate::dispatch) struct Root {
+    carrier: Carrier,
     pub(in crate::dispatch) mm: ReservationMm,
 }
 
-struct View(Arc<SharedReservations>, ReservationMm);
+struct View(Carrier);
 impl PreparedHostReservations for View {
     fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-        if mm != self.1 {
-            return Err(Refusal::Stale);
-        }
-        self.0.lock(0, mm)
+        self.0.table.lock(self.0.slot(mm)?, mm)
     }
 }
-struct Provider(Arc<SharedReservations>, ReservationMm);
+struct Provider(Carrier);
 impl HostReservationProvider for Provider {
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
-        Ok(Box::new(View(Arc::clone(&self.0), self.1)))
+        Ok(Box::new(View(self.0.clone())))
     }
+}
+
+/// `dispatcher`'s production admission under its own MM permit.
+fn admit(
+    dispatcher: &SyscallDispatcher,
+    origin: El1AdmissionOrigin<'_, '_>,
+    enabled: bool,
+) -> Result<El1Admission, Refusal> {
+    crate::dispatch::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            dispatcher
+                .mem_view()
+                .admit_el1_reservations(permit, origin, enabled)
+        },
+    )
 }
 
 /// Mock substrate: this VM-free fixture has no descriptors or frames.
@@ -68,48 +149,39 @@ fn commit(root: &mut Reservations<'_>, decision: Decision) -> u64 {
 
 impl Root {
     /// Publish this dispatcher MM's root, install the carrier provider and
-    /// delegate its anonymous memory (the conformance-fixture admission).
+    /// admit it (the production bind admission).
     pub(in crate::dispatch) fn admit(dispatcher: &SyscallDispatcher) -> Self {
-        // Same zeroed-region initialization as EL1 bootstrap.
-        let ptr =
-            unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::new::<SharedReservations>()) };
-        assert!(!ptr.is_null());
-        let table: Arc<SharedReservations> =
-            Arc::from(unsafe { Box::<SharedReservations>::from_raw(ptr.cast()) });
-        let mm = ReservationMm::new(dispatcher.mm_authority().mm_id.raw()).unwrap();
-        let layout = dispatcher.mem().lock().layout;
-        table
-            .publish(
-                0,
-                mm,
-                Layout {
-                    heap: ReservationRange::new(
-                        layout.heap_base,
-                        layout.heap_base + layout.heap_size,
-                    )
-                    .unwrap(),
-                    arena: ReservationRange::new(
-                        layout.mmap_base,
-                        layout.mmap_base + layout.mmap_size,
-                    )
-                    .unwrap(),
-                    brk: layout.heap_base,
-                    address_limit: u64::MAX,
-                    data_limit: u64::MAX,
-                    external_address_bytes: 0,
-                    external_data_bytes: 0,
-                },
-            )
-            .unwrap();
+        let root = Self::publish(dispatcher);
+        assert_eq!(
+            admit(dispatcher, El1AdmissionOrigin::Bind, true),
+            Ok(El1Admission::Delegated)
+        );
+        root
+    }
+
+    /// Publish this dispatcher MM's root and install the carrier provider,
+    /// leaving the MM in host setup.
+    fn publish(dispatcher: &SyscallDispatcher) -> Self {
+        let carrier = Carrier::new();
+        let mm = carrier.publish(dispatcher);
         dispatcher
-            .install_reservation_provider(Arc::new(Provider(Arc::clone(&table), mm)))
+            .install_reservation_provider(Arc::new(Provider(carrier.clone())))
             .unwrap();
-        dispatcher.mem_view().delegate_anonymous_for_test().unwrap();
-        Self { table, mm }
+        Self { carrier, mm }
+    }
+
+    /// Publish a fork child's root in this carrier (its provider is the
+    /// parent's, inherited by the fork).
+    fn publish_child(&self, child: &SyscallDispatcher) -> Self {
+        Self {
+            carrier: self.carrier.clone(),
+            mm: self.carrier.publish(child),
+        }
     }
 
     pub(in crate::dispatch) fn lock(&self) -> Reservations<'_> {
-        self.table.lock(0, self.mm).unwrap()
+        let slot = self.carrier.slot(self.mm).unwrap();
+        self.carrier.table.lock(slot, self.mm).unwrap()
     }
 
     /// What guest EL1 does for `brk` on its own venue.
@@ -453,8 +525,10 @@ fn delegated_rlimit_as_counts_every_mapping_exactly_once() {
     );
 }
 
+/// Fork preparation (before the child's root is published): the child's
+/// host-setup twin holds the parent root's rows as its own host facts.
 #[test]
-fn delegated_fork_child_owns_the_parents_rows_in_host_setup() {
+fn delegated_fork_twin_owns_the_parents_rows_until_its_fork_commit() {
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
     let first = root
@@ -480,7 +554,7 @@ fn delegated_fork_child_owns_the_parents_rows_in_host_setup() {
     let arena = child
         .lock()
         .host_arena()
-        .expect("a fork child is in host setup")
+        .expect("a fork twin is in host setup until its fork commit")
         .clone();
     assert_eq!(arena.mmap_next, second + PAGE);
     assert_eq!(arena.free_regions, vec![(gap, PAGE)]);
@@ -2332,4 +2406,343 @@ fn delegated_fork_then_protect_restore_leaves_one_row_in_both_mms() {
         whole,
         "parent after protect+restore"
     );
+}
+
+// S3 T4: the ONE production admission (`admit_el1_reservations`) at bind
+// and at fork commit.
+
+/// A copied-MM fork of `dispatcher` through the production prepare/commit
+/// pair: the child dispatcher, its root not yet published.
+fn fork_child(dispatcher: &SyscallDispatcher) -> SyscallDispatcher {
+    let parent_mm = dispatcher.mm_authority().mm_id;
+    let child_mm = crate::kernel::MmId::from_registry_allocation(
+        std::num::NonZeroU64::new(parent_mm.raw() + 1).unwrap(),
+    );
+    let prepared = dispatcher
+        .prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy)
+        .unwrap();
+    dispatcher
+        .fork_clone_with_prepared_mm(parent_mm, child_mm, 100, 101, prepared)
+        .ok()
+        .unwrap()
+}
+
+/// The fork-commit admission of `child`, holding both MM permits.
+fn fork_commit(
+    parent: &SyscallDispatcher,
+    child: &SyscallDispatcher,
+) -> Result<El1Admission, Refusal> {
+    crate::dispatch::mm_mutation::test_support::with_permit(
+        parent.mm_mutation_coordinator(),
+        |parent_permit| {
+            crate::dispatch::mm_mutation::test_support::with_permit(
+                child.mm_mutation_coordinator(),
+                |permit| {
+                    child.mem_view().admit_el1_reservations(
+                        permit,
+                        El1AdmissionOrigin::ForkCommit {
+                            parent,
+                            parent_permit,
+                        },
+                        true,
+                    )
+                },
+            )
+        },
+    )
+}
+
+/// Every placement, `/proc` and charge answer an MM gives. `/proc` is read
+/// per page over the image and the arena: host setup coalesces adjacent
+/// rows whose lock or dump attributes differ, where Linux (and the root)
+/// keeps separate VMAs, and host setup renders the loader's whole heap
+/// backing row where the root renders `[heap]` up to the break (asserted
+/// separately).
+#[derive(Debug, PartialEq)]
+struct MmAnswers {
+    proc: Vec<ProcPage>,
+    committed: u64,
+    data: u64,
+    locked: u64,
+    brk: u64,
+    high_water: u64,
+}
+
+const IMAGE: u64 = 0x40_0000;
+
+fn mm_answers(dispatcher: &SyscallDispatcher, a: u64) -> MmAnswers {
+    let authority = dispatcher.mem();
+    let mem = authority.lock();
+    let answers = MmAnswers {
+        proc: Vec::new(),
+        committed: committed_va_bytes(&mem),
+        data: data_va_bytes(&mem),
+        locked: mem.locked_bytes(),
+        brk: mem.program_break(),
+        high_water: mem.arena_high_water(),
+    };
+    drop(mem);
+    let mut proc = proc_pages(dispatcher, IMAGE, 2);
+    proc.extend(proc_pages(dispatcher, a, 6));
+    MmAnswers { proc, ..answers }
+}
+
+const MADV_DONTDUMP: u64 = 16;
+
+/// A mixed host-setup MM: anonymous rows (one mprotected, one locked, one
+/// `MADV_DONTDUMP`), a heap, a private file mapping and a boot image region
+/// outside the heap/arena layout.
+fn populated_host_setup_mm() -> (SyscallDispatcher, CountingMmapMemory, u64) {
+    let mut dispatcher = SyscallDispatcher::new();
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+    let layout = dispatcher.mem().lock().layout;
+    let region = |start: u64, end: u64, path: &str| ProcMapsEntry {
+        start,
+        end,
+        read: true,
+        write: true,
+        execute: false,
+        sharing: carrick_vfs::ProcMapSharing::Private,
+        path: path.to_owned(),
+    };
+    // The boot image and the heap backing row the loader publishes.
+    dispatcher.mem().lock().address_space_regions = Some(vec![
+        region(IMAGE, IMAGE + 2 * PAGE, "/bin/image"),
+        region(layout.heap_base, layout.heap_base + layout.heap_size, ""),
+    ]);
+    let mut memory = arena_memory();
+    let a = anon_mmap(&mut dispatcher, &mut memory, 0, 4 * PAGE);
+    returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        a + 4 * PAGE,
+        PAGE,
+        LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+        FILE_FD,
+    ));
+    for (number, args) in [
+        (SYS_MPROTECT, [a + PAGE, PAGE, LINUX_PROT_READ, 0, 0, 0]),
+        (SYS_MLOCK, [a + 2 * PAGE, PAGE, 0, 0, 0, 0]),
+        (SYS_MADVISE, [a + 3 * PAGE, PAGE, MADV_DONTDUMP, 0, 0, 0]),
+    ] {
+        assert_eq!(
+            returned(call(&mut dispatcher, &mut memory, number, args)),
+            0
+        );
+    }
+    let heap = dispatcher.mem().lock().layout.heap_base;
+    let mut heap_memory = CountingMmapMemory::new(heap, (4 * PAGE) as usize);
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut heap_memory,
+            SYS_BRK,
+            [heap + 2 * PAGE, 0, 0, 0, 0, 0],
+        )) as u64,
+        heap + 2 * PAGE
+    );
+    (dispatcher, memory, a)
+}
+
+#[test]
+fn delegated_bind_admission_is_exact_against_its_host_setup_twin() {
+    let (twin, twin_memory, a) = populated_host_setup_mm();
+    let (live, live_memory, b) = populated_host_setup_mm();
+    assert_eq!(a, b);
+    let before = mm_answers(&live, a);
+    assert_eq!(before, mm_answers(&twin, a));
+
+    let root = Root::admit(&live);
+    assert!(live.mem().lock().delegated_root().is_some());
+    // The anonymous rows left the host; the root owns them with their
+    // protections and attributes.
+    assert!(host_owns_no_anonymous_row(&live, a, a + 4 * PAGE));
+    assert_eq!(
+        root.node(a + PAGE),
+        Some((a + PAGE, a + 2 * PAGE, true, ANON_FLAGS))
+    );
+    assert_eq!(
+        root.node(a + 2 * PAGE),
+        Some((a + 2 * PAGE, a + 3 * PAGE, true, ANON_FLAGS | LOCKED))
+    );
+    assert!(
+        root.lock()
+            .mapping(a + 4 * PAGE)
+            .is_some_and(|m| !m.anonymous)
+    );
+    assert_eq!(
+        root.lock().mapping(a + PAGE).map(|m| m.protection),
+        Some(READ)
+    );
+    // Every reader answers as the host-setup twin: rows, /proc, charges.
+    assert_eq!(mm_answers(&live, a), before);
+    // The root renders the heap as Linux does: `[heap]` up to the break.
+    let heap = live.mem().lock().layout.heap_base;
+    let rw_heap = Some((true, true, false, "[heap]".to_owned()));
+    assert_eq!(
+        proc_pages(&live, heap, 4),
+        [rw_heap.clone(), rw_heap, None, None]
+    );
+    assert_eq!(
+        mincore(&live, &live_memory, a, 5),
+        mincore(&twin, &twin_memory, a, 5)
+    );
+    let pages: Vec<u64> = (0..5).map(|page| a + page * PAGE).collect();
+    assert_eq!(fault_answers(&live, &pages), fault_answers(&twin, &pages));
+    // Idempotent for its own root.
+    assert_eq!(
+        admit(&live, El1AdmissionOrigin::Bind, true),
+        Ok(El1Admission::Delegated)
+    );
+}
+
+#[test]
+fn delegated_bind_admission_seals_the_exact_external_charges() {
+    let (dispatcher, _memory, a) = populated_host_setup_mm();
+    let root = Root::publish(&dispatcher);
+    assert_eq!(
+        admit(&dispatcher, El1AdmissionOrigin::Bind, true),
+        Ok(El1Admission::Delegated)
+    );
+    // The boot image is the only mapping the root does not hold: two
+    // private writable pages of address space and of data.
+    let layout = root.lock().layout();
+    assert_eq!(
+        (layout.external_address_bytes, layout.external_data_bytes),
+        (2 * PAGE, 2 * PAGE)
+    );
+    let charges = root.lock().charges();
+    let answers = mm_answers(&dispatcher, a);
+    assert_eq!(
+        charges.bytes + layout.external_address_bytes,
+        answers.committed
+    );
+    assert_eq!(charges.data + layout.external_data_bytes, answers.data);
+}
+
+#[test]
+fn delegated_bind_admission_decides_against_a_finite_rlimit_from_its_first_proposal() {
+    let (dispatcher, _memory, _) = populated_host_setup_mm();
+    let root = Root::publish(&dispatcher);
+    let committed = committed_va_bytes(&dispatcher.mem().lock());
+    dispatcher
+        .capture_one_task_context()
+        .unwrap()
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::As, |_| {
+            Ok::<_, std::convert::Infallible>(carrick_abi::LinuxRlimit::new(
+                committed + PAGE,
+                LINUX_RLIM_INFINITY,
+            ))
+        })
+        .expect("set RLIMIT_AS");
+    assert_eq!(
+        admit(&dispatcher, El1AdmissionOrigin::Bind, true),
+        Ok(El1Admission::Delegated)
+    );
+    // No host step ran since the admission: the guest venue's first
+    // decisions see the whole MM's charges.
+    assert_eq!(
+        root.guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE
+        ),
+        Err(Refusal::Limit)
+    );
+    assert!(
+        root.guest_mmap(Placement::Anywhere, PAGE, ReservationProtection::READ_WRITE)
+            .is_ok()
+    );
+}
+
+#[test]
+fn delegated_admission_hatch_keeps_the_mm_in_host_setup() {
+    let (dispatcher, _memory, a) = populated_host_setup_mm();
+    let root = Root::publish(&dispatcher);
+    let before = mm_answers(&dispatcher, a);
+    // `CARRICK_EL1_RESERVATIONS=0`: the same entry point admits nothing.
+    assert_eq!(
+        admit(&dispatcher, El1AdmissionOrigin::Bind, false),
+        Ok(El1Admission::HostSetup)
+    );
+    assert!(dispatcher.mem().lock().host_arena().is_some());
+    assert!(!root.lock().is_admitted());
+    assert!(root.lock().mapping(a).is_none());
+    assert_eq!(mm_answers(&dispatcher, a), before);
+    // A carrier without a provider is host setup too.
+    let (bare, _bare_memory, _) = populated_host_setup_mm();
+    assert_eq!(
+        admit(&bare, El1AdmissionOrigin::Bind, true),
+        Ok(El1Admission::HostSetup)
+    );
+}
+
+#[test]
+fn delegated_fork_commit_seeds_a_delegated_child_root_with_the_parents_rows() {
+    let (parent, _memory, a) = populated_host_setup_mm();
+    let root = Root::admit(&parent);
+    let guest = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    let before = mm_answers(&parent, a);
+
+    let child = fork_child(&parent);
+    // A fork twin is sealed only by its fork commit, never as a bind.
+    let child_root = root.publish_child(&child);
+    assert_eq!(
+        admit(&child, El1AdmissionOrigin::Bind, true),
+        Err(Refusal::Stale)
+    );
+    assert_eq!(fork_commit(&parent, &child), Ok(El1Admission::Delegated));
+
+    // The child stays delegated, its root seeded with the parent's rows.
+    assert!(child.mem().lock().delegated_root().is_some());
+    assert!(host_owns_no_anonymous_row(&child, a, a + 4 * PAGE));
+    assert!(host_owns_no_anonymous_row(&child, guest, guest + 2 * PAGE));
+    for address in [a, a + PAGE, a + 2 * PAGE, a + 3 * PAGE, a + 4 * PAGE, guest] {
+        assert_eq!(
+            child_root.lock().mapping(address).map(|m| (
+                m.range,
+                m.protection,
+                m.anonymous,
+                m.flags
+            )),
+            root.lock()
+                .mapping(address)
+                .map(|m| (m.range, m.protection, m.anonymous, m.flags)),
+            "child root node at {address:#x}"
+        );
+    }
+    assert_eq!(mm_answers(&child, a), before);
+    // Idempotent for its own root.
+    assert_eq!(fork_commit(&parent, &child), Ok(El1Admission::Delegated));
+
+    // Two live MMs: each root moves on alone.
+    root.guest_munmap(guest, 2 * PAGE);
+    assert!(child_root.lock().mapping(guest).is_some());
+    child_root.guest_munmap(a, PAGE);
+    assert!(root.lock().mapping(a).is_some());
+    assert!(proc_row_at(&parent, a).is_some());
+    assert!(proc_row_at(&child, a).is_none());
+    assert!(proc_row_at(&child, guest).is_some());
+}
+
+#[test]
+fn delegated_fork_commit_refuses_a_parent_that_moved_on() {
+    let (parent, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&parent);
+    let child = fork_child(&parent);
+    let child_root = root.publish_child(&child);
+    // The parent root's generation moved after the twin was taken.
+    root.guest_mmap(Placement::Anywhere, PAGE, ReservationProtection::READ_WRITE)
+        .unwrap();
+    assert_eq!(fork_commit(&parent, &child), Err(Refusal::Stale));
+    assert!(child.mem().lock().host_arena().is_some());
+    assert!(!child_root.lock().is_admitted());
 }
