@@ -7,7 +7,7 @@
     "description_backing": 24,
     "epoll": 422,
     "stream": 176,
-    "mapping": 1246,
+    "mapping": 1247,
     "lifecycle": 32
   },
   "production_counts": {
@@ -20256,6 +20256,15 @@
       ],
       "text": "/// `FAR_EL1` as `si_addr`). Mapping only `el0_fault_signal` would regress",
       "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "line": 2847,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// The backend registered backing, inventory, an alias and a mapping",
+      "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/threads.rs",
