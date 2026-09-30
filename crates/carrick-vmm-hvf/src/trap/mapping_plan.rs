@@ -486,6 +486,10 @@ impl HvfVmState {
 
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
+        let root_host_cow_stats = carrier_foreign_mm_transport
+            .custody
+            .host_cow_ledger
+            .admit_mm();
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm.into_inner()),
             carrier_foreign_mm_transport,
@@ -506,6 +510,7 @@ impl HvfVmState {
                     std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
                     std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                     std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    root_host_cow_stats,
                 ),
                 last_exit_class: 0,
                 last_fault_esr: 0,

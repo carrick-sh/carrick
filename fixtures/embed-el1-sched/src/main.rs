@@ -67,6 +67,14 @@
 //!   the complete range, proves write/read denial through `SEGV_ACCERR`, restores
 //!   RW from the signal handler, and verifies every byte remains intact.
 //!
+//! - `anonymous-reservations <count>` (EL1 increment 2): exercises anonymous
+//!   `mmap`, `MAP_FIXED` replacement, and `brk` growth and shrink, proving
+//!   authoritative in-guest reservation tracking and zero-fill semantics.
+//!
+//! - `anonymous-discard-and-exit <pages> <rounds>` (EL1 increment 2): exercises
+//!   `madvise(MADV_DONTNEED)` and process termination without `munmap` under a
+//!   live fork peer, proving elastic frame return and zero-fill on reuse.
+//!
 //! - `fault-entry`: triggers a stage-1 permission fault on a PROT_READ mapping,
 //!   catches SIGSEGV with SA_SIGINFO, verifies si_addr, mprotects PROT_READ|PROT_WRITE,
 //!   retries store, and verifies store success and register preservation.
@@ -1486,7 +1494,7 @@ fn fork_cow_worker(
     worker_id: usize,
     workers: usize,
     round: usize,
-) -> bool {
+) -> Option<u64> {
     pin((worker_id % 4) as u32);
     let start_page = (worker_id * pages) / workers;
     let end_page = ((worker_id + 1) * pages) / workers;
@@ -1508,13 +1516,16 @@ fn fork_cow_worker(
             let expected = page_val ^ ((w as u64) << 48);
             let seen = unsafe { page_ptr.add(w).read_volatile() };
             if seen != expected {
-                return false;
+                return None;
             }
         }
     }
-    true
+    // Pages this worker wrote after the fork and read back intact.
+    Some((end_page - start_page) as u64)
 }
 
+/// Returns the pages this process wrote after the fork and verified intact
+/// (each is a COW break against the peer), or `None` on any failure.
 fn fork_cow_process(
     role: &str,
     base: usize,
@@ -1523,7 +1534,7 @@ fn fork_cow_process(
     round: usize,
     write_fd: libc::c_int,
     read_fd: libc::c_int,
-) -> bool {
+) -> Option<u64> {
     let role_magic: u64 = if role == "child" {
         0x4348_494C_0000_0000 // 'CHIL'
     } else {
@@ -1536,23 +1547,14 @@ fn fork_cow_process(
             fork_cow_worker(base, pages, page_size, role_magic, w, WORKERS, round)
         }));
     }
-    let mut all_ok = true;
+    let mut verified_pages = 0u64;
     for h in handles {
-        if let Ok(worker_ok) = h.join() {
-            if !worker_ok {
-                all_ok = false;
-            }
-        } else {
-            all_ok = false;
-        }
-    }
-    if !all_ok {
-        return false;
+        verified_pages += h.join().ok().flatten()?;
     }
 
     const TIMEOUT_MS: libc::c_int = 10_000;
     if !write_signal_byte(write_fd, b'W') || !poll_read_byte(read_fd, TIMEOUT_MS) {
-        return false;
+        return None;
     }
 
     // Verify after peer wrote that our memory is still intact
@@ -1565,15 +1567,45 @@ fn fork_cow_process(
             let expected = page_val ^ ((w as u64) << 48);
             let seen = unsafe { page_ptr.add(w).read_volatile() };
             if seen != expected {
-                return false;
+                return None;
             }
         }
     }
 
     if !write_signal_byte(write_fd, b'D') || !poll_read_byte(read_fd, TIMEOUT_MS) {
-        return false;
+        return None;
     }
-    true
+    Some(verified_pages)
+}
+
+/// Send one observed count to the peer as 8 little-endian bytes.
+fn write_count(fd: libc::c_int, count: u64) -> bool {
+    let bytes = count.to_le_bytes();
+    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    n == bytes.len() as isize
+}
+
+/// Receive a count written by `write_count`, bounded by `timeout_ms`.
+fn poll_read_count(fd: libc::c_int, timeout_ms: libc::c_int) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    let mut have = 0;
+    while have < bytes.len() {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+            return None;
+        }
+        let n = unsafe { libc::read(fd, bytes[have..].as_mut_ptr().cast(), bytes.len() - have) };
+        if n <= 0 {
+            return None;
+        }
+        have += n as usize;
+    }
+    Some(u64::from_le_bytes(bytes))
 }
 
 fn fork_cow(forks: usize, pages: usize) -> i32 {
@@ -1613,6 +1645,8 @@ fn fork_cow(forks: usize, pages: usize) -> i32 {
     let base = region as usize;
 
     let words_per_page = page_size / std::mem::size_of::<u64>();
+    let mut parent_verified = 0u64;
+    let mut child_verified = 0u64;
     for round in 0..forks {
         // Pre-populate memory so all pages are resident before fork
         for page_idx in 0..pages {
@@ -1650,7 +1684,10 @@ fn fork_cow(forks: usize, pages: usize) -> i32 {
                 libc::close(c2p[0]);
                 libc::alarm(60);
             }
-            let ok = fork_cow_process("child", base, pages, page_size, round, c2p[1], p2c[0]);
+            let verified = fork_cow_process("child", base, pages, page_size, round, c2p[1], p2c[0]);
+            // Report the child's own observation to the parent; a failed child
+            // reports nothing and exits non-zero.
+            let ok = verified.is_some_and(|count| write_count(c2p[1], count));
             unsafe {
                 libc::close(c2p[1]);
                 libc::close(p2c[0]);
@@ -1665,23 +1702,46 @@ fn fork_cow(forks: usize, pages: usize) -> i32 {
             libc::close(p2c[0]);
             libc::close(c2p[1]);
         }
-        let parent_ok = fork_cow_process("parent", base, pages, page_size, round, p2c[1], c2p[0]);
+        let parent_pages =
+            fork_cow_process("parent", base, pages, page_size, round, p2c[1], c2p[0]);
+        let child_pages = if parent_pages.is_some() {
+            poll_read_count(c2p[0], 10_000)
+        } else {
+            None
+        };
         unsafe {
             libc::close(p2c[1]);
             libc::close(c2p[0]);
         }
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        let child_ok = waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        let child_exit_ok =
+            waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        let parent_ok = parent_pages.is_some();
+        let child_ok = child_exit_ok && child_pages.is_some();
         if !parent_ok || !child_ok {
             println!("fork-cow failed round={round} parent_ok={parent_ok} child_ok={child_ok}");
             unsafe { libc::munmap(region, len) };
             return 1;
         }
+        parent_verified += parent_pages.unwrap_or(0);
+        child_verified += child_pages.unwrap_or(0);
     }
 
     unsafe { libc::munmap(region, len) };
-    println!("fork-cow forks={forks} pages={pages} ok=true");
+    // Every count below was observed by the process it names: pages written
+    // after the fork and read back intact, summed over all rounds. A failure
+    // above returns before any of these lines exist.
+    println!(
+        "fork-cow parent writers=4 forks={forks} pages={pages} verified_pages={parent_verified} ok=true"
+    );
+    println!(
+        "fork-cow child writers=4 forks={forks} pages={pages} verified_pages={child_verified} ok=true"
+    );
+    println!(
+        "fork-cow forks={forks} pages={pages} cow_pages={} isolation_ok=true ok=true",
+        parent_verified + child_verified
+    );
     0
 }
 
@@ -1980,6 +2040,273 @@ fn permission_transitions(pages: usize, rounds: usize) -> i32 {
         signal_errors == 0,
     );
     i32::from(!ok)
+}
+
+fn anonymous_reservations(count: usize) -> i32 {
+    let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size_raw <= 0 {
+        println!("anonymous-reservations invalid page size {page_size_raw}");
+        return 1;
+    }
+    let page_size = page_size_raw as usize;
+    if count == 0 {
+        println!("anonymous-reservations invalid count {count}");
+        return 1;
+    }
+
+    let mut mmaps = 0usize;
+    let mut reserved_pages = 0usize;
+    let mut brks = 0usize;
+    let mut regions = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let pages = (i % 4) + 1;
+        let len = pages * page_size;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            println!("anonymous-reservations mmap failed at {i}");
+            return 1;
+        }
+        mmaps += 1;
+        reserved_pages += pages;
+        let p = ptr as *mut u64;
+        unsafe {
+            p.write_volatile(0x1122_3344_5566_7788 ^ (i as u64));
+            if p.read_volatile() != (0x1122_3344_5566_7788 ^ (i as u64)) {
+                println!("anonymous-reservations readback failed at {i}");
+                return 1;
+            }
+        }
+        regions.push((ptr, len));
+    }
+
+    if let Some(&(first_ptr, first_len)) = regions.first() {
+        let fixed_ptr = unsafe {
+            libc::mmap(
+                first_ptr,
+                first_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if fixed_ptr == libc::MAP_FAILED {
+            println!("anonymous-reservations MAP_FIXED failed");
+            return 1;
+        }
+        mmaps += 1;
+    }
+
+    // brk is required to work: growth by one page must move the break exactly,
+    // the new page must be writable, and shrinking must restore the break.
+    let initial_brk = unsafe { raw6(214, 0, 0, 0, 0, 0, 0) } as usize;
+    if initial_brk == 0 {
+        println!("anonymous-reservations brk query failed");
+        return 1;
+    }
+    let expanded = initial_brk + page_size;
+    let grown = unsafe { raw6(214, expanded as u64, 0, 0, 0, 0, 0) } as usize;
+    if grown != expanded {
+        println!("anonymous-reservations brk growth failed: want {expanded:#x} got {grown:#x}");
+        return 1;
+    }
+    brks += 1;
+    let heap_ptr = initial_brk as *mut u64;
+    unsafe {
+        heap_ptr.write_volatile(0xDEAD_BEEF_CAFE_BABE);
+        if heap_ptr.read_volatile() != 0xDEAD_BEEF_CAFE_BABE {
+            println!("anonymous-reservations heap readback failed");
+            return 1;
+        }
+    }
+    let shrunk = unsafe { raw6(214, initial_brk as u64, 0, 0, 0, 0, 0) } as usize;
+    if shrunk != initial_brk {
+        println!("anonymous-reservations brk shrink failed: want {initial_brk:#x} got {shrunk:#x}");
+        return 1;
+    }
+    brks += 1;
+
+    for (ptr, len) in regions {
+        unsafe { libc::munmap(ptr, len) };
+    }
+
+    println!(
+        "anonymous-reservations count={count} pages={reserved_pages} mmaps={mmaps} brks={brks} ok=true"
+    );
+    0
+}
+
+fn anonymous_discard_and_exit(pages: usize, rounds: usize) -> i32 {
+    let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size_raw <= 0 {
+        println!("anonymous-discard-and-exit invalid page size {page_size_raw}");
+        return 1;
+    }
+    let page_size = page_size_raw as usize;
+    if pages == 0 || rounds == 0 {
+        println!("anonymous-discard-and-exit invalid pages={pages} rounds={rounds}");
+        return 1;
+    }
+    let len = match pages.checked_mul(page_size) {
+        Some(l) if l > 0 => l,
+        _ => {
+            println!("anonymous-discard-and-exit overflow len");
+            return 1;
+        }
+    };
+
+    let words_per_page = page_size / std::mem::size_of::<u64>();
+
+    for round in 0..rounds {
+        let region = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if region == libc::MAP_FAILED {
+            println!("anonymous-discard-and-exit mmap failed round={round}");
+            return 1;
+        }
+        let base = region as usize;
+
+        for p in 0..pages {
+            let page_ptr = (base + p * page_size) as *mut u64;
+            let val = 0xD15C_0000_0000_0000u64 | ((round as u64) << 32) | (p as u64);
+            for w in 0..words_per_page {
+                unsafe { page_ptr.add(w).write_volatile(val ^ ((w as u64) << 48)) };
+            }
+        }
+
+        let mut p2c = [0 as libc::c_int; 2];
+        let mut c2p = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0 || unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0 {
+            println!("pipe failed round={round}");
+            unsafe { libc::munmap(region, len) };
+            return 1;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("fork failed round={round}");
+            unsafe {
+                libc::close(p2c[0]);
+                libc::close(p2c[1]);
+                libc::close(c2p[0]);
+                libc::close(c2p[1]);
+                libc::munmap(region, len);
+            }
+            return 1;
+        }
+
+        if pid == 0 {
+            unsafe {
+                libc::close(p2c[1]);
+                libc::close(c2p[0]);
+            }
+            let mut child_ok = true;
+            for p in 0..pages {
+                let page_ptr = (base + p * page_size) as *mut u64;
+                let expected = 0xD15C_0000_0000_0000u64 | ((round as u64) << 32) | (p as u64);
+                if unsafe { page_ptr.read_volatile() } != expected {
+                    child_ok = false;
+                }
+            }
+
+            let rc = unsafe { libc::madvise(region, len, libc::MADV_DONTNEED) };
+            if rc != 0 {
+                child_ok = false;
+            }
+
+            for p in 0..pages {
+                let page_ptr = (base + p * page_size) as *mut u64;
+                for w in 0..words_per_page {
+                    if unsafe { page_ptr.add(w).read_volatile() } != 0 {
+                        child_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            write_signal_byte(c2p[1], if child_ok { b'K' } else { b'F' });
+            poll_read_byte(p2c[0], 5000);
+
+            unsafe {
+                libc::close(c2p[1]);
+                libc::close(p2c[0]);
+                libc::_exit(if child_ok { 0 } else { 1 });
+            }
+        }
+
+        unsafe {
+            libc::close(p2c[0]);
+            libc::close(c2p[1]);
+        }
+
+        let ok_child_signal = poll_read_byte(c2p[0], 10000);
+        write_signal_byte(p2c[1], b'A');
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let child_ok = ok_child_signal && waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        unsafe {
+            libc::close(p2c[1]);
+            libc::close(c2p[0]);
+        }
+
+        if !child_ok {
+            println!("child discard failed round={round}");
+            unsafe { libc::munmap(region, len) };
+            return 1;
+        }
+
+        for p in 0..pages {
+            let page_ptr = (base + p * page_size) as *mut u64;
+            let expected = 0xD15C_0000_0000_0000u64 | ((round as u64) << 32) | (p as u64);
+            if unsafe { page_ptr.read_volatile() } != expected {
+                println!("parent memory corruption after child discard round={round} page={p}");
+                unsafe { libc::munmap(region, len) };
+                return 1;
+            }
+        }
+
+        let rc = unsafe { libc::madvise(region, len, libc::MADV_DONTNEED) };
+        if rc != 0 {
+            println!("parent madvise failed round={round}");
+            unsafe { libc::munmap(region, len) };
+            return 1;
+        }
+
+        for p in 0..pages {
+            let page_ptr = (base + p * page_size) as *mut u64;
+            for w in 0..words_per_page {
+                if unsafe { page_ptr.add(w).read_volatile() } != 0 {
+                    println!("parent non-zero page after discard round={round} page={p}");
+                    unsafe { libc::munmap(region, len) };
+                    return 1;
+                }
+            }
+        }
+
+        unsafe { libc::munmap(region, len) };
+    }
+
+    println!("anonymous-discard-and-exit pages={pages} rounds={rounds} dontneed_ok=true exit_ok=true zero_ok=true ok=true");
+    0
 }
 
 static FAULT_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -2691,6 +3018,13 @@ fn main() {
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
         ),
         "permission-transitions" => permission_transitions(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
+        ),
+        "anonymous-reservations" => {
+            anonymous_reservations(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(64))
+        }
+        "anonymous-discard-and-exit" => anonymous_discard_and_exit(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
         ),

@@ -307,6 +307,29 @@ pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
     El1FrameGrantStats::observe_current()
         .map_or_else(El1FrameGrantStats::default, |observer| observer.snapshot())
 }
+/// Retain the published carrier's host-COW ledger; it stays readable after
+/// every admitted MM and the VM are gone. `None` when no carrier is published.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn host_cow_observe_current() -> Option<crate::hvf_aarch64_engine::HostCowLedger> {
+    let carrier = persistent_carrier_cell().lock();
+    match carrier.as_ref()? {
+        PersistentCarrierCellEntry::Published(carrier) => Some(
+            carrier
+                .carrier_foreign_mm_transport
+                .custody
+                .host_cow_ledger
+                .clone(),
+        ),
+        PersistentCarrierCellEntry::CreateCleanup { .. } => None,
+    }
+}
+
+/// Snapshot only the currently published carrier; absence is incomplete
+/// (`complete == false`), never zero.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn host_cow_snapshot() -> crate::hvf_aarch64_engine::HostCowSnapshot {
+    host_cow_observe_current().map_or_else(Default::default, |ledger| ledger.snapshot())
+}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod execve_rebuild;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1691,12 +1714,14 @@ impl HvfTaskState {
             pending_exec_predecessor_identity: None,
             pending_exec_stage2_cleanup: None,
             shared_process_mm: false,
+            // Placeholder task state, not admitted to any carrier: detached.
             mm_access: MmAccessState::new(
                 page_tables,
                 protections,
                 frame_inventory,
                 cow_armed,
                 cow_deferred_publications,
+                crate::hvf_aarch64_engine::HostCowStats::default(),
             ),
             last_exit_class: 0,
             last_fault_esr: 0,
@@ -1822,6 +1847,7 @@ impl HvfTaskState {
                 ))),
                 std::sync::Arc::clone(&self.cow_armed),
                 std::sync::Arc::clone(&self.cow_deferred_publications),
+                self.custody().host_cow_ledger.admit_mm(),
             );
             // This provisional state only separates the replacement inventory.
             // Its table authority still belongs to the live parent: installing
@@ -1948,6 +1974,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
             frame_inventory,
             cow_armed,
             cow_deferred_publications,
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         ),
         last_exit_class: 0,
         last_fault_esr: 0,
@@ -5375,6 +5402,14 @@ impl HvpatchTaskRegistration {
             .ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch task lacks COW publication state".to_owned())
             })?;
+        #[cfg(not(test))]
+        let custody = std::sync::Arc::clone(&self.custody);
+        #[cfg(test)]
+        let custody = task_mm
+            .foreign_mm_transport
+            .as_ref()
+            .map(|t| std::sync::Arc::clone(&t.custody))
+            .unwrap_or_else(|| std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()));
         let mm_access = {
             let mut slot = task_mm.mm_access.lock();
             std::sync::Arc::clone(slot.get_or_insert_with(|| {
@@ -5384,6 +5419,7 @@ impl HvpatchTaskRegistration {
                     std::sync::Arc::clone(&ledger),
                     std::sync::Arc::clone(&cow_armed),
                     std::sync::Arc::clone(&cow_deferred_publications),
+                    custody.host_cow_ledger.admit_mm(),
                 );
                 if let Some(authority) = task_mm.mm_root_stage2.lock().take() {
                     access
@@ -5411,15 +5447,8 @@ impl HvpatchTaskRegistration {
                             });
                     }
                 }
-                #[cfg(not(test))]
-                let custody = std::sync::Arc::clone(&self.custody);
-                #[cfg(test)]
-                let custody = task_mm
-                    .foreign_mm_transport
-                    .as_ref()
-                    .map(|t| std::sync::Arc::clone(&t.custody))
-                    .unwrap_or_else(|| std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()));
-                let resolver = MmAccessLiveResolver::new(&access, custody);
+                let resolver =
+                    MmAccessLiveResolver::new(&access, std::sync::Arc::clone(&custody));
                 access.set_live_resolver(resolver);
                 access
             }))
@@ -7186,6 +7215,10 @@ impl HvfVmState {
             plan.frame_inventory,
             plan.cow_armed,
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            plan.carrier_foreign_mm_transport
+                .custody
+                .host_cow_ledger
+                .admit_mm(),
         );
         for mapping in &mapped {
             if let Some(owner) = &mapping.structural_owner {

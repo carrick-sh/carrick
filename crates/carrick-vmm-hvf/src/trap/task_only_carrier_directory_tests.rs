@@ -2779,6 +2779,7 @@ fn shared_process_authority_preserves_the_exact_mm_access_arc() {
         Arc::clone(&ledger),
         Arc::clone(&cow_armed),
         Arc::clone(&cow_deferred_publications),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     let authority = HvpatchTaskMmAuthority::from_prepared(
         HvpatchPreparedTaskAuthority {

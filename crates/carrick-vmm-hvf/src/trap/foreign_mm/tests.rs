@@ -2962,6 +2962,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
         Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
         Arc::new(parking_lot::Mutex::new(Vec::new())),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     transport.register(&replacement_snapshot, &replacement_state);
 
@@ -3443,6 +3444,7 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
                 .as_ref()
                 .expect("prepared COW publications"),
         ),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     *task_mm.mm_access.lock() = Some(Arc::clone(&prepared_mm_access));
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
@@ -3625,6 +3627,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
                 .as_ref()
                 .expect("prepared COW publications"),
         ),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     *task_mm.mm_access.lock() = Some(Arc::clone(&prepared_mm_access));
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
@@ -3777,6 +3780,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
                 .as_ref()
                 .expect("prepared COW publications"),
         ),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     *task_mm.mm_access.lock() = Some(Arc::clone(&prepared_mm_access));
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
@@ -3966,6 +3970,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
                 .as_ref()
                 .expect("prepared COW publications"),
         ),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     *task_mm.mm_access.lock() = Some(Arc::clone(&prepared_mm_access));
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
@@ -4674,6 +4679,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             parent_inventory,
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         ),
         last_exit_class: 0,
         last_fault_esr: 0,
@@ -4933,6 +4939,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         Arc::clone(&child_inventory),
         child_cow_armed,
         child_deferred_publications,
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     for mapping in &prepared.mappings {
         if let Some(owner) = &mapping.structural_owner {
@@ -6123,6 +6130,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
         ledger,
         Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
         Arc::new(parking_lot::Mutex::new(Vec::new())),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     for mapping in &prepared.mappings {
         if let Some(owner) = &mapping.structural_owner {
@@ -6201,6 +6209,7 @@ fn owned_foreign_mm_registration_teardown_is_exact_and_stale_safe() {
             Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         )
     };
     let old_state = make_state();
@@ -6640,6 +6649,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             parent_inventory,
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
         ),
         last_exit_class: 0,
         last_fault_esr: 0,
@@ -7191,6 +7201,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         Arc::new(parking_lot::Mutex::new(stale_inventory)),
         Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
         Arc::new(parking_lot::Mutex::new(Vec::new())),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     for mapping in &child_task_state.mappings {
         if let Some(owner) = &mapping.structural_owner {

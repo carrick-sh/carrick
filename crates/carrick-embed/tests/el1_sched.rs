@@ -1638,6 +1638,466 @@ mm-occupancy child_ok=true
     );
 }
 
+/// One `key=value` report line. Malformed tokens, duplicate keys and keys the
+/// caller did not name are rejected, so a fixture cannot smuggle an
+/// unvalidated counter past the witness.
+struct ReportLine<'a> {
+    line: &'a str,
+    fields: std::collections::BTreeMap<&'a str, &'a str>,
+}
+
+impl<'a> ReportLine<'a> {
+    /// The first line that starts with the words `lead` and continues with
+    /// `key=value` tokens only.
+    fn find(transcript: &'a str, lead: &[&str], allowed: &[&str]) -> Result<Self, String> {
+        let label = lead.join(" ");
+        let line = transcript
+            .lines()
+            .find(|line| {
+                let mut words = line.split_whitespace();
+                lead.iter().all(|word| words.next() == Some(word))
+                    && words.next().is_none_or(|next| next.contains('='))
+            })
+            .ok_or_else(|| format!("missing `{label}` report line"))?;
+        let mut fields = std::collections::BTreeMap::new();
+        for token in line.split_whitespace().skip(lead.len()) {
+            let (key, value) = token
+                .split_once('=')
+                .ok_or_else(|| format!("malformed token `{token}` in line: {line}"))?;
+            if !allowed.contains(&key) {
+                return Err(format!("unexpected key `{key}` in line: {line}"));
+            }
+            if fields.insert(key, value).is_some() {
+                return Err(format!("duplicate key `{key}` in line: {line}"));
+            }
+        }
+        Ok(Self { line, fields })
+    }
+
+    fn raw(&self, key: &str) -> Result<&'a str, String> {
+        self.fields
+            .get(key)
+            .copied()
+            .ok_or_else(|| format!("missing {key} counter in line: {}", self.line))
+    }
+
+    fn u64(&self, key: &str) -> Result<u64, String> {
+        let value = self.raw(key)?;
+        value
+            .parse::<u64>()
+            .map_err(|error| format!("invalid {key} `{value}`: {error}"))
+    }
+
+    fn flag(&self, key: &str) -> Result<bool, String> {
+        let value = self.raw(key)?;
+        value
+            .parse::<bool>()
+            .map_err(|error| format!("invalid {key} `{value}`: {error}"))
+    }
+}
+
+/// One process's fork-COW report: the pages that role wrote after the fork and
+/// then read back intact, counted by the fixture as it verified them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct El1MemoryCowRoleReport {
+    writers: u64,
+    pages: u64,
+    verified_pages: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct El1MemoryCowReport {
+    parent: El1MemoryCowRoleReport,
+    child: El1MemoryCowRoleReport,
+    cow_pages: u64,
+    guest_faults: u64,
+    /// Completed host COW transactions credited by the carrier's MMs during
+    /// the run (`carrick_embed::host_cow_snapshot` delta). Never a fault-exit
+    /// count.
+    host_cow_resolutions: u64,
+    /// MMs the carrier admitted during the run; proves the ledger observed the
+    /// workload's fork children rather than reading zero from nothing.
+    host_cow_mms: u64,
+    host_fault_exits: u64,
+    exits: u64,
+    grants: u64,
+    returns: u64,
+    bytes_granted: u64,
+    bytes_returned: u64,
+}
+
+fn parse_cow_role_line(
+    transcript: &str,
+    role: &str,
+    forks: u64,
+    pages: u64,
+) -> Result<El1MemoryCowRoleReport, String> {
+    let line = ReportLine::find(
+        transcript,
+        &["fork-cow", role],
+        &["writers", "forks", "pages", "verified_pages", "ok"],
+    )?;
+    if !line.flag("ok")? {
+        return Err(format!("{role} report ok must be true"));
+    }
+    let writers = line.u64("writers")?;
+    if writers < 2 {
+        return Err(format!("{role} writers must be at least 2, saw {writers}"));
+    }
+    if line.u64("forks")? != forks {
+        return Err(format!(
+            "expected forks={forks}, saw forks={}",
+            line.u64("forks")?
+        ));
+    }
+    if line.u64("pages")? != pages {
+        return Err(format!(
+            "expected pages={pages}, saw pages={}",
+            line.u64("pages")?
+        ));
+    }
+    let verified_pages = line.u64("verified_pages")?;
+    if verified_pages != forks * pages {
+        return Err(format!(
+            "{role} verified_pages ({verified_pages}) != forks*pages ({})",
+            forks * pages
+        ));
+    }
+    Ok(El1MemoryCowRoleReport {
+        writers,
+        pages,
+        verified_pages,
+    })
+}
+
+/// Parse and cross-check a fork-COW transcript: the fixture's own role lines
+/// and summary, then the host's `el1-memory cow` observation line. This checks
+/// that the report is well formed, internally consistent and fully observed;
+/// whether COW was resolved by EL1 is asserted separately
+/// ([`cow_ownership_violation`]) so a malformed report and a red ownership
+/// witness stay distinguishable.
+fn validate_el1_memory_cow_report(
+    transcript: &str,
+    forks: u64,
+    pages: u64,
+) -> Result<El1MemoryCowReport, String> {
+    let parent = parse_cow_role_line(transcript, "parent", forks, pages)?;
+    let child = parse_cow_role_line(transcript, "child", forks, pages)?;
+
+    let summary = ReportLine::find(
+        transcript,
+        &["fork-cow"],
+        &["forks", "pages", "cow_pages", "isolation_ok", "ok"],
+    )?;
+    if summary.u64("forks")? != forks || summary.u64("pages")? != pages {
+        return Err(format!(
+            "summary forks/pages ({}/{}) != expected ({forks}/{pages})",
+            summary.u64("forks")?,
+            summary.u64("pages")?
+        ));
+    }
+    let cow_pages = summary.u64("cow_pages")?;
+    if cow_pages == 0 {
+        return Err("cow_pages must be non-zero".to_owned());
+    }
+    if cow_pages != parent.verified_pages + child.verified_pages {
+        return Err(format!(
+            "cow_pages ({cow_pages}) != parent+child verified_pages ({})",
+            parent.verified_pages + child.verified_pages
+        ));
+    }
+    if !summary.flag("isolation_ok")? {
+        return Err("isolation_ok must be true".to_owned());
+    }
+    if !summary.flag("ok")? {
+        return Err("summary ok must be true".to_owned());
+    }
+
+    let host = ReportLine::find(
+        transcript,
+        &["el1-memory", "cow"],
+        &[
+            "guest_faults",
+            "host_cow_resolutions",
+            "host_cow_mms",
+            "host_fault_exits",
+            "exits",
+            "grants",
+            "returns",
+            "bytes_granted",
+            "bytes_returned",
+            "ok",
+        ],
+    )?;
+    let report = El1MemoryCowReport {
+        parent,
+        child,
+        cow_pages,
+        guest_faults: host.u64("guest_faults")?,
+        host_cow_resolutions: host.u64("host_cow_resolutions")?,
+        host_cow_mms: host.u64("host_cow_mms")?,
+        host_fault_exits: host.u64("host_fault_exits")?,
+        exits: host.u64("exits")?,
+        grants: host.u64("grants")?,
+        returns: host.u64("returns")?,
+        bytes_granted: host.u64("bytes_granted")?,
+        bytes_returned: host.u64("bytes_returned")?,
+    };
+    if !host.flag("ok")? {
+        return Err("host ok flag must be true".to_owned());
+    }
+    if report.guest_faults == 0 {
+        return Err("guest_faults must be non-zero".to_owned());
+    }
+    if report.host_cow_mms < forks {
+        return Err(format!(
+            "host COW ledger admitted {} MMs for {forks} forks: the ledger did not observe the workload",
+            report.host_cow_mms
+        ));
+    }
+    if report.host_fault_exits > report.exits {
+        return Err(format!(
+            "host_fault_exits ({}) exceeds total exits ({})",
+            report.host_fault_exits, report.exits
+        ));
+    }
+    if report.returns != report.grants {
+        return Err(format!(
+            "incorrect frame accounting: returns ({}) != grants ({})",
+            report.returns, report.grants
+        ));
+    }
+    if report.bytes_returned != report.bytes_granted {
+        return Err(format!(
+            "incorrect frame accounting: bytes_returned ({}) != bytes_granted ({})",
+            report.bytes_returned, report.bytes_granted
+        ));
+    }
+    let ceiling = forks * pages / 4 + 64;
+    if report.exits > ceiling {
+        return Err(format!(
+            "per-page host exits detected: exits={} exceeds ceiling {ceiling} for forks={forks} pages={pages}",
+            report.exits
+        ));
+    }
+    Ok(report)
+}
+
+/// The ownership claim of `kernel.el1.fork-cow`: no COW transaction completed
+/// on the host. Host fault exits are reported but are not this quantity.
+fn cow_ownership_violation(report: &El1MemoryCowReport) -> Option<String> {
+    (report.host_cow_resolutions != 0).then(|| {
+        format!(
+            "host completed {} COW resolutions across {} MMs; EL1 must resolve COW in guest",
+            report.host_cow_resolutions, report.host_cow_mms
+        )
+    })
+}
+
+#[cfg(test)]
+mod cow_report_tests {
+    use super::*;
+
+    const PARENT: &str = "fork-cow parent writers=4 forks=20 pages=16 verified_pages=320 ok=true";
+    const CHILD: &str = "fork-cow child writers=4 forks=20 pages=16 verified_pages=320 ok=true";
+    const SUMMARY: &str = "fork-cow forks=20 pages=16 cow_pages=640 isolation_ok=true ok=true";
+    const HOST: &str = "el1-memory cow guest_faults=640 host_cow_resolutions=0 host_cow_mms=21 host_fault_exits=0 exits=12 grants=16 returns=16 bytes_granted=65536 bytes_returned=65536 ok=true";
+
+    fn transcript(lines: &[&str]) -> String {
+        lines.join("\n") + "\n"
+    }
+
+    fn rejects(lines: &[&str], needle: &str) {
+        let err = validate_el1_memory_cow_report(&transcript(lines), 20, 16).unwrap_err();
+        assert!(err.contains(needle), "wanted `{needle}` in `{err}`");
+    }
+
+    fn with_host(replace: (&str, &str)) -> String {
+        assert!(HOST.contains(replace.0), "test edits an existing field");
+        HOST.replacen(replace.0, replace.1, 1)
+    }
+
+    #[test]
+    fn accepts_valid_transcript() {
+        let report =
+            validate_el1_memory_cow_report(&transcript(&[PARENT, CHILD, SUMMARY, HOST]), 20, 16)
+                .unwrap();
+        assert_eq!(report.cow_pages, 640);
+        assert_eq!(report.host_cow_resolutions, 0);
+        assert_eq!(report.host_cow_mms, 21);
+        assert_eq!(cow_ownership_violation(&report), None);
+    }
+
+    #[test]
+    fn host_resolved_cow_is_a_well_formed_report_with_an_ownership_violation() {
+        let host = with_host(("host_cow_resolutions=0", "host_cow_resolutions=320"));
+        let report =
+            validate_el1_memory_cow_report(&transcript(&[PARENT, CHILD, SUMMARY, &host]), 20, 16)
+                .expect("a red ownership witness is not a malformed report");
+        let violation = cow_ownership_violation(&report).unwrap();
+        assert!(violation.contains("320 COW resolutions"), "{violation}");
+    }
+
+    #[test]
+    fn fault_exits_are_not_host_cow_resolutions() {
+        // Host fault exits alone never count as a host COW resolution.
+        let host = with_host(("host_fault_exits=0", "host_fault_exits=9"));
+        let report =
+            validate_el1_memory_cow_report(&transcript(&[PARENT, CHILD, SUMMARY, &host]), 20, 16)
+                .unwrap();
+        assert_eq!(report.host_fault_exits, 9);
+        assert_eq!(cow_ownership_violation(&report), None);
+    }
+
+    #[test]
+    fn rejects_legacy_unmetered_transcript() {
+        rejects(&["fork-cow forks=20 pages=16 ok=true"], "`fork-cow parent`");
+    }
+
+    #[test]
+    fn rejects_missing_host_cow_counters() {
+        let no_resolutions = HOST.replace(" host_cow_resolutions=0", "");
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &no_resolutions],
+            "missing host_cow_resolutions counter",
+        );
+        let no_mms = HOST.replace(" host_cow_mms=21", "");
+        rejects(&[PARENT, CHILD, SUMMARY, &no_mms], "missing host_cow_mms");
+        let no_exits = HOST.replace(" host_fault_exits=0", "");
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &no_exits],
+            "missing host_fault_exits",
+        );
+    }
+
+    #[test]
+    fn rejects_a_ledger_that_did_not_observe_the_forks() {
+        let host = with_host(("host_cow_mms=21", "host_cow_mms=0"));
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &host],
+            "did not observe the workload",
+        );
+        let host = with_host(("host_cow_mms=21", "host_cow_mms=19"));
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &host],
+            "admitted 19 MMs for 20 forks",
+        );
+    }
+
+    #[test]
+    fn rejects_fault_exits_exceeding_total_exits() {
+        let host = with_host(("host_fault_exits=0", "host_fault_exits=20"));
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &host],
+            "host_fault_exits (20) exceeds total exits (12)",
+        );
+    }
+
+    #[test]
+    fn rejects_zero_guest_faults_and_zero_cow_pages() {
+        let host = with_host(("guest_faults=640", "guest_faults=0"));
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &host],
+            "guest_faults must be non-zero",
+        );
+        let summary = SUMMARY.replace("cow_pages=640", "cow_pages=0");
+        rejects(
+            &[PARENT, CHILD, &summary, HOST],
+            "cow_pages must be non-zero",
+        );
+    }
+
+    #[test]
+    fn rejects_cow_pages_that_disagree_with_role_observations() {
+        let summary = SUMMARY.replace("cow_pages=640", "cow_pages=641");
+        rejects(
+            &[PARENT, CHILD, &summary, HOST],
+            "cow_pages (641) != parent+child",
+        );
+    }
+
+    #[test]
+    fn rejects_unverified_or_zero_role_pages() {
+        let parent = PARENT.replace("verified_pages=320", "verified_pages=0");
+        rejects(
+            &[&parent, CHILD, SUMMARY, HOST],
+            "parent verified_pages (0)",
+        );
+        let child = CHILD.replace("verified_pages=320", "verified_pages=319");
+        rejects(
+            &[PARENT, &child, SUMMARY, HOST],
+            "child verified_pages (319)",
+        );
+    }
+
+    #[test]
+    fn rejects_frame_accounting_mismatches() {
+        let host = with_host(("returns=16", "returns=8"));
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &host],
+            "returns (8) != grants (16)",
+        );
+        let host = with_host(("bytes_returned=65536", "bytes_returned=32768"));
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &host],
+            "bytes_returned (32768) != bytes_granted (65536)",
+        );
+    }
+
+    #[test]
+    fn rejects_per_page_exits() {
+        let host = with_host(("exits=12", "exits=500"));
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &host],
+            "per-page host exits detected",
+        );
+    }
+
+    #[test]
+    fn rejects_isolation_and_role_failures() {
+        let summary = SUMMARY.replace("isolation_ok=true", "isolation_ok=false");
+        rejects(
+            &[PARENT, CHILD, &summary, HOST],
+            "isolation_ok must be true",
+        );
+        let child = CHILD.replace("ok=true", "ok=false");
+        rejects(
+            &[PARENT, &child, SUMMARY, HOST],
+            "child report ok must be true",
+        );
+    }
+
+    #[test]
+    fn rejects_fork_and_page_count_mismatches() {
+        rejects(
+            &[
+                &PARENT.replace("forks=20", "forks=10"),
+                CHILD,
+                SUMMARY,
+                HOST,
+            ],
+            "expected forks=20",
+        );
+        rejects(
+            &[&PARENT.replace("pages=16", "pages=8"), CHILD, SUMMARY, HOST],
+            "expected pages=16",
+        );
+    }
+
+    #[test]
+    fn rejects_missing_lines_duplicates_and_unknown_keys() {
+        rejects(&[CHILD, SUMMARY, HOST], "`fork-cow parent` report line");
+        rejects(&[PARENT, CHILD, SUMMARY], "`el1-memory cow` report line");
+        let dup = format!("{HOST} exits=13");
+        rejects(&[PARENT, CHILD, SUMMARY, &dup], "duplicate key `exits`");
+        let unknown = format!("{HOST} extra=1");
+        rejects(
+            &[PARENT, CHILD, SUMMARY, &unknown],
+            "unexpected key `extra`",
+        );
+    }
+}
+
 /// Contract `kernel.el1.anonymous-first-touch` (EL1 increment 2, first-touch checkpoint):
 /// two live fork-related processes freshly touch private anonymous memory at the
 /// same inherited virtual range across 256, 1024, and 4096 pages per process.
@@ -2167,38 +2627,280 @@ fn el1_metadata_allocator_host_wait_requires_unmasked_irq() {
     );
 }
 
-/// Fork COW resolution verification: forks 100 times with private anonymous
-/// pages armed read-only for COW. 4 guest threads concurrently write to the
-/// pages, taking write permission faults. EL1 serves the faults in-guest by
-/// upgrading descriptors to AP_RW and invalidating ASIDs without host exits.
+/// Contract `kernel.el1.fork-cow`: fork COW resolution verification.
+/// Forks across three scales with private anonymous pages armed read-only for
+/// COW; four guest threads per process concurrently write them, taking write
+/// permission faults. EL1 must resolve those faults in the guest, so the
+/// carrier's host COW ledger must record no completed host COW transaction.
 /// Parent and child verify memory isolation and integrity.
+///
+/// Observations: `host_cow_resolutions` is the delta of the CARRIER-scoped
+/// `carrick_embed::host_cow_snapshot()` (every MM the carrier admitted,
+/// surviving their retirement; `checked_delta` rejects a missing or different
+/// carrier). It is not the host fault-exit count, which is reported beside it.
+///
+/// Expected RED until guest-owned COW lands: today the host `cow_engine`
+/// completes the transactions and this assertion names the count. Only a
+/// recorded signed run establishes the measured failure.
 #[test]
 fn el1_fork_cow_resolves_in_guest() {
+    const FORKS: u64 = 20;
+    const SCALES: [u64; 3] = [16, 64, 256];
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
-    let measured = run_fixture(
-        &carrier,
-        &["fork-cow", "100", "16"],
-        Duration::from_secs(60),
-    );
-    assert!(measured.result.success(), "{}", describe(&measured));
-    let stdout = measured.result.stdout_utf8();
-    assert!(
-        stdout.contains("fork-cow forks=100 pages=16 ok=true"),
-        "fixture fork-cow must succeed and verify isolation: {stdout:?}"
-    );
+    let mut runs = Vec::new();
 
-    let el1_active = std::env::var("CARRICK_EL1").as_deref() != Ok("0");
-    if el1_active {
-        let counters =
-            read_el1_counters().expect("EL1 counters must be populated when EL1 is enabled");
-        let faults = counters
-            .fault_taken
-            .load(std::sync::atomic::Ordering::Relaxed);
+    for pages in SCALES {
+        let grants_before = carrick_embed::el1_frame_grant_stats();
+        let cow_before = carrick_embed::host_cow_snapshot();
+        let faults_before = read_el1_counters().map_or(0, |c| {
+            c.fault_taken.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        let measured = run_fixture(
+            &carrier,
+            &["fork-cow", &FORKS.to_string(), &pages.to_string()],
+            Duration::from_secs(120),
+        );
+        let cow = carrick_embed::host_cow_snapshot()
+            .checked_delta(&cow_before)
+            .expect("host COW ledger must be complete and belong to the same carrier");
+        let grants_after = carrick_embed::el1_frame_grant_stats();
+        let faults_after = read_el1_counters().map_or(0, |c| {
+            c.fault_taken.load(std::sync::atomic::Ordering::Relaxed)
+        });
+
+        let faults = faults_after.saturating_sub(faults_before);
+        let grants = grants_after
+            .grants_succeeded
+            .saturating_sub(grants_before.grants_succeeded);
+        let returns = grants_after
+            .returns_completed
+            .saturating_sub(grants_before.returns_completed);
+        let bytes_granted = grants_after
+            .bytes_granted
+            .saturating_sub(grants_before.bytes_granted);
+        let bytes_returned = grants_after
+            .bytes_returned
+            .saturating_sub(grants_before.bytes_returned);
+        let host_fault_exits =
+            measured.exit_classes[carrick_el1_abi::HostExitClass::Fault as usize];
+
+        assert!(measured.result.success(), "{}", describe(&measured));
+        let stdout = measured.result.stdout_utf8();
+        let host_line = format!(
+            "el1-memory cow guest_faults={faults} host_cow_resolutions={} host_cow_mms={} host_fault_exits={host_fault_exits} exits={} grants={grants} returns={returns} bytes_granted={bytes_granted} bytes_returned={bytes_returned} ok={}",
+            cow.host_cow_resolutions,
+            cow.admitted_mms,
+            measured.exits,
+            measured.result.success()
+        );
+        let transcript = format!("{}\n{}", stdout.trim(), host_line);
+        println!(
+            "el1-sched fork-cow forks={FORKS} pages={pages} exits={} {host_line}",
+            measured.exits
+        );
+        let report = validate_el1_memory_cow_report(&transcript, FORKS, pages)
+            .unwrap_or_else(|error| panic!("invalid fork-cow report: {error}\n{transcript}"));
+
         assert!(
-            faults >= 100,
-            "expected at least 100 EL1 fault entries for 100 fork-COW rounds, got {faults}"
+            report.guest_faults >= FORKS * pages,
+            "expected at least {} guest fault entries, got {}",
+            FORKS * pages,
+            report.guest_faults
+        );
+        if let Some(violation) = cow_ownership_violation(&report) {
+            panic!(
+                "fork-cow pages={pages}: {violation} (host fault exits {host_fault_exits}, guest faults {faults})"
+            );
+        }
+        runs.push((pages, measured.exits));
+    }
+
+    for pair in runs.windows(2) {
+        let (p0, exits0) = pair[0];
+        let (p1, exits1) = pair[1];
+        let added_pages = (FORKS as f64) * (p1 as f64 - p0 as f64);
+        let exit_slope = (exits1 as f64 - exits0 as f64) / added_pages;
+        println!(
+            "el1-sched fork-cow slope {p0}->{p1} pages (added={added_pages}): \
+             exits_diff={} slope={exit_slope:.4} exits/page",
+            exits1 as i64 - exits0 as i64,
+        );
+        assert!(
+            exit_slope < 0.125,
+            "fork-cow host-exit slope {exit_slope:.4} exceeds ceiling <0.125 exits per added page"
+        );
+    }
+}
+
+/// Contract `kernel.el1.anonymous-reservations`: anonymous `mmap` (including
+/// `MAP_FIXED` replacement) and `brk` growth/shrink are served by EL1, with
+/// memory committed lazily on first touch.
+///
+/// Forwarding is asserted structurally: the forwarded `mmap`/`brk` count must
+/// be identical at every scale (fixed runtime start-up cost only), never
+/// growing with the number of reservations.
+///
+/// Expected RED until guest-owned reservations land (`mmap`/`brk` still
+/// forward per call). Only a recorded signed run establishes the failure.
+#[test]
+fn el1_anonymous_reservations_stay_in_guest() {
+    const SCALES: [usize; 3] = [64, 256, 1024];
+    const MMAP: usize = 222;
+    const BRK: usize = 214;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let counters = || {
+        read_el1_counters().map_or([0; 4], |c| {
+            let load = |counter: &std::sync::atomic::AtomicU64| {
+                counter.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            [
+                load(&c.served[MMAP]),
+                load(&c.forwarded[MMAP]),
+                load(&c.served[BRK]),
+                load(&c.forwarded[BRK]),
+            ]
+        })
+    };
+    let mut runs = Vec::new();
+
+    for count in SCALES {
+        let before = counters();
+        let measured = run_fixture(
+            &carrier,
+            &["anonymous-reservations", &count.to_string()],
+            Duration::from_secs(120),
+        );
+        let after = counters();
+        let [served_mmap, forwarded_mmap, served_brk, forwarded_brk] =
+            std::array::from_fn(|i| after[i].saturating_sub(before[i]));
+
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched anonymous-reservations count={count} exits={} served_mmap={served_mmap} forwarded_mmap={forwarded_mmap} served_brk={served_brk} forwarded_brk={forwarded_brk} {}",
+            measured.exits,
+            stdout.trim()
+        );
+
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            stdout.contains(&format!("anonymous-reservations count={count} "))
+                && stdout.contains("ok=true"),
+            "anonymous reservations failed: {stdout:?}"
+        );
+        assert!(
+            served_mmap >= count as u64,
+            "EL1 must serve every anonymous mmap: expected >= {count} served, got {served_mmap}"
+        );
+        assert!(
+            served_brk >= 2,
+            "EL1 must serve brk growth and shrink: expected >= 2 served, got {served_brk}"
+        );
+        runs.push((count, measured.exits, forwarded_mmap, forwarded_brk));
+    }
+
+    for pair in runs.windows(2) {
+        let (c0, exits0, fmmap0, fbrk0) = pair[0];
+        let (c1, exits1, fmmap1, fbrk1) = pair[1];
+        assert_eq!(
+            fmmap1, fmmap0,
+            "forwarded mmap grew with reservations {c0}->{c1} ({fmmap0} -> {fmmap1}): per-call forwarding"
+        );
+        assert_eq!(
+            fbrk1, fbrk0,
+            "forwarded brk grew with reservations {c0}->{c1} ({fbrk0} -> {fbrk1}): per-call forwarding"
+        );
+        let exit_slope = (exits1 as f64 - exits0 as f64) / (c1 - c0) as f64;
+        println!(
+            "el1-sched anonymous-reservations slope {c0}->{c1}: exits_diff={} slope={exit_slope:.4} exits/reservation",
+            exits1 as i64 - exits0 as i64,
+        );
+        assert!(
+            exit_slope < 0.125,
+            "anonymous-reservations host-exit slope {exit_slope:.4} exceeds <0.125 exits per added reservation"
+        );
+    }
+}
+
+/// Contract `kernel.el1.anonymous-retirement`: `madvise(MADV_DONTNEED)` and
+/// process exit without `munmap`, under a live fork peer, return every granted
+/// frame, keep the peer's memory intact and let returned frames be reused.
+///
+/// Expected RED until discard and exit accounting is complete; only a recorded
+/// signed run establishes the measured failure.
+#[test]
+fn el1_anonymous_discard_and_exit_return_frames() {
+    const SCALES: [u64; 3] = [256, 1024, 4096];
+    const ROUNDS: u64 = 4;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+
+    for pages in SCALES {
+        let before = carrick_embed::el1_frame_grant_stats();
+        let measured = run_fixture(
+            &carrier,
+            &[
+                "anonymous-discard-and-exit",
+                &pages.to_string(),
+                &ROUNDS.to_string(),
+            ],
+            Duration::from_secs(120),
+        );
+        let after = carrick_embed::el1_frame_grant_stats();
+
+        let grants = after.grants_succeeded - before.grants_succeeded;
+        let returns = after.returns_completed - before.returns_completed;
+        let reused = after.reused_grants - before.reused_grants;
+        let bytes_granted = after.bytes_granted - before.bytes_granted;
+        let bytes_returned = after.bytes_returned - before.bytes_returned;
+
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched anonymous-discard-and-exit pages={pages} rounds={ROUNDS} exits={} grants={grants} returns={returns} reused={reused} bytes_granted={bytes_granted} bytes_returned={bytes_returned} {}",
+            measured.exits,
+            stdout.trim()
+        );
+
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            stdout.contains(&format!(
+                "anonymous-discard-and-exit pages={pages} rounds={ROUNDS} dontneed_ok=true exit_ok=true zero_ok=true ok=true"
+            )),
+            "discard and exit semantics incomplete: {stdout:?}"
+        );
+        assert!(grants > 0, "workload published no EL1 frame grants");
+        assert_eq!(
+            returns, grants,
+            "every exact EL1 grant across discard and exit must return"
+        );
+        assert_eq!(
+            bytes_returned, bytes_granted,
+            "every granted physical byte must return after discard and exit"
+        );
+        assert!(
+            reused > 0,
+            "repeated mapping across rounds must physically reuse returned frames"
+        );
+        runs.push((pages, measured.exits));
+    }
+
+    for pair in runs.windows(2) {
+        let (p0, exits0) = pair[0];
+        let (p1, exits1) = pair[1];
+        let added_pages = (ROUNDS as f64) * (p1 - p0) as f64;
+        let exit_slope = (exits1 as f64 - exits0 as f64) / added_pages;
+        println!(
+            "el1-sched anonymous-discard-and-exit slope {p0}->{p1} pages rounds={ROUNDS}: exits_diff={} slope={exit_slope:.4} exits/page/round",
+            exits1 as i64 - exits0 as i64,
+        );
+        assert!(
+            exit_slope < 0.125,
+            "discard-and-exit host-exit slope {exit_slope:.4} exceeds ceiling <0.125 exits per added page per round"
         );
     }
 }
