@@ -243,13 +243,30 @@ impl Stage1Authority {
     ) -> bool {
         let mut inner = self.inner.lock();
         inner.host_resolver = Some(Arc::clone(&resolver));
-        let promote = inner.guest_lane_pending
+        // Making the manager live discards its owned descriptor copy. Host
+        // edits not yet synced (still host-owned here) are first published
+        // to the backing that becomes authoritative; a manager that cannot
+        // publish them keeps them and the selection stays pending.
+        let host_owned = inner.live_owner == LiveDescriptorOwner::Host;
+        let synced = match inner.manager.as_mut() {
+            Some(manager) if host_owned && manager.has_unsynced_edits() => {
+                // SAFETY: the caller authenticated `resolver` for this
+                // authority's arenas (this function's contract).
+                unsafe { manager.sync_to_host(&resolver) }.is_ok()
+            }
+            _ => true,
+        };
+        let promote = synced
+            && inner.guest_lane_pending
             && inner.live_owner == LiveDescriptorOwner::Host
             && inner
                 .manager
                 .as_ref()
                 .is_none_or(|manager| !manager.has_unsynced_edits());
         if let Some(manager) = inner.manager.as_mut() {
+            if !synced {
+                return false;
+            }
             unsafe { manager.make_live(resolver) };
             if promote {
                 manager.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
@@ -2372,6 +2389,66 @@ mod tests {
             Err(GuestLaneRefusal::UnsyncedEdits)
         );
         assert_eq!(dirty.live_descriptor_owner(), LiveDescriptorOwner::Host);
+    }
+
+    /// A pending guest selection whose live backing arrives while host edits
+    /// are still unsynced must neither discard those edits (making the
+    /// manager live drops its owned copy) nor strand the selection: once the
+    /// edits reach the live backing the authority is exactly as admissible as
+    /// a clean one, and nothing else ever retries the promotion. A stranded
+    /// MM stays on the host lane for its whole life, and every fork child
+    /// (which inherits the pending flag and binds clean) is promoted instead.
+    #[test]
+    fn pending_guest_selection_syncs_unsynced_edits_at_live_bind_and_completes() {
+        let resolver = Arc::new(BufferResolver {
+            buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
+            base: LINUX_PAGE_TABLES_BASE,
+        });
+        let mut staged = test_manager();
+        staged.set_prot_none(LINUX_MMAP_BASE, 0x1000, None).unwrap();
+        assert!(staged.has_unsynced_edits(), "fixture must hold host edits");
+        let owned_walk = staged.debug_walk(LINUX_MMAP_BASE);
+        assert_ne!(owned_walk[0], 0, "fixture edit must be visible offline");
+        let authority = Stage1Authority::new_with_manager(Some(staged));
+        assert_eq!(
+            authority.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Deferred)
+        );
+        let child = authority.child_with_manager(test_manager());
+
+        assert!(
+            unsafe {
+                authority.bind_live_backing(
+                    Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+                )
+            },
+            "the binding that makes the edits live completes the pending selection"
+        );
+        assert_eq!(
+            authority.live_descriptor_owner(),
+            LiveDescriptorOwner::Guest
+        );
+        assert_eq!(
+            authority.with_manager(|m| (m.is_live(), m.has_unsynced_edits())),
+            Some((true, false))
+        );
+        // The terminal the host edit wrote is in the backing EL1 now edits
+        // (the tables above it were published with the image before bind).
+        let l3_table = owned_walk[2] & 0x0000_FFFF_FFFF_F000;
+        let slot = (l3_table - LINUX_PAGE_TABLES_BASE) as usize
+            + ((LINUX_MMAP_BASE >> 12) & 511) as usize * 8;
+        let live_terminal = {
+            let buf = resolver.buf.lock().unwrap();
+            u64::from_le_bytes(buf[slot..slot + 8].try_into().unwrap())
+        };
+        assert_eq!(
+            live_terminal, owned_walk[3],
+            "the host edit reached the live backing instead of being discarded"
+        );
+        // The child forked while pending still completes its own selection.
+        assert!(unsafe {
+            child.bind_live_backing(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>)
+        });
     }
 
     #[test]
