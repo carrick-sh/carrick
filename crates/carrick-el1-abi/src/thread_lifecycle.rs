@@ -48,7 +48,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 1;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 2;
 
 /// Pool entries per process: a task holds up to four identities ahead of use.
 pub const THREAD_POOL_ENTRIES: usize = 8;
@@ -115,6 +115,8 @@ pub enum TransitionError {
     GateClosed(GateState),
     /// The index is outside the pool.
     NoSuchEntry,
+    /// No entry is `Reserved` ([`ThreadLifecyclePage::claim_any`]).
+    PoolEmpty,
 }
 
 /// A reference to one incarnation of one entry. Copyable: it proves nothing
@@ -130,6 +132,20 @@ impl EntryRef {
     }
     pub const fn generation(self) -> u64 {
         self.generation
+    }
+    /// One word for a [`ThreadControlSlot`]: never 0, since a stocked entry's
+    /// generation is at least 1.
+    const fn pack(self) -> u64 {
+        (self.generation << 8) | self.index as u64
+    }
+    const fn unpack(word: u64) -> Option<Self> {
+        if word == 0 {
+            return None;
+        }
+        Some(Self {
+            index: (word & 0xff) as u32,
+            generation: word >> 8,
+        })
     }
 }
 
@@ -275,12 +291,25 @@ impl Default for PendingSummary {
     }
 }
 
-/// Snapshot of a thread's `sigaltstack`.
+/// Snapshot of a thread's `sigaltstack`. Size 0 is the disabled stack
+/// (zeroed storage, and what `SS_DISABLE` stores): an enabled one is at least
+/// `MINSIGSTKSZ` bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AltStack {
     pub sp: u64,
     pub size: u64,
     pub flags: u32,
+}
+impl AltStack {
+    /// No alternate stack.
+    pub const DISABLED: Self = Self {
+        sp: 0,
+        size: 0,
+        flags: 0,
+    };
+    pub const fn is_disabled(&self) -> bool {
+        self.size == 0
+    }
 }
 
 /// Per-thread control state served at EL1. Single writer per field: the
@@ -298,6 +327,11 @@ pub struct ThreadControlSlot {
     alt_flags: AtomicU32,
     robust_len: AtomicU32,
     robust_head: AtomicU64,
+    /// `clear_child_tid` (`CLONE_CHILD_CLEARTID`, `set_tid_address`); 0 = none.
+    clear_child_tid: AtomicU64,
+    /// The pool entry this thread was born into ([`EntryRef::pack`]); 0 for
+    /// a thread that holds none (the leader).
+    entry: AtomicU64,
 }
 
 impl ThreadControlSlot {
@@ -310,7 +344,44 @@ impl ThreadControlSlot {
             alt_flags: AtomicU32::new(0),
             robust_len: AtomicU32::new(0),
             robust_head: AtomicU64::new(0),
+            clear_child_tid: AtomicU64::new(0),
+            entry: AtomicU64::new(0),
         }
+    }
+
+    /// Initialise the slot of a thread about to be born into `entry`, before
+    /// it is visible (nothing else reads the slot of a thread not yet Born):
+    /// the mask captured at claim, no alternate stack and no robust list
+    /// (`clone(2)` with `CLONE_VM` clears both), its `clear_child_tid`.
+    pub fn reset_for_birth(&self, blocked: BlockedMask, clear_child_tid: u64, entry: EntryRef) {
+        self.blocked.store(blocked.0, Ordering::Relaxed);
+        // Keep the sequence even: a stale odd value would wedge readers.
+        let seq = self.alt_seq.load(Ordering::Relaxed);
+        self.alt_seq
+            .store(seq.wrapping_add(seq & 1), Ordering::Relaxed);
+        self.alt_sp.store(0, Ordering::Relaxed);
+        self.alt_size.store(0, Ordering::Relaxed);
+        self.alt_flags.store(0, Ordering::Relaxed);
+        self.robust_head.store(0, Ordering::Relaxed);
+        self.robust_len.store(0, Ordering::Relaxed);
+        self.clear_child_tid
+            .store(clear_child_tid, Ordering::Relaxed);
+        self.entry.store(entry.pack(), Ordering::Release);
+    }
+
+    /// The pool entry the thread holds, if any.
+    pub fn entry(&self) -> Option<EntryRef> {
+        EntryRef::unpack(self.entry.load(Ordering::Acquire))
+    }
+
+    /// The thread's `clear_child_tid` address (0 = none).
+    pub fn clear_child_tid(&self) -> u64 {
+        self.clear_child_tid.load(Ordering::Acquire)
+    }
+
+    /// Owner-written `clear_child_tid` (`set_tid_address(2)`).
+    pub fn set_clear_child_tid(&self, address: u64) {
+        self.clear_child_tid.store(address, Ordering::Release);
     }
 
     /// Masker half of the Dekker pair: install `new`, then read the shared
@@ -401,22 +472,82 @@ pub struct ThreadLifecyclePage {
     live: AtomicU32,
     pending: PendingSummary,
     entries: [PoolEntry; THREAD_POOL_ENTRIES],
+    /// [`LifecycleHatches`] bits, fixed when the page is built.
+    serving: AtomicU32,
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
+
+/// Environment names of the EL1 lifecycle opt-out hatches.
+pub const EL1_THREADS_HATCH_ENV: &str = "CARRICK_EL1_THREADS";
+pub const EL1_SIGMASK_HATCH_ENV: &str = "CARRICK_EL1_SIGMASK";
+
+/// Which EL1 lifecycle services a page allows. Both are on by default;
+/// `CARRICK_EL1_THREADS=0` stops EL1 serving clone and exit,
+/// `CARRICK_EL1_SIGMASK=0` stops it serving `rt_sigprocmask`,
+/// `sigaltstack` and `set_robust_list`. The host reads each variable once
+/// ([`Self::from_lookup`]) and builds every page with the result, so EL1 and
+/// the host decide from the same bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleHatches {
+    pub threads: bool,
+    pub sigmask: bool,
+}
+
+const SERVING_THREADS: u32 = 1;
+const SERVING_SIGMASK: u32 = 2;
+
+impl LifecycleHatches {
+    pub const ON: Self = Self {
+        threads: true,
+        sigmask: true,
+    };
+
+    /// Consult `lookup` once per hatch variable; exactly `0` (trimmed)
+    /// disables that service, anything else (or unset) leaves it on.
+    pub fn from_lookup<S: AsRef<str>>(mut lookup: impl FnMut(&str) -> Option<S>) -> Self {
+        let mut on = |name: &str| lookup(name).is_none_or(|value| value.as_ref().trim() != "0");
+        Self {
+            threads: on(EL1_THREADS_HATCH_ENV),
+            sigmask: on(EL1_SIGMASK_HATCH_ENV),
+        }
+    }
+
+    const fn bits(self) -> u32 {
+        (if self.threads { SERVING_THREADS } else { 0 })
+            | (if self.sigmask { SERVING_SIGMASK } else { 0 })
+    }
+}
 const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 64);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 impl ThreadLifecyclePage {
-    /// A page with an open gate, one live thread (the leader) and an empty
-    /// pool.
+    /// A page with an open gate, one live thread (the leader), an empty
+    /// pool and every service on.
     pub const fn new() -> Self {
+        Self::with_hatches(LifecycleHatches::ON)
+    }
+
+    /// [`Self::new`] with the services `hatches` allows.
+    pub const fn with_hatches(hatches: LifecycleHatches) -> Self {
         Self {
             gate: AtomicU32::new(GateState::Open as u32),
             live: AtomicU32::new(1),
             pending: PendingSummary::new(),
             entries: [const { PoolEntry::new() }; THREAD_POOL_ENTRIES],
+            serving: AtomicU32::new(hatches.bits()),
         }
+    }
+
+    /// Whether EL1 may serve clone and exit (`CARRICK_EL1_THREADS`).
+    pub fn serves_threads(&self) -> bool {
+        self.serving.load(Ordering::Relaxed) & SERVING_THREADS != 0
+    }
+
+    /// Whether EL1 may serve the per-thread setup calls
+    /// (`CARRICK_EL1_SIGMASK`).
+    pub fn serves_sigmask(&self) -> bool {
+        self.serving.load(Ordering::Relaxed) & SERVING_SIGMASK != 0
     }
 
     pub fn pending(&self) -> &PendingSummary {
@@ -593,6 +724,41 @@ impl ThreadLifecyclePage {
         Ok(ClaimedEntry(r))
     }
 
+    /// EL1 clone: claim the first `Reserved` entry ([`Self::claim`]).
+    /// `GateClosed` as soon as the gate refuses a claim; `PoolEmpty` when no
+    /// entry could be claimed (another claimant may have won each one).
+    pub fn claim_any(&self) -> Result<ClaimedEntry, TransitionError> {
+        for (index, e) in self.entries.iter().enumerate() {
+            let (generation, state) = unpack(e.state.load(Ordering::Acquire));
+            if state != EntryState::Reserved {
+                continue;
+            }
+            let r = EntryRef {
+                index: index as u32,
+                generation,
+            };
+            match self.claim(r) {
+                Ok(claimed) => return Ok(claimed),
+                Err(closed @ TransitionError::GateClosed(_)) => return Err(closed),
+                Err(_) => {}
+            }
+        }
+        Err(TransitionError::PoolEmpty)
+    }
+
+    /// EL1 clone backs out after a successful claim (the child could not be
+    /// created): `Claimed -> Reserved`, the identity unused and still issued.
+    pub fn unclaim(&self, claim: ClaimedEntry) -> Result<EntryRef, TransitionError> {
+        let r = claim.0;
+        self.transition(
+            r,
+            &[EntryState::Claimed],
+            EntryState::Reserved,
+            Ordering::SeqCst,
+        )?;
+        Ok(r)
+    }
+
     /// Kernel: withdraw an unused entry, `Reserved -> Revoked`. Loses to a
     /// concurrent claim.
     pub fn revoke(&self, r: EntryRef) -> Result<(), TransitionError> {
@@ -707,7 +873,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 12] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 15] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     THREAD_POOL_ENTRIES as u64,
     core::mem::size_of::<ThreadLifecyclePage>() as u64,
@@ -720,6 +886,9 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 12] = [
     core::mem::size_of::<ThreadControlSlot>() as u64,
     core::mem::offset_of!(ThreadControlSlot, alt_seq) as u64,
     core::mem::offset_of!(ThreadControlSlot, robust_head) as u64,
+    core::mem::offset_of!(ThreadControlSlot, clear_child_tid) as u64,
+    core::mem::offset_of!(ThreadControlSlot, entry) as u64,
+    core::mem::offset_of!(ThreadLifecyclePage, serving) as u64,
 ];
 
 #[cfg(test)]
@@ -1010,6 +1179,86 @@ mod tests {
             r.join().unwrap();
         }
         assert_eq!(s.read_altstack().sp, 200_000);
+    }
+
+    #[test]
+    fn claim_any_takes_a_reserved_entry_and_unclaim_returns_it() {
+        let p = ThreadLifecyclePage::new();
+        assert_eq!(p.claim_any(), Err(TransitionError::PoolEmpty));
+        let r0 = p.stock(0, ident(1)).unwrap();
+        let r3 = p.stock(3, ident(4)).unwrap();
+        let c = p.claim_any().unwrap();
+        assert_eq!(c.entry(), r0);
+        let c2 = p.claim_any().unwrap();
+        assert_eq!(c2.entry(), r3);
+        assert_eq!(p.claim_any(), Err(TransitionError::PoolEmpty));
+        // Backing out keeps the identity issued, same incarnation.
+        assert_eq!(p.unclaim(c), Ok(r0));
+        assert_eq!(st(&p, 0), EntryState::Reserved);
+        assert_eq!(p.identity(r0), Some(ident(1)));
+        assert_eq!(p.claim_any().map(|c| c.entry()), Ok(r0));
+        // A closed gate refuses without consuming anything.
+        p.record_born(c2, born(0)).unwrap();
+        let r5 = p.stock(5, ident(6)).unwrap();
+        p.close_for_fork().unwrap();
+        assert_eq!(
+            p.claim_any(),
+            Err(TransitionError::GateClosed(GateState::ForkClosing))
+        );
+        assert_eq!(p.state(5).unwrap().1, EntryState::Reserved);
+        p.reopen_after_fork().unwrap();
+        assert_eq!(p.claim_any().map(|c| c.entry()), Ok(r5));
+    }
+
+    #[test]
+    fn birth_resets_the_slot_and_names_the_entry() {
+        let p = ThreadLifecyclePage::new();
+        let r = p.stock(2, ident(3)).unwrap();
+        let s = ThreadControlSlot::new();
+        assert_eq!(s.entry(), None);
+        s.set_robust_list(0x5000, 24);
+        s.write_altstack(AltStack {
+            sp: 0x9000,
+            size: 0x4000,
+            flags: 0,
+        });
+        s.init_blocked(BlockedMask(0xff));
+        s.reset_for_birth(BlockedMask(0x10), 0x7000, r);
+        assert_eq!(s.entry(), Some(r));
+        assert_eq!(s.blocked(), BlockedMask(0x10));
+        assert_eq!(s.robust_list(), (0, 0));
+        assert!(s.read_altstack().is_disabled());
+        assert_eq!(s.clear_child_tid(), 0x7000);
+        s.set_clear_child_tid(0);
+        assert_eq!(s.clear_child_tid(), 0);
+    }
+
+    #[test]
+    fn hatches_read_each_variable_once_and_only_zero_disables() {
+        let mut seen = Vec::new();
+        let h = LifecycleHatches::from_lookup(|name: &str| {
+            seen.push(std::string::String::from(name));
+            (name == EL1_SIGMASK_HATCH_ENV).then_some(" 0 ")
+        });
+        assert_eq!(
+            h,
+            LifecycleHatches {
+                threads: true,
+                sigmask: false
+            }
+        );
+        assert_eq!(seen, [EL1_THREADS_HATCH_ENV, EL1_SIGMASK_HATCH_ENV]);
+        let h = LifecycleHatches::from_lookup(|name: &str| {
+            (name == EL1_THREADS_HATCH_ENV).then_some("1")
+        });
+        assert_eq!(h, LifecycleHatches::ON);
+        let p = ThreadLifecyclePage::with_hatches(LifecycleHatches {
+            threads: false,
+            sigmask: true,
+        });
+        assert!(!p.serves_threads());
+        assert!(p.serves_sigmask());
+        assert!(ThreadLifecyclePage::new().serves_threads());
     }
 
     #[test]
