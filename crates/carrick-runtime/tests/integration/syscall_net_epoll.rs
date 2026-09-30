@@ -13,9 +13,11 @@ mod support;
 
 #[cfg(target_os = "macos")]
 use carrick_kernel::dispatch::{FdWaitCompletion, ThreadCtx, WaitFds};
+#[cfg(target_os = "macos")]
 use carrick_kernel::kernel::Scheduler;
 #[cfg(target_os = "macos")]
 use carrick_kernel::kernel::continuation::test_support::{await_event, capture, publish};
+#[cfg(target_os = "macos")]
 use carrick_kernel::kernel::continuation::{
     BlockedContinuation, CarrierWaitService, ContinuationCompletion,
 };
@@ -28,6 +30,7 @@ use carrick_runtime::linux_abi::{
     LINUX_EINTR, LINUX_EPOLLHUP, LINUX_EPOLLOUT, LINUX_SO_ERROR, LINUX_SOCK_CLOEXEC,
     LINUX_SOCK_NONBLOCK, LINUX_SOL_SOCKET, LINUX_SOL_TCP,
 };
+#[cfg(target_os = "macos")]
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 #[cfg(target_os = "macos")]
 use carrick_vmm_hvf::io_wait::{ThreadWaiter, WaitResult};
