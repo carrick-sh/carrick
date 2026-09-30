@@ -1314,8 +1314,31 @@ pub(crate) fn primary_spare_table(primary_base: u64, pa: u64) -> bool {
 /// the same address), or RETIRED by `munmap` (the lease is gone; the
 /// retained address is only a reuse signal). The host editor and the guest
 /// executor share this one definition.
+/// The parts of `[va, end)` outside the Carrick-owned EL1 COW copy window,
+/// or `None` when the range does not intersect it. Host range edits apply to
+/// these parts only, so the window's idle leaves (and the L3 table holding
+/// them) are exactly what [`PageTableManager::provision_cow_copy_window`]
+/// left.
+fn around_cow_copy_window(va: u64, end: u64) -> Option<[(u64, u64); 2]> {
+    use descriptor_txn::copy_window::{COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_LEN};
+    if end <= va || !descriptor_txn::copy_window::overlaps_cow_copy_window(va, end - va) {
+        return None;
+    }
+    let window_end = COW_COPY_WINDOW_BASE + COW_COPY_WINDOW_LEN;
+    Some([
+        (va, COW_COPY_WINDOW_BASE.max(va)),
+        (window_end.min(end), end),
+    ])
+}
+
 pub(crate) fn reclaimable_entry(desc: u64, level: usize, entry_va: u64) -> bool {
     if desc & VALID != 0 {
+        return false;
+    }
+    // The idle EL1 COW copy leaves look like reclaimable identity leaves, but
+    // their table is what lets EL1 map a copy without allocating.
+    let (span, _) = PageTableManager::level_span(level);
+    if descriptor_txn::copy_window::overlaps_cow_copy_window(entry_va, span) {
         return false;
     }
     if !PageTableManager::records_output(desc, level) || desc & SW_RETIRED != 0 {
@@ -1386,6 +1409,10 @@ pub enum PageTableError {
     /// A host store to live descriptors on the lane where guest EL1 owns
     /// them. The edit must be submitted as a guest descriptor transaction.
     GuestOwnsLiveDescriptors,
+    /// A single-leaf edit named the Carrick-owned EL1 COW copy window
+    /// ([`descriptor_txn::copy_window::COW_COPY_WINDOW_BASE`]), whose leaves
+    /// only provisioning and the bounded EL1 copy may write.
+    CarrickOwnedWindow,
 }
 
 impl core::fmt::Display for PageTableError {
@@ -1406,6 +1433,9 @@ impl core::fmt::Display for PageTableError {
             Self::MetadataAllocation => write!(f, "metadata allocation failed"),
             Self::GuestOwnsLiveDescriptors => {
                 write!(f, "guest EL1 owns the live stage-1 descriptors")
+            }
+            Self::CarrickOwnedWindow => {
+                write!(f, "edit names the Carrick-owned EL1 COW copy window")
             }
         }
     }
@@ -4496,6 +4526,11 @@ impl PageTableManager {
         if self.multi_vcpu || !self.offline_private_image {
             return Ok(false);
         }
+        // The tables holding the idle EL1 COW copy leaves are never folded:
+        // EL1 maps a copy into those leaves without allocating a table.
+        let holds_window = |mask: u64, span: u64| {
+            descriptor_txn::copy_window::overlaps_cow_copy_window(va & mask, span)
+        };
         let mut coalesced = false;
         let idx = indices(va);
         let l0_entry = TableLocation::new(0, idx[0] * 8);
@@ -4512,7 +4547,8 @@ impl PageTableManager {
             && let Ok(l2_loc) = self.pa_to_loc(l2_pa)
         {
             let l2_entry = l2_loc.entry(idx[2]);
-            if let Some(l3_pa) = self.child_table_pa(l2_entry)
+            if !holds_window(PA_MASK_2MIB, 1 << 21)
+                && let Some(l3_pa) = self.child_table_pa(l2_entry)
                 && self.is_spare_table(l3_pa)
                 && let Ok(l3_loc) = self.pa_to_loc(l3_pa)
                 && let Some((base, attrs)) =
@@ -4528,7 +4564,8 @@ impl PageTableManager {
         }
 
         // L2 -> L1: the L1 entry must point at a spare L2 table of uniform blocks.
-        if let Some(l2_pa) = self.child_table_pa(l1_entry)
+        if !holds_window(PA_MASK_1GIB, 1 << 30)
+            && let Some(l2_pa) = self.child_table_pa(l1_entry)
             && self.is_spare_table(l2_pa)
             && let Ok(l2_loc) = self.pa_to_loc(l2_pa)
             && let Some((base, attrs)) =
@@ -4606,6 +4643,20 @@ impl PageTableManager {
             self.reclaim_pending = true;
         }
         let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
+        if let Some(parts) = around_cow_copy_window(va, end) {
+            let mut outcome = PageTableApplyOutcome::default();
+            for (start, stop) in parts {
+                if start < stop {
+                    outcome |= self.apply_rule(
+                        start,
+                        (stop - start) as usize,
+                        rule,
+                        source.as_deref_mut(),
+                    )?;
+                }
+            }
+            return Ok(outcome);
+        }
         let mut cur = va;
         let mut changed = false;
         let mut flush_required = false;
@@ -4786,6 +4837,9 @@ impl PageTableManager {
     pub fn clear_inaccessible_invalid_fork_leaf(&mut self, va: u64) -> Result<(), PageTableError> {
         if !va.is_multiple_of(PT_PAGE) {
             return Err(PageTableError::BadAddress);
+        }
+        if descriptor_txn::copy_window::overlaps_cow_copy_window(va, PT_PAGE) {
+            return Err(PageTableError::CarrickOwnedWindow);
         }
         loop {
             let (location, level) = self.leaf_offset(va, false, None)?;
@@ -5098,6 +5152,63 @@ impl PageTableManager {
         self.apply(va, len, PtOp::ForkReadOnly, source)
     }
 
+    /// Make the two EL1 COW copy-alias leaves exactly what
+    /// [`descriptor_txn::copy_window::with_cow_copy_aliases`] requires: table
+    /// descriptors down to L3, and each leaf invalid, EL1-only (AP=00),
+    /// kernel-attributed and recording its own VA as output, with this
+    /// image's nG scoping. This is the one writer of those leaves outside the
+    /// bounded EL1 copy; every constructor of a live HVPatch MM image (boot,
+    /// exec rebuild, fork child) calls it on the offline image before
+    /// publication. Other range edits step around the window and never
+    /// coalesce or reclaim its table, so the shape then persists. Returns
+    /// whether any descriptor changed.
+    pub fn provision_cow_copy_window(
+        &mut self,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<bool, PageTableError> {
+        use descriptor_txn::copy_window::{COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_LEN};
+        let scope = if self.asid_scoped_leaves {
+            NON_GLOBAL
+        } else {
+            0
+        };
+        let mut changed = false;
+        for va in (COW_COPY_WINDOW_BASE..COW_COPY_WINDOW_BASE + COW_COPY_WINDOW_LEN)
+            .step_by(PT_PAGE as usize)
+        {
+            let (location, level) = self.leaf_offset(va, true, source.as_deref_mut())?;
+            if level != 3 {
+                return Err(PageTableError::BadAddress);
+            }
+            let idle = (va & PA_MASK_4KIB) | (KERNEL_PAGE_FLAGS & !VALID) | scope;
+            if self.read_desc(location)? != idle {
+                self.write_desc(location, idle)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Whether both EL1 COW copy-alias leaves have the idle shape
+    /// [`descriptor_txn::copy_window::with_cow_copy_aliases`] requires:
+    /// table descriptors down to L3, each leaf invalid, AP=00 and recording
+    /// its own VA. The post-condition of [`Self::provision_cow_copy_window`].
+    #[must_use]
+    pub fn cow_copy_window_is_idle(&self) -> bool {
+        use descriptor_txn::copy_window::{COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_LEN};
+        (COW_COPY_WINDOW_BASE..COW_COPY_WINDOW_BASE + COW_COPY_WINDOW_LEN)
+            .step_by(PT_PAGE as usize)
+            .all(|va| {
+                self.try_debug_walk(va).is_ok_and(|walk| {
+                    walk[..3]
+                        .iter()
+                        .all(|descriptor| descriptor & TYPE_BITS == TYPE_TABLE_OR_PAGE)
+                        && walk[3] & (VALID | AP_MASK) == 0
+                        && walk[3] & PA_MASK_4KIB == va
+                })
+            })
+    }
+
     /// Mark a Carrick-owned EL1 range read-only without granting EL0 access.
     /// The AP=10 distinction is architectural under PAN and must survive the
     /// fork-arm split of the kernel-only 2 MiB boot block.
@@ -5248,6 +5359,9 @@ impl PageTableManager {
         if va & (FOUR_KIB - 1) != ipa & (FOUR_KIB - 1) {
             return Err(PageTableError::BadAddress);
         }
+        if descriptor_txn::copy_window::overlaps_cow_copy_window(va, len) {
+            return Err(PageTableError::CarrickOwnedWindow);
+        }
         if self.layout.ipa_overlaps_excluded(ipa, len) {
             return Err(PageTableError::GicWindowOutput);
         }
@@ -5281,6 +5395,9 @@ impl PageTableManager {
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
         const FOUR_KIB: u64 = 1 << 12;
+        if descriptor_txn::copy_window::overlaps_cow_copy_window(va, len as u64) {
+            return Err(PageTableError::CarrickOwnedWindow);
+        }
         let pages = (len as u64).div_ceil(FOUR_KIB);
         let mut changed = false;
         for index in 0..pages {
@@ -5359,6 +5476,22 @@ impl PageTableManager {
             return Err(PageTableError::GicWindowOutput);
         }
         let end = va.checked_add(len).ok_or(PageTableError::BadAddress)?;
+        if let Some(parts) = around_cow_copy_window(va, end) {
+            let mut mapped = false;
+            for (start, stop) in parts {
+                if start < stop {
+                    mapped |= self.map_aliased_with_flags(
+                        start,
+                        ipa + (start - va),
+                        stop - start,
+                        block_flags,
+                        page_flags,
+                        source.as_deref_mut(),
+                    )?;
+                }
+            }
+            return Ok(mapped);
+        }
 
         // Upper-bound the new tables this build can need, so an unsatisfiable
         // one is refused before a single descriptor is written. Coarse leaves
@@ -12108,5 +12241,217 @@ mod tests {
             .expect("the genuine receipt settles");
         assert_eq!(verified.reclaimed_tables(), &[l3]);
         assert_eq!(image.free_tables.iter().filter(|&&pa| pa == l3).count(), 1);
+    }
+
+    /// The two idle EL1 COW copy-alias leaves are an invariant of every
+    /// HVPatch MM image: table descriptors down to L3, and each leaf invalid,
+    /// AP=00 (EL1-only) and recording its own VA, exactly as
+    /// `copy_window::with_cow_copy_aliases` requires. No host range edit,
+    /// coalesce or reclaim may change that.
+    mod cow_copy_window_provisioning {
+        use super::*;
+        use crate::aarch64::descriptor_txn::copy_window::{
+            COW_COPY_WINDOW_BASE as WINDOW, COW_COPY_WINDOW_LEN,
+        };
+        use carrick_mem::memory::{LINUX_EL1_KERNEL_BASE, LINUX_EL1_KERNEL_SIZE};
+
+        const TWO_MIB: u64 = 1 << 21;
+
+        fn hvpatch() -> PageTableManager {
+            PageTableManager::new(
+                stage1_hvpatch_page_tables(),
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+            )
+        }
+
+        fn window_leaves(mgr: &PageTableManager) -> [u64; 2] {
+            [WINDOW, WINDOW + PT_PAGE].map(|va| mgr.try_debug_walk(va).unwrap()[3])
+        }
+
+        fn assert_idle(mgr: &PageTableManager, why: &str) {
+            for va in [WINDOW, WINDOW + PT_PAGE] {
+                let walk = mgr.try_debug_walk(va).unwrap();
+                for (level, descriptor) in walk.iter().take(3).enumerate() {
+                    assert_eq!(
+                        descriptor & TYPE_BITS,
+                        TYPE_TABLE_OR_PAGE,
+                        "{why}: L{level} of {va:#x} is not a table descriptor: {walk:x?}"
+                    );
+                }
+                assert_eq!(walk[3] & VALID, 0, "{why}: {va:#x} translates: {walk:x?}");
+                assert_eq!(walk[3] & AP_MASK, 0, "{why}: {va:#x} admits EL0: {walk:x?}");
+                assert_eq!(
+                    walk[3] & PA_MASK_4KIB,
+                    va,
+                    "{why}: {va:#x} lost its identity output: {walk:x?}"
+                );
+            }
+        }
+
+        #[test]
+        fn hvpatch_boot_image_provisions_the_idle_window() {
+            const {
+                assert!(WINDOW >= LINUX_EL1_KERNEL_BASE);
+                assert!(
+                    WINDOW + COW_COPY_WINDOW_LEN <= LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE
+                );
+            }
+            assert_idle(&hvpatch(), "boot image");
+        }
+
+        /// Exec rebuild remaps every kernel-only image range with
+        /// `map_kernel_aliased`, including the whole 64 MiB EL1 region, at
+        /// its identity IPA or a leased one.
+        #[test]
+        fn kernel_alias_remap_of_the_el1_region_keeps_the_window_idle() {
+            for ipa in [LINUX_EL1_KERNEL_BASE, LINUX_HVPATCH_GLOBAL_FRAME_BASE] {
+                assert!(ipa.is_multiple_of(TWO_MIB));
+                let mut mgr = hvpatch();
+                let before = window_leaves(&mgr);
+                mgr.map_kernel_aliased(LINUX_EL1_KERNEL_BASE, ipa, LINUX_EL1_KERNEL_SIZE, None)
+                    .expect("remap EL1 region");
+                assert_idle(&mgr, "EL1 region kernel remap");
+                assert_eq!(window_leaves(&mgr), before);
+                for va in [
+                    LINUX_EL1_KERNEL_BASE,
+                    WINDOW - PT_PAGE,
+                    WINDOW + COW_COPY_WINDOW_LEN,
+                    LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE - PT_PAGE,
+                ] {
+                    assert_eq!(
+                        mgr.translate(va),
+                        Some(ipa + (va - LINUX_EL1_KERNEL_BASE)),
+                        "{va:#x} keeps the requested kernel alias"
+                    );
+                }
+            }
+        }
+
+        /// Fork arming (host `set_kernel_readonly`, `set_fork_readonly`) and
+        /// every other protection edit over a range containing the window
+        /// steps around it: neither leaf becomes a valid mapping of the IPA
+        /// its VA names.
+        #[test]
+        fn range_edits_over_the_el1_region_never_touch_the_window() {
+            type Edit = fn(&mut PageTableManager) -> Result<PageTableApplyOutcome, PageTableError>;
+            const LEN: usize = LINUX_EL1_KERNEL_SIZE as usize;
+            let edits: [(&str, Edit); 8] = [
+                ("kernel ro", |m| {
+                    m.set_kernel_readonly(LINUX_EL1_KERNEL_BASE, LEN, false, None)
+                }),
+                ("kernel rx", |m| {
+                    m.set_kernel_readonly(LINUX_EL1_KERNEL_BASE, LEN, true, None)
+                }),
+                ("fork ro", |m| {
+                    m.set_fork_readonly(LINUX_EL1_KERNEL_BASE, LEN, None)
+                }),
+                ("ro", |m| {
+                    m.set_readonly(LINUX_EL1_KERNEL_BASE, LEN, false, None)
+                }),
+                ("rw", |m| m.set_rw(LINUX_EL1_KERNEL_BASE, LEN, false, None)),
+                ("prot none", |m| {
+                    m.set_prot_none(LINUX_EL1_KERNEL_BASE, LEN, None)
+                }),
+                ("retire", |m| m.invalidate(LINUX_EL1_KERNEL_BASE, LEN, None)),
+                ("unmap", |m| {
+                    m.unmap_aliased(LINUX_EL1_KERNEL_BASE, LEN, None)
+                }),
+            ];
+            for offline in [false, true] {
+                for (name, edit) in edits {
+                    let mut mgr = hvpatch();
+                    if offline {
+                        mgr.declare_offline_private_image();
+                    }
+                    let before = window_leaves(&mgr);
+                    edit(&mut mgr).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                    assert_idle(&mgr, name);
+                    assert_eq!(window_leaves(&mgr), before, "{name} rewrote a window leaf");
+                }
+            }
+        }
+
+        /// An offline fork/exec image coalesces uniform spare tables and
+        /// reclaims empty ones. Invalidating every neighbor of the window
+        /// makes its L3 table uniform and reclaimable; it must survive both.
+        #[test]
+        fn offline_coalesce_and_reclaim_keep_the_window_table() {
+            let block = WINDOW & !(TWO_MIB - 1);
+            let mut mgr = hvpatch();
+            mgr.declare_offline_private_image();
+            mgr.set_prot_none(block, TWO_MIB as usize, None)
+                .expect("invalidate the window's 2 MiB block");
+            assert_idle(&mgr, "prot-none coalesce");
+            mgr.unmap_aliased(block, TWO_MIB as usize, None)
+                .expect("retire the window's 2 MiB block");
+            assert_idle(&mgr, "unmap reclaim");
+            mgr.reclaim_pending = true;
+            mgr.reclaim_all_invalid_tables().expect("sweep");
+            assert_idle(&mgr, "reclaim sweep");
+            mgr.set_kernel_readonly(block, TWO_MIB as usize, false, None)
+                .expect("re-arm the block");
+            assert_idle(&mgr, "kernel re-arm");
+        }
+
+        /// Single-page editors outside the range rule refuse the window
+        /// rather than retarget or revalidate a Carrick-owned leaf.
+        #[test]
+        fn page_editors_refuse_the_window() {
+            let mut mgr = hvpatch();
+            let before = window_leaves(&mgr);
+            assert_eq!(
+                mgr.repoint_preserving_attributes(
+                    WINDOW - PT_PAGE,
+                    LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+                    3 * PT_PAGE,
+                    None
+                ),
+                Err(PageTableError::CarrickOwnedWindow)
+            );
+            assert_eq!(
+                mgr.set_writable_preserving_attributes(WINDOW + PT_PAGE, PT_PAGE as usize, None),
+                Err(PageTableError::CarrickOwnedWindow)
+            );
+            assert_eq!(
+                mgr.clear_inaccessible_invalid_fork_leaf(WINDOW),
+                Err(PageTableError::CarrickOwnedWindow)
+            );
+            assert_eq!(window_leaves(&mgr), before);
+        }
+
+        /// Provisioning makes the exact idle shape from any predecessor:
+        /// a valid kernel block (the compatibility image), a block alias at
+        /// another IPA, or leaves some editor revalidated.
+        #[test]
+        fn provisioning_restores_the_exact_idle_shape() {
+            let expected = window_leaves(&hvpatch());
+            let mut identity = PageTableManager::new(
+                stage1_identity_page_tables(),
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+            );
+            identity.set_multi_vcpu(false);
+            let mut scoped = hvpatch();
+            let mut forged = hvpatch();
+            for index in 0..2 {
+                let va = WINDOW + index * PT_PAGE;
+                let (loc, level) = forged.leaf_offset(va, false, None).unwrap();
+                assert_eq!(level, 3);
+                forged
+                    .write_desc(loc, LINUX_HVPATCH_GLOBAL_FRAME_BASE | KERNEL_PAGE_FLAGS)
+                    .unwrap();
+            }
+            for (name, mgr) in [("identity", &mut identity), ("forged", &mut forged)] {
+                mgr.provision_cow_copy_window(None)
+                    .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                assert_idle(mgr, name);
+            }
+            assert_eq!(window_leaves(&forged), expected);
+            scoped
+                .provision_cow_copy_window(None)
+                .expect("reprovision a provisioned image");
+            assert_eq!(window_leaves(&scoped), expected, "idempotent");
+        }
     }
 }

@@ -6,6 +6,31 @@ const PAGE: u64 = 4096;
 const MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const AP: u64 = 3 << 6;
 
+/// VA of the two idle EL1 COW copy-alias leaves every HVPatch MM image
+/// carries (`EL1_REGION_BASE + 0x1A_0000`; `carrick-el1-abi` derives
+/// `EL1_COW_COPY_BASE` from this and asserts that identity). The window is
+/// Carrick-owned: only [`crate::aarch64::PageTableManager::provision_cow_copy_window`]
+/// writes its leaves offline and only [`with_cow_copy_aliases`] maps them
+/// live. Every other host range edit steps around it, never coalesces or
+/// reclaims its table, and every guest descriptor operation that names it is
+/// refused ([`DescriptorRefusal::CarrickOwnedWindow`]).
+pub const COW_COPY_WINDOW_BASE: u64 = 0x2D_0400_0000 + 0x1A_0000;
+/// Length of [`COW_COPY_WINDOW_BASE`]'s window: one source, one destination.
+pub const COW_COPY_WINDOW_LEN: u64 = 2 * PAGE;
+
+/// Whether `[va, va + len)` intersects the Carrick-owned copy window. An
+/// overflowing range intersects everything.
+#[must_use]
+pub const fn overlaps_cow_copy_window(va: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    match va.checked_add(len) {
+        Some(end) => va < COW_COPY_WINDOW_BASE + COW_COPY_WINDOW_LEN && COW_COPY_WINDOW_BASE < end,
+        None => true,
+    }
+}
+
 fn leaf<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     root: SubstrateGpa,

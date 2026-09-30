@@ -133,9 +133,15 @@ pub const EL1_DESCRIPTOR_TXN_BASE: u64 = EL1_REGION_BASE + EL1_DESCRIPTOR_TXN_OF
 /// Two temporary kernel-only aliases for one exact-MM COW copy. The MM's
 /// single editor owns both slots; they are invalid outside that copy. These
 /// are virtual aliases, not another frame pool or persistent backing owner.
+/// The window's VA is owned by `carrick-mmu-core`, whose stage-1 editors
+/// provision it and refuse to edit it; these names are that same window.
 pub const EL1_COW_COPY_OFFSET: u64 = 0x1A_0000;
-pub const EL1_COW_COPY_BASE: u64 = EL1_REGION_BASE + EL1_COW_COPY_OFFSET;
-pub const EL1_COW_COPY_SIZE: u64 = 2 * 4096;
+pub const EL1_COW_COPY_BASE: u64 =
+    carrick_mmu_core::aarch64::descriptor_txn::copy_window::COW_COPY_WINDOW_BASE;
+pub const EL1_COW_COPY_SIZE: u64 =
+    carrick_mmu_core::aarch64::descriptor_txn::copy_window::COW_COPY_WINDOW_LEN;
+const _: () = assert!(EL1_COW_COPY_BASE == EL1_REGION_BASE + EL1_COW_COPY_OFFSET);
+const _: () = assert!(EL1_COW_COPY_SIZE == 2 * 4096);
 const _: () = assert!(EL1_COW_COPY_OFFSET + EL1_COW_COPY_SIZE <= crate::EL1_STACKS_OFFSET);
 
 const _: () = assert!(core::mem::size_of::<Counters>() as u64 <= 0x8_0000);
