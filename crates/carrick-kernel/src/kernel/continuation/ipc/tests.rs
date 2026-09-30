@@ -147,8 +147,14 @@ impl IpcHostServices for Wakes {
     ) -> Result<(), IpcError> {
         Err(IpcError::Corrupt)
     }
-    fn wake(&self, object: IpcObjectHandle, lanes: WakeSet) {
-        self.0.borrow_mut().push((object, lanes));
+    fn wake(&self, wake: carrick_el1_abi::ipc::IpcWake) {
+        self.0.borrow_mut().push((
+            wake.object,
+            WakeSet {
+                readers: wake.readers,
+                writers: wake.writers,
+            },
+        ));
     }
 }
 
@@ -653,4 +659,78 @@ fn serial_host_el1_ipc_every_slot_boundary_delivers_owed_host_wakes() {
         (1, 2),
         "each boundary that consumes pending host work delivers the owed wake"
     );
+}
+
+/// An operation EL1 handed back and the host completes publishes its
+/// change like any other: host subscribers of the object (a blocked host
+/// reader, poll, epoll) are owed a wake and must receive it, not only the
+/// object's EL1 waiters.
+#[test]
+fn serial_host_el1_ipc_host_completed_handback_wakes_host_subscribers() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = context.kernel().ipc().unwrap();
+    let object = owner
+        .create_eventfd(0, carrick_el1_abi::ipc::EventMode::Counter)
+        .unwrap();
+    let queue = owner.wait_queue(object);
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&wakes);
+    let subscriber = queue.enroll_callback(move |_| {
+        seen.fetch_add(1, Ordering::Relaxed);
+    });
+    let region = owner.region();
+    let pin = region
+        .fd(HostIpcWait)
+        .create_pinned(Description::new(
+            IpcBacking::EventFd { object }.encode(),
+            AccessMode::ReadWrite,
+            StatusFlags::default(),
+        ))
+        .unwrap();
+    // A descriptor keeps the eventfd alive past the operation's own pin.
+    let table = owner.create_table(1024, 64).unwrap();
+    owner
+        .region()
+        .fd(HostIpcWait)
+        .install_pin(table, Fd(3), &pin, false)
+        .unwrap();
+    let token = region
+        .begin_operation(IpcOperation {
+            kind: IpcOpKind::EventFdWrite,
+            pin: pin.into_raw(),
+            object: object.to_raw(),
+            task: IpcTaskKey(1),
+            mm: MM,
+            buf: IpcUserVa(BUF),
+            progress: WriteProgress::new(8),
+            value: carrick_el1_abi::ipc::IpcEventValue(5),
+            orig_x0: 3,
+            nr: 64,
+            handback: IpcHandback::Continue,
+            ..IpcOperation::EMPTY
+        })
+        .unwrap();
+    let mut mem = memory(&[]);
+    let service = ZoneHostServices::for_dispatcher(&dispatcher).unwrap();
+    let outcome = complete_handback(&region, token, MM, &mut mem, None, &service).unwrap();
+    assert_eq!(
+        outcome,
+        IpcHostOutcome::Complete {
+            result: 8,
+            sigpipe: false
+        }
+    );
+    let delivered = wakes.load(Ordering::Relaxed);
+    drop(subscriber);
+    let mut guard = region.lock(object, &HostIpcWait).unwrap();
+    assert_eq!(guard.eventfd().unwrap().value(), 5);
+    drop(guard);
+    let closed = region.fd(HostIpcWait).close(table, Fd(3)).unwrap().unwrap();
+    owner.release(closed.backing).unwrap();
+    assert_eq!(delivered, 1, "the host subscriber must be woken");
 }
