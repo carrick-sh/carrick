@@ -4581,14 +4581,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // no mmap/mprotect edit has already done so. The no-op edit publishes
         // nothing and performs no TLBI.
         let stage_started = std::time::Instant::now();
-        // A guest selection still pending behind an already bound backing is
-        // completed before the lane is read: the parent's arming venue and
-        // the child image's inherited owner must agree from fork commit.
-        if self.page_tables.complete_pending_guest_lane() {
-            self.vm.record_guest_descriptor_lane(Ok(
-                crate::stage1_authority::GuestLaneSelection::Selected,
-            ));
-        }
         self.vm.record_host_lane_sample(
             crate::stage1_authority::GuestLaneSite::ForkPlan,
             &self.page_tables,

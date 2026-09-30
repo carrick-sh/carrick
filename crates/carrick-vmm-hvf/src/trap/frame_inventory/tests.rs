@@ -978,7 +978,7 @@ fn exec_successor_root_publication_installs_exact_structural_authority() {
         "fixed root-slot custody must not be hidden in the global-frame directory"
     );
 
-    let access = MmAccessState::new(
+    let access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
         std::sync::Arc::new(MemoryProtections::default()),
         std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
@@ -5640,7 +5640,7 @@ fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
     );
     assert!(owner.runtime_authorities_match(&sibling_mm_access, &page_tables, &owner.protections,));
 
-    let distinct_state = MmAccessState::new(
+    let distinct_state = MmAccessState::new_unbound(
         page_tables.clone(),
         std::sync::Arc::clone(&owner.protections),
         owner.frame_inventory.shared_ledger(),

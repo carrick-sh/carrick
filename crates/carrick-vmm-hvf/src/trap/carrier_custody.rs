@@ -3703,7 +3703,7 @@ mod carrier_vm_custody_tests {
             .cloned()
             .expect("structural root-slot owner");
         let identity = *owner.retained.record_identity.lock();
-        let mm_access = super::MmAccessState::new(
+        let mm_access = super::MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
             std::sync::Arc::new(super::MemoryProtections::default()),
             std::sync::Arc::new(parking_lot::Mutex::new(
@@ -3849,7 +3849,7 @@ mod carrier_vm_custody_tests {
             .cloned()
             .expect("pinned structural root-slot owner");
         let identity = *owner.retained.record_identity.lock();
-        let mm_access = super::MmAccessState::new(
+        let mm_access = super::MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
             std::sync::Arc::new(super::MemoryProtections::default()),
             std::sync::Arc::new(parking_lot::Mutex::new(
