@@ -388,8 +388,15 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             sched.task.mark_pending_host_work();
         }
         let effects = notify(sched, object, wake);
+        // Never park while host work is pending: it may be a signal for
+        // this thread, which the host must deliver before the call sleeps
+        // (Linux checks for one before it blocks). The call leaves instead,
+        // forwarded unchanged or handed back ([`bail`]).
+        let host_work = sched.task.has_pending_host_work();
         let parking = match status {
-            StepStatus::Blocked(lane) if !nonblock => Some((lane, snapshot(sched, object, lane))),
+            StepStatus::Blocked(lane) if !nonblock && !host_work => {
+                Some((lane, snapshot(sched, object, lane)))
+            }
             _ => None,
         };
         drop(guard);
@@ -407,6 +414,9 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 } else {
                     linux::EAGAIN
                 }
+            }
+            StepStatus::Blocked(_) if host_work => {
+                return bail(sched, frame, token, op, resumed, venue);
             }
             StepStatus::Blocked(lane) => {
                 let Some((_, Some(snap))) = parking else {
@@ -1482,6 +1492,57 @@ mod tests {
         assert_eq!(host_calls(&w), 0);
     }
 
+    /// The slot's task table as EL1 publishes it for the thread `w.task`
+    /// names, with host work pending (a kick, an owed wake or a signal).
+    fn slot_tasks_with_host_work(w: &World) -> Vec<CurrentTask> {
+        let tasks: Vec<CurrentTask> = (0..=SLOT.raw() as usize)
+            .map(|_| CurrentTask::new())
+            .collect();
+        let task = &tasks[SLOT.raw() as usize];
+        for (to, from) in [
+            (&task.task_id, &w.task.task_id),
+            (&task.thread_serial, &w.task.thread_serial),
+            (&task.file_table, &w.task.file_table),
+            (&task.zone_mm, &w.task.zone_mm),
+            (&task.generation, &w.task.generation),
+        ] {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        task.mark_pending_host_work();
+        tasks
+    }
+
+    /// One trap through the EL1 syscall dispatcher on the slot.
+    fn dispatch(
+        w: &World,
+        frame: &mut TrapFrame,
+        tasks: &[CurrentTask],
+    ) -> carrick_el1_abi::Action {
+        let venue = w.venue();
+        // SAFETY: all-zero is a valid empty name cache.
+        let names: &carrick_el1_abi::InotifyNameCache = unsafe {
+            &*std::alloc::alloc_zeroed(Layout::new::<carrick_el1_abi::InotifyNameCache>()).cast()
+        };
+        let mut cpu = FakeCpu::default();
+        crate::personality::dispatch::dispatch_syscall_with_ipc(
+            frame,
+            w.counters,
+            tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            names,
+            Some(crate::personality::dispatch::Zone {
+                tables: &w.zone,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+            }),
+            Some(&venue),
+            |_| core::ptr::null_mut(),
+        )
+    }
+
     /// A woken thread re-issues its SVC to resume the operation its record
     /// owns. Pending host work on the slot must not forward that SVC before
     /// the operation is taken: the host would run the call afresh (consuming
@@ -1513,43 +1574,9 @@ mod tests {
         let current = w.zone.slot(SLOT).current().unwrap();
         assert!(w.zone.record(current).has_object_operation());
         // The slot's task as EL1 published it for A, with host work pending.
-        let tasks: Vec<CurrentTask> = (0..=SLOT.raw() as usize)
-            .map(|_| CurrentTask::new())
-            .collect();
+        let tasks = slot_tasks_with_host_work(&w);
         let task = &tasks[SLOT.raw() as usize];
-        for (to, from) in [
-            (&task.task_id, &w.task.task_id),
-            (&task.thread_serial, &w.task.thread_serial),
-            (&task.file_table, &w.task.file_table),
-            (&task.zone_mm, &w.task.zone_mm),
-            (&task.generation, &w.task.generation),
-        ] {
-            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-        task.mark_pending_host_work();
-        let venue = w.venue();
-        // SAFETY: all-zero is a valid empty name cache.
-        let names: &carrick_el1_abi::InotifyNameCache = unsafe {
-            &*std::alloc::alloc_zeroed(Layout::new::<carrick_el1_abi::InotifyNameCache>()).cast()
-        };
-        let mut cpu = FakeCpu::default();
-        let action = crate::personality::dispatch::dispatch_syscall_with_ipc(
-            &mut g,
-            w.counters,
-            &tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            names,
-            Some(crate::personality::dispatch::Zone {
-                tables: &w.zone,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-            }),
-            Some(&venue),
-            |_| core::ptr::null_mut(),
-        );
+        let action = dispatch(&w, &mut g, &tasks);
         assert_eq!(
             (action, g.x[0]),
             (carrick_el1_abi::Action::ServedWithWork, 8),
@@ -1558,6 +1585,127 @@ mod tests {
         assert_eq!(u64::from_ne_bytes(value), 7);
         assert!(!w.zone.record(current).has_object_operation());
         assert_eq!(task.served_with_work.load(Ordering::Acquire), 1);
+    }
+
+    /// Host work pending at entry (the host kicked the vCPU, or a write
+    /// owed a host-parked peer a wake) must not send a pipe read that
+    /// completes right now to the host: EL1 serves it and leaves with the
+    /// work (el1_ipc_two_processes_blocking lost one served read per fork,
+    /// 511 of 512). Linux runs a signal pending at entry after the call
+    /// returns, which is what the host does with the work on the way out.
+    #[test]
+    fn el1_ipc_io_pending_host_work_serves_a_completing_transfer() {
+        let w = world();
+        let t = w.table(w.a_tid);
+        let (r, wfd, _) = w.pipe(t, BLOCK);
+        let tasks = slot_tasks_with_host_work(&w);
+        let task = &tasks[SLOT.raw() as usize];
+        let mut out = *b"ab";
+        let mut f = syscall(SYS_WRITE, wfd, out.as_mut_ptr() as u64, 2, A_SVC);
+        assert_eq!(
+            (dispatch(&w, &mut f, &tasks), f.x[0]),
+            (carrick_el1_abi::Action::ServedWithWork, 2),
+            "a write with room completes in EL1"
+        );
+        let mut buf = [0u8; 2];
+        let mut f = syscall(SYS_READ, r, buf.as_mut_ptr() as u64, 2, A_SVC);
+        assert_eq!(
+            (dispatch(&w, &mut f, &tasks), f.x[0]),
+            (carrick_el1_abi::Action::ServedWithWork, 2),
+            "a read with data completes in EL1"
+        );
+        assert_eq!(&buf, b"ab");
+        assert_eq!(task.orig_arg0.load(Ordering::Relaxed), r as u64);
+        assert!(task.has_pending_host_work(), "the host still sees its work");
+        assert_eq!(task.served_with_work.load(Ordering::Acquire), 1);
+        assert_eq!(w.counters.served[SYS_READ].load(Ordering::Relaxed), 1);
+        assert_eq!(w.counters.served[SYS_WRITE].load(Ordering::Relaxed), 1);
+        assert_eq!(host_calls(&w), 0);
+    }
+
+    /// A read that would block while host work (possibly a signal) is
+    /// pending never parks in EL1: a parked thread's signal would wait for
+    /// a wake that may never come. A fresh call with no effect forwards
+    /// unchanged; the host blocks it and delivers the signal first, as
+    /// Linux checks for a signal before it sleeps.
+    #[test]
+    fn el1_ipc_io_pending_host_work_forwards_a_fresh_read_that_would_block() {
+        let w = world();
+        let t = w.table(w.a_tid);
+        let (r, _wfd, _) = w.pipe(t, BLOCK);
+        // Another thread is runnable here: a park would switch to it.
+        w.mem.write(OTHER_MM, 0x10000, &[0; 8]);
+        w.fork_table(t, 202);
+        let b = syscall(SYS_READ, r, 0x10000, 1, B_SVC);
+        w.queue(202, OTHER_MM, &b, B_SVC);
+        let tasks = slot_tasks_with_host_work(&w);
+        let task = &tasks[SLOT.raw() as usize];
+        let mut buf = [0u8; 1];
+        let mut f = syscall(SYS_READ, r, buf.as_mut_ptr() as u64, 1, A_SVC);
+        let before = f;
+        assert_eq!(
+            dispatch(&w, &mut f, &tasks),
+            carrick_el1_abi::Action::Forward
+        );
+        assert_eq!((f.x, f.elr), (before.x, before.elr), "forwarded unchanged");
+        assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+        assert!(task.has_pending_host_work(), "the signal is still owed");
+        assert_eq!(task.served_with_work.load(Ordering::Acquire), 0);
+        assert_eq!(w.counters.forwarded[SYS_READ].load(Ordering::Relaxed), 1);
+    }
+
+    /// A woken read re-enters to resume its owned operation and finds the
+    /// pipe empty again while host work (possibly a signal) is pending: it
+    /// hands the operation back to the host instead of parking again, so
+    /// the host delivers the signal before the call can block.
+    #[test]
+    fn el1_ipc_io_pending_host_work_hands_back_a_resumed_read_that_would_block() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let (r, wfd, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let mut buf = [0u8; 1];
+        let a_buf = buf.as_mut_ptr() as u64;
+        w.mem.map(MM, a_buf, 1);
+        w.mem.write(OTHER_MM, 0x10000, b"z");
+        let b_write = syscall(SYS_WRITE, wfd, 0x10000, 1, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let mut f = syscall(SYS_READ, r, a_buf, 1, A_SVC);
+        assert_eq!(w.call(&mut f), SWITCHED, "A reads nothing and parks");
+        f = b_write;
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 1), "B writes, A woken");
+        let mut g = syscall(SYS_READ, r, 0x10000, 1, B_SVC);
+        assert_eq!((w.call(&mut g), g.x[0]), (RETURNED, 1), "B takes the byte");
+        let mut g = syscall(SYS_READ, r, 0x10000, 1, B_SVC);
+        assert_eq!(w.call(&mut g), SWITCHED, "B parks: the vCPU runs A");
+        reenter(&mut g, A_SVC);
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(w.zone.record(current).has_object_operation());
+        let parks = w.zone.counters.el1_parks.load(Ordering::Relaxed);
+        let tasks = slot_tasks_with_host_work(&w);
+        let task = &tasks[SLOT.raw() as usize];
+        assert_eq!(
+            dispatch(&w, &mut g, &tasks),
+            carrick_el1_abi::Action::Forward
+        );
+        assert_eq!(
+            g.x[8], IPC_HANDBACK_NR,
+            "the owned operation goes to the host"
+        );
+        let op = handed_back(&w, &g);
+        assert_eq!(
+            (op.kind, op.handback, op.orig_x0, op.nr, op.progress.written),
+            (
+                IpcOpKind::PipeRead,
+                IpcHandback::Continue,
+                r as u64,
+                SYS_READ as u32,
+                0
+            )
+        );
+        assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), parks);
+        assert!(task.has_pending_host_work(), "the signal is still owed");
+        assert_eq!(task.served_with_work.load(Ordering::Acquire), 0);
     }
 
     /// N communicating pairs of processes, pipes both ways plus an eventfd,
