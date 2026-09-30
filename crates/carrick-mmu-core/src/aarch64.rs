@@ -4570,7 +4570,7 @@ impl PageTableManager {
         &mut self,
         va: u64,
         len: usize,
-        mut source: Option<&mut dyn TableArenaSource>,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
         let end = va
             .checked_add(len as u64)
@@ -4607,7 +4607,7 @@ impl PageTableManager {
                 deny_host_buffers: false,
                 fork_arm: false,
             },
-            source.as_deref_mut(),
+            source,
         )?;
         Ok(PageTableApplyOutcome::new(outcome.changed, false))
     }
