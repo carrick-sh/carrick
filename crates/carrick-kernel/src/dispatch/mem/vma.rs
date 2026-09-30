@@ -741,7 +741,7 @@ pub(crate) fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSum
     let mut maps = project_core_maps(mem);
     let heap_template = ProcMapsEntry {
         start: mem.layout.heap_base,
-        end: mem.brk_current,
+        end: mem.program_break(),
         read: true,
         write: true,
         execute: false,
@@ -751,7 +751,7 @@ pub(crate) fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSum
     append_uncovered(
         &mut maps,
         mem.layout.heap_base,
-        mem.brk_current,
+        mem.program_break(),
         &heap_template,
     );
     for (_, current, end) in &mem.growdown_ranges {
@@ -842,14 +842,36 @@ pub(crate) fn mapping_is_data(write: bool, private: bool, growsdown: bool) -> bo
 /// writable mapping in the visible boot image (`.data`/`.bss`) and the dynamic
 /// VMAs. A dynamic map overlapping a grow-down range is stack, not data.
 pub(crate) fn data_va_bytes(mem: &MemState) -> u64 {
-    let heap = mem.brk_current.saturating_sub(mem.layout.heap_base);
+    let heap = mem.program_break().saturating_sub(mem.layout.heap_base);
+    heap.saturating_add(mapped_data_va_bytes(mem))
+}
+
+/// Charges of everything a delegated reservation root does not model: every
+/// projected VMA outside the heap reservation it owns, and the private
+/// writable mappings (the heap excluded). The root adds its own heap nodes.
+pub(crate) fn host_owned_charges(mem: &MemState) -> (u64, u64) {
+    let heap_start = mem.layout.heap_base;
+    let heap_end = heap_start.saturating_add(mem.layout.heap_size);
+    let address = project_vma_summaries(mem)
+        .iter()
+        .map(|vma| {
+            let (start, end) = (vma.start.0, vma.end.0);
+            let len = end.saturating_sub(start);
+            let inside = end.min(heap_end).saturating_sub(start.max(heap_start));
+            len.saturating_sub(inside)
+        })
+        .sum();
+    (address, mapped_data_va_bytes(mem))
+}
+
+/// `RLIMIT_DATA` bytes of the mapped (non-heap) private writable VMAs.
+fn mapped_data_va_bytes(mem: &MemState) -> u64 {
     let is_growdown = |map: &ProcMapsEntry| {
         mem.growdown_ranges
             .iter()
             .any(|(low, _, end)| map.start < *end && map.end > *low)
     };
-    let maps: u64 = mem
-        .address_space_regions
+    mem.address_space_regions
         .iter()
         .flatten()
         .filter(|map| !boot_region_is_carrick_kernel_hole(map))
@@ -864,8 +886,7 @@ pub(crate) fn data_va_bytes(mem: &MemState) -> u64 {
             )
         })
         .map(|map| map.end - map.start)
-        .sum();
-    heap.saturating_add(maps)
+        .sum()
 }
 
 /// Exact Linux-visible mapping metadata used by the live core publisher.
@@ -883,7 +904,7 @@ pub(crate) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
         .collect();
     for vma in &mem.semantic_vmas {
         if (vma.path == "[heap]"
-            || (vma.start >= mem.layout.heap_base && vma.end <= mem.brk_current))
+            || (vma.start >= mem.layout.heap_base && vma.end <= mem.program_break()))
             && vma.start < vma.end
         {
             trim_proc_maps_for_range(&mut maps, vma.start, vma.end.saturating_sub(vma.start));
@@ -1074,7 +1095,7 @@ pub(crate) fn boot_region_source_intersects_hidden_backing(
     {
         return true;
     }
-    boot_region_is_hidden_heap_backing(map, mem.layout) && end > mem.brk_current
+    boot_region_is_hidden_heap_backing(map, mem.layout) && end > mem.program_break()
 }
 
 /// Cut `[start, start+len)` out of `MemState::dynamic_maps`, which is kept

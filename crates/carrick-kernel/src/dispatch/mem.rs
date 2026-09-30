@@ -36,11 +36,11 @@
 //!
 //! ## `brk` and the `/proc` views
 //!
-//! `brk` advances/retreats the program break (`brk_current`) within the heap
-//! region. Shrinking scrubs the page-aligned released backing so a later growth
+//! `brk` advances/retreats the program break within the heap region; its one
+//! owner is `brk::BreakAuthority` (host setup, or the delegated EL1 root). Shrinking scrubs the page-aligned released backing so a later growth
 //! re-exposes zero-filled memory, matching Linux's anonymous-memory contract.
 //! `/proc/self/maps` is rendered from the boot-captured `AddressSpace`
-//! snapshot (`address_space_regions`) with the heap end tracking `brk_current`
+//! snapshot (`address_space_regions`) with the heap end tracking the break
 //! and the mmap arena end tracking `mmap_next`; `/proc/self/auxv` echoes the
 //! exact serialized ELF auxiliary vector written to the guest stack at exec
 //! (`linux_auxv_image`). `mprotect` adjusts stage-1 leaf permissions;
@@ -238,6 +238,7 @@ impl MemAuthority {
         let revision = self.vma_revision();
         let mut forked = state.clone();
         forked.deferred_anonymous = std::sync::Arc::new(state.deferred_anonymous.fork_private());
+        forked.brk = state.brk.fork_private();
         let projection = Self::derive_fork_projection(&state)?;
 
         for (start, len) in projection.omitted_ranges {
@@ -289,6 +290,7 @@ impl MemAuthority {
         let revision = self.vma_revision();
         let mut forked = state.clone();
         forked.deferred_anonymous = std::sync::Arc::new(state.deferred_anonymous.fork_private());
+        forked.brk = state.brk.fork_private();
         std::sync::Arc::new(Self::with_revision(forked, revision))
     }
 
@@ -335,8 +337,10 @@ pub struct MemState {
     pub layout: MemoryLayout,
     /// Canonical semantic VMAs owned by this address space.
     semantic_vmas: VmaMap,
-    /// Current program break (`brk`/`sbrk`).
-    brk_current: u64,
+    /// The single owner of the program break (`brk`/`sbrk`): this state while
+    /// the MM is in host setup, the shared EL1 reservation root once the MM's
+    /// break is delegated. Read it only through [`MemState::program_break`].
+    brk: brk::BreakAuthority,
     /// Bump cursor for the anonymous mmap arena.
     pub mmap_next: u64,
     /// MONOTONIC high-water of the arena: the highest address the guest could
@@ -388,7 +392,7 @@ pub struct MemState {
     /// Snapshot of the guest's `AddressSpace` regions, captured at boot
     /// via `SyscallDispatcher::set_address_space_regions`. When present,
     /// `/proc/self/maps` is rendered from this list (with the heap end
-    /// tracking `brk_current` and the mmap arena end tracking `mmap_next`)
+    /// tracking the program break and the mmap arena end tracking `mmap_next`)
     /// instead of the hard-coded four-line summary.
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
     /// Linux-visible dynamic mappings created after exec. The boot address-space
@@ -504,7 +508,7 @@ impl MemState {
         Self {
             layout,
             semantic_vmas: VmaMap::new(),
-            brk_current: layout.heap_base,
+            brk: brk::BreakAuthority::HostSetup(layout.heap_base),
             mmap_next: layout.mmap_base,
             mmap_writable_high: layout.mmap_base,
             shared: crate::shared_aperture::SharedAperture::new(),
@@ -558,13 +562,23 @@ impl MemState {
         self.semantic_vmas = vmas;
     }
 
-    pub(super) fn brk_current(&self) -> u64 {
-        self.brk_current
+    /// The program break as answered by its single owner. A delegated break
+    /// is read from the exact admitted root; this state holds no copy.
+    pub(super) fn program_break(&self) -> u64 {
+        self.brk.observe()
+    }
+
+    pub(super) fn break_authority(&self) -> &brk::BreakAuthority {
+        &self.brk
+    }
+
+    pub(super) fn break_authority_mut(&mut self) -> &mut brk::BreakAuthority {
+        &mut self.brk
     }
 
     #[cfg(test)]
     pub(super) fn seed_brk_current_for_test(&mut self, value: u64) {
-        self.brk_current = value;
+        self.brk = brk::BreakAuthority::HostSetup(value);
     }
 
     #[cfg(test)]
@@ -984,9 +998,10 @@ pub(super) fn guest_vma_overlaps_locked(mem: &MemState, start: u64, len: u64) ->
             .growdown_ranges
             .iter()
             .any(|(_, current, vma_end)| *current < end && start < *vma_end)
-        || (mem.brk_current > mem.layout.heap_base
-            && start < mem.brk_current
-            && mem.layout.heap_base < end)
+        || {
+            let brk = mem.program_break();
+            brk > mem.layout.heap_base && start < brk && mem.layout.heap_base < end
+        }
         || mem.address_space_regions.iter().flatten().any(|map| {
             map.start < end
                 && start < map.end
@@ -1249,7 +1264,7 @@ impl<'a> MemView<'a> {
     ///
     /// The boot snapshot includes Carrick's hidden heap and mmap backing arenas;
     /// those reservations are not VMAs by themselves. Dynamic mappings inside
-    /// either arena and the live `[heap_base, brk_current)` span are real VMAs and
+    /// either arena and the live `[heap_base, program break)` span are real VMAs and
     /// are checked separately before the hidden boot reservations are filtered.
     pub(super) fn guest_vma_overlaps(&self, start: u64, len: u64) -> bool {
         guest_vma_overlaps_locked(&self.mem().lock(), start, len)
@@ -1813,16 +1828,14 @@ impl<'a> MemView<'a> {
     /// `MAP_FIXED` overlaps, and walking/projecting VMAs.
     #[inline]
     pub(super) fn address_space_limits_apply(&self, data: bool) -> Option<(u64, u64)> {
-        let mut as_limit = self.effective_resource_limit(LINUX_RLIMIT_AS).rlim_cur;
-        if let Some(task) = super::resources::task() {
-            if let Some(budget) = task.container().budget() {
-                if let Some(max_mem) = budget.max_memory_limit() {
-                    as_limit = as_limit.min(max_mem);
-                }
-            }
-        }
+        let limits = crate::kernel::ReservationLimits::new(
+            self.effective_resource_limit(LINUX_RLIMIT_AS).rlim_cur,
+            self.effective_resource_limit(LINUX_RLIMIT_DATA).rlim_cur,
+            super::resources::task().as_ref(),
+        );
+        let as_limit = limits.address;
         let data_limit = if data {
-            self.effective_resource_limit(LINUX_RLIMIT_DATA).rlim_cur
+            limits.data
         } else {
             LINUX_RLIM_INFINITY
         };

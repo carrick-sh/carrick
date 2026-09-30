@@ -473,8 +473,16 @@ impl MmExecutorParticipation {
         self.authority.seal_reservation_provider();
         let (brk_current, mmap_next) = {
             let state = self.authority.mem.lock();
-            (state.brk_current(), state.mmap_next)
+            (state.program_break(), state.mmap_next)
         };
+        // The publishing process's limits seed its root; `setrlimit` on the
+        // process pushes later changes.
+        let task = self.admission.thread().and_then(|thread| thread.task());
+        let rlimits = task
+            .as_ref()
+            .map_or_else(crate::kernel::RlimitSet::carrick_defaults, |task| {
+                task.rlimits()
+            });
         crate::kernel::publish_address_space_with_layout(
             self.mm_id(),
             self.pt_quiesce(),
@@ -482,6 +490,7 @@ impl MmExecutorParticipation {
             ttbr1,
             brk_current,
             mmap_next,
+            crate::kernel::ReservationLimits::of_task(&rlimits, task.as_ref()),
         )
     }
 
