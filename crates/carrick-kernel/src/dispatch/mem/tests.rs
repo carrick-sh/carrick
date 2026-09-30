@@ -1,7 +1,7 @@
 use super::*;
 use crate::linux_abi::LINUX_PROT_EXEC;
 use crate::memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE};
-use carrick_abi::LINUX_MADV_DONTNEED;
+use carrick_abi::{LINUX_MADV_DONTNEED, LINUX_MREMAP_FIXED};
 use std::cell::{Cell, RefCell};
 
 /// The Darwin constraint behind [`host_fd_can_back_shared_alias`], asserted

@@ -2457,86 +2457,25 @@ impl<'a> MemView<'a> {
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
-            // Errno precedence below is oracle-derived (real Linux 6.12.76,
-            // docker gcc:latest, 2026-07-23 — see
-            // .superpowers/sdd/mremap-ruling-report.md) and follows man 2 mremap's
-            // documented EINVAL conditions: no unrecognized flag bits,
-            // new_size != 0, MREMAP_FIXED/MREMAP_DONTUNMAP only paired with
-            // MREMAP_MAYMOVE, and MREMAP_DONTUNMAP only with old_size ==
-            // new_size. Real Linux validates ALL of these — even for
-            // requests that use MREMAP_FIXED or MREMAP_DONTUNMAP, since real
-            // Linux actually implements both flags — before it would ever
-            // attempt the remap. So every one of these well-formedness
-            // checks must run BEFORE carrick's own "not yet implemented"
-            // refusal just below: a malformed request (e.g. an unrelated
-            // garbage bit ORed onto MREMAP_FIXED) must surface the EINVAL
-            // real Linux would give, not carrick's EOPNOTSUPP stand-in for a
-            // shape real Linux would have actually performed.
-            if new_size_req == 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            // `man 2 mremap`: `old_address` must be page aligned, and EINVAL is
-            // documented for "old_address was not page aligned". Carrick
-            // validated the MREMAP_FIXED `new_address` alignment but never the
-            // source, so a misaligned request ran the whole move: it published
-            // the destination, then could not reclaim the misaligned source
-            // (`MemoryError::Unsupported`) and hit the fail-stop `abort()`
-            // below, taking the carrier down. `memflagmatrix` is an
-            // argument-matrix probe and asks for exactly this
-            // (`old_address = 0x6000006001`, `old_size = 4096`,
-            // `new_size = 8192`), so the whole shard-2 executable aborted.
-            // Ordering against the other EINVAL well-formedness checks is
-            // unobservable — they all yield EINVAL — but this must precede the
-            // size rounding below, which answers ENOMEM.
-            if !old_address.0.is_multiple_of(page_size) {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            // `man 2 mremap`: a zero `old_size` asks for a NEW mapping of the
-            // same pages, which is only meaningful for a shareable mapping and
-            // necessarily relocates -- so it requires MREMAP_MAYMOVE. Without
-            // it Linux answers EINVAL; carrick rounded the zero up and tried to
-            // resize in place (`memflagmatrix` `mremap_old_len_zero_einval`).
-            if old_size == 0 && flags & LINUX_MREMAP_MAYMOVE == 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let Some(old_size) = align_up_u64(old_size, page_size) else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            // Well-formedness first (`mremap_request`), exactly as Linux orders it.
+            let request = match mremap_request(
+                page_size,
+                old_address.0,
+                old_size,
+                new_size_req,
+                flags,
+                new_address.0,
+            ) {
+                Ok(request) => request,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let Some(new_size) = align_up_u64(new_size_req, page_size) else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            };
-            let move_fixed = flags & LINUX_MREMAP_FIXED != 0;
-            let dontunmap = flags & LINUX_MREMAP_DONTUNMAP != 0;
-            if (move_fixed || dontunmap) && flags & LINUX_MREMAP_MAYMOVE == 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            if dontunmap && new_size != old_size {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            // Two more well-formedness checks real Linux performs on a
-            // MREMAP_FIXED request, both EINVAL, both BEFORE it would attempt
-            // the move — so they must precede carrick's "not yet implemented"
-            // EOPNOTSUPP stand-in below for the same reason the checks above
-            // do. Without them a malformed fixed request reported carrick's
-            // refusal instead of the errno Linux gives (mremap05 cases 2/3:
-            // "new_addr has to be page aligned" and "old/new area must not
-            // overlap", both answered EOPNOTSUPP).
-            if move_fixed {
-                if !new_address.0.is_multiple_of(page_size) {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                if ranges_overlap(
-                    old_address.0,
-                    old_size,
-                    new_address.0,
-                    new_address.0.saturating_add(new_size),
-                ) {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-            }
+            let MremapRequest {
+                old_size,
+                new_size,
+                move_fixed,
+                dontunmap,
+                ..
+            } = request;
             // A zero old_size duplicates a mapping, so it still names a
             // source page. In-place growth must not consume the sealed span.
             let source_len = if move_fixed { old_size.max(page_size) } else { old_size.max(new_size) };
@@ -4213,4 +4152,93 @@ impl<'a> MemView<'a> {
             Ok(DispatchOutcome::errno(LINUX_EINVAL))
         }
     }
+}
+
+/// A well-formed `mremap(2)` request: page-rounded sizes and decoded flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::dispatch) struct MremapRequest {
+    pub(in crate::dispatch) old_address: u64,
+    pub(in crate::dispatch) old_size: u64,
+    pub(in crate::dispatch) new_size: u64,
+    pub(in crate::dispatch) new_address: u64,
+    pub(in crate::dispatch) may_move: bool,
+    pub(in crate::dispatch) move_fixed: bool,
+    pub(in crate::dispatch) dontunmap: bool,
+}
+
+/// The argument-only `mremap(2)` validation every venue answers first.
+///
+/// Errno precedence is oracle-derived (real Linux 6.12.76, docker
+/// gcc:latest, 2026-07-23 — see .superpowers/sdd/mremap-ruling-report.md) and
+/// follows man 2 mremap's documented EINVAL conditions: no unrecognized flag
+/// bits, new_size != 0, MREMAP_FIXED/MREMAP_DONTUNMAP only paired with
+/// MREMAP_MAYMOVE, and MREMAP_DONTUNMAP only with old_size == new_size. Real
+/// Linux validates ALL of these — even for requests that use MREMAP_FIXED or
+/// MREMAP_DONTUNMAP — before it would ever attempt the remap, so a malformed
+/// request (e.g. an unrelated garbage bit ORed onto MREMAP_FIXED) surfaces
+/// the EINVAL real Linux would give.
+pub(in crate::dispatch) fn mremap_request(
+    page_size: u64,
+    old_address: u64,
+    old_size: u64,
+    new_size_req: u64,
+    flags: u64,
+    new_address: u64,
+) -> Result<MremapRequest, LinuxErrno> {
+    use carrick_abi::LinuxMremapFlags;
+    let flags = LinuxMremapFlags::from_bits_retain(flags);
+    if new_size_req == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    if !LinuxMremapFlags::all().contains(flags) {
+        return Err(LINUX_EINVAL);
+    }
+    // `man 2 mremap`: `old_address` must be page aligned. A misaligned
+    // request once ran the whole move, then could not reclaim the misaligned
+    // source and hit the fail-stop abort (`memflagmatrix` asks for exactly
+    // this). Ordering against the other EINVAL checks is unobservable, but
+    // it must precede the size rounding below, which answers ENOMEM.
+    if !old_address.is_multiple_of(page_size) {
+        return Err(LINUX_EINVAL);
+    }
+    let may_move = flags.contains(LinuxMremapFlags::MAYMOVE);
+    // A zero `old_size` asks for a NEW mapping of the same pages, which
+    // necessarily relocates, so it requires MREMAP_MAYMOVE
+    // (`memflagmatrix` `mremap_old_len_zero_einval`).
+    if old_size == 0 && !may_move {
+        return Err(LINUX_EINVAL);
+    }
+    let old_size = align_up_u64(old_size, page_size).ok_or(LINUX_ENOMEM)?;
+    let new_size = align_up_u64(new_size_req, page_size).ok_or(LINUX_ENOMEM)?;
+    let move_fixed = flags.contains(LinuxMremapFlags::FIXED);
+    let dontunmap = flags.contains(LinuxMremapFlags::DONTUNMAP);
+    if (move_fixed || dontunmap) && !may_move {
+        return Err(LINUX_EINVAL);
+    }
+    if dontunmap && new_size != old_size {
+        return Err(LINUX_EINVAL);
+    }
+    // Two MREMAP_FIXED well-formedness checks, both EINVAL (mremap05 cases
+    // 2/3: "new_addr has to be page aligned", "old/new area must not
+    // overlap").
+    if move_fixed
+        && (!new_address.is_multiple_of(page_size)
+            || ranges_overlap(
+                old_address,
+                old_size,
+                new_address,
+                new_address.saturating_add(new_size),
+            ))
+    {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(MremapRequest {
+        old_address,
+        old_size,
+        new_size,
+        new_address,
+        may_move,
+        move_fixed,
+        dontunmap,
+    })
 }
