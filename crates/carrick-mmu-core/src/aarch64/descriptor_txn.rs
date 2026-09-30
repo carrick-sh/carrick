@@ -898,6 +898,10 @@ pub enum DescriptorRefusal {
     /// so EL1 cannot copy the page without allocating (a provisioning
     /// defect of that image, distinct from exhausted table grants).
     CopyWindowAbsent = 23,
+    /// The operation's span names the Carrick-owned EL1 COW copy window
+    /// ([`copy_window::COW_COPY_WINDOW_BASE`]); only EL1's bounded copy may
+    /// write those leaves.
+    CarrickOwnedWindow = 24,
 }
 
 impl DescriptorRefusal {
@@ -927,6 +931,7 @@ impl DescriptorRefusal {
             21 => Self::ExcludedOutput,
             22 => Self::ReclaimCapacity,
             23 => Self::CopyWindowAbsent,
+            24 => Self::CarrickOwnedWindow,
             _ => return None,
         })
     }
@@ -2309,6 +2314,12 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
     let span = op.span();
     if !span.is_well_formed() {
         return Err(DescriptorRefusal::BadRange);
+    }
+    // The EL1 COW copy window belongs to Carrick, not to any guest range:
+    // only `copy_window::with_cow_copy_aliases` maps its leaves, and only
+    // for the bounded copy. No host-described edit may name it.
+    if copy_window::overlaps_cow_copy_window(span.va, span.len) {
+        return Err(DescriptorRefusal::CarrickOwnedWindow);
     }
     let aligned = |raw: u64| raw != 0 && raw.is_multiple_of(PT_PAGE) && raw & !PA_MASK_4KIB == 0;
     let ok = match *op {
@@ -4821,5 +4832,116 @@ mod tests {
                 DescriptorOutcome::Indeterminate(DescriptorRefusal::BadEncoding)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod carrick_owned_window_tests {
+    use super::copy_window::{COW_COPY_WINDOW_BASE as WINDOW, COW_COPY_WINDOW_LEN};
+    use super::*;
+
+    fn backing() -> BackingIdentity {
+        let one = NonZeroU64::MIN;
+        BackingIdentity {
+            frame_id: one,
+            mapping_id: one,
+            owner_generation: one,
+            inventory_revision: one,
+        }
+    }
+
+    fn ops(span: PageSpan) -> [DescriptorOp; 8] {
+        let ipa = SubstrateGpa(0x40_0000_0000);
+        [
+            DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: span.va,
+                    ipa: ipa.raw(),
+                    len: span.len,
+                    writable: true,
+                    executable: false,
+                },
+                resident: span,
+                backing: backing(),
+            },
+            DescriptorOp::Publish {
+                span,
+                expected_ipa: ipa,
+                access: LeafAccess::Read,
+            },
+            DescriptorOp::Protect(GuestPermissionEdit {
+                va: span.va,
+                len: span.len,
+                readable: true,
+                writable: false,
+                executable: false,
+            }),
+            DescriptorOp::Retire(span),
+            DescriptorOp::CowRepoint {
+                access: CowRepointAccess::Kernel,
+                va: span.va,
+                len: span.len,
+                old_ipa: ipa,
+                new_ipa: SubstrateGpa(ipa.raw() + 0x10_0000),
+                backing: backing(),
+            },
+            DescriptorOp::MapAlias {
+                access: AliasAccess::User {
+                    writable: true,
+                    executable: false,
+                },
+                span,
+                target_ipa: ipa,
+                backing: backing(),
+            },
+            DescriptorOp::Terminal {
+                span,
+                edit: TerminalEdit::fork_arm(true, false, true, 0, 0),
+            },
+            DescriptorOp::Terminal {
+                span,
+                edit: TerminalEdit::unmap_reclaiming(true, 0, 0),
+            },
+        ]
+    }
+
+    /// The copy window is Carrick-owned: no guest operation may name it,
+    /// whatever the op, so a kernel-range fork arm or alias can never turn
+    /// an idle copy slot into a mapping of the IPA its VA names.
+    #[test]
+    fn every_guest_op_naming_the_copy_window_is_refused() {
+        for span in [
+            PageSpan::new(WINDOW, COW_COPY_WINDOW_LEN),
+            PageSpan::new(WINDOW + PT_PAGE, PT_PAGE),
+            PageSpan::new(WINDOW - PT_PAGE, 2 * PT_PAGE),
+            PageSpan::new(
+                WINDOW - 4 * PT_PAGE,
+                4 * PT_PAGE + COW_COPY_WINDOW_LEN + PT_PAGE,
+            ),
+        ] {
+            for op in ops(span) {
+                assert_eq!(
+                    validate_op(&op),
+                    Err(DescriptorRefusal::CarrickOwnedWindow),
+                    "{op:?}"
+                );
+            }
+        }
+        for span in [
+            PageSpan::new(WINDOW - 4 * PT_PAGE, 4 * PT_PAGE),
+            PageSpan::new(WINDOW + COW_COPY_WINDOW_LEN, 4 * PT_PAGE),
+        ] {
+            for op in ops(span) {
+                assert_ne!(
+                    validate_op(&op),
+                    Err(DescriptorRefusal::CarrickOwnedWindow),
+                    "{op:?}"
+                );
+            }
+        }
+        assert_eq!(
+            DescriptorRefusal::from_code(DescriptorRefusal::CarrickOwnedWindow as u32),
+            Some(DescriptorRefusal::CarrickOwnedWindow)
+        );
     }
 }
