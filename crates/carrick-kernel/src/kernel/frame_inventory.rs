@@ -39,6 +39,19 @@ pub struct MappingRow {
     pub permissions: MemPerms,
 }
 
+/// The exact published row a frame grant must leave live in its mm. It is
+/// authenticated inside the apply that publishes it, under the same lock,
+/// because the inventory revision is global: re-reading the row "at the
+/// receipt's revision" after the lock drops fails whenever any sibling mm
+/// commits in between, although the row itself is exact and live.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactMappingRow {
+    pub mapping: MappingId,
+    pub frame: FrameId,
+    pub gpa: Gpa,
+    pub length: FrameLength,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameInventorySnapshot {
     pub revision: u64,
@@ -301,7 +314,7 @@ impl FrameInventoryAuthority {
         mm: MmId,
         commit: FrameInventoryCommit<T>,
     ) -> Result<(T, u64), FrameInventoryError> {
-        let (outcome, revision, _) = self.apply_inner(mm, commit, None)?;
+        let (outcome, revision, _) = self.apply_inner(mm, commit, None, None)?;
         Ok((outcome, revision))
     }
 
@@ -312,6 +325,29 @@ impl FrameInventoryAuthority {
         &self,
         mm: MmId,
         commit: FrameInventoryCommit<T>,
+    ) -> Result<(T, FrameInventoryApplyReceipt), FrameInventoryError> {
+        self.apply_with_receipt_inner(mm, commit, None)
+    }
+
+    /// [`Self::apply_with_receipt`] for a frame grant: the commit must
+    /// publish `grant` exactly in `mm`. The row is checked inside the apply,
+    /// on the candidate state, so a refused grant mutates nothing and an
+    /// accepted receipt proves the row was live at the revision it names —
+    /// independent of any sibling commit that follows.
+    pub fn apply_grant_with_receipt<T>(
+        &self,
+        mm: MmId,
+        commit: FrameInventoryCommit<T>,
+        grant: ExactMappingRow,
+    ) -> Result<(T, FrameInventoryApplyReceipt), FrameInventoryError> {
+        self.apply_with_receipt_inner(mm, commit, Some(grant))
+    }
+
+    fn apply_with_receipt_inner<T>(
+        &self,
+        mm: MmId,
+        commit: FrameInventoryCommit<T>,
+        grant: Option<ExactMappingRow>,
     ) -> Result<(T, FrameInventoryApplyReceipt), FrameInventoryError> {
         let transaction = commit.batch().transaction();
         let provenance = self
@@ -330,7 +366,7 @@ impl FrameInventoryAuthority {
             }
         }
         let mm_id = mm;
-        let (outcome, revision, _) = self.apply_inner(mm_id, commit, None)?;
+        let (outcome, revision, _) = self.apply_inner(mm_id, commit, None, grant)?;
         let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::frame_inventory",
@@ -437,7 +473,8 @@ impl FrameInventoryAuthority {
         }
         drop(state);
         let mm_id = mm;
-        let (outcome, revision, mm_empty_at_revision) = self.apply_inner(mm_id, commit, None)?;
+        let (outcome, revision, mm_empty_at_revision) =
+            self.apply_inner(mm_id, commit, None, None)?;
         let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::frame_inventory",
@@ -462,6 +499,7 @@ impl FrameInventoryAuthority {
         mm: MmId,
         commit: FrameInventoryCommit<T>,
         fail_before_event: Option<usize>,
+        grant: Option<ExactMappingRow>,
     ) -> Result<(T, u64, bool), FrameInventoryError> {
         let transaction = commit.batch().transaction();
         let mut state = self.state.lock();
@@ -499,6 +537,21 @@ impl FrameInventoryAuthority {
             matches!(mapping.state, MappingState::Prepared(owner) if owner == transaction)
         }) {
             return Err(FrameInventoryError::UnpublishedMapping);
+        }
+        if let Some(grant) = grant {
+            // The grant row must be one THIS batch published (present in the
+            // overlay), exactly, in this mm.
+            let exact = matches!(
+                candidate.mappings.get(&grant.mapping),
+                Some(Some(entry)) if entry.state == MappingState::Published
+                    && entry.mm == mm
+                    && entry.frame == grant.frame
+                    && entry.gpa == grant.gpa
+                    && entry.length == grant.length
+            );
+            if !exact {
+                return Err(FrameInventoryError::GrantRowMismatch(grant.mapping));
+            }
         }
         let changes = candidate.into_changes();
         for (frame, entry) in changes.frames {
@@ -695,7 +748,7 @@ impl FrameInventoryAuthority {
         commit: FrameInventoryCommit<T>,
         fail_before_event: usize,
     ) -> Result<(T, u64), FrameInventoryError> {
-        let (outcome, revision, _) = self.apply_inner(mm, commit, Some(fail_before_event))?;
+        let (outcome, revision, _) = self.apply_inner(mm, commit, Some(fail_before_event), None)?;
         Ok((outcome, revision))
     }
 }
@@ -1122,6 +1175,8 @@ pub enum FrameInventoryError {
     RollbackReceiptDuplicate(MappingId),
     #[error("unpublished frame inventory rollback receipt does not match mapping {0:?}")]
     RollbackReceiptMismatch(MappingId),
+    #[error("frame grant commit does not publish mapping {0:?} exactly in its mm")]
+    GrantRowMismatch(MappingId),
     #[error("test failpoint before event {0}")]
     InjectedFailure(usize),
 }
@@ -1316,6 +1371,68 @@ mod tests {
              apply_inner: the emptiness verdict belongs to the revision the apply \
              produced, not to whatever revision is current afterwards"
         );
+    }
+
+    #[test]
+    fn grant_apply_authenticates_its_row_at_its_own_revision_and_refuses_mismatch_unmutated() {
+        let fixture = Fixture::new();
+        let mut expected = None;
+        let batch = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            expected = Some((mapping, frame));
+            prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);
+        });
+        let (mapping, frame) = expected.unwrap();
+        let row = ExactMappingRow {
+            mapping,
+            frame,
+            gpa: Gpa(0x8000),
+            length: length(0x4000),
+        };
+        let (_, receipt) = fixture
+            .authority
+            .apply_grant_with_receipt(fixture.mm1, batch, row)
+            .expect("exact grant row");
+        assert!(receipt.authorizes(mapping, frame));
+        // A sibling mm's commit moves the global revision; the grant's
+        // receipt stays authentic because it was proven inside its apply.
+        let sibling = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            prepare_publish(reservation, transaction, frame, mapping, 0x10_0000, 0x4000);
+        });
+        fixture.authority.apply(fixture.mm2, sibling).unwrap();
+        assert!(fixture.authority.mapping_is_live_exact(
+            fixture.mm1,
+            mapping,
+            frame,
+            row.gpa,
+            row.length
+        ));
+
+        // A commit that publishes another extent than the grant names is
+        // refused before any state changes.
+        let before = fixture.authority.snapshot();
+        let mut mismatched = None;
+        let batch = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            mismatched = Some((mapping, frame));
+            prepare_publish(reservation, transaction, frame, mapping, 0x20_0000, 0x4000);
+        });
+        let (mapping, frame) = mismatched.unwrap();
+        let wrong = ExactMappingRow {
+            mapping,
+            frame,
+            gpa: Gpa(0x20_4000),
+            length: length(0x4000),
+        };
+        assert!(matches!(
+            fixture.authority.apply_grant_with_receipt(fixture.mm1, batch, wrong),
+            Err(FrameInventoryError::GrantRowMismatch(refused)) if refused == mapping
+        ));
+        assert_eq!(fixture.authority.snapshot(), before);
     }
 
     #[test]

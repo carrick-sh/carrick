@@ -357,30 +357,30 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
     > {
         let owner = self.owner_inventory.retain_current(gpa, length)?;
         let owner_generation = owner.generation();
+        // The exact row is authenticated inside the apply: the inventory
+        // revision is global, so a post-apply "live at the receipt's
+        // revision" query fails whenever any sibling commits in between.
         let ((), receipt) = self
             .kernel
             .frame_inventory()
-            .apply_with_receipt(self.mm, commit)
+            .apply_grant_with_receipt(
+                self.mm,
+                commit,
+                carrick_kernel::kernel::ExactMappingRow {
+                    mapping,
+                    frame,
+                    gpa,
+                    length,
+                },
+            )
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
         let expected_mm = std::num::NonZeroU64::new(self.mm.raw()).ok_or_else(|| {
             Box::new(std::io::Error::other(
                 "frame grant authority carries a zero MM identity",
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
-        let authenticated = receipt.mm() == expected_mm
-            && receipt.authorizes(mapping, frame)
-            && self
-                .kernel
-                .frame_inventory()
-                .mapping_is_live_exact_at_revision(
-                    self.mm,
-                    receipt.revision(),
-                    mapping,
-                    frame,
-                    gpa,
-                    length,
-                )
-            && owner.is_current();
+        let authenticated =
+            receipt.mm() == expected_mm && receipt.authorizes(mapping, frame) && owner.is_current();
         if !authenticated {
             self.kernel
                 .frame_inventory()
@@ -496,10 +496,21 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         // the retained owner incarnation and generation that will be signed.
         let owner = self.owner_inventory.retain_current(gpa, length)?;
         let owner_generation = owner.generation();
+        // Row exactness is proven inside the apply (see `apply_frame_grant`);
+        // the proof below binds the revision that apply produced.
         let ((), receipt) = self
             .kernel
             .frame_inventory()
-            .apply_with_receipt(self.mm, commit)
+            .apply_grant_with_receipt(
+                self.mm,
+                commit,
+                carrick_kernel::kernel::ExactMappingRow {
+                    mapping,
+                    frame,
+                    gpa,
+                    length,
+                },
+            )
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
         let expected_mm = std::num::NonZeroU64::new(self.mm.raw()).unwrap_or_else(|| {
             carrick_fatal!(
@@ -507,20 +518,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
                 "KernelFrameCowAuthority target MmId is zero"
             )
         });
-        if receipt.mm() != expected_mm
-            || !receipt.authorizes(mapping, frame)
-            || !self
-                .kernel
-                .frame_inventory()
-                .mapping_is_live_exact_at_revision(
-                    self.mm,
-                    receipt.revision(),
-                    mapping,
-                    frame,
-                    gpa,
-                    length,
-                )
-            || !owner.is_current()
+        if receipt.mm() != expected_mm || !receipt.authorizes(mapping, frame) || !owner.is_current()
         {
             carrick_fatal!(
                 "hvpatch::frame_inventory",
@@ -3646,6 +3644,110 @@ mod tests {
                 transport_chosen_owner,
             ),
             "transport-selected owner generation was accepted by the kernel proof issuer"
+        );
+    }
+
+    /// A grant commit publishing exactly one PrepareMapping+PublishMapping row.
+    fn stage_grant_row(
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
+        gpa: Gpa,
+    ) -> (
+        carrick_hal::FrameInventoryReservation,
+        carrick_hal::MappingId,
+        carrick_hal::FrameId,
+        carrick_hal::FrameLength,
+    ) {
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = kernel.reserve_frame_inventory(1, 1, capacity).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation =
+            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
+        let length =
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x4000).unwrap());
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        (reservation, mapping, frame, length)
+    }
+
+    /// The inventory revision is global. A sibling commit landing between a
+    /// grant's apply and its row authentication must not make an exact,
+    /// live grant row fail authentication (the inotify09 child died with
+    /// "frame grant inventory or host-owner authentication failed" while its
+    /// parent committed inventory concurrently). The window is a few
+    /// instructions, so the unfixed code fails only when the sibling wins
+    /// it; the fixed code authenticates inside the apply and cannot fail.
+    #[test]
+    fn frame_grant_authenticates_despite_concurrent_sibling_inventory_commits() {
+        let (kernel, root) = bootstrap(31_131);
+        let mm = root.shared().mm().id();
+        let tid = ThreadId::synthetic_for_tests(31_131);
+        let owner =
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(5).unwrap());
+        let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
+            Arc::clone(&kernel),
+            mm,
+            tid,
+            7,
+            crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(owner),
+        );
+        const GRANTS: u64 = 4_000;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sibling = {
+            let kernel = Arc::clone(&kernel);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut next = 0x1_0000_0000_u64;
+                while !stop.load(Ordering::Acquire) {
+                    let (reservation, ..) = stage_grant_row(&kernel, Gpa(next));
+                    kernel
+                        .frame_inventory()
+                        .apply(mm, reservation.commit(()))
+                        .expect("sibling inventory commit");
+                    next += 0x4000;
+                }
+            })
+        };
+        let mut refused = 0_u64;
+        for index in 0..GRANTS {
+            let gpa = Gpa(0x10_0000 + index * 0x4000);
+            let (reservation, mapping, frame, length) = stage_grant_row(&kernel, gpa);
+            match authority.apply_frame_grant(reservation.commit(()), mapping, frame, gpa, length) {
+                Ok((receipt, generation)) => {
+                    assert!(receipt.authorizes(mapping, frame));
+                    assert_eq!(receipt.mm().get(), mm.raw());
+                    assert_eq!(generation, owner);
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        stop.store(true, Ordering::Release);
+        sibling.join().expect("sibling committer");
+        assert_eq!(
+            refused, 0,
+            "{refused} of {GRANTS} exact live grant rows failed authentication \
+             because a sibling commit advanced the global inventory revision"
         );
     }
 
