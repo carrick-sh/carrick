@@ -14390,7 +14390,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 311,
+      "line": 317,
       "categories": [
         "mapping"
       ],
@@ -14399,7 +14399,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 312,
+      "line": 318,
       "categories": [
         "mapping"
       ],
@@ -14408,7 +14408,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 351,
+      "line": 357,
       "categories": [
         "mapping"
       ],
@@ -14417,7 +14417,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 352,
+      "line": 358,
       "categories": [
         "mapping"
       ],
