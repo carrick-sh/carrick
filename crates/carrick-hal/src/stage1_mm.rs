@@ -46,6 +46,14 @@ pub trait Stage1MmProjection: Debug + Send + Sync {
     /// resident on this mm and return it; the invalidation is acknowledged
     /// against exactly that generation.
     fn publish_foreign_cow_invalidation(&self) -> ForeignCowInvalidationGeneration;
+
+    /// Admit a borrowed-TTBR0 window of this mm's current ASID generation
+    /// (a foreign EL1 drain on another MM's vCPU). `None` when the
+    /// generation no longer admits loads (it is retiring) or this backend
+    /// has no ASID residency authority.
+    fn admit_borrowed_ttbr0(&self) -> Option<Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>> {
+        None
+    }
 }
 
 /// The backend that may install foreign-mm state on a kernel mm, and the

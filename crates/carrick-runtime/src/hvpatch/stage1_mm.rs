@@ -502,6 +502,57 @@ impl carrick_hal::stage1_mm::Stage1MmProjection for Stage1MmLease {
     fn publish_foreign_cow_invalidation(&self) -> carrick_hal::ForeignCowInvalidationGeneration {
         self.publish_cow_invalidation().ticket().generation()
     }
+
+    fn admit_borrowed_ttbr0(&self) -> Option<Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>> {
+        let load = self.begin_asid_load().ok()?;
+        Some(Box::new(BorrowedAsidAdmission {
+            load: Some(load),
+            armed: false,
+        }))
+    }
+}
+
+/// One borrowed-TTBR0 window of an ASID generation: an ordinary admitted
+/// load, so retirement cannot close its invalidation while it lives. Once
+/// armed it ends RESIDENT, not cancelled: the borrowing vCPU may still cache
+/// the generation's translations after restoring its own TTBR0, and only
+/// the generation's broadcast invalidation at retirement removes them.
+#[derive(Debug)]
+struct BorrowedAsidAdmission {
+    load: Option<AsidLoad>,
+    armed: bool,
+}
+
+impl carrick_guest_mem::BorrowedTtbr0Admission for BorrowedAsidAdmission {
+    fn arm(&mut self) -> Result<(), String> {
+        if self.armed {
+            return Ok(());
+        }
+        self.load
+            .as_mut()
+            .ok_or_else(|| "borrowed ASID admission already settled".to_owned())?
+            .arm_hardware_dirty()
+            .map_err(|error| error.to_string())?;
+        self.armed = true;
+        Ok(())
+    }
+}
+
+impl Drop for BorrowedAsidAdmission {
+    fn drop(&mut self) {
+        let Some(load) = self.load.take() else {
+            return;
+        };
+        if self.armed
+            && let Err(error) = load.mark_resident()
+        {
+            carrick_fatal!(
+                "hvpatch::stage1_mm",
+                "borrowed ASID admission could not record residency: {error}"
+            );
+        }
+        // An unarmed load is cancelled by dropping it: no vCPU installed it.
+    }
 }
 
 /// Only the HVPatch bootstrap/lifecycle module can mint the permit
@@ -1014,6 +1065,9 @@ impl Stage1MmRetirement {
             space.retire_reservations();
         }
         drop(space);
+        // A foreign drain may still borrow this generation's TTBR0 on another
+        // MM's vCPU: its window ends before the invalidation is decided.
+        self.residency.wait_for_admitted_loads();
     }
 
     pub(crate) fn asid_generation(&self) -> AsidGeneration {
@@ -1534,6 +1588,75 @@ mod tests {
             .expect("retire replacement")
             .complete_for_test()
             .expect("complete replacement retirement");
+    }
+
+    #[test]
+    fn borrowed_ttbr0_admission_is_refused_once_retirement_closes_admission() {
+        use carrick_hal::stage1_mm::Stage1MmProjection;
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child").commit();
+        let prepared = pool.prepare_retirement(&lease).expect("close admission");
+        assert!(
+            lease.admit_borrowed_ttbr0().is_none(),
+            "a retiring generation must refuse the borrow before any TTBR0 swap"
+        );
+        drop(prepared);
+        assert!(
+            lease.admit_borrowed_ttbr0().is_some(),
+            "rollback reopens it"
+        );
+    }
+
+    #[test]
+    fn retirement_waits_for_a_borrowed_ttbr0_window_and_then_owes_its_invalidation() {
+        use carrick_hal::stage1_mm::Stage1MmProjection;
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child").commit();
+        // A foreign drain borrows this generation's TTBR0 on another MM's
+        // vCPU; no executor of the space ever loaded it.
+        let mut borrowed = lease
+            .admit_borrowed_ttbr0()
+            .expect("live generation admits");
+        borrowed.arm().expect("arm before the TTBR0 install");
+        let retirement = Arc::new(pool.retire(&lease).expect("retire racing the borrow"));
+        assert_eq!(
+            retirement
+                .acknowledge(BroadcastInvalidation::completed(
+                    retirement.asid_generation()
+                ))
+                .unwrap_err(),
+            AsidResidencyError::ExecutorStillLoading,
+            "no invalidation may complete (and the ASID recycle) while borrowed"
+        );
+        let (decided, decision) = std::sync::mpsc::channel();
+        let retirer = {
+            let retirement = Arc::clone(&retirement);
+            std::thread::spawn(move || {
+                retirement.retire_address_space();
+                decided.send(retirement.needs_invalidation()).unwrap();
+            })
+        };
+        assert!(
+            decision
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "retirement decided its invalidation while a TTBR0 was still borrowed"
+        );
+        drop(borrowed);
+        assert!(
+            decision.recv().unwrap(),
+            "the borrowing vCPU may cache translations: the broadcast is owed"
+        );
+        retirer.join().unwrap();
+        retirement
+            .acknowledge(BroadcastInvalidation::completed(
+                retirement.asid_generation(),
+            ))
+            .expect("acknowledged once the window closed");
+        Arc::try_unwrap(retirement)
+            .unwrap()
+            .complete_for_test()
+            .expect("complete retirement");
     }
 
     #[test]

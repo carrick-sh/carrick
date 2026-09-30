@@ -529,8 +529,14 @@ impl ForeignMmReadLease for MockCowLease {
     ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
         self.counters.break_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(caller) = invalidator.caller_el1_call() {
+            struct Unowned;
+            impl carrick_guest_mem::BorrowedTtbr0Admission for Unowned {
+                fn arm(&mut self) -> Result<(), String> {
+                    Ok(())
+                }
+            }
             let answer = caller
-                .drain_foreign(snapshot.mm().raw_for_probe(), 0)
+                .drain_foreign(snapshot.mm().raw_for_probe(), 0, &mut Unowned)
                 .unwrap_or(u64::MAX);
             self.counters.lent_drain_answers.lock().push(answer);
         }

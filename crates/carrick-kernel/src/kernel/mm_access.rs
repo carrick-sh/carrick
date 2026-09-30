@@ -2073,7 +2073,12 @@ mod tests {
             fn slot(&self) -> Option<usize> {
                 Some(0)
             }
-            fn drain_foreign(&mut self, mm_key: u64, _ttbr0: u64) -> Result<u64, String> {
+            fn drain_foreign(
+                &mut self,
+                mm_key: u64,
+                _ttbr0: u64,
+                _admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+            ) -> Result<u64, String> {
                 self.0.push(mm_key);
                 Ok(7)
             }

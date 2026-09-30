@@ -142,16 +142,22 @@ pub fn drain_frame(slot: usize, mm_key: u64, ttbr0: u64) -> carrick_el1_abi::Tra
 /// Run the host-driven drain for another MM on a borrowed caller vCPU:
 /// `set_ttbr0` installs the target's TTBR0 for exactly the call (EL1's COW
 /// copy window lives in the target's tables) and restores the caller's own.
-/// Failing to restore it is fatal: the vCPU would resume in another MM.
+/// `admission` (the target ASID generation's residency) is armed before the
+/// install, so the generation's retirement flushes whatever this vCPU cached.
+/// Failing to restore the TTBR0 is fatal: the vCPU would resume in another MM.
 pub(crate) fn run_foreign_drain_call(
     slot: usize,
     mm_key: u64,
     ttbr0: u64,
+    admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
     mut get_ttbr0: impl FnMut() -> Result<u64, TrapError>,
     mut set_ttbr0: impl FnMut(u64) -> Result<(), TrapError>,
     run: impl FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<u64, TrapError> {
     let own = get_ttbr0()?;
+    admission
+        .arm()
+        .map_err(|error| TrapError::Hypervisor(format!("admit borrowed target ASID: {error}")))?;
     set_ttbr0(ttbr0)?;
     let answered = run_drain_call(drain_frame(slot, mm_key, ttbr0), run);
     if let Err(error) = set_ttbr0(own) {

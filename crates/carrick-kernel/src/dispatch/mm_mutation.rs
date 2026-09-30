@@ -307,6 +307,19 @@ impl carrick_hal::ForeignMmInvalidator for MmMutationGuard<'_> {
             .map_err(|_| carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
     }
 
+    fn admit_borrowed_ttbr0(
+        &mut self,
+        binding: carrick_hal::ForeignMmBinding,
+    ) -> Result<
+        Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>,
+        carrick_hal::ForeignMmTransportError,
+    > {
+        self.foreign_authority
+            .as_deref()
+            .and_then(|authority| authority.admit_borrowed_ttbr0(binding))
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
+    }
+
     fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
         // Only the exact-target foreign arm holds the pause EL1's host
         // custody drain requires.

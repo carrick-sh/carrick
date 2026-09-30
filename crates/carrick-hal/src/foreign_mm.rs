@@ -404,6 +404,16 @@ pub trait ForeignMmInvalidator {
     fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
         None
     }
+
+    /// Admit the exact target's ASID generation for one borrowed-TTBR0
+    /// window of the lent vCPU (see [`carrick_guest_mem::BorrowedTtbr0Admission`]).
+    /// Refused when `binding` is not the target's or its generation retires.
+    fn admit_borrowed_ttbr0(
+        &mut self,
+        _binding: ForeignMmBinding,
+    ) -> Result<Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>, ForeignMmTransportError> {
+        Err(ForeignMmTransportError::AuthorityUnavailable)
+    }
 }
 
 /// Content status for participating carrier host writes only. No variant grants

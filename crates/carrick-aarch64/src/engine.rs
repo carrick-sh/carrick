@@ -2330,7 +2330,12 @@ impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
         self.vcpu.mailbox_slot()
     }
 
-    fn drain_foreign(&mut self, mm_key: u64, ttbr0: u64) -> Result<u64, String> {
+    fn drain_foreign(
+        &mut self,
+        mm_key: u64,
+        ttbr0: u64,
+        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    ) -> Result<u64, String> {
         let slot = self
             .vcpu
             .mailbox_slot()
@@ -2340,6 +2345,7 @@ impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
             slot,
             mm_key,
             ttbr0,
+            admission,
             || vcpu.borrow().get_sys_reg(SysReg::Ttbr0),
             |value| vcpu.borrow_mut().set_sys_reg(SysReg::Ttbr0, value),
             |entry, frame_va| run_el1_service_call_on::<V>(&mut vcpu.borrow_mut(), entry, frame_va),

@@ -1060,7 +1060,12 @@ impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
         Some(3)
     }
 
-    fn drain_foreign(&mut self, mm_key: u64, ttbr0: u64) -> Result<u64, String> {
+    fn drain_foreign(
+        &mut self,
+        mm_key: u64,
+        ttbr0: u64,
+        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    ) -> Result<u64, String> {
         use carrick_mmu_core::aarch64::descriptor_txn::{
             DescriptorOp, InlineJournal, PrimaryTableWords, TableMaintenance,
             execute_descriptor_txn,
@@ -1074,6 +1079,9 @@ impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
             ttbr0, self.expected_ttbr0,
             "the drain installs the target's TTBR0"
         );
+        // As the engine does: the target generation is armed before its
+        // TTBR0 is installed on this vCPU.
+        admission.arm()?;
         self.drains += 1;
         (self.before_apply)();
         let words = unsafe {
@@ -1123,11 +1131,50 @@ impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
     }
 }
 
+/// Model of the runtime's ASID residency for the target generation: counts
+/// admitted-but-unsettled windows and whether any was armed.
+#[derive(Clone, Default)]
+struct ModelAsidResidency {
+    retiring: Arc<std::sync::atomic::AtomicBool>,
+    loading: Arc<std::sync::atomic::AtomicUsize>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    resident: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ModelAdmission {
+    residency: ModelAsidResidency,
+    armed: bool,
+}
+
+impl carrick_guest_mem::BorrowedTtbr0Admission for ModelAdmission {
+    fn arm(&mut self) -> Result<(), String> {
+        self.armed = true;
+        self.residency
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl Drop for ModelAdmission {
+    fn drop(&mut self) {
+        if self.armed {
+            self.residency
+                .resident
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.residency
+            .loading
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The runtime's exact-target capability with (or without) a lent vCPU. On
 /// the guest lane host TLB maintenance is never requested: EL1 invalidates.
 struct LendingInvalidator {
     inner: TestInvalidator,
     caller: Option<ModelCallerEl1>,
+    residency: ModelAsidResidency,
 }
 
 impl carrick_hal::ForeignMmInvalidator for LendingInvalidator {
@@ -1143,6 +1190,30 @@ impl carrick_hal::ForeignMmInvalidator for LendingInvalidator {
         self.caller
             .as_mut()
             .map(|caller| caller as &mut dyn carrick_guest_mem::CallerEl1Call)
+    }
+
+    fn admit_borrowed_ttbr0(
+        &mut self,
+        binding: carrick_hal::ForeignMmBinding,
+    ) -> Result<
+        Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>,
+        carrick_hal::ForeignMmTransportError,
+    > {
+        assert_eq!(binding, self.inner.expected);
+        if self
+            .residency
+            .retiring
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable);
+        }
+        self.residency
+            .loading
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(ModelAdmission {
+            residency: self.residency.clone(),
+            armed: false,
+        }))
     }
 }
 
@@ -1285,6 +1356,7 @@ fn guest_owned_foreign_cow_publishes_through_the_lent_vcpu_before_retirement() {
         }) as Box<dyn FnMut()>
     };
     let mut lending = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
         inner: invalidator,
         caller: Some(ModelCallerEl1::new(&child, observe)),
     };
@@ -1301,6 +1373,13 @@ fn guest_owned_foreign_cow_publishes_through_the_lent_vcpu_before_retirement() {
     let caller = lending.caller.as_ref().unwrap();
     assert_eq!(caller.drains, 1);
     assert_eq!(lending.inner.calls, 0, "EL1 owns TLB maintenance");
+    // The borrowed window was admitted, armed before the TTBR0 install, and
+    // settled resident: the target's retirement now owes the caller vCPU's
+    // translations a broadcast invalidation, and nothing holds it open.
+    use std::sync::atomic::Ordering::SeqCst;
+    assert!(lending.residency.armed.load(SeqCst));
+    assert!(lending.residency.resident.load(SeqCst));
+    assert_eq!(lending.residency.loading.load(SeqCst), 0);
     assert!(matches!(
         caller.submitted.as_slice(),
         [DescriptorOp::CowRepoint {
@@ -1363,6 +1442,7 @@ fn guest_owned_foreign_cow_refusal_before_submission_rolls_back_every_stage() {
         let live_before = installed.live.0.read().clone();
         let aliases_before = alias_registry().lock().ordered();
         let mut lending = LendingInvalidator {
+            residency: ModelAsidResidency::default(),
             inner: invalidator,
             caller: Some(ModelCallerEl1::new(
                 &installed,
@@ -1400,11 +1480,81 @@ fn guest_owned_foreign_cow_refusal_before_submission_rolls_back_every_stage() {
         let caller = lending.caller.as_ref().unwrap();
         assert_eq!(caller.drains, 0, "phase {phase}");
         assert!(
+            !lending
+                .residency
+                .armed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "phase {phase}: no TTBR0 was borrowed, so none was armed"
+        );
+        assert_eq!(
+            lending
+                .residency
+                .loading
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "phase {phase}: the unarmed admission is cancelled"
+        );
+        assert!(
             caller.slots.as_slice().iter().all(|slot| slot.state() == 0),
             "phase {phase}"
         );
         assert_eq!(lending.inner.calls, 0, "phase {phase}");
     }
+}
+
+#[test]
+fn guest_owned_foreign_cow_refuses_a_retiring_target_before_borrowing_its_ttbr0() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        740,
+        0x9a01_5000_0000,
+        0x9b01_5000_0000,
+        *b"dies",
+    );
+    let (authority, lease, invalidator) = prepare_foreign_cow(&installed);
+    installed
+        .state
+        .page_tables_authority()
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let before = foreign_cow_fingerprint(&installed);
+    let live_before = installed.live.0.read().clone();
+    let residency = ModelAsidResidency::default();
+    residency
+        .retiring
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut lending = LendingInvalidator {
+        residency,
+        inner: invalidator,
+        caller: Some(ModelCallerEl1::new(
+            &installed,
+            Box::new(|| panic!("a retiring target's TTBR0 must never be borrowed")),
+        )),
+    };
+    install_test_slots(&installed, lending.caller.as_ref().unwrap());
+    assert!(matches!(
+        lease.break_cow(
+            &mut lending,
+            &installed.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
+    ));
+    assert_eq!(foreign_cow_fingerprint(&installed), before);
+    assert_eq!(*installed.live.0.read(), live_before);
+    assert!(authority.published.lock().is_none());
+    assert_eq!(lending.caller.as_ref().unwrap().drains, 0);
+    assert!(
+        !lending
+            .residency
+            .armed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
 }
 
 #[test]
@@ -1430,6 +1580,7 @@ fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
     tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
     let requested = CarrierForeignMmSnapshot::capture(&target.snapshot);
     let mut lending = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
         inner: TestInvalidator {
             expected: carrick_hal::ForeignMmSnapshot::binding(&target.snapshot),
             calls: 0,
@@ -1543,6 +1694,7 @@ fn guest_owned_foreign_pristine_write_publishes_user_writable_through_the_lent_v
         }) as Box<dyn FnMut()>
     };
     let mut lending = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
         inner: invalidator,
         caller: Some(ModelCallerEl1::new(&installed, observe)),
     };
@@ -2131,6 +2283,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
         "fixture must publish a semantic alias for source IPA 0x{before_ipa:x}",
     );
     let mut invalidator = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
         inner: TestInvalidator {
             expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
             calls: 0,

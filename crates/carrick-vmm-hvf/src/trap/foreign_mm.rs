@@ -2771,6 +2771,9 @@ fn perform_foreign_guest_cow(
             "guest foreign COW receipt names another transaction"
         );
     }
+    // The borrowed-TTBR0 window is closed: settle the target ASID admission
+    // (resident) before the commit, so the target's retirement is not held.
+    drop(publisher);
     grant.commit();
     let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
         carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
