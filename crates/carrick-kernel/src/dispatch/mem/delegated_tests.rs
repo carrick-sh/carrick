@@ -1565,3 +1565,112 @@ fn delegated_mremap_carries_the_lock_with_the_mapping() {
     assert_eq!(locked_memory(&dispatcher), [(moved, moved + 2 * PAGE)]);
     assert!(dispatcher.mem().lock().locked_ranges.is_empty());
 }
+
+fn mincore_page(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut CountingMmapMemory,
+    address: u64,
+) -> u8 {
+    let vec = LINUX_MMAP_BASE + 31 * PAGE;
+    assert_eq!(
+        returned(call(dispatcher, memory, 232, [address, PAGE, vec, 0, 0, 0])),
+        0
+    );
+    memory.read_bytes(vec, 1).unwrap()[0]
+}
+
+#[test]
+fn delegated_mremap_growth_over_a_guest_unmapped_page_is_not_resident() {
+    // The host venue makes a page resident, the guest venue unmaps it
+    // without the host, then a host-venue mremap grows back over it: the
+    // grown page is fresh memory (mincore(2) 0), exactly as when every step
+    // is a host syscall.
+    for delegated in [false, true] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = delegated.then(|| Root::admit(&dispatcher));
+        let mut memory = arena_memory();
+        let a = anon_mmap(&mut dispatcher, &mut memory, 0, 2 * PAGE);
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MLOCK,
+            [a + PAGE, PAGE, 0, 0, 0, 0],
+        ));
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MUNLOCK,
+            [a + PAGE, PAGE, 0, 0, 0, 0],
+        ));
+        assert_eq!(mincore_page(&mut dispatcher, &mut memory, a + PAGE), 1);
+        match &root {
+            Some(root) => root.guest_munmap(a + PAGE, PAGE),
+            None => {
+                returned(call(
+                    &mut dispatcher,
+                    &mut memory,
+                    SYS_MUNMAP,
+                    [a + PAGE, PAGE, 0, 0, 0, 0],
+                ));
+            }
+        }
+        assert_eq!(
+            returned(mremap(
+                &mut dispatcher,
+                &mut memory,
+                [a, PAGE, 2 * PAGE, 0, 0]
+            )) as u64,
+            a
+        );
+        assert_eq!(
+            mincore_page(&mut dispatcher, &mut memory, a + PAGE),
+            0,
+            "delegated={delegated}: the grown page is fresh"
+        );
+    }
+}
+
+#[test]
+fn delegated_heap_mremap_and_mlockall_match_a_host_setup_mm() {
+    // Readers S1d found still reading host rows only: the mremap source
+    // metadata (a heap source is host-served) and mlockall(MCL_CURRENT).
+    fn run(delegated: bool) -> (Vec<DispatchOutcome>, Vec<(u64, u64)>) {
+        let mut dispatcher = SyscallDispatcher::new();
+        let _root = delegated.then(|| Root::admit(&dispatcher));
+        let heap = dispatcher.mem().lock().layout.heap_base;
+        let mut heap_memory = CountingMmapMemory::new(heap, (8 * PAGE) as usize);
+        let mut memory = arena_memory();
+        let outcomes = vec![
+            call(
+                &mut dispatcher,
+                &mut heap_memory,
+                SYS_BRK,
+                [heap + 3 * PAGE, 0, 0, 0, 0, 0],
+            ),
+            mremap(
+                &mut dispatcher,
+                &mut heap_memory,
+                [heap, 3 * PAGE, 2 * PAGE, 0, 0],
+            ),
+            mremap(
+                &mut dispatcher,
+                &mut heap_memory,
+                [heap + 2 * PAGE, PAGE, PAGE, 0, 0],
+            ),
+            DispatchOutcome::Returned {
+                value: anon_mmap(&mut dispatcher, &mut memory, 0, 2 * PAGE) as i64,
+            },
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MLOCKALL,
+                [MCL_CURRENT, 0, 0, 0, 0, 0],
+            ),
+        ];
+        (outcomes, locked_memory(&dispatcher))
+    }
+    let host = run(false);
+    let root = run(true);
+    assert_eq!(host.0, root.0, "outcomes differ");
+    assert_eq!(host.1, root.1, "mlockall locked different memory");
+}

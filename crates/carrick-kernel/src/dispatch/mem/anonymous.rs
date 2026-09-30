@@ -1491,6 +1491,16 @@ impl MemView<'_> {
             {
                 Ok(Decision::Work(request)) => {
                     mem.open_venue(HostVenue::Proposal(request));
+                    if request.operation != ReservationOperation::Retire {
+                        // What the root held no node for is fresh memory,
+                        // however the host last saw it (as for placement).
+                        let holes = root
+                            .with_root(|model| super::fault::root_holes(model, request.range))
+                            .unwrap_or_else(|refusal| {
+                                broken_root("an mremap placement observation", refusal)
+                            });
+                        mem.retire_stale_first_touch(&holes);
+                    }
                     request
                 }
                 Ok(Decision::Complete(value)) => {
