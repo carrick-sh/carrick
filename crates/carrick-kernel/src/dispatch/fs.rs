@@ -1016,7 +1016,7 @@ impl<'a> FsView<'a> {
         let network_model = context.task().net_ns().view().as_ref().clone();
         after_proc_snapshot();
         let mem = self.mem_snapshot();
-        let brk_current = mem.brk_current();
+        let brk_current = mem.program_break();
         let mut address_space_regions = mem.address_space_regions;
         if !mem.dynamic_maps.is_empty() {
             match &mut address_space_regions {

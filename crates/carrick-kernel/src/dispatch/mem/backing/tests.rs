@@ -1763,7 +1763,10 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
 #[test]
 fn proc_mem_snapshot_waits_for_install_and_returns_one_coherent_generation() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
-    dispatcher.mem().lock().brk_current = 0x1111_0000;
+    dispatcher
+        .mem()
+        .lock()
+        .seed_brk_current_for_test(0x1111_0000);
     let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
         guard
             .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
@@ -1797,7 +1800,7 @@ fn proc_mem_snapshot_waits_for_install_and_returns_one_coherent_generation() {
                         std::time::Instant::now() + std::time::Duration::from_secs(1),
                     )
                     .expect("snapshot after install phase");
-                tx.send(snapshot.brk_current).expect("publish snapshot");
+                tx.send(snapshot.program_break()).expect("publish snapshot");
             });
 
             assert_eq!(

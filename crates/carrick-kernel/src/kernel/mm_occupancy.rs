@@ -732,20 +732,42 @@ impl std::fmt::Debug for AddressSpacePublication {
     }
 }
 
-/// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, for guest EL1
-/// to install. `None`: the carrier does not schedule in the guest, the hatch
-/// is set, the table is full, or `mm` is already published.
-pub fn publish_address_space(
-    mm: MmId,
-    fence: &MmFence,
-    ttbr0: u64,
-    ttbr1: u64,
-) -> Option<AddressSpacePublication> {
-    publish_address_space_with_layout(mm, fence, ttbr0, ttbr1, 0, 0)
+/// `RLIMIT_AS` (capped by the container memory budget) and `RLIMIT_DATA`
+/// soft limits in bytes, `u64::MAX` for infinity, as a reservation root
+/// compares its whole mm against them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservationLimits {
+    pub address: u64,
+    pub data: u64,
+}
+
+impl ReservationLimits {
+    /// The soft limits, the address limit capped by `task`'s container budget.
+    pub fn new(address_soft: u64, data_soft: u64, task: Option<&crate::kernel::TaskRef>) -> Self {
+        let budget = task
+            .and_then(|task| task.container().budget().cloned())
+            .and_then(|budget| budget.max_memory_limit());
+        Self {
+            address: budget.map_or(address_soft, |max| address_soft.min(max)),
+            data: data_soft,
+        }
+    }
+
+    pub fn of_task(
+        rlimits: &crate::kernel::RlimitSet,
+        task: Option<&crate::kernel::TaskRef>,
+    ) -> Self {
+        Self::new(
+            rlimits.get(carrick_abi::LinuxResource::As).rlim_cur,
+            rlimits.get(carrick_abi::LinuxResource::Data).rlim_cur,
+            task,
+        )
+    }
 }
 
 /// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, with initial
-/// `brk_current` and `mmap_next` layout anchors for guest EL1 to install.
+/// `brk_current` and `mmap_next` layout anchors for guest EL1 to install and
+/// the publishing process's `limits` for its reservation root.
 pub fn publish_address_space_with_layout(
     mm: MmId,
     fence: &MmFence,
@@ -753,6 +775,7 @@ pub fn publish_address_space_with_layout(
     ttbr1: u64,
     brk_current: u64,
     mmap_next: u64,
+    limits: ReservationLimits,
 ) -> Option<AddressSpacePublication> {
     if !switching_enabled() {
         return None;
@@ -768,8 +791,11 @@ pub fn publish_address_space_with_layout(
         fence,
         ttbr0,
         ttbr1,
-        brk_current,
-        mmap_next,
+        Anchors {
+            brk_current,
+            mmap_next,
+            limits,
+        },
     )
 }
 
@@ -781,7 +807,28 @@ fn publish_in(
     ttbr0: u64,
     ttbr1: u64,
 ) -> Option<AddressSpacePublication> {
-    publish_in_with_layout(tables, mm, fence, ttbr0, ttbr1, 0, 0)
+    publish_in_with_layout(
+        tables,
+        mm,
+        fence,
+        ttbr0,
+        ttbr1,
+        Anchors {
+            brk_current: 0,
+            mmap_next: 0,
+            limits: ReservationLimits {
+                address: u64::MAX,
+                data: u64::MAX,
+            },
+        },
+    )
+}
+
+/// Initial layout anchors and limits a publication installs.
+struct Anchors {
+    brk_current: u64,
+    mmap_next: u64,
+    limits: ReservationLimits,
 }
 
 fn publish_in_with_layout(
@@ -790,9 +837,13 @@ fn publish_in_with_layout(
     fence: &MmFence,
     ttbr0: u64,
     ttbr1: u64,
-    brk_current: u64,
-    mmap_next: u64,
+    anchors: Anchors,
 ) -> Option<AddressSpacePublication> {
+    let Anchors {
+        brk_current,
+        mmap_next,
+        limits,
+    } = anchors;
     let spaces = tables.spaces;
     let _serial = SPACES_LOCK.lock();
     if spaces.find(mm.raw()).is_some() {
@@ -827,8 +878,8 @@ fn publish_in_with_layout(
                         } else {
                             brk_current
                         },
-                        address_limit: u64::MAX,
-                        data_limit: u64::MAX,
+                        address_limit: limits.address,
+                        data_limit: limits.data,
                         external_address_bytes: 0,
                         external_data_bytes: 0,
                     },
@@ -881,7 +932,7 @@ impl AddressSpacePublication {
     }
 }
 
-/// [`publish_address_space`] into private tables (VM-free tests).
+/// [`publish_address_space_with_layout`] into private tables (VM-free tests).
 #[cfg(test)]
 fn publish_for_test(
     spaces: &'static AddressSpaces,

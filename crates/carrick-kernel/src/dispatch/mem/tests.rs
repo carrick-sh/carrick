@@ -2277,7 +2277,10 @@ fn mremap_boot_heap_fallback_accepts_live_prefix_and_rejects_hidden_suffix() {
     // Boot publication derives the canonical semantic heap VMA from the live
     // break. Set the fixture's break first instead of mutating `brk_current`
     // behind that authority after publication.
-    dispatcher.mem().lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
+    dispatcher
+        .mem()
+        .lock()
+        .seed_brk_current_for_test(layout.heap_base + (2 * LINUX_PAGE_SIZE));
     dispatcher.set_address_space_regions(vec![ProcMapsEntry {
         start: layout.heap_base,
         end: layout.heap_base + layout.heap_size,
@@ -3428,7 +3431,10 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
     let dispatcher = SyscallDispatcher::new();
     let layout = dispatcher.mem().lock().layout;
     const BOOT: u64 = 0x20_0000_0000;
-    dispatcher.mem().lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
+    dispatcher
+        .mem()
+        .lock()
+        .seed_brk_current_for_test(layout.heap_base + LINUX_PAGE_SIZE);
     dispatcher.set_address_space_regions(vec![
         ProcMapsEntry {
             start: layout.heap_base,
@@ -3524,7 +3530,10 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
 fn core_vma_projection_subtracts_map_fixed_replacement_from_live_heap() {
     let dispatcher = SyscallDispatcher::new();
     let layout = dispatcher.mem().lock().layout;
-    dispatcher.mem().lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
+    dispatcher
+        .mem()
+        .lock()
+        .seed_brk_current_for_test(layout.heap_base + (2 * LINUX_PAGE_SIZE));
     dispatcher.set_address_space_regions(vec![ProcMapsEntry {
         start: layout.heap_base,
         end: layout.heap_base + layout.heap_size,
@@ -3589,7 +3598,10 @@ fn mem_authority_revises_once_per_published_vma_transaction() {
     assert_eq!(dispatcher.mem().vma_revision(), initial);
 
     dispatcher.with_vma_dispatch_for_test(|_vma_dispatch| {
-        dispatcher.mem().lock().brk_current += LINUX_PAGE_SIZE;
+        let authority = dispatcher.mem();
+        let mut mem = authority.lock();
+        let brk = mem.program_break();
+        mem.seed_brk_current_for_test(brk + LINUX_PAGE_SIZE);
     });
     assert_eq!(
         dispatcher.mem().vma_revision(),
@@ -3658,7 +3670,10 @@ fn mem_authority_fork_is_independent_after_one_existing_state_clone() {
     let parent = SyscallDispatcher::new();
     let layout = parent.mem().lock().layout;
     parent.with_vma_dispatch_for_test(|_parent_vma_dispatch| {
-        parent.mem().lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
+        parent
+            .mem()
+            .lock()
+            .seed_brk_current_for_test(layout.heap_base + LINUX_PAGE_SIZE);
     });
     let parent_revision = parent.mem().vma_revision();
     let child = parent.fork_clone_in_process(
@@ -3671,10 +3686,13 @@ fn mem_authority_fork_is_independent_after_one_existing_state_clone() {
     assert!(!std::sync::Arc::ptr_eq(&parent.mem(), &child.mem()));
     assert_eq!(child.mem().vma_revision(), parent_revision);
     child.with_vma_dispatch_for_test(|_child_vma_dispatch| {
-        child.mem().lock().brk_current += LINUX_PAGE_SIZE;
+        let authority = child.mem();
+        let mut mem = authority.lock();
+        let brk = mem.program_break();
+        mem.seed_brk_current_for_test(brk + LINUX_PAGE_SIZE);
     });
     assert_eq!(
-        parent.mem().lock().brk_current,
+        parent.mem().lock().program_break(),
         layout.heap_base + LINUX_PAGE_SIZE
     );
     assert_eq!(parent.mem().vma_revision(), parent_revision);
@@ -4330,7 +4348,7 @@ fn reset_memory_state_on_execve_resets_arenas_and_preserves_auxv_snapshot() {
     {
         let mem_authority_118 = dispatcher.mem();
         let mut mem = mem_authority_118.lock();
-        mem.brk_current = LINUX_HEAP_BASE + 0x21000;
+        mem.seed_brk_current_for_test(LINUX_HEAP_BASE + 0x21000);
         mem.mmap_next = LINUX_MMAP_BASE + 0x8000;
         mem.mmap_writable_high = LINUX_MMAP_BASE + 0x9000;
         free_regions_insert(&mut mem.free_regions, LINUX_MMAP_BASE + 0x1000, 0x1000);
@@ -4341,7 +4359,7 @@ fn reset_memory_state_on_execve_resets_arenas_and_preserves_auxv_snapshot() {
     {
         let mem_authority_119 = dispatcher.mem();
         let mem = mem_authority_119.lock();
-        assert_eq!(mem.brk_current, LINUX_HEAP_BASE);
+        assert_eq!(mem.program_break(), LINUX_HEAP_BASE);
         assert_eq!(mem.mmap_next, LINUX_MMAP_BASE);
         assert_eq!(mem.mmap_writable_high, LINUX_MMAP_BASE);
         assert!(mem.free_regions.is_empty());
@@ -5091,7 +5109,7 @@ fn data_va_bytes_counts_only_private_writable_mappings_and_the_heap() {
         false,
         ProcMapSharing::Private,
     ));
-    mem.brk_current = mem.layout.heap_base + 2 * LINUX_PAGE_SIZE;
+    mem.seed_brk_current_for_test(mem.layout.heap_base + 2 * LINUX_PAGE_SIZE);
 
     assert_eq!(data_va_bytes(&mem), 5 * LINUX_PAGE_SIZE);
     assert_eq!(committed_va_bytes(&mem), 7 * LINUX_PAGE_SIZE);

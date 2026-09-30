@@ -30,6 +30,10 @@ pub struct PreparedReservationSession {
 pub(in crate::dispatch) struct ReservationProviderSlot {
     published: bool,
     provider: Option<Arc<dyn HostReservationProvider>>,
+    /// Serializes every host venue of THIS MM's root. The root lock is a
+    /// bounded try-lock sized for EL1 critical sections; two host threads of
+    /// one MM must queue here instead of refusing each other with `Busy`.
+    host_serial: Arc<parking_lot::Mutex<()>>,
 }
 
 impl ReservationProviderSlot {
@@ -37,7 +41,51 @@ impl ReservationProviderSlot {
         Self {
             published: false,
             provider: self.provider.clone(),
+            // A successor MM has its own root, hence its own host queue.
+            host_serial: Arc::default(),
         }
+    }
+}
+
+/// The exact root that owns a delegated MM's program break: the installed
+/// carrier provider, this MM's key and its host queue. Minted only from the
+/// MM's own authority, so it cannot name a sibling's or a successor's root.
+#[derive(Clone)]
+pub(in crate::dispatch) struct DelegatedBreak {
+    provider: Arc<dyn HostReservationProvider>,
+    host_serial: Arc<parking_lot::Mutex<()>>,
+    mm: ReservationMm,
+}
+
+impl DelegatedBreak {
+    /// One host-venue step on the exact admitted root. The root guard lives
+    /// only for `step`: no host backend service ever runs under it.
+    pub(in crate::dispatch) fn with_root<R>(
+        &self,
+        step: impl FnOnce(&mut Reservations<'_>) -> Result<R, Refusal>,
+    ) -> Result<R, Refusal> {
+        let _host = self.host_serial.lock();
+        let view = self.provider.prepare()?;
+        let mut model = view.lock(self.mm)?;
+        if model.mm() != self.mm || !model.is_admitted() {
+            return Err(Refusal::Stale);
+        }
+        step(&mut model)
+    }
+
+    /// The admission step: the exact published root before it is sealed.
+    #[cfg(test)]
+    pub(in crate::dispatch) fn with_root_for_import<R>(
+        &self,
+        step: impl FnOnce(&mut Reservations<'_>) -> Result<R, Refusal>,
+    ) -> Result<R, Refusal> {
+        let _host = self.host_serial.lock();
+        let view = self.provider.prepare()?;
+        let mut model = view.lock(self.mm)?;
+        if model.mm() != self.mm || model.is_admitted() {
+            return Err(Refusal::Stale);
+        }
+        step(&mut model)
     }
 }
 
@@ -68,6 +116,18 @@ impl DispatchMmAuthority {
         self.reservation_provider.lock().provider.is_some()
     }
 
+    /// The break authority handle for this exact MM's root. Used by root
+    /// admission, which production still refuses (see `BreakAuthority`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::dispatch) fn delegated_break(&self) -> Result<DelegatedBreak, Refusal> {
+        let slot = self.reservation_provider.lock();
+        Ok(DelegatedBreak {
+            provider: slot.provider.clone().ok_or(Refusal::ForeignMapping)?,
+            host_serial: Arc::clone(&slot.host_serial),
+            mm: ReservationMm::new(self.mm_id.raw()).ok_or(Refusal::Invalid)?,
+        })
+    }
+
     pub fn prepare_el1_reservations(&self) -> Result<PreparedReservationSession, Refusal> {
         let provider = self
             .reservation_provider
@@ -92,15 +152,17 @@ impl DispatchMmAuthority {
         if !permit.authorizes(&self.mutation_coordinator, self.mm_id) {
             return Err(Refusal::Stale);
         }
-        let installed = self
-            .reservation_provider
-            .lock()
-            .provider
-            .clone()
-            .ok_or(Refusal::ForeignMapping)?;
+        let (installed, host_serial) = {
+            let slot = self.reservation_provider.lock();
+            (
+                slot.provider.clone().ok_or(Refusal::ForeignMapping)?,
+                Arc::clone(&slot.host_serial),
+            )
+        };
         if !Arc::ptr_eq(&installed, &prepared.provider) {
             return Err(Refusal::Stale);
         }
+        let _host = host_serial.lock();
         let mm = ReservationMm::new(self.mm_id.raw()).ok_or(Refusal::Invalid)?;
         let mut model = prepared.view.lock(mm)?;
         if model.mm() != mm {

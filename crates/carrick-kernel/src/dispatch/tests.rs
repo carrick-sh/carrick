@@ -4853,7 +4853,7 @@ mod hvpatch_in_process_fork_tests {
         assert!(child_context.thread().signal_state().pending().is_empty());
         assert_eq!(child.proc.lock().pdeathsig, 0);
         assert_eq!(child.proc.lock().membarrier_ready, 0);
-        assert_eq!(child.mem().lock().brk_current(), 0x1234_0000);
+        assert_eq!(child.mem().lock().program_break(), 0x1234_0000);
 
         child.captured_file_table().write_open_files().remove(&3);
         child.mem().lock().seed_brk_current_for_test(0x5678_0000);
@@ -4863,7 +4863,7 @@ mod hvpatch_in_process_fork_tests {
                 .read_open_files()
                 .contains_key(&3)
         );
-        assert_eq!(parent.mem().lock().brk_current(), 0x1234_0000);
+        assert_eq!(parent.mem().lock().program_break(), 0x1234_0000);
     }
 
     #[test]
