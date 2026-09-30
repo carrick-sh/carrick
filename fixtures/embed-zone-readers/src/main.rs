@@ -244,6 +244,46 @@ fn check(how: &str, path: &str, got: &[u8], want: &[u8], read_seq: u64) {
         later != snapshot,
         later == want
     );
+    // Per-CPU view: yield between samples so the thread can run on other
+    // vCPUs, and record which CPU saw which bytes at the first wrong record.
+    // A value that follows the CPU names a stale translation on one vCPU; a
+    // value that only changes once names a late store.
+    let mut samples = String::new();
+    for _ in 0..16 {
+        // SAFETY: sched_yield(2) takes no arguments.
+        unsafe { raw_syscall0(124) };
+        let cpu = getcpu();
+        let now: Vec<u8> = got[at..(at + 16).min(got.len())]
+            .iter()
+            // SAFETY: as above.
+            .map(|byte| unsafe { std::ptr::read_volatile(byte) })
+            .collect();
+        samples.push_str(&format!(" cpu{cpu}:{}", u8::from(now == want_record)));
+    }
+    eprintln!(
+        "PERCPU pid={} tid={} {how} {path} at=0x{at:x}{samples}",
+        std::process::id(),
+        tid()
+    );
+}
+
+/// getcpu(2): the CPU this thread is running on.
+fn getcpu() -> u32 {
+    let mut cpu: u32 = u32::MAX;
+    let ret: u64;
+    // SAFETY: getcpu writes one u32 through the first pointer; the others are
+    // NULL, which Linux accepts.
+    unsafe {
+        std::arch::asm!(
+            "svc #0",
+            in("x8") 168u64,
+            inlateout("x0") &mut cpu as *mut u32 as u64 => ret,
+            in("x1") 0u64,
+            in("x2") 0u64,
+            options(nostack)
+        );
+    }
+    if ret == 0 { cpu } else { u32::MAX }
 }
 
 /// read(2) in 4 KiB steps, or pread(2) in 8 KiB steps, to EOF. Returns the
