@@ -2884,14 +2884,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "frame_inventory_backend_tests::global_frame_allocator_test_lock::LOCK",
-      "fingerprint": "3733301ed62b969ff1a71d81f5a661292521b46329c1fee163ff6f4d540fd28e",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock frame_inventory_backend_tests::global_frame_allocator_test_lock::LOCK in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "global_vcpu_permits::PERMITS",
       "fingerprint": "2cfb6ff6c91d9fc94a3f2455fe2f89e335aaf4a15cb778e7c9a9558e881a25ac",
       "classification": "carrier_infra",
@@ -3107,14 +3099,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs",
-      "symbol": "alias_registry_tests::thread_mapping_desc_from_region_and_fork_inheritance_with_offset::TEST_LOCK",
-      "fingerprint": "36d60d63e84235d3f359fde0e1dff30ca04a9cb2b9cfc10f27ac32471ec98eb3",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock alias_registry_tests::thread_mapping_desc_from_region_and_fork_inheritance_with_offset::TEST_LOCK in crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
       "symbol": "EL1_COUNTERS_HOST_PTR",
       "fingerprint": "74269fd071612aacbfa59305659478ad55c83dcf4d13580c553606ce1913b8f4",
@@ -3152,14 +3136,6 @@
       "fingerprint": "42bf125b1a2036c1901bd98b788faff5653ebe534424c4863eea3ab7f676ee54",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock tag_strip_tests::EXEC_PAYLOAD_ENV_LOCK in crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/task_only_carrier_directory_tests.rs",
-      "symbol": "ALIAS_TEST_LOCK",
-      "fingerprint": "c741dcb695fc184418519e560da921139a25e5c2f67062f61249121b041d414b",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock ALIAS_TEST_LOCK in crates/carrick-vmm-hvf/src/trap/task_only_carrier_directory_tests.rs scoped strictly to test harness execution."
     },
     {
       "kind": "static",
