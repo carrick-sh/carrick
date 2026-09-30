@@ -87,7 +87,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 cpu: &mut sched::HardwareCpu,
                 user: &sched::HardwareUserWord,
             }),
-            ipc::guest_venue().as_ref(),
+            ipc::guest_venue(frame.slot as u32).as_ref(),
             |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
         )
     }

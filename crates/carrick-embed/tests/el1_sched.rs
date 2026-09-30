@@ -374,6 +374,8 @@ fn ipc_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
         (L::ForeignOperation, "foreign_operation"),
         (L::FlagsRefused, "flags_refused"),
         (L::ObjectBusy, "object_busy"),
+        (L::ObjectBusyHost, "object_busy_host"),
+        (L::ObjectBusyEl1, "object_busy_el1"),
         (L::TransferRefused, "transfer_refused"),
         (L::ParkRefused, "park_refused"),
         (L::BrokenFirst, "broken_first"),

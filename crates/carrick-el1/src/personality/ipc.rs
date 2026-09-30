@@ -45,9 +45,9 @@ pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
-    IpcBacking, IpcEventValue, IpcHandback, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken,
-    IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawOfdPin, RawTableId,
-    WriteProgress,
+    IpcBacking, IpcEventValue, IpcHandback, IpcLockHolder, IpcMmKey, IpcObjectHandle, IpcOpKind,
+    IpcOpToken, IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawOfdPin,
+    RawTableId, WriteProgress,
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave, TrapFrame};
@@ -115,14 +115,17 @@ impl IpcTables for MapTables<'_> {
 /// `EL1_IPC_BASE`, once the host authority has published its directory.
 /// Unmapped or unpublished, the attach fails and every call forwards.
 #[cfg(target_os = "none")]
-pub fn guest_venue() -> Option<IpcVenue<'static>> {
+pub fn guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
     static TABLES: GuestTables = GuestTables;
     // Unmapped at stage-2 until the carrier installs it: never touch the
     // window before the host says so.
     if !carrick_el1_abi::ipc_table_map_guest().window_published() {
         return None;
     }
-    let region = carrick_el1_abi::ipc_window_guest()?.attach().ok()?;
+    let region = carrick_el1_abi::ipc_window_guest()?
+        .attach()
+        .ok()?
+        .for_el1_slot(slot);
     Some(IpcVenue {
         region,
         tables: &TABLES,
@@ -131,7 +134,7 @@ pub fn guest_venue() -> Option<IpcVenue<'static>> {
 
 /// Host builds serve no guest: there is no EL1 window to attach.
 #[cfg(not(target_os = "none"))]
-pub fn guest_venue() -> Option<IpcVenue<'static>> {
+pub fn guest_venue(_slot: u32) -> Option<IpcVenue<'static>> {
     None
 }
 
@@ -404,18 +407,21 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 }
             }
         };
-        let mut guard = match region.lock(object, &EL1_WAIT) {
+        // Wait for the object lock's holder (`Finish`), never forward: a
+        // holder's section is short and never waits on this vCPU. A host
+        // thread's takes no guest-progress lock; an EL1 holder that a host
+        // kick stopped mid-section is resumed to completion on its vCPU
+        // (`should_resume_mid_el1`). Giving up turned a transfer that could
+        // complete into a host round trip.
+        let mut guard = match region.lock(object, &Finish) {
             Ok(guard) => guard,
             Err(_) => {
-                return bail(
-                    sched,
-                    frame,
-                    token,
-                    op,
-                    resumed,
-                    venue,
-                    IpcLeave::ObjectBusy,
-                );
+                let why = match region.lock_holder(object) {
+                    Some(IpcLockHolder::Host) => IpcLeave::ObjectBusyHost,
+                    Some(IpcLockHolder::El1 { .. }) => IpcLeave::ObjectBusyEl1,
+                    None => IpcLeave::ObjectBusy,
+                };
+                return bail(sched, frame, token, op, resumed, venue, why);
             }
         };
         let (status, wake) = match transfer(&mut guard, &mut op, &mut copy) {
@@ -1393,6 +1399,59 @@ mod tests {
             backed += usize::from(g.provide_ring_from_stock().unwrap());
         }
         assert_eq!(backed, 1);
+    }
+
+    /// An object lock is held only for short sections that never wait on
+    /// the waiter: a host thread's, or an EL1 holder's that the host resumes
+    /// to completion when a kick lands mid-section. So EL1 waits for the
+    /// holder instead of turning a transfer that can complete into a host
+    /// round trip (`object_busy_el1` in el1_ipc_pairs_blocking, n=8).
+    #[test]
+    fn el1_ipc_io_contended_object_lock_waits_for_its_holder_instead_of_forwarding() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (_r, wfd, object) = w.pipe(t, NONBLOCK);
+        w.mem.map(MM, 0x10000, PAGE);
+        w.mem.write(MM, 0x10000, b"ping");
+        let region = w.region;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let calling = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let calling = &calling;
+            s.spawn(move || {
+                // A holder stopped far longer than any bounded spin: it
+                // releases only well after the call started waiting (the
+                // green result waits for it whatever the timing).
+                let guard = region.lock(object, &HostWait).unwrap();
+                held_tx.send(()).unwrap();
+                while !calling.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+                for _ in 0..50_000_000u64 {
+                    core::hint::spin_loop();
+                }
+                drop(guard);
+            });
+            held_rx.recv().unwrap();
+            calling.store(true, Ordering::Release);
+            assert_eq!(
+                region.lock_holder(object),
+                Some(carrick_el1_abi::ipc::IpcLockHolder::Host)
+            );
+            let mut f = syscall(SYS_WRITE, wfd, 0x10000, 4, A_SVC);
+            assert_eq!(
+                (w.call(&mut f), f.x[0]),
+                (RETURNED, 4),
+                "served once the holder releases"
+            );
+        });
+        assert_eq!(host_calls(&w), 0);
+        assert!(
+            w.counters
+                .ipc_leaves
+                .iter()
+                .all(|n| n.load(Ordering::Relaxed) == 0)
+        );
     }
 
     #[test]
