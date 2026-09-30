@@ -110,6 +110,7 @@ pub mod kernel;
 // graph, never in a host-process global. Rendered docs live in the module
 // itself so its intra-doc links resolve in its own scope.
 pub(crate) mod keyring;
+pub mod mprotect_diag;
 pub mod namespace;
 pub mod network;
 pub mod observe;

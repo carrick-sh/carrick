@@ -3644,6 +3644,7 @@ impl<'a> MemView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let Some(length) = align_up_u64(length, page_size) else {
+                crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::LengthOverflow, || None);
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             match overlaps_clock_stub(address.0, length) {
@@ -3652,6 +3653,7 @@ impl<'a> MemView<'a> {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
             let Ok(len) = usize::try_from(length) else {
+                crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::LengthConversion, || None);
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             // Linux mprotect returns ENOMEM when the range covers unmapped VA
@@ -3700,6 +3702,13 @@ impl<'a> MemView<'a> {
             let incomplete_backend_says_unmapped = !committed_vma_covers_range
                 && !cx.memory.has_complete_mapping_metadata()
                 && cx.memory.read_bytes_raw(address.0, 1).is_err();
+            let hole_site = if metadata_says_unmapped {
+                crate::mprotect_diag::MprotectEnomemSite::RegistryUnmapped
+            } else if incomplete_backend_says_unmapped {
+                crate::mprotect_diag::MprotectEnomemSite::BackendProbeUnmapped
+            } else {
+                crate::mprotect_diag::MprotectEnomemSite::LazyAliasNotCommitted
+            };
             if metadata_says_unmapped
                 || lazy_alias_reservation.is_some()
                 || incomplete_backend_says_unmapped
@@ -3737,6 +3746,7 @@ impl<'a> MemView<'a> {
                         this.mremap_mapping_metadata(cx.memory, address.0, length)
                             .ok()
                     }) else {
+                        crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::LazyAliasNoReservation, || None);
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     let shared = reservation.sharing == ProcMapSharing::Shared;
@@ -3770,7 +3780,12 @@ impl<'a> MemView<'a> {
                             private_file: None,
                             shared_file_alias: None,
                         }))
-                        .map_err(|_| DispatchError::Errno(linux_errno::ENOMEM))?;
+                        .map_err(|error| {
+                            crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::LazyAliasPublish, || {
+                                Some(format!("{error:?}"))
+                            });
+                            DispatchError::Errno(linux_errno::ENOMEM)
+                        })?;
                     return Ok(DispatchOutcome::MapHostAlias {
                         // mprotect answers 0, not the address.
                         success_retval: 0,
@@ -3790,6 +3805,7 @@ impl<'a> MemView<'a> {
                         prot_none: false,
                     });
                 }
+                crate::mprotect_diag::record(hole_site, || None);
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             // A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to
@@ -3868,6 +3884,9 @@ impl<'a> MemView<'a> {
                         %error,
                         "mprotect failed to publish mmap-arena protection"
                     );
+                    crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::ArenaProtectRange, || {
+                        Some(error.to_string())
+                    });
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 // THE SECOND MARK POINT. `mmap` is the first: together they are
@@ -3897,6 +3916,9 @@ impl<'a> MemView<'a> {
                         %error,
                         "mprotect failed to re-arm first-touch residency"
                     );
+                    crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::ArenaFirstTouchRearm, || {
+                        Some(error.to_string())
+                    });
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             } else if mprotect_range_in_identity_image(address.0, length, layout) {
@@ -3910,12 +3932,16 @@ impl<'a> MemView<'a> {
                         cx.raw_args(),
                         "native16k backend protection failure",
                     ));
+                    crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::IdentityProtectRange, || None);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             } else if (this.range_has_host_alias_backing(address.0, length)
                 || cx.memory.supports_concurrent_exec_protection())
-                && cx.memory.protect_range(address.0, len, prot).is_err()
+                && let Err(error) = cx.memory.protect_range(address.0, len, prot)
             {
+                crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::AliasBackingProtectRange, || {
+                    Some(error.to_string())
+                });
                 // HVPatch reaches this branch under the syscall's stage-1
                 // exclusivity/pause; DSR-backed native aliases use their
                 // concurrent host-mapping path. Either backend must fail the
@@ -3928,9 +3954,13 @@ impl<'a> MemView<'a> {
             // whose ordinary mprotect path is host-side-only.
             for (bus_start, bus_end) in bus_faults {
                 let Ok(bus_len) = usize::try_from(bus_end - bus_start) else {
+                    crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::BusFaultReapply, || None);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                if cx.memory.protect_range(bus_start, bus_len, 0).is_err() {
+                if let Err(error) = cx.memory.protect_range(bus_start, bus_len, 0) {
+                    crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::BusFaultReapply, || {
+                        Some(error.to_string())
+                    });
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             }
