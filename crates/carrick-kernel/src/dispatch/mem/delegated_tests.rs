@@ -2232,3 +2232,104 @@ fn mremap_move_with_an_unreclaimable_source_fails_without_a_second_owner() {
         assert_eq!(memory.read_bytes(moved, 4).unwrap(), b"keep");
     }
 }
+
+/// The fixture `el1_delegated_root_concurrent_vma_ops` in miniature: the
+/// pre-fork region, then A (protect the middle, cut its tail), B (punch a
+/// hole), with the protect and unmap served by the guest venue. Every step
+/// must read back from /proc exactly as on a host-setup MM, which is the
+/// Linux answer (adjacent same-flag anonymous VMAs merge).
+#[test]
+fn delegated_served_mprotect_and_munmap_read_back_as_linux_rows() {
+    let arena = |d: &SyscallDispatcher, _: &CountingMmapMemory| {
+        proc_rows(d)
+            .into_iter()
+            .filter(|r| r.start >= LINUX_MMAP_BASE && r.start < LINUX_MMAP_BASE + 64 * PAGE)
+            .map(|r| (r.start, r.end, r.read, r.write, r.execute, r.path))
+            .collect::<Vec<_>>()
+    };
+    let mut twin = Twin::new();
+    let shared = LINUX_MMAP_BASE + 5 * PAGE;
+    let a = shared + 8 * PAGE;
+    let b = a + 8 * PAGE;
+    twin.host_anonymous(shared, 8 * PAGE, RW);
+    for page in 0..8 {
+        twin.touch(shared + page * PAGE);
+    }
+    twin.same("shared", arena);
+    // Protect one page of the pre-fork region and restore it.
+    twin.mprotect(shared + PAGE, PAGE, LINUX_PROT_READ);
+    twin.same("protect shared page", arena);
+    twin.mprotect(shared + PAGE, PAGE, RW);
+    twin.same("restore shared page", arena);
+    assert_eq!(
+        arena(&twin.delegated, &twin.delegated_memory)
+            .iter()
+            .map(|r| (r.0, r.1))
+            .collect::<Vec<_>>(),
+        vec![(shared, shared + 8 * PAGE)],
+        "one merged row after the restore"
+    );
+    twin.host_anonymous(a, 8 * PAGE, RW);
+    twin.same("map A", arena);
+    twin.mprotect(a + 3 * PAGE, 2 * PAGE, LINUX_PROT_READ);
+    twin.same("protect A middle", arena);
+    twin.host_anonymous(b, 4 * PAGE, RW);
+    twin.munmap(b + PAGE, 2 * PAGE);
+    twin.same("hole in B", arena);
+    twin.munmap(a + 7 * PAGE, PAGE);
+    twin.same("unmap A tail", arena);
+    twin.mprotect(shared + 2 * PAGE, PAGE, LINUX_PROT_READ);
+    twin.same("protect shared page again", arena);
+    twin.mprotect(shared + 2 * PAGE, PAGE, RW);
+    twin.same("restore shared page again", arena);
+}
+
+/// After a fork both MMs see the pre-fork region: an mprotect and restore of
+/// one page must leave ONE row in the parent (root rows) and in the child
+/// (host-setup rows).
+#[test]
+fn delegated_fork_then_protect_restore_leaves_one_row_in_both_mms() {
+    use carrick_abi::LinuxProtFlags;
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let shared = root
+        .guest_mmap(
+            Placement::Anywhere,
+            8 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    let child_mm = crate::kernel::MmId::from_registry_allocation(
+        std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
+    );
+    let child = dispatcher.mm_authority().fork_private(child_mm);
+    let rows = |regions: Vec<ProcMapsEntry>| {
+        regions
+            .into_iter()
+            .filter(|r| r.start >= shared && r.start < shared + 8 * PAGE)
+            .map(|r| (r.start, r.end))
+            .collect::<Vec<_>>()
+    };
+    let whole = vec![(shared, shared + 8 * PAGE)];
+    assert_eq!(rows(child.lock().proc_regions().unwrap()), whole);
+    for prot in [
+        LinuxProtFlags::READ,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+    ] {
+        child
+            .lock()
+            .set_mapping_prot(shared + PAGE, shared + 2 * PAGE, prot);
+    }
+    assert_eq!(
+        rows(child.lock().proc_regions().unwrap()),
+        whole,
+        "child after protect+restore"
+    );
+    root.guest_mprotect(shared + PAGE, PAGE, READ);
+    root.guest_mprotect(shared + PAGE, PAGE, ReservationProtection::READ_WRITE);
+    assert_eq!(
+        rows(proc_rows(&dispatcher)),
+        whole,
+        "parent after protect+restore"
+    );
+}

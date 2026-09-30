@@ -340,12 +340,25 @@ where
     if nr == 226
         && let Some(zone) = zone.as_ref()
     {
+        let orig_x0 = frame.x[0];
         let mut editor = memory::HardwareAnonymousPermissionEditor;
         match memory::try_serve_mprotect(frame, current_tasks, &zone.tables.spaces, &mut editor) {
             memory::MprotectDisposition::Forward => {}
             memory::MprotectDisposition::Return(result) => {
                 frame.x[0] = result as u64;
                 counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                // A successful narrowing changed the guest's page tables
+                // only. The host's VMA rows (`/proc/self/maps`, fork,
+                // core) must learn it too, exactly as for a retired
+                // `munmap`: hand the call back so the ordinary mutation
+                // route commits the metadata (the hardware edit is
+                // idempotent there). Errors change nothing.
+                if result == 0
+                    && let Some(task) = cur_task
+                {
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    return task.leave_served_with_work();
+                }
                 return Action::Served;
             }
         }
