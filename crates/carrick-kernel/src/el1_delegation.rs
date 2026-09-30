@@ -17,9 +17,9 @@ use crate::kernel::objects::FileDescription;
 use crate::kernel::{FileTableId, RlimitSet};
 
 pub use carrick_el1_abi::{
-    El1TaskId, clear_pending_host_work, get_el1_region_host_ptr, get_orig_arg0,
-    mark_pending_host_work, mark_pending_host_work_all, mark_pending_host_work_for_file_tables,
-    mark_pending_host_work_for_task, record_el1_region_host_ptr, take_served_with_work,
+    El1TaskId, get_el1_region_host_ptr, get_orig_arg0, mark_pending_host_work,
+    mark_pending_host_work_all, mark_pending_host_work_for_file_tables,
+    mark_pending_host_work_for_task, record_el1_region_host_ptr,
     update_current_task_file_table_for_task,
 };
 
@@ -33,6 +33,37 @@ impl From<crate::kernel::ids::TaskId> for El1TaskId {
     fn from(id: crate::kernel::ids::TaskId) -> Self {
         El1TaskId::from_linux_tid(id.raw())
     }
+}
+
+/// Settle the EL1 boundary flags of the vCPU at `slot` as the host takes
+/// it back: consume whether its last syscall was served in EL1 with host
+/// work owed (the return value) and its pending-host-work flag, and deliver
+/// the wakes they stand for. This is the only way the host consumes those
+/// flags: EL1 announces an owed host IPC wake (a pipe/eventfd change with
+/// host subscribers) solely by marking its slot's pending host work, so a
+/// boundary that cleared the flag without draining this kernel's owed-wake
+/// index would leave a host waiter asleep until an unrelated boundary.
+/// Clear first, then drain: a publication after the drain marks pending
+/// host work again for the next boundary.
+pub fn settle_el1_boundary(slot: usize, kernel: &crate::kernel::Kernel) -> bool {
+    let served = carrick_el1_abi::take_served_with_work(slot);
+    let pending = carrick_el1_abi::take_pending_host_work(slot);
+    if served {
+        crate::el1_inotify::deliver_owed_wakes();
+    }
+    if served || pending {
+        kernel.deliver_ipc_host_wakes();
+    }
+    served
+}
+
+/// [`settle_el1_boundary`] for the kernel `dispatcher` serves.
+pub fn settle_el1_boundary_for(
+    slot: usize,
+    dispatcher: &crate::dispatch::SyscallDispatcher,
+) -> bool {
+    let kernel = std::sync::Arc::clone(dispatcher.kernel_binding.read().kernel());
+    settle_el1_boundary(slot, &kernel)
 }
 
 /// Clear the recorded host virtual address of the EL1 kernel aperture.
