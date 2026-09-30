@@ -2053,7 +2053,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2129,
+      "line": 2138,
       "categories": [
         "description_guard"
       ],
@@ -2064,7 +2064,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2157,
+      "line": 2166,
       "categories": [
         "description_guard"
       ],
@@ -2075,7 +2075,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2230,
+      "line": 2239,
       "categories": [
         "description_guard"
       ],

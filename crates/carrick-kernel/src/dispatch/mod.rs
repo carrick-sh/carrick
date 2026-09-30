@@ -1678,10 +1678,14 @@ impl SyscallDispatcher {
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
         let layout = mem.layout;
-        let brk_current = mem.brk_current;
+        let brk_current = mem.brk_current();
         let file_mappings = mem.core_file_mappings.clone();
-        mem.semantic_vmas =
-            mem::semantic_vmas_from_boot_regions(&regions, &file_mappings, layout, brk_current);
+        mem.seed_semantic_vmas(mem::semantic_vmas_from_boot_regions(
+            &regions,
+            &file_mappings,
+            layout,
+            brk_current,
+        ));
         mem.address_space_regions = Some(regions);
     }
 
@@ -1689,10 +1693,11 @@ impl SyscallDispatcher {
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
         let layout = mem.layout;
-        let brk_current = mem.brk_current;
+        let brk_current = mem.brk_current();
         if let Some(regions) = &mem.address_space_regions {
-            mem.semantic_vmas =
+            let vmas =
                 mem::semantic_vmas_from_boot_regions(regions, &mappings, layout, brk_current);
+            mem.seed_semantic_vmas(vmas);
         }
         mem.core_file_mappings = mappings;
     }
@@ -1738,9 +1743,13 @@ impl SyscallDispatcher {
         let mut mem = authority.mem.lock();
         mem.reset_for_execve();
         let layout = mem.layout;
-        let brk_current = mem.brk_current;
-        mem.semantic_vmas =
-            mem::semantic_vmas_from_boot_regions(&regions, &file_mappings, layout, brk_current);
+        let brk_current = mem.brk_current();
+        mem.seed_semantic_vmas(mem::semantic_vmas_from_boot_regions(
+            &regions,
+            &file_mappings,
+            layout,
+            brk_current,
+        ));
         mem.address_space_regions = Some(regions);
         mem.linux_auxv_image = auxv;
         mem.core_file_mappings = file_mappings;
@@ -3018,6 +3027,7 @@ impl SyscallDispatcher {
         let network_model = context.task().net_ns().view().as_ref().clone();
         after_proc_snapshot();
         let mem = self.mem_snapshot();
+        let brk_current = mem.brk_current();
         let mut address_space_regions = mem.address_space_regions;
         if !mem.dynamic_maps.is_empty() {
             match &mut address_space_regions {
@@ -3095,7 +3105,7 @@ impl SyscallDispatcher {
             auxv: mem.linux_auxv_image,
             address_space_regions,
             locked_memory: mem.locked_ranges,
-            brk_current: mem.brk_current,
+            brk_current,
             mmap_next: mem.mmap_next,
             heap_base: mem.layout.heap_base,
             native_guest_va: self.page_geometry().native_geometry().is_some(),

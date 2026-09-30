@@ -906,3 +906,46 @@ fn persistent_worker_invariant_configuration_is_complete_and_audited() {
         .expect("factory audits invariants and mailbox SP before publication");
     assert!(configure < allocate && allocate < audit);
 }
+
+#[test]
+fn reservation_metadata_access_retains_exact_carrier_and_rejects_retirement() {
+    let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+    let start = carrick_el1_abi::EL1_REGION_BASE;
+    let size = carrick_el1_abi::EL1_REGION_SIZE as usize;
+    let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        size,
+        crate::host_mapping::HostMappingKind::PrivateAnon,
+    )
+    .unwrap();
+    let address = host.as_ptr();
+    let mut mapping = mapped_region(start, start + size as u64, start);
+    mapping.host_addr = address;
+    mapping.host_mapping = Some(host);
+    // Host-only fixture: this lease has never been mapped into a real VM.
+    mapping.stage2_lease = Some(GlobalFrameStage2Lease::fixed(start, size as u64));
+    let carrier = std::sync::Arc::new(PersistentCarrierMappings {
+        mappings: TaskMappingIndex::from_region(mapping),
+        custody: std::sync::Arc::clone(&custody),
+        vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
+        fd_ceiling_publisher: parking_lot::Mutex::new(None),
+    });
+    let weak = std::sync::Arc::downgrade(&carrier);
+    let access = crate::metadata_grant::CarrierMetadataAccess::new(carrier.clone())
+        .expect("live carrier must supply reservation metadata access");
+    drop(carrier);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(access.region().unwrap().as_ptr(), address);
+    let generation = custody.live_generation().unwrap();
+    custody.begin_destroy(generation).unwrap();
+    custody.commit_destroy(generation).unwrap();
+    assert!(matches!(
+        access.region(),
+        Err(carrick_el1_abi::MetadataResolutionError::StaleOwner)
+    ));
+    assert!(
+        weak.upgrade().is_some(),
+        "stale access must still retain host backing until dropped"
+    );
+    drop(access);
+    assert!(weak.upgrade().is_none());
+}

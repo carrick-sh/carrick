@@ -1,0 +1,42 @@
+    Blocking waiting for file lock on build directory
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-mem)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 04s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-0e30fc82960c1af7)
+
+running 27 tests
+test dispatch::mem::el1_reservations::tests::reservation_host_failed_import_exposes_no_partial_authority ... ok
+test dispatch::mem::el1_reservations::tests::reservation_host_import_two_mm_observers_share_fault_generation ... ok
+test dispatch::mem::el1_reservations::tests::reservation_legacy_host_authority_refuses_both_mm_admissions ... ok
+test dispatch::mem::el1_reservations::tests::reservation_proc_projection_rejects_a_second_anonymous_owner ... ok
+test dispatch::mem::el1_reservations::tests::reservation_proc_projection_tracks_two_mm_generations_and_rollback ... ok
+test dispatch::mem::el1_reservations::tests::reservation_proc_provider_rejects_wrong_mm_guard_and_wrong_permit ... ok
+test dispatch::mem::tests::lazy_high_va_commit_preserves_shared_reservation_provenance ... ok
+test dispatch::mm_authority::reservation_provider_tests::reservation_provider_installation_is_exact_once_and_prepublication ... ok
+test dispatch::mm_authority::reservation_provider_tests::reservation_provider_survives_fork_rebind_and_exec_staging_without_copying_roots ... ok
+test kernel::continuation::tests::kernel_signal_reservation_is_atomic_across_two_waiters_and_two_instances ... ok
+test kernel::continuation::tests::kernel_signal_reservation_linearizes_disposition_and_mask_changes ... ok
+test kernel::objects::tests::authenticated_commit_rejects_mismatched_reservation_id ... ok
+test kernel::objects::tests::exact_slot_reservation_linear_winner_and_isolation ... ok
+test kernel::objects::tests::reservation_rollback_and_cursor_rewind_on_drop ... ok
+test kernel::operations::exit::tests::child_exit_receipt_uses_parent_committed_during_reservation_wait ... ok
+test kernel::operations::exit::tests::exact_generation_exit_waits_for_reservation_release_and_is_idempotent ... ok
+test kernel::operations::exit::tests::exit_notification_runs_after_reservation_release ... ok
+test kernel::operations::identity::credential_authority_tests::credential_publication_waits_for_task_reservation_without_recapture ... ok
+test kernel::operations::tests::dropped_fork_reservation_restores_identity_claim_counts ... ok
+test kernel::operations::tests::fork_reservation_enforces_rlimit_nproc_per_real_uid ... ok
+test kernel::operations::tests::fork_reservation_stays_undiscoverable_until_backend_commit ... ok
+test kernel::operations::tests::reservation_cannot_cross_kernel_identity ... ok
+test kernel::operations::thread::tests::thread_clone_reservation_keeps_tid_private_until_commit ... ok
+test kernel::operations::thread::tests::thread_reservation_waits_for_an_overlapping_task_transaction ... ok
+test kernel::registry::tests::dropped_reservation_rolls_back_without_publication ... ok
+test network::inzone::tests::explicit_port_reservation_is_visible_to_bind_and_releases_cleanly ... ok
+test network::inzone::tests::listener_reservation_rolls_back_on_drop_and_commits_exactly_once ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 2323 filtered out; finished in 0.05s
+

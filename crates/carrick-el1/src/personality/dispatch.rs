@@ -1,7 +1,6 @@
 //! Linux syscall dispatch and completion mapping.
 use super::{file, inotify, ipc, sched};
 use crate::fault::dispatch_fault;
-#[cfg(target_os = "none")]
 use crate::memory;
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
@@ -16,6 +15,39 @@ use carrick_el1_abi::{
     FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
 use core::sync::atomic::Ordering;
+
+/// T2's SVC integration point. A Work result is an owned continuation, not a
+/// completed syscall and not permission to enter the host syscall dispatcher.
+pub enum AnonymousReservationRoute {
+    Action(Action),
+    Work(memory::PendingReservationSyscall),
+    Unavailable(memory::reservations::Refusal),
+}
+
+pub fn dispatch_anonymous_with_reservations(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current: &CurrentTask,
+    model: &mut memory::reservations::Reservations<'_>,
+) -> AnonymousReservationRoute {
+    match memory::decide_anonymous_syscall(frame, current, model) {
+        memory::ReservationDisposition::Forward => {
+            if let Some(counter) = counters.forwarded.get(frame.x[8] as usize) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            AnonymousReservationRoute::Action(Action::Forward)
+        }
+        memory::ReservationDisposition::Return(result) => {
+            frame.x[0] = result as u64;
+            counters.served[frame.x[8] as usize].fetch_add(1, Ordering::Relaxed);
+            AnonymousReservationRoute::Action(Action::Served)
+        }
+        memory::ReservationDisposition::Work(pending) => AnonymousReservationRoute::Work(pending),
+        memory::ReservationDisposition::Unavailable(reason) => {
+            AnonymousReservationRoute::Unavailable(reason)
+        }
+    }
+}
 
 /// The shared-record layout this image was built against; the image header
 /// points at it and the host refuses an image whose value differs
@@ -215,13 +247,6 @@ where
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }
-        return Action::Forward;
-    }
-
-    // Anonymous brk (214) and mmap (222) stay host-served until EL1
-    // reservations are published to the host's first-touch plan; an EL1-only
-    // reservation has no plan and its first touch is refused as SIGSEGV.
-    if nr == 214 || nr == 222 {
         return Action::Forward;
     }
 
@@ -707,6 +732,63 @@ pub unsafe fn serve_locked_file_op(
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn anonymous_reservation_routing_counts_two_mm_fallback_without_effects() {
+        // Exercise the production dispatcher, not dispatch_syscall's host-only
+        // fallback. Both live tasks deliberately use the same guest addresses.
+        for rounds in [1, 8, 64] {
+            let counters = Counters::default();
+            let tasks = [CurrentTask::new(), CurrentTask::new()];
+            for (slot, task) in tasks.iter().enumerate() {
+                task.set(
+                    carrick_el1_abi::El1TaskId::from_linux_tid(slot as i32 + 1),
+                    1,
+                    slot as u64 + 1,
+                );
+                task.zone_mm.store(slot as u64 + 17, Ordering::Release);
+            }
+            for _ in 0..rounds {
+                for slot in 0..tasks.len() {
+                    for nr in [214, 222] {
+                        let mut frame = TrapFrame {
+                            slot: slot as u64,
+                            ..TrapFrame::default()
+                        };
+                        frame.x[..6].copy_from_slice(&[
+                            0x60_0000_0000,
+                            0x3000,
+                            3,
+                            0x22,
+                            u64::MAX,
+                            0,
+                        ]);
+                        frame.x[8] = nr;
+                        let original = frame.x;
+                        let action = dispatch_syscall_with_regions(
+                            &mut frame,
+                            &counters,
+                            &tasks,
+                            &[],
+                            &[],
+                            &[],
+                            &[],
+                            &InotifyNameCache::new(),
+                            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+                            |_| core::ptr::null_mut(),
+                        );
+                        assert_eq!(action, Action::Forward);
+                        assert_eq!(frame.x, original, "forwarding cannot consume arguments");
+                        assert_eq!(tasks[slot].served_with_work.load(Ordering::Acquire), 0);
+                    }
+                }
+            }
+            for nr in [214, 222] {
+                assert_eq!(counters.forwarded[nr].load(Ordering::Relaxed), 2 * rounds);
+                assert_eq!(counters.served[nr].load(Ordering::Relaxed), 0);
+            }
+        }
+    }
 
     #[test]
     fn allocator_control_requires_test_feature() {

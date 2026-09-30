@@ -60,6 +60,8 @@ use carrick_kernel::run_result::{RunResult, RuntimeError};
 pub mod continuation;
 pub mod executor;
 mod fd_ceiling;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod reservations;
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 

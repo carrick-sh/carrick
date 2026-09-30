@@ -1598,6 +1598,13 @@ pub fn persistent_executor_factory_authority(
 }
 
 impl HvpatchPersistentExecutorFactoryAuthority {
+    /// Retain the exact carrier region and generation for reservation metadata.
+    pub fn reservation_metadata_access(
+        &self,
+    ) -> Option<crate::metadata_grant::CarrierMetadataAccess> {
+        self.spec.reservation_metadata_access()
+    }
+
     /// Publisher for first-root activation. Factory extraction is the point at
     /// which the fixed mappings acquire their carrier-wide Arc owner; callers
     /// register this while the prepared task start gate is still closed.
