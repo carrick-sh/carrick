@@ -3,6 +3,7 @@
 #[cfg(target_os = "none")]
 extern crate alloc as rust_alloc;
 pub mod alloc;
+pub mod cow;
 pub mod fault;
 pub mod lock;
 pub mod memory;

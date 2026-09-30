@@ -20,6 +20,8 @@
 
 #![no_std]
 
+mod cow_grants;
+pub use cow_grants::*;
 mod descriptor_txn;
 pub use descriptor_txn::*;
 mod metadata_extent;
@@ -488,11 +490,14 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
     ];
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
-    while i < facts.len() + DESCRIPTOR_TXN_LAYOUT_FACTS.len() {
+    let txn_end = facts.len() + DESCRIPTOR_TXN_LAYOUT_FACTS.len();
+    while i < txn_end + COW_GRANT_LAYOUT_FACTS.len() {
         let mut word = if i < facts.len() {
             facts[i]
-        } else {
+        } else if i < txn_end {
             DESCRIPTOR_TXN_LAYOUT_FACTS[i - facts.len()]
+        } else {
+            COW_GRANT_LAYOUT_FACTS[i - txn_end]
         };
         let mut b = 0;
         while b < 8 {
@@ -2422,10 +2427,10 @@ pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
 pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 
 pub use carrick_sched_core::{
-    BoundedSpin, Claim, CurrentHandback, Exhausted, Handback, HostClaim, HostPlacement,
-    HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef, SlotDrain, SlotId, SlotState,
-    SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord, WakeRefusal, Waker, ZONE_SLOTS,
-    ZoneRecord, ZoneTables,
+    AddressSpaces, BoundedSpin, Claim, CurrentHandback, ExcludedEditor, Exhausted, Handback,
+    HostClaim, HostPlacement, HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef,
+    SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord,
+    WakeRefusal, Waker, ZONE_SLOTS, ZoneRecord, ZoneTables,
 };
 
 /// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex

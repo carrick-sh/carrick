@@ -4371,6 +4371,13 @@ impl HvfVmState {
         if is_stage1_cow_write_fault(syndrome) {
             let fault_va = strip_pointer_tag(far);
             let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
+            // EL1 found no grant for a fault it could resolve itself: refill
+            // the MM's pool and let EL1 take the retry, with no host COW.
+            if self.task.refill_guest_cow_pool(&custody, fault_va)? {
+                return Ok(carrick_hal::CowFaultResolution::Resolved {
+                    translation: self.translate_va(fault_va),
+                });
+            }
             let resolved = self.task.perform_frame_cow(
                 &custody,
                 fault_va,
@@ -6939,41 +6946,7 @@ impl HvfTaskState {
     }
 
     pub(crate) fn supersede_cow_receipts_for_cow(&self, va: u64, len: u64) {
-        let Some(end) = va.checked_add(len) else {
-            return;
-        };
-        let mut receipts = self.cow_deferred_publications.lock();
-        let mut remaining = Vec::with_capacity(receipts.len());
-        for receipt in receipts.drain(..) {
-            let receipt_end = receipt.va.saturating_add(receipt.len as u64);
-            if receipt_end <= va || receipt.va >= end {
-                remaining.push(receipt);
-                continue;
-            }
-            let overlap_start = receipt.va.max(va);
-            let overlap_end = receipt_end.min(end);
-            if receipt.va < overlap_start
-                && let Ok(prefix) = usize::try_from(overlap_start - receipt.va)
-            {
-                remaining.push(PendingFrameCowPublication {
-                    va: receipt.va,
-                    len: prefix,
-                    expected_ipa: receipt.expected_ipa,
-                });
-            }
-            if overlap_end < receipt_end
-                && let Ok(suffix) = usize::try_from(receipt_end - overlap_end)
-                && let Some(expected_ipa) =
-                    receipt.expected_ipa.checked_add(overlap_end - receipt.va)
-            {
-                remaining.push(PendingFrameCowPublication {
-                    va: overlap_end,
-                    len: suffix,
-                    expected_ipa,
-                });
-            }
-        }
-        *receipts = remaining;
+        supersede_cow_receipts_in(&self.cow_deferred_publications, va, len);
     }
 
     pub(crate) fn retire_stage2_extent_for_cow(
@@ -7037,6 +7010,49 @@ pub(crate) enum ProjectedForkSpan {
 
 /// Intersect one VMM mapping's semantic span with the fork projection.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Void the parts of every deferred COW publication receipt that `[va,
+/// va + len)` repointed: they name the owner the span no longer maps.
+pub(crate) fn supersede_cow_receipts_in(
+    receipts: &parking_lot::Mutex<Vec<PendingFrameCowPublication>>,
+    va: u64,
+    len: u64,
+) {
+    let Some(end) = va.checked_add(len) else {
+        return;
+    };
+    let mut receipts = receipts.lock();
+    let mut remaining = Vec::with_capacity(receipts.len());
+    for receipt in receipts.drain(..) {
+        let receipt_end = receipt.va.saturating_add(receipt.len as u64);
+        if receipt_end <= va || receipt.va >= end {
+            remaining.push(receipt);
+            continue;
+        }
+        let overlap_start = receipt.va.max(va);
+        let overlap_end = receipt_end.min(end);
+        if receipt.va < overlap_start
+            && let Ok(prefix) = usize::try_from(overlap_start - receipt.va)
+        {
+            remaining.push(PendingFrameCowPublication {
+                va: receipt.va,
+                len: prefix,
+                expected_ipa: receipt.expected_ipa,
+            });
+        }
+        if overlap_end < receipt_end
+            && let Ok(suffix) = usize::try_from(receipt_end - overlap_end)
+            && let Some(expected_ipa) = receipt.expected_ipa.checked_add(overlap_end - receipt.va)
+        {
+            remaining.push(PendingFrameCowPublication {
+                va: overlap_end,
+                len: suffix,
+                expected_ipa,
+            });
+        }
+    }
+    *receipts = remaining;
+}
+
 pub(crate) fn projected_fork_span(
     ranges: &[carrick_hal::ForkProjectionRange],
     start: u64,

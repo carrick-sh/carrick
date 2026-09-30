@@ -739,6 +739,11 @@ impl HvpatchRuntimeDirectory {
         carrick_kernel::el1_zone::enable(
             carrick_vmm_hvf::gic::interrupt_model() == carrick_vmm_hvf::gic::InterruptModel::Gic,
         );
+        // Every host exclusion of a published MM's EL1 editor settles the
+        // guest COW completions EL1 recorded for it (see `guest_cow`).
+        carrick_kernel::kernel::mm_occupancy::install_guest_cow_settlement(
+            authority.guest_cow_settlement(),
+        );
         carrick_kernel::el1_zone::register_slot_kicker(Box::new(|slot| {
             carrick_vmm_hvf::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
         }));
@@ -2018,5 +2023,30 @@ mod tests {
         ));
         let log = String::from_utf8(log.lock().clone()).expect("UTF-8 trace");
         assert!(!log.contains("child exit notification dropped"), "{log}");
+    }
+}
+
+#[cfg(test)]
+mod guest_cow_wiring_tests {
+    /// Guest EL1 COW completions are settled by the host exclusions of an
+    /// MM's editor only if the carrier installed its settlement before any
+    /// executor can run a guest thread (and so before EL1 can complete a
+    /// COW the host would then touch unsettled).
+    #[test]
+    fn the_carrier_installs_guest_cow_settlement_before_executors_start() {
+        let source = include_str!("wait_wake.rs");
+        let start = source
+            .split("pub(crate) fn start_persistent_pool")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }\n").next())
+            .expect("start_persistent_pool");
+        let install = start
+            .find("install_guest_cow_settlement(")
+            .expect("the carrier installs its guest COW settlement");
+        let executors = start
+            .find("executor::ExecutorPool::start(")
+            .expect("executor pool start");
+        assert!(install < executors, "installed before any executor runs");
+        assert!(start[..install].contains("el1_region_host_ptr"));
     }
 }
