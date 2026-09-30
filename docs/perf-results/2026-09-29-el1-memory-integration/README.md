@@ -65,3 +65,14 @@ policy: legacy MemState admission still refuses a second anonymous owner.
 The signed first-touch regression is next. The reservation branch's earlier
 active-target fixture race, full source review, inventory reconciliation and
 full acceptance remain open.
+
+Signed first-touch regression passes on 96e912e6a, run
+el1-reservation-provider-20260929-a, at 256/1024/4096 pages with checked
+parent/child output. Exit counts are 99/106/136; incremental slopes
+0.0046/0.0049 exits per added page. The negative entitlement control passes;
+cleanup records zero remaining processes. Exact tested bytes are preserved
+and independently hashed in provider-preserved.json; manifest and full log
+are provider-signed-artifacts.jsonl and provider-signed.log. This proves the
+joined boot/memory regression only, not anonymous-policy activation or full
+provider operation coverage. Next: convert host copyout publication using
+the existing guest descriptor transaction and authenticated plan/commit split.
