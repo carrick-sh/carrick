@@ -525,6 +525,78 @@ pub(crate) struct CowArmedSpan {
     pub(crate) kernel_only: bool,
 }
 
+/// An armed granule that has not yet been checked against the live stage-1
+/// leaves. It cannot be repointed or disarmed: the one way to a
+/// [`CowArmedSpan`] is [`Self::live`], which drops every page whose leaf
+/// names a frame other than the faulting page's.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArmedSpanCandidate(CowArmedSpan);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ArmedSpanCandidate {
+    pub(crate) fn executable(&self) -> bool {
+        self.0.executable
+    }
+
+    /// The span one COW at `va` may repoint: the largest run of 4 KiB pages
+    /// of the candidate, containing `va`, whose retained stage-1 output keeps
+    /// the exact affine relation to `va`'s output. A page with no leaf at all
+    /// cannot contradict it and stays in the span (its descriptor is
+    /// preserved invalid by the repoint). `retained_output` must report the
+    /// output of valid and invalid leaves alike. Without a translation for
+    /// `va` itself nothing can be proven and the candidate is returned whole.
+    ///
+    /// Example (4 KiB-aligned region at compound offset 0x1000): the region's
+    /// first eight pages were `MAP_FIXED`-replaced, so the compound at
+    /// 0xC000 holds page 7 on the new frame and pages 8..10 on the old one.
+    /// A write to page 8 must copy and repoint 0xD000..0x10000 only;
+    /// repointing 0xC000 too aimed page 7 at a copy of the old frame's page
+    /// and the guest read bytes from before the replacement.
+    pub(crate) fn live(
+        self,
+        va: u64,
+        mut retained_output: impl FnMut(u64) -> Option<u64>,
+    ) -> CowArmedSpan {
+        const PAGE: u64 = CowArmedRanges::PAGE_SIZE;
+        let span = self.0;
+        let span_end = span.va.saturating_add(span.len as u64);
+        let page = va & !(PAGE - 1);
+        let Some(anchor) = retained_output(page) else {
+            return span;
+        };
+        let anchor = anchor & !(PAGE - 1);
+        let mut same_frame = |candidate: u64| -> bool {
+            let expected = if candidate >= page {
+                anchor.checked_add(candidate - page)
+            } else {
+                anchor.checked_sub(page - candidate)
+            };
+            match retained_output(candidate) {
+                None => true,
+                Some(output) => expected == Some(output & !(PAGE - 1)),
+            }
+        };
+        let first = span.va & !(PAGE - 1);
+        let mut start = page;
+        while start > first && same_frame(start - PAGE) {
+            start -= PAGE;
+        }
+        let mut end = page.saturating_add(PAGE);
+        while end < span_end && same_frame(end) {
+            end = end.saturating_add(PAGE);
+        }
+        let start = start.max(span.va);
+        let end = end.min(span_end);
+        CowArmedSpan {
+            va: start,
+            len: usize::try_from(end.saturating_sub(start)).unwrap_or_default(),
+            executable: span.executable,
+            kernel_only: span.kernel_only,
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CowArmedRanges {
@@ -561,7 +633,12 @@ impl CowArmedRanges {
         self.ranges = snapshot;
     }
 
-    pub(crate) fn span_for(&self, va: u64) -> Option<CowArmedSpan> {
+    /// The armed granule around `va`, clipped to its arm. This is only a
+    /// candidate: an arm is VA metadata, and a later mapping may have put a
+    /// different frame under part of the granule (a `MAP_FIXED` that ends
+    /// mid-compound keeps the compound's arm for its surviving pages). Only
+    /// [`ArmedSpanCandidate::live`] turns it into the span a COW may repoint.
+    pub(crate) fn span_for(&self, va: u64) -> Option<ArmedSpanCandidate> {
         // A boot arena row can remain as a broad structural mapping while
         // exact post-COW/post-unmap alias fragments overlap it. The live
         // stage-1 leaf belongs to the most-specific fragment: greatest start,
@@ -603,12 +680,12 @@ impl CowArmedRanges {
         let granule_end = granule_start.checked_add(granule)?;
         let start = range.va.max(granule_start);
         let end = range_end.min(granule_end);
-        Some(CowArmedSpan {
+        Some(ArmedSpanCandidate(CowArmedSpan {
             va: start,
             len: usize::try_from(end.checked_sub(start)?).ok()?,
             executable: range.executable,
             kernel_only: range.kernel_only,
-        })
+        }))
     }
 
     /// The lowest armed range start strictly above `va`, so an unarmed write

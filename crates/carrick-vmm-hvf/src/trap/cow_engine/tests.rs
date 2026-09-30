@@ -1022,3 +1022,84 @@ fn host_cow_is_split_by_admission_order_and_by_lane() {
         "guest-lane host COWs are apart from host_cow_resolutions"
     );
 }
+
+/// Signed witness `el1_delegated_root_map_fixed_over_cow_pages`, round 1: a
+/// 4 KiB-aligned region at host-compound offset 0x1000 whose first eight
+/// pages were `MAP_FIXED`-replaced after a fork. The compound at +0x7000
+/// (region pages 7..10) then holds page 7 on the replacement frame and
+/// pages 8..10 on the old, still fork-armed frame, and the unmap kept the
+/// compound's arm for its surviving pages. A write to page 8 must copy and
+/// repoint pages 8..10 only. Repointing page 7 as well aimed it at a copy
+/// of the OLD frame's page 7, so the guest read bytes from before the
+/// replacement (`got=pattern(round=0,page=7)`) and the parent's own write
+/// to page 7 vanished.
+#[test]
+fn frame_cow_repoints_only_pages_that_name_the_faulting_frame() {
+    use super::*;
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    const PAGE: u64 = 0x1000;
+    let base = 0x6000_0000_5000_u64;
+    let old_frame = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+    let replacement = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x80_0000;
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
+        carrick_mem::memory::stage1_hvpatch_page_tables(),
+        carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    // The original 64-page region: semantic IPA at compound offset 0x1000.
+    tables
+        .map_aliased(base, old_frame + PAGE, 64 * PAGE, false, None)
+        .expect("map the original region");
+    // The MAP_FIXED replacement of pages 0..8 on its own frame.
+    tables
+        .map_aliased(base, replacement + PAGE, 8 * PAGE, false, None)
+        .expect("map the replacement");
+    let task = HvfTaskState::neutral();
+    task.page_tables_authority().set_manager(tables);
+    // The arm the unmap left behind still covers the replaced pages.
+    task.cow_armed
+        .lock()
+        .arm(&[carrick_aarch64::vmm::ForkCowRange {
+            va: base,
+            len: (64 * PAGE) as usize,
+            executable: false,
+            kernel_only: false,
+            granule: carrick_aarch64::vmm::CowGranule::Compound,
+        }]);
+
+    let page = |index: u64| base + index * PAGE;
+    let repoint = |fault: u64| {
+        let candidate = task.cow_armed.lock().span_for(fault).expect("armed");
+        task.live_cow_span(candidate, fault)
+    };
+    assert_eq!(
+        repoint(page(8)),
+        CowArmedSpan {
+            va: page(8),
+            len: (3 * PAGE) as usize,
+            executable: false,
+            kernel_only: false,
+        },
+        "a COW of the old frame must not repoint page 7, which names the replacement"
+    );
+    assert_eq!(
+        repoint(page(7)),
+        CowArmedSpan {
+            va: page(7),
+            len: PAGE as usize,
+            executable: false,
+            kernel_only: false,
+        },
+        "a COW of the replacement must not repoint pages 8..10 of the old frame"
+    );
+    // A compound wholly on one frame is still repointed whole.
+    assert_eq!(
+        repoint(page(12)),
+        CowArmedSpan {
+            va: page(11),
+            len: (4 * PAGE) as usize,
+            executable: false,
+            kernel_only: false,
+        },
+    );
+}

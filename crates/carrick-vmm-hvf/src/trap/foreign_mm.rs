@@ -1935,69 +1935,81 @@ pub(crate) fn perform_foreign_cow_transaction(
             executable: true,
             kernel_only: false,
         },
-        None => match lease.state.cow_armed.lock().span_for(va.raw()) {
-            Some(span) => span,
-            None => {
-                let deferred = lease
-                    .state
-                    .deferred_anonymous
-                    .read()
-                    .as_ref()
-                    .filter(|(mm, _)| *mm == requested.mm)
-                    .map(|(_, state)| std::sync::Arc::clone(state));
-                if let Some(deferred) = deferred.as_ref()
-                    && deferred.covers_pristine(va, len)
-                {
-                    return materialize_foreign_pristine_write(
-                        lease,
-                        lease_guard,
-                        invalidator,
-                        invocation,
-                        requested,
-                        ForeignWriteRequest {
-                            va,
-                            len,
-                            deadline,
-                            deferred: std::sync::Arc::clone(deferred),
-                        },
-                    );
-                }
-                if let Some(deferred) = deferred.as_ref()
-                    && deferred.covers_private_file(va, len)
-                {
-                    return materialize_foreign_private_file_write(
-                        lease,
-                        lease_guard,
-                        invalidator,
-                        invocation,
-                        requested,
-                        ForeignWriteRequest {
-                            va,
-                            len,
-                            deadline,
-                            deferred: std::sync::Arc::clone(deferred),
-                        },
-                    );
-                }
-                // Not COW-armed: the page is already PRIVATE to this mm — one
-                // the target wrote or mapped after fork, so there is nothing
-                // to copy. `process_vm_writev` into a forked child's own
-                // buffer lands exactly here. Write authority is attested
-                // against the live stage-1 translation instead: the identity
-                // lane below mints a receipt referencing the EXISTING
-                // compound, and the prepared write commits into the live
-                // owner pages the guest itself already writes.
-                return attest_foreign_identity_write_receipt(
-                    lease,
-                    lease_guard,
-                    requested,
-                    &runtime,
-                    va,
-                    len,
+        None => {
+            // Take the candidate and release the arm lock before walking the
+            // page tables.
+            let candidate = lease.state.cow_armed.lock().span_for(va.raw());
+            match candidate {
+                Some(candidate) => lease.state.page_tables_authority().try_with_manager_until(
                     deadline,
-                );
+                    carrick_hal::ForeignMmTransportError::TimedOut,
+                    carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
+                    |tables| {
+                        Ok(candidate.live(va.raw(), |page| tables.translate_retained_output(page)))
+                    },
+                )?,
+                None => {
+                    let deferred = lease
+                        .state
+                        .deferred_anonymous
+                        .read()
+                        .as_ref()
+                        .filter(|(mm, _)| *mm == requested.mm)
+                        .map(|(_, state)| std::sync::Arc::clone(state));
+                    if let Some(deferred) = deferred.as_ref()
+                        && deferred.covers_pristine(va, len)
+                    {
+                        return materialize_foreign_pristine_write(
+                            lease,
+                            lease_guard,
+                            invalidator,
+                            invocation,
+                            requested,
+                            ForeignWriteRequest {
+                                va,
+                                len,
+                                deadline,
+                                deferred: std::sync::Arc::clone(deferred),
+                            },
+                        );
+                    }
+                    if let Some(deferred) = deferred.as_ref()
+                        && deferred.covers_private_file(va, len)
+                    {
+                        return materialize_foreign_private_file_write(
+                            lease,
+                            lease_guard,
+                            invalidator,
+                            invocation,
+                            requested,
+                            ForeignWriteRequest {
+                                va,
+                                len,
+                                deadline,
+                                deferred: std::sync::Arc::clone(deferred),
+                            },
+                        );
+                    }
+                    // Not COW-armed: the page is already PRIVATE to this mm — one
+                    // the target wrote or mapped after fork, so there is nothing
+                    // to copy. `process_vm_writev` into a forked child's own
+                    // buffer lands exactly here. Write authority is attested
+                    // against the live stage-1 translation instead: the identity
+                    // lane below mints a receipt referencing the EXISTING
+                    // compound, and the prepared write commits into the live
+                    // owner pages the guest itself already writes.
+                    return attest_foreign_identity_write_receipt(
+                        lease,
+                        lease_guard,
+                        requested,
+                        &runtime,
+                        va,
+                        len,
+                        deadline,
+                    );
+                }
             }
-        },
+        }
     };
     let span_end = span
         .va

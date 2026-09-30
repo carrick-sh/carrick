@@ -3026,7 +3026,7 @@ impl HvfTaskState {
         // proportional to the mm's armed range count — to serve one boolean
         // and two diagnostics. A fork arms every private writable range, so
         // the clone grew with the very thing the faults are resolving.
-        let (span, armed_is_empty, armed_len) = {
+        let (candidate, armed_is_empty, armed_len) = {
             let cow_armed = self.cow_armed.lock();
             (
                 cow_armed.span_for(fault_va),
@@ -3034,6 +3034,7 @@ impl HvfTaskState {
                 cow_armed.ranges.len(),
             )
         };
+        let span = candidate.map(|candidate| self.live_cow_span(candidate, fault_va));
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
             let write_denied = self.protections.range_write_denied(fault_va, 1);
@@ -4499,15 +4500,19 @@ impl HvfVmState {
         let mut current = start;
         let mut stalled: Option<(u64, u32)> = None;
         while current < end {
-            let (armed_span_end, next_armed_start) = {
+            let (candidate, next_armed_start) = {
                 let cow_armed = self.cow_armed.lock();
                 (
-                    cow_armed
-                        .span_for(current)
-                        .map(|span| span.va.saturating_add(span.len as u64)),
+                    cow_armed.span_for(current),
                     cow_armed.next_armed_start_after(current),
                 )
             };
+            // The live span, not the armed granule: a page past it names
+            // another frame and is routed on its own next iteration.
+            let armed_span_end = candidate.map(|candidate| {
+                let span = self.task.live_cow_span(candidate, current);
+                span.va.saturating_add(span.len as u64)
+            });
             let armed = armed_span_end.is_some();
             let (retained_output_has_no_physical_source, retained_output_source_is_shared) =
                 if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
@@ -6773,6 +6778,18 @@ impl HvfTaskState {
                 .release_structural_owner_at(base, TWO_MIB as usize);
         }
         Ok(())
+    }
+
+    /// Restrict an armed granule to the pages that still name the faulting
+    /// page's frame in this MM's live stage-1 (see
+    /// [`ArmedSpanCandidate::live`]). Call without holding `cow_armed`.
+    pub(crate) fn live_cow_span(&self, candidate: ArmedSpanCandidate, va: u64) -> CowArmedSpan {
+        let page_tables = self.page_tables_authority();
+        page_tables
+            .with_manager(|manager| {
+                candidate.live(va, |page| manager.translate_retained_output(page))
+            })
+            .unwrap_or_else(|| candidate.live(va, |_| None))
     }
 
     pub(crate) fn translate_va_for_cow(&self, va: u64) -> Option<u64> {

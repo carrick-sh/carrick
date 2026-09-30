@@ -414,7 +414,7 @@ fn settle_one(
     let span = CowArmedSpan {
         va: completion.span_va,
         len: span_len,
-        executable: armed.executable,
+        executable: armed.executable(),
         kernel_only: false,
     };
 
