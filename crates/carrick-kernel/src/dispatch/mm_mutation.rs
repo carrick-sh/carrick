@@ -210,6 +210,9 @@ pub struct MmMutationGuard<'authority> {
     _el1_editor: Option<crate::kernel::mm_occupancy::El1EditorExclusion>,
     /// The executor arm owns the exact-MM pause for the whole mutation.
     _stage1: Option<super::mm_quiesce::MmStage1Authority<'authority>>,
+    /// The syscall's own vCPU, lent by the runtime for this mutation scope so
+    /// a guest-owned target publishes through EL1 under this guard's pause.
+    caller_el1: Option<&'authority mut dyn carrick_guest_mem::CallerEl1Call>,
     _authority: PhantomData<&'authority mut ()>,
 }
 
@@ -303,6 +306,16 @@ impl carrick_hal::ForeignMmInvalidator for MmMutationGuard<'_> {
             .publish_foreign_cow_invalidation(binding)
             .map_err(|_| carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
     }
+
+    fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
+        // Only the exact-target foreign arm holds the pause EL1's host
+        // custody drain requires.
+        self.foreign_authority.as_ref()?;
+        match self.caller_el1.as_mut() {
+            Some(caller) => Some(&mut **caller),
+            None => None,
+        }
+    }
 }
 
 /// Sealed exact-target binding installed alongside the foreign-MM carrier
@@ -356,6 +369,17 @@ impl ForeignMmMutationAuthority {
         tid: carrick_hal::ThreadId,
         operation: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
     ) -> Result<T, ForeignMmMutationError> {
+        self.with_guard_lending(tid, None, operation)
+    }
+
+    /// [`Self::with_guard`], lending the syscall's own vCPU to the guard for
+    /// exactly this mutation so a guest-owned target can publish through EL1.
+    pub fn with_guard_lending<T>(
+        &self,
+        tid: carrick_hal::ThreadId,
+        caller_el1: Option<&mut dyn carrick_guest_mem::CallerEl1Call>,
+        operation: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
+    ) -> Result<T, ForeignMmMutationError> {
         let mut authority = super::mm_quiesce::acquire_foreign_mm_mutation_quiesce(
             &self.pt_quiesce,
             self.mm,
@@ -368,8 +392,16 @@ impl ForeignMmMutationAuthority {
             super::mm_quiesce::PtPauseError::TimedOut => ForeignMmMutationError::TimedOut,
         })?;
         let mut mutation = from_frame_cow(&mut authority);
+        mutation.caller_el1 = caller_el1.map(shorten_caller_el1);
         Ok(operation(&mut mutation))
     }
+}
+
+/// Scope a lent caller vCPU to the guard's own borrow.
+fn shorten_caller_el1<'short>(
+    caller: &'short mut (dyn carrick_guest_mem::CallerEl1Call + '_),
+) -> &'short mut (dyn carrick_guest_mem::CallerEl1Call + 'short) {
+    caller
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -396,6 +428,7 @@ pub fn from_pt_pause<'authority>(
         foreign_authority: None,
         _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _stage1: None,
+        caller_el1: None,
         _authority: PhantomData,
     }
 }
@@ -417,6 +450,7 @@ pub fn from_sole_executor<'authority>(
         foreign_authority: None,
         _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _stage1: None,
+        caller_el1: None,
         _authority: PhantomData,
     }
 }
@@ -440,6 +474,7 @@ pub fn from_executor<'authority>(
         foreign_authority: None,
         _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _stage1: Some(stage1),
+        caller_el1: None,
         _authority: PhantomData,
     })
 }
@@ -462,6 +497,7 @@ pub(crate) fn from_frame_cow<'authority>(
         foreign_authority: Some(authority),
         _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _stage1: None,
+        caller_el1: None,
         _authority: PhantomData,
     }
 }

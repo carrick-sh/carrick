@@ -537,13 +537,27 @@ impl MmAccessAuthority {
             &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
         ) -> Result<T, MmAccessError>,
     ) -> Result<T, MmAccessError> {
+        self.with_foreign_mutation_lending(mm, tid, None, operation)
+    }
+
+    /// [`Self::with_foreign_mutation`], lending the syscall's own vCPU so a
+    /// guest-owned target publishes through EL1 under the target's pause.
+    pub fn with_foreign_mutation_lending<T>(
+        &self,
+        mm: &ForeignMm,
+        tid: carrick_hal::ThreadId,
+        caller_el1: Option<&mut dyn carrick_guest_mem::CallerEl1Call>,
+        operation: impl FnOnce(
+            &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+        ) -> Result<T, MmAccessError>,
+    ) -> Result<T, MmAccessError> {
         let authority = mm
             .token
             .foreign_mutation
             .as_ref()
             .ok_or(MmAccessError::MissingForeignMutationAuthority(mm.mm_id()))?;
         authority
-            .with_guard(tid, operation)
+            .with_guard_lending(tid, caller_el1, operation)
             .map_err(|error| MmAccessError::ForeignMutation(error.to_string()))?
     }
 
@@ -555,13 +569,27 @@ impl MmAccessAuthority {
             &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
         ) -> Result<T, MmAccessError>,
     ) -> Result<T, MmAccessError> {
+        self.with_current_mutation_lending(mm, tid, None, operation)
+    }
+
+    /// [`Self::with_current_mutation`], lending the syscall's own vCPU (see
+    /// [`Self::with_foreign_mutation_lending`]).
+    pub fn with_current_mutation_lending<T>(
+        &self,
+        mm: &CurrentMm<'_>,
+        tid: carrick_hal::ThreadId,
+        caller_el1: Option<&mut dyn carrick_guest_mem::CallerEl1Call>,
+        operation: impl FnOnce(
+            &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+        ) -> Result<T, MmAccessError>,
+    ) -> Result<T, MmAccessError> {
         let authority = mm
             .token
             .foreign_mutation
             .as_ref()
             .ok_or(MmAccessError::MissingForeignMutationAuthority(mm.mm_id()))?;
         authority
-            .with_guard(tid, operation)
+            .with_guard_lending(tid, caller_el1, operation)
             .map_err(|error| MmAccessError::ForeignMutation(error.to_string()))?
     }
 
@@ -2036,6 +2064,48 @@ mod tests {
 
         assert_eq!(parent_bytes, b"same");
         assert_eq!(&*child_bytes.lock(), b"edit");
+    }
+
+    #[test]
+    fn foreign_cow_scope_lends_the_callers_vcpu_only_when_the_runtime_lent_it() {
+        struct LentVcpu(Vec<u64>);
+        impl carrick_guest_mem::CallerEl1Call for LentVcpu {
+            fn slot(&self) -> Option<usize> {
+                Some(0)
+            }
+            fn drain_foreign(&mut self, mm_key: u64, _ttbr0: u64) -> Result<u64, String> {
+                self.0.push(mm_key);
+                Ok(7)
+            }
+        }
+        let (kernel, root) = bootstrap(31_400);
+        let execution = execution_lease(&root, 140);
+        let (child, _backend, _owner, _bytes, counters) =
+            cow_fixture(&kernel, &root, 31_401, MockCowFault::None);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        with_foreign_mutation(&foreign, |mutation| {
+            let _ = super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range);
+        });
+        assert!(
+            counters.lent_drain_answers.lock().is_empty(),
+            "an unlent scope must not offer the transport a vCPU"
+        );
+        let mut lent = LentVcpu(Vec::new());
+        super::MmAccessAuthority::new()
+            .with_foreign_mutation_lending(
+                &foreign,
+                carrick_hal::ThreadId::synthetic_for_tests(31_402),
+                Some(&mut lent),
+                |mutation| {
+                    let _ = super::MmAccessAuthority::new()
+                        .break_foreign_cow(mutation, &foreign, range);
+                    Ok(())
+                },
+            )
+            .expect("acquire exact target-MM mutation authority");
+        assert_eq!(*counters.lent_drain_answers.lock(), vec![7]);
+        assert_eq!(lent.0, vec![foreign.mm_id().raw()]);
     }
 
     #[test]

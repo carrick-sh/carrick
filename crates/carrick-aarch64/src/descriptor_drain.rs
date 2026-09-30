@@ -79,13 +79,7 @@ pub fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
             .map(|offset| (own + offset) % slots.as_slice().len())
             .find(|&slot| slots.submit(slot, txn))
             .ok_or_else(|| fail("every descriptor slot is busy".to_owned()))?;
-        let mut frame = carrick_el1_abi::TrapFrame {
-            esr: carrick_el1_abi::DESCRIPTOR_DRAIN_ESR,
-            slot: own as u64,
-            ..carrick_el1_abi::TrapFrame::default()
-        };
-        frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM] = txn.id.mm_key.get();
-        frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_TTBR0] = ttbr0;
+        let frame = drain_frame(own, txn.id.mm_key.get(), ttbr0);
         let answered = match venue.drain_call(frame) {
             Ok(answered) => answered,
             Err(error) => {
@@ -130,6 +124,43 @@ pub fn publish_copyout<V: GuestDrainVenue>(
     receipts
         .pop()
         .ok_or_else(|| TrapError::Hypervisor("guest copyout has no verified receipt".to_owned()))
+}
+
+/// The host-driven drain call's frame: drain `mm_key` on the live graph
+/// `ttbr0` names, on `slot`'s EL1 stack.
+pub fn drain_frame(slot: usize, mm_key: u64, ttbr0: u64) -> carrick_el1_abi::TrapFrame {
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: carrick_el1_abi::DESCRIPTOR_DRAIN_ESR,
+        slot: slot as u64,
+        ..carrick_el1_abi::TrapFrame::default()
+    };
+    frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM] = mm_key;
+    frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_TTBR0] = ttbr0;
+    frame
+}
+
+/// Run the host-driven drain for another MM on a borrowed caller vCPU:
+/// `set_ttbr0` installs the target's TTBR0 for exactly the call (EL1's COW
+/// copy window lives in the target's tables) and restores the caller's own.
+/// Failing to restore it is fatal: the vCPU would resume in another MM.
+pub(crate) fn run_foreign_drain_call(
+    slot: usize,
+    mm_key: u64,
+    ttbr0: u64,
+    mut get_ttbr0: impl FnMut() -> Result<u64, TrapError>,
+    mut set_ttbr0: impl FnMut(u64) -> Result<(), TrapError>,
+    run: impl FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<u64, TrapError> {
+    let own = get_ttbr0()?;
+    set_ttbr0(ttbr0)?;
+    let answered = run_drain_call(drain_frame(slot, mm_key, ttbr0), run);
+    if let Err(error) = set_ttbr0(own) {
+        carrick_fatal::carrick_fatal!(
+            "aarch64::descriptor_drain",
+            "restore caller TTBR0 after a foreign descriptor drain: {error}"
+        );
+    }
+    Ok(answered?.x[0])
 }
 
 /// Run the shared descriptor service using an already borrowed driving vCPU.

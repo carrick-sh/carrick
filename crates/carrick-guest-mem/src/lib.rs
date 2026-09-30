@@ -972,6 +972,30 @@ pub trait GuestMemory {
         Ok(())
     }
     fn finish_host_write(&mut self, _ranges: &[HostWriteRange]) {}
+
+    /// The vCPU executing this syscall, lent for a host-driven EL1 descriptor
+    /// drain of ANOTHER address space ([`CallerEl1Call`]). `None` when this
+    /// memory is not backed by a live vCPU with an EL1 slot; guest-owned
+    /// foreign publication then refuses before any mutation.
+    fn caller_el1_call(&mut self) -> Option<&mut dyn CallerEl1Call> {
+        None
+    }
+}
+
+/// The calling vCPU, borrowed for one host-driven EL1 descriptor drain of an
+/// exact other address space while the host holds that space's page-table
+/// pause. Lent only through the syscall's own memory borrow, never retained.
+pub trait CallerEl1Call {
+    /// This vCPU's EL1 slot: its descriptor-slot search starts here and EL1
+    /// runs the call on this slot's stack.
+    fn slot(&self) -> Option<usize>;
+
+    /// Run EL1's host-driven descriptor drain for `mm_key` on this vCPU with
+    /// TTBR0_EL1 = `ttbr0` (the target's root and ASID) installed for exactly
+    /// the call, so EL1's copy window and ASID maintenance address the target.
+    /// The vCPU's own TTBR0 is restored before returning. Returns EL1's
+    /// answer word (applied count, plus the blocked bit).
+    fn drain_foreign(&mut self, mm_key: u64, ttbr0: u64) -> Result<u64, String>;
 }
 
 /// Marker trait for guest memory views that genuinely represent the currently

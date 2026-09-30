@@ -792,19 +792,22 @@ impl<'a> ProcView<'a> {
             .has_deliverable_dispatch_pending_for_wait(context, tid, mask)
     }
 
+    /// Run `op` outside the caller's MM executor participation, lending it
+    /// the syscall's own vCPU for a guest-owned target's EL1 publication.
     #[inline]
     pub(in crate::dispatch) fn with_current_mm_executor_released<M: CurrentMmMemory, T>(
         &self,
         cx: &mut SyscallCtx<'_, M>,
-        op: impl FnOnce() -> T,
+        op: impl FnOnce(Option<&mut dyn carrick_guest_mem::CallerEl1Call>) -> T,
     ) -> Result<T, super::outcome::DispatchError> {
         let mut result = None;
         let mut op_opt = Some(op);
-        self.cross.with_current_mm_executor_released(cx, &mut || {
-            if let Some(f) = op_opt.take() {
-                result = Some(f());
-            }
-        })?;
+        self.cross
+            .with_current_mm_executor_released(cx, &mut |caller| {
+                if let Some(f) = op_opt.take() {
+                    result = Some(f(caller));
+                }
+            })?;
         result.ok_or(super::outcome::DispatchError::MmExecutorParticipationUnavailable)
     }
 
@@ -2747,10 +2750,11 @@ impl<'a> ProcView<'a> {
                                 let Some(authority) = process.mm_access_authority() else {
                                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                                 };
-                                let result = this.with_current_mm_executor_released(cx, || {
+                                let result = this.with_current_mm_executor_released(cx, |caller_el1| {
                                     let mutation = authority.$with_mutation(
                                         &$mm,
                                         mutation_tid,
+                                        caller_el1,
                                         |mutation_guard| -> Result<_, crate::kernel::MmAccessError> {
                                             Ok(if request == LINUX_PTRACE_POKETEXT {
                                             ptrace_witness.with_revalidated_text(
@@ -2821,11 +2825,11 @@ impl<'a> ProcView<'a> {
                                         Ok(Err(errno)) | Err(errno) => DispatchOutcome::errno(errno),
                                     }
                                 } else {
-                                    commit_transport_poke!(current, with_current_mutation)
+                                    commit_transport_poke!(current, with_current_mutation_lending)
                                 }
                             }
                             crate::kernel::MmRelation::Foreign(foreign) => {
-                                commit_transport_poke!(foreign, with_foreign_mutation)
+                                commit_transport_poke!(foreign, with_foreign_mutation_lending)
                             }
                         }
                     }
@@ -4187,8 +4191,8 @@ impl<'a> ProcView<'a> {
                         // Acquire target MM's real mutation authority for the staged compound.
                         // No cx.memory access or allocation occurs while mutation_guard is live.
                         let mutation_tid = cx.tid();
-                        let commit_res = self.with_current_mm_executor_released(cx, || {
-                            authority.with_foreign_mutation(&foreign, mutation_tid, |mutation_guard| {
+                        let commit_res = self.with_current_mm_executor_released(cx, |caller_el1| {
+                            authority.with_foreign_mutation_lending(&foreign, mutation_tid, caller_el1, |mutation_guard| {
                                 let mut witness: Option<crate::kernel::CowBroken<'_, '_, '_>> = None;
                                 let mut committed_chunks = 0usize;
 

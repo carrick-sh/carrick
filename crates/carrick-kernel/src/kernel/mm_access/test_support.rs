@@ -342,6 +342,8 @@ pub struct MockCowCounters {
     pub(crate) commit_calls: Arc<AtomicUsize>,
     caller_occupancy_probe: Arc<parking_lot::Mutex<Option<OccupancyProbe>>>,
     break_observed_caller_executor: Arc<std::sync::atomic::AtomicBool>,
+    /// EL1 drain answers from the caller vCPU the scope lent the transport.
+    pub(crate) lent_drain_answers: Arc<parking_lot::Mutex<Vec<u64>>>,
 }
 
 /// How many vCPU slots the caller's MM occupies, read by a mock transport.
@@ -518,7 +520,7 @@ impl ForeignMmReadLease for MockCowLease {
     fn break_cow(
         &self,
         _invocation: &carrick_hal::ForeignMmInvocation,
-        _invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
+        invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
         snapshot: &dyn ForeignMmSnapshot,
         va: GuestVa,
         len: usize,
@@ -526,6 +528,12 @@ impl ForeignMmReadLease for MockCowLease {
         _deadline: Instant,
     ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
         self.counters.break_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(caller) = invalidator.caller_el1_call() {
+            let answer = caller
+                .drain_foreign(snapshot.mm().raw_for_probe(), 0)
+                .unwrap_or(u64::MAX);
+            self.counters.lent_drain_answers.lock().push(answer);
+        }
         if self
             .counters
             .caller_occupancy_probe
