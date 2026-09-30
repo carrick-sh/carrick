@@ -1015,8 +1015,20 @@ mod tests {
 
     #[test]
     fn serial_host_el1_ipc_pipe_second_description_refusal_rolls_back() {
-        use carrick_el1_abi::ipc::{IPC_OBJECTS, IPC_OFDS, fd, pipe::EventMode};
-        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        use carrick_el1_abi::ipc::{
+            IPC_OBJECT_SEGMENT as IPC_OBJECTS, IPC_OFD_SEGMENT as IPC_OFDS, fd, pipe::EventMode,
+        };
+        // A zone whose file table is one segment of each store.
+        let owner = Arc::new(
+            crate::el1_ipc::HostIpc::with_limits(
+                1 << 20,
+                crate::el1_ipc::IpcLimits {
+                    objects: IPC_OBJECTS,
+                    descriptions: IPC_OFDS,
+                },
+            )
+            .unwrap(),
+        );
         let descriptions: Vec<_> = (0..IPC_OFDS - 1)
             .map(|_| {
                 let token = owner.retain_host_resource(Box::new(())).unwrap();

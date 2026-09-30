@@ -243,7 +243,7 @@ mod tests {
         );
         m.publish_window();
         assert!(m.window_published());
-        let dir_len = core::mem::size_of::<crate::ipc::IpcDirectory>();
+        let dir_len = crate::ipc::IPC_DIRECTORY_BYTES;
         let pool_len = crate::EL1_IPC_POOL_SPAN as usize;
         let dir = unsafe {
             std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(dir_len, 4096).unwrap())

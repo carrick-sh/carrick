@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::{AdmissionError, HostDescriptionFlags, HostDescriptionState, HostIpc};
 use crate::el1_zone::HostLockWait;
-use carrick_el1_abi::ipc::{IPC_OFDS, fd};
+use carrick_el1_abi::ipc::{IPC_MAX_OFDS, fd};
 
 #[derive(Debug)]
 pub struct HostTable {
@@ -106,9 +106,9 @@ impl HostTable {
     }
 
     pub fn exec(&self) -> Result<(), AdmissionError> {
-        // At most IPC_OFDS distinct descriptions can reach their final hold;
+        // At most one final hold per slot, and no more than the zone holds;
         // reserve before entering the core so callbacks never allocate there.
-        let mut retired = Vec::with_capacity(self.capacity.min(IPC_OFDS));
+        let mut retired = Vec::with_capacity(self.capacity.min(IPC_MAX_OFDS));
         self.owner
             .region()
             .fd(HostLockWait)
@@ -128,7 +128,7 @@ impl HostTable {
 
 impl Drop for HostTable {
     fn drop(&mut self) {
-        let mut retired = Vec::with_capacity(self.capacity.min(IPC_OFDS));
+        let mut retired = Vec::with_capacity(self.capacity.min(IPC_MAX_OFDS));
         let extent = self
             .owner
             .region()

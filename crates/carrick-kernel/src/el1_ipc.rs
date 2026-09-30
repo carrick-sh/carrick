@@ -8,7 +8,8 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_el1_abi::ipc::{
-    HostResourceToken, IPC_POOL_ALIGN, IpcDirectory, IpcError, IpcObjectHandle, IpcPipeStorage,
+    HostResourceToken, IPC_DIRECTORY_BYTES, IPC_MAX_OBJECTS, IPC_MAX_OFDS, IPC_OBJECT_SEGMENT,
+    IPC_OFD_SEGMENT, IPC_POOL_ALIGN, IpcDirectory, IpcError, IpcObjectHandle, IpcPipeStorage,
     IpcRegion, IpcReleased, descriptor_extent_bytes, fd, pipe,
 };
 use parking_lot::Mutex;
@@ -126,6 +127,33 @@ impl Pool {
         }
         self.free[order].insert(offset);
     }
+}
+
+/// Zone-wide ceilings of the authority's elastic stores: the zone's file
+/// table limit (`fs.file-max`). Past them creation is ENFILE. Each store
+/// grows a whole segment at a time, so a ceiling is effective rounded down
+/// to its segment (never below the first segment, published at creation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpcLimits {
+    /// Pipe and eventfd objects.
+    pub objects: usize,
+    /// Open file descriptions (pipe/eventfd ends and published host fds).
+    pub descriptions: usize,
+}
+impl IpcLimits {
+    /// The ABI's reservation: the largest zone the window can hold.
+    pub const ZONE: Self = Self {
+        objects: IPC_MAX_OBJECTS,
+        descriptions: IPC_MAX_OFDS,
+    };
+}
+
+/// Records the authority has published by growing its stores (never
+/// shrinks): the elastic-store work receipt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IpcGrowth {
+    pub object_records: usize,
+    pub description_records: usize,
 }
 
 struct HostResources {
@@ -318,7 +346,11 @@ pub struct HostIpc {
     bytes: Mapping,
     pool: Mutex<Pool>,
     resources: Mutex<HostResources>,
+    /// Host wake targets by object index, sized to the highest index used.
     host_wakes: Mutex<Vec<Option<HostWakeEntry>>>,
+    limits: IpcLimits,
+    /// Serializes store growth (the one growth venue) and counts its work.
+    growth: Mutex<IpcGrowth>,
 }
 impl std::fmt::Debug for HostIpc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -347,25 +379,34 @@ impl carrick_el1_abi::IpcWindowBacking for HostIpc {
 }
 
 impl HostIpc {
-    pub const DEFAULT_POOL_BYTES: usize = 128 * 1024 * 1024;
+    pub const DEFAULT_POOL_BYTES: usize = carrick_el1_abi::EL1_IPC_POOL_SPAN as usize;
 
     pub fn new(pool_bytes: usize) -> Result<Self, AdmissionError> {
+        Self::with_limits(pool_bytes, IpcLimits::ZONE)
+    }
+
+    /// An authority whose zone-wide file table stops at `limits` (clamped to
+    /// the ABI's reservation). The directory reserves address space for every
+    /// store's full span; pages are committed only as segments are published.
+    pub fn with_limits(pool_bytes: usize, limits: IpcLimits) -> Result<Self, AdmissionError> {
         if pool_bytes < IPC_POOL_ALIGN as usize || !pool_bytes.is_power_of_two() {
             return Err(AdmissionError::NoMemory);
         }
+        let limits = IpcLimits {
+            objects: limits.objects.min(IPC_MAX_OBJECTS),
+            descriptions: limits.descriptions.min(IPC_MAX_OFDS),
+        };
         let owner = Self {
-            directory: Mapping::new(std::mem::size_of::<IpcDirectory>())?,
+            directory: Mapping::new(IPC_DIRECTORY_BYTES)?,
             bytes: Mapping::new(pool_bytes)?,
             pool: Mutex::new(Pool::new(pool_bytes)),
-            host_wakes: Mutex::new(
-                (0..carrick_el1_abi::ipc::IPC_OBJECTS)
-                    .map(|_| None)
-                    .collect(),
-            ),
+            host_wakes: Mutex::new(Vec::new()),
             resources: Mutex::new(HostResources {
                 next: 1,
                 live: BTreeMap::new(),
             }),
+            limits,
+            growth: Mutex::new(IpcGrowth::default()),
         };
         let identity = NEXT_REGION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -376,12 +417,83 @@ impl HostIpc {
         unsafe {
             IpcRegion::initialize(
                 owner.directory_ptr(),
+                owner.directory_len(),
                 owner.pool_ptr(),
                 pool_bytes,
                 identity,
             )?;
         }
         Ok(owner)
+    }
+
+    /// The zone-wide ceilings this authority grows its stores to.
+    pub fn limits(&self) -> IpcLimits {
+        self.limits
+    }
+
+    /// Records published by store growth so far (the work receipt).
+    pub fn growth(&self) -> IpcGrowth {
+        *self.growth.lock()
+    }
+
+    /// Publish another object segment unless one was published since the
+    /// caller observed `seen` records (then just retry). `ZoneLimit` at the
+    /// configured ceiling. O(segment), under the growth lock only.
+    fn grow_objects(&self, seen: usize) -> Result<(), AdmissionError> {
+        let mut growth = self.growth.lock();
+        let region = self.region();
+        let count = region.object_count();
+        if count != seen {
+            return Ok(());
+        }
+        if count + IPC_OBJECT_SEGMENT > self.limits.objects {
+            return Err(IpcError::ZoneLimit.into());
+        }
+        growth.object_records += region.grow_objects()?;
+        Ok(())
+    }
+
+    /// As [`HostIpc::grow_objects`], for open file descriptions.
+    fn grow_descriptions(&self, seen: usize) -> Result<(), AdmissionError> {
+        let mut growth = self.growth.lock();
+        let region = self.region();
+        let count = region.ofd_count();
+        if count != seen {
+            return Ok(());
+        }
+        if count + IPC_OFD_SEGMENT > self.limits.descriptions {
+            return Err(IpcError::ZoneLimit.into());
+        }
+        growth.description_records += region.grow_ofds()?;
+        Ok(())
+    }
+
+    /// Run `create` until the object store has a free record: an exhausted
+    /// store grows by one segment and the creation retries. Every retry
+    /// follows growth (by this or another creator), so the loop is bounded
+    /// by the zone's ceiling.
+    fn with_object<T>(
+        &self,
+        mut create: impl FnMut(&IpcRegion<'_>) -> Result<T, IpcError>,
+    ) -> Result<T, AdmissionError> {
+        loop {
+            let region = self.region();
+            let seen = region.object_count();
+            match create(&region) {
+                Err(IpcError::NoObjects) => self.grow_objects(seen)?,
+                result => return result.map_err(Into::into),
+            }
+        }
+    }
+
+    fn set_host_wake(&self, object: IpcObjectHandle, target: HostWakeTarget) {
+        let mut wakes = self.host_wakes.lock();
+        let index = object.index() as usize;
+        if index >= wakes.len() {
+            // Amortized: grows with the object store's highest used index.
+            wakes.resize_with(index + 1, || None);
+        }
+        wakes[index] = Some(HostWakeEntry { object, target });
     }
     pub(crate) fn wait_queue(
         self: &std::sync::Arc<Self>,
@@ -409,10 +521,10 @@ impl HostIpc {
             }
             Some(Box::new(subscription))
         }));
-        self.host_wakes.lock()[object.index() as usize] = Some(HostWakeEntry {
+        self.set_host_wake(
             object,
-            target: HostWakeTarget::Queue(std::sync::Arc::downgrade(&queue)),
-        });
+            HostWakeTarget::Queue(std::sync::Arc::downgrade(&queue)),
+        );
         queue
     }
     pub(crate) fn subscribe_host(
@@ -431,13 +543,13 @@ impl HostIpc {
         publisher: &std::sync::Arc<dyn Fn() + Send + Sync>,
         primer: &std::sync::Arc<dyn Fn() + Send + Sync>,
     ) {
-        self.host_wakes.lock()[object.index() as usize] = Some(HostWakeEntry {
+        self.set_host_wake(
             object,
-            target: HostWakeTarget::Publisher {
+            HostWakeTarget::Publisher {
                 wake: std::sync::Arc::downgrade(publisher),
                 prime: std::sync::Arc::downgrade(primer),
             },
-        });
+        );
     }
     /// Deliver guest-produced readiness work by exact object incarnation.
     /// Runtime calls this after returning from EL1; it never scans the pool.
@@ -503,8 +615,15 @@ impl HostIpc {
     /// A view cannot outlive the mappings it borrows.
     pub fn region(&self) -> IpcRegion<'_> {
         // SAFETY: only new() constructs an owner; it initialized both mappings.
-        unsafe { IpcRegion::attach(self.directory_ptr(), self.pool_ptr(), self.pool_len()) }
-            .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("IPC", "corrupt owned IPC region"))
+        unsafe {
+            IpcRegion::attach(
+                self.directory_ptr(),
+                self.directory_len(),
+                self.pool_ptr(),
+                self.pool_len(),
+            )
+        }
+        .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("IPC", "corrupt owned IPC region"))
     }
 
     fn bind_waits(&self, object: IpcObjectHandle) {
@@ -536,24 +655,24 @@ impl HostIpc {
         Ok(storage)
     }
     pub fn create_pipe(&self, capacity: usize) -> Result<IpcObjectHandle, AdmissionError> {
-        let region = self.region();
         let mut storage = None;
-        match region.create_pipe(capacity, &mut storage, &HostLockWait) {
-            Ok(object) => {
-                self.bind_waits(object);
-                return Ok(object);
-            }
-            Err(IpcError::NeedsStorage { ring_bytes, pages }) => {
+        let first =
+            self.with_object(|region| region.create_pipe(capacity, &mut storage, &HostLockWait));
+        let object = match first {
+            Ok(object) => object,
+            Err(AdmissionError::Shared(IpcError::NeedsStorage { ring_bytes, pages })) => {
                 storage = Some(self.provision_pipe(ring_bytes, pages)?);
+                // Provisioning happens after create_pipe released its object lock.
+                let result = self.with_object(|region| {
+                    region.create_pipe(capacity, &mut storage, &HostLockWait)
+                });
+                if let Some(retired_or_unused) = storage {
+                    self.pool.lock().release(retired_or_unused.offset);
+                }
+                result?
             }
-            Err(error) => return Err(error.into()),
-        }
-        // Provisioning happens after create_pipe released its object lock.
-        let result = region.create_pipe(capacity, &mut storage, &HostLockWait);
-        if let Some(retired_or_unused) = storage {
-            self.pool.lock().release(retired_or_unused.offset);
-        }
-        let object = result?;
+            Err(error) => return Err(error),
+        };
         self.bind_waits(object);
         Ok(object)
     }
@@ -562,7 +681,8 @@ impl HostIpc {
         initial: u32,
         mode: pipe::EventMode,
     ) -> Result<IpcObjectHandle, AdmissionError> {
-        let object = self.region().create_eventfd(initial, mode, &HostLockWait)?;
+        let object =
+            self.with_object(|region| region.create_eventfd(initial, mode, &HostLockWait))?;
         self.bind_waits(object);
         Ok(object)
     }
@@ -619,8 +739,17 @@ impl HostIpc {
     pub fn admit_description(
         self: &std::sync::Arc<Self>,
         description: fd::Description,
-    ) -> Result<HostDescription, fd::Error> {
-        let pin = self.region().fd(HostLockWait).create_pinned(description)?;
+    ) -> Result<HostDescription, AdmissionError> {
+        // An exhausted description store grows by one segment and retries
+        // (bounded by the zone's ceiling, as for objects).
+        let pin = loop {
+            let region = self.region();
+            let seen = region.ofd_count();
+            match region.fd(HostLockWait).create_pinned(description) {
+                Err(fd::Error::NeedsOfds) => self.grow_descriptions(seen)?,
+                result => break result?,
+            }
+        };
         Ok(HostDescription {
             flags: std::sync::Arc::new(HostDescriptionFlags {
                 owner: std::sync::Arc::clone(self),
@@ -810,7 +939,12 @@ mod tests {
             assert_eq!(guard.pipe().unwrap().try_write(b"shared").result, Ok(6));
             drop(guard);
             let attached = unsafe {
-                IpcRegion::attach(owner.directory_ptr(), owner.pool_ptr(), owner.pool_len())
+                IpcRegion::attach(
+                    owner.directory_ptr(),
+                    owner.directory_len(),
+                    owner.pool_ptr(),
+                    owner.pool_len(),
+                )
             }
             .expect("second venue");
             let mut bytes = [0; 6];

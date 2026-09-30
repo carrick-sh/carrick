@@ -1324,15 +1324,15 @@ static IPC_WINDOW_BACKING: parking_lot::Mutex<Option<std::sync::Arc<dyn IpcWindo
     parking_lot::Mutex::new(None);
 
 /// Validate a backing against the window's fixed geometry: granule-aligned
-/// host memory, a directory that fits its span, and a pool exactly the ABI's
-/// length. Returns the (directory, pool) mapping lengths.
+/// host memory, a directory mapping that holds every elastic store's
+/// reservation and fits its span, and a pool exactly the ABI's length. Returns the (directory, pool) mapping lengths.
 fn ipc_window_geometry(backing: &dyn IpcWindowBacking) -> Result<(usize, usize), TrapError> {
     let directory_len = backing.directory_len().next_multiple_of(IPC_WINDOW_GRANULE);
     let aligned =
         |ptr: *mut u8| !ptr.is_null() && (ptr as usize).is_multiple_of(IPC_WINDOW_GRANULE);
     if !aligned(backing.directory_ptr())
         || !aligned(backing.pool_ptr())
-        || backing.directory_len() < std::mem::size_of::<carrick_el1_abi::ipc::IpcDirectory>()
+        || backing.directory_len() < carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES
         || directory_len as u64 > carrick_el1_abi::EL1_IPC_DIRECTORY_SPAN
         || backing.pool_len() as u64 != carrick_el1_abi::EL1_IPC_POOL_SPAN
     {
@@ -1510,7 +1510,7 @@ mod ipc_window_tests {
             self.directory
         }
         fn directory_len(&self) -> usize {
-            std::mem::size_of::<carrick_el1_abi::ipc::IpcDirectory>()
+            carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES
         }
         fn pool_ptr(&self) -> *mut u8 {
             self.pool

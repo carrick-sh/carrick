@@ -25,6 +25,12 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: same contract as the caller's.
         unsafe { System.alloc(layout) }
     }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+        // SAFETY: same contract as the caller's. The system allocator keeps
+        // a large zeroed reservation (the directory) lazily committed.
+        unsafe { System.alloc_zeroed(layout) }
+    }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: same contract as the caller's.
         unsafe { System.dealloc(ptr, layout) }
@@ -53,13 +59,21 @@ struct Fixture {
 }
 static IDENTITY: AtomicU64 = AtomicU64::new(0x1_0000);
 
+/// A zeroed directory mapping (lazily committed by the system allocator).
+pub(super) fn zeroed_directory() -> *mut IpcDirectory {
+    let layout = Layout::from_size_align(IPC_DIRECTORY_BYTES, 4096).unwrap();
+    // SAFETY: nonzero layout; the leaked mapping outlives every view.
+    unsafe { std::alloc::alloc_zeroed(layout) }.cast()
+}
+
 fn fixture(pool_len: usize) -> Fixture {
-    let dir: Box<core::mem::MaybeUninit<IpcDirectory>> = Box::new_zeroed();
-    let dir = Box::into_raw(dir) as *mut IpcDirectory;
+    let dir = zeroed_directory();
     let pool =
         unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
     let identity = IDENTITY.fetch_add(1, Ordering::Relaxed);
-    let region = unsafe { IpcRegion::initialize(dir, pool, pool_len, identity) }.unwrap();
+    let region =
+        unsafe { IpcRegion::initialize(dir, IPC_DIRECTORY_BYTES, pool, pool_len, identity) }
+            .unwrap();
     Fixture {
         region: Box::leak(Box::new(region)),
         next: Cell::new(0),
@@ -225,37 +239,51 @@ fn el1_ipc_layout_is_frozen_and_fits_one_metadata_extent() {
     assert_eq!(core::mem::size_of::<IpcPipeStorage>(), 24);
     assert!(
         core::mem::size_of::<IpcDirectory>() <= crate::EL1_DYNAMIC_METADATA_EXTENT_SIZE,
-        "directory {} bytes",
+        "directory head {} bytes",
         core::mem::size_of::<IpcDirectory>()
     );
+    // The elastic stores' reservations fit the directory span, in order.
+    assert!(IPC_OBJECTS_OFFSET >= core::mem::size_of::<IpcDirectory>());
+    assert!(IPC_OFDS_OFFSET >= IPC_OBJECTS_OFFSET + IPC_MAX_OBJECTS * 64);
+    assert!(IPC_WAKE_LEAVES_OFFSET >= IPC_OFDS_OFFSET + IPC_MAX_OFDS * 64);
+    assert!(IPC_DIRECTORY_BYTES as u64 <= crate::EL1_IPC_DIRECTORY_SPAN);
 }
 
 #[test]
 fn el1_ipc_region_attach_authenticates_the_header() {
     let len = 1 << 20;
-    let dir = Box::into_raw(Box::<core::mem::MaybeUninit<IpcDirectory>>::new_zeroed())
-        as *mut IpcDirectory;
+    let dir = zeroed_directory();
+    let dl = IPC_DIRECTORY_BYTES;
     let pool = unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(len, 4096).unwrap()) };
     // Unpublished: zeroed memory never attaches.
     assert_eq!(
-        unsafe { IpcRegion::attach(dir, pool, len) }.err(),
-        Some(IpcError::BadRegion)
-    );
-    let host = unsafe { IpcRegion::initialize(dir, pool, len, 77) }.unwrap();
-    assert_eq!(
-        unsafe { IpcRegion::initialize(dir, pool, len, 78) }.err(),
+        unsafe { IpcRegion::attach(dir, dl, pool, len) }.err(),
         Some(IpcError::BadRegion)
     );
     assert_eq!(
-        unsafe { IpcRegion::attach(dir, pool, len - 4096) }.err(),
+        unsafe { IpcRegion::initialize(dir, dl - 1, pool, len, 77) }.err(),
+        Some(IpcError::BadRegion),
+        "a directory mapping shorter than the stores' reservation"
+    );
+    let host = unsafe { IpcRegion::initialize(dir, dl, pool, len, 77) }.unwrap();
+    assert_eq!(
+        unsafe { IpcRegion::initialize(dir, dl, pool, len, 78) }.err(),
         Some(IpcError::BadRegion)
     );
     assert_eq!(
-        unsafe { IpcRegion::attach(dir.cast::<u8>().add(64).cast(), pool, len) }.err(),
+        unsafe { IpcRegion::attach(dir, dl, pool, len - 4096) }.err(),
+        Some(IpcError::BadRegion)
+    );
+    assert_eq!(
+        unsafe { IpcRegion::attach(dir.cast::<u8>().add(64).cast(), dl, pool, len) }.err(),
         Some(IpcError::BadRegion),
         "misaligned directory"
     );
-    let el1 = unsafe { IpcRegion::attach(dir, pool, len) }.unwrap();
+    assert_eq!(
+        unsafe { IpcRegion::attach(dir, dl - 1, pool, len) }.err(),
+        Some(IpcError::BadRegion)
+    );
+    let el1 = unsafe { IpcRegion::attach(dir, dl, pool, len) }.unwrap();
     // The two views share one authority: a table the host creates is the
     // table EL1 resolves.
     let h: &'static IpcRegion<'static> = Box::leak(Box::new(host));
@@ -286,7 +314,7 @@ fn el1_ipc_region_attach_authenticates_the_header() {
     // A corrupted layout hash is refused.
     unsafe { (*dir).header.layout_hash.store(1, Ordering::Relaxed) };
     assert_eq!(
-        unsafe { IpcRegion::attach(dir, pool, len) }.err(),
+        unsafe { IpcRegion::attach(dir, dl, pool, len) }.err(),
         Some(IpcError::BadRegion)
     );
 }
@@ -527,7 +555,7 @@ fn el1_ipc_contended_object_lock_refuses_before_effects() {
     let fx = fixture(1 << 20);
     let t = fx.table();
     let (r, w, object) = fx.pipe(t);
-    let record = &fx.region.dir.objects[object.index() as usize];
+    let record = fx.region.record(object.index()).unwrap();
     record.lock.store(1, Ordering::Release);
     assert_eq!(
         el1_io(&fx, t, w, Some(b"x"), &mut []),
@@ -967,4 +995,142 @@ fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
     write_ipc_wait_census(&zone, fx.region, &mut busy).unwrap();
     assert!(busy.contains("state=<locked>"), "{busy}");
     drop(held);
+}
+
+/// The object and description stores are elastic: a region starts with one
+/// published segment of each, an exhausted free list asks the growth venue
+/// for more (`NoObjects` / `NeedsOfds`, never an errno by themselves), a
+/// grown segment is resolved identically by both venues, and only the
+/// zone-wide ceiling refuses (`ZoneLimit`, ENFILE).
+#[test]
+fn el1_ipc_object_and_description_stores_grow_by_segment() {
+    let fx = fixture(1 << 20);
+    assert_eq!(fx.region.object_count(), IPC_OBJECT_SEGMENT);
+    assert_eq!(fx.region.ofd_count(), IPC_OFD_SEGMENT);
+    let first: Vec<_> = (0..IPC_OBJECT_SEGMENT)
+        .map(|_| {
+            fx.region
+                .create_eventfd(0, EventMode::Counter, &Spin)
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        fx.region.create_eventfd(0, EventMode::Counter, &Spin),
+        Err(IpcError::NoObjects)
+    );
+    assert_eq!(fx.region.grow_objects(), Ok(IPC_OBJECT_SEGMENT));
+    let grown = fx
+        .region
+        .create_eventfd(9, EventMode::Counter, &Spin)
+        .unwrap();
+    assert_eq!(
+        grown.index() as usize,
+        IPC_OBJECT_SEGMENT,
+        "lowest new record first"
+    );
+    // The other venue resolves the grown segment through the same mapping.
+    let el1 = unsafe {
+        IpcRegion::attach(
+            (fx.region.dir as *const IpcDirectory).cast_mut(),
+            IPC_DIRECTORY_BYTES,
+            fx.region.pool,
+            fx.pool_len as usize,
+        )
+    }
+    .unwrap();
+    assert_eq!(el1.lock(grown, &EL1).unwrap().eventfd().unwrap().value(), 9);
+    assert_eq!(el1.object_count(), 2 * IPC_OBJECT_SEGMENT);
+    // Descriptions: the first segment is exhausted, then grown.
+    let t = fx
+        .host()
+        .create_table(1 << 16, &mut fx.descriptors(4096))
+        .unwrap();
+    let desc = |object| {
+        Description::new(
+            IpcBacking::EventFd { object }.encode(),
+            AccessMode::ReadWrite,
+            StatusFlags::default(),
+        )
+    };
+    for (n, object) in first.iter().cycle().take(IPC_OFD_SEGMENT).enumerate() {
+        assert_eq!(
+            fx.host().open(t, Fd(0), desc(*object), false),
+            Ok(Fd(n as i32))
+        );
+    }
+    assert_eq!(
+        fx.host().open(t, Fd(0), desc(grown), false),
+        Err(fd::Error::NeedsOfds)
+    );
+    assert_eq!(fx.region.grow_ofds(), Ok(IPC_OFD_SEGMENT));
+    let fd = fx.host().open(t, Fd(0), desc(grown), false).unwrap();
+    assert_eq!(el1.fd(EL1).get(t, fd).unwrap().backing, desc(grown).backing);
+    // Only the zone-wide ceiling refuses.
+    while fx.region.object_count() < IPC_MAX_OBJECTS {
+        assert_eq!(fx.region.grow_objects(), Ok(IPC_OBJECT_SEGMENT));
+    }
+    assert_eq!(fx.region.grow_objects(), Err(IpcError::ZoneLimit));
+    while fx.region.ofd_count() < IPC_MAX_OFDS {
+        assert_eq!(fx.region.grow_ofds(), Ok(IPC_OFD_SEGMENT));
+    }
+    assert_eq!(fx.region.grow_ofds(), Err(IpcError::ZoneLimit));
+    // The last record of the zone is an ordinary record.
+    let objects: Vec<_> =
+        core::iter::from_fn(|| fx.region.create_eventfd(0, EventMode::Counter, &Spin).ok())
+            .collect();
+    assert_eq!(
+        (
+            objects.len(),
+            fx.region.create_eventfd(0, EventMode::Counter, &Spin)
+        ),
+        (
+            IPC_MAX_OBJECTS - IPC_OBJECT_SEGMENT - 1,
+            Err(IpcError::NoObjects)
+        )
+    );
+    let last = *objects.iter().max_by_key(|o| o.index()).unwrap();
+    assert_eq!(last.index() as usize, IPC_MAX_OBJECTS - 1);
+    assert!(el1.lock(last, &EL1).is_ok());
+}
+
+/// The owed-host-wake index scales with the object store: objects in any
+/// segment (past the old 4096-object index) are indexed with three word
+/// updates, and a boundary visits exactly the pending objects whatever the
+/// live population.
+#[test]
+fn el1_ipc_host_wake_index_spans_every_segment_without_scanning() {
+    let fx = fixture(1 << 20);
+    while fx.region.object_count() < 5 * IPC_OBJECT_SEGMENT {
+        fx.region.grow_objects().unwrap();
+    }
+    let objects: Vec<_> = (0..5 * IPC_OBJECT_SEGMENT)
+        .map(|_| {
+            fx.region
+                .create_eventfd(0, EventMode::Counter, &Spin)
+                .unwrap()
+        })
+        .collect();
+    let pending = [objects[5], objects[4100], objects[3000], objects[4095]];
+    for object in pending {
+        fx.region.subscribe_host(object, &Spin).unwrap();
+        let mut guard = fx.region.lock(object, &Spin).unwrap();
+        let step = guard.eventfd().unwrap().try_write(1);
+        assert!(guard.publish(step.wake).host_owed);
+    }
+    let mut delivered = Vec::new();
+    let visits = fx
+        .region
+        .drain_host_wake_candidates(|candidate| delivered.push(candidate));
+    assert_eq!(visits, pending.len(), "5120 live objects, 4 visited");
+    delivered.sort_by_key(|o| o.index());
+    let mut expected = pending.to_vec();
+    expected.sort_by_key(|o| o.index());
+    assert_eq!(delivered, expected);
+    for object in pending {
+        assert!(fx.region.take_host_wake(object));
+    }
+    assert_eq!(
+        fx.region.drain_host_wake_candidates(|_| panic!("drained")),
+        0
+    );
 }
