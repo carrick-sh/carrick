@@ -984,6 +984,7 @@ where
             if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
                 table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);
             }
+            super::signal::withdraw_guest_descriptor_work(terminal_mm.raw());
             let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
                 carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
                 process.pid(),
@@ -5582,6 +5583,10 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
         .as_ref()
         .map_or(mm.raw(), crate::hvpatch::ProcessContext::asid_generation);
     engine.bind_task_snapshot_identity(mm.raw(), asid_generation);
+    super::signal::select_guest_descriptor_lane(
+        engine,
+        super::signal::GuestDescriptorLanePrecondition::current(),
+    );
     if let Some(process) = kernel.hvpatch_process.as_ref() {
         let owner_inventory = engine.frame_cow_owner_inventory().ok_or_else(|| {
             RuntimeError::Configuration(

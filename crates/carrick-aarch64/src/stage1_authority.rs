@@ -11,9 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 
 use carrick_hal::TrapError;
+use carrick_mmu_core::aarch64::descriptor_txn::{
+    DescriptorOp, DescriptorReceipt, DescriptorTxn, DescriptorTxnId, VerifiedDescriptorReceipt,
+};
 use carrick_mmu_core::aarch64::{
-    HostArenaResolver, PageTableApplyOutcome, PageTableError, PageTableManager, PtOp,
-    TableArenaSource,
+    GuestTxnPrepareError, GuestTxnSettleError, HostArenaResolver, LiveDescriptorOwner,
+    PageTableApplyOutcome, PageTableError, PageTableManager, PtOp, TableArenaSource,
 };
 
 /// Explicit sharing lifecycle for stage-1 page tables across process fork/execve boundaries.
@@ -59,6 +62,11 @@ struct Stage1AuthorityInner {
     /// Recycle pool shared by this authority and every child authority it
     /// forks. The retiring image of an exited process returns here on drop.
     image_pool: Arc<Stage1ImagePool>,
+    /// The only venue allowed to store into this authority's live tables.
+    /// Every image lent for editing carries it, whichever path installed it.
+    live_owner: LiveDescriptorOwner,
+    /// Last guest descriptor transaction generation issued for this MM.
+    txn_generation: u64,
 }
 
 impl Drop for Stage1AuthorityInner {
@@ -212,6 +220,8 @@ impl Stage1Authority {
                 vfork_shares: 0,
                 engines: 1,
                 image_pool,
+                live_owner: LiveDescriptorOwner::Host,
+                txn_generation: 0,
             })),
         }
     }
@@ -232,13 +242,96 @@ impl Stage1Authority {
     /// image. The child shares this authority's image pool, so its image
     /// returns to the parent's pool when the child retires.
     pub fn child_with_manager(&self, manager: PageTableManager) -> Self {
-        let image_pool = Arc::clone(&self.inner.lock().image_pool);
-        Self::with_pool(Some(manager), image_pool)
+        let (image_pool, live_owner) = {
+            let inner = self.inner.lock();
+            (Arc::clone(&inner.image_pool), inner.live_owner)
+        };
+        let child = Self::with_pool(Some(manager), image_pool);
+        // The child's image was built and published offline; once live, it
+        // belongs to the same lane as its parent.
+        child.select_live_descriptor_owner(live_owner);
+        child
     }
 
     /// The image recycle pool shared across this authority's process tree.
     pub fn image_pool(&self) -> Arc<Stage1ImagePool> {
         Arc::clone(&self.inner.lock().image_pool)
+    }
+
+    /// Select the venue that owns this address space's live descriptor stores.
+    ///
+    /// `Guest` is the lane on which EL1 is the only live writer: host edits
+    /// through this authority may still stage and validate, but every live
+    /// store (`sync_to_host`, snapshot restore, published rollback) is refused
+    /// with [`PageTableError::GuestOwnsLiveDescriptors`], and live work must
+    /// be built with [`Self::prepare_guest_descriptor_txn`] and submitted to
+    /// EL1. Offline images (a fork child before publication, an exec image
+    /// before installation) are separate authorities and are not affected.
+    pub fn select_live_descriptor_owner(&self, owner: LiveDescriptorOwner) {
+        let mut inner = self.inner.lock();
+        inner.live_owner = owner;
+        if let Some(manager) = inner.manager.as_mut() {
+            manager.set_live_descriptor_owner(owner);
+        }
+    }
+
+    /// The venue that owns this address space's live descriptor stores.
+    pub fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
+        self.inner.lock().live_owner
+    }
+
+    /// Build one guest descriptor transaction for `mm_key` on the guest-owned
+    /// lane: a fresh nonzero generation for this authority, the live root,
+    /// and exactly the primary-arena table grants the operation needs. No
+    /// live descriptor is stored.
+    pub fn prepare_guest_descriptor_txn(
+        &self,
+        mm_key: std::num::NonZeroU64,
+        op: DescriptorOp,
+    ) -> Result<DescriptorTxn, GuestTxnPrepareError> {
+        let mut inner = self.inner.lock();
+        if inner.live_owner != LiveDescriptorOwner::Guest {
+            return Err(GuestTxnPrepareError::NotGuestOwned);
+        }
+        let generation = inner
+            .txn_generation
+            .checked_add(1)
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or(GuestTxnPrepareError::Manager(PageTableError::BadAddress))?;
+        let live_owner = inner.live_owner;
+        let manager = inner
+            .manager
+            .as_mut()
+            .ok_or(GuestTxnPrepareError::NotLive)?;
+        manager.set_live_descriptor_owner(live_owner);
+        let txn =
+            manager.prepare_guest_descriptor_txn(DescriptorTxnId { mm_key, generation }, op)?;
+        inner.txn_generation = generation.get();
+        Ok(txn)
+    }
+
+    /// Authenticate EL1's receipt for a transaction built by
+    /// [`Self::prepare_guest_descriptor_txn`] and return its unused grants.
+    /// Backing adapters require the returned receipt before committing
+    /// residency, repointing inventory or retiring an old owner.
+    pub fn settle_guest_descriptor_receipt(
+        &self,
+        txn: &DescriptorTxn,
+        receipt: &DescriptorReceipt,
+    ) -> Result<VerifiedDescriptorReceipt, GuestTxnSettleError> {
+        let mut inner = self.inner.lock();
+        let manager = inner
+            .manager
+            .as_mut()
+            .ok_or(GuestTxnSettleError::Manager(PageTableError::BadAddress))?;
+        manager.settle_guest_descriptor_receipt(txn, receipt)
+    }
+
+    /// Return every grant of a submission withdrawn before EL1 claimed it.
+    pub fn abandon_guest_descriptor_txn(&self, txn: &DescriptorTxn) -> Result<(), PageTableError> {
+        let mut inner = self.inner.lock();
+        let manager = inner.manager.as_mut().ok_or(PageTableError::BadAddress)?;
+        manager.abandon_guest_descriptor_txn(txn)
     }
 
     /// Replace or update the inner manager directly. Used primarily for test harnesses and initialization.
@@ -440,7 +533,9 @@ impl Stage1Authority {
     ) -> Result<Vec<u64>, PageTableError> {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
+        let live_owner = inner.live_owner;
         if let Some(manager) = inner.manager.as_mut() {
+            manager.set_live_descriptor_owner(live_owner);
             unsafe { manager.rollback_undo(resolver, inner.arena_source.as_deref_mut()) }
         } else {
             Ok(Vec::new())
@@ -482,10 +577,12 @@ impl Stage1Authority {
         let Stage1AuthorityInner {
             ref mut manager,
             ref mut arena_source,
+            live_owner,
             ..
         } = *inner;
         let manager = manager.as_mut().ok_or(on_absent)?;
         manager.declare_live_hardware_image();
+        manager.set_live_descriptor_owner(live_owner);
         let mut editor = Stage1Editor {
             manager,
             arena_source,
@@ -590,12 +687,14 @@ impl Stage1Authority {
         let Stage1AuthorityInner {
             ref mut manager,
             ref mut arena_source,
+            live_owner,
             ..
         } = *inner;
         let manager = manager
             .as_mut()
             .expect("manager must be present after lazy initialization");
         manager.declare_live_hardware_image();
+        manager.set_live_descriptor_owner(live_owner);
         let mut editor = Stage1Editor {
             manager,
             arena_source,
@@ -617,6 +716,9 @@ impl Stage1Authority {
         let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
+        if inner.live_owner == LiveDescriptorOwner::Guest {
+            return Err(PageTableError::GuestOwnsLiveDescriptors);
+        }
         if let Some(live) = inner.manager.as_ref() {
             let before = u32::from(inner.arena_source.is_some());
             snapshot.adopt_live_extension_state(live);
@@ -657,6 +759,9 @@ impl Stage1Authority {
         let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
+        if inner.live_owner == LiveDescriptorOwner::Guest {
+            return Err(PageTableError::GuestOwnsLiveDescriptors);
+        }
         if let Some(live) = inner.manager.as_ref() {
             let before = u32::from(inner.arena_source.is_some());
             snapshot.adopt_live_extension_state(live);
@@ -1113,6 +1218,9 @@ impl<'a> Stage1Editor<'a> {
         site: u32,
         authority: u64,
     ) -> Result<(), PageTableError> {
+        if self.manager.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            return Err(PageTableError::GuestOwnsLiveDescriptors);
+        }
         let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let before = u32::from(self.arena_source.is_some());
         snapshot.adopt_live_extension_state(self.manager);
@@ -2253,5 +2361,173 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn guest_owned_authority_refuses_host_live_stores_and_builds_guest_transactions() {
+        use carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            BackingIdentity, CallerInvalidatesAsid, DescriptorOutcome, DescriptorRefusal,
+            InlineJournal, PageSpan, PrimaryTableWords, execute_descriptor_txn,
+        };
+        use carrick_mmu_core::aarch64::{
+            El1PrivateLeafState, GuestLeafPublication, el1_private_leaf_state, terminal_descriptor,
+        };
+        use std::num::NonZeroU64;
+
+        let nz = |value| NonZeroU64::new(value).unwrap();
+        let va = LINUX_MMAP_BASE + 0x80_0000;
+        // The sparse mmap window is reserved (invalid) before any grant.
+        let mut manager = test_manager();
+        manager.set_prot_none(va, 0x20_0000, None).unwrap();
+        let mut boot = manager.as_bytes().to_vec();
+        boot.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let resolver = Arc::new(BufferResolver {
+            buf: std::sync::Mutex::new(boot),
+            base: LINUX_PAGE_TABLES_BASE,
+        });
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        unsafe {
+            authority.bind_live_backing(
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+            );
+        }
+        let snapshot = authority.snapshot_image().unwrap();
+        authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        assert_eq!(
+            authority.live_descriptor_owner(),
+            LiveDescriptorOwner::Guest
+        );
+        let bytes = || resolver.buf.lock().unwrap().clone();
+        let before = bytes();
+
+        // The engine edit funnel: staging is refused publication.
+        let edit = authority.edit(
+            || panic!("manager must be present"),
+            |editor| {
+                editor.set_readonly(LINUX_MMAP_BASE, 0x1000, false)?;
+                unsafe { editor.sync_to_host(&*resolver) }
+            },
+        );
+        assert_eq!(edit, Err(PageTableError::GuestOwnsLiveDescriptors));
+        // Snapshot restores are live stores too, through every entry point.
+        let mut image = Some(snapshot.snapshot_image().unwrap());
+        assert_eq!(
+            authority.restore_image(&mut image, 0).err(),
+            Some(PageTableError::GuestOwnsLiveDescriptors)
+        );
+        assert_eq!(
+            unsafe { authority.restore_image_and_host(&mut image, 0, &*resolver) }.err(),
+            Some(PageTableError::GuestOwnsLiveDescriptors)
+        );
+        let editor_restore = authority.edit(
+            || panic!("manager must be present"),
+            |editor| editor.restore_image(&mut image, 0, 0),
+        );
+        assert_eq!(
+            editor_restore,
+            Err(PageTableError::GuestOwnsLiveDescriptors)
+        );
+        assert!(
+            image.is_some(),
+            "a refused restore keeps the caller's image"
+        );
+        assert_eq!(bytes(), before);
+
+        // Live work is built as an authenticated guest transaction.
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        let backing = BackingIdentity {
+            frame_id: nz(3),
+            mapping_id: nz(4),
+            owner_generation: nz(5),
+            inventory_revision: nz(6),
+        };
+        let op = DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va,
+                ipa,
+                len: 4 * 4096,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(va, 4096),
+            backing,
+        };
+        let txn = authority.prepare_guest_descriptor_txn(nz(9), op).unwrap();
+        assert_eq!(txn.id.generation, nz(1));
+        assert_eq!(txn.root.raw(), LINUX_PAGE_TABLES_BASE);
+        assert_eq!(bytes(), before, "building a transaction stores nothing");
+
+        // EL1 executes it; the host settles the exact receipt.
+        let receipt = {
+            let mut buf = resolver.buf.lock().unwrap();
+            let maintenance = CallerInvalidatesAsid;
+            let words = unsafe {
+                PrimaryTableWords::new(
+                    buf.as_mut_ptr().cast(),
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    &maintenance,
+                )
+            }
+            .unwrap();
+            let mut journal = InlineJournal::new();
+            execute_descriptor_txn(
+                &words,
+                carrick_mmu_core::aarch64::SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+                &txn,
+                &mut journal,
+            )
+        };
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        let verified = authority
+            .settle_guest_descriptor_receipt(&txn, &receipt)
+            .unwrap();
+        assert_eq!(verified.resident(), PageSpan::new(va, 4096));
+        let leaf = authority
+            .with_manager(|manager| terminal_descriptor(manager.debug_walk(va + 4096)))
+            .unwrap();
+        assert_eq!(el1_private_leaf_state(leaf), El1PrivateLeafState::Prepared);
+
+        // Generations advance per transaction; refusals reserve nothing.
+        assert_eq!(
+            authority.prepare_guest_descriptor_txn(nz(9), op),
+            Err(GuestTxnPrepareError::Refused(
+                DescriptorRefusal::AlreadyValid
+            ))
+        );
+        let retire = authority
+            .prepare_guest_descriptor_txn(nz(9), DescriptorOp::Retire(PageSpan::new(va, 4096)))
+            .unwrap();
+        assert_eq!(retire.id.generation, nz(2));
+        authority.abandon_guest_descriptor_txn(&retire).unwrap();
+
+        // The host-owned lane never builds guest transactions.
+        let host_lane = Stage1Authority::new_with_manager(Some(test_manager()));
+        assert_eq!(
+            host_lane.prepare_guest_descriptor_txn(nz(9), op),
+            Err(GuestTxnPrepareError::NotGuestOwned)
+        );
+    }
+
+    #[test]
+    fn fork_children_inherit_their_parents_live_descriptor_lane() {
+        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
+        let host_child = parent.child_with_manager(test_manager());
+        assert_eq!(
+            host_child.live_descriptor_owner(),
+            LiveDescriptorOwner::Host
+        );
+        parent.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        let guest_child = parent.child_with_manager(test_manager());
+        assert_eq!(
+            guest_child.live_descriptor_owner(),
+            LiveDescriptorOwner::Guest
+        );
+        assert_eq!(
+            guest_child.with_manager(PageTableManager::live_descriptor_owner),
+            Some(LiveDescriptorOwner::Guest)
+        );
+        assert!(!guest_child.shares_exact_authority(&parent));
     }
 }

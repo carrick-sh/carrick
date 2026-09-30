@@ -3752,6 +3752,14 @@
       "fingerprint": "3c7db8490488c0bd323b91a6de2d99ca3390619e18e9a327bc04d958bad88f4b",
       "classification": "monotonic_allocator",
       "rationale": "Allocates non-reused authority identities for kernel-owned IPC regions; no guest object state is process-global."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "symbol": "GUEST_GRANT_LEDGER",
+      "fingerprint": "6670038873952da70b2429e36f8428f963e5bffa09786ff2a3e2e71bd62d8f93",
+      "classification": "carrier_infra",
+      "rationale": "Host-retained copies of guest descriptor transactions submitted through the carrier-wide shared EL1 DescriptorTxnSlots, one entry per persistent vCPU slot, keyed by exact MM and transaction id; carrier VM scope like the shared EL1 region it mirrors. Entries are settled only under the exact MM mutation guard."
     }
   ]
 }

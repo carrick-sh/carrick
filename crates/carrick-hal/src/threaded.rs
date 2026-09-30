@@ -2627,6 +2627,35 @@ pub struct El1FrameGrantReady {
     pub inventory_revision: u64,
 }
 
+/// One prepared EL1 frame grant to expose: the clipped semantic span, the
+/// backend-authenticated backing and the exact faulting page that alone
+/// becomes resident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct El1FrameGrantPublication {
+    pub mm_key: u64,
+    pub semantic_base: u64,
+    pub len: u64,
+    pub fault_va: u64,
+    pub permissions: u64,
+    pub ready: El1FrameGrantReady,
+}
+
+/// How an engine exposed a prepared EL1 frame grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum El1FrameGrantPublished {
+    /// This backend has no EL1 frame-grant publication.
+    Unsupported,
+    /// Host-owned lane: the host published the leaves; they are live now.
+    OnHost,
+    /// Guest-owned lane: nothing was stored. Submit this transaction to the
+    /// MM's EL1 editor; the grant is live, and residency may be committed,
+    /// only after the engine settles EL1's receipt for it.
+    Submit(carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn),
+    /// Guest-owned lane: EL1 would refuse this publication, so nothing was
+    /// reserved or submitted.
+    Refused(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal),
+}
+
 /// Exact kernel-graph identity of the address space an in-place `execve`
 /// replaces. Unlike a carrier-directory registration, this also exists for
 /// the bootstrap task that entered the persistent executor pool directly.
@@ -2866,17 +2895,73 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         Ok(None)
     }
 
-    /// Publish prepared grant backing with only `fault_va` accessible; retain
-    /// invalid outputs for the other pages. `Ok(false)`: unsupported backend.
-    fn publish_el1_frame_grant_on_host(
+    /// Expose prepared grant backing with only `fault_va` accessible and
+    /// the other pages prepared. The engine's live-descriptor owner decides
+    /// the lane: on the host-owned lane it stores the leaves itself; on the
+    /// guest-owned lane it stores nothing and returns the authenticated
+    /// descriptor transaction EL1 must execute.
+    fn publish_el1_frame_grant(
         &mut self,
-        _va: u64,
-        _ipa: u64,
-        _len: u64,
-        _fault_va: u64,
-        _permissions: u64,
-    ) -> Result<bool, TrapError> {
-        Ok(false)
+        _grant: El1FrameGrantPublication,
+    ) -> Result<El1FrameGrantPublished, TrapError> {
+        Ok(El1FrameGrantPublished::Unsupported)
+    }
+
+    /// The venue that owns this engine's live stage-1 descriptor stores.
+    fn live_descriptor_owner(&self) -> carrick_mmu_core::aarch64::LiveDescriptorOwner {
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Host
+    }
+
+    /// Select the venue that owns this engine's live stage-1 descriptor
+    /// stores. `false`: this backend has no guest-owned lane.
+    fn select_live_descriptor_owner(
+        &mut self,
+        _owner: carrick_mmu_core::aarch64::LiveDescriptorOwner,
+    ) -> bool {
+        false
+    }
+
+    /// This vCPU's full TTBR0 (root and ASID).
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend exposes no live TTBR0".to_owned(),
+        ))
+    }
+
+    /// Run one EL1 image function on this vCPU as a host-driven call: PC =
+    /// `entry_pc` at EL1h with interrupts masked, `x0` = `frame_va`, the
+    /// stack just below the frame, and the maintenance `hvc #1` as the return
+    /// address. Every register the call may clobber is restored afterwards,
+    /// so a parked syscall resumes unperturbed.
+    fn run_el1_service_call(&mut self, _entry_pc: u64, _frame_va: u64) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend has no host-driven EL1 call".to_owned(),
+        ))
+    }
+
+    /// Authenticate EL1's receipt for a transaction this engine returned and
+    /// return its unused table grants. Required before residency commit,
+    /// inventory repoint or old-owner retirement.
+    fn settle_el1_descriptor_receipt(
+        &mut self,
+        _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        _receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        Err(TrapError::Hypervisor(
+            "backend issued no guest descriptor transaction".to_owned(),
+        ))
+    }
+
+    /// Return the table grants of a transaction withdrawn before EL1
+    /// claimed it.
+    fn abandon_el1_descriptor_txn(
+        &mut self,
+        _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend issued no guest descriptor transaction".to_owned(),
+        ))
     }
 
     /// Authenticate a guest-committed grant page against the current live
@@ -3118,6 +3203,15 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// is fail-closed. Forget the parent's saved pre-arm state.
     fn commit_process_fork(&mut self) -> Result<(), TrapError> {
         Ok(())
+    }
+
+    /// Guest-owned lane: take the parent's fork-COW arm transactions so the
+    /// runtime submits them to EL1 before any parent thread resumes EL0.
+    /// `commit_process_fork` refuses while any remain untaken.
+    fn take_guest_fork_arm_txns(
+        &mut self,
+    ) -> Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
+        Vec::new()
     }
 
     /// Restore parent stage-1 and COW-arm metadata after a recoverable child

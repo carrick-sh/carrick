@@ -36,7 +36,9 @@ use carrick_hal::{
     SyscallTrap, ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
-use carrick_mmu_core::aarch64::{PageTableApplyOutcome, PageTableError, PageTableManager};
+use carrick_mmu_core::aarch64::{
+    LiveDescriptorOwner, PageTableApplyOutcome, PageTableError, PageTableManager,
+};
 
 pub use crate::stage1_authority::{ShareState, Stage1Authority, Stage1Editor};
 
@@ -65,6 +67,163 @@ pub fn reserve_hvpatch_process_apertures(
         (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
             + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE) as usize,
         None,
+    )
+}
+
+/// Build the guest-owned lane's frame-grant publication: a Prepare
+/// transaction naming the backend-authenticated backing, with exactly the
+/// faulting page resident. Nothing is stored in the live tables.
+fn guest_frame_grant_submission(
+    page_tables: &Stage1Authority,
+    grant: carrick_hal::threaded::El1FrameGrantPublication,
+    publication: carrick_mmu_core::aarch64::GuestLeafPublication,
+) -> Result<carrick_hal::threaded::El1FrameGrantPublished, TrapError> {
+    use carrick_hal::threaded::El1FrameGrantPublished;
+    use carrick_mmu_core::aarch64::GuestTxnPrepareError;
+    use carrick_mmu_core::aarch64::descriptor_txn::{BackingIdentity, DescriptorOp, PageSpan};
+    use std::num::NonZeroU64;
+
+    let unauthenticated =
+        || TrapError::Hypervisor("EL1 frame grant lacks an authenticated identity".to_owned());
+    let nonzero = |value| NonZeroU64::new(value).ok_or_else(unauthenticated);
+    let backing = BackingIdentity {
+        frame_id: nonzero(grant.ready.frame_id)?,
+        mapping_id: nonzero(grant.ready.mapping_id)?,
+        owner_generation: nonzero(grant.ready.owner_generation)?,
+        inventory_revision: nonzero(grant.ready.inventory_revision)?,
+    };
+    let op = DescriptorOp::Prepare {
+        publication,
+        resident: PageSpan::new(grant.fault_va & !0xfff, 0x1000),
+        backing,
+    };
+    match page_tables.prepare_guest_descriptor_txn(nonzero(grant.mm_key)?, op) {
+        Ok(txn) => Ok(El1FrameGrantPublished::Submit(txn)),
+        Err(GuestTxnPrepareError::Refused(refusal)) => Ok(El1FrameGrantPublished::Refused(refusal)),
+        Err(error) => Err(TrapError::Hypervisor(format!(
+            "prepare EL1 frame-grant descriptor transaction: {error:?}"
+        ))),
+    }
+}
+
+/// The guest-owned lane's parent fork-COW arm: one EL1 transaction per newly
+/// armed range, each with the host editor's exact per-descriptor rule and
+/// exactly the table grants it needs. Nothing is stored. A refusal returns
+/// every grant already reserved and fails the fork before it commits.
+fn guest_fork_arm_txns(
+    page_tables: &Stage1Authority,
+    mm_key: u64,
+    ranges: &[crate::vmm::ForkCowRange],
+) -> Result<Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>, TrapError> {
+    let mm_key = std::num::NonZeroU64::new(mm_key).ok_or_else(|| {
+        TrapError::Hypervisor("guest fork arm lacks the parent MM identity".to_owned())
+    })?;
+    let mut txns = Vec::new();
+    for range in ranges {
+        let op = page_tables
+            .with_manager(|manager| {
+                manager.fork_arm_op(
+                    range.va,
+                    range.len as u64,
+                    range.kernel_only,
+                    range.executable,
+                )
+            })
+            .ok_or_else(|| {
+                TrapError::Hypervisor("guest fork arm lost the parent stage-1 image".to_owned())
+            });
+        let txn = op.and_then(|op| {
+            page_tables
+                .prepare_guest_descriptor_txn(mm_key, op)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "prepare guest fork arm at VA 0x{:x}: {error:?}",
+                        range.va
+                    ))
+                })
+        });
+        match txn {
+            Ok(txn) => txns.push(txn),
+            Err(error) => {
+                for txn in &txns {
+                    let _ = page_tables.abandon_guest_descriptor_txn(txn);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(txns)
+}
+
+/// The maintenance trampoline's closing `hvc #1`, used as the return address
+/// of a host-driven EL1 call so its `ret` completes as `MaintenanceDone`.
+const EL1_SERVICE_CALL_RETURN: u64 = carrick_mem::memory::LINUX_EL1_MAINT_BASE + 16;
+
+/// See [`carrick_hal::threaded::ThreadedEngine::run_el1_service_call`].
+fn run_el1_service_call_on<V: Aarch64Vmm>(
+    vcpu: &mut V::Vcpu,
+    entry_pc: u64,
+    frame_va: u64,
+) -> Result<(), TrapError> {
+    const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+    let mut saved = Vec::with_capacity(36);
+    let mut regs: Vec<Reg> = (0..31).map(Reg::X).collect();
+    regs.extend([Reg::Pc, Reg::Pstate, Reg::ElrEl1, Reg::SpsrEl1, Reg::SpEl1]);
+    for &reg in &regs {
+        saved.push(vcpu.get_reg(reg).map_err(|error| {
+            TrapError::Hypervisor(format!("save {reg:?} for host-driven EL1 call: {error}"))
+        })?);
+    }
+    let setup = [
+        (Reg::Pc, entry_pc),
+        (Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED),
+        (Reg::X(0), frame_va),
+        (Reg::X(30), EL1_SERVICE_CALL_RETURN),
+        (Reg::SpEl1, frame_va & !0xF),
+    ];
+    let mut result = Ok(());
+    for (reg, value) in setup {
+        if let Err(error) = vcpu.set_reg(reg, value) {
+            result = Err(TrapError::Hypervisor(format!(
+                "set {reg:?} for host-driven EL1 call: {error}"
+            )));
+            break;
+        }
+    }
+    if result.is_ok() {
+        // A cross-thread kick only interrupts the run; the call continues
+        // from where it stopped.
+        result = loop {
+            match vcpu.run() {
+                Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
+                Ok(Aarch64Exit::Kicked) => continue,
+                Ok(other) => {
+                    break Err(TrapError::UnexpectedExit {
+                        reason: format!(
+                            "{} during host-driven EL1 call",
+                            maintenance_exit_detail(&other)
+                        ),
+                    });
+                }
+                Err(error) => break Err(error),
+            }
+        };
+    }
+    for (&reg, &value) in regs.iter().zip(&saved) {
+        vcpu.set_reg(reg, value).map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "restore {reg:?} after host-driven EL1 call: {error}"
+            ))
+        })?;
+    }
+    result
+}
+
+/// A host live-table edit attempted on the lane where guest EL1 owns the live
+/// descriptors. The caller must submit a guest descriptor transaction.
+fn guest_owned_live_edit_error() -> MemoryError {
+    MemoryError::HostMap(
+        "guest EL1 owns the live stage-1 descriptors; submit a descriptor transaction".to_owned(),
     )
 }
 
@@ -608,6 +767,10 @@ fn ensure_sparse_page_table_editor(
 
 struct ParentForkCowRollback {
     armed_ranges: Vec<crate::vmm::ForkCowRange>,
+    /// Guest-owned lane: the parent's fork-COW arm as EL1 transactions, one
+    /// per newly armed range. Nothing was stored; rollback returns their
+    /// grants, and commit refuses unless the runtime took them for EL1.
+    guest_arm: Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>,
 }
 
 fn aarch64_task_state_from_snapshot(
@@ -1101,6 +1264,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .get_sys_reg(SysReg::Ttbr0)
             .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
             & TTBR_ROOT_MASK;
+        // The single live edit funnel. On the guest-owned lane EL1 is the only
+        // live descriptor writer: refuse before staging anything, so no dirty
+        // host state can outlive the refusal.
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            return Err(guest_owned_live_edit_error());
+        }
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = self
             .vm
@@ -1207,6 +1376,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     }
                     Err(PageTableError::MetadataAllocation) => {
                         Err(MemoryError::MetadataAllocation)
+                    }
+                    Err(PageTableError::GuestOwnsLiveDescriptors) => {
+                        Err(guest_owned_live_edit_error())
                     }
                 }
             },
@@ -3483,30 +3655,27 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.prepare_el1_frame_grant(request)
     }
 
-    fn publish_el1_frame_grant_on_host(
+    fn publish_el1_frame_grant(
         &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        fault_va: u64,
-        permissions: u64,
-    ) -> Result<bool, TrapError> {
-        let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
-        self.pt_edit_and_flush_after_adopting(va, size, |editor| {
+        grant: carrick_hal::threaded::El1FrameGrantPublication,
+    ) -> Result<carrick_hal::threaded::El1FrameGrantPublished, TrapError> {
+        use carrick_hal::threaded::El1FrameGrantPublished;
+        let publication = carrick_mmu_core::aarch64::GuestLeafPublication {
+            va: grant.semantic_base,
+            ipa: grant.ready.physical_ipa,
+            len: grant.len,
+            writable: grant.permissions & 2 != 0,
+            executable: grant.permissions & 4 != 0,
+        };
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+            return guest_frame_grant_submission(&self.page_tables, grant, publication);
+        }
+        let size = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
+        self.pt_edit_and_flush_after_adopting(grant.semantic_base, size, |editor| {
             let source = editor.arena_source.as_deref_mut();
             editor
                 .manager
-                .publish_private_pages(
-                    carrick_mmu_core::aarch64::GuestLeafPublication {
-                        va,
-                        ipa,
-                        len,
-                        writable: permissions & 2 != 0,
-                        executable: permissions & 4 != 0,
-                    },
-                    fault_va,
-                    source,
-                )
+                .publish_private_pages(publication, grant.fault_va, source)
                 .map_err(|error| match error {
                     carrick_mmu_core::aarch64::GuestLeafPublicationError::Manager(error) => error,
                     _ => PageTableError::BadAddress,
@@ -3517,7 +3686,50 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })
         })
         .map_err(|error| memory_error_to_trap_error(error, "publish EL1 frame grant on host"))?;
-        Ok(true)
+        Ok(El1FrameGrantPublished::OnHost)
+    }
+
+    fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
+        self.vcpu
+            .get_sys_reg(SysReg::Ttbr0)
+            .map_err(|error| TrapError::Hypervisor(format!("read TTBR0_EL1: {error}")))
+    }
+
+    fn run_el1_service_call(&mut self, entry_pc: u64, frame_va: u64) -> Result<(), TrapError> {
+        run_el1_service_call_on::<V>(&mut self.vcpu, entry_pc, frame_va)
+    }
+
+    fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
+        self.page_tables.live_descriptor_owner()
+    }
+
+    fn select_live_descriptor_owner(&mut self, owner: LiveDescriptorOwner) -> bool {
+        self.page_tables.select_live_descriptor_owner(owner);
+        true
+    }
+
+    fn settle_el1_descriptor_receipt(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        self.page_tables
+            .settle_guest_descriptor_receipt(txn, receipt)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("settle EL1 descriptor receipt: {error:?}"))
+            })
+    }
+
+    fn abandon_el1_descriptor_txn(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<(), TrapError> {
+        self.page_tables
+            .abandon_guest_descriptor_txn(txn)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("abandon EL1 descriptor transaction: {error:?}"))
+            })
     }
 
     fn live_el1_grant_page(&self, va: u64, expected_ipa: u64) -> bool {
@@ -3915,7 +4127,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // no mmap/mprotect edit has already done so. The no-op edit publishes
         // nothing and performs no TLBI.
         let stage_started = std::time::Instant::now();
+        let guest_lane = self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest;
         let page_tables_absent = self.page_tables.is_none();
+        if page_tables_absent && guest_lane {
+            return Err(TrapError::Hypervisor(
+                "guest-owned MM forked before its live stage-1 manager exists".to_owned(),
+            ));
+        }
         if page_tables_absent {
             self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
                 .map_err(|error| {
@@ -3949,13 +4167,26 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // range (Go's heap arenas are not all in that list), and the child
         // image is cloned from this copy. The walk skips empty subtrees, so
         // its cost follows the populated tables, not the span.
+        // On the guest-owned lane the manager reads hardware-visible tables
+        // directly (a live image has nothing to adopt), and the live edit
+        // funnel refuses there.
         const USER_ADDRESS_SPACE: usize = 1 << 48;
-        self.pt_edit_locked_after_adopting(Some((0, USER_ADDRESS_SPACE)), |_| {
-            Ok(PageTableApplyOutcome::default())
-        })
-        .map_err(|error| {
-            memory_error_to_trap_error(error, "adopt live stage-1 tables before fork")
-        })?;
+        if !guest_lane {
+            self.pt_edit_locked_after_adopting(Some((0, USER_ADDRESS_SPACE)), |_| {
+                Ok(PageTableApplyOutcome::default())
+            })
+            .map_err(|error| {
+                memory_error_to_trap_error(error, "adopt live stage-1 tables before fork")
+            })?;
+        } else if !self
+            .page_tables
+            .with_manager(PageTableManager::is_live)
+            .unwrap_or(false)
+        {
+            return Err(TrapError::Hypervisor(
+                "guest-owned MM fork requires a live stage-1 manager".to_owned(),
+            ));
+        }
         let cow_ranges = if request.shares_mm() {
             Vec::new()
         } else {
@@ -4112,7 +4343,21 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             process_asid: child_asid,
         };
 
-        if !cow_ranges.is_empty() {
+        if !cow_ranges.is_empty() && guest_lane {
+            let stage_started = std::time::Instant::now();
+            let guest_arm =
+                guest_fork_arm_txns(&self.page_tables, self.mm_generation, &unarmed_ranges)?;
+            self.vm.arm_frame_cow_ranges(&unarmed_ranges);
+            self.pending_process_fork = Some(ParentForkCowRollback {
+                armed_ranges: parent_armed_snapshot,
+                guest_arm,
+            });
+            emit_stage(
+                HvpatchForkProcessSpecStagePhase::ParentCowPublication,
+                stage_started,
+                unarmed_ranges.len() as u64,
+            );
+        } else if !cow_ranges.is_empty() {
             let stage_started = std::time::Instant::now();
             // Final publication transaction. All child allocation, mapping-plan,
             // ASID, snapshot, and wrapper work is complete. Open an undo journal
@@ -4230,6 +4475,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             self.vm.arm_frame_cow_ranges(&unarmed_ranges);
             self.pending_process_fork = Some(ParentForkCowRollback {
                 armed_ranges: parent_armed_snapshot,
+                guest_arm: Vec::new(),
             });
             emit_stage(
                 HvpatchForkProcessSpecStagePhase::ParentCowPublication,
@@ -4271,15 +4517,51 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn commit_process_fork(&mut self) -> Result<(), TrapError> {
+        if self
+            .pending_process_fork
+            .as_ref()
+            .is_some_and(|pending| !pending.guest_arm.is_empty())
+        {
+            // Committing without handing the arm to EL1 would let the parent
+            // write frames the child shares. Refuse; the caller rolls back.
+            return Err(TrapError::Hypervisor(
+                "guest-owned fork committed before its parent arm was submitted to EL1".to_owned(),
+            ));
+        }
         let _ = self.pending_process_fork.take();
         self.page_tables.commit_undo();
         Ok(())
+    }
+
+    fn take_guest_fork_arm_txns(
+        &mut self,
+    ) -> Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
+        self.pending_process_fork
+            .as_mut()
+            .map(|pending| std::mem::take(&mut pending.guest_arm))
+            .unwrap_or_default()
     }
 
     fn rollback_process_fork(&mut self) -> Result<(), TrapError> {
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };
+        if !rollback.guest_arm.is_empty() {
+            // Nothing reached the live tables: return the grants and restore
+            // the backend's armed-range metadata.
+            for txn in &rollback.guest_arm {
+                self.page_tables
+                    .abandon_guest_descriptor_txn(txn)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "return guest fork-arm grants after failed fork: {error:?}"
+                        ))
+                    })?;
+            }
+            self.vm
+                .restore_frame_cow_arm_snapshot(rollback.armed_ranges);
+            return Ok(());
+        }
         self.pt_rollback_undo_and_flush().map_err(|error| {
             TrapError::Hypervisor(format!(
                 "restore parent after failed in-process fork: {error}"
@@ -4697,6 +4979,82 @@ mod tests {
             );
             assert!(!body.contains("run_el1_maintenance"));
         }
+    }
+
+    /// The guest-owned lane has no host live-descriptor writer in the engine:
+    /// the single live edit funnel refuses before staging anything, and EL1
+    /// frame-grant publication builds a guest transaction instead of editing.
+    #[test]
+    fn guest_owned_lane_has_no_engine_live_descriptor_store() {
+        let source = include_str!("engine.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production AArch64 engine source");
+        let funnel = production
+            .split("fn pt_edit_locked_after_adopting")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("live edit funnel");
+        let refusal = funnel
+            .find("LiveDescriptorOwner::Guest")
+            .expect("funnel refuses the guest-owned lane");
+        let first_edit = funnel.find("page_tables.edit(").expect("funnel edit");
+        assert!(refusal < first_edit, "refusal must precede any staged edit");
+        assert_eq!(
+            production.matches("page_tables.edit(").count(),
+            1,
+            "the engine's only live editor is the refusing funnel"
+        );
+
+        let grant = production
+            .split("fn publish_el1_frame_grant(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("frame-grant publication");
+        let submission = grant
+            .find("guest_frame_grant_submission")
+            .expect("guest lane builds a transaction");
+        let host_edit = grant
+            .find("pt_edit_and_flush_after_adopting")
+            .expect("host lane edits");
+        assert!(submission < host_edit);
+        let submit_body = production
+            .split("fn guest_frame_grant_submission")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("guest submission");
+        assert!(submit_body.contains("prepare_guest_descriptor_txn"));
+        assert!(!submit_body.contains("pt_edit"));
+        assert!(!submit_body.contains("sync_to_host"));
+
+        // Fork: the guest lane arms the parent with EL1 transactions, before
+        // and instead of the host publication edit, and commit refuses while
+        // the arm has not been handed to EL1.
+        let fork = production
+            .split("fn build_process_spec(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn materialize_process").next())
+            .expect("fork spec");
+        let guest_arm = fork
+            .find("guest_fork_arm_txns(")
+            .expect("guest lane builds fork-arm transactions");
+        let host_arm = fork.find("self.pt_edit_and_flush(").expect("host lane arm");
+        assert!(guest_arm < host_arm);
+        assert!(fork.contains("if !guest_lane {"));
+        let arm_body = production
+            .split("fn guest_fork_arm_txns")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("guest fork arm");
+        assert!(arm_body.contains("fork_arm_op("));
+        assert!(!arm_body.contains("pt_edit"));
+        let commit = production
+            .split("fn commit_process_fork")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("commit");
+        assert!(commit.contains("guest_arm.is_empty()"));
     }
 
     #[test]
