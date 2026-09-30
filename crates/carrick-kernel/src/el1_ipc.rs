@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_el1_abi::ipc::{
     HostResourceToken, IPC_DIRECTORY_BYTES, IPC_MAX_OBJECTS, IPC_MAX_OFDS, IPC_OBJECT_SEGMENT,
-    IPC_OFD_SEGMENT, IPC_POOL_ALIGN, IpcDirectory, IpcError, IpcObjectHandle, IpcPipeStorage,
-    IpcRegion, IpcReleased, descriptor_extent_bytes, fd, pipe,
+    IPC_OFD_SEGMENT, IPC_PIPE_PAGE_SIZE, IPC_POOL_ALIGN, IpcDirectory, IpcError, IpcObjectHandle,
+    IpcPipeStorage, IpcRegion, IpcReleased, descriptor_extent_bytes, fd, pipe,
 };
 use parking_lot::Mutex;
 
@@ -654,27 +654,56 @@ impl HostIpc {
         storage.offset = self.pool.lock().allocate(storage.footprint())?;
         Ok(storage)
     }
+    /// A new pipe costs its object record only: its ring is provided at its
+    /// first write ([`HostIpc::ensure_pipe_storage`]), as Linux allocates
+    /// pipe pages on demand.
     pub fn create_pipe(&self, capacity: usize) -> Result<IpcObjectHandle, AdmissionError> {
-        let mut storage = None;
-        let first =
-            self.with_object(|region| region.create_pipe(capacity, &mut storage, &HostLockWait));
-        let object = match first {
-            Ok(object) => object,
-            Err(AdmissionError::Shared(IpcError::NeedsStorage { ring_bytes, pages })) => {
-                storage = Some(self.provision_pipe(ring_bytes, pages)?);
-                // Provisioning happens after create_pipe released its object lock.
-                let result = self.with_object(|region| {
-                    region.create_pipe(capacity, &mut storage, &HostLockWait)
-                });
-                if let Some(retired_or_unused) = storage {
-                    self.pool.lock().release(retired_or_unused.offset);
-                }
-                result?
-            }
-            Err(error) => return Err(error),
-        };
+        let mut retired = None;
+        let object =
+            self.with_object(|region| region.create_pipe(capacity, &mut retired, &HostLockWait));
+        // A reused record's too-small ring, detached after the object lock.
+        if let Some(retired) = retired {
+            self.pool.lock().release(retired.offset);
+        }
+        let object = object?;
         self.bind_waits(object);
         Ok(object)
+    }
+
+    /// Give `object`'s pipe its ring before a host write: provisioned from
+    /// the pool outside any lock, installed under the object lock unless
+    /// another writer did so first (then reclaimed). A pipe that already has
+    /// its ring costs one object lock. `NoMemory` only when the pool itself
+    /// is exhausted (the write then fails like a failed page allocation).
+    pub(crate) fn ensure_pipe_storage(
+        &self,
+        object: IpcObjectHandle,
+    ) -> Result<(), AdmissionError> {
+        let region = self.region();
+        loop {
+            let capacity = {
+                let mut guard = region.lock(object, &HostLockWait)?;
+                let pipe = guard.pipe()?;
+                if pipe.is_backed() {
+                    return Ok(());
+                }
+                pipe.capacity()
+            };
+            let mut storage =
+                self.provision_pipe(capacity as u64, (capacity / IPC_PIPE_PAGE_SIZE) as u64)?;
+            let installed = region
+                .lock(object, &HostLockWait)
+                .and_then(|mut guard| guard.provide_pipe_storage(&mut storage));
+            if storage != IpcPipeStorage::default() {
+                self.pool.lock().release(storage.offset);
+            }
+            match installed {
+                Ok(_) => return Ok(()),
+                // F_SETPIPE_SZ grew the capacity meanwhile: size it again.
+                Err(IpcError::Object(pipe::Error::Storage)) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     pub fn create_eventfd(
         &self,
@@ -694,32 +723,47 @@ impl HostIpc {
         limit: usize,
     ) -> Result<usize, AdmissionError> {
         let region = self.region();
-        let current = region.lock(object, &HostLockWait)?.pipe()?.capacity();
-        let rounded = pipe::Pipe::rounded_capacity(4096, requested).map_err(IpcError::Object)?;
-        if rounded > current && rounded > limit {
-            return Err(IpcError::Object(pipe::Error::Permission).into());
-        }
-        let mut replacement = if rounded > current {
-            Some(self.provision_pipe(rounded as u64, (rounded / 4096) as u64)?)
-        } else {
-            None
-        };
-        let result = (|| {
-            let mut guard = region.lock(object, &HostLockWait)?;
-            if let Some(storage) = &mut replacement {
-                guard.replace_pipe_storage(storage)?;
+        loop {
+            let (current, backed) = {
+                let mut guard = region.lock(object, &HostLockWait)?;
+                let pipe = guard.pipe()?;
+                (pipe.capacity(), pipe.is_backed())
+            };
+            let rounded = pipe::Pipe::rounded_capacity(IPC_PIPE_PAGE_SIZE, requested)
+                .map_err(IpcError::Object)?;
+            if rounded > current && rounded > limit {
+                return Err(IpcError::Object(pipe::Error::Permission).into());
             }
-            let step = guard.pipe()?.set_capacity(requested, limit);
-            let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
-            delivery.collect(guard.publish(step.wake));
-            drop(guard);
-            delivery.deliver();
-            step.result.map_err(IpcError::Object)
-        })();
-        if let Some(storage) = replacement {
-            self.pool.lock().release(storage.offset);
+            // An unbacked pipe only records its capacity; its first write
+            // sizes the ring.
+            let mut replacement = if rounded > current && backed {
+                Some(self.provision_pipe(rounded as u64, (rounded / IPC_PIPE_PAGE_SIZE) as u64)?)
+            } else {
+                None
+            };
+            let result = (|| {
+                let mut guard = region.lock(object, &HostLockWait)?;
+                if let Some(storage) = &mut replacement {
+                    guard.replace_pipe_storage(storage)?;
+                }
+                let step = guard.pipe()?.set_capacity(requested, limit);
+                let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+                delivery.collect(guard.publish(step.wake));
+                drop(guard);
+                delivery.deliver();
+                step.result.map_err(IpcError::Object)
+            })();
+            let without_ring = replacement.is_none();
+            if let Some(storage) = replacement {
+                self.pool.lock().release(storage.offset);
+            }
+            match result {
+                // A first write gave the pipe its ring (for the old capacity)
+                // between the sample and the lock: size it again.
+                Err(IpcError::Object(pipe::Error::Storage)) if without_ring => continue,
+                result => return result.map_err(Into::into),
+            }
         }
-        result.map_err(Into::into)
     }
     fn provision_descriptors(&self, capacity: usize) -> Result<fd::Extent, AdmissionError> {
         if capacity == 0 || capacity > i32::MAX as usize {
@@ -934,6 +978,9 @@ mod tests {
         let owner = HostIpc::new(1 << 20).expect("region");
         for _ in 0..2048 {
             let object = owner.create_pipe(65536).expect("pipe");
+            owner
+                .ensure_pipe_storage(object)
+                .expect("first write's ring");
             let region = owner.region();
             let mut guard = region.lock(object, &HostLockWait).expect("object");
             assert_eq!(guard.pipe().unwrap().try_write(b"shared").result, Ok(6));
@@ -993,14 +1040,67 @@ mod tests {
         assert!(owner.pool.lock().allocated.is_empty());
     }
 
+    /// Creating a pipe takes no pool storage (Linux allocates pipe pages on
+    /// demand): an exhausted pool refuses only the first write's ring, with
+    /// nothing allocated and the pipe intact.
     #[test]
     fn serial_host_el1_ipc_pool_refusal_has_no_partial_admission() {
         let owner = HostIpc::new(4096).unwrap();
-        assert!(owner.create_pipe(65536).is_err());
+        let pipe = owner.create_pipe(65536).unwrap();
+        assert_eq!(
+            owner.ensure_pipe_storage(pipe),
+            Err(AdmissionError::NoMemory)
+        );
         assert!(owner.pool.lock().allocated.is_empty());
+        let region = owner.region();
+        let mut guard = region.lock(pipe, &HostLockWait).unwrap();
+        assert!(!guard.pipe().unwrap().is_backed());
+        drop(guard);
+        for end in [pipe::End::Reader, pipe::End::Writer] {
+            owner
+                .release(IpcBacking::Pipe { object: pipe, end }.encode())
+                .unwrap();
+        }
         let object = owner.create_eventfd(0, pipe::EventMode::Counter).unwrap();
         owner
             .release(IpcBacking::EventFd { object }.encode())
             .unwrap();
+    }
+
+    /// An idle pipe costs its record only: many pipes take no pool bytes;
+    /// the first write provides one ring (a second provision finds it and
+    /// takes nothing), and F_SETPIPE_SZ on an unbacked pipe only records the
+    /// capacity the first write then sizes.
+    #[test]
+    fn serial_host_el1_ipc_rings_are_provided_at_first_write() {
+        let owner = HostIpc::new(1 << 24).unwrap();
+        let pipes: Vec<_> = (0..4096)
+            .map(|_| owner.create_pipe(65536).unwrap())
+            .collect();
+        assert!(
+            owner.pool.lock().allocated.is_empty(),
+            "idle pipes: no rings"
+        );
+        let first = pipes[4000];
+        owner.ensure_pipe_storage(first).unwrap();
+        owner.ensure_pipe_storage(first).unwrap();
+        assert_eq!(owner.pool.lock().allocated.len(), 1);
+        let second = pipes[7];
+        assert_eq!(owner.resize_pipe(second, 1 << 20, 1 << 20), Ok(1 << 20));
+        assert_eq!(owner.pool.lock().allocated.len(), 1, "resize takes no ring");
+        owner.ensure_pipe_storage(second).unwrap();
+        let region = owner.region();
+        let mut guard = region.lock(second, &HostLockWait).unwrap();
+        let mut ring = guard.pipe().unwrap();
+        assert_eq!((ring.capacity(), ring.is_backed()), (1 << 20, true));
+        assert_eq!(ring.try_write(&[7; 70_000]).result, Ok(70_000));
+        drop(guard);
+        for object in pipes {
+            for end in [pipe::End::Reader, pipe::End::Writer] {
+                owner
+                    .release(IpcBacking::Pipe { object, end }.encode())
+                    .unwrap();
+            }
+        }
     }
 }

@@ -27,7 +27,9 @@
 //! - **Objects** — [`IpcObjectRecord`]: lock word, kind, generation, the
 //!   readiness sequences, host-subscriber accounting, and the object state
 //!   (`carrick_pipe_core::PipeRecord` or `EventFd`). A pipe's ring bytes and
-//!   page metadata live in a pool [`IpcPipeStorage`] extent.
+//!   page metadata live in a pool [`IpcPipeStorage`] extent, attached at the
+//!   pipe's first write (Linux allocates pipe pages on demand): until then
+//!   the pipe is *unbacked* and costs only its record.
 //! - **Continuations** — [`IpcOperation`]: the plain-data record an owned
 //!   suspended operation keeps outside any stack, in an [`IpcOperationSlot`]
 //!   named by the owned [`IpcOpToken`] `(index, generation)` that the
@@ -66,7 +68,9 @@
 //! spins a bounded while and forwards on `Contended` before effects; the host
 //! waits. No lock is held across I/O, a WFI, a context switch or a host wait,
 //! and nothing allocates under a lock: pool storage is provisioned by the
-//! host before it takes any lock ([`IpcError::NeedsStorage`] asks for it).
+//! host before it takes any lock. A write to an unbacked pipe refuses with
+//! `pipe::Error::Storage` before any effect; EL1 then forwards the call and
+//! the host provides the ring ([`IpcObjectGuard::provide_pipe_storage`]).
 //!
 //! Guest page size for pipe accounting is [`IPC_PIPE_PAGE_SIZE`] (Linux
 //! aarch64 4 KiB pages, `carrick_abi::LINUX_PAGE_SIZE`).
@@ -719,9 +723,6 @@ pub enum IpcError {
     ZoneLimit,
     /// Every operation record is in use (refused before effects).
     NoOperations,
-    /// The host must provision pipe storage of at least this size (outside
-    /// any lock) and retry; never a guest errno by itself.
-    NeedsStorage { ring_bytes: u64, pages: u64 },
     /// A pool extent is out of bounds or misaligned (venue bug; fail closed).
     BadStorage,
     /// The region is unpublished or its header does not match this ABI.
@@ -1153,50 +1154,50 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Create a pipe of `capacity` bytes (rounded like F_SETPIPE_SZ) with one
-    /// reader and one writer reference. A free record keeps its storage: if
-    /// that storage is too small, `storage` must supply adequate storage
-    /// (consumed; the record's old storage is handed back in its place for
-    /// the host to reclaim). Otherwise `NeedsStorage` asks for it, with no
-    /// state changed. Host venue only (it provisions pool storage).
+    /// reader and one writer reference. No pool storage is needed: a free
+    /// record's retained storage is reused when it fits, otherwise the pipe
+    /// starts *unbacked* (its ring is provided at the first write) and the
+    /// record's too-small storage is detached into `retired` for the host to
+    /// reclaim. `retired` must be `None` on entry. Host venue only.
     pub fn create_pipe<W: LockWait>(
         &self,
         capacity: usize,
-        storage: &mut Option<IpcPipeStorage>,
+        retired: &mut Option<IpcPipeStorage>,
         wait: &W,
     ) -> Result<IpcObjectHandle, IpcError> {
+        if retired.is_some() {
+            return Err(IpcError::BadStorage);
+        }
         let capacity =
             Pipe::rounded_capacity(IPC_PIPE_PAGE_SIZE, capacity).map_err(IpcError::Object)?;
         let (index, record) = self.pop_object()?;
         let mut guard = self.lock_fresh(index, record, wait)?;
         let existing = guard.storage();
-        let chosen = if existing.fits(capacity) {
-            existing
+        let initialized = if existing.fits(capacity) {
+            guard.pipe_parts().and_then(|(state, bytes, slots)| {
+                Pipe::init(&mut state.pipe, bytes, slots, IPC_PIPE_PAGE_SIZE, capacity)
+                    .map(|_| ())
+                    .map_err(IpcError::Object)
+            })
         } else {
-            match *storage {
-                Some(s) if s.fits(capacity) => s,
-                _ => {
-                    drop(guard);
-                    push(&self.dir.free_objects, index as usize, &record.next_free);
-                    return Err(IpcError::NeedsStorage {
-                        ring_bytes: capacity as u64,
-                        pages: (capacity / IPC_PIPE_PAGE_SIZE) as u64,
-                    });
-                }
-            }
-        };
-        if let Err(e) = guard.set_storage(chosen).and_then(|()| {
-            let (state, bytes, slots) = guard.pipe_parts()?;
-            Pipe::init(&mut state.pipe, bytes, slots, IPC_PIPE_PAGE_SIZE, capacity)
-                .map(|_| ())
+            PipeRecord::unbacked(IPC_PIPE_PAGE_SIZE, capacity)
                 .map_err(IpcError::Object)
-        }) {
+                .and_then(|fresh| {
+                    guard.set_storage(IpcPipeStorage::default())?;
+                    // SAFETY: the object lock is held and the record is
+                    // unpublished.
+                    unsafe { (*record.state.get()).pipe = fresh };
+                    Ok(())
+                })
+        };
+        if let Err(e) = initialized {
             let _ = guard.set_storage(existing);
             drop(guard);
             push(&self.dir.free_objects, index as usize, &record.next_free);
             return Err(e);
         }
-        if chosen != existing {
-            *storage = (existing != IpcPipeStorage::default()).then_some(existing);
+        if guard.storage() != existing {
+            *retired = Some(existing);
         }
         Ok(guard.publish_kind(KIND_PIPE))
     }
@@ -1533,6 +1534,11 @@ impl<'a> IpcObjectGuard<'a> {
     #[allow(clippy::type_complexity)]
     fn pipe_parts(&mut self) -> Result<(&mut IpcObjectState, &mut [u8], &mut [Page]), IpcError> {
         let s = self.storage();
+        if s == IpcPipeStorage::default() {
+            // Unbacked: the record alone (its ring comes at the first write).
+            // SAFETY: the object lock is held (exclusive state access).
+            return Ok((unsafe { &mut *self.record.state.get() }, &mut [], &mut []));
+        }
         let base = self
             .region
             .pool_range(s.offset, s.footprint(), IPC_POOL_ALIGN)
@@ -1558,6 +1564,21 @@ impl<'a> IpcObjectGuard<'a> {
         }
         let (state, bytes, slots) = self.pipe_parts()?;
         Pipe::attach(&mut state.pipe, bytes, slots).map_err(|_| IpcError::Corrupt)
+    }
+
+    /// Host, under this lock: give an unbacked pipe its ring. `storage` is an
+    /// independently owned pool extent the host provisioned before locking,
+    /// holding at least the pipe's current capacity. Returns `true` when it
+    /// was installed (`storage` becomes the empty extent); `false` when the
+    /// pipe already has its ring (another writer provided it) and `storage`
+    /// stays the caller's to reclaim. `pipe::Error::Storage` when `storage`
+    /// is smaller than the capacity (F_SETPIPE_SZ grew it meanwhile).
+    pub fn provide_pipe_storage(&mut self, storage: &mut IpcPipeStorage) -> Result<bool, IpcError> {
+        if self.pipe()?.is_backed() {
+            return Ok(false);
+        }
+        self.replace_pipe_storage(storage)?;
+        Ok(true)
     }
 
     /// Replace a live pipe's storage with an independently owned pool extent.

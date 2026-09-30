@@ -129,6 +129,7 @@ impl<'a> FsView<'a> {
         match pipe::tee_in_memory_pipes(src.pipe, dst.pipe, count) {
             pipe::InMemoryTeeOutcome::SamePipe => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             pipe::InMemoryTeeOutcome::BrokenPipe => Ok(DispatchOutcome::errno(LINUX_EPIPE)),
+            pipe::InMemoryTeeOutcome::NoMemory => Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
             pipe::InMemoryTeeOutcome::Eof => Ok(DispatchOutcome::Returned { value: 0 }),
             pipe::InMemoryTeeOutcome::SourceWouldBlock => {
                 let Some(host_fd) = src.pipe.read_poll_fd() else {
@@ -1136,6 +1137,7 @@ impl<'a> FsView<'a> {
                         Transfer::Transferred(n) => DispatchOutcome::returned_len_or_errno(n),
                         Transfer::SamePipe => DispatchOutcome::errno(LINUX_EINVAL),
                         Transfer::BrokenPipe => DispatchOutcome::errno(LINUX_EPIPE),
+                        Transfer::NoMemory => DispatchOutcome::errno(LINUX_ENOMEM),
                         Transfer::Eof => DispatchOutcome::Returned { value: 0 },
                         Transfer::SourceWouldBlock => {
                             if splice_flags.contains(LinuxSpliceFlags::NONBLOCK) || status_flags & LINUX_O_NONBLOCK != 0 {

@@ -888,17 +888,28 @@ mod tests {
                 .unwrap();
             t
         }
-        /// pipe(2) as the host venue performs it.
+        /// A new pipe object before any write: no ring yet.
+        fn unbacked_pipe_object(&self) -> IpcObjectHandle {
+            let mut retired = None;
+            let object = self
+                .region
+                .create_pipe(65536, &mut retired, &HostWait)
+                .unwrap();
+            assert_eq!(retired, None);
+            object
+        }
+        /// pipe(2) as the host venue performs it, after its first write.
         fn pipe(&self, t: TableId, flags: StatusFlags) -> (i32, i32, IpcObjectHandle) {
-            let storage = IpcPipeStorage {
+            let object = self.unbacked_pipe_object();
+            // The ring the host's first write would provide.
+            let mut storage = IpcPipeStorage {
                 offset: self.bump(65536 + 16 * 8),
                 ring_bytes: 65536,
                 pages: 16,
             };
-            let object = self
-                .region
-                .create_pipe(65536, &mut Some(storage), &HostWait)
-                .unwrap();
+            let mut guard = self.region.lock(object, &HostWait).unwrap();
+            assert_eq!(guard.provide_pipe_storage(&mut storage), Ok(true));
+            drop(guard);
             let open = |end, access| {
                 self.host()
                     .open(
@@ -1170,6 +1181,62 @@ mod tests {
         assert_eq!(rw(&mut w, SYS_WRITE, c, Some(u64::MAX - 1)), 8);
         assert_eq!(rw(&mut w, SYS_WRITE, c, Some(1)), linux::EAGAIN);
         assert_eq!(host_calls(&w), 0);
+    }
+
+    /// A pipe gets its ring at its first write (Linux allocates pipe pages
+    /// on demand). EL1 never provisions: a write to an unbacked pipe
+    /// forwards unchanged before any effect, so the host provides the ring
+    /// and performs the write; reads and EOF need no ring.
+    #[test]
+    fn el1_ipc_io_first_write_to_an_unbacked_pipe_forwards_before_effects() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let object = w.unbacked_pipe_object();
+        let open = |w: &World, end, access| {
+            w.host()
+                .open(
+                    t,
+                    Fd(0),
+                    Description::new(IpcBacking::Pipe { object, end }.encode(), access, NONBLOCK),
+                    false,
+                )
+                .unwrap()
+                .0
+        };
+        let r = open(&w, End::Reader, AccessMode::ReadOnly);
+        let wfd = open(&w, End::Writer, AccessMode::WriteOnly);
+        w.mem.map(MM, 0x10000, PAGE);
+        w.mem.write(MM, 0x10000, b"ping");
+        let seqs = w.region.observe(object).unwrap();
+        let mut f = syscall(SYS_WRITE, wfd, 0x10000, 4, A_SVC);
+        let before = f;
+        assert_eq!(w.call(&mut f), IpcServed::Forward);
+        assert_eq!((f.x, f.elr), (before.x, before.elr), "frame unchanged");
+        assert_eq!(
+            w.region.observe(object).unwrap(),
+            seqs,
+            "no effect, no wake"
+        );
+        let mut g = w.region.lock(object, &HostWait).unwrap();
+        assert!(!g.pipe().unwrap().is_backed());
+        assert_eq!(g.pipe().unwrap().unread_bytes(), 0);
+        drop(g);
+        // An empty unbacked pipe reads as EAGAIN in EL1, with no ring.
+        let mut f = syscall(SYS_READ, r, 0x10000, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, linux::EAGAIN));
+        // Once the host provided the ring, EL1 serves the write itself.
+        let mut ring = IpcPipeStorage {
+            offset: w.bump(65536 + 16 * 8),
+            ring_bytes: 65536,
+            pages: 16,
+        };
+        let mut g = w.region.lock(object, &HostWait).unwrap();
+        assert_eq!(g.provide_pipe_storage(&mut ring), Ok(true));
+        drop(g);
+        let mut f = syscall(SYS_WRITE, wfd, 0x10000, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4));
+        let mut f = syscall(SYS_READ, r, 0x10000, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4));
     }
 
     #[test]
