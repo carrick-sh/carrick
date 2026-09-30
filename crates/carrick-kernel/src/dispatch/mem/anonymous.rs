@@ -778,6 +778,9 @@ impl MemState {
         }
         let layout = self.layout;
         let root = delegated.root.clone();
+        // Captured before the demotion retires their incarnations: the
+        // residency facts to hand over name them.
+        let pieces = self.root_first_touch_pieces(start, end);
         let mut demoted = Vec::new();
         root.with_root(|model| {
             model.observe_range(reservation_range(start, end)?, &mut |mapping| {
@@ -810,12 +813,14 @@ impl MemState {
             if !heap {
                 insert_dynamic_map_coalescing(self, entry);
             }
-            self.adopt_root_first_touch(mapping);
             if mapping.flags.contains(ReservationNodeFlags::LOCKED)
                 && let Some(range) = guest_range(mapping.range.start(), mapping.range.end())
             {
                 super::locked_ranges_insert(&mut self.locked_ranges, range);
             }
+        }
+        for piece in &pieces {
+            self.adopt_root_first_touch(piece);
         }
     }
 
@@ -1238,6 +1243,14 @@ impl MemView<'_> {
             HostVenue::Proposal(request) => {
                 if matches!(outcome, Ok(outcome) if succeeded(outcome, &request)) {
                     complete_delegated(&root, request)?;
+                    if matches!(
+                        request.operation,
+                        ReservationOperation::Prepare | ReservationOperation::Move
+                    ) {
+                        // What this syscall made resident belongs to the
+                        // incarnations it just created.
+                        mem.adopt_completed_residency(request.range.start(), request.range.end());
+                    }
                     return Ok(());
                 }
                 root.with_root(|model| model.refuse(request))

@@ -1111,7 +1111,8 @@ fn file_private_fixed_shared_aperture_repoints_snapshot_and_publishes_map_time_b
         dispatcher
             .mem()
             .lock()
-            .resident_ranges
+            .resident
+            .ranges()
             .iter()
             .any(|range| { range.start().raw() == mapped && range.end().raw() == mapped + LENGTH })
     );

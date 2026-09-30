@@ -1318,7 +1318,7 @@ fn range_owned_metadata_removal_clears_every_mmap_classification() {
         mem.remap_snapshots.insert(start, vec![0; len as usize]);
         mem.bus_fault_ranges.push((start, len));
         locked_ranges_insert(&mut mem.locked_ranges, range);
-        locked_ranges_insert(&mut mem.resident_ranges, range);
+        mem.record_resident(range);
         locked_ranges_insert(&mut mem.resident_tracked_ranges, range);
         mem.resident_fault_ranges.arm(range, LinuxProtFlags::READ);
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, range);
@@ -1365,7 +1365,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         mem.remap_snapshots.insert(start, snapshot);
         mem.bus_fault_ranges.push((start, len));
         locked_ranges_insert(&mut mem.locked_ranges, whole);
-        locked_ranges_insert(&mut mem.resident_ranges, whole);
+        mem.record_resident(whole);
         locked_ranges_insert(&mut mem.resident_tracked_ranges, whole);
         mem.resident_fault_ranges.arm(whole, LinuxProtFlags::READ);
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, whole);
@@ -1418,7 +1418,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
             .expect("suffix"),
     ];
     assert_eq!(mem.locked_ranges, expected_ranges);
-    assert_eq!(mem.resident_ranges, expected_ranges);
+    assert_eq!(mem.resident.ranges(), expected_ranges);
     assert_eq!(mem.resident_tracked_ranges, expected_ranges);
     assert_eq!(mem.write_sealed_shared_maps, expected_ranges);
     assert_eq!(mem.resident_fault_ranges.len(), 2);
@@ -1628,7 +1628,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         let mem_authority_124 = dispatcher.mem();
         let mut mem = mem_authority_124.lock();
         locked_ranges_insert(&mut mem.locked_ranges, replacement);
-        locked_ranges_insert(&mut mem.resident_ranges, replacement);
+        mem.record_resident(replacement);
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, replacement);
         mem.writable_memfd_maps
             .push((replacement, std::sync::Arc::clone(&writable_memfd)));
@@ -1672,7 +1672,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
     assert!(!dispatcher.range_has_host_alias_backing(start, len));
     assert_eq!(pending.dynamic_maps, before.dynamic_maps);
     assert_eq!(pending.locked_ranges, before.locked_ranges);
-    assert_eq!(pending.resident_ranges, before.resident_ranges);
+    assert_eq!(pending.resident.ranges(), before.resident.ranges());
     assert_eq!(pending.bus_fault_ranges, before.bus_fault_ranges);
     assert_eq!(
         pending.write_sealed_shared_maps,
@@ -1694,7 +1694,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
     );
     assert_eq!(after.dynamic_maps, before.dynamic_maps);
     assert_eq!(after.locked_ranges, before.locked_ranges);
-    assert_eq!(after.resident_ranges, before.resident_ranges);
+    assert_eq!(after.resident.ranges(), before.resident.ranges());
     assert_eq!(after.bus_fault_ranges, before.bus_fault_ranges);
     assert_eq!(
         after.write_sealed_shared_maps,
