@@ -2362,7 +2362,7 @@ mod guest_descriptor_lane_tests {
     use carrick_mmu_core::aarch64::descriptor_txn::{
         BackingIdentity, CallerInvalidatesAsid, DescriptorApplied, DescriptorOp, DescriptorOutcome,
         DescriptorReceipt, DescriptorRefusal, InlineJournal, PageSpan, PrimaryTableWords,
-        apply_submitted_descriptor_txn,
+        ReclaimedTables, apply_submitted_descriptor_txn,
     };
     use carrick_mmu_core::aarch64::{
         GuestLeafPublication, GuestPermissionEdit, HostArenaResolver, LiveDescriptorOwner,
@@ -2712,6 +2712,7 @@ mod guest_descriptor_lane_tests {
                 pages: 4,
                 resident: PageSpan::new(VA, 4096),
                 tables_linked: 0,
+                reclaimed: ReclaimedTables::NONE,
                 live_stores: 1,
                 flush_required: true,
             }),
