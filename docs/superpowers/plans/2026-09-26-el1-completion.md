@@ -72,6 +72,16 @@ Preserve physical-owner pins through completion and distinguish inventory mappin
 extents from physical-owner extents. Use the existing journal and submission
 channel; do not use COW byte copying to implement an alias-only mapping.
 
+**Writer removed, adapter `ec366760f`:** shared backend repoint no longer
+repeats the engine's descriptor edit. Its production hook checks the full expected
+translation before publishing metadata. The red witness caught silent creation
+of an unpublished leaf; green covers missing/partial/wrong-output/read-only
+mappings and success with host edits prohibited. Focused check, 11 backend tests
+and affected Clippy pass; see `repoint-publication.md`. This is one writer removed,
+not an active EL1 lane. The engine private/shared writer remains the immediate
+conversion target; private backend publication is bookkeeping, still lane-guarded.
+Adapter is clean at this commit; no main advancement or signed acceptance.
+
 Finish this unit with caller-connected rollback/refusal coverage. Then convert
 replacement/retired/sparse/foreign writers and engine protection/discard/exec,
 using one finite caller checklist beside the implementation. No separate framework
