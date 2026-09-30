@@ -3834,7 +3834,7 @@ impl Scheduler {
 
         // 1. Check whether target task and thread are live in the kernel graph.
         let thread = {
-            let state = self.kernel.registry().state.read();
+            let state = self.kernel.registry().settled().read();
             let Some(record) = state.tasks.get(&target.task.id) else {
                 tracing::debug!(
                     ?target,
@@ -3897,7 +3897,7 @@ impl Scheduler {
     /// zombie `Reaped`, which is backwards: a zombie is exited-but-not-yet-
     /// waited-for, so its identity is still the parent's to consume.
     fn audit_wake_rejection(&self, thread: ThreadKey, err: &SchedulerError) {
-        let state = self.kernel.registry().state.read();
+        let state = self.kernel.registry().settled().read();
         let mut target = None;
         let mut reason = None;
 

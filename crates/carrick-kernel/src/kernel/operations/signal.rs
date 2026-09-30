@@ -78,7 +78,7 @@ impl Kernel {
         signal: Option<LinuxSignal>,
     ) -> SignalTargetAuthorization {
         let target = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target_task) else {
                 return SignalTargetAuthorization::Missing;
             };
@@ -118,7 +118,7 @@ impl Kernel {
             return ExactSignalTargetAuthorization::Missing;
         }
         let (target, thread, target_credentials, target_session, target_sighand) = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target_task.id) else {
                 return ExactSignalTargetAuthorization::Missing;
             };
@@ -195,7 +195,7 @@ impl Kernel {
         action_generation: Option<crate::kernel::objects::JobControlStopInvalidationGeneration>,
     ) -> bool {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
             };
@@ -239,7 +239,7 @@ impl Kernel {
     /// its `wait` and exit consult.
     fn bind_ptrace_tracer(&self, tracee: &Task, tracer: TaskKey) -> bool {
         let tracer_task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&tracer.id) else {
                 return false;
             };
@@ -274,7 +274,7 @@ impl Kernel {
         }
         let tracer = context.task().key();
         let tracee = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return Err(carrick_abi::LINUX_ESRCH);
             };
@@ -324,7 +324,7 @@ impl Kernel {
     /// published, so the tracer's wait vehicle can be woken. The registry lock
     /// is released before callers invoke the lane waker.
     fn current_tracer_task(&self, task: &Task) -> Option<TaskRef> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         task.ptrace_tracer()
             .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
             .filter(|(key, record)| record.task.key() == *key)
@@ -339,7 +339,7 @@ impl Kernel {
         target: TaskKey,
     ) -> Result<crate::kernel::objects::PtraceMemoryAccessWitness, carrick_abi::LinuxErrno> {
         let task = {
-            let registry = self.registry().state.read();
+            let registry = self.registry().settled().read();
             let Some(record) = registry.tasks.get(&target.id) else {
                 return Err(carrick_abi::LINUX_ESRCH);
             };
@@ -353,7 +353,7 @@ impl Kernel {
 
     pub fn stop_task_for_ptrace(&self, target: TaskId, signal: LinuxSignal) -> bool {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
             };
@@ -383,7 +383,7 @@ impl Kernel {
         fault: PtraceSynchronousFault,
     ) -> bool {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
             };
@@ -409,7 +409,7 @@ impl Kernel {
 
     pub fn take_ptrace_resume_fault(&self, target: TaskId) -> Option<PtraceSynchronousFault> {
         self.registry()
-            .state
+            .settled()
             .read()
             .tasks
             .get(&target)
@@ -423,7 +423,7 @@ impl Kernel {
         signal: Option<LinuxSignal>,
     ) -> bool {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
             };
@@ -441,7 +441,7 @@ impl Kernel {
 
     pub fn settle_task_ptrace_stop(&self, target: TaskId) -> PtraceStopSettlement {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return PtraceStopSettlement::NotPtraceStopped;
             };
@@ -452,7 +452,7 @@ impl Kernel {
 
     pub(crate) fn detach_task_from_ptrace(&self, tracer: TaskKey, target: TaskId) -> bool {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
             };
@@ -473,7 +473,7 @@ impl Kernel {
 
     pub(crate) fn consume_ptrace_resume_signal(&self, target: TaskId, signal: LinuxSignal) -> bool {
         self.registry()
-            .state
+            .settled()
             .read()
             .tasks
             .get(&target)
@@ -485,7 +485,7 @@ impl Kernel {
     /// succeed and may still invoke a caught handler.
     pub fn continue_task_from_job_control(&self, target: TaskId) -> bool {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
             };
@@ -509,7 +509,7 @@ impl Kernel {
 
     pub fn task_is_job_control_stopped(&self, target: TaskId) -> bool {
         self.registry()
-            .state
+            .settled()
             .read()
             .tasks
             .get(&target)
@@ -534,7 +534,7 @@ impl Kernel {
     }
 
     pub(crate) fn task_keys_in_process_group(&self, group: ProcessGroupId) -> Vec<TaskKey> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let mut keys: Vec<TaskKey> = state
             .tasks
             .iter()
@@ -565,7 +565,7 @@ impl Kernel {
             return None;
         }
         let targets = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let container = caller.container().id();
             let group = *state
                 .process_group_by_namespace
@@ -591,7 +591,7 @@ impl Kernel {
             return None;
         }
         let targets = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let caller_record = state.tasks.get(&caller.task().key().id)?;
             if caller_record.task.key() != caller.task().key()
                 || caller_record.task.lifecycle() != TaskLifecycle::Live
@@ -624,7 +624,7 @@ impl Kernel {
     }
 
     pub(crate) fn task_keys_for_broadcast(&self, caller: TaskId) -> Vec<TaskKey> {
-        let state = self.registry().state.read();
+        let state = self.registry().settled().read();
         let Some(caller_record) = state.tasks.get(&caller) else {
             return Vec::new();
         };
@@ -671,7 +671,7 @@ impl Kernel {
         signal: LinuxSignal,
     ) -> CarrierControlSignalPost {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target.id) else {
                 return CarrierControlSignalPost::Missing;
             };
@@ -848,7 +848,7 @@ impl Kernel {
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
         let target = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
             };
@@ -870,7 +870,7 @@ impl Kernel {
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
         let (task, parent) = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state
                 .tasks
                 .get(&target.id)
@@ -933,7 +933,7 @@ impl Kernel {
     /// tasks are selected out while holding the topology read lock.
     pub fn request_container_shutdown(&self, container: ContainerId) -> usize {
         let tasks = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             state
                 .tasks
                 .values()
@@ -975,7 +975,7 @@ impl Kernel {
         publish: impl FnOnce() -> bool,
     ) -> bool {
         let task = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state
                 .tasks
                 .get(&target.id)
@@ -1007,7 +1007,7 @@ impl Kernel {
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
         let (thread, task, parent) = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&target_task.id) else {
                 return false;
             };
@@ -1070,7 +1070,7 @@ impl Kernel {
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
         let target = {
-            let state = self.registry().state.read();
+            let state = self.registry().settled().read();
             let record = match state.tasks.get(&target_task) {
                 Some(record) => record,
                 None => return false,
@@ -1555,7 +1555,7 @@ mod tests {
         let child_id = fork_child(&kernel, &root, "exiting signal target", 705);
         let group = root.task().process_group();
         {
-            let state = kernel.registry().state.read();
+            let state = kernel.registry().settled().read();
             let child = &state.tasks.get(&child_id).expect("live child").task;
             assert!(child.begin_exit());
         }
@@ -2025,7 +2025,7 @@ mod tests {
         assert!(kernel.post_signal_to_task(child_id, sigcont, None));
 
         let child = {
-            let state = kernel.registry().state.read();
+            let state = kernel.registry().settled().read();
             Arc::clone(&state.tasks.get(&child_id).expect("child task").task)
         };
         assert!(!kernel.task_is_job_control_stopped(child_id));
@@ -2059,7 +2059,7 @@ mod tests {
         assert!(kernel.post_signal_to_thread(child_id, child_tid, sigstop, None));
 
         let child = {
-            let state = kernel.registry().state.read();
+            let state = kernel.registry().settled().read();
             Arc::clone(&state.tasks.get(&child_id).expect("child task").task)
         };
         assert!(
@@ -2109,7 +2109,7 @@ mod tests {
         assert!(kernel.post_signal_to_task(child_id, sigstop, None));
         assert!(kernel.post_signal_to_thread(child_id, child_tid, sigtstp, None));
         let child = {
-            let state = kernel.registry().state.read();
+            let state = kernel.registry().settled().read();
             Arc::clone(&state.tasks.get(&child_id).expect("child task").task)
         };
         assert!(
@@ -2336,7 +2336,7 @@ mod tests {
         assert!(kernel.post_signal_to_task(child_id, sigstop, None));
         assert!(kernel.post_signal_to_thread(child_id, child_tid, sigtstp, None));
         let child = {
-            let state = kernel.registry().state.read();
+            let state = kernel.registry().settled().read();
             Arc::clone(&state.tasks.get(&child_id).expect("child task").task)
         };
         assert!(
@@ -2369,7 +2369,7 @@ mod tests {
         kernel: &Arc<Kernel>,
         id: TaskId,
     ) -> Arc<crate::kernel::objects::TaskPendingSignals> {
-        let state = kernel.registry().state.read();
+        let state = kernel.registry().settled().read();
         state
             .tasks
             .get(&id)
@@ -2432,7 +2432,7 @@ mod tests {
         ));
 
         let child = {
-            let state = kernel.registry().state.read();
+            let state = kernel.registry().settled().read();
             state.tasks.get(&child_id).unwrap().task.clone()
         };
         assert!(
@@ -2610,7 +2610,7 @@ mod tests {
         });
 
         {
-            let state = kernel.registry().state.read();
+            let state = kernel.registry().settled().read();
             let task = &state.tasks.get(&child_id).expect("child").task;
             task.set_waker(Arc::clone(&waker) as Arc<dyn crate::kernel::objects::TaskWaker>);
         }

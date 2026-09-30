@@ -3538,6 +3538,14 @@
       "rationale": "CARRICK_FORK_DEBUG_VA names one guest VA for the mmap allocator audits (free-list insert, bump lowering, grant). Parsed once into a OnceLock so the mmap/munmap hot path no longer takes the environment lock per call; read-only carrier-wide debug configuration."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-kernel/src/kernel/thread_ledger.rs",
+      "symbol": "pool_depth_from_env::CARRICK_THREAD_POOL",
+      "fingerprint": "a0d0fd83e16479ac639448b9245bd320b87a20146f644b9514d2dc9413b47c71",
+      "classification": "config_debug",
+      "rationale": "Exact =0 bisection hatch CARRICK_THREAD_POOL in crates/carrick-kernel/src/kernel/thread_ledger.rs that keeps no standing thread identities (EL1 thread lifecycle stage L1): each clone reserves its one pool entry at clone time through the same claim; read once per carrier process."
+    },
+    {
       "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "symbol": "mmap_grant_debug::CARRICK_MMAP_GRANT_DEBUG",
@@ -3744,6 +3752,14 @@
       "fingerprint": "d10d556c47439ffc179c5b09ab0b1020b8b4cfbe772087ad1bd5a542a7a7caca",
       "classification": "carrier_infra",
       "rationale": "The carrier's guest COW settlement hook: installed once per carrier before any executor starts (latest carrier wins, like the IPC window offer) and read only to settle EL1 COW completions while an MM's EL1 editor is excluded. It stores no current-container or current-MM identity; settlement is keyed by the exact MM passed in."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/thread_ledger.rs",
+      "symbol": "pool_depth_from_env::DEPTH",
+      "fingerprint": "ebaccd7a566b2cdd61ccf1d0f36981216d735118ebb88c8ac5712b8fa0ec5133",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_THREAD_POOL bisection hatch in crates/carrick-kernel/src/kernel/thread_ledger.rs; read once, immutable for the carrier's life. It seeds each Registry's ThreadLedger depth; the per-kernel state lives in the ledger, not in this static."
     }
   ]
 }

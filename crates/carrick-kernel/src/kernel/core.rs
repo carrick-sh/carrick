@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use carrick_fatal::carrick_fatal;
 
 use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, HostSignalBridge, ThreadId};
-use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::address::MmBackend;
 use super::container::{Container, ContainerId};
@@ -22,7 +22,7 @@ use super::objects::{
     TaskShared, Thread, ThreadKey, ThreadRef, ThreadResources, Zombie,
 };
 use super::operations::KernelOperationError;
-use super::registry::{IdError, IdRegistry, TaskClaim, TaskReservation, ThreadClaim};
+use super::registry::{IdError, IdRegistry, Registry, TaskClaim, TaskReservation, ThreadClaim};
 
 /// Complete syscall identity snapshot. Each context keeps the exact shared
 /// associations observed at entry, so exec/resource publication cannot tear a
@@ -255,7 +255,7 @@ impl KernelTaskBinding {
     /// Sighand with the replacement thread set. Selecting any live thread also
     /// handles a valid process whose original leader has retired.
     pub fn capture_signal_snapshot(&self) -> Result<KernelTaskSignalSnapshot, KernelError> {
-        let state = self.kernel.registry.state.read();
+        let state = self.kernel.registry.settled().read();
         let record = state
             .tasks
             .get(&self.task.id)
@@ -636,7 +636,7 @@ impl PreparedContainerRoot {
             crate::namespace::pid::PreparedNamespaceIdentity::visible_id,
         );
 
-        let mut state = kernel.registry.state.write_unpublished();
+        let mut state = kernel.registry.settled().write_unpublished();
         let mut containers = kernel.containers.lock();
         if containers.contains_key(&container.id()) {
             return Err(KernelError::DuplicateContainer(container.id()));
@@ -657,6 +657,7 @@ impl PreparedContainerRoot {
                 vfork_release: None,
                 has_execed: false,
                 diagnostic_name,
+                thread_pool: Default::default(),
             },
         );
         state.publish_process_group(
@@ -1378,9 +1379,10 @@ impl Kernel {
             vfork_release: None,
             has_execed: false,
             diagnostic_name: bootstrap.diagnostic_name.clone(),
+            thread_pool: Default::default(),
         };
-        let registry = Registry {
-            state: RegistryLock::new(RegistryState {
+        let registry = Registry::new(
+            RegistryState {
                 epoch: 1,
                 container_inits: BTreeMap::from([(container.id(), task_key)]),
                 tasks: BTreeMap::from([(bootstrap.task_id, task_record)]),
@@ -1413,8 +1415,9 @@ impl Kernel {
                     (container.id(), namespace_id),
                     session_id,
                 )]),
-            }),
-        };
+            },
+            super::thread_ledger::ThreadLedger::default(),
+        );
         let mut observations = ObservationInventory::default();
         observations.register_task(
             &task,
@@ -1563,7 +1566,12 @@ impl Kernel {
 
     /// Exact init generation for one container, never a carrier-global pid 1.
     pub fn container_init(&self, id: ContainerId) -> Option<TaskKey> {
-        self.registry.state.read().container_inits.get(&id).copied()
+        self.registry
+            .settled()
+            .read()
+            .container_inits
+            .get(&id)
+            .copied()
     }
 
     /// Prepare a later container root without publishing any graph edge.
@@ -1687,7 +1695,7 @@ impl Kernel {
     ) -> Result<super::control::ContainerTeardown, KernelError> {
         fail_container_root(failpoint, super::operations::KernelFailpoint::AfterReserve)?;
         let (container, init, mut live_tasks) = {
-            let state = self.registry.state.write_unpublished();
+            let state = self.registry.settled().write_unpublished();
             let containers = self.containers.lock();
             let container = containers
                 .get(&container_id)
@@ -1758,7 +1766,7 @@ impl Kernel {
         }
 
         let retiring_tasks = {
-            let state = self.registry.state.read();
+            let state = self.registry.settled().read();
             let containers = self.containers.lock();
             if containers
                 .get(&container_id)
@@ -1803,7 +1811,7 @@ impl Kernel {
         container.mark_retired();
 
         let tasks_reaped = {
-            let mut state = self.registry.state.write_unpublished();
+            let mut state = self.registry.settled().write_unpublished();
             let mut containers = self.containers.lock();
             if state
                 .tasks
@@ -2012,7 +2020,7 @@ impl Kernel {
     /// releases numeric claims. Registry-before-inventory is the fixed order,
     /// and the registry epoch makes the removal snapshot-visible.
     pub fn sweep_observations(&self) -> usize {
-        let mut state = self.registry.state.write_unpublished();
+        let mut state = self.registry.settled().write_unpublished();
         let removed = self.observations.lock().sweep();
         if removed != 0 {
             state.publish_epoch();
@@ -2024,7 +2032,11 @@ impl Kernel {
         &self,
         deadline: std::time::Instant,
     ) -> Result<usize, super::snapshot::KernelSnapshotError> {
-        let Some(mut state) = self.registry.state.try_write_unpublished_until(deadline) else {
+        let Some(mut state) = self
+            .registry
+            .settled()
+            .try_write_unpublished_until(deadline)
+        else {
             return Err(if std::time::Instant::now() >= deadline {
                 super::snapshot::KernelSnapshotError::TimedOut
             } else {
@@ -2102,7 +2114,7 @@ impl Kernel {
         task_id: TaskId,
         tid: LinuxTid,
     ) -> Result<KernelContext, KernelError> {
-        let state = self.registry.state.read();
+        let state = self.registry.settled().read();
         let record = state
             .tasks
             .get(&task_id)
@@ -2118,7 +2130,7 @@ impl Kernel {
     }
 
     pub fn validate_invariants(&self) -> Result<(), RegistryInvariantError> {
-        let state = self.registry.state.read();
+        let state = self.registry.settled().read();
         if state.container_inits.values().any(|root| {
             state
                 .tasks
@@ -2301,61 +2313,6 @@ impl Kernel {
     }
 }
 
-/// Authoritative object index. Multi-object mutations take this lock first and
-/// may then take at most one Task or subsystem leaf lock.
-#[derive(Debug)]
-pub struct Registry {
-    pub(super) state: RegistryLock,
-}
-
-#[derive(Debug)]
-pub(super) struct RegistryLock {
-    inner: RwLock<RegistryState>,
-}
-
-impl RegistryLock {
-    fn new(state: RegistryState) -> Self {
-        Self {
-            inner: RwLock::new(state),
-        }
-    }
-
-    pub(super) fn read(&self) -> RwLockReadGuard<'_, RegistryState> {
-        self.inner.read()
-    }
-
-    pub(super) fn try_read_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Option<RwLockReadGuard<'_, RegistryState>> {
-        self.inner.try_read_until(deadline)
-    }
-
-    pub(super) fn write(&self) -> RwLockWriteGuard<'_, RegistryState> {
-        let mut state = self.inner.write();
-        state.publish_epoch();
-        state
-    }
-
-    #[cfg(test)]
-    pub(super) fn try_write(&self) -> Option<RwLockWriteGuard<'_, RegistryState>> {
-        let mut state = self.inner.try_write()?;
-        state.publish_epoch();
-        Some(state)
-    }
-
-    fn write_unpublished(&self) -> RwLockWriteGuard<'_, RegistryState> {
-        self.inner.write()
-    }
-
-    fn try_write_unpublished_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Option<RwLockWriteGuard<'_, RegistryState>> {
-        self.inner.try_write_until(deadline)
-    }
-}
-
 /// One LIVE process's Linux identity, as [`Registry::live_processes`] reports
 /// it. The field set deliberately matches the identity half of
 /// [`super::snapshot::TaskSnapshotRow`] and the whole of
@@ -2380,7 +2337,7 @@ pub struct LiveProcess {
 
 impl Registry {
     pub(crate) fn live_process(&self, id: TaskId) -> Option<LiveProcess> {
-        let state = self.state.read();
+        let state = self.settled().read();
         let record = state.tasks.get(&id)?;
         Some(LiveProcess {
             key: record.task.key(),
@@ -2395,7 +2352,7 @@ impl Registry {
     }
 
     pub fn task(&self, id: TaskId) -> Option<TaskRef> {
-        self.state
+        self.settled()
             .read()
             .tasks
             .get(&id)
@@ -2403,7 +2360,7 @@ impl Registry {
     }
 
     pub fn zombie(&self, id: TaskId) -> Option<Zombie> {
-        self.state
+        self.settled()
             .read()
             .zombies
             .get(&id)
@@ -2411,7 +2368,7 @@ impl Registry {
     }
 
     pub(crate) fn zombies_for_container(&self, container: ContainerId) -> Vec<Zombie> {
-        self.state
+        self.settled()
             .read()
             .zombies
             .values()
@@ -2432,7 +2389,7 @@ impl Registry {
     /// count is small, so one `state` read collecting five identity fields is
     /// the whole cost.
     pub(crate) fn live_processes(&self) -> Vec<LiveProcess> {
-        self.state
+        self.settled()
             .read()
             .tasks
             .values()
@@ -2464,7 +2421,7 @@ impl Registry {
         &self,
         container: ContainerId,
     ) -> BTreeMap<u32, i32> {
-        self.state
+        self.settled()
             .read()
             .tasks
             .iter()
@@ -2486,7 +2443,7 @@ impl Registry {
         let Ok(task_id) = TaskId::from_abi_positive(pid) else {
             return false;
         };
-        let state = self.state.read();
+        let state = self.settled().read();
         match state.tasks.get(&task_id) {
             Some(record) => {
                 record.task.set_oom_score_adj(value);
@@ -2505,7 +2462,7 @@ impl Registry {
         let Ok(task_id) = TaskId::from_abi_positive(pid) else {
             return None;
         };
-        self.state
+        self.settled()
             .read()
             .tasks
             .get(&task_id)
@@ -2519,7 +2476,7 @@ impl Registry {
         let Ok(task_id) = TaskId::from_abi_positive(pid) else {
             return false;
         };
-        let state = self.state.read();
+        let state = self.settled().read();
         match state.tasks.get(&task_id) {
             Some(record) => {
                 record.task.set_nice(nice);
@@ -2532,7 +2489,7 @@ impl Registry {
     /// Apply a diagnostic/comm name update to live process `id`. `false` means
     /// no such live process.
     pub(crate) fn set_diagnostic_name(&self, id: TaskId, name: String) -> bool {
-        let mut state = self.state.write();
+        let mut state = self.settled().write();
         match state.tasks.get_mut(&id) {
             Some(record) => {
                 record.diagnostic_name = name;
@@ -2550,7 +2507,7 @@ impl Registry {
         container: ContainerId,
         pgid: ProcessGroupId,
     ) -> Vec<(Arc<Task>, carrick_abi::NsUid)> {
-        let state = self.state.read();
+        let state = self.settled().read();
         let Some(group) = state.process_groups.get(&pgid) else {
             return Vec::new();
         };
@@ -2586,7 +2543,7 @@ impl Registry {
         container: ContainerId,
         uid: carrick_abi::NsUid,
     ) -> Vec<(Arc<Task>, carrick_abi::NsUid)> {
-        self.state
+        self.settled()
             .read()
             .tasks
             .values()
@@ -2605,7 +2562,7 @@ impl Registry {
     }
 
     pub fn process_group(&self, id: ProcessGroupId) -> Option<Arc<ProcessGroup>> {
-        self.state
+        self.settled()
             .read()
             .process_groups
             .get(&id)
@@ -2622,7 +2579,7 @@ impl Registry {
         container: ContainerId,
         namespace_id: u32,
     ) -> Option<ProcessGroupId> {
-        let state = self.state.read();
+        let state = self.settled().read();
         let id = *state
             .process_group_by_namespace
             .get(&(container, namespace_id))?;
@@ -2635,7 +2592,7 @@ impl Registry {
         container: ContainerId,
         id: ProcessGroupId,
     ) -> Option<u32> {
-        self.state
+        self.settled()
             .read()
             .process_groups
             .get(&id)
@@ -2644,7 +2601,7 @@ impl Registry {
     }
 
     pub fn session(&self, id: SessionId) -> Option<Arc<Session>> {
-        self.state
+        self.settled()
             .read()
             .sessions
             .get(&id)
@@ -2658,7 +2615,7 @@ impl Registry {
         container: ContainerId,
         namespace_id: u32,
     ) -> Option<SessionId> {
-        let state = self.state.read();
+        let state = self.settled().read();
         let id = *state.session_by_namespace.get(&(container, namespace_id))?;
         state.sessions.contains_key(&id).then_some(id)
     }
@@ -2669,7 +2626,7 @@ impl Registry {
         container: ContainerId,
         id: SessionId,
     ) -> Option<u32> {
-        self.state
+        self.settled()
             .read()
             .sessions
             .get(&id)
@@ -2678,7 +2635,7 @@ impl Registry {
     }
 
     pub fn process_group_members(&self, id: ProcessGroupId) -> Vec<TaskKey> {
-        self.state
+        self.settled()
             .read()
             .process_groups
             .get(&id)
@@ -2687,7 +2644,7 @@ impl Registry {
     }
 
     pub fn session_process_groups(&self, id: SessionId) -> Vec<ProcessGroupId> {
-        self.state
+        self.settled()
             .read()
             .sessions
             .get(&id)
@@ -2696,31 +2653,36 @@ impl Registry {
     }
 
     pub fn task_ids(&self) -> Vec<TaskId> {
-        self.state.read().tasks.keys().copied().collect()
+        self.settled().read().tasks.keys().copied().collect()
     }
 
     pub fn process_group_ids(&self) -> Vec<ProcessGroupId> {
-        self.state.read().process_groups.keys().copied().collect()
+        self.settled()
+            .read()
+            .process_groups
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub fn task_count(&self) -> usize {
-        self.state.read().tasks.len()
+        self.settled().read().tasks.len()
     }
 
     pub fn zombie_count(&self) -> usize {
-        self.state.read().zombies.len()
+        self.settled().read().zombies.len()
     }
 
     pub fn process_group_count(&self) -> usize {
-        self.state.read().process_groups.len()
+        self.settled().read().process_groups.len()
     }
 
     pub fn session_count(&self) -> usize {
-        self.state.read().sessions.len()
+        self.settled().read().sessions.len()
     }
 
     pub fn retired_thread_count(&self) -> usize {
-        self.state.read().retired_threads.len()
+        self.settled().read().retired_threads.len()
     }
 }
 
@@ -2750,7 +2712,7 @@ fn fail_container_root(
 }
 
 impl RegistryState {
-    fn publish_epoch(&mut self) {
+    pub(super) fn publish_epoch(&mut self) {
         let Some(next) = self.epoch.checked_add(1) else {
             carrick_fatal!(
                 "kernel::registry_epoch",
@@ -2831,6 +2793,10 @@ pub(super) struct TaskRecord {
     pub(super) vfork_release: Option<VforkChildRelease>,
     pub(super) has_execed: bool,
     pub(super) diagnostic_name: String,
+    /// Standing thread identities for this task's future clones. Owned by
+    /// the record so they are released exactly when the task leaves the live
+    /// set.
+    pub(super) thread_pool: super::thread_ledger::ThreadIdentityPool,
 }
 
 #[derive(Debug)]
