@@ -346,6 +346,7 @@ impl PipeInner {
     }
     #[cfg(test)]
     pub(crate) fn guest_write_for_test(&self, bytes: &[u8]) {
+        self.ensure_ring().unwrap();
         let mut guard = self.lock();
         let step = guard.pipe().unwrap().try_write(bytes);
         assert_eq!(step.result, Ok(bytes.len()));
@@ -421,13 +422,31 @@ impl PipeInner {
         }
         step.result.map_err(object_error)
     }
+    /// Give the pipe its ring (at its first write). ENOMEM only when the
+    /// IPC pool itself is exhausted, as a failed pipe page allocation is.
+    fn ensure_ring(&self) -> Result<(), LinuxErrno> {
+        match self.owner.ensure_pipe_storage(self.object) {
+            Ok(()) => Ok(()),
+            Err(crate::el1_ipc::AdmissionError::NoMemory) => Err(LINUX_ENOMEM),
+            Err(_) => carrick_fatal::carrick_fatal!("ipc::pipe", "live pipe ring provision"),
+        }
+    }
     pub(crate) fn write_bytes(&self, bytes: &[u8]) -> Result<usize, LinuxErrno> {
-        let mut guard = self.lock();
-        let step = guard
-            .pipe()
-            .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"))
-            .try_write(bytes);
-        self.finish(guard, step)
+        loop {
+            let mut guard = self.lock();
+            let step = guard
+                .pipe()
+                .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"))
+                .try_write(bytes);
+            if step.result == Err(core_pipe::Error::Storage) {
+                // An unbacked pipe (EPIPE was already decided): its first
+                // write provides the ring outside the object lock.
+                drop(guard);
+                self.ensure_ring()?;
+                continue;
+            }
+            return self.finish(guard, step);
+        }
     }
     pub(crate) fn read_with(
         &self,
@@ -727,6 +746,8 @@ pub(crate) fn take_pipe_bytes(pipe: &PipeRef, length: usize) -> PipeDrain<'_> {
 pub enum InMemoryTeeOutcome {
     SamePipe,
     BrokenPipe,
+    /// The destination's ring could not be provided (IPC pool exhausted).
+    NoMemory,
     Eof,
     SourceWouldBlock,
     DestWouldBlock,
@@ -752,6 +773,15 @@ pub(crate) fn transfer_in_memory_pipes(
     }
     if count == 0 {
         return InMemoryTeeOutcome::Transferred(0);
+    }
+    // The destination's ring comes with its first write, provided before
+    // either object lock is taken (only when there is something to move).
+    if source.snapshot().unread != 0 && dest.ensure_ring().is_err() {
+        return if dest.snapshot().readers == 0 {
+            InMemoryTeeOutcome::BrokenPipe
+        } else {
+            InMemoryTeeOutcome::NoMemory
+        };
     }
     // One stable order for every host operation touching two pipe objects.
     let (mut src, mut dst) = if Arc::as_ptr(source) < Arc::as_ptr(dest) {
@@ -1082,6 +1112,8 @@ mod tests {
             "guest operation must prevent premature EOF"
         );
         {
+            // A guest write after the host's first write gave the ring.
+            pipe.ensure_ring().unwrap();
             let mut guard = region.lock(pipe.object, &HostLockWait).unwrap();
             assert_eq!(guard.pipe().unwrap().try_write(b"guest").result, Ok(5));
         }
@@ -1119,6 +1151,7 @@ mod tests {
             0,
             "cached proxy is not a live host subscriber"
         );
+        pipe.ensure_ring().unwrap();
         let mut guard = pipe.lock();
         let step = guard.pipe().unwrap().try_write(b"guest");
         assert!(!guard.publish(step.wake).host_owed);
@@ -1141,6 +1174,18 @@ mod tests {
         let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
         let pipe = Arc::new(PipeInner::create(Arc::clone(&owner), 1, 65536).unwrap());
         let region = owner.region();
+        // EL1 forwards a write to an unbacked pipe; the host gives the ring.
+        assert_eq!(
+            region
+                .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .try_write(b"guest")
+                .result,
+            Err(core_pipe::Error::Storage)
+        );
+        pipe.ensure_ring().unwrap();
         let mut guest = region
             .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
             .unwrap();

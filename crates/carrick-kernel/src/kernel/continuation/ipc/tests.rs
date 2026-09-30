@@ -202,15 +202,20 @@ impl World {
         at
     }
     fn pipe(&self) -> (Fd, Fd, IpcObjectHandle) {
-        let storage = IpcPipeStorage {
+        let mut retired = None;
+        let object = self
+            .region
+            .create_pipe(65536, &mut retired, &HostIpcWait)
+            .unwrap();
+        // The ring the host's first write provides.
+        let mut storage = IpcPipeStorage {
             offset: self.bump(65536 + 16 * 8),
             ring_bytes: 65536,
             pages: 16,
         };
-        let object = self
-            .region
-            .create_pipe(65536, &mut Some(storage), &HostIpcWait)
-            .unwrap();
+        let mut guard = self.region.lock(object, &HostIpcWait).unwrap();
+        assert_eq!(guard.provide_pipe_storage(&mut storage), Ok(true));
+        drop(guard);
         let fd = self.region.fd(HostIpcWait);
         let open = |end, access| {
             fd.open(

@@ -117,12 +117,19 @@ impl Fixture {
             .create_table(1024, &mut self.descriptors(64))
             .unwrap()
     }
-    /// What the host venue does for pipe(2): one object, two descriptions.
+    /// What the host venue does for pipe(2): one object, two descriptions,
+    /// then (as the host's first write would) the pipe's ring.
     fn pipe(&self, table: TableId) -> (Fd, Fd, IpcObjectHandle) {
-        let object = self
-            .region
-            .create_pipe(65536, &mut Some(self.pipe_storage()), &Spin)
-            .unwrap();
+        let mut retired = None;
+        let object = self.region.create_pipe(65536, &mut retired, &Spin).unwrap();
+        if retired.is_none() {
+            let mut storage = self.pipe_storage();
+            let mut guard = self.region.lock(object, &Spin).unwrap();
+            if !guard.provide_pipe_storage(&mut storage).unwrap() {
+                // The reused record kept a fitting ring.
+                assert!(guard.pipe().unwrap().is_backed());
+            }
+        }
         let open = |end, access| {
             self.host()
                 .open(
@@ -505,25 +512,53 @@ fn el1_ipc_host_notification_is_owed_only_to_subscribers() {
 fn el1_ipc_storage_refusals_roll_back_and_free_records_keep_storage() {
     let fx = fixture(1 << 20);
     let t = fx.table();
-    // No storage supplied for a fresh record: refused, nothing consumed.
+    // A fresh record needs no storage: the pipe starts unbacked, and its
+    // first write refuses before any effect (EL1 forwards; the host
+    // provides the ring). Out-of-pool storage fails closed, nothing kept.
     let mut none = None;
+    let unbacked = fx.region.create_pipe(65536, &mut none, &Spin).unwrap();
+    assert_eq!(none, None);
+    let mut g = fx.region.lock(unbacked, &Spin).unwrap();
+    assert_eq!(g.pipe().unwrap().capacity(), 65536);
+    assert!(!g.pipe().unwrap().is_backed());
+    let before = g.seqs();
+    let step = g.pipe().unwrap().try_write(b"x");
+    assert_eq!(step.result, Err(pipe::Error::Storage));
     assert_eq!(
-        fx.region.create_pipe(65536, &mut none, &Spin),
-        Err(IpcError::NeedsStorage {
-            ring_bytes: 65536,
-            pages: 16
-        })
+        g.publish(step.wake).seqs,
+        before,
+        "a refused write wakes nobody"
     );
-    // Out-of-pool storage fails closed and leaves the record reusable.
-    let mut bad = Some(IpcPipeStorage {
+    let mut bad = IpcPipeStorage {
         offset: fx.pool_len,
         ring_bytes: 65536,
         pages: 16,
-    });
+    };
+    assert_eq!(g.provide_pipe_storage(&mut bad), Err(IpcError::BadStorage));
+    let mut small = fx.pipe_storage();
+    small.ring_bytes = 4096;
+    small.pages = 1;
     assert_eq!(
-        fx.region.create_pipe(65536, &mut bad, &Spin),
-        Err(IpcError::BadStorage)
+        g.provide_pipe_storage(&mut small),
+        Err(IpcError::Object(pipe::Error::Storage)),
+        "a ring smaller than the capacity is refused"
     );
+    let mut ring = fx.pipe_storage();
+    assert_eq!(g.provide_pipe_storage(&mut ring), Ok(true));
+    assert_eq!(ring, IpcPipeStorage::default(), "consumed");
+    let mut spare = fx.pipe_storage();
+    assert_eq!(
+        g.provide_pipe_storage(&mut spare),
+        Ok(false),
+        "already backed"
+    );
+    assert_ne!(
+        spare,
+        IpcPipeStorage::default(),
+        "left for the host to reclaim"
+    );
+    assert_eq!(g.pipe().unwrap().try_write(b"x").result, Ok(1));
+    drop(g);
     let (r, w, object) = fx.pipe(t);
     // F_SETPIPE_SZ beyond the reserve: Storage, capacity and bytes kept.
     el1_io(&fx, t, w, Some(b"kept"), &mut []).unwrap();
@@ -537,11 +572,19 @@ fn el1_ipc_storage_refusals_roll_back_and_free_records_keep_storage() {
     drop(g);
     fx.finish(fx.host().close(t, r).unwrap());
     fx.finish(fx.host().close(t, w).unwrap());
-    // The freed record kept its storage: a new pipe needs none supplied.
+    // The freed record kept its storage: a new pipe reuses it.
     let mut none = None;
     let reused = fx.region.create_pipe(65536, &mut none, &Spin).unwrap();
     assert_eq!(reused.index(), object.index());
     assert_eq!(none, None);
+    assert!(
+        fx.region
+            .lock(reused, &Spin)
+            .unwrap()
+            .pipe()
+            .unwrap()
+            .is_backed()
+    );
     let mut g = fx.region.lock(reused, &Spin).unwrap();
     assert_eq!(
         g.pipe().unwrap().unread_bytes(),
@@ -1132,5 +1175,30 @@ fn el1_ipc_host_wake_index_spans_every_segment_without_scanning() {
     assert_eq!(
         fx.region.drain_host_wake_candidates(|_| panic!("drained")),
         0
+    );
+}
+
+/// A reused record whose retained ring is too small for the new pipe starts
+/// the pipe unbacked and hands the old ring back for reclamation, rather
+/// than asking for storage at creation.
+#[test]
+fn el1_ipc_too_small_retained_ring_is_retired_at_creation() {
+    let fx = fixture(1 << 20);
+    let t = fx.table();
+    let (r, w, object) = fx.pipe(t);
+    let kept = fx.region.lock(object, &Spin).unwrap().storage();
+    fx.finish(fx.host().close(t, r).unwrap());
+    fx.finish(fx.host().close(t, w).unwrap());
+    let mut retired = None;
+    let big = fx.region.create_pipe(1 << 20, &mut retired, &Spin).unwrap();
+    assert_eq!(big.index(), object.index());
+    assert_eq!(retired, Some(kept));
+    let mut g = fx.region.lock(big, &Spin).unwrap();
+    assert_eq!(g.pipe().unwrap().capacity(), 1 << 20);
+    assert!(!g.pipe().unwrap().is_backed());
+    assert_eq!(
+        fx.region.create_pipe(4096, &mut retired, &Spin),
+        Err(IpcError::BadStorage),
+        "retired storage must be collected before the next creation"
     );
 }
