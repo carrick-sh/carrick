@@ -490,7 +490,7 @@ mod tests {
         arena.set_leaf(VA, OLD | 3 | AF | SH | AP_RO_EL0 | NG);
         assert_eq!(
             resolve(&arena, &memory, &pool, VA, &Cell::new(0)),
-            GuestCowOutcome::Declined(CowDecline::NotCowArmed)
+            GuestCowOutcome::Declined(CowDecline::NotEl1Private)
         );
         assert_eq!(pool.ready(MM).count(), 1);
         arena.set_leaf(VA, before[((Arena::leaf_pa(VA) - ROOT) / 8) as usize]);
