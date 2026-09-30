@@ -40,7 +40,63 @@ status/order statements where explicitly corrected below.
 
 ## Current execution decision — impact reset, 2026-09-29
 
-This section is the current work order. The chronological observations below
+### Delivery correction after renewed user review
+
+This work order supersedes the ordering of the earlier five-step table below.
+Live reinspection of adapter `09afdd4c5` confirms admission remains disabled
+(`host_copyout=false`, `backend_writers=false`). No new checkpoint is accepted.
+Repeated prerequisite commits and repeated impact-reset prose have not delivered
+an active descriptor lane. Do not count this plan edit as implementation progress.
+
+**Split the next milestone into two independently observable deliveries:**
+
+1. **Active descriptor ownership.** Close the actual production descriptor-writer
+   census, then enable the complete lane and run a signed two-live-MM witness:
+   host copyout, fork/COW, permission changes and retirement must execute through
+   EL1 with authenticated backing and completion before reuse. Existing host
+   reservation policy may remain during this intermediate delivery; label it
+   explicitly. It is not checkpoint-2 acceptance. Do not wait for the entire
+   SharedReservations policy migration before seeking this execution evidence,
+   unless a concrete source dependency makes that ordering necessary.
+2. **Complete anonymous-memory ownership.** Move production brk/mmap reservation
+   decisions and fork/exec/exit lifecycle to SharedReservations, remove the
+   superseded authority, prove pause-free progress once all writers are converted,
+   then run full checkpoint correctness, structural and workload-cost acceptance.
+
+**Immediate implementation unit:** existing engine private/shared repoint callers
+through verified EL1 descriptor publication and subsequent backend alias
+bookkeeping. Source inspection shows the engine performs the descriptor write;
+private backend publication is bookkeeping, while shared backend publication
+also repeats the descriptor edit. Classify by actual mutation, not method name.
+Preserve physical-owner pins through completion and distinguish inventory mapping
+extents from physical-owner extents. Use the existing journal and submission
+channel; do not use COW byte copying to implement an alias-only mapping.
+
+Finish this unit with caller-connected rollback/refusal coverage. Then convert
+replacement/retired/sparse/foreign writers and engine protection/discard/exec,
+using one finite caller checklist beside the implementation. No separate framework
+or new transport project. Every added abstraction must have its production caller
+in the same implementation unit. Do not remove ownership guards or enable partial
+admission to obtain an early green result.
+
+**Change the monitor's action, not just its wording:** retain a running list of
+remaining activation blockers; a removed blocker must identify the production
+call site and evidence. Two consecutive prerequisite-only intervals trigger a
+choice: finish the named integration, simplify/delete redundant orchestration, or
+stop that investigation and move to another required writer. Repeating that the
+prerequisite is necessary is not a course correction. Thirty minutes without new
+discriminating evidence triggers that choice sooner. Report elapsed effort and
+whether the blocker list shrank; tests/commits/documentation are not the metric.
+Do not invent a percentage or completion date from an incomplete writer census.
+
+Stop additional broad boot/IPC capture campaigns, repeated full qualification of
+disabled intermediate states, and expansion of helper fixtures without an actual
+caller defect. Keep focused red-first checks during conversion. Run the first
+signed descriptor-ownership witness at delivery 1, not only after delivery 2;
+retain full acceptance gates and exact-artifact provenance at their proper scope.
+Later ARM64 checkpoints remain required; x86 remains deferred.
+
+The delivery correction above is the current work order. The observations below
 preserve evidence; their older “next” statements are not competing work orders.
 
 **Diagnosis:** development has accumulated useful foundations and regression
