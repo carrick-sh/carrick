@@ -1,0 +1,7 @@
+run_id=el1-retire-debug-22523-08
+deadline_seconds=5
+fatal_hold_seconds=60
+stop_on_signal=<none>
+exe=/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/el1-resume-b3/retirement-debug/carrick
+lldb_plugin=/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/scripts/carrick_lldb.py
+run_args=--name el1-retire-debug-22523-08 --fs host -w /tmp --max-traps 18446744073709551615 localhost:5005/carrick-go-conformance@sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b /bin/sh -c cd /tmp && printf 'package main\nfunc main(){println("ok")}\n' > h.go && GOCACHE=/tmp/gc /usr/local/go/bin/go build -o /tmp/h ./h.go && /tmp/h && echo BUILD_OK

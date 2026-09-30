@@ -1,0 +1,21 @@
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-sched-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 1 test
+
+thread 'tests::guest_wake_publication_has_no_remaining_futex_entry' (33174271) panicked at crates/carrick-sched-core/src/tests.rs:1656:9:
+assertion `left == right` failed: runnable publication left futex queue entries attached
+  left: [1]
+ right: [0]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::guest_wake_publication_has_no_remaining_futex_entry ... FAILED
+
+failures:
+
+failures:
+    tests::guest_wake_publication_has_no_remaining_futex_entry
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 53 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-sched-core --lib`

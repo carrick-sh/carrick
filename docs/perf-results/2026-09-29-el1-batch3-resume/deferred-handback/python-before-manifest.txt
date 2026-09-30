@@ -1,0 +1,7 @@
+run_id=el1-b3-current-python-20260929
+deadline_seconds=180
+fatal_hold_seconds=180
+stop_on_signal=<none>
+exe=/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/carrick
+lldb_plugin=scripts/carrick_lldb.py
+run_args=--name el1-b3-current-python-20260929 --fs host localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30 /usr/local/bin/python3 -m test -v --randseed 0 test_multiprocessing_fork

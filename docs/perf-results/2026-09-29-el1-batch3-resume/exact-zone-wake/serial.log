@@ -1,0 +1,147 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.92s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 109 tests
+test dispatch::container_policy_dispatch_tests::serial_host::policy_is_inherited_by_forked_children ... ok
+test dispatch::fifo_beacon::tests::serial_host::parked_reader_and_writer_cleanup_drains_presence_and_removes_beacon ... ok
+test dispatch::fifo_beacon::tests::serial_host::rdwr_registration_asserts_both_presence_pipes ... ok
+test dispatch::fifo_beacon::tests::serial_host::readers_present_becomes_readable_and_unreadable_on_close ... ok
+test dispatch::fifo_beacon::tests::serial_host::register_close_requires_a_live_host_fd_owner ... ok
+test dispatch::fifo_beacon::tests::serial_host::writer_reopen_rearms_a_live_reader_beacon ... ok
+test dispatch::fifo_beacon::tests::serial_host::writers_present_becomes_readable_and_unreadable_on_close ... ok
+test dispatch::fs::tests::readonly_destination_offsets::serial_host::test_getdents64_structural_budget_10_100_1000_entries ... ok
+test dispatch::fs::tests::serial_host::absolute_lower_fast_open_refuses_nofollow_symlink_semantics ... ok
+test dispatch::fs::tests::serial_host::absolute_readonly_open_can_install_an_upper_absent_lower_file_directly ... ok
+test dispatch::fs::tests::serial_host::deep_tree_lookups_and_negative_opens_via_dentry_cache ... ok
+test dispatch::fs::tests::serial_host::directory_listing_is_taken_at_read_time_not_open_time ... ok
+test dispatch::fs::tests::serial_host::fstat_caches_host_xattrs_and_invalidates_on_mutators ... ok
+test dispatch::fs::tests::serial_host::immutable_lower_directory_path_stat_matches_its_fd_stat ... ok
+test dispatch::fs::tests::serial_host::immutable_lower_path_stat_reports_real_mtime_and_nlink ... ok
+test dispatch::fs::tests::serial_host::immutable_lower_reports_one_inode_through_stat_fstat_and_getdents ... ok
+test dispatch::fs::tests::serial_host::namespace_ops_host_syscall_budget ... ok
+test dispatch::fs::tests::serial_host::repeated_openat_newfstatat_name_resolution_budget ... ok
+test dispatch::fs::tests::serial_host::test_guest_openat_1000_files_in_one_dir_host_openat_budget ... ok
+test dispatch::fs::tests::serial_host::test_mkdirat_under_resolved_parent_zero_openat_budget ... ok
+test dispatch::fs::tests::serial_host::trusted_immutable_lower_falls_back_after_an_upper_shadow ... ok
+test dispatch::fs::tests::serial_host::trusted_immutable_lower_serves_walk_recursively_while_upper_is_unchanged ... ok
+test dispatch::fs::tests::serial_host::trusted_immutable_lower_stat_preserves_layered_guest_identity ... ok
+test dispatch::fs::tests::serial_host::trusted_upper_only_directory_seeds_the_lane_and_streams ... ok
+test dispatch::fs::tests::serial_host::tty0_legacy_termio_set_variants_round_trip ... ok
+test dispatch::fs::tests::serial_host::tty0_tcflsh_accepts_linux_selectors_and_rejects_invalid ... ok
+test dispatch::fs::tests::serial_host::tty0_two_opens_share_termios_and_winsize ... ok
+test dispatch::inzone_tcp::serial_host::inzone_tcp_disconnect_rebind_accepted_stream ... ok
+test dispatch::inzone_tcp::serial_host::inzone_tcp_disconnect_rebind_and_reconnect ... ok
+test dispatch::inzone_tcp::serial_host::inzone_tcp_disconnect_rebind_lifecycle ... ok
+test dispatch::ioring::tests::serial_host::host_fork_observes_shared_queue_bytes ... ok
+test dispatch::mem::backing::tests::serial_host::clean_private_repoint_failure_does_not_commit_shared_file_writeback ... ok
+test dispatch::mem::backing::tests::serial_host::dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction ... ok
+test dispatch::mem::backing::tests::serial_host::mmap_private_hostfile_hatch_zero_keeps_snapshot_path ... ok
+test dispatch::mem::backing::tests::serial_host::mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success ... ok
+test dispatch::mem::backing::tests::serial_host::partial_shared_file_munmaps_write_exact_fragments_and_close_once ... ok
+test dispatch::mem::tests::serial_host::darwin_private_file_mapping_detaches_from_truncate ... ok
+test dispatch::mem::tests::serial_host::indeterminate_private_repoint_failure_fails_stopped ... carrick fatal [dispatch::mmap_overlay]: private repoint failure entered indeterminate state during overlay
+ok
+test dispatch::mem::tests::serial_host::post_repoint_protection_failure_aborts_instead_of_publishing_split_ownership ... carrick fatal [dispatch::mmap_overlay]: protect_range failed on repointed memory range during private overlay: host mapping operation failed: injected private protection failure
+ok
+test dispatch::mem::tests::serial_host::private_overlay_middle_replacement_carves_exact_storage ... ok
+test dispatch::mem::tests::serial_host::private_overlay_prefix_replacement_carves_exact_storage ... ok
+test dispatch::mem::tests::serial_host::private_overlay_suffix_replacement_carves_exact_storage ... ok
+test dispatch::mem::tests::serial_host::shared_anon_persistent_rollback_failure_aborts_concurrent_exec_backend ... carrick fatal [dispatch::mmap_rollback]: shared-anon rollback unmap failed under concurrent-exec protection
+ok
+test dispatch::net::netlink_readiness_tests::serial_host::named_fifo_terminal_readiness_reports_implicit_hup ... ok
+test dispatch::net::reuseport::tests::serial_host::a_lone_member_is_not_shared ... ok
+test dispatch::net::reuseport::tests::serial_host::an_ungrouped_socket_is_untouched ... ok
+test dispatch::net::reuseport::tests::serial_host::leaving_keeps_the_cursor_in_range ... ok
+test dispatch::net::reuseport::tests::serial_host::leaving_prunes_the_member_and_empty_groups ... ok
+test dispatch::net::reuseport::tests::serial_host::siblings_exclude_self_and_start_at_the_cursor ... ok
+test dispatch::net::reuseport::tests::serial_host::socket_type_separates_groups ... ok
+test dispatch::net::reuseport::tests::serial_host::stealing_is_gated_on_the_turn_but_own_draining_is_not ... ok
+test dispatch::net::reuseport::tests::serial_host::two_members_alternate_deterministically ... ok
+test dispatch::overlay_dispatch_tests::serial_host::epoll_et_repolls_host_level_when_mux_misses_wake ... ok
+test dispatch::overlay_dispatch_tests::serial_host::non_cloexec_classic_record_lock_survives_exec_transfer ... ok
+test dispatch::signal::tests::serial_host::cross_process_sigqueue_checks_guest_credentials_before_ring_capacity ... ok
+test dispatch::signal::tests::serial_host::cross_process_sigqueue_signal_zero_checks_guest_credentials ... ok
+test dispatch::signal::tests::serial_host::queued_signal_copies_siginfo_before_validating_selector ... ok
+test dispatch::signal::tests::serial_host::queued_signal_nonpositive_target_errno_depends_on_syscall_shape ... ok
+test dispatch::signal::tests::serial_host::retired_cross_process_sigqueue_transport_returns_esrch_without_host_fallback ... ok
+test dispatch::signal::tests::serial_host::sigqueueinfo_payload_uses_resolved_guest_main_thread_key ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::existing_shmget_rejects_a_larger_requested_size ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::message_queue_hot_path_does_not_rewrite_identity_file ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::msg_queue_wait_outcome_owns_send_state_without_executor_tls ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock ... 
+running 1 test
+test dispatch::sysv::ipc_set_tests::serial_host::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2311 filtered out; finished in 0.26s
+
+ok
+test dispatch::sysv::ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting ... 
+running 1 test
+test dispatch::sysv::ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2311 filtered out; finished in 0.00s
+
+ok
+test dispatch::sysv::ipc_set_tests::serial_host::semctl_setall_witness_revalidates_identity_and_fails_eidrm_when_removed ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::semctl_setall_witness_revalidates_permissions_and_fails_eacces_when_mode_revoked ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::semctl_setall_witness_succeeds_and_updates_values_when_valid ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::shmdt_ambiguous_backend_unmap_failure_aborts_with_sigabrt ... carrick fatal [dispatch::sysv_shmdt]: ambiguous unmap failure leaving split shared memory backend ownership
+ok
+test dispatch::sysv::ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout ... 
+running 1 test
+ok
+test el1_delegation::tests::serial_host::a_demoted_description_never_reenters_the_zone ... ok
+test el1_delegation::tests::serial_host::a_pending_description_recalls_on_host_access ... ok
+test el1_delegation::tests::serial_host::a_second_open_joins_the_zone_with_its_own_offset ... ok
+test el1_delegation::tests::serial_host::a_user_copy_failure_falls_back_instead_of_serving ... ok
+test el1_delegation::tests::serial_host::accessor_on_a_delegated_description_recalls_it_first ... ok
+test el1_delegation::tests::serial_host::an_fd_number_the_table_reassigns_is_forgotten_by_el1 ... ok
+test el1_delegation::tests::serial_host::closing_one_member_keeps_the_inode_in_the_zone ... ok
+test el1_delegation::tests::serial_host::contended_host_lock_yields_until_the_holder_releases ... ok
+test el1_delegation::tests::serial_host::forwarded_operations_are_served_on_the_host_without_recall ... ok
+test el1_delegation::tests::serial_host::in_memory_files_are_never_delegated ... ok
+test el1_delegation::tests::serial_host::inspecting_a_delegated_description_leaves_it_in_the_zone ... ok
+test el1_delegation::tests::serial_host::mapping_recalls_and_blocks_delegation ... ok
+test el1_delegation::tests::serial_host::recall_during_delegation_rolls_the_delegation_back ... ok
+test el1_delegation::tests::serial_host::recall_path_by_identity_recalls_only_that_inode ... ok
+test el1_delegation::tests::serial_host::recall_writes_back_bytes_size_and_offset ... ok
+test el1_delegation::tests::serial_host::sync_by_inode_writes_back_only_what_the_zone_owns ... ok
+test el1_delegation::tests::serial_host::sync_writes_back_in_zone_bytes_without_recalling ... ok
+test exec_stamps::tests::serial_host::related_and_reap_records_bind_the_exact_child ... ok
+test exec_stamps::tests::serial_host::run_completion_carries_the_transitive_child_cpu_denominator ... ok
+test exec_stamps::tests::serial_host::spawned_guest_process_exit_exports_both_terminal_stamps_before_raw_exit ... ok
+test exec_stamps::tests::serial_host::stamp_appends_one_line_per_phase_when_gated ... ok
+test file_authority::tests::serial_host::rejected_direct_adoptions_close_transferred_capabilities ... ok
+test kernel::container::tests::serial_host::from_process_env_falls_back_to_the_carrier_pid_scope ... ok
+test kernel::container::tests::serial_host::from_process_env_reads_a_managed_detached_carrier ... ok
+test kernel::container::tests::serial_host::from_process_env_refuses_an_unsafe_registry_id ... ok
+test kernel::container::tests::serial_host::from_process_env_treats_an_empty_run_id_as_absent ... ok
+test kernel::continuation::tests::serial_host::event_future_cancelled_observation_drains_inflight_operation_safely ... 
+running 1 test
+test kernel::continuation::tests::serial_host::event_future_cancelled_observation_drains_inflight_operation_safely ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2311 filtered out; finished in 5.01s
+
+ok
+test kernel::continuation::tests::serial_host::fd_wait_pins_exact_open_description_until_cleanup_and_rejects_reuse ... ok
+test kernel::continuation::tests::serial_host::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock ... 
+running 1 test
+test kernel::continuation::tests::serial_host::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2311 filtered out; finished in 0.00s
+
+ok
+test kernel::control::tests::serial_host::exec_status_and_wait_return_and_consume_exact_terminal_result ... ok
+test kernel::crash_capture::tests::serial_host::crash_quorum_reads_the_authoritative_el1_save_area_for_a_parked_sibling ... ok
+test kernel::crash_capture::tests::serial_host::crash_quorum_still_completes_without_el1_registers_when_truly_absent ... ok
+test kernel::debug::tests::serial_host::a_request_without_an_action_reads_rather_than_aborts ... ok
+test kernel::debug::tests::serial_host::an_abort_request_is_acknowledged_and_latched_exactly_once ... ok
+test kernel::scheduler::tests::serial_host::an_absent_but_non_terminal_target_is_a_lost_transition_not_a_reap ... ok
+test network::socket_namespace::tests::serial_host::forked_child_resolves_private_realm_endpoints_across_the_fork ... ok
+test network::socket_namespace::tests::serial_host::forked_child_resolves_service_and_endpoint_records_across_the_fork ... ok
+test network::socket_namespace::tests::serial_host::published_relays_of_two_instances_do_not_cross_wire ... ok
+test run_state::tests::serial_host::parent_seed_races_child_blocked_publish_across_fork ... ok
+
+test result: ok. 109 passed; 0 failed; 0 ignored; 0 measured; 2203 filtered out; finished in 6.45s
+

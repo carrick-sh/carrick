@@ -1,3 +1,12 @@
+# Request-lifetime follow-up: request words now carry 64-bit incarnation
+# identities and HOST_REQUEST_PROTOCOL participates in ABI hashing. Record
+# layout/hash regression bindings remain required; no new GIC/fault/page-table
+# behavior is asserted by the request lifetime tests.
+# Transfer-protocol review: the shared ABI hash now includes transfer claim
+# encodings, so older images cannot decode an in-flight transfer as Free.
+# No GIC, fault, metadata or page-table layout/algorithm changed here; retain
+# those existing regression bindings. New transfer unit tests do not prove
+# these contracts, and fresh signed promotion remains required.
 schema_version = 1
 id = "kernel.el1.fault-entry"
 title = "Guest EL1 lower-EL data-abort entry and architectural context preservation with host fallback"
@@ -19,7 +28,7 @@ rationale = "EL1 data-abort entry and context preservation contract. EL0 data ab
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-el1-abi::tests (trap_frame_layout_and_offsets, counters_abi_layout); carrick-el1::fault::tests (dispatch_fault_increments_counter_and_forwards); carrick-mem::memory::el1_shim_tests (el1_data_abort_vector_routing_and_hook_installation); carrick-mem::memory::el1_hook_kick (fault_hook_forward_restores_complete_architectural_context)"
+vm_free = "carrick-el1-abi::tests (trap_frame_layout_and_offsets, counters_abi_layout); carrick-el1::fault::tests (dispatch_fault_increments_counter_and_forwards); carrick-mem::memory::el1_shim_tests (el1_data_abort_vector_routing_and_hook_installation); carrick-mem::memory::el1_hook_kick (fault_hook_forward_restores_complete_architectural_context); carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused (shared ABI identity now includes OnCpuRequested; image header acceptance/rejection only, no new el1-fault-entry semantic or signed acceptance claim)"
 embed = "carrick-embed::el1_sched (signed; el1_memory_fault_entry_preserves_context verifies stage-1 permission fault entry, SIGSEGV si_addr accuracy, mprotect retry, complete register canary preservation, and positive fault_taken counter in live carrier)"
 
 [bindings.unresolved]

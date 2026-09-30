@@ -1,0 +1,28 @@
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-sched-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 2 tests
+
+thread 'tests::service_take_keeps_identity_after_return_and_reuse' (33091783) panicked at crates/carrick-sched-core/src/tests.rs:423:5:
+assertion `left == right` failed: returned service acquired a replacement identity
+  left: RecordRef { id: RecordId(1), incarnation: 3 }
+ right: RecordRef { id: RecordId(1), incarnation: 1 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'tests::host_wake_batch_keeps_identity_after_return_and_reuse' (33091782) panicked at crates/carrick-sched-core/src/tests.rs:409:5:
+assertion `left == right` failed: returned batch acquired a replacement identity
+  left: RecordRef { id: RecordId(1), incarnation: 3 }
+ right: RecordRef { id: RecordId(1), incarnation: 1 }
+test tests::service_take_keeps_identity_after_return_and_reuse ... FAILED
+test tests::host_wake_batch_keeps_identity_after_return_and_reuse ... FAILED
+
+failures:
+
+failures:
+    tests::host_wake_batch_keeps_identity_after_return_and_reuse
+    tests::service_take_keeps_identity_after_return_and_reuse
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 51 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-sched-core --lib`

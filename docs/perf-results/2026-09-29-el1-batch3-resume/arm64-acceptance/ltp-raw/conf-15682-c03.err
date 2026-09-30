@@ -1,0 +1,22 @@
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+close_range02.c:50: TPASS: close_range(3, 100, 0) passed
+close_range02.c:52: TPASS: fcntl(3, F_GETFD) : EBADF (9)
+close_range02.c:54: TPASS: fcntl(100, F_GETFD) : EBADF (9)
+close_range02.c:57: TPASS: close_range(4, 3, 0) : EINVAL (22)
+close_range02.c:60: TPASS: close_range(3, ~0U, ~0U) : EINVAL (22)
+close_range02.c:63: TPASS: close_range(~0U, ~0U, 0) passed
+close_range02.c:69: TPASS: close_range(3, 3, CLOSE_RANGE_CLOEXEC): SUCCESS (0)
+close_range02.c:77: TPASS: FD_CLOEXEC was set on 3
+close_range02.c:86: TPASS: close_range(3, 3, CLOSE_RANGE_UNSHARE): SUCCESS (0)
+close_range02.c:93: TPASS: fcntl(3, F_GETFD) : EBADF (9)
+close_range02.c:100: TPASS: 3 is open passed
+
+Summary:
+passed   11
+failed   0
+broken   0
+skipped  0
+warnings 0

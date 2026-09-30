@@ -1,0 +1,15 @@
+diff --git a/crates/carrick-embed/tests/el1_sched.rs b/crates/carrick-embed/tests/el1_sched.rs
+index 26be245fe..384cea1ff 100644
+--- a/crates/carrick-embed/tests/el1_sched.rs
++++ b/crates/carrick-embed/tests/el1_sched.rs
+@@ -2233,6 +2233,10 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
+         carrier
+             .container(common::SMOKE_IMAGE)
+             .pull_policy(PullPolicy::Missing)
++            // Mixed routing lowers stdout to an embed-owned piped writer.
++            // Unlike the default in-memory capture path, owned stdio writes
++            // then release execution through the real host-wait boundary.
++            .stderr(carrick_embed::StdioConfig::Inherit)
+             .command([FIXTURE, "two-process", "200"])
+             .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+             .auditor(capture.clone())

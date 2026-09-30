@@ -1,0 +1,17 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_staVDnycS as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+statx02.c:44: TPASS: statx(file_fd, "", AT_EMPTY_PATH, 0, &buf)
+statx02.c:51: TPASS: stx_size(14) is correct
+statx02.c:68: TPASS: statx(AT_FDCWD, test_temp, 0, 0, &fbuf)
+statx02.c:77: TPASS: statx(AT_FDCWD, test_temp_ln, AT_SYMLINK_NOFOLLOW, 0,&lbuf)
+statx02.c:86: TPASS: Statx symlink flag worked as expected
+
+Summary:
+passed   5
+failed   0
+broken   0
+skipped  0
+warnings 0

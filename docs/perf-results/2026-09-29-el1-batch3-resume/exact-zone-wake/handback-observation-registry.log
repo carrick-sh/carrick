@@ -1,0 +1,4 @@
+    Blocking waiting for file lock on build directory
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.49s
+     Running `target/debug/check-contracts --root .`
+conformance contracts checked: 68 contracts, 15 claims, 148 surfaces (inventory: 338 syscalls, 14 with claims)

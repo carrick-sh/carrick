@@ -1,0 +1,1425 @@
+    Checking serde_core v1.0.228
+   Compiling syn v2.0.117
+    Checking smallvec v1.15.1
+    Checking once_cell v1.21.4
+    Checking digest v0.10.7
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-vmm-hvf)
+    Checking tempfile v3.27.0
+    Checking tracing-core v0.1.36
+    Checking parking_lot_core v0.9.12
+    Checking sha2 v0.10.9
+    Checking parking_lot v0.12.5
+    Checking serde_json v1.0.149
+   Compiling pest_generator v2.8.6
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling tracing-attributes v0.1.31
+   Compiling clap_derive v4.6.1
+   Compiling pest_derive v2.8.6
+   Compiling dtrace-parser v0.3.0
+    Checking scroll v0.13.0
+    Checking tracing v0.1.44
+    Checking goblin v0.10.5
+    Checking zerocopy v0.8.48
+    Checking clap v4.6.1
+    Checking serde v1.0.228
+    Checking serde_spanned v0.6.9
+    Checking toml_datetime v0.6.11
+   Compiling serde_tokenstream v0.2.3
+   Compiling usdt-impl v0.6.0
+    Checking toml_edit v0.22.27
+   Compiling usdt-attr-macro v0.6.0
+   Compiling usdt-macro v0.6.0
+    Checking toml v0.8.23
+    Checking carrick-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-abi)
+    Checking dof v0.4.0
+    Checking carrick-guest-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-guest-mem)
+    Checking usdt v0.6.0
+    Checking carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-observability)
+    Checking carrick-signal-linux v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-signal-linux)
+    Checking carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-mem)
+(kernel) Failed to query kext info (MAC policy error 0x1).
+Failed to read loaded kext info from kernel - (libkern/kext) internal error.
+(kernel) Failed to query kext info (MAC policy error 0x1).
+Failed to read loaded kext info from kernel - (libkern/kext) internal error.
+failed to retrieve the kernel binary, the module cache will not be updated
+dtrace: failed to open header file '/dev/stdout': Operation not permitted
+error: custom attribute panicked
+    --> crates/carrick-observability/src/probes.rs:4982:5
+     |
+4982 |     #[usdt::provider(provider = "carrick")]
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: message: no entry found for key
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5877:9
+     |
+5877 |         carrick_usdt::native__syscall__service__entry!(|| (number, name));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5882:9
+     |
+5882 |         carrick_usdt::native__syscall__service__branch!(|| kind.raw());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5891:9
+     |
+5891 |         carrick_usdt::native__syscall__service__end!(|| (number, name, outcome.raw()));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5896:9
+     |
+5896 |         carrick_usdt::native__tierd__exception!(|| { (phase, std::process::id(), a, b, c, d) });
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5901:9
+     |
+5901 |         carrick_usdt::native__tierd__unsupported!(|| { (std::process::id(), syscall, detail) });
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5912:9
+     |
+5912 |         carrick_usdt::hvf__syscall__transport!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5923:9
+     |
+5923 |         carrick_usdt::dsr__prepare__begin!(|| (tid, guest_pc));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5934:9
+     |
+5934 |         carrick_usdt::dsr__prepare__end!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5941:9
+     |
+5941 |         carrick_usdt::dsr__run__begin!(|| (tid, guest_pc, cache_pc, generation));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5952:9
+     |
+5952 |         carrick_usdt::dsr__run__end!(|| (tid, kind.raw(), guest_pc, target_pc, status));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5957:9
+     |
+5957 |         carrick_usdt::dsr__translate__begin!(|| (tid, guest_pc, generation));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5968:9
+     |
+5968 |         carrick_usdt::dsr__translate__end!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5980:9
+     |
+5980 |         carrick_usdt::dsr__translate__subphase__begin!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5992:9
+     |
+5992 |         carrick_usdt::dsr__translate__subphase__end!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:5999:9
+     |
+5999 |         carrick_usdt::dsr__synchronization__begin!(|| kind.raw());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6004:9
+     |
+6004 |         carrick_usdt::dsr__synchronization__end!(|| kind.raw());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6014:9
+     |
+6014 |         carrick_usdt::dsr__resolve__begin!(|| (tid, kind.raw(), source_pc, target_pc));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6025:9
+     |
+6025 |         carrick_usdt::dsr__resolve__end!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6038:9
+     |
+6038 |         carrick_usdt::dsr__cache__event!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6045:9
+     |
+6045 |         carrick_usdt::dsr__cache__capacity!(|| (role.raw(), capacity_bytes));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6050:9
+     |
+6050 |         carrick_usdt::dsr__cache__bounds!(|| (base, end));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6055:9
+     |
+6055 |         carrick_usdt::host__process__birth!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6063:9
+     |
+6063 |         carrick_usdt::host__process__birth!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6078:9
+     |
+6078 |         carrick_usdt::host__translated__range__reset!(|| event.epoch().get());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6083:9
+     |
+6083 |         carrick_usdt::host__translated__private__range!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6096:9
+     |
+6096 |         carrick_usdt::host__translated__shared__range!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6110:9
+     |
+6110 |         carrick_usdt::host__translated__range__ready!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6117:9
+     |
+6117 |         carrick_usdt::host__native__owned__range__reset!(|| event.epoch().get());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6122:9
+     |
+6122 |         carrick_usdt::host__native__owned__range__add!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6135:9
+     |
+6135 |         carrick_usdt::host__native__owned__range__ready!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6148:9
+     |
+6148 |         carrick_usdt::dsr__cache__lifecycle!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6161:9
+     |
+6161 |         carrick_usdt::dsr__exec__map__detail!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6167:9
+     |
+6167 |         carrick_usdt::fork__pre!(|| (pc, elr, cpsr));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6175:9
+     |
+6175 |         carrick_usdt::path__open!(|| (std::process::id(), path, result_size, errno));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6179:9
+     |
+6179 |         carrick_usdt::itimer__fire!(|| (std::process::id(), signum, generation));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6183:9
+     |
+6183 |         carrick_usdt::futex__route!(|| (std::process::id(), addr, op, shared, host_addr));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6187:9
+     |
+6187 |         carrick_usdt::ulock__wait!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6198:9
+     |
+6198 |         carrick_usdt::ulock__wake!(|| (std::process::id(), host_addr, iter, rc));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6273:13
+     |
+6273 |             carrick_usdt::ulock__requeue!(|| ptr);
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6278:9
+     |
+6278 |         carrick_usdt::futex__unexpected__errno!(|| (std::process::id(), host_addr, errno));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6282:9
+     |
+6282 |         carrick_usdt::guest__exit!(|| (std::process::id(), code));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6286:9
+     |
+6286 |         carrick_usdt::mn__admit!(|| (tid, slot, budget));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6290:9
+     |
+6290 |         carrick_usdt::mn__reclaim!(|| (tid, old_slot, new_slot, kind));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6294:9
+     |
+6294 |         carrick_usdt::mn__clone__outcome!(|| (tid, phase.raw(), errno));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6304:9
+     |
+6304 |         carrick_usdt::mm__slot__busy!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6320:9
+     |
+6320 |         carrick_usdt::hvpatch__executor__lifecycle!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6340:9
+     |
+6340 |         carrick_usdt::hvpatch__executor__claim!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6358:9
+     |
+6358 |         carrick_usdt::hvpatch__scheduler__wake!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6376:9
+     |
+6376 |         carrick_usdt::hvpatch__lease__settle!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6393:9
+     |
+6393 |         carrick_usdt::hvpatch__thread__terminal!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6408:9
+     |
+6408 |         carrick_usdt::mn__clone__tid__output!(|| (tid, output.raw(), address, result.raw()));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6425:9
+     |
+6425 |         carrick_usdt::lifecycle!(|| phase);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6429:9
+     |
+6429 |         carrick_usdt::hvpatch__tlb__invalidation!(|| (asid, va, pages));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6436:9
+     |
+6436 |         carrick_usdt::hvpatch__guest__lifecycle__identity!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6442:9
+     |
+6442 |         carrick_usdt::hvpatch__guest__lifecycle!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6450:13
+     |
+6450 |             carrick_usdt::hvpatch__guest__exit!(|| (
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6461:9
+     |
+6461 |         carrick_usdt::hvpatch__stale__stage1__retry!(|| (far, access, tid));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6473:9
+     |
+6473 |         carrick_usdt::hvpatch__first__touch__deliver!(|| (far, reason.raw(), tid));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6485:9
+     |
+6485 |         carrick_usdt::hvpatch__first__touch__refused!(|| (page, access, site, format!("{error}")));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6496:9
+     |
+6496 |         carrick_usdt::hvpatch__el1__frame__grant__plan!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6507:9
+     |
+6507 |         carrick_usdt::hvpatch__fault__delivery!(|| (far, incoming, delivered, u32::from(bus), tid));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6512:9
+     |
+6512 |         carrick_usdt::hvpatch__fault__signal__frame__failure!(|| (far, signum, tid));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6517:9
+     |
+6517 |         carrick_usdt::hvpatch__signal__frame__step!(|| (step, va, len, error));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6522:9
+     |
+6522 |         carrick_usdt::hvpatch__fault__terminal!(|| (far, signum, si_code, tid));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6529:9
+     |
+6529 |         carrick_usdt::hvpatch__cow__runtime__bind!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6541:9
+     |
+6541 |         carrick_usdt::stage1__arena__bind!(|| (authority, present, has_source, arenas));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6547:9
+     |
+6547 |         carrick_usdt::stage1__arena__install!(|| (site, applied, deferred, authority));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6553:9
+     |
+6553 |         carrick_usdt::stage1__arena__replace!(|| (site, source_before, source_after, authority));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6559:9
+     |
+6559 |         carrick_usdt::stage1__arena__absent!(|| (site, authority));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6564:9
+     |
+6564 |         carrick_usdt::hvpatch__guest__fault__asid!(|| (event.pid(), event.tid(), event.asid()));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6565:9
+     |
+6565 |         carrick_usdt::hvpatch__guest__fault!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6593:9
+     |
+6593 |         carrick_usdt::hvpatch__guest__fault__asid!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6601:9
+     |
+6601 |         carrick_usdt::hvpatch__guest__fault!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6615:9
+     |
+6615 |         carrick_usdt::hvpatch__frame__cow__intent!(|| event.intent().raw());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6616:9
+     |
+6616 |         carrick_usdt::hvpatch__frame__cow__identity!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6623:9
+     |
+6623 |         carrick_usdt::hvpatch__frame__cow!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6634:9
+     |
+6634 |         carrick_usdt::hvpatch__frame__cow__trigger__identity!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6641:9
+     |
+6641 |         carrick_usdt::hvpatch__frame__cow__trigger!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6660:9
+     |
+6660 |         carrick_usdt::hvpatch__frame__cow__copy!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6671:9
+     |
+6671 |         carrick_usdt::hvpatch__anonymous__discard__entry!(|| (va, len, granule));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6682:9
+     |
+6682 |         carrick_usdt::hvpatch__frame__cow__inventory__miss!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6700:9
+     |
+6700 |         carrick_usdt::hvpatch__mapping__index__begin!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6712:9
+     |
+6712 |         carrick_usdt::hvpatch__mapping__index__fault!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6719:9
+     |
+6719 |         carrick_usdt::hvpatch__mapping__index__cost!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6728:9
+     |
+6728 |         carrick_usdt::hvpatch__frame__pool__hit!(|| (site, ipa));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6733:9
+     |
+6733 |         carrick_usdt::hvpatch__frame__pool__miss!(|| (site, ipa));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6738:9
+     |
+6738 |         carrick_usdt::hvpatch__fork__frame__identity!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6745:9
+     |
+6745 |         carrick_usdt::hvpatch__fork__frame!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6756:9
+     |
+6756 |         carrick_usdt::hvpatch__global__frame__stage2!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6772:9
+     |
+6772 |         carrick_usdt::hvpatch__global__frame__owner__miss!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6787:9
+     |
+6787 |         carrick_usdt::mmap__lowering__verdict!(|| (va, len, offset, outcome as u32));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6792:9
+     |
+6792 |         carrick_usdt::mmap__lowering__error!(|| (va, len, offset, format!("{error}")));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6797:9
+     |
+6797 |         carrick_usdt::hvpatch__guest__address__space!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6811:9
+     |
+6811 |         carrick_usdt::hvpatch__mm__maintenance__begin!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6822:9
+     |
+6822 |         carrick_usdt::hvpatch__mm__maintenance__work!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6829:9
+     |
+6829 |         carrick_usdt::hvpatch__mm__maintenance__population!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6842:9
+     |
+6842 |         carrick_usdt::hvpatch__backing__scrub!(|| (total, zeroed, remapped, eligible));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6854:9
+     |
+6854 |         carrick_usdt::hvpatch__syscall__service__begin!(match resolve() {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6862:13
+     |
+6862 |             carrick_usdt::hvpatch__syscall__args!(|| (
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6879:9
+     |
+6879 |         carrick_usdt::hvpatch__syscall__service__begin!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6887:13
+     |
+6887 |             carrick_usdt::hvpatch__syscall__args!(|| (
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6900:9
+     |
+6900 |         carrick_usdt::hvpatch__syscall__service!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6911:9
+     |
+6911 |         carrick_usdt::hvpatch__syscall__service__clear!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6921:9
+     |
+6921 |         carrick_usdt::hvpatch__core__lifecycle!(|| (phase, pid, tid, generation, outcome));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6926:9
+     |
+6926 |         carrick_usdt::hvpatch__core__census!(|| (generation, mappings, notes, loads, bytes));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6937:9
+     |
+6937 |         carrick_usdt::hvpatch__core__context!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6948:9
+     |
+6948 |         carrick_usdt::hvpatch__core__hash!(|| (generation, words[0], words[1], words[2], words[3]));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6953:9
+     |
+6953 |         carrick_usdt::hvpatch__fork__snapshot__begin!(|| (child_pid, forking_tid));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6964:9
+     |
+6964 |         carrick_usdt::hvpatch__fork__snapshot__end!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6981:9
+     |
+6981 |         carrick_usdt::hvpatch__fork__snapshot__shape!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:6992:9
+     |
+6992 |         carrick_usdt::hvpatch__exec__backing!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7005:9
+     |
+7005 |         carrick_usdt::hvpatch__exec__predecessor__classification__identity!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7012:9
+     |
+7012 |         carrick_usdt::hvpatch__exec__predecessor__classification__asid!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7018:9
+     |
+7018 |         carrick_usdt::hvpatch__exec__predecessor__classification!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7029:9
+     |
+7029 |         carrick_usdt::hvpatch__mm__lease__lifecycle!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7040:9
+     |
+7040 |         carrick_usdt::hvpatch__mm__lease__relation!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7050:9
+     |
+7050 |         carrick_usdt::hvpatch__exec__stage2!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7061:9
+     |
+7061 |         carrick_usdt::hvpatch__exec__replace__stage!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7071:9
+     |
+7071 |         carrick_usdt::hvpatch__exec__runtime__stage!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7081:9
+     |
+7081 |         carrick_usdt::hvpatch__topology__lock!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7092:9
+     |
+7092 |         carrick_usdt::hvpatch__fork__runtime__stage!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7103:9
+     |
+7103 |         carrick_usdt::hvpatch__fork__process__spec__stage!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7114:9
+     |
+7114 |         carrick_usdt::hvpatch__fork__private__snapshot!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7125:9
+     |
+7125 |         carrick_usdt::hvpatch__fork__private__snapshot__outcome!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7136:9
+     |
+7136 |         carrick_usdt::hvpatch__fork__quiesce!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7147:9
+     |
+7147 |         carrick_usdt::vm__lifecycle!(|| (operation, admission));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7161:9
+     |
+7161 |         carrick_usdt::execve__argv!(|| (std::process::id(), path, joined.as_str()));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7235:9
+     |
+7235 |         carrick_usdt::host__image__base!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7368:9
+     |
+7368 |         carrick_usdt::host__image__text__range!(|| host_image_text_range_snapshot());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7426:9
+     |
+7426 |         carrick_usdt::host__image__catalog!(|| catalog);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7494:9
+     |
+7494 |         carrick_usdt::host__image__base!(|| args);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7504:9
+     |
+7504 |         carrick_usdt::host__image__catalog!(|| catalog);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7519:9
+     |
+7519 |         carrick_usdt::guest__image__base!(|| (std::process::id(), base, entry, path_arg));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7525:9
+     |
+7525 |         carrick_usdt::host__jit__range!(|| (std::process::id(), start, end));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7529:9
+     |
+7529 |         carrick_usdt::fs__op!(|| (std::process::id(), op, path, errno));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7533:9
+     |
+7533 |         carrick_usdt::host__pipe__io!(|| (std::process::id(), host_fd, dir, n));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7537:9
+     |
+7537 |         carrick_usdt::epoll__ctl!(|| (epfd, op, fd, events, data, errno));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7548:9
+     |
+7548 |         carrick_usdt::epoll__interest!(|| (epfd, fd, requested, raw_ready, last_ready, ready));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7595:13
+     |
+7595 |             carrick_usdt::epoll__masked!(|| ptr);
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7644:13
+     |
+7644 |             carrick_usdt::epoll__rebind!(|| ptr);
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7649:9
+     |
+7649 |         carrick_usdt::epoll__wait__fd!(|| (epfd, fd, host_fd, poll_events, timeout_ms));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7653:9
+     |
+7653 |         carrick_usdt::epoll__result!(|| (epfd, ready_count, wait_count, timeout_ms, kind));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7659:9
+     |
+7659 |         carrick_usdt::epoll__lookup!(|| emit());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7663:9
+     |
+7663 |         carrick_usdt::epoll__stale__edge!(|| (udata, guest_fd, generation));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7674:9
+     |
+7674 |         carrick_usdt::io__wait__begin!(|| (tid, fd_count, timeout_ms, fd0, events0, fd1));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7678:9
+     |
+7678 |         carrick_usdt::io__wait__end!(|| (tid, result, fd_count, fd0, fd1, fd2));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7682:9
+     |
+7682 |         carrick_usdt::fork__quiesce!(|| (phase, a, b, tid));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7686:9
+     |
+7686 |         carrick_usdt::fork__rebuild!(|| (role, phase, desc_count, map_count, elapsed_us));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7690:9
+     |
+7690 |         carrick_usdt::fork__lifecycle!(|| (role, phase, elapsed_us, a, b));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7701:9
+     |
+7701 |         carrick_usdt::fork__lifecycle!(|| { (phase.role().raw(), phase.raw(), elapsed_us, a, b) });
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7715:9
+     |
+7715 |         carrick_usdt::fork__lifecycle!(|| (role.raw(), phase.raw(), elapsed_us, a, b));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7725:9
+     |
+7725 |         carrick_usdt::fork__footprint!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7743:9
+     |
+7743 |         carrick_usdt::fork__footprint__class!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7753:9
+     |
+7753 |         carrick_usdt::fork__footprint__class!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7762:9
+     |
+7762 |         carrick_usdt::fork__post!(|| (pid, pc, elr));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7766:9
+     |
+7766 |         carrick_usdt::signal__inject!(|| (signum, saved_pc, new_sp, handler));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7770:9
+     |
+7770 |         carrick_usdt::guest__internal__write__fault!(|| (address, length, phase, error));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7774:9
+     |
+7774 |         carrick_usdt::signal__restore!(|| (saved_pc, sp, magic));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7778:9
+     |
+7778 |         carrick_usdt::kick__in_kernel!(|| (pc, el));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7782:9
+     |
+7782 |         carrick_usdt::vcpu__kick!(|| (vcpu, valid, rc));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7786:9
+     |
+7786 |         carrick_usdt::vcpu__canceled!(|| (vcpu, pc, el, resumed));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7790:9
+     |
+7790 |         carrick_usdt::kick__rearm__irq!(|| (pc, where_, spsr_el1, elr_el1));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7794:9
+     |
+7794 |         carrick_usdt::vcpu__irq__kick!(|| pc);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7798:9
+     |
+7798 |         carrick_usdt::owed__kick__settle!(|| (pc, pstate, el0_state));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7802:9
+     |
+7802 |         carrick_usdt::kick__stats!(|| (el1_resumed, kick_inject, inject_at_el1));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7812:9
+     |
+7812 |         carrick_usdt::el1__task__record__stale!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7822:9
+     |
+7822 |         carrick_usdt::mem__watch!(|| (syscall_nr, addr, value));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7826:9
+     |
+7826 |         carrick_usdt::sigaction__read!(|| (signum, w0, w1, w2, w3));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7830:9
+     |
+7830 |         carrick_usdt::supervisor__fork!(|| child_pid);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7834:9
+     |
+7834 |         carrick_usdt::supervisor__child__ready!(|| runtime_pid);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7838:9
+     |
+7838 |         carrick_usdt::supervisor__foreground__pgrp!(|| (pgid, errno));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7842:9
+     |
+7842 |         carrick_usdt::supervisor__child__exit!(|| (pid, status));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7846:9
+     |
+7846 |         carrick_usdt::hvpatch__reactor__cycle!(|| (registrations, visited, pollfds, timeout_ms));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7855:9
+     |
+7855 |         carrick_usdt::pt__pause__begin!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7864:9
+     |
+7864 |         carrick_usdt::pt__pause__ready!(|| (tid, spins, wait_us));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7868:9
+     |
+7868 |         carrick_usdt::pt__pause__timeout!(|| (tid, wait_us));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7872:9
+     |
+7872 |         carrick_usdt::pt__pause__drain__wait!(|| (coordinator_tid, sibling_tid, wait_us));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7876:9
+     |
+7876 |         carrick_usdt::pt__pause__election__timeout!(|| (tid, wait_us));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7880:9
+     |
+7880 |         carrick_usdt::pt__pause__end!(|| tid);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7884:9
+     |
+7884 |         carrick_usdt::pt__pool!(|| (in_use, free_list, capacity, changed));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7888:9
+     |
+7888 |         carrick_usdt::pt__fault__walk!(|| (far, l0, l1, l2, l3));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7892:9
+     |
+7892 |         carrick_usdt::pt__fault__ttbr!(|| (far, ttbr));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7915:9
+     |
+7915 |         carrick_usdt::pt__fault__walk!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7927:9
+     |
+7927 |         carrick_usdt::pt__fault__ttbr!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7937:9
+     |
+7937 |         carrick_usdt::pt__fault__next__walk!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:7952:9
+     |
+7952 |         carrick_usdt::hvpatch__sparse__boundary__walk!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8079:9
+     |
+8079 |         carrick_usdt::guest__mem__copy!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8086:9
+     |
+8086 |         carrick_usdt::guest__mem__region!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8096:9
+     |
+8096 |         carrick_usdt::guest__mem__bytes!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8106:9
+     |
+8106 |         carrick_usdt::guest__mem__tail!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8115:13
+     |
+8115 |             carrick_usdt::guest__mem__subrange!(|| (
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8122:13
+     |
+8122 |             carrick_usdt::guest__mem__subedge!(|| (
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8129:13
+     |
+8129 |             carrick_usdt::guest__mem__subcount!(|| (direction, address, offset, digest.nonzero));
+     |             ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8144:9
+     |
+8144 |         carrick_usdt::guest__mem__point!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8157:9
+     |
+8157 |         carrick_usdt::resident__fault__protection__error!(|| (page, prot, format!("{error}")));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8172:9
+     |
+8172 |         carrick_usdt::vcpu__trap!(|| ptr);
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8180:9
+     |
+8180 |         carrick_usdt::vcpu__trap!(|| {
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8187:9
+     |
+8187 |         carrick_usdt::execve__loaded!(|| (path, entry, initial_sp, mapping_count));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8191:9
+     |
+8191 |         carrick_usdt::execve__sysregs!(|| (sctlr, ttbr0, mair));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8197:9
+     |
+8197 |         carrick_usdt::vcpu__fault!(|| (esr, elr, far, x30, sp, tid));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8204:9
+     |
+8204 |         carrick_usdt::vcpu__fault__regs!(|| (esr, elr, far, insn, rn, xrn));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8215:9
+     |
+8215 |         carrick_usdt::vcpu__fault__regs!(|| args());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8222:9
+     |
+8222 |         carrick_usdt::vcpu__fault__gprs!(|| (x0, x1, x2, x3, x4, x5));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8229:9
+     |
+8229 |         carrick_usdt::vcpu__fault__gprs!(|| args());
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8248:9
+     |
+8248 |         carrick_usdt::native__x86__fault!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8256:9
+     |
+8256 |         carrick_usdt::native__x86__fault__regs!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8263:9
+     |
+8263 |         carrick_usdt::native__x86__fault__stack!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8275:9
+     |
+8275 |         carrick_usdt::native__x86__fault__history!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8282:9
+     |
+8282 |         carrick_usdt::native__x86__pc!(|| (pid, pc, rsp, rdi, rbp, stack_word));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8287:9
+     |
+8287 |         carrick_usdt::native__x86__resolve!(|| (pid, source, target, rsp, rdi, rbp));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8309:9
+     |
+8309 |         carrick_usdt::native__x86__xstate__edge!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8322:9
+     |
+8322 |         carrick_usdt::native__x86__xstate__controls!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8330:9
+     |
+8330 |         carrick_usdt::native__x86__xstate__hashes!(|| (
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8346:9
+     |
+8346 |         carrick_usdt::pt__alias__walk!(|| (va, descs[0], descs[1], descs[2], descs[3], flag));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8352:9
+     |
+8352 |         carrick_usdt::pt__alias__receipt!(|| (va, leaf, expected_ipa, expected_ap, phase));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8358:9
+     |
+8358 |         carrick_usdt::hv__vm__map__alias!(|| (va, ipa, size, rc, forked));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8363:9
+     |
+8363 |         carrick_usdt::signal__publish!(|| (target_tid, signum, kind));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8368:9
+     |
+8368 |         carrick_usdt::signal__deliver!(|| (tid, pending));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8379:9
+     |
+8379 |         carrick_usdt::signal__restart__decision!(|| (tid, signum, syscall_nr, retval, predicates));
+     |         ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8403:17
+     |
+8403 |                 carrick_usdt::syscall__entry!(|| (*number, name.as_ref(), args_ptr));
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8411:17
+     |
+8411 |                 carrick_usdt::syscall__return!(|| {
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8421:17
+     |
+8421 |                 carrick_usdt::unhandled__syscall!(|| (*number, name.as_str(), args_ptr));
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8430:17
+     |
+8430 |                 carrick_usdt::partial__syscall!(|| (
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8438:17
+     |
+8438 |                 carrick_usdt::unhandled__ioctl!(|| (*fd, *request, *arg));
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8441:17
+     |
+8441 |                 carrick_usdt::proc__read__unimplemented!(|| path.as_str());
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8444:17
+     |
+8444 |                 carrick_usdt::sys__read__unimplemented!(|| path.as_str());
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8447:17
+     |
+8447 |                 carrick_usdt::signal__unsupported!(|| (*signum, reason.as_str()));
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+error[E0433]: cannot find module or crate `carrick_usdt` in this scope
+    --> crates/carrick-observability/src/probes.rs:8455:17
+     |
+8455 |                 carrick_usdt::unknown__syscall__flags!(|| (
+     |                 ^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_usdt`
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `carrick-observability` (lib) due to 229 previous errors

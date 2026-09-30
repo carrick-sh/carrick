@@ -263,6 +263,19 @@ pub trait KernelAuditor: Send + Sync {
     fn zombie_created(&self, _task: TaskKey, _reaper: ZombieReaper) -> AuditVerdict {
         AuditVerdict::Continue
     }
+    /// A child-exit delivery captured this exact parent's signal snapshot.
+    /// Called without graph or runtime-directory locks, before wake publication.
+    fn child_exit_notification_captured(&self, _parent: TaskKey) -> AuditVerdict {
+        AuditVerdict::Continue
+    }
+
+    /// Slot evacuation released its queue locks and retained these exact
+    /// records. Deferred liveness filtering and publication have not run.
+    /// Called through the current carrier scheduler's kernel auditor chain.
+    fn zone_handbacks_captured(&self, _records: &[carrick_el1_abi::RecordRef]) -> AuditVerdict {
+        AuditVerdict::Continue
+    }
+
     fn reaped(&self, _parent: TaskKey, _child: TaskKey) -> AuditVerdict {
         AuditVerdict::Continue
     }
@@ -433,6 +446,32 @@ impl AuditorChain {
         }
         for auditor in &self.auditors {
             let verdict = auditor.zombie_created(task, reaper);
+            if !verdict.is_continue() {
+                return self.check_or_record(verdict);
+            }
+        }
+        AuditVerdict::Continue
+    }
+
+    pub fn child_exit_notification_captured(&self, parent: TaskKey) -> AuditVerdict {
+        if let Some(reason) = self.abort_reason() {
+            return AuditVerdict::Abort(reason);
+        }
+        for auditor in &self.auditors {
+            let verdict = auditor.child_exit_notification_captured(parent);
+            if !verdict.is_continue() {
+                return self.check_or_record(verdict);
+            }
+        }
+        AuditVerdict::Continue
+    }
+
+    pub fn zone_handbacks_captured(&self, records: &[carrick_el1_abi::RecordRef]) -> AuditVerdict {
+        if let Some(reason) = self.abort_reason() {
+            return AuditVerdict::Abort(reason);
+        }
+        for auditor in &self.auditors {
+            let verdict = auditor.zone_handbacks_captured(records);
             if !verdict.is_continue() {
                 return self.check_or_record(verdict);
             }

@@ -1,0 +1,10 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-vmm-hvf)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.39s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-ac6ca1c49daa9635)
+
+running 1 test
+test vcpu_loop::executor::tests::terminal_retirement_does_not_hold_topology_lock_across_detached_cleanup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 637 filtered out; finished in 0.02s
+

@@ -793,6 +793,7 @@ mod tests {
             let index = zone.spaces.publish_closed(mm, ttbr, ttbr).unwrap();
             zone.spaces.open(index);
         }
+        zone.drive(SLOT, u64::from(SLOT.raw()) + 1);
         zone.publish_slot(SLOT, MM, None, 0);
         let here = carrick_sched_core::ExecutionSlot::zone(SLOT);
         zone.occupancy.vacate_any(here);

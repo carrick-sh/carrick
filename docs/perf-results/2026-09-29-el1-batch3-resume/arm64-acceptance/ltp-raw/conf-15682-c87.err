@@ -1,0 +1,27 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_lseZFsGOy as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+lseek02.c:64: TPASS: lseek(-1, 1, 0) failed as expected: EBADF (9)
+lseek02.c:64: TPASS: lseek(-1, 1, 1) failed as expected: EBADF (9)
+lseek02.c:64: TPASS: lseek(-1, 1, 2) failed as expected: EBADF (9)
+lseek02.c:64: TPASS: lseek(3, 1, 5) failed as expected: EINVAL (22)
+lseek02.c:64: TPASS: lseek(3, 1, -1) failed as expected: EINVAL (22)
+lseek02.c:64: TPASS: lseek(3, 1, 7) failed as expected: EINVAL (22)
+lseek02.c:64: TPASS: lseek(4, 1, 0) failed as expected: ESPIPE (29)
+lseek02.c:64: TPASS: lseek(4, 1, 1) failed as expected: ESPIPE (29)
+lseek02.c:64: TPASS: lseek(4, 1, 2) failed as expected: ESPIPE (29)
+lseek02.c:64: TPASS: lseek(5, 1, 0) failed as expected: ESPIPE (29)
+lseek02.c:64: TPASS: lseek(5, 1, 1) failed as expected: ESPIPE (29)
+lseek02.c:64: TPASS: lseek(5, 1, 2) failed as expected: ESPIPE (29)
+lseek02.c:64: TPASS: lseek(7, 1, 0) failed as expected: ESPIPE (29)
+lseek02.c:64: TPASS: lseek(7, 1, 1) failed as expected: ESPIPE (29)
+lseek02.c:64: TPASS: lseek(7, 1, 2) failed as expected: ESPIPE (29)
+
+Summary:
+passed   15
+failed   0
+broken   0
+skipped  0
+warnings 0

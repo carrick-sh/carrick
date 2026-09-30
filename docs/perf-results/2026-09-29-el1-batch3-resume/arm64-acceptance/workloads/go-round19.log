@@ -1,0 +1,10 @@
+oracle: all 1 selected suite(s) cached; running carrick-only
+phase 1/4: 1 carrick runs (workers=8, cpython-workers=4, fast-timeout=5s; cached slow rows get 2x oracle + 2s; hard-cap=None)
+  [carrick] go-build
+phase 2/4: 0 docker run(s), 1 cached oracle(s) (workers=8, cpython-workers=4)
+phase 3/4: classify
+
+=== summary ===
+  ok   MATCH          go-build                                 carrick[Success] oracle[Success]
+
+OK: no regressions

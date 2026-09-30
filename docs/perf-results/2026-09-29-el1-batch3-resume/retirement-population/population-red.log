@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-672563aa3a2a02c2)
+
+running 1 test
+test trap::frame_inventory::tests::process_retirement_does_not_combine_counts_from_different_populations ... FAILED
+
+failures:
+
+---- trap::frame_inventory::tests::process_retirement_does_not_combine_counts_from_different_populations stdout ----
+
+thread 'trap::frame_inventory::tests::process_retirement_does_not_combine_counts_from_different_populations' (33945787) panicked at crates/carrick-vmm-hvf/src/trap/frame_inventory/tests.rs:2844:5:
+a kernel count before sibling publication and a backend count after sibling retirement must not authorize retiring a still-mapped frame
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::frame_inventory::tests::process_retirement_does_not_combine_counts_from_different_populations
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 600 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

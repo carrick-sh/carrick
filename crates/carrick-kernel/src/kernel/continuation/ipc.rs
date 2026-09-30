@@ -94,10 +94,10 @@ impl IpcHostServices for ZoneHostServices {
                 let Ok(guard) = zone.object_wait(key, &HostIpcWait) else {
                     continue;
                 };
-                let _ = guard.notify_object_host(
-                    &mut |record| handed.push(zone.record_ref(record)),
-                    &mut |placement| placed.push(placement),
-                );
+                let _ = guard
+                    .notify_object_host(&mut |record| handed.push(record), &mut |placement| {
+                        placed.push(placement)
+                    });
             }
             for placement in placed {
                 if placement.resched {

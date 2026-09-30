@@ -54,6 +54,8 @@ fn identity(tid: u64) -> ThreadIdentity {
 /// slot's scheduling facts and its occupancy word (the executor installs the
 /// loaded task's address space before it runs the vCPU).
 fn host_publish(zone: &ZoneTables, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
+    // The executor that loads it drives the slot (one executor per slot).
+    zone.drive(slot, u64::from(slot.raw()) + 1);
     zone.publish_slot(slot, mm, cpu, affinity);
     let here = carrick_sched_core::ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
@@ -223,6 +225,100 @@ fn ping_pong(skip_fpsimd: bool) -> (TrapFrame, FakeCpu, TrapFrame, FakeCpu) {
     assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
     assert_eq!(task.task_id.load(Ordering::Relaxed), 101);
     (a_before_wait.0, a_before_wait.1, frame, cpu)
+}
+
+/// A host request arrives after futex dispatch admission, while the current
+/// guest thread still owns its OnCpu record. The CPU then finishes its park
+/// and handles the host kick. No further futex wake is owed by the workload.
+fn host_request_during_repark(kind: Handback) {
+    struct RequestOnRead<'a> {
+        zone: &'a ZoneTables,
+        record: carrick_el1_abi::RecordRef,
+        kind: Handback,
+    }
+    impl UserWord for RequestOnRead<'_> {
+        fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
+            assert_eq!(
+                self.zone
+                    .claim_for_host(self.record, None, self.kind, &HostWait),
+                carrick_el1_abi::HostClaim::El1Held { slot: SLOT }
+            );
+            // Model delivery of the claimant's kick after dispatch admission.
+            task.mark_pending_host_work();
+            HardwareUserWord.read_u32(task, uaddr)
+        }
+        fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
+            HardwareUserWord.read_u64(task, uaddr)
+        }
+    }
+
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
+    let original = zone.record_ref(b);
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
+    set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert_eq!(zone.slot(SLOT).current(), Some(b));
+
+    let user = RequestOnRead {
+        zone: &zone,
+        record: original,
+        kind,
+    };
+    set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    let before = frame;
+    let result = Sched {
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &user,
+        counters: counters(),
+    }
+    .serve_futex(&mut frame);
+    assert_eq!(result, None, "refused park forwards the syscall");
+    assert_eq!(
+        frame, before,
+        "forwarding preserves syscall and register state"
+    );
+
+    // The stopped executor's normal reconciliation: queue cancellation,
+    // requested handbacks, then the current record, if one remains.
+    zone.sweep_cancelled(SLOT);
+    let mut handed = std::vec::Vec::new();
+    zone.take_host_wanted(SLOT, &mut |record| handed.push(record));
+    if zone.slot(SLOT).current() == Some(b) {
+        let _ = zone.handback_current(SLOT, b);
+    }
+    if kind == Handback::Cancelled {
+        assert!(
+            zone.live(original).is_none(),
+            "cancelled re-park must retire"
+        );
+    } else {
+        let rec = zone.live(original).expect("signal preserves the thread");
+        assert!(
+            matches!(rec.claim(), Claim::Host { .. }),
+            "host request must survive re-park, got {:?}",
+            rec.claim()
+        );
+        assert_eq!(rec.entry_count(), 0, "no attached wait after handback");
+    }
+    assert_eq!(cpu.wfis, 0, "the pending host request must prevent WFI");
+}
+
+#[test]
+fn cancelled_on_cpu_thread_is_not_stranded_by_repark() {
+    host_request_during_repark(Handback::Cancelled);
+}
+
+#[test]
+fn signal_requested_on_cpu_is_not_lost_by_repark() {
+    host_request_during_repark(Handback::Signal);
 }
 
 #[test]
@@ -1059,7 +1155,7 @@ fn a_raised_gate_sends_the_thread_to_its_executor() {
     assert_eq!(zone.installed_space(SLOT), MM);
     assert!(cpu.translations.is_empty());
     assert_eq!(
-        zone.take_service_head(SLOT),
+        zone.take_service_head(SLOT).map(|r| r.id),
         Some(b),
         "the executor takes B"
     );

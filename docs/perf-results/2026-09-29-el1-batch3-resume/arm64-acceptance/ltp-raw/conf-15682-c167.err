@@ -1,0 +1,18 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_sta49tY6O as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+stat03.c:47: TPASS: stat(tc->pathname, &stat_buf) : EACCES (13)
+stat03.c:47: TPASS: stat(tc->pathname, &stat_buf) : EFAULT (14)
+stat03.c:47: TPASS: stat(tc->pathname, &stat_buf) : ENAMETOOLONG (36)
+stat03.c:47: TPASS: stat(tc->pathname, &stat_buf) : ENOENT (2)
+stat03.c:47: TPASS: stat(tc->pathname, &stat_buf) : ENOTDIR (20)
+stat03.c:47: TPASS: stat(tc->pathname, &stat_buf) : ELOOP (40)
+
+Summary:
+passed   6
+failed   0
+broken   0
+skipped  0
+warnings 0

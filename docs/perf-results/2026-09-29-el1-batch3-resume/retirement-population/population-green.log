@@ -1,0 +1,19 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.23s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-672563aa3a2a02c2)
+
+running 11 tests
+test trap::frame_inventory::tests::process_retirement_fails_when_the_authoritative_mapping_count_is_unavailable ... ok
+test trap::frame_inventory::tests::process_retirement_rejects_matching_generation_with_wrong_host_pointer ... ok
+test trap::frame_inventory::tests::process_retirement_rejects_rowless_inventory_not_owned_by_the_retiring_mm ... ok
+test trap::frame_inventory::tests::process_retirement_does_not_combine_counts_from_different_populations ... ok
+test trap::frame_inventory::tests::process_retirement_uses_inventory_owner_when_task_local_rows_are_absent ... ok
+test trap::frame_inventory::tests::process_retirement_does_not_retire_a_frame_still_mapped_by_another_mm ... ok
+test trap::frame_inventory::tests::process_retirement_rejects_a_recycled_owner_generation ... ok
+test trap::frame_inventory::tests::process_retirement_retires_the_exact_last_authoritative_mapping ... ok
+test trap::frame_inventory::tests::process_retirement_uses_inventory_owner_identity_not_stale_mapping_rows ... ok
+test trap::frame_inventory::tests::process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reuse ... ok
+test trap::frame_inventory::tests::process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 590 filtered out; finished in 0.04s
+

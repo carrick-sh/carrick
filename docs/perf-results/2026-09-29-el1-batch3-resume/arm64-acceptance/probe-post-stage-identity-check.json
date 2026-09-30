@@ -1,0 +1,51 @@
+[
+  {
+    "receipt": "conformance-probes-generic-signed-artifacts.jsonl",
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/probes_shard_0-bc1124b1cba0e2a7",
+    "receipt_sha256": "16590bace524b6e3ee34f0741aa33e952457020e45400792d2f7c2321d40e3ec",
+    "current_sha256": "e8317a1c17e7e2bf75ebc2e40d03eea9187367901d91c923e3707fd52f83063a",
+    "matches": false
+  },
+  {
+    "receipt": "conformance-probes-generic-signed-artifacts.jsonl",
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/probes_shard_2-4bff45dd8f48909e",
+    "receipt_sha256": "c3d3e8db41ccf137fe595f91067b95b0fd6e7d0b732686ec573fcd2f6f9dbd37",
+    "current_sha256": "429cf51084c8143a917ab47a0f5d7c198c58aaefc661ce1af39541cd83d4d434",
+    "matches": false
+  },
+  {
+    "receipt": "conformance-probes-generic-signed-artifacts.jsonl",
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/probes_shard_1-5c533f0fc206e105",
+    "receipt_sha256": "0cef842d6f81dd5561fc5b376ede358beb380a0956c770b68bc1a70458e1fe78",
+    "current_sha256": "9b20472a459e04cfc951b2020e407ae69fd77388248197f05bfa0ff6fb9755ed",
+    "matches": false
+  },
+  {
+    "receipt": "conformance-probes-dedicated-signed-artifacts.jsonl",
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/conformance_cases-3fa55e0d3773963c",
+    "receipt_sha256": "d9aa9747429fdedc7daf7a3f4fcaa84fa99589999932c8e46eb1015293ab45da",
+    "current_sha256": "d9aa9747429fdedc7daf7a3f4fcaa84fa99589999932c8e46eb1015293ab45da",
+    "matches": true
+  },
+  {
+    "receipt": "conformance-probes-dedicated-signed-artifacts.jsonl",
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/private_file_cow_lanes-fb2372014a0b39bd",
+    "receipt_sha256": "3147a599bdd08ef44d11e9f1df27605cf3e46a653d4b57fe7747d761a56c75c7",
+    "current_sha256": "3147a599bdd08ef44d11e9f1df27605cf3e46a653d4b57fe7747d761a56c75c7",
+    "matches": true
+  },
+  {
+    "receipt": "conformance-probes-dedicated-signed-artifacts.jsonl",
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/immutable_private_file-6733698b84ae979c",
+    "receipt_sha256": "3d72f65cd537f1ea799ac13e055f542b8e6892a81a3b377e23170ecf84e48e1c",
+    "current_sha256": "3d72f65cd537f1ea799ac13e055f542b8e6892a81a3b377e23170ecf84e48e1c",
+    "matches": true
+  },
+  {
+    "receipt": "conformance-probes-dedicated-signed-artifacts.jsonl",
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/inotify_lifecycle-6cb09a9214704f86",
+    "receipt_sha256": "75142ef1a91699ac23876df1efa4849394576bfd3d4570395c4f6e33263e7ecd",
+    "current_sha256": "75142ef1a91699ac23876df1efa4849394576bfd3d4570395c4f6e33263e7ecd",
+    "matches": true
+  }
+]

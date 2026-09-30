@@ -1,0 +1,63 @@
+diff --git a/crates/carrick-kernel/src/kernel/scheduler.rs b/crates/carrick-kernel/src/kernel/scheduler.rs
+index d9fe34f73..762c96626 100644
+--- a/crates/carrick-kernel/src/kernel/scheduler.rs
++++ b/crates/carrick-kernel/src/kernel/scheduler.rs
+@@ -3736,6 +3736,14 @@ impl Scheduler {
+         let Some(key) = crate::el1_zone::thread_key_of(record) else {
+             return;
+         };
++        self.publish_zone_thread_handback(record, key);
++    }
++
++    fn publish_zone_thread_handback(
++        &self,
++        record: carrick_el1_abi::RecordRef,
++        key: ThreadKey,
++    ) {
+         if let Some(thread) = self.kernel.exact_thread_for_scheduler(key) {
+             let _ = thread.publish_zone_ready(record);
+         }
+@@ -5797,6 +5805,43 @@ mod tests {
+         assert_eq!(disposition, WakeDisposition::Queued);
+     }
+ 
++    /// The zone publisher has captured the exact thread key, but the task
++    /// is reaped before it can publish readiness and issue its scheduler wake.
++    #[test]
++    fn a_deferred_zone_handback_does_not_audit_a_reaped_target() {
++        let (kernel, root) = bootstrap(12_465);
++        let child = process_child(&kernel, &root, 9_465, "zone-handback-reaped");
++        let captured_key = child.thread().key();
++        let child_task = child.task().key();
++        let zone = HeapZone::new();
++        let id = zone.alloc_record(carrick_el1_abi::ThreadIdentity {
++            tid: captured_key.tid.raw() as u64,
++            serial: captured_key.serial.raw(),
++            mm: 7,
++            file_table: 1,
++            generation: 1,
++            affinity: 0,
++        }).unwrap();
++        let captured_record = zone.record_ref(id);
++        let recorder = Arc::new(RecordingWakeAuditor::default());
++        kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![
++            Arc::clone(&recorder) as Arc<dyn crate::observe::KernelAuditor>,
++        ])));
++        drop(child);
++        kernel.exit_task_key_eventually(child_task, LinuxWaitStatus::from_wait_encoding(0)).unwrap();
++        kernel.wait_child(root.task().key().id, Some(child_task.id), crate::kernel::WaitMode::Consume).unwrap();
++        assert!(!kernel.task_exists(child_task.id));
++        // The real continuation may have retired/reused its record while
++        // this already-captured thread key was waiting for publication.
++        zone.free_record(id);
++        let scheduler = Scheduler::new(Arc::clone(&kernel));
++        scheduler.publish_zone_thread_handback(captured_record, captured_key);
++        assert!(recorder.rejections.lock().is_empty(),
++            "late zone handback must not issue an untyped wake: {:?}",
++            *recorder.rejections.lock());
++        assert_eq!(scheduler.queued_len(), 0);
++    }
++
+     #[derive(Debug, Default)]
+     struct RecordingKick {
+         binding: parking_lot::Mutex<Option<super::ExecutorBinding>>,

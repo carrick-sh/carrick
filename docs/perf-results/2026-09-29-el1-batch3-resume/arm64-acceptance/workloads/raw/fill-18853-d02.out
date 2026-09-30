@@ -1,0 +1,32 @@
+== CPython 3.12.13 (main, Aug 5 2026, 03:49:12) [GCC 14.2.0]
+== Linux-7.0.14-linuxkit-aarch64-with-glibc2.41 little-endian
+== Python build: release shared LTO+PGO
+== cwd: /tmp/test_python_worker_1æ
+== CPU count: 10
+== encodings: locale=UTF-8 FS=utf-8
+== resources: all test resources are disabled, use -u option to unskip tests
+
+Using random seed: 0
+0:00:00 load avg: 0.17 Run 1 test sequentially in a single process
+0:00:00 load avg: 0.17 [1/1] test_fork1
+test_nested_import_lock_fork (test.test_fork1.ForkTest.test_nested_import_lock_fork)
+Check fork() in main thread works while the main thread is doing an import ... ok
+test_threaded_import_lock_fork (test.test_fork1.ForkTest.test_threaded_import_lock_fork)
+Check fork() in main thread works while a subthread is doing an import ... ok
+test_wait (test.test_fork1.ForkTest.test_wait) ... ok
+test_wait (test.fork_wait.ForkWait.test_wait) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 5.119s
+
+OK
+0:00:05 load avg: 0.15 [1/1] test_fork1 passed
+
+== Tests result: SUCCESS ==
+
+1 test OK.
+
+Total duration: 5.1 sec
+Total tests: run=4
+Total test files: run=1/1
+Result: SUCCESS

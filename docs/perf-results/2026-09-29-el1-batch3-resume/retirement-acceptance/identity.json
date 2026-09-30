@@ -1,0 +1,9 @@
+{
+  "source_head": "b5a751775cc9501ffec33c7a724053f8a33777a6",
+  "sha256": "ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f",
+  "cdhash": "3a0d1ae17ac52f9bd4a01c87f82bbcc5caf0c140",
+  "uuid": "01F11BD2-04FA-3221-9CD9-7C423A206946",
+  "hypervisor_entitlement": true,
+  "dof_carrick": true,
+  "go_image_digest": "sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b"
+}

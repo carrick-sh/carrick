@@ -1,0 +1,5 @@
+Warning -- reap_children() reaped child process 267
+Warning -- reap_children() reaped child process 343
+[2m2026-09-29T11:07:38.418193Z[0m [31mERROR[0m [2mcarrick_runtime::vcpu_loop::executor::settlement[0m[2m:[0m executor failed a claimed task [3mthread[0m[2m=[0mThreadKey { tid: LinuxTid(843), serial: ThreadSerial(689782) } [3mgeneration[0m[2m=[0mExecutionGeneration(3) [3mreason[0m[2m=[0mSnapshotRestoreFailed [3mresolved[0m[2m=[0mtrue [3msite[0m[2m=[0mcrates/carrick-runtime/src/vcpu_loop/executor.rs:412:30
+[2m2026-09-29T11:07:38.418457Z[0m [31mERROR[0m [2mcarrick_runtime::vcpu_loop::executor[0m[2m:[0m executor worker died [3mindex[0m[2m=[0m3 [3merror[0m[2m=[0mhypervisor operation failed: zone record RecordRef { id: RecordId(1), incarnation: 35925 } is not host-owned: Parked { seq: 17965 }
+carrick fatal [hvpatch::mm_authority]: drop HVPatch MM authority (phase=active mm_root_slot=Some((661424963584, 2097152)) kernel_mm=Some(201) holder=registration-cleanup): hypervisor operation failed: published HVPatch inventory dropped before exact retirement (phase=active)

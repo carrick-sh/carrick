@@ -708,7 +708,9 @@ impl CarrierWaitServiceInner {
         };
         match crate::el1_zone::claim(record, seq, kind) {
             carrick_el1_abi::HostClaim::Claimed | carrick_el1_abi::HostClaim::AlreadyHost => true,
-            carrick_el1_abi::HostClaim::El1Held { .. } | carrick_el1_abi::HostClaim::Stale => {
+            carrick_el1_abi::HostClaim::Deferred
+            | carrick_el1_abi::HostClaim::El1Held { .. }
+            | carrick_el1_abi::HostClaim::Stale => {
                 // The handback publishes `Ready`; a stale or held timeout
                 // must not re-fire every reactor cycle meanwhile.
                 if matches!(event, ContinuationEvent::Timeout) {

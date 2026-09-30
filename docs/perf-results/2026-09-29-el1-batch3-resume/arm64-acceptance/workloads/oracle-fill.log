@@ -1,0 +1,20 @@
+oracle-fill: 9 suite(s), profile=regression, platform=LinuxArm64 (docker only; no carrick, no classification)
+  [docker] go-build -> Success n=0 pass=0 fail=0 broken=0 skip=0 (1228 ms)
+raw: target/conformance/raw/fill-18853-d00.out / target/conformance/raw/fill-18853-d00.err
+  [docker] cpython-concurrent_futures -> Success n=237 pass=237 fail=0 broken=0 skip=18 (74271 ms)
+raw: target/conformance/raw/fill-18853-d01.out / target/conformance/raw/fill-18853-d01.err
+  [docker] cpython-fork1 -> Success n=4 pass=4 fail=0 broken=0 skip=0 (5497 ms)
+raw: target/conformance/raw/fill-18853-d02.out / target/conformance/raw/fill-18853-d02.err
+  [docker] cpython-mmap -> Success n=38 pass=38 fail=0 broken=0 skip=8 (403 ms)
+raw: target/conformance/raw/fill-18853-d03.out / target/conformance/raw/fill-18853-d03.err
+  [docker] cpython-multiprocessing_fork -> Success n=344 pass=344 fail=0 broken=0 skip=51 (51604 ms)
+raw: target/conformance/raw/fill-18853-d04.out / target/conformance/raw/fill-18853-d04.err
+  [docker] cpython-subprocess -> Success n=297 pass=297 fail=0 broken=0 skip=44 (20387 ms)
+raw: target/conformance/raw/fill-18853-d05.out / target/conformance/raw/fill-18853-d05.err
+  [docker] cpython-threading -> Success n=206 pass=206 fail=0 broken=0 skip=2 (13475 ms)
+raw: target/conformance/raw/fill-18853-d06.out / target/conformance/raw/fill-18853-d06.err
+  [docker] cpython-wait3 -> Success n=3 pass=3 fail=0 broken=0 skip=0 (5323 ms)
+raw: target/conformance/raw/fill-18853-d07.out / target/conformance/raw/fill-18853-d07.err
+  [docker] cpython-wait4 -> Success n=2 pass=2 fail=0 broken=0 skip=0 (5291 ms)
+raw: target/conformance/raw/fill-18853-d08.out / target/conformance/raw/fill-18853-d08.err
+oracle-fill: wrote target/el1-resume-b3/arm64-acceptance/workload-oracle.jsonl

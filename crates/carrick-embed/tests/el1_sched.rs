@@ -2202,3 +2202,229 @@ fn el1_fork_cow_resolves_in_guest() {
         );
     }
 }
+
+/// Retain a real parent's notification snapshot across its guest-visible reap.
+/// The marker prevents the parent from exiting before snapshot capture; the
+/// auditor then delays only that notification until the root reaps the parent.
+#[test]
+fn el1_sched_delayed_notification_survives_parent_reap() {
+    use carrick_kernel::kernel::TaskKey;
+    use carrick_kernel::observe::{
+        AuditVerdict, ForkKind, InterceptAction, InterceptedSyscall, KernelAuditor, ProcessInfo,
+        SyscallInterceptor,
+    };
+    use std::sync::{Arc, Condvar, Mutex};
+
+    #[derive(Default)]
+    struct State {
+        target: Option<TaskKey>,
+        captured: bool,
+        reaped: bool,
+        timed_out: bool,
+        markers: usize,
+        reaped_wake_rejections: usize,
+        events: Vec<&'static str>,
+    }
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<State>,
+        changed: Condvar,
+    }
+    impl KernelAuditor for Gate {
+        fn fork_admitted(&self, _parent: TaskKey, child: TaskKey, kind: ForkKind) -> AuditVerdict {
+            if matches!(kind, ForkKind::Fork) {
+                self.state.lock().unwrap().target.get_or_insert(child);
+            }
+            AuditVerdict::Continue
+        }
+
+        fn child_exit_notification_captured(&self, parent: TaskKey) -> AuditVerdict {
+            let mut state = self.state.lock().unwrap();
+            if state.target != Some(parent) {
+                return AuditVerdict::Continue;
+            }
+            state.events.push("captured");
+            state.captured = true;
+            self.changed.notify_all();
+            let (mut state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.reaped)
+                .unwrap();
+            state.timed_out |= timeout.timed_out() && !state.reaped;
+            state.events.push("released");
+            AuditVerdict::Continue
+        }
+
+        fn wake_rejected(
+            &self,
+            target: TaskKey,
+            reason: carrick_kernel::observe::WakeRejectionReason,
+        ) -> AuditVerdict {
+            let mut state = self.state.lock().unwrap();
+            if state.target == Some(target)
+                && reason == carrick_kernel::observe::WakeRejectionReason::Reaped
+            {
+                state.reaped_wake_rejections += 1;
+            }
+            AuditVerdict::Continue
+        }
+
+        fn reaped(&self, _parent: TaskKey, child: TaskKey) -> AuditVerdict {
+            let mut state = self.state.lock().unwrap();
+            if state.target == Some(child) {
+                state.events.push("reaped");
+                state.reaped = true;
+                self.changed.notify_all();
+            }
+            AuditVerdict::Continue
+        }
+    }
+    impl SyscallInterceptor for Gate {
+        fn intercept(
+            &self,
+            _process: &ProcessInfo<'_>,
+            call: &InterceptedSyscall<'_>,
+        ) -> InterceptAction {
+            if call.name() == "sched_yield" && call.original_args().0[0] == 0x454c314e {
+                let mut state = self.state.lock().unwrap();
+                state.markers += 1;
+                let (mut state, timeout) = self
+                    .changed
+                    .wait_timeout_while(state, Duration::from_secs(5), |state| !state.captured)
+                    .unwrap();
+                state.timed_out |= timeout.timed_out() && !state.captured;
+            }
+            InterceptAction::Continue
+        }
+    }
+
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(30));
+    let carrier = carrier_or_fail();
+    #[cfg(feature = "conformance-metrics")]
+    let scope = carrick_observability::work_meter::WorkMeter::default().new_scope();
+    let gate = Arc::new(Gate::default());
+    let builder = carrier
+        .container(common::SMOKE_IMAGE)
+        .pull_policy(PullPolicy::Missing)
+        .command([FIXTURE, "delayed-parent-notification"])
+        .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+        .auditor(gate.clone())
+        .interceptor(gate.clone());
+    #[cfg(feature = "conformance-metrics")]
+    let builder = builder.work_scope(scope.clone());
+    let result = common::run_or_fail(builder.run_blocking());
+    assert!(result.success(), "{}", result.stdout_utf8());
+    assert!(
+        result
+            .stdout_utf8()
+            .contains("delayed-parent-notification reaped=1")
+    );
+    let state = gate.state.lock().unwrap();
+    assert!(
+        !state.timed_out,
+        "lifecycle rendezvous timed out: {:?}",
+        state.events
+    );
+    assert_eq!(state.markers, 1);
+    assert_eq!(state.events, ["captured", "reaped", "released"]);
+    assert_eq!(
+        state.reaped_wake_rejections, 0,
+        "delayed notification used reaped wake authority"
+    );
+    #[cfg(feature = "conformance-metrics")]
+    {
+        use carrick_conformance_contract::{
+            Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+            SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+        };
+        use sha2::{Digest, Sha256};
+        let registry = ContractRegistry::load(&common::repo_root()).unwrap();
+        let contract = registry
+            .require("kernel.wait.child-exit-notification-lifecycle")
+            .unwrap();
+        let observation = ContractObservation {
+            contract_id: ContractId::new("kernel.wait.child-exit-notification-lifecycle").unwrap(),
+            layer: ExecutionLayer::EmbedStructural,
+            implementation_revision: format!(
+                "sha256:{:x}",
+                Sha256::new()
+                    .chain_update(include_bytes!("el1_sched.rs"))
+                    .chain_update(include_bytes!(
+                        "../../carrick-runtime/src/vcpu_loop/wait_wake.rs"
+                    ))
+                    .finalize()
+            ),
+            fixture_identity: contract.fixture.clone(),
+            scale: 1,
+            semantic_assertions: vec![SemanticAssertion::pass(
+                "captured_reaped_released_without_stale_wake",
+            )],
+            work: Some(scope.snapshot().expect("complete scoped notification work")),
+            timing: None,
+            completeness: Completeness::Complete,
+        };
+        println!("{}", serde_json::to_string(&observation).unwrap());
+        evaluate(contract, std::slice::from_ref(&observation)).unwrap();
+        for (visits, attempts, wakes) in [(3, 2, 1), (2, 3, 1), (2, 2, 2)] {
+            let mut excess = observation.clone();
+            let mut work = WorkSnapshot::new();
+            work.insert(WorkMetric::ChildExitNotificationThreadVisits, visits)
+                .unwrap();
+            work.insert(WorkMetric::ChildExitNotificationWakeAttempts, attempts)
+                .unwrap();
+            work.insert(WorkMetric::ChildExitNotificationWakeDeliveries, wakes)
+                .unwrap();
+            excess.work = Some(work);
+            assert!(
+                evaluate(contract, &[excess]).is_err(),
+                "excess notification work escaped"
+            );
+        }
+    }
+    println!(
+        "el1 delayed notification ordering={:?} markers={}",
+        state.events, state.markers
+    );
+}
+
+/// Feasibility witness for the deferred-capture auditor on real guest work.
+/// This does not establish retirement/reuse ordering or close the contract.
+#[test]
+fn el1_sched_deferred_handback_capture_observes_guest_records() {
+    use carrick_kernel::observe::{AuditVerdict, KernelAuditor};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Capture {
+        records: Mutex<Vec<carrick_el1_abi::RecordRef>>,
+    }
+    impl KernelAuditor for Capture {
+        fn zone_handbacks_captured(&self, records: &[carrick_el1_abi::RecordRef]) -> AuditVerdict {
+            self.records.lock().unwrap().extend_from_slice(records);
+            AuditVerdict::Continue
+        }
+    }
+
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(30));
+    let carrier = carrier_or_fail();
+    let capture = Arc::new(Capture::default());
+    let result = common::run_or_fail(
+        carrier
+            .container(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([FIXTURE, "two-process", "200"])
+            .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+            .auditor(capture.clone())
+            .run_blocking(),
+    );
+    assert!(result.success(), "{}", result.stdout_utf8());
+    assert!(result.stdout_utf8().contains("child_ok=true"));
+    let records = capture.records.lock().unwrap();
+    println!("deferred handback real guest captures: {records:?}");
+    assert!(
+        !records.is_empty(),
+        "guest workload did not exercise the deferred capture boundary"
+    );
+}

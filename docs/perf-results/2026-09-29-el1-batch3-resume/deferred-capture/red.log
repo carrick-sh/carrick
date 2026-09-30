@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 1 test
+test el1_zone::tests::deferred_capture_precedes_filter_and_releases_queue_authority ... FAILED
+
+failures:
+
+---- el1_zone::tests::deferred_capture_precedes_filter_and_releases_queue_authority stdout ----
+
+thread 'el1_zone::tests::deferred_capture_precedes_filter_and_releases_queue_authority' (34178980) panicked at crates/carrick-kernel/src/el1_zone.rs:854:9:
+assertion `left == right` failed
+  left: []
+ right: [RecordRef { id: RecordId(1), incarnation: 1 }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    el1_zone::tests::deferred_capture_precedes_filter_and_releases_queue_authority
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2313 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

@@ -1,0 +1,21 @@
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-sched-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 1 test
+
+thread 'tests::exhausted_record_incarnation_is_never_reallocated' (33335682) panicked at crates/carrick-sched-core/src/tests.rs:1994:5:
+assertion `left == right` failed: incarnation exhaustion must not wrap to an old request identity
+  left: 0
+ right: 18446744073709551615
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::exhausted_record_incarnation_is_never_reallocated ... FAILED
+
+failures:
+
+failures:
+    tests::exhausted_record_incarnation_is_never_reallocated
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 60 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-sched-core --lib`

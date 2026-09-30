@@ -1,0 +1,24 @@
+{
+  "schema": "carrick.controlled-signed-failure.v1",
+  "source": {
+    "base_head": "2e6e3794abb60c2fa4016742f1c5fd5140118b4a",
+    "control_body_from": "932a33568^",
+    "modified_file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
+    "modified_file_sha256": "18d3f187bf7baa865e9cb2d4f0cb5fc2e0cb53117ff4730c49ec62043f266711",
+    "patch_sha256": "ca95588ffb7f6c590e1210eee5d4ddab3f40db189d9bc320b97de225131fe648",
+    "note": "Runner header base HEAD plus this controlled method patch is the complete source identity; rejection-count assertion is committed in base HEAD."
+  },
+  "run_id": "el1-b3-notify-red-20260929",
+  "test": "el1_sched_delayed_notification_survives_parent_reap",
+  "terminal_status": "failed",
+  "reason": "reaped wake rejection count 1, expected 0",
+  "canonical_path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-5c0e433fa1c09ea5",
+  "sha256": "3abb0c5258905f2caf22a4b6b6a4c07f9b95c170cf0f846ca769d64b37f7b3ae",
+  "cdhash": "a210cbef65ba0ba75be11c01c7f4c1e6f62009a5",
+  "uuid": "UUID: D2DC043E-B9C2-3BD2-B13D-03EBA4EB462A (arm64) /Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/deps/el1_sched-5c0e433fa1c09ea5",
+  "entitlement_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+  "hypervisor_entitlement": true,
+  "dof_carrick": true,
+  "scoped_remaining_processes": 0,
+  "negative_control": "passed; see raw log"
+}

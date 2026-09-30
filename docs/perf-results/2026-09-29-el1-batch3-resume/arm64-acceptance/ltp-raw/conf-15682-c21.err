@@ -1,0 +1,18 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_dupAIw06u as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+dup203.c:38: TINFO: Test duping over an open fd
+dup203.c:72: TPASS: test the content of file is correct
+dup203.c:79: TPASS: test the FD_CLOEXEC flag is correct
+dup203.c:38: TINFO: Test duping over a close fd
+dup203.c:72: TPASS: test the content of file is correct
+dup203.c:79: TPASS: test the FD_CLOEXEC flag is correct
+
+Summary:
+passed   4
+failed   0
+broken   0
+skipped  0
+warnings 0

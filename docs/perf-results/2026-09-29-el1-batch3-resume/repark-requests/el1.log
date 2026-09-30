@@ -1,0 +1,86 @@
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-sched-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-el1-abi)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-el1)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.72s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-a61e50e98fe13e35)
+
+running 76 tests
+test alloc::tests::test_extent_admission_validation_and_overlap_rejection ... ok
+test alloc::tests::test_dynamic_growth_and_exact_once_return ... ok
+test alloc::tests::test_extent_return_cancellation_preserves_reusable_memory ... ok
+test alloc::tests::test_grant_refusal_preserves_state_and_allows_subsequent_retry ... ok
+test alloc::tests::oversized_layout_fails_without_panic_or_state_change ... ok
+test alloc::tests::test_arbitrary_alignments_and_memory_writes ... ok
+test alloc::tests::test_fragmentation_coalescing_and_reuse ... ok
+test fault::tests::cow_write_permission_fault_forwards_when_not_authorized ... ok
+test fault::tests::concurrent_and_migrated_faults_share_one_host_publication ... ok
+test fault::tests::cow_write_permission_fault_serves_in_guest_when_resolved ... ok
+test fault::tests::missing_guest_table_is_handled_before_commit_without_guest_handback ... ok
+test fault::tests::non_translation_or_permission_fault_never_requests_a_grant ... ok
+test fault::tests::permission_fault_never_requests_a_first_touch_frame_grant ... ok
+test fault::tests::test_dispatch_fault_increments_counter_and_forwards ... ok
+test fault::tests::refused_frame_grant_falls_back_without_republishing_in_the_same_dispatch ... ok
+test lock::tests::test_spinlock_mutual_exclusion ... ok
+test fault::tests::prepared_executable_leaf_commits_on_instruction_translation_fault ... ok
+test memory::tests::ineligible_mapping_and_permission_widening_forward ... ok
+test fault::tests::prepared_grant_fault_commits_in_guest_and_records_residency ... ok
+test memory::tests::malformed_or_ineligible_munmap_preserves_linux_fallback ... ok
+test alloc::tests::test_bounded_operations_and_bytes_at_scales_1_8_32_128 ... ok
+test memory::tests::resident_anonymous_mmap_allocates_and_replaces ... ok
+test memory::tests::resident_anonymous_brk_manages_heap_break ... ok
+test memory::tests::resident_anonymous_mprotect_rounds_and_edits_under_exact_mm_guard ... ok
+test personality::dispatch::tests::allocator_control_requires_test_feature ... ok
+test memory::tests::resident_anonymous_munmap_retires_under_exact_mm_guard ... ok
+test personality::dispatch::tests::test_dispatch_entry_routes_fault_with_high_bits_and_arbitrary_x8 ... ok
+test personality::dispatch::tests::test_dispatch_entry_routes_irq ... ok
+test personality::dispatch::tests::test_dispatch_entry_routes_syscall ... ok
+test personality::dispatch::tests::test_dispatch_forwards_all_and_counts ... ok
+test personality::dispatch::tests::test_concurrent_dispatch_increments ... ok
+test personality::dispatch::tests::test_dispatch_syscall_with_regions_entry_pending_work ... ok
+test personality::dispatch::tests::test_dispatch_syscall_with_regions_served ... ok
+test personality::dispatch::tests::test_dispatch_syscall_with_regions_exit_pending_work ... ok
+test personality::file::tests::test_extension_gap_pages_tracked_in_zero_filled_mask ... ok
+test personality::dispatch::tests::test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake ... ok
+test personality::file::tests::test_fixup_fault_interception ... ok
+test personality::file::tests::test_lseek_model ... ok
+test personality::dispatch::tests::test_stale_handle_interleaving_forwards ... ok
+test personality::file::tests::test_read_and_pread64_model ... ok
+test personality::dispatch::tests::test_thread_sleep_survives_task_generation_bump ... ok
+test personality::file::tests::test_write_and_pwrite64_model ... ok
+test personality::dispatch::tests::test_inotify_add_watch_write_rm_watch_read_served ... ok
+test personality::dispatch::tests::test_inotify_cache_miss_forwards ... ok
+test personality::dispatch::tests::test_two_open_files_share_one_inode_with_independent_offsets ... ok
+test personality::file::tests::test_efault_forward_semantics ... ok
+test personality::inotify::tests::a_short_read_of_a_non_inotify_fd_forwards ... ok
+test personality::file::tests::test_write_extension_zeroes_hole ... ok
+test personality::inotify::tests::a_large_read_returns_every_whole_record_that_fits ... ok
+test personality::inotify::tests::a_spilled_instance_forwards_reads_to_the_host ... ok
+test personality::inotify::tests::an_unwritable_buffer_forwards_without_consuming_records ... ok
+test substrate::sched::tests::a_kick_taken_at_el0_forwards ... ok
+test substrate::sched::tests::a_park_before_a_host_runnable_thread_leaves_for_the_host ... ok
+test substrate::sched::tests::a_futex_handoff_switches_threads_in_guest_and_preserves_state ... ok
+test substrate::sched::tests::a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host ... ok
+test substrate::sched::tests::a_wait_on_a_changed_word_returns_eagain_without_parking ... ok
+test substrate::sched::tests::a_futex_wait_switches_the_vcpu_to_another_process_in_guest ... ok
+test substrate::sched::tests::a_switch_without_fpsimd_save_is_detected ... ok
+test substrate::sched::tests::a_timed_wait_ends_in_guest_with_etimedout ... ok
+test substrate::sched::tests::a_raised_gate_sends_the_thread_to_its_executor ... ok
+test substrate::sched::tests::a_wait_with_nothing_runnable_idles_until_host_work ... ok
+test substrate::sched::tests::a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to ... ok
+test substrate::sched::tests::an_idle_vcpu_does_not_steal_host_service_work ... ok
+test substrate::sched::tests::a_vcpu_in_wfi_holds_no_address_space ... ok
+test substrate::sched::tests::an_idle_vcpu_parks_in_wfi_after_its_spin ... ok
+test substrate::sched::tests::an_idle_vcpu_steals_a_queued_thread ... ok
+test substrate::sched::tests::an_owed_cow_invalidation_runs_before_the_install ... ok
+test substrate::sched::tests::cancelled_on_cpu_thread_is_not_stranded_by_repark ... ok
+test substrate::sched::tests::threads_of_another_process_are_not_woken ... ok
+test substrate::sched::tests::signal_requested_on_cpu_is_not_lost_by_repark ... ok
+test substrate::sched::tests::the_idle_entry_runs_no_thread_itself ... ok
+test substrate::sched::tests::the_virtual_timer_preempts_a_compute_loop ... ok
+test substrate::sched::tests::the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host ... ok
+test substrate::sched::tests::timed_waits_this_vcpu_cannot_keep_forward ... ok
+test substrate::sched::tests::queued_threads_do_not_send_other_syscalls_to_the_host ... ok
+test substrate::sched::tests::unserved_futex_operations_forward ... ok
+
+test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

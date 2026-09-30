@@ -1,0 +1,40 @@
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-el1-abi)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1_abi-c5bd077523efdcc6)
+
+running 32 tests
+test tests::frame_grant_commit_interleaving_never_exposes_unpublished_residency ... ok
+test tests::el1_task_id_zero_extends_and_never_matches_none ... ok
+test tests::frame_grant_guest_claims_only_the_exact_fault_response ... ok
+test tests::frame_grant_host_claim_leaves_another_faults_request_pending ... ok
+test tests::frame_grant_mailbox_binds_ready_data_to_exact_request_and_mm ... ok
+test tests::frame_grant_mailbox_rejects_mismatched_or_unauthenticated_ready_data ... ok
+test tests::an_image_built_against_another_layout_is_refused ... ok
+test tests::frame_grant_mailboxes_are_single_flight_per_vcpu_slot ... ok
+test tests::frame_grant_publication_failure_keeps_arming_and_refuses_without_commit ... ok
+test tests::frame_grant_read_accepts_every_accessible_linux_vma_permission ... ok
+test tests::host_exit_classes_keep_hvf_and_el1_reasons_distinct ... ok
+test tests::an_enqueue_owes_a_wake_only_on_the_readable_edge_of_an_observed_instance ... ok
+test tests::hvc_not_svc_reason_keeps_el0_syndrome_and_fault_status ... ok
+test tests::metadata_mailbox_transfers_one_request_and_response_without_overwrite ... ok
+test tests::test_action_discriminants ... ok
+test tests::test_counters_layout ... ok
+test tests::test_counters_snapshot_and_initialization ... ok
+test tests::test_current_task_layout ... ok
+test tests::grant_residency_rejects_retired_and_reused_identity ... ok
+test tests::test_current_task_operations ... ok
+test tests::test_delegated_file_cache_va ... ok
+test tests::test_delegated_file_layout ... ok
+test tests::test_delegated_file_locking ... ok
+test tests::test_delegated_inotify_layout ... ok
+test tests::test_fd_map_slot_layout ... ok
+test tests::test_fd_map_operations ... ok
+test tests::test_image_header_layout ... ok
+test tests::test_delegated_inotify_operations ... ok
+test tests::test_inotify_name_cache ... ok
+test tests::test_pending_host_work_helpers ... ok
+test tests::test_region_layout ... ok
+test tests::test_trap_frame_layout ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

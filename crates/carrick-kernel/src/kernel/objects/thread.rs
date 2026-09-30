@@ -1348,18 +1348,34 @@ impl Thread {
     /// that ran it handing it back): if this thread's blocked continuation is
     /// the zone wait on `record`, make it ready. A thread still settling (its
     /// continuation not yet registered) sees the host-owned record when it
-    /// enrolls.
-    pub(crate) fn publish_zone_ready(&self, record: carrick_el1_abi::RecordRef) -> bool {
+    /// enrolls. Capture the exact wake target under the same execution lock;
+    /// a registered different wait or an inactive thread owes no zone wake.
+    pub(crate) fn prepare_zone_handback(
+        &self,
+        record: carrick_el1_abi::RecordRef,
+    ) -> Option<crate::kernel::scheduler::ExactWakeTarget> {
         let execution = self.execution.lock();
-        if let Some(continuation) = execution.blocked_continuation.as_ref()
-            && continuation
+        let generation = execution.state.generation()?;
+        let mut target =
+            crate::kernel::scheduler::ExactWakeTarget::new(self.task_key(), self.key, generation);
+        if let Some(continuation) = execution.blocked_continuation.as_ref() {
+            if !continuation
                 .zone_wait()
                 .is_some_and(|wait| wait.record == record)
-        {
-            return continuation
-                .publish_ready_event(crate::kernel::continuation::ContinuationEvent::Ready);
+            {
+                return None;
+            }
+            continuation.publish_ready_event(crate::kernel::continuation::ContinuationEvent::Ready);
+            // Control quanta can advance the generation while this exact
+            // continuation stays owned. Capture both under the same lock.
+            target = target.for_continuation(continuation.id());
+        } else if !matches!(
+            execution.state,
+            ThreadExecutionState::Running { .. } | ThreadExecutionState::SwitchingOut { .. }
+        ) {
+            return None;
         }
-        false
+        Some(target)
     }
 
     /// Schedule owner-thread control work without manufacturing readiness for
@@ -1395,7 +1411,8 @@ impl Thread {
                 .and_then(|continuation| continuation.zone_wait())
         {
             match crate::el1_zone::claim(wait.record, None, carrick_el1_abi::Handback::Control) {
-                carrick_el1_abi::HostClaim::El1Held { .. } => {
+                carrick_el1_abi::HostClaim::Deferred
+                | carrick_el1_abi::HostClaim::El1Held { .. } => {
                     return Ok(ThreadSchedulerAction::None);
                 }
                 carrick_el1_abi::HostClaim::Claimed
@@ -2184,7 +2201,8 @@ impl Thread {
                                 None,
                                 carrick_el1_abi::Handback::Control,
                             ) {
-                                carrick_el1_abi::HostClaim::El1Held { .. } => false,
+                                carrick_el1_abi::HostClaim::Deferred
+                                | carrick_el1_abi::HostClaim::El1Held { .. } => false,
                                 carrick_el1_abi::HostClaim::Claimed
                                 | carrick_el1_abi::HostClaim::AlreadyHost
                                 | carrick_el1_abi::HostClaim::Stale => {

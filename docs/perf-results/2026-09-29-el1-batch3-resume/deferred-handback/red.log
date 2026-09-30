@@ -1,0 +1,19 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.95s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-e83b75ec664a6efd)
+
+running 1 test
+
+thread 'el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record' (33008344) panicked at crates/carrick-kernel/src/el1_zone.rs:721:13:
+delayed handback targeted replacement: [RecordRef { id: RecordId(1), incarnation: 3 }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record ... FAILED
+
+failures:
+
+failures:
+    el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2307 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`
