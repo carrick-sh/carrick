@@ -42,6 +42,7 @@ fn exercise(epoll: bool) -> (i32, i32, bool) {
         }
         libc::close(ready[0]);
         libc::close(data[1]);
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let epfd = if epoll { libc::epoll_create1(0) } else { -1 };
             if epoll {
@@ -64,9 +65,17 @@ fn exercise(epoll: bool) -> (i32, i32, bool) {
                 libc::close(epfd);
             }
             libc::close(data[0]);
-            (rc, error, before)
+            completed_tx
+                .send((rc, error, before))
+                .expect("publish wait result");
         });
-        let result = worker.join().expect("wait thread");
+        let result = completed_rx
+            .recv_timeout(Duration::from_secs(6))
+            .unwrap_or_else(|_| {
+                println!("wait_completed=false");
+                std::process::exit(1);
+            });
+        drop(worker);
         let mut status = 0;
         assert_eq!(libc::waitpid(helper, &mut status, 0), helper);
         assert_eq!(status, 0);
