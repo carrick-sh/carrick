@@ -1374,7 +1374,9 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
     let Some(table) = carrick_el1_abi::frame_grant_residency_host() else {
         return;
     };
+    let mut pages = Vec::new();
     table.for_each_dirty_mm(mutation.mm_id().raw(), |slot, identity, bits| {
+        pages.clear();
         for (word_index, mut word) in bits.into_iter().enumerate() {
             while word != 0 {
                 let bit = word.trailing_zeros() as u64;
@@ -1383,12 +1385,14 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
                 if page >= identity.semantic_base + identity.len {
                     continue;
                 }
-                let expected_ipa = identity.physical_ipa + page - identity.semantic_base;
-                if engine.live_el1_grant_page(page, expected_ipa) {
-                    let _ = dispatcher.reconcile_el1_resident_page(mutation, page);
-                }
+                pages.push((page, identity.physical_ipa + page - identity.semantic_base));
             }
         }
+        // One live-root read and one resolution per table arena for the
+        // whole grant (`ThreadedEngine::live_el1_grant_pages`).
+        engine.live_el1_grant_pages(&pages, &mut |page| {
+            let _ = dispatcher.reconcile_el1_resident_page(mutation, page);
+        });
         let _ = table.ack_dirty(slot, identity);
     });
 }

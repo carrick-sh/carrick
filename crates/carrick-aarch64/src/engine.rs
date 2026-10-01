@@ -1768,6 +1768,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// hardware MMU sees. Kept off the syscall hot path; high-VA alias installs
     /// use it to fire the existing `pt-alias-walk` USDT receipt.
     fn live_pt_debug_walk(&self, va: u64) -> Result<[u64; 4], MemoryError> {
+        let (pt_base, host) = self.live_pt_root()?;
+        self.live_pt_debug_walk_with_host(va, pt_base, host)
+    }
+
+    /// The live stage-1 root this vCPU runs on (`TTBR0_EL1`) and the host
+    /// mapping of its page-table region.
+    fn live_pt_root(&self) -> Result<(u64, *mut u8), MemoryError> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
@@ -1779,7 +1786,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .vm
             .host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_owned()))?;
-        self.live_pt_debug_walk_with_host(va, pt_base, host)
+        Ok((pt_base, host))
     }
 
     fn live_pt_debug_walk_with_host(
@@ -4296,17 +4303,52 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })
     }
 
-    fn live_el1_grant_page(&self, va: u64, expected_ipa: u64) -> bool {
-        if self.process_asid.is_none() {
-            return false;
+    fn live_el1_grant_pages(&self, pages: &[(u64, u64)], resident: &mut dyn FnMut(u64)) {
+        if self.process_asid.is_none() || pages.is_empty() {
+            return;
         }
-        let Ok(walk) = self.live_pt_debug_walk(va) else {
-            return false;
+        // A root that cannot be read or resolved authenticates no page, as
+        // the per-page walk's error did.
+        let Ok((pt_base, host)) = self.live_pt_root() else {
+            return;
         };
-        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(walk);
-        carrick_mmu_core::aarch64::el1_private_leaf_state(leaf)
-            == carrick_mmu_core::aarch64::El1PrivateLeafState::Resident
-            && leaf & 0x0000_FFFF_FFFF_F000 == expected_ipa
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        self.page_tables.with_manager(|manager| {
+            if manager.base() != pt_base {
+                return;
+            }
+            let resolver = EngineHostResolver {
+                vm: &self.vm,
+                pt_base,
+                host,
+                size,
+            };
+            let mut expected = pages.iter().map(|&(_, ipa)| ipa);
+            // SAFETY: `live_pt_root` resolved the live page-table mapping at
+            // `pt_base` and its base was checked above; the caller's MM
+            // mutation authority excludes table edits for this call.
+            unsafe {
+                manager.debug_walk_host_pages(
+                    resolver,
+                    pages.iter().map(|&(va, _)| va),
+                    |va, walk| {
+                        let Some(expected_ipa) = expected.next() else {
+                            return;
+                        };
+                        let Ok(walk) = walk else {
+                            return;
+                        };
+                        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(walk);
+                        if carrick_mmu_core::aarch64::el1_private_leaf_state(leaf)
+                            == carrick_mmu_core::aarch64::El1PrivateLeafState::Resident
+                            && leaf & 0x0000_FFFF_FFFF_F000 == expected_ipa
+                        {
+                            resident(va);
+                        }
+                    },
+                );
+            }
+        });
     }
 
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
@@ -5532,6 +5574,31 @@ mod tests {
                 .windows(4)
                 .any(|word| word == 0xd508_831f_u32.to_le_bytes())
         );
+    }
+
+    /// Contract `kernel.el1.grant-commit-revalidation`: one grant's committed
+    /// pages are authenticated with one live-root read (`TTBR0_EL1` plus the
+    /// host page-table mapping) and one batched walk, never a root read and
+    /// full walk per page. The arena-resolution budget of the batched walk
+    /// is `debug_walk_host_pages_resolves_each_arena_once_however_many_pages`
+    /// in carrick-mmu-core.
+    #[test]
+    fn el1_grant_revalidation_reads_the_live_root_once_per_grant() {
+        let source = include_str!("engine.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production AArch64 engine source");
+        let body = production
+            .split("fn live_el1_grant_pages(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("live_el1_grant_pages body");
+        assert_eq!(body.matches("self.live_pt_root()").count(), 1);
+        assert_eq!(body.matches("debug_walk_host_pages(").count(), 1);
+        assert!(!body.contains("live_pt_debug_walk"));
+        assert!(!body.contains("get_sys_reg"));
+        assert!(!production.contains("fn live_el1_grant_page("));
     }
 
     #[test]
