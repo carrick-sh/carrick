@@ -117,6 +117,15 @@ fn forwarded_read_per_call_budget() {
 
 #[test]
 fn forwarded_write_per_call_budget() {
+    assert_forwarded_write_per_call_budget(false);
+}
+
+#[test]
+fn forwarded_write_after_foreign_namespace_bump_per_call_budget() {
+    assert_forwarded_write_per_call_budget(true);
+}
+
+fn assert_forwarded_write_per_call_budget(foreign_namespace_bump: bool) {
     let file = tempfile::tempfile().expect("tempfile");
 
     let mut dispatcher = SyscallDispatcher::new();
@@ -131,6 +140,11 @@ fn forwarded_write_per_call_budget() {
 
     let buf_addr = MEM_BASE + 0x1000;
     let count = 8192u64;
+    if foreign_namespace_bump {
+        // Another kernel graph can mutate the shared namespace between cache
+        // construction and this first write. No inode has been cached here.
+        carrick_vfs::fs_resolve_cache::bump_generation();
+    }
 
     let (outcome, snapshot) = budget_meter::measure_no_allocations(|| {
         dispatcher
