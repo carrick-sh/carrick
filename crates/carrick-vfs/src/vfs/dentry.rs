@@ -2660,6 +2660,13 @@ impl DentryCache {
 
     /// Whether any inode record is currently cached.
     pub fn has_cached_inodes(&self) -> bool {
+        // An empty inode cache cannot expose stale metadata. In particular,
+        // a forwarded write need not reconcile directory topology (including
+        // allocating its kept-directory set) just to discover there is no
+        // inode record to invalidate after a foreign namespace mutation.
+        if self.inodes.read().is_empty() {
+            return false;
+        }
         self.check_fork();
         !self.inodes.read().is_empty()
     }
