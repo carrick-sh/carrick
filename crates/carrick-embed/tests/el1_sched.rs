@@ -1159,6 +1159,75 @@ fn el1_sched_pipe_pingpong_stays_in_guest() {
     }
 }
 
+/// Contract `kernel.el1.epoll-zone`, structural part: an eventfd round trip
+/// through an epoll whose set holds only in-zone objects (libuv's
+/// MessagePort shape: post the peer's eventfd, block in `epoll_wait` on your
+/// own) needs no host exit in steady state. Over the differences of three
+/// run lengths (1000, 3000, 6000 round trips), host exits per round trip and
+/// forwarded `epoll_pwait` (nr 22) per round trip must both be below 0.01.
+/// Red before the in-zone epoll: every turn forwards one `epoll_pwait` per
+/// side, and every served eventfd write and read returns through the host to
+/// deliver the wake it owes the host-side epoll.
+#[test]
+fn el1_epoll_eventfd_pingpong_stays_in_guest() {
+    const LENGTHS: [u64; 3] = [1_000, 3_000, 6_000];
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for iters in LENGTHS {
+        let measured = run_fixture(
+            &carrier,
+            &["epoll-pingpong", &iters.to_string()],
+            Duration::from_secs(120),
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        let stdout = measured.result.stdout_utf8();
+        assert!(
+            stdout.contains(&format!("epoll-pingpong iters={iters}")),
+            "epoll-pingpong did not complete: {stdout}"
+        );
+        let epoll_forwards = measured
+            .forwarded_syscalls
+            .iter()
+            .find(|(nr, _)| *nr == 22)
+            .map_or(0, |(_, n)| *n);
+        println!(
+            "el1-sched epoll-pingpong iters={iters} exits={} epoll_pwait_forwarded={epoll_forwards} \
+             exit_classes={} el1_reasons={} host_work={} carrier_cpu_ns={} zone={:?} {}",
+            measured.exits,
+            exit_breakdown(&measured),
+            el1_reason_breakdown(&measured),
+            host_work_breakdown(&measured),
+            measured.cpu_ns,
+            measured.zone,
+            stdout.trim()
+        );
+        runs.push((iters, measured.exits, epoll_forwards, measured.cpu_ns));
+    }
+    let mut failures = Vec::new();
+    for pair in runs.windows(2) {
+        let (short, long) = (pair[0], pair[1]);
+        let span = (long.0 - short.0) as f64;
+        let exits = (long.1 as f64 - short.1 as f64) / span;
+        let forwards = (long.2 as f64 - short.2 as f64) / span;
+        let cpu = (long.3 as f64 - short.3 as f64) / span;
+        println!(
+            "el1-sched epoll-pingpong {}..{} exits_per_rt={exits:.4} \
+             epoll_pwait_forwarded_per_rt={forwards:.4} carrier_cpu_ns_per_rt={cpu:.0}",
+            short.0, long.0
+        );
+        if exits >= 0.01 || forwards >= 0.01 {
+            failures.push(format!(
+                "eventfd round trip through an in-zone epoll reached the host ({}..{}): \
+                 {exits:.3} exits and {forwards:.3} forwarded epoll_pwait per round trip",
+                short.0, long.0
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Contract `kernel.el1.guest-run-queue`, two live processes sharing vCPUs:
 /// each of a parent and its forked child runs a futex ping-pong between two
 /// threads pinned to guest CPUs 0 and 1, so both processes' threads hand off

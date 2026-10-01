@@ -1,0 +1,13 @@
+b93e3a7fc8f6ced1
+unblock_pending_rc=-1
+unblock_pending_errno=4
+unblock_pending_handler_ran=true
+unblock_pending_mask_restored=true
+blocked_during_rc=0
+blocked_during_errno=0
+blocked_handler_ran_by_return=true
+blocked_mask_restored=true
+ready_rc=1
+ready_data=77
+bad_sigsetsize_rc=-1
+bad_sigsetsize_errno=22

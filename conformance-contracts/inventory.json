@@ -268,6 +268,7 @@
       "handler": "network",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.epoll-zone",
         "kernel.el1.ipc-two-process"
       ],
       "claims": [],
@@ -282,7 +283,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.epoll-zone"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -295,7 +298,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.epoll-zone"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -308,7 +313,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.epoll-zone"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -321,7 +328,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.epoll-zone"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -801,6 +810,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.epoll-zone",
         "kernel.el1.files.cross-process-readers"
       ],
       "claims": [],
@@ -829,6 +839,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.epoll-zone",
         "kernel.el1.ipc-two-process"
       ],
       "claims": [],
@@ -892,6 +903,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.epoll-zone",
         "kernel.el1.files",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.files.path-mutation",
@@ -919,6 +931,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.epoll-zone",
         "kernel.el1.files",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.files.path-mutation",
