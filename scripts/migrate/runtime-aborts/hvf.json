@@ -599,7 +599,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "mutate_known_external_alias_state",
+      "function": "mutate_known_external_alias_state_in",
       "ordinal_in_function": 1,
       "fingerprint": "9bc8dfe365a75eaf1934b03a20342c3cf32da92fbfbe50647278e91dd34f560f",
       "verdict": "carrier_fault",
@@ -610,7 +610,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "mutate_known_external_alias_state",
+      "function": "mutate_known_external_alias_state_in",
       "ordinal_in_function": 2,
       "fingerprint": "5f85d289e3cc6be143e75ae8a76e3e3b4fb321de7b664936dc31b8b50494d92e",
       "verdict": "carrier_fault",
@@ -832,7 +832,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::commit_process_alias_retirement_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "b536eef05774f917636663e8b4394e234f7788b129328f5d3b83acae61f2c1a4",
+      "fingerprint": "c739b3a2810b9ce5ff8066dcf3f6efc58fc3bb6cbd922b348dc61753f41be7df",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "A restarted alias retirement read no fewer registry rows than the stale attempt: only an out-of-guard writer ADDING rows to the retiring window can do that, which breaks the owned-scope invariant the restart bound rests on.",
