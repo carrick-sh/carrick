@@ -23,7 +23,8 @@ use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
 use carrick_el1_abi::{
-    CurrentHandback, Handback, RecordRef, SlotId, ThreadCtx, ThreadIdentity, ZoneTables,
+    CurrentHandback, CurrentRelease, Handback, RecordRef, SlotId, ThreadCtx, ThreadIdentity,
+    ZoneTables,
 };
 use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
@@ -232,15 +233,39 @@ where
         zone.sweep_cancelled(slot);
         carrick_kernel::el1_zone::hand_back_wanted(slot);
         let s = zone.slot(slot);
-        let (current, own) = (s.current(), s.host_record());
+        let (mut current, own) = (s.current(), s.host_record());
+        let mut requeued = false;
+        if let (Some(switched), Some(own)) = (current, own)
+            && switched == own
+        {
+            // EL1 switched this job's own thread back in. Nothing stays
+            // switched in on the slot past this boundary.
+            match zone.release_current(slot, own, &HostLockWait) {
+                // It is simply running again: its record is retired.
+                CurrentRelease::Released => {
+                    return self.own_space_installed(zone, slot).map(|()| None);
+                }
+                // It was switched in at the SVC of its pending object
+                // operation, which never re-executed (EL1 left with host
+                // work after the switch, or a kick stopped it at EL0): its
+                // record is back at the head of the run queue, and the
+                // thread settles into its zone wait on it below, exactly as
+                // a thread EL1 parked or preempted. Its next load resumes
+                // the operation; this exit (no call of the thread's) is
+                // abandoned.
+                CurrentRelease::Requeued => {
+                    crate::probes::el1_zone_requeue_operation(
+                        u32::from(slot.raw()),
+                        u32::from(matches!(exit, ZoneExit::Syscall { .. })),
+                        own.raw().into(),
+                    );
+                    current = None;
+                    requeued = true;
+                }
+            }
+        }
         let state = match (current, own) {
             (None, None) => return self.own_space_installed(zone, slot).map(|()| None),
-            (Some(current), Some(own)) if current == own => {
-                // EL1 switched this job's own thread back in: it is simply
-                // running again, and its record is done.
-                zone.release_current(slot, current);
-                return self.own_space_installed(zone, slot).map(|()| None);
-            }
             (Some(current), _) => {
                 // Another thread is on the vCPU. Take it off with its live
                 // state; this executor claims it next. This job's thread,
@@ -291,6 +316,12 @@ where
                     &self.kernel.dispatcher,
                 );
                 let state = engine.snapshot_guest_state_for_publication()?;
+                if requeued && matches!(exit, ZoneExit::Syscall { .. }) {
+                    // EL1 left through the syscall mailbox with the requeued
+                    // record's unexecuted SVC as its frame: no call of this
+                    // thread's to complete. The record keeps its context.
+                    engine.discard_terminal_syscall_continuation()?;
+                }
                 // The thread re-issues its syscall when it resumes. A call EL1
                 // served whose host commit is owed must re-issue with its
                 // ORIGINAL x0, not the result EL1 wrote there (a re-issued

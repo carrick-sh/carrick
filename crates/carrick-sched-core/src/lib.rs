@@ -1205,6 +1205,20 @@ pub struct HostPlacement {
     pub resched: bool,
 }
 
+/// The outcome of [`ZoneTables::release_current`]: either way the slot
+/// holds nothing switched in afterwards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "a requeued record must be settled into its thread's zone wait"]
+pub enum CurrentRelease {
+    /// The thread is simply running again; its record is retired.
+    Released,
+    /// The thread is at the SVC of the pending object operation its record
+    /// owns, never re-executed: the record is back at the head of the slot's
+    /// run queue, still the slot's home record, and the caller settles the
+    /// thread into its zone wait on it.
+    Requeued,
+}
+
 /// The outcome of [`ZoneTables::handback_current`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CurrentHandback {
@@ -2320,17 +2334,24 @@ impl ZoneTables {
     /// queue, still queued, for the slot's executor to take
     /// ([`Self::take_service_head`]).
     pub fn unswitch(&self, slot: SlotId, record: RecordId) {
+        let _ = self.unswitch_with(slot, record, &SpinForever);
+    }
+
+    /// [`Self::unswitch`], waiting for the slot lock as `wait` says. False:
+    /// `record` was not switched in on `slot` (or the lock was not taken),
+    /// and nothing changed.
+    fn unswitch_with(&self, slot: SlotId, record: RecordId, wait: &impl LockWait) -> bool {
         let rec = self.record(record);
         let from = rec.claim();
         let (Claim::OnCpu { slot: owner, seq } | Claim::OnCpuRequested { slot: owner, seq }) = from
         else {
-            return;
+            return false;
         };
         if owner != slot {
-            return;
+            return false;
         }
-        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
-            return;
+        let Some(guard) = self.slot_lock(slot, wait) else {
+            return false;
         };
         if !rec.cas(from, Claim::Queued { slot, seq })
             && !rec.cas(
@@ -2338,13 +2359,14 @@ impl ZoneTables {
                 Claim::Queued { slot, seq },
             )
         {
-            return;
+            return false;
         }
         let s = self.slot(slot);
         if s.current.load(Ordering::Acquire) == record.raw() {
             s.current.store(NIL, Ordering::Release);
         }
         self.push_front_locked(&guard, record);
+        true
     }
 
     /// Put `record` at the head of the run queue `guard` holds.
@@ -2803,21 +2825,39 @@ impl ZoneTables {
         }
     }
 
-    /// The switched-in record of `slot` is the thread the executor loaded:
-    /// it is simply running again, so its record is done.
-    pub fn release_current(&self, slot: SlotId, record: RecordId) {
-        if self.record(record).has_object_operation() {
-            return;
-        }
+    /// The switched-in record of `slot` is the thread the executor loaded,
+    /// back on the vCPU at a host boundary: nothing may stay switched in on
+    /// the slot past this boundary (its next load would find it there).
+    ///
+    /// A record EL1 switched back in at the SVC of a pending object
+    /// operation, which its adapter never took (the vCPU left for the host
+    /// before that SVC re-executed: a kick, owed host work after the switch,
+    /// a descriptor drain that could not run), has not resumed: its context
+    /// is still exactly the thread's at that SVC. It goes back to the head of
+    /// the run queue, operation and all ([`CurrentRelease::Requeued`]); the
+    /// caller settles the thread into its zone wait on it, as for a thread
+    /// EL1 parked or preempted, and the operation resumes from there. Any
+    /// other record is retired ([`CurrentRelease::Released`]).
+    pub fn release_current(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        wait: &impl LockWait,
+    ) -> CurrentRelease {
         let s = self.slot(slot);
+        let rec = self.record(record);
+        let owned = matches!(rec.claim(), Claim::OnCpu { slot: owner, .. } | Claim::OnCpuRequested { slot: owner, .. } if owner == slot);
+        if owned && rec.has_object_operation() && self.unswitch_with(slot, record, wait) {
+            return CurrentRelease::Requeued;
+        }
         s.current.store(NIL, Ordering::Release);
         if s.host_record.load(Ordering::Acquire) == record.raw() {
             s.host_record.store(NIL, Ordering::Release);
         }
-        if matches!(self.record(record).claim(), Claim::OnCpu { slot: owner, .. } | Claim::OnCpuRequested { slot: owner, .. } if owner == slot)
-        {
+        if owned {
             self.free_record(record);
         }
+        CurrentRelease::Released
     }
 
     /// The host publishes the affinity of the thread it runs on `slot`

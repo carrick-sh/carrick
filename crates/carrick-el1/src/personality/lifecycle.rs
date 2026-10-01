@@ -564,7 +564,13 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
             return None;
         }
     }
-    zone.release_current(zslot, record);
+    // Checked above: the record holds no object operation (only its own
+    // park gives it one), so the release is a plain retirement.
+    let _released: carrick_sched_core::CurrentRelease = zone.release_current(
+        zslot,
+        record,
+        &carrick_sched_core::BoundedSpin(carrick_el1_abi::EL1_GUEST_LOCK_SPINS),
+    );
     if page.exit_in_zone(entry).is_err() {
         // Unreachable (checked above; only this thread leaves Born or
         // Published that way): the host must look at this process.

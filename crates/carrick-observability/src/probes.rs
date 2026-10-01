@@ -5743,6 +5743,13 @@ mod real {
         /// A re-armed kick IRQ was taken: the EL1 IRQ vector's `hvc` kick
         /// surfaced with the interrupted EL0 `pc`.
         fn vcpu__irq__kick(_: u64) {}
+        /// A host boundary found the loaded thread's own zone record switched
+        /// back in by EL1 at the SVC of a pending object operation its adapter
+        /// never took, and requeued it at the head of the slot's run queue for
+        /// the thread to settle on. `slot` the zone slot, `syscall_exit` 1 when
+        /// the vCPU left through the syscall mailbox (EL1 `ServedWithWork`), 0
+        /// at an EL0 boundary; `record` the zone record id.
+        fn el1__zone__requeue__operation(_: u32, _: u32, _: u64) {}
         /// An owed kick was settled by a surfaced exit. `pc`/`pstate` where the
         /// vCPU stopped, `el0_state` the EL0 return PSTATE before restoring its
         /// `I` bit (`I` clear here means EL0 ran unmasked yet did not take the
@@ -7826,6 +7833,10 @@ mod real {
         carrick_usdt::vcpu__irq__kick!(|| pc);
     }
 
+    pub fn el1_zone_requeue_operation(slot: u32, syscall_exit: u32, record: u64) {
+        carrick_usdt::el1__zone__requeue__operation!(|| (slot, syscall_exit, record));
+    }
+
     pub fn owed_kick_settle(pc: u64, pstate: u64, el0_state: u64) {
         carrick_usdt::owed__kick__settle!(|| (pc, pstate, el0_state));
     }
@@ -8926,6 +8937,7 @@ mod stub {
     stub!(vcpu_hvc_not_svc(esr: u64));
     stub!(kick_rearm_irq(pc: u64, where_: u32, spsr_el1: u64, elr_el1: u64));
     stub!(vcpu_irq_kick(pc: u64));
+    stub!(el1_zone_requeue_operation(slot: u32, syscall_exit: u32, record: u64));
     stub!(owed_kick_settle(pc: u64, pstate: u64, el0_state: u64));
     stub!(kick_stats(el1_resumed: u64, kick_inject: u64, inject_at_el1: u64));
     stub!(el1_task_record_stale(slot: u64, recorded_tid: u64, recorded_table: u64, tid: u64, table: u64));
