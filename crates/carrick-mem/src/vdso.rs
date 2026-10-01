@@ -100,29 +100,35 @@ pub fn vvar_realtime_off_ns(host_off_ns: u64, delta_ns: i64) -> u64 {
     host_off_ns.wrapping_add(delta_ns as u64)
 }
 
+/// Resolution the arm64 vDSO's `__kernel_clock_getres` reports for every
+/// clock its `__kernel_clock_gettime` serves (REALTIME, MONOTONIC,
+/// MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE, BOOTTIME), and the grid
+/// the COARSE clocks are truncated to (`CLOCK_COARSE_RES_NS` in
+/// `tools/vdso_fns.s`). It must equal what the `clock_getres` syscall reports
+/// for those clocks; the embedded code is checked against it below.
+pub const VDSO_CLOCK_RESOLUTION_NS: i64 = carrick_abi::LINUX_CLOCK_RESOLUTION_NSEC;
+
 /// The assembled clock functions (aarch64). Offsets within this blob:
-/// `__kernel_clock_gettime` @ 0x00, `__kernel_gettimeofday` @ 0x84,
-/// `__kernel_clock_getres` @ 0xdc, `__kernel_rt_sigreturn` @ 0x104,
-/// `__kernel_getrandom` @ 0x10c.
+/// `__kernel_clock_gettime` @ 0x00, `__kernel_gettimeofday` @ 0x98,
+/// `__kernel_clock_getres` @ 0xb4, `__kernel_rt_sigreturn` @ 0xf0,
+/// `__kernel_getrandom` @ 0xf8.
 /// See `tools/vdso_fns.s`.
 const VDSO_CODE: &[u8] = &[
-    0x1f, 0x1c, 0x00, 0x71, 0x28, 0x01, 0x00, 0x54, 0x1f, 0x10, 0x00, 0x71, 0x40, 0x01, 0x00, 0x54,
-    0x1f, 0x04, 0x00, 0x71, 0x00, 0x01, 0x00, 0x54, 0x1f, 0x1c, 0x00, 0x71, 0xc0, 0x00, 0x00, 0x54,
-    0x1f, 0x00, 0x00, 0x71, 0x80, 0x00, 0x00, 0x54, 0x28, 0x0e, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
-    0xc0, 0x03, 0x5f, 0xd6, 0xc9, 0x05, 0xc0, 0xd2, 0x42, 0xe0, 0x3b, 0xd5, 0x0a, 0xe0, 0x3b, 0xd5,
+    0x1f, 0x1c, 0x00, 0x71, 0x88, 0x00, 0x00, 0x54, 0x69, 0x1e, 0x80, 0x52, 0x29, 0x25, 0xc0, 0x1a,
+    0x89, 0x00, 0x00, 0x37, 0x28, 0x0e, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
+    0x2f, 0x00, 0x80, 0xd2, 0xc9, 0x05, 0xc0, 0xd2, 0x42, 0xe0, 0x3b, 0xd5, 0x0a, 0xe0, 0x3b, 0xd5,
     0x43, 0x08, 0xca, 0x9a, 0x64, 0x88, 0x0a, 0x9b, 0x0b, 0x40, 0x99, 0xd2, 0x4b, 0x73, 0xa7, 0xf2,
-    0x84, 0x7c, 0x0b, 0x9b, 0x84, 0x08, 0xca, 0x9a, 0x65, 0x10, 0x0b, 0x9b, 0x1f, 0x00, 0x00, 0x71,
-    0x61, 0x00, 0x00, 0x54, 0x2c, 0x09, 0x40, 0xf9, 0xa5, 0x00, 0x0c, 0x8b, 0xa7, 0x08, 0xcb, 0x9a,
-    0xe4, 0x94, 0x0b, 0x9b, 0x27, 0x00, 0x00, 0xf9, 0x24, 0x04, 0x00, 0xf9, 0x00, 0x00, 0x80, 0x52,
-    0xc0, 0x03, 0x5f, 0xd6, 0x80, 0x02, 0x00, 0xb4, 0xed, 0x03, 0x00, 0xaa, 0xc9, 0x05, 0xc0, 0xd2,
-    0x42, 0xe0, 0x3b, 0xd5, 0x0a, 0xe0, 0x3b, 0xd5, 0x43, 0x08, 0xca, 0x9a, 0x64, 0x88, 0x0a, 0x9b,
-    0x0b, 0x40, 0x99, 0xd2, 0x4b, 0x73, 0xa7, 0xf2, 0x84, 0x7c, 0x0b, 0x9b, 0x84, 0x08, 0xca, 0x9a,
-    0x65, 0x10, 0x0b, 0x9b, 0x2c, 0x09, 0x40, 0xf9, 0xa5, 0x00, 0x0c, 0x8b, 0xa7, 0x08, 0xcb, 0x9a,
-    0xe4, 0x94, 0x0b, 0x9b, 0x0e, 0x7d, 0x80, 0xd2, 0x84, 0x08, 0xce, 0x9a, 0xa7, 0x01, 0x00, 0xf9,
-    0xa4, 0x05, 0x00, 0xf9, 0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6, 0x1f, 0x1c, 0x00, 0x71,
-    0xe8, 0x00, 0x00, 0x54, 0x81, 0x00, 0x00, 0xb4, 0x3f, 0x00, 0x00, 0xf9, 0x22, 0x00, 0x80, 0xd2,
-    0x22, 0x04, 0x00, 0xf9, 0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6, 0x48, 0x0e, 0x80, 0xd2,
-    0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
+    0x84, 0x7c, 0x0b, 0x9b, 0x84, 0x08, 0xca, 0x9a, 0x65, 0x10, 0x0b, 0x9b, 0x2c, 0x04, 0x80, 0x52,
+    0x8c, 0x25, 0xc0, 0x1a, 0x6c, 0x00, 0x00, 0x36, 0x2c, 0x09, 0x40, 0xf9, 0xa5, 0x00, 0x0c, 0x8b,
+    0x0d, 0x0c, 0x80, 0x52, 0xad, 0x25, 0xc0, 0x1a, 0xad, 0x00, 0x00, 0x36, 0x0d, 0x48, 0x88, 0xd2,
+    0xed, 0x01, 0xa0, 0xf2, 0xae, 0x08, 0xcd, 0x9a, 0xc5, 0x7d, 0x0d, 0x9b, 0xa7, 0x08, 0xcb, 0x9a,
+    0xe4, 0x94, 0x0b, 0x9b, 0x84, 0x08, 0xcf, 0x9a, 0x27, 0x00, 0x00, 0xf9, 0x24, 0x04, 0x00, 0xf9,
+    0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6, 0xa0, 0x00, 0x00, 0xb4, 0xe1, 0x03, 0x00, 0xaa,
+    0x00, 0x00, 0x80, 0x52, 0x0f, 0x7d, 0x80, 0xd2, 0xdf, 0xff, 0xff, 0x17, 0x00, 0x00, 0x80, 0x52,
+    0xc0, 0x03, 0x5f, 0xd6, 0x1f, 0x1c, 0x00, 0x71, 0x68, 0x01, 0x00, 0x54, 0x69, 0x1e, 0x80, 0x52,
+    0x29, 0x25, 0xc0, 0x1a, 0x09, 0x01, 0x00, 0x36, 0xa1, 0x00, 0x00, 0xb4, 0x3f, 0x00, 0x00, 0xf9,
+    0x02, 0x48, 0x88, 0xd2, 0xe2, 0x01, 0xa0, 0xf2, 0x22, 0x04, 0x00, 0xf9, 0x00, 0x00, 0x80, 0x52,
+    0xc0, 0x03, 0x5f, 0xd6, 0x48, 0x0e, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
     // __kernel_rt_sigreturn (8 bytes, the trailing 8 of VDSO_CODE): `mov x8, #139
     // (__NR_rt_sigreturn); svc #0`. The canonical aarch64 sigreturn trampoline
     // body — unwinders (libgcc, gdb, Go traceback) recognise a signal frame by
@@ -183,10 +189,10 @@ const GETRANDOM_BLOB: &[u8] = include_bytes!("vdso_getrandom_blob.bin");
 
 // Symbol offsets within the code section (VDSO_CODE ‖ GETRANDOM_BLOB).
 const SYM_CLOCK_GETTIME: u64 = 0x00;
-const SYM_GETTIMEOFDAY: u64 = 0x84;
-const SYM_CLOCK_GETRES: u64 = 0xdc;
-const SYM_CLOCK_GETTIME_SYSCALL: u64 = 0x28;
-const SYM_CLOCK_GETRES_SYSCALL: u64 = 0xfc;
+const SYM_GETTIMEOFDAY: u64 = 0x98;
+const SYM_CLOCK_GETRES: u64 = 0xb4;
+const SYM_CLOCK_GETTIME_SYSCALL: u64 = 0x14;
+const SYM_CLOCK_GETRES_SYSCALL: u64 = 0xe4;
 // rt_sigreturn is the trailing 8 bytes of VDSO_CODE; getrandom is the blob
 // appended right after. Derive offsets from the lengths so they stay correct.
 const RT_SIGRETURN_LEN: u64 = 8;
@@ -1114,6 +1120,315 @@ mod tests {
         );
     }
 
+    /// Minimal interpreter for the instruction subset `tools/vdso_fns.s`
+    /// assembles to. Unknown opcodes fail closed, so a re-assembled blob that
+    /// grows a new instruction must teach the interpreter it, not skip it.
+    struct VdsoMachine<'a> {
+        code: &'a [u8],
+        x: [u64; 32],
+        nzcv_c: bool,
+        nzcv_z: bool,
+        mem: std::collections::BTreeMap<u64, u64>,
+        cntvct: u64,
+        cntfrq: u64,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum VdsoExit {
+        /// `ret` with the given x0 and no kernel entry.
+        Returned(u64),
+        /// `svc #0` with (x8, x0): the call entered the kernel.
+        Syscall(u64, u64),
+    }
+
+    impl<'a> VdsoMachine<'a> {
+        fn new(code: &'a [u8], cntvct: u64, cntfrq: u64, realtime_off: u64) -> Self {
+            let mut mem = std::collections::BTreeMap::new();
+            mem.insert(
+                LINUX_VVAR_BASE + VVAR_OFF_REALTIME_OFF_NS as u64,
+                realtime_off,
+            );
+            Self {
+                code,
+                x: [0xDEAD_0000; 32],
+                nzcv_c: false,
+                nzcv_z: false,
+                mem,
+                cntvct,
+                cntfrq,
+            }
+        }
+
+        fn reg(&self, r: u32) -> u64 {
+            if r == 31 { 0 } else { self.x[r as usize] }
+        }
+
+        fn set(&mut self, r: u32, v: u64) {
+            if r != 31 {
+                self.x[r as usize] = v;
+            }
+        }
+
+        fn call(&mut self, entry: u64, x0: u64, x1: u64) -> VdsoExit {
+            self.x[0] = x0;
+            self.x[1] = x1;
+            let mut pc = entry as usize;
+            for _ in 0..200 {
+                let op = u32::from_le_bytes(self.code[pc..pc + 4].try_into().unwrap());
+                let (rd, rn, rm) = (op & 31, (op >> 5) & 31, (op >> 16) & 31);
+                let mut next = pc + 4;
+                match op {
+                    0xd65f_03c0 => return VdsoExit::Returned(self.x[0]),
+                    0xd400_0001 => return VdsoExit::Syscall(self.x[8], self.x[0]),
+                    _ if op & 0xffff_ffe0 == 0xd53b_e040 => self.set(rd, self.cntvct),
+                    _ if op & 0xffff_ffe0 == 0xd53b_e000 => self.set(rd, self.cntfrq),
+                    // cmp wn, #imm12 (subs wzr)
+                    _ if op & 0xffc0_001f == 0x7100_001f => {
+                        let a = self.reg(rn) as u32;
+                        let b = (op >> 10) & 0xfff;
+                        self.nzcv_c = a >= b;
+                        self.nzcv_z = a == b;
+                    }
+                    // b.cond (eq, ne, hi, ls only)
+                    _ if op & 0xff00_0010 == 0x5400_0000 => {
+                        let taken = match op & 15 {
+                            0 => self.nzcv_z,
+                            1 => !self.nzcv_z,
+                            8 => self.nzcv_c && !self.nzcv_z,
+                            9 => !self.nzcv_c || self.nzcv_z,
+                            cond => panic!("unsupported condition {cond}"),
+                        };
+                        if taken {
+                            let imm = ((((op >> 5) & 0x7ffff) << 13) as i32 >> 13) as isize;
+                            next = (pc as isize + imm * 4) as usize;
+                        }
+                    }
+                    // movz (w or x), movk x
+                    _ if op & 0x7f80_0000 == 0x5280_0000 => {
+                        let hw = (op >> 21) & 3;
+                        self.set(rd, u64::from((op >> 5) & 0xffff) << (16 * hw));
+                    }
+                    _ if op & 0xff80_0000 == 0xf280_0000 => {
+                        let shift = 16 * ((op >> 21) & 3);
+                        let v = (self.reg(rd) & !(0xffff << shift))
+                            | (u64::from((op >> 5) & 0xffff) << shift);
+                        self.set(rd, v);
+                    }
+                    // mov xd, xm (orr xd, xzr, xm)
+                    _ if op & 0xffe0_ffe0 == 0xaa00_03e0 => self.set(rd, self.reg(rm)),
+                    // lsr wd, wn, wm (lsrv, 32-bit)
+                    _ if op & 0xffe0_fc00 == 0x1ac0_2400 => {
+                        let v = (self.reg(rn) as u32) >> (self.reg(rm) as u32 & 31);
+                        self.set(rd, u64::from(v));
+                    }
+                    // tbz / tbnz (bit < 32)
+                    _ if op & 0xfe00_0000 == 0x3600_0000 => {
+                        let bit = (op >> 19) & 31;
+                        let set = self.reg(rd) >> bit & 1 == 1;
+                        if set == (op & 0x0100_0000 != 0) {
+                            let imm = ((((op >> 5) & 0x3fff) << 18) as i32 >> 18) as isize;
+                            next = (pc as isize + imm * 4) as usize;
+                        }
+                    }
+                    // b imm26
+                    _ if op & 0xfc00_0000 == 0x1400_0000 => {
+                        let imm = (((op & 0x03ff_ffff) << 6) as i32 >> 6) as isize;
+                        next = (pc as isize + imm * 4) as usize;
+                    }
+                    // cbz x
+                    _ if op & 0xff00_0000 == 0xb400_0000 => {
+                        if self.reg(rd) == 0 {
+                            let imm = ((((op >> 5) & 0x7ffff) << 13) as i32 >> 13) as isize;
+                            next = (pc as isize + imm * 4) as usize;
+                        }
+                    }
+                    // udiv x
+                    _ if op & 0xffe0_fc00 == 0x9ac0_0800 => {
+                        let v = self.reg(rn).checked_div(self.reg(rm)).unwrap_or(0);
+                        self.set(rd, v);
+                    }
+                    // madd / msub x
+                    _ if op & 0xffe0_0000 == 0x9b00_0000 => {
+                        let ra = (op >> 10) & 31;
+                        let product = self.reg(rn).wrapping_mul(self.reg(rm));
+                        let v = if op & 0x8000 == 0 {
+                            self.reg(ra).wrapping_add(product)
+                        } else {
+                            self.reg(ra).wrapping_sub(product)
+                        };
+                        self.set(rd, v);
+                    }
+                    // add xd, xn, xm
+                    _ if op & 0xffe0_fc00 == 0x8b00_0000 => {
+                        self.set(rd, self.reg(rn).wrapping_add(self.reg(rm)));
+                    }
+                    // ldr / str x, [xn, #imm12*8]
+                    _ if op & 0xffc0_0000 == 0xf940_0000 => {
+                        let addr = self.reg(rn) + u64::from((op >> 10) & 0xfff) * 8;
+                        let v = *self.mem.get(&addr).unwrap_or(&0);
+                        self.set(rd, v);
+                    }
+                    _ if op & 0xffc0_0000 == 0xf900_0000 => {
+                        let addr = self.reg(rn) + u64::from((op >> 10) & 0xfff) * 8;
+                        let v = self.reg(rd);
+                        self.mem.insert(addr, v);
+                    }
+                    _ => panic!("unsupported vDSO opcode {op:08x} at {pc:#x}"),
+                }
+                pc = next;
+            }
+            panic!("vDSO control flow did not return")
+        }
+    }
+
+    fn arm64_symbol(img: &[u8], name: &str) -> u64 {
+        let elf = goblin::elf::Elf::parse(img).unwrap();
+        elf.dynsyms
+            .iter()
+            .find(|s| elf.dynstrtab.get_at(s.st_name) == Some(name))
+            .unwrap_or_else(|| panic!("{name} not exported"))
+            .st_value
+    }
+
+    const TIMESPEC: u64 = 0x1000;
+    /// The HVF guest counter frequency.
+    const FREQ: u64 = 24_000_000;
+    const SERVED: [u64; 6] = [0, 1, 4, 5, 6, 7];
+
+    fn read_clock(img: &[u8], cntvct: u64, realtime_off: u64, id: u64) -> VdsoExit {
+        let mut m = VdsoMachine::new(img, cntvct, FREQ, realtime_off);
+        match m.call(arm64_symbol(img, "__kernel_clock_gettime"), id, TIMESPEC) {
+            VdsoExit::Returned(0) => {
+                let sec = m.mem[&TIMESPEC];
+                let nsec = m.mem[&(TIMESPEC + 8)];
+                assert!(nsec < 1_000_000_000, "id {id}: tv_nsec {nsec}");
+                VdsoExit::Returned(sec * 1_000_000_000 + nsec)
+            }
+            other => other,
+        }
+    }
+
+    fn served_ns(img: &[u8], cntvct: u64, realtime_off: u64, id: u64) -> u64 {
+        match read_clock(img, cntvct, realtime_off, id) {
+            VdsoExit::Returned(ns) => ns,
+            other => panic!("clock {id} at cntvct {cntvct} entered the kernel: {other:?}"),
+        }
+    }
+
+    /// Contract `kernel.time.coarse-clock-vdso` (VM-free): the arm64 vDSO
+    /// serves REALTIME, MONOTONIC, MONOTONIC_RAW, the two COARSE clocks and
+    /// BOOTTIME without `svc`; every other id (the CPU-time clocks, unknown
+    /// and dynamic ids) enters the kernel as `clock_gettime` with its id
+    /// unchanged. A COARSE value is its base clock truncated to
+    /// `VDSO_CLOCK_RESOLUTION_NS`: on that grid, never ahead of the fine
+    /// value for the same counter, and nondecreasing as the counter advances.
+    #[test]
+    fn vdso_serves_coarse_clocks_without_kernel_entry() {
+        let img = vdso_image_bytes();
+        let res = VDSO_CLOCK_RESOLUTION_NS as u64;
+        let off = 1_700_000_000_123_456_789;
+        for id in [2u64, 3, 8, 9, 10, 11, 12, 0xffff_fffa] {
+            assert_eq!(
+                read_clock(&img, FREQ * 5, off, id),
+                VdsoExit::Syscall(113, id),
+                "clock {id} must use the syscall"
+            );
+        }
+        let mut previous = [0u64; 2];
+        // Counter samples from boot through ~1 day, including sub-tick steps
+        // and exact second and resolution boundaries.
+        let mut cntvct = 0u64;
+        for step in 0..20_000u64 {
+            cntvct += match step % 4 {
+                0 => 1,
+                1 => FREQ / 1_000 - 1,
+                2 => 7_919,
+                _ => FREQ / 3 + step,
+            };
+            for id in SERVED {
+                served_ns(&img, cntvct, off, id);
+            }
+            let mono = served_ns(&img, cntvct, off, 1);
+            let real = served_ns(&img, cntvct, off, 0);
+            assert_eq!(served_ns(&img, cntvct, off, 4), mono);
+            assert_eq!(served_ns(&img, cntvct, off, 7), mono);
+            assert_eq!(real, mono.wrapping_add(off));
+            for (slot, (coarse_id, fine)) in [(6u64, mono), (5, real)].into_iter().enumerate() {
+                let coarse = served_ns(&img, cntvct, off, coarse_id);
+                assert_eq!(coarse, fine - fine % res, "clock {coarse_id} at {cntvct}");
+                assert!(coarse <= fine && fine - coarse < res);
+                assert!(coarse >= previous[slot], "clock {coarse_id} went backwards");
+                previous[slot] = coarse;
+            }
+        }
+    }
+
+    /// `__kernel_gettimeofday` shares the gettime conversion: it reports the
+    /// fine REALTIME value in microseconds, never enters the kernel, and a
+    /// NULL timeval is a successful no-op.
+    #[test]
+    fn vdso_gettimeofday_reports_realtime_microseconds() {
+        let img = vdso_image_bytes();
+        let entry = arm64_symbol(&img, "__kernel_gettimeofday");
+        let off = 1_700_000_000_123_456_789;
+        for cntvct in [0, 1, FREQ - 1, FREQ, FREQ * 86_400 + 12_345] {
+            let real = served_ns(&img, cntvct, off, 0);
+            let mut m = VdsoMachine::new(&img, cntvct, FREQ, off);
+            assert_eq!(m.call(entry, TIMESPEC, 0), VdsoExit::Returned(0));
+            assert_eq!(m.mem[&TIMESPEC], real / 1_000_000_000);
+            assert_eq!(m.mem[&(TIMESPEC + 8)], real % 1_000_000_000 / 1_000);
+        }
+        let mut m = VdsoMachine::new(&img, FREQ, FREQ, off);
+        assert_eq!(m.call(entry, 0, 0), VdsoExit::Returned(0));
+        assert!(m.mem.get(&TIMESPEC).is_none());
+    }
+
+    /// `__kernel_clock_getres` reports `VDSO_CLOCK_RESOLUTION_NS` (the
+    /// syscall's `LINUX_CLOCK_RESOLUTION_NSEC`) for exactly the clocks
+    /// `__kernel_clock_gettime` serves, accepts a NULL result pointer, and
+    /// asks the kernel for every other id.
+    #[test]
+    fn vdso_getres_reports_the_syscall_resolution_for_served_clocks() {
+        let img = vdso_image_bytes();
+        let entry = arm64_symbol(&img, "__kernel_clock_getres");
+        for id in SERVED {
+            let mut m = VdsoMachine::new(&img, 0, FREQ, 0);
+            assert_eq!(m.call(entry, id, TIMESPEC), VdsoExit::Returned(0));
+            assert_eq!(m.mem[&TIMESPEC], 0, "clock {id} tv_sec");
+            assert_eq!(
+                m.mem[&(TIMESPEC + 8)],
+                VDSO_CLOCK_RESOLUTION_NS as u64,
+                "clock {id} tv_nsec"
+            );
+            let mut m = VdsoMachine::new(&img, 0, FREQ, 0);
+            assert_eq!(m.call(entry, id, 0), VdsoExit::Returned(0));
+            assert!(m.mem.get(&TIMESPEC).is_none());
+        }
+        for id in [2u64, 3, 8, 9, 10, 11, 0xffff_fffa] {
+            let mut m = VdsoMachine::new(&img, 0, FREQ, 0);
+            assert_eq!(m.call(entry, id, TIMESPEC), VdsoExit::Syscall(114, id));
+        }
+    }
+
+    /// The clock-syscalls image (container clock domains, debugging) keeps
+    /// every clock id, COARSE included, on the syscall.
+    #[test]
+    fn clock_syscalls_vdso_routes_coarse_clocks_to_the_kernel() {
+        let img = vdso_image_bytes_with_clock_syscalls();
+        for id in [0u64, 1, 5, 6, 7] {
+            assert_eq!(
+                read_clock(&img, FREQ, 0, id),
+                VdsoExit::Syscall(113, id),
+                "clock {id}"
+            );
+            let mut m = VdsoMachine::new(&img, 0, FREQ, 0);
+            assert_eq!(
+                m.call(arm64_symbol(&img, "__kernel_clock_getres"), id, TIMESPEC),
+                VdsoExit::Syscall(114, id)
+            );
+        }
+    }
+
     /// The vvar word is `host calibration + guest delta` in two's complement,
     /// so the vDSO's `counter_ns + word` yields the shifted wall clock. Pure:
     /// the delta is an argument, never a static in this crate.
@@ -1135,13 +1450,25 @@ mod tests {
 mod rosetta_vdso_size_test {
     #[test]
     fn vdso_image_fits_in_one_page_and_has_dynsym() {
+        // Every variant is mapped into the same one-page slot; bytes past the
+        // page are silently dropped by the mapping, not rejected.
+        for (variant, img) in [
+            ("full", super::vdso_image_bytes()),
+            ("no-getrandom", super::vdso_image_bytes_without_getrandom()),
+            ("no-fastpaths", super::vdso_image_bytes_without_fastpaths()),
+            (
+                "clock-syscalls",
+                super::vdso_image_bytes_with_clock_syscalls(),
+            ),
+        ] {
+            assert!(
+                img.len() <= super::LINUX_VDSO_SIZE as usize,
+                "{variant} vDSO image {} exceeds page {}",
+                img.len(),
+                super::LINUX_VDSO_SIZE
+            );
+        }
         let img = super::vdso_image_bytes();
-        assert!(
-            img.len() <= super::LINUX_VDSO_SIZE as usize,
-            "vDSO image {} exceeds page {}",
-            img.len(),
-            super::LINUX_VDSO_SIZE
-        );
         let elf = goblin::elf::Elf::parse(&img).unwrap();
         assert!(
             elf.section_headers.iter().any(|s| s.sh_type == 11),

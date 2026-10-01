@@ -1,0 +1,33 @@
+schema_version = 1
+id = "kernel.time.coarse-clock-vdso"
+title = "COARSE clocks are served by the arm64 vDSO without a kernel entry"
+guest_surfaces = [
+  "vdso:clock_gettime",
+  "vdso:clock_getres",
+  "syscall:clock_gettime",
+  "syscall:clock_getres",
+]
+semantic_authority = ["man 2 clock_gettime", "man 2 clock_getres", "man 7 vdso"]
+fixture = "probe:clockcoarsevdso"
+scale_points = [1, 8, 32, 128]
+structural_budgets = []
+rationale = """
+Linux serves CLOCK_REALTIME_COARSE and CLOCK_MONOTONIC_COARSE from the vDSO
+with no kernel entry; runtimes such as Node read MONOTONIC_COARSE on hot paths,
+so a vDSO that forwards them turns every read into a host syscall service (a
+Node workload spent ~44% of its forwarded syscalls on them). A COARSE clock is
+its base clock truncated down to the resolution clock_getres reports for it:
+never ahead of a fine read of the base clock taken after it, MONOTONIC_COARSE
+never backwards, and the vDSO and the syscall apply the same rule to the same
+base value so interleaved reads stay ordered. clock_getres is one answer per
+clock, so the vDSO must report what the syscall reports for every clock it
+serves. The VM-free binding interprets the embedded vDSO code over counter
+samples; the signed binding counts forwarded clock_gettime/clock_getres for
+10,000 vDSO reads of each COARSE clock and requires zero. No structural work
+meter or runtime-ratio acceptance is claimed.
+"""
+
+[bindings]
+vm_free = "carrick-mem::vdso::tests::vdso_serves_coarse_clocks_without_kernel_entry"
+embed = "carrick-embed::coarse_clock_vdso::coarse_clock_vdso_reads_forward_no_clock_syscall"
+docker = "probe:clockcoarsevdso"

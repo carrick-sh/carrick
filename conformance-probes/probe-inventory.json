@@ -169,6 +169,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "clockcoarsevdso": {
+    "class": "conformance",
+    "contract_ids": [
+      "kernel.time.coarse-clock-vdso"
+    ],
+    "excluded": false,
+    "runner": "generic"
+  },
   "clockcoherence": {
     "class": "conformance",
     "excluded": false,
