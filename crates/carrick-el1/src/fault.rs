@@ -1678,7 +1678,9 @@ mod tests {
                 Action::Served
             );
             assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
-            assert_eq!(*applier.invalidated.borrow(), vec![ROOT | ASID]);
+            // Invalid -> valid: no TLB held the old (invalid) leaves, so
+            // nothing is invalidated.
+            assert!(applier.invalidated.borrow().is_empty());
             for page in 0..4 {
                 let expected = if VA + page * 4096 == fault {
                     El1PrivateLeafState::Resident
