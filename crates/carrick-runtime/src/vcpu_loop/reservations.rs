@@ -93,7 +93,7 @@ impl PreparedHostReservations for PreparedView {
             index,
             mm,
             &self.0.nodes,
-            &carrick_kernel::el1_zone::HostLockWait,
+            &carrick_kernel::dispatch::mem::el1_reservations::RootHostWait::new(),
         )
     }
 }
