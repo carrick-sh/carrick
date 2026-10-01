@@ -45,6 +45,22 @@ fn remove_epoll_interest(
     Some(removed)
 }
 
+/// Linux keys an epoll item on the (open file, fd number) pair it was added
+/// with (`man 7 epoll`: the item outlives the descriptor and goes away only
+/// when the open file description's last reference closes). A slot whose
+/// description is not the one `fd` names now belongs to a closed descriptor
+/// whose number was reused: MOD and DEL of the new file must not find it.
+/// Bare inherited stdio has no table-backed description (`target: None`)
+/// and keeps matching by number.
+fn epoll_slot_names_current_file(
+    slot: &EpollInterest,
+    current: &crate::kernel::FileDescription,
+) -> bool {
+    slot.target
+        .as_ref()
+        .is_none_or(|target| target.id() == current.id())
+}
+
 fn merge_epoll_edge_sample(
     accumulated: &mut (u32, u64),
     edge_bits: u32,
@@ -2363,6 +2379,69 @@ mod nested_epoll_readiness_tests {
         read_kernel_struct(mem, address).unwrap()
     }
 
+    /// `man 7 epoll`: an item belongs to the (open file, fd number) it was
+    /// added with. Register an eventfd, keep its file open through a dup,
+    /// close the registered number and let a fresh eventfd reuse it: MOD and
+    /// DEL of the fresh file are ENOENT (probe `epollzoneclose`).
+    #[test]
+    fn epoll_ctl_mod_del_of_a_reused_fd_number_is_enoent() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let ctl = |dispatcher: &mut SyscallDispatcher,
+                   mem: &mut LinearMemory,
+                   epfd: i32,
+                   op: u64,
+                   fd: i32| {
+            let req = SyscallRequest::new(
+                21,
+                SyscallArgs::from([epfd as u64, op, fd as u64, 0x1000, 0, 0]),
+            );
+            dispatcher.dispatch(&kernel, req, mem, &reporter).unwrap()
+        };
+
+        let epfd = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let efd = create_eventfd(&mut dispatcher, &kernel, &mut guest_mem, &reporter, 0);
+        write_guest_epoll_event(&mut guest_mem, 0x1000, LINUX_EPOLLIN, 111);
+        assert!(matches!(
+            ctl(
+                &mut dispatcher,
+                &mut guest_mem,
+                epfd,
+                LINUX_EPOLL_CTL_ADD,
+                efd
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        ));
+        let dup = SyscallRequest::new(23, SyscallArgs::from([efd as u64, 0, 0, 0, 0, 0]));
+        let DispatchOutcome::Returned { value: dupfd } = dispatcher
+            .dispatch(&kernel, dup, &mut guest_mem, &reporter)
+            .unwrap()
+        else {
+            panic!("dup failed");
+        };
+        assert!(close_guest_fd(
+            &mut dispatcher,
+            &kernel,
+            &mut guest_mem,
+            &reporter,
+            efd
+        ));
+        let fresh = create_eventfd(&mut dispatcher, &kernel, &mut guest_mem, &reporter, 0);
+        assert_eq!(fresh, efd, "the fresh eventfd reuses the closed number");
+
+        for op in [LINUX_EPOLL_CTL_MOD, LINUX_EPOLL_CTL_DEL] {
+            assert_eq!(
+                ctl(&mut dispatcher, &mut guest_mem, epfd, op, fresh),
+                DispatchOutcome::errno(LINUX_ENOENT),
+                "op {op} on a new file reusing a registered number"
+            );
+        }
+        // The dup keeps the old file (and its item) alive throughout.
+        assert!(dupfd >= 0);
+    }
+
     #[test]
     fn empty_inner_epoll_has_no_false_in_on_poll_or_outer_epoll() {
         let mut dispatcher = SyscallDispatcher::new();
@@ -3430,6 +3509,12 @@ impl<'a> NetView<'a> {
                     if this.epoll_add_would_loop_desc(&target_file.description, epoll_description.id()) {
                         return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ELOOP));
                     }
+                    // Candid divergence: an item still live for a closed
+                    // descriptor whose number `fd` now reuses (another
+                    // descriptor keeps its open file alive) occupies the
+                    // number here, so this ADD is EEXIST where Linux would
+                    // add a second (file, fd) item. MOD and DEL of the new
+                    // file do follow Linux (ENOENT) below.
                     if interest.contains_key(&fd) {
                         return Ok(DispatchOutcome::errno(LINUX_EEXIST));
                     }
@@ -3554,7 +3639,10 @@ impl<'a> NetView<'a> {
                 }
                 LINUX_EPOLL_CTL_MOD => {
                     let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
-                    let Some(slot) = interest.get_mut(&fd) else {
+                    let Some(slot) = interest
+                        .get_mut(&fd)
+                        .filter(|slot| epoll_slot_names_current_file(slot, &target_file.description))
+                    else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                     };
                     // `register_io` re-arms the filters present in the new mask and
@@ -3612,6 +3700,12 @@ impl<'a> NetView<'a> {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_EPOLL_CTL_DEL => {
+                    if interest
+                        .get(&fd)
+                        .is_some_and(|slot| !epoll_slot_names_current_file(slot, &target_file.description))
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+                    }
                     let Some(removed) =
                         remove_epoll_interest(interest, synthetic_interest_count, fd)
                     else {
