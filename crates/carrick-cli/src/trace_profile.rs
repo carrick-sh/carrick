@@ -239,6 +239,7 @@ impl V2ProfileAuthority {
 pub(crate) enum TraceProfileKind {
     HvpatchCarrierCpuLowRate,
     HvpatchCarrierCpuAttribution,
+    HvpatchExitAttribution,
     HvpatchInotify09Population,
     HvpatchFrameCow,
     HvpatchExecRuntimeStages,
@@ -253,6 +254,7 @@ impl TraceProfileKind {
         match self {
             Self::HvpatchCarrierCpuLowRate => "hvpatch-carrier-cpu-low-rate",
             Self::HvpatchCarrierCpuAttribution => "hvpatch-carrier-cpu-attribution",
+            Self::HvpatchExitAttribution => "hvpatch-exit-attribution",
             Self::HvpatchInotify09Population => "hvpatch-inotify09-population",
             Self::HvpatchFrameCow => "hvpatch-frame-cow",
             Self::HvpatchExecRuntimeStages => "hvpatch-exec-runtime-stages",
@@ -274,6 +276,9 @@ impl TraceProfileKind {
             Self::HvpatchCarrierCpuAttribution => {
                 Some(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
             }
+            Self::HvpatchExitAttribution => {
+                Some(crate::hvpatch_exit_attribution_profile::BOUND_PLACEHOLDER)
+            }
             Self::HvpatchCarrierCpuLowRate
             | Self::HvpatchInotify09Population
             | Self::HvpatchFrameCow
@@ -292,6 +297,9 @@ impl TraceProfileKind {
             }
             Self::HvpatchCarrierCpuAttribution => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_ATTRIBUTION_D
+            }
+            Self::HvpatchExitAttribution => {
+                carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_EXIT_ATTRIBUTION_D
             }
             Self::HvpatchInotify09Population => {
                 crate::hvpatch_inotify_population_profile::BUNDLED_PROGRAM
@@ -320,6 +328,7 @@ impl TraceProfileKind {
         match value {
             "hvpatch-carrier-cpu-low-rate" => Ok(Self::HvpatchCarrierCpuLowRate),
             "hvpatch-carrier-cpu-attribution" => Ok(Self::HvpatchCarrierCpuAttribution),
+            "hvpatch-exit-attribution" => Ok(Self::HvpatchExitAttribution),
             "hvpatch-inotify09-population" => Ok(Self::HvpatchInotify09Population),
             "hvpatch-frame-cow" => Ok(Self::HvpatchFrameCow),
             "hvpatch-exec-runtime-stages" => Ok(Self::HvpatchExecRuntimeStages),
@@ -536,6 +545,10 @@ mod tests {
             (
                 TraceProfileKind::HvpatchCarrierCpuAttribution,
                 "hvpatch-carrier-cpu-attribution",
+            ),
+            (
+                TraceProfileKind::HvpatchExitAttribution,
+                "hvpatch-exit-attribution",
             ),
             (TraceProfileKind::HvpatchFrameCow, "hvpatch-frame-cow"),
             (

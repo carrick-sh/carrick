@@ -2264,6 +2264,48 @@ pub enum HostExitClass {
 impl HostExitClass {
     pub const COUNT: usize = 8;
 
+    /// Every class in ordinal order: `ALL[c.ordinal() as usize] == c`. The
+    /// ordinal is the wire value of the `vcpu-run-exit` USDT probe, so a
+    /// trace reader decodes it here instead of keeping its own copy.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Canceled,
+        Self::Idle,
+        Self::Kick,
+        Self::Syscall,
+        Self::Metadata,
+        Self::Maintenance,
+        Self::Fault,
+        Self::Other,
+    ];
+
+    /// The stable wire ordinal (also the index of the exit counters).
+    pub const fn ordinal(self) -> u32 {
+        self as u32
+    }
+
+    /// Decode a wire ordinal; `None` for a value no class carries.
+    pub const fn from_ordinal(ordinal: u32) -> Option<Self> {
+        if (ordinal as usize) < Self::COUNT {
+            Some(Self::ALL[ordinal as usize])
+        } else {
+            None
+        }
+    }
+
+    /// Stable kebab-case name used in trace summaries.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Canceled => "canceled",
+            Self::Idle => "idle",
+            Self::Kick => "kick",
+            Self::Syscall => "syscall",
+            Self::Metadata => "metadata",
+            Self::Maintenance => "maintenance",
+            Self::Fault => "fault",
+            Self::Other => "other",
+        }
+    }
+
     /// `exception` means HVF reported EXCEPTION; `canceled` means CANCELED.
     /// The syndrome is authoritative only for EXCEPTION. Keep every unknown
     /// exception in `Fault` so the accounting remains exhaustive.
@@ -3768,6 +3810,20 @@ mod tests {
         assert_eq!(HostExitClass::from_hvf(false, true, hvc(1)), Maintenance);
         assert_eq!(HostExitClass::from_hvf(false, true, 0x24_u64 << 26), Fault);
         assert_eq!(HostExitClass::from_hvf(false, false, 0), Other);
+    }
+
+    #[test]
+    fn host_exit_class_ordinals_round_trip_and_index_the_counters() {
+        for (index, class) in HostExitClass::ALL.into_iter().enumerate() {
+            assert_eq!(class as usize, index);
+            assert_eq!(class.ordinal() as usize, index);
+            assert_eq!(HostExitClass::from_ordinal(class.ordinal()), Some(class));
+        }
+        assert_eq!(
+            HostExitClass::from_ordinal(HostExitClass::COUNT as u32),
+            None
+        );
+        assert_eq!(HostExitClass::from_ordinal(u32::MAX), None);
     }
 
     #[test]

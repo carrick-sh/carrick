@@ -110,6 +110,10 @@ pub const BUNDLED_HVPATCH_CARRIER_CPU_LOW_RATE_D: &str =
 /// Complete HVPatch carrier CPU attribution decomposition.
 pub const BUNDLED_HVPATCH_CARRIER_CPU_ATTRIBUTION_D: &str =
     include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-attribution.d");
+/// HVPatch host exits by class, executor guest/host on-CPU split and the
+/// host-forwarded syscall histogram.
+pub const BUNDLED_HVPATCH_EXIT_ATTRIBUTION_D: &str =
+    include_str!("../../../scripts/dtrace/hvpatch-exit-attribution.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
 pub const BUNDLED_NATIVE_SHAPE_D: &str =
     include_str!("../../../scripts/dtrace/native-shape-census.d");

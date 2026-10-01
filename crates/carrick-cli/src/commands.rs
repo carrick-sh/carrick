@@ -981,6 +981,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     {
                         bail!("hvpatch-carrier-cpu-attribution requires a Darwin/HVF host");
                     }
+                    if profile
+                        == Some(crate::trace_profile::TraceProfileKind::HvpatchExitAttribution)
+                    {
+                        bail!("hvpatch-exit-attribution requires a Darwin/HVF host");
+                    }
                 }
                 if command.is_empty() {
                     bail!(
@@ -1123,6 +1128,18 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         })?;
                         Some(
                             crate::hvpatch_carrier_cpu_attribution_profile::render_profile_script(
+                                template,
+                            )?,
+                        )
+                    }
+                    Some(crate::trace_profile::TraceProfileKind::HvpatchExitAttribution) => {
+                        let template = script_template.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "HVPatch exit attribution profile has no bundled D program"
+                            )
+                        })?;
+                        Some(
+                            crate::hvpatch_exit_attribution_profile::render_profile_script(
                                 template,
                             )?,
                         )
@@ -1277,6 +1294,20 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             == crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuAttribution
                         {
                             let summary = HvpatchCarrierCpuAttributionSummary::from_path(
+                                raw_path,
+                                capture_status,
+                            )?;
+                            if let Some(jsonl_path) = summary_jsonl {
+                                let json = serde_json::to_string(&summary)?;
+                                std::fs::write(&jsonl_path, format!("{json}\n")).with_context(
+                                    || format!("write summary JSON to {}", jsonl_path.display()),
+                                )?;
+                            }
+                            eprintln!("{}", summary.render_human());
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::HvpatchExitAttribution
+                        {
+                            let summary = crate::hvpatch_exit_attribution_profile::HvpatchExitAttributionSummary::from_path(
                                 raw_path,
                                 capture_status,
                             )?;
