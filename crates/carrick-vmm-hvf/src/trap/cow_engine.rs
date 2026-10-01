@@ -6356,7 +6356,18 @@ impl HvfVmState {
                         "alias retirement has no prepared inventory reservation".to_owned(),
                     )
                 })?;
-                authority.apply(reservation.commit(()))
+                // Kernel publication and backend decrement are one step under
+                // the frame registry; see `apply_inventory_lease_retirement`.
+                Self::apply_inventory_lease_retirement(
+                    &self.frame_inventory.ledger,
+                    &retirement,
+                    reservation,
+                    |commit| {
+                        authority
+                            .apply(commit)
+                            .map_err(|error| TrapError::Hypervisor(error.to_string()))
+                    },
+                )
             }
             AliasRetirementAuthorityState::AppliedWithReplacement => {
                 if reservation.is_some() {
@@ -6365,6 +6376,8 @@ impl HvfVmState {
                             .to_owned(),
                     ));
                 }
+                // `publish_frame_grant` applied and committed it with the
+                // grant, through the same single step.
                 Ok(())
             }
         };
@@ -6397,17 +6410,6 @@ impl HvfVmState {
                 retirement.frames,
                 retirement.stage2_leases,
                 inventory.extents.len(),
-            );
-        }
-        {
-            let mut inventory = self.frame_inventory.lock();
-            Self::commit_inventory_lease_retirement(&mut inventory, &retirement).unwrap_or_else(
-                |error| {
-                    carrick_fatal!(
-                        "hvpatch::frame_inventory",
-                        "commit HVPatch alias retirement backend ledger: {error}"
-                    )
-                },
             );
         }
         let scope = CowInventoryLifecycleScope {
