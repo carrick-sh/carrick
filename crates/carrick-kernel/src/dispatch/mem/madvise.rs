@@ -71,7 +71,7 @@ fn validate_mlock_range(
     if committed_vma_covers_range || memory.has_complete_mapping_metadata() {
         return Ok(());
     }
-    if !populate && memory.host_ptr_for_read(range.start().raw(), len).is_some() {
+    if !populate && memory.host_read(range.start().raw(), len).is_some() {
         return Ok(());
     }
     let mut page = range.start().raw();

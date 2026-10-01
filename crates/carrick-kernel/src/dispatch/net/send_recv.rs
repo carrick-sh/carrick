@@ -417,11 +417,13 @@ impl<'a> NetView<'a> {
             let (host_fd, family) = (send_view.host_fd, send_view.family);
             // Zero-copy when the whole buffer is one contiguous mapped region
             // (send straight out of guest memory); otherwise snapshot it. The
-            // pointer is resolved per dispatch — blocking_io's op is FnOnce and an
-            // EAGAIN re-dispatches the whole handler, so it never outlives a
-            // lock-releasing wait.
-            let zc_ptr = memory.host_ptr_for_read(buf_addr, len);
-            let send_copy: Option<Vec<u8>> = if zc_ptr.is_some() {
+            // admitted source retains its exact backing until this handler
+            // returns, so a sibling's unmap cannot recycle the frame under the
+            // host send. It is resolved per dispatch — blocking_io's op is
+            // FnOnce and an EAGAIN re-dispatches the whole handler, so it never
+            // outlives a lock-releasing wait.
+            let zc_read = memory.host_read(buf_addr, len);
+            let send_copy: Option<Vec<u8>> = if zc_read.is_some() {
                 None
             } else {
                 match memory.read_bytes(buf_addr, len) {
@@ -429,8 +431,8 @@ impl<'a> NetView<'a> {
                     Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 }
             };
-            let data_ptr: *const u8 = match (zc_ptr, &send_copy) {
-                (Some(p), _) => p,
+            let data_ptr: *const u8 = match (&zc_read, &send_copy) {
+                (Some(read), _) => read.as_ptr(),
                 (None, Some(b)) => b.as_ptr(),
                 (None, None) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
             };
@@ -572,13 +574,14 @@ impl<'a> NetView<'a> {
                 (send_view.cork_enabled, send_view.has_pending_cork);
 
             if is_cork_enabled || is_msg_more {
-                let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
+                let mut data = vec![0_u8; len];
+                copy_send_payload(&zc_read, send_copy.as_deref(), &mut data);
                 if let Some(open_file) = this.open_file(fd) {
                     open_file
                         .description
                         .common()
                         .cork()
-                        .stage(data, host_addr.as_deref());
+                        .stage(&data, host_addr.as_deref());
                 }
                 return Ok(DispatchOutcome::returned_len(len)?);
             }
@@ -596,7 +599,9 @@ impl<'a> NetView<'a> {
                     host_addr = dest;
                 }
                 let cur = len;
-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(data_ptr, len) });
+                let staged = buf.len();
+                buf.resize(staged + len, 0);
+                copy_send_payload(&zc_read, send_copy.as_deref(), &mut buf[staged..]);
                 (Some(buf), cur)
             } else {
                 (None, len)
@@ -2564,5 +2569,25 @@ mod inet_in_memory_socket_tests {
             .unwrap();
         assert_eq!(out_normal, DispatchOutcome::Returned { value: 12 });
         assert_eq!(&memory.read_bytes(base, 12).unwrap(), b"peek-payload");
+    }
+}
+
+/// Copy a send payload into private memory from whichever source the handler
+/// resolved: the retained zero-copy guest source (raw copy, never a slice over
+/// guest memory) or the already-staged snapshot.
+fn copy_send_payload(
+    zc_read: &Option<carrick_guest_mem::HostRead>,
+    send_copy: Option<&[u8]>,
+    dst: &mut [u8],
+) {
+    match (zc_read, send_copy) {
+        (Some(read), _) => {
+            read.copy_into(dst);
+        }
+        (None, Some(bytes)) => {
+            let len = dst.len().min(bytes.len());
+            dst[..len].copy_from_slice(&bytes[..len]);
+        }
+        (None, None) => {}
     }
 }

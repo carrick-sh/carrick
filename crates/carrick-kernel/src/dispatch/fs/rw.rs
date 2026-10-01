@@ -16,7 +16,8 @@ use crate::dispatch::fd_table::{
 };
 use crate::dispatch::io_pipe::{
     HostPipeReadTarget, HostPipeWriteTarget, HostWaitRunner, read_host_pipe, read_host_pipe_at,
-    write_host_pipe, write_host_pipe_at, write_host_pipe_owned, write_host_pipe_owned_at,
+    write_host_pipe, write_host_pipe_at, write_host_pipe_guest, write_host_pipe_owned,
+    write_host_pipe_owned_at,
 };
 use crate::dispatch::{SyscallHostWaitReleaser, WaitFdAuthority};
 use crate::kernel::FileSlotNumber;
@@ -28,8 +29,29 @@ use crate::linux_abi::{
 };
 
 enum PwritevPayloads {
-    Borrowed(Vec<libc::iovec>),
+    /// Zero-copy sources: `iovecs` point into guest memory retained by
+    /// `reads` (same order), which must outlive every use of `iovecs`.
+    Borrowed {
+        iovecs: Vec<libc::iovec>,
+        reads: Vec<carrick_guest_mem::HostRead>,
+    },
     Staged(Vec<Vec<u8>>),
+}
+
+/// The payload of one `write(2)` to a host file: a private staged copy, or an
+/// admitted guest source written through raw pointers (never a slice).
+enum WriteSource<'a> {
+    Staged(&'a [u8]),
+    Guest(&'a carrick_guest_mem::HostRead),
+}
+
+impl WriteSource<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Staged(bytes) => bytes.len(),
+            Self::Guest(read) => read.len(),
+        }
+    }
 }
 
 fn retained_executable_bytes(
@@ -53,24 +75,30 @@ fn prepare_pwritev_payloads(
     iovecs: &[LinuxIovec],
 ) -> Result<PwritevPayloads, LinuxErrno> {
     let mut borrowed_iovecs = Vec::with_capacity(iovecs.len());
+    let mut reads = Vec::with_capacity(iovecs.len());
     let mut all_borrowed = true;
     for iovec in iovecs {
         let iov_len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
         if iov_len == 0 {
             continue;
         }
-        let Some(ptr) = memory.host_ptr_for_read(iovec.iov_base, iov_len) else {
+        let Some(read) = memory.host_read(iovec.iov_base, iov_len) else {
             all_borrowed = false;
             break;
         };
         borrowed_iovecs.push(libc::iovec {
-            iov_base: ptr as *mut libc::c_void,
+            iov_base: read.as_ptr() as *mut libc::c_void,
             iov_len,
         });
+        reads.push(read);
     }
     if all_borrowed {
-        return Ok(PwritevPayloads::Borrowed(borrowed_iovecs));
+        return Ok(PwritevPayloads::Borrowed {
+            iovecs: borrowed_iovecs,
+            reads,
+        });
     }
+    drop(reads);
 
     let mut staged_iovecs = Vec::with_capacity(iovecs.len());
     let mut faulted = false;
@@ -339,7 +367,7 @@ impl<'a> FsView<'a> {
         cx: &mut SyscallCtx<'_, M>,
         fd: i32,
         tid: crate::thread::ThreadId,
-        bytes: &[u8],
+        source: WriteSource<'_>,
         open_file: &OpenFile,
         open: &mut FileDescriptionWriteGuard<'_>,
         nonblocking: bool,
@@ -384,13 +412,13 @@ impl<'a> FsView<'a> {
             } else {
                 None
             };
-            let bytes = if file_limit.is_some() && pos >= 0 {
-                match self.fsize_write_len(cx, pos as u64, bytes.len()) {
-                    Ok(len) => &bytes[..len.min(bytes.len())],
+            let write_len = if file_limit.is_some() && pos >= 0 {
+                match self.fsize_write_len(cx, pos as u64, source.len()) {
+                    Ok(len) => len.min(source.len()),
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             } else {
-                bytes
+                source.len()
             };
             let raw_fd = host_io.raw();
             host_io.record_sequential_io();
@@ -427,7 +455,10 @@ impl<'a> FsView<'a> {
                 }
             }
             .with_host_wait(host_wait_ref);
-            let out = write_host_pipe(bytes, target)?;
+            let out = match source {
+                WriteSource::Staged(bytes) => write_host_pipe(&bytes[..write_len], target)?,
+                WriteSource::Guest(read) => write_host_pipe_guest(read, write_len, target)?,
+            };
             let mut punch = Ok(());
             if let DispatchOutcome::Returned { value } = out
                 && value > 0
@@ -2485,13 +2516,17 @@ impl<'a> FsView<'a> {
                     offset as usize
                 };
                 let mut total = 0i64;
-                if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
-                    for iov in borrowed_iovecs {
-                        let len = iov.iov_len;
+                if let PwritevPayloads::Borrowed { reads, .. } = &payloads {
+                    for read in reads {
+                        let len = read.len();
                         if len == 0 {
                             continue;
                         }
-                        let buf = unsafe { std::slice::from_raw_parts(iov.iov_base as *const u8, len) };
+                        // Raw copy out of the retained guest source: never a
+                        // Rust slice over memory other vCPUs may write.
+                        let mut owned = vec![0_u8; len];
+                        read.copy_into(&mut owned);
+                        let buf = owned.as_slice();
                         let end = match cur.checked_add(len) {
                             Some(e) => e,
                             None => {
@@ -2593,7 +2628,11 @@ impl<'a> FsView<'a> {
                 let host_wait_runner = this.host_wait_runner_for_ctx(cx);
                 let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                 if host_wait_ref.is_none() {
-                    if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
+                    if let PwritevPayloads::Borrowed {
+                        iovecs: borrowed_iovecs,
+                        reads: _retained,
+                    } = &payloads
+                    {
                         if borrowed_iovecs.is_empty() {
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
@@ -2800,15 +2839,31 @@ impl<'a> FsView<'a> {
             const STACK_WRITE_LIMIT: usize = 4096;
             let mut stack_buf = [0u8; STACK_WRITE_LIMIT];
             let heap_buf;
-            let direct_slice = if length > 0 {
-                (*cx.memory).host_ptr_for_read(address, length)
+            // A large contiguous source is admitted once: the admission
+            // retains its exact backing until this handler returns, so a
+            // sibling's unmap cannot recycle the frame under the host call.
+            // A host file writes straight from it through raw pointers. Every
+            // other consumer (pipes, eventfds, overlay files, ...) takes a
+            // private copy, because a Rust slice must never view guest memory
+            // that other vCPUs may write.
+            let direct = if length > STACK_WRITE_LIMIT {
+                (*cx.memory).host_read(address, length)
             } else {
                 None
             };
-            let bytes: &[u8] = if length == 0 {
+            let zero_copy_host_file = direct.is_some()
+                && open_file.as_ref().is_some_and(|of| {
+                    of.description
+                        .inspect_kind(|open| matches!(open, OpenDescription::HostFile { .. }))
+                        .unwrap_or(false)
+                });
+            let bytes: &[u8] = if length == 0 || zero_copy_host_file {
                 &[]
-            } else if let Some(ptr) = direct_slice {
-                unsafe { std::slice::from_raw_parts(ptr, length) }
+            } else if let Some(read) = &direct {
+                let mut staged = vec![0_u8; length];
+                read.copy_into(&mut staged);
+                heap_buf = staged;
+                &heap_buf
             } else if length <= STACK_WRITE_LIMIT {
                 match (*cx.memory).read_into(address, &mut stack_buf[..length]) {
                     Ok(()) => &stack_buf[..length],
@@ -2860,17 +2915,33 @@ impl<'a> FsView<'a> {
                 };
                 if matches!(&*open, OpenDescription::HostFile { .. }) {
                     drop(io_lease);
+                    let source = match (&direct, zero_copy_host_file) {
+                        (Some(read), true) => WriteSource::Guest(read),
+                        _ => WriteSource::Staged(bytes),
+                    };
                     return this.write_host_file(
                         cx,
                         fd,
                         tid,
-                        bytes,
+                        source,
                         &open_file,
                         &mut open,
                         nonblocking,
                         slot_authority,
                     );
                 }
+                // The description stopped being a host file after the
+                // zero-copy decision: stage the payload privately now.
+                let late_buf;
+                let bytes: &[u8] = match (&direct, zero_copy_host_file) {
+                    (Some(read), true) => {
+                        let mut staged = vec![0_u8; length];
+                        read.copy_into(&mut staged);
+                        late_buf = staged;
+                        &late_buf
+                    }
+                    _ => bytes,
+                };
                 // Take an inner scope so the borrow on the description ends
                 // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
                 enum FileWriteback {

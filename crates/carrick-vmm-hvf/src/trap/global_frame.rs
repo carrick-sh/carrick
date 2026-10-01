@@ -1321,6 +1321,22 @@ impl GlobalFrameOwnerPin {
     pub(crate) fn owner(&self) -> &GlobalFrameHostOwner {
         &self.owner
     }
+
+    /// Transfer this exact pin (logical and stage-2) to the owner `Arc` as a
+    /// type-erased host-read retention; its `release` undoes both, exactly as
+    /// dropping this pin would. Allocation-free.
+    pub(crate) fn into_read_retention(
+        self,
+    ) -> std::sync::Arc<dyn carrick_guest_mem::HostReadRetention> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so each field is moved out exactly
+        // once; the logical pin's `Drop` is replaced by `release`.
+        let owner = unsafe { std::ptr::read(&this.owner) };
+        let stage2 = unsafe { std::ptr::read(&this._stage2_pin) };
+        let identity = stage2.into_transferred_identity();
+        debug_assert_eq!(identity, owner.record_identity);
+        owner
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

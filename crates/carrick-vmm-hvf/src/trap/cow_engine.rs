@@ -6177,7 +6177,7 @@ impl HvfVmState {
 
     /// Resolve a guest VA range to a [`MappingView`] (host pointer + bounds +
     /// writability). THE single chokepoint every syscall-path memory accessor
-    /// (read/write_guest_bytes, host_ptr_for_read/write, validate_guest_write_range,
+    /// (read/write_guest_bytes, host_read/host_ptr_for_write, validate_guest_write_range,
     /// zero_guest_backing) routes through.
     ///
     /// Fast path: THIS thread's per-thread `mappings`. Cross-thread FALLBACK: when

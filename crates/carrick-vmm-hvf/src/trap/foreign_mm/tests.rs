@@ -11387,6 +11387,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     );
 }
 
+mod syscall_reads;
 mod syscall_writes;
 
 #[test]

@@ -2620,7 +2620,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.commit_prepared_host_write(address, length, false)
     }
 
-    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+    fn host_read(&self, address: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
         if !self.el1_private_range_permits(
             address,
             len,
@@ -2628,7 +2628,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         ) {
             return None;
         }
-        self.vm.host_ptr_for_read(address, len)
+        self.vm.host_read(address, len)
     }
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {

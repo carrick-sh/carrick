@@ -1210,7 +1210,7 @@ impl GuestMemory for HostPtrPayloadMemory {
         Ok(())
     }
 
-    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+    fn host_read(&self, address: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
         if !self
             .host_ptr_ranges
             .iter()
@@ -1220,7 +1220,15 @@ impl GuestMemory for HostPtrPayloadMemory {
         }
         let offset = self.offset(address, len).ok()?;
         self.host_ptr_hits.set(self.host_ptr_hits.get() + 1);
-        Some(unsafe { self.bytes.as_ptr().add(offset) })
+        // SAFETY: the fixture's byte vector outlives every dispatch using it.
+        Some(unsafe {
+            carrick_guest_mem::HostRead::retained(
+                carrick_guest_mem::GuestVa(address),
+                self.bytes.as_ptr().add(offset),
+                len,
+                None,
+            )
+        })
     }
 
     fn begin_host_write(
