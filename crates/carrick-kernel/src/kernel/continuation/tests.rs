@@ -6702,3 +6702,85 @@ fn group_stop_socket_policy_requires_an_admitted_socket_timeout() {
         }
     }
 }
+
+#[test]
+fn group_stop_preserves_published_terminal_results() {
+    let (kernel, context) = bootstrap(153_802);
+    let generation = publish(&context, 0x802);
+    for (family, nr, value) in [
+        (
+            ContinuationFamily::Semop,
+            carrick_abi::syscall::nr::SEMTIMEDOP,
+            0,
+        ),
+        (
+            ContinuationFamily::WaitOnSignals,
+            carrick_abi::syscall::nr::RT_SIGTIMEDWAIT,
+            10,
+        ),
+        (
+            ContinuationFamily::WaitOnFds,
+            carrick_abi::syscall::nr::RECVFROM,
+            3,
+        ),
+        (
+            ContinuationFamily::WaitOnFds,
+            carrick_abi::syscall::nr::EPOLL_PWAIT,
+            1,
+        ),
+    ] {
+        let outcome = if family == ContinuationFamily::WaitOnFds {
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: Some(Duration::from_secs(5)),
+                sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd {
+                    on_timeout: LINUX_EAGAIN.guest_retval(),
+                },
+            }
+        } else {
+            outcome_for(family, ThreadId::synthetic_for_tests(153_802))
+        };
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            ContinuationCapture::new(&context, generation, request(nr.raw()), RestartClass::Never)
+                .unwrap(),
+        )
+        .unwrap();
+        // A terminal publication owns the result: semaphore changes, a
+        // dequeued signal, copied bytes, or harvested events cannot be undone.
+        let completed = if family == ContinuationFamily::Semop {
+            let ContinuationDetail::Semop(wait) = &continuation.state().detail else {
+                panic!("semaphore continuation");
+            };
+            crate::dispatch::complete_semop_for_continuation_test(
+                wait.lock().take().expect("admitted semaphore operation"),
+            )
+        } else {
+            if family == ContinuationFamily::WaitOnSignals {
+                let signal = crate::kernel::LinuxSignal::for_signal_number(10).unwrap();
+                let authority = context.signal_authority();
+                let wanted = SigSet::EMPTY.with(signal.raw());
+                authority.enqueue_thread_standard(signal, None);
+                assert!(authority.take_lowest_in(wanted).is_some());
+                assert!(!authority.has_pending_in(wanted), "signal already dequeued");
+            }
+            DispatchOutcome::Returned { value }
+        };
+        *continuation.state().producer_completion.lock() = Some(completed);
+        let stop =
+            crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).unwrap();
+        let cont =
+            crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).unwrap();
+        assert!(kernel.stop_task_for_job_control(context.task().key().id, stop, None));
+        assert!(kernel.post_signal_to_task(context.task().key().id, cont, None));
+        assert_eq!(
+            continuation
+                .resume(ContinuationEvent::Signal, &context)
+                .unwrap()
+                .completion,
+            ContinuationCompletion::Return(value),
+            "{family:?}"
+        );
+    }
+}

@@ -3743,6 +3743,21 @@ impl BlockingSemop {
 }
 
 #[cfg(test)]
+pub fn complete_semop_for_continuation_test(wait: BlockingSemop) -> DispatchOutcome {
+    let values = Arc::clone(&wait.sem_set.values);
+    values.lock()[0] = 1;
+    let BlockingSemopStep::Done(outcome) = wait.complete() else {
+        panic!("supplied semaphore value must complete the admitted operation");
+    };
+    assert_eq!(
+        values.lock()[0],
+        0,
+        "operation must have consumed the value"
+    );
+    outcome
+}
+
+#[cfg(test)]
 pub fn blocking_semop_for_continuation_test() -> BlockingSemop {
     let set = SemSet {
         key: LINUX_IPC_PRIVATE,
