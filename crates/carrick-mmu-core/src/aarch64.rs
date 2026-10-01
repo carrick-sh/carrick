@@ -9693,6 +9693,35 @@ mod tests {
     /// The batched walk is the per-page walk: same descriptors at every
     /// level, including pages that cross into another L3 table and pages
     /// whose walk stops at an invalid upper level.
+    /// A sole-owner COW write reuses the frame in place by granting write on
+    /// the fork-armed leaf. The grant changes AP only: an executable page
+    /// stays executable (mprotectexec `exec_mmap_fetch_allowed`) and a
+    /// non-executable one stays NX, exactly as the copy path's repoint does.
+    #[test]
+    fn a_fork_armed_leaf_granted_write_in_place_keeps_its_execute_permission() {
+        for exec in [true, false] {
+            let mut mgr = hvpatch_manager();
+            let va = LINUX_MMAP_BASE + 0x4000;
+            mgr.set_rw(va, 0x4000, exec, None)
+                .expect("map the private compound");
+            mgr.set_fork_readonly(va, 0x4000, None).expect("fork arm");
+            let armed = mgr.debug_walk(va)[3];
+            assert_eq!(armed & AP_MASK, AP_RO, "exec={exec}: armed read-only");
+            assert_eq!(armed & UXN == 0, exec, "exec={exec}: arming keeps UXN");
+            mgr.set_writable_preserving_attributes(va, 0x4000, None)
+                .expect("grant write in place");
+            for page in (va..va + 0x4000).step_by(0x1000) {
+                let leaf = mgr.debug_walk(page)[3];
+                assert_eq!(leaf & AP_MASK, AP_RW, "exec={exec} page {page:#x}");
+                assert_eq!(
+                    leaf & UXN == 0,
+                    exec,
+                    "exec={exec} page {page:#x}: UXN changed"
+                );
+            }
+        }
+    }
+
     #[test]
     fn debug_walk_host_pages_matches_the_per_page_walk() {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
