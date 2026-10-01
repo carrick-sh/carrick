@@ -10,12 +10,12 @@
 //!
 //! ## Coherence across carrick's real-process forks
 //!
-//! carrick services guest `clone(2)` by forking the HOST process, so an
+//! In lanes that fork the HOST process, an
 //! in-process map is NOT fork-coherent: a sibling that renames/creates/deletes
 //! a directory would leave every other process's cache serving a stale resolve.
 //! We fix that with a **generation counter in a `MAP_SHARED` page** (the same
 //! trick as the alias-IPA allocator): every structural fs mutation — in ANY
-//! process — bumps the one shared word, and a cache entry is valid only while
+//! process within the backing cohort — bumps its shared word, and a cache entry is valid only while
 //! its stamped generation still equals the current shared generation. A stale
 //! entry re-resolves. Content writes do NOT bump it (they can't change a path's
 //! resolution); only structural changes (mkdir/rmdir/rename/symlink/link/
@@ -57,6 +57,8 @@ unsafe impl Sync for FsCacheCoherence {}
 
 impl Default for FsCacheCoherence {
     fn default() -> Self {
+        // SAFETY: request a new writable anonymous shared mapping, owned by
+        // this authority and inherited by real host-fork descendants.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

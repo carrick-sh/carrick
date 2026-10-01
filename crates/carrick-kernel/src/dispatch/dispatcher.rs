@@ -452,7 +452,12 @@ impl SyscallDispatcher {
     /// directory. Returns the previously-installed backend so the
     /// caller can decide what to do with it (normally just drop).
     pub fn set_fs_backend(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        self.fs.rootfs_vfs_mut().set_overlay(backend)
+        let old = self.fs.rootfs_vfs_mut().set_overlay(backend);
+        let coherence = std::sync::Arc::clone(&self.fs.rootfs_vfs.dentry_cache.coherence);
+        self.fs.resolve_cache =
+            carrick_vfs::fs_resolve_cache::ResolveCache::new(std::sync::Arc::clone(&coherence));
+        self.fs.vfs_mounts_mut().set_cache_coherence(coherence);
+        old
     }
 
     /// Install an immutable lower beneath the current writable backend. Used
