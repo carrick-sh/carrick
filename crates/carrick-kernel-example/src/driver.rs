@@ -7,6 +7,7 @@
 //! |---|---|---|---|
 //! | `WaitOnFds` | `BlockedContinuation::from_dispatch_outcome` | `ReadinessProbe::Fds` (polled host fds + wait queues) | `RestartClass::RestartSyscall` (for restartable nr) / `Never` |
 //! | `WaitOnHvpatchChild` | `BlockedContinuation::from_dispatch_outcome` | `ReadinessProbe::TaskWake` (child exit edge) | `RestartClass::Never` |
+//! | `WaitOnPtraceStopSettle` | `BlockedContinuation::from_dispatch_outcome` | `ReadinessProbe::TaskWake` (tracer wake on tracee settle/exit; SIGKILL-only signal) | `RestartClass::Never` |
 //! | `WaitOnSignals` | `BlockedContinuation::from_dispatch_outcome` | `SignalReadinessProbe` (pending signal deliverable) | `RestartClass::Never` |
 //! | `WaitOnSleep` | `BlockedContinuation::from_dispatch_outcome` | `ReadinessProbe::Timer` (reactor deadline) | `RestartClass::Never` |
 //! | `FutexWait` / `FutexWaitv` | `BlockedContinuation::from_dispatch_outcome` | `ReadinessProbe::Futex` (futex table subscription) | `RestartClass::Never` |

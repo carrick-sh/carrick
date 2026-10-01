@@ -475,6 +475,7 @@ def _format_hvpatch_blocked_continuation(pid: int, tid: int, packed: int) -> str
         18: "fd-wait",
         19: "semop",
         20: "mqueue",
+        23: "ptrace-stop-settle",
     }.get((packed >> 24) & 0xFF, "unknown")
     native_nr = packed & 0xFFFFFF
     syscall = "overflow" if native_nr == 0xFFFFFF else str(native_nr)

@@ -13,8 +13,8 @@ use crate::kernel::container::ContainerId;
 use crate::kernel::core::{Kernel, KernelContext, KernelDomain};
 use crate::kernel::ids::{LinuxSignal, LinuxTid, ProcessGroupId, TaskId};
 use crate::kernel::objects::{
-    DumpableMode, PtraceStopSettlement, PtraceSynchronousFault, Task, TaskKey, TaskLifecycle,
-    TaskRef, ThreadKey,
+    DumpableMode, PtraceStopRefusal, PtraceStopSettlement, PtraceSynchronousFault, Task, TaskKey,
+    TaskLifecycle, TaskRef, ThreadKey,
 };
 
 /// Result of resolving one Linux signal target against the authoritative
@@ -365,18 +365,37 @@ impl Kernel {
         &self,
         tracer: TaskKey,
         target: TaskKey,
-    ) -> Result<crate::kernel::objects::PtraceMemoryAccessWitness, carrick_abi::LinuxErrno> {
-        let task = {
-            let registry = self.registry().settled().read();
-            let Some(record) = registry.tasks.get(&target.id) else {
-                return Err(carrick_abi::LINUX_ESRCH);
-            };
-            if record.task.key() != target {
-                return Err(carrick_abi::LINUX_ESRCH);
-            }
-            Arc::clone(&record.task)
+    ) -> Result<crate::kernel::objects::PtraceMemoryAccessWitness, PtraceStopRefusal> {
+        let (tracer, task) = self.ptrace_request_pair(tracer, target)?;
+        task.begin_ptrace_memory_access(&tracer)
+    }
+
+    /// Admit a ptrace request that needs `target` in a settled ptrace-stop
+    /// owned by `tracer` but no memory witness (`PEEKUSER`/`POKEUSER`).
+    pub(crate) fn ptrace_stop_admission(
+        &self,
+        tracer: TaskKey,
+        target: TaskKey,
+    ) -> Result<(), PtraceStopRefusal> {
+        let (tracer, task) = self.ptrace_request_pair(tracer, target)?;
+        task.ptrace_stop_admission(&tracer).map(|_| ())
+    }
+
+    fn ptrace_request_pair(
+        &self,
+        tracer: TaskKey,
+        target: TaskKey,
+    ) -> Result<(TaskRef, TaskRef), PtraceStopRefusal> {
+        let registry = self.registry().settled().read();
+        let exact = |key: TaskKey| {
+            registry
+                .tasks
+                .get(&key.id)
+                .filter(|record| record.task.key() == key)
+                .map(|record| Arc::clone(&record.task))
+                .ok_or(PtraceStopRefusal::NotStopped)
         };
-        task.begin_ptrace_memory_access(tracer)
+        Ok((exact(tracer)?, exact(target)?))
     }
 
     pub fn stop_task_for_ptrace(&self, target: TaskId, signal: LinuxSignal) -> bool {
@@ -475,7 +494,13 @@ impl Kernel {
             };
             Arc::clone(&record.task)
         };
-        task.settle_ptrace_stop()
+        let (settlement, unsettled_window_ended) = task.settle_ptrace_stop();
+        // A tracer request that found this stop published but unsettled is
+        // parked on the tracer's wake generation; this is its producer edge.
+        if unsettled_window_ended && let Some(tracer) = self.current_tracer_task(&task) {
+            tracer.wake();
+        }
+        settlement
     }
 
     pub(crate) fn detach_task_from_ptrace(&self, tracer: TaskKey, target: TaskId) -> bool {

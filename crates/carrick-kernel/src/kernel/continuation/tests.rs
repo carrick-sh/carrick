@@ -619,6 +619,9 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
         ContinuationFamily::VforkParent => {
             panic!("vfork continuation is constructed from the published Kernel relationship")
         }
+        ContinuationFamily::PtraceStopSettle => {
+            panic!("a ptrace settlement wait names an exact tracee and tracer precheck")
+        }
         ContinuationFamily::ZoneFutexWait => {
             panic!("a zone futex wait is constructed from the zone record it parked in")
         }
@@ -630,6 +633,7 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     let mut families = DISPATCH_FAMILIES.to_vec();
     families.push(ContinuationFamily::VforkParent);
     families.push(ContinuationFamily::ZoneFutexWait);
+    families.push(ContinuationFamily::PtraceStopSettle);
     let mut codes = families
         .into_iter()
         .map(ContinuationFamily::event_code)
@@ -644,7 +648,7 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     assert_eq!(
         codes,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
         ]
     );
 }
@@ -1001,6 +1005,56 @@ fn child_wait_enrolled_after_the_exit_edge_still_sees_it() {
         RegistrationState::Ready,
         "an exit edge published between the child scan and the capture must \
          still make the wait ready; enrolling past it parks the parent forever"
+    );
+}
+
+/// A tracee that settles AFTER the ptrace admission found its stop unsettled
+/// but BEFORE the request's continuation is captured must still wake it.
+/// The settlement edge publishes `settled` and then wakes the tracer, so the
+/// continuation has to enroll at the generation the admission sampled —
+/// enrolling at the capture's re-reading would subscribe past the only edge.
+#[test]
+fn ptrace_settle_wait_enrolled_after_the_settle_edge_still_sees_it() {
+    let (kernel, context) = bootstrap(15_122);
+    let generation = publish(&context, 0x362);
+    let precheck =
+        crate::kernel::objects::PtraceSettlePrecheck::for_test(context.task().wake_generation());
+    // The tracee settles here and wakes its tracer; nothing is enrolled yet.
+    let _ = context.task().publish_wake_subscriptions();
+    assert_ne!(context.task().wake_generation(), precheck.wake_generation());
+
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnPtraceStopSettle {
+            tracee: context.task().key(),
+            precheck,
+        },
+        capture(&context, generation),
+    )
+    .expect("ptrace settle continuation");
+    assert_eq!(continuation.family(), ContinuationFamily::PtraceStopSettle);
+    assert_eq!(
+        continuation.signal_masks().temporary(),
+        None,
+        "the settle wait is killable-only and installs no temporary mask"
+    );
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let service = CarrierWaitService::new(scheduler);
+    let mut registration = service.prepare_registration(&continuation);
+    let token = registration.wake_token();
+    service
+        .enroll(&mut registration)
+        .expect("enroll ptrace settle wait");
+    assert_eq!(
+        service
+            .inner
+            .state
+            .lock()
+            .entries
+            .get(&token.continuation)
+            .expect("ptrace settle registration")
+            .state,
+        RegistrationState::Ready,
+        "a settle edge published between admission and capture must make the wait ready"
     );
 }
 

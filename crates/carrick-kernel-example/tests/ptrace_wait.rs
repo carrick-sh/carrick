@@ -1615,3 +1615,205 @@ fn ptrace_lost_wake_window_non_child_sibling_waitid() {
     let detach_outcome = tracer.ptrace_detach(tracee_pid).expect("ptrace detach");
     assert_eq!(detach_outcome, DispatchOutcome::Returned { value: 0 });
 }
+
+impl TestProcess {
+    fn ptrace_peekdata(
+        &mut self,
+        target_pid: i32,
+        addr: u64,
+    ) -> (SyscallRequest, Result<DispatchOutcome, DispatchError>) {
+        let request = SyscallRequest::new(
+            nr::PTRACE.raw(),
+            SyscallArgs::from([
+                carrick_abi::LINUX_PTRACE_PEEKDATA,
+                target_pid as u64,
+                addr,
+                0,
+                0,
+                0,
+            ]),
+        );
+        let outcome = self.dispatch(request);
+        (request, outcome)
+    }
+
+    /// Park `outcome` the way the carrier does: owned continuation, enrolled
+    /// in the wait service, no worker held.
+    fn park(
+        &self,
+        request: SyscallRequest,
+        outcome: DispatchOutcome,
+        wait_service: &CarrierWaitService,
+    ) -> (
+        BlockedContinuation,
+        carrick_kernel::kernel::continuation::ContinuationWakeToken,
+    ) {
+        let capture = ContinuationCapture::new(
+            &self.context,
+            self.execution_generation,
+            request,
+            RestartClass::Never,
+        )
+        .expect("continuation capture");
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(outcome, capture)
+            .expect("ptrace settle continuation must build");
+        continuation.install_temporary_signal_mask(&self.context);
+        continuation.bind_product_futex(&self.futex);
+        let mut registration = wait_service.prepare_registration(&continuation);
+        wait_service
+            .enroll(&mut registration)
+            .expect("enroll ptrace settle wait");
+        let token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
+        (continuation, token)
+    }
+
+    fn resume_to_redispatch(
+        &mut self,
+        continuation: BlockedContinuation,
+        wait_service: &CarrierWaitService,
+        token: carrick_kernel::kernel::continuation::ContinuationWakeToken,
+    ) {
+        let event = block_on_timeout(wait_service.event(token), Duration::from_secs(5))
+            .expect("settlement edge must publish an event")
+            .expect("wait service event must succeed");
+        let result = continuation
+            .resume(event, &self.context)
+            .expect("continuation resume");
+        assert_eq!(
+            fold_continuation_completion(
+                result.completion,
+                &self.dispatcher,
+                &self.context,
+                &mut self.memory.linear,
+            )
+            .expect("fold continuation completion"),
+            None,
+            "a ptrace settle wake re-dispatches the whole request"
+        );
+    }
+}
+
+fn registration_state(continuation: &BlockedContinuation) -> String {
+    continuation
+        .diagnostic()
+        .registration
+        .expect("registration diagnostic")
+        .state
+}
+
+/// `ptraceinvaliderrno` shape, two live processes: the tracer's `wait4`
+/// reports the stop before the tracee settles into it (report-before-settle
+/// is kept), and a PEEKDATA issued in that window must neither fail with
+/// ESRCH nor park a worker. It becomes an owned continuation on the tracer's
+/// wake generation, stays quiet until the TRACEE settles, and the re-dispatch
+/// then answers with Linux semantics (EIO for address 0).
+///
+/// Red-first: with the old admission every PEEK in this window returned
+/// `ESRCH` directly.
+#[test]
+fn ptrace_peek_after_wait_reports_unsettled_stop_waits_for_tracee_settlement() {
+    let asids = AsidAllocator::new();
+    let mut root = TestProcess::boot_root(&asids, "root-pid1");
+    let mut tracer = root.fork_child(&asids, "sibling-tracer");
+    let tracee = root.fork_child(&asids, "sibling-tracee");
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(root.context.kernel())));
+    let wait_service = CarrierWaitService::try_new(scheduler).expect("carrier wait service");
+    let wstatus_addr = tracer.memory.alloc_zeroed(4).expect("alloc wstatus");
+    let tracee_pid = tracee.process.pid();
+    let tracee_key = tracee.context.task().key();
+
+    assert_eq!(
+        tracer.ptrace_attach(tracee_pid).expect("ptrace attach"),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // The tracee publishes its ptrace-stop but is held before settling.
+    assert!(tracee.process.stop_for_ptrace_signal(LINUX_SIGSTOP as i32));
+    let (_, reported) = tracer.wait4(tracee_pid, wstatus_addr, 0, 0);
+    assert_eq!(
+        reported.expect("wait4 dispatch"),
+        DispatchOutcome::Returned {
+            value: i64::from(tracee_pid)
+        },
+        "the published stop is reportable before settlement"
+    );
+
+    let (request, outcome) = tracer.ptrace_peekdata(tracee_pid, 0);
+    let outcome = outcome.expect("ptrace dispatch");
+    assert!(
+        matches!(
+            outcome,
+            DispatchOutcome::WaitOnPtraceStopSettle { tracee, .. } if tracee == tracee_key
+        ),
+        "PEEKDATA on a reported-but-unsettled stop must wait for the exact tracee, got {outcome:?}"
+    );
+    let (continuation, token) = tracer.park(request, outcome, &wait_service);
+    assert_eq!(continuation.diagnostic().family, "ptrace-stop-settle");
+    assert_eq!(
+        registration_state(&continuation),
+        "enrolled",
+        "nothing may make the request runnable before the tracee settles"
+    );
+
+    // The tracee reaches its job-control boundary and settles.
+    assert_eq!(
+        tracee
+            .context
+            .kernel()
+            .settle_task_ptrace_stop(tracee_key.id),
+        carrick_kernel::kernel::objects::PtraceStopSettlement::Stopped
+    );
+    assert_eq!(registration_state(&continuation), "ready");
+    tracer.resume_to_redispatch(continuation, &wait_service, token);
+
+    let (_, redispatched) = tracer.ptrace_peekdata(tracee_pid, 0);
+    assert_eq!(
+        redispatched.expect("redispatched ptrace"),
+        DispatchOutcome::errno(carrick_abi::LINUX_EIO),
+        "the settled stop answers the invalid peek with Linux's EIO"
+    );
+    assert_eq!(
+        tracer.ptrace_detach(tracee_pid).expect("ptrace detach"),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
+
+/// The settle wait is bounded by the tracee: if it dies instead of settling,
+/// its exit wakes the tracer and the re-dispatched request answers ESRCH.
+#[test]
+fn ptrace_peek_parked_on_unsettled_stop_answers_esrch_when_tracee_dies() {
+    let asids = AsidAllocator::new();
+    let mut root = TestProcess::boot_root(&asids, "root-pid1");
+    let mut tracer = root.fork_child(&asids, "sibling-tracer");
+    let mut tracee = root.fork_child(&asids, "sibling-tracee");
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(root.context.kernel())));
+    let wait_service = CarrierWaitService::try_new(scheduler).expect("carrier wait service");
+    let tracee_pid = tracee.process.pid();
+
+    assert_eq!(
+        tracer.ptrace_attach(tracee_pid).expect("ptrace attach"),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(tracee.process.stop_for_ptrace_signal(LINUX_SIGSTOP as i32));
+    let (request, outcome) = tracer.ptrace_peekdata(tracee_pid, 0);
+    let outcome = outcome.expect("ptrace dispatch");
+    assert!(
+        matches!(outcome, DispatchOutcome::WaitOnPtraceStopSettle { .. }),
+        "got {outcome:?}"
+    );
+    let (continuation, token) = tracer.park(request, outcome, &wait_service);
+    assert_eq!(registration_state(&continuation), "enrolled");
+
+    tracee.exit(9);
+    assert_eq!(registration_state(&continuation), "ready");
+    tracer.resume_to_redispatch(continuation, &wait_service, token);
+
+    let (_, redispatched) = tracer.ptrace_peekdata(tracee_pid, 0);
+    assert_eq!(
+        redispatched.expect("redispatched ptrace"),
+        DispatchOutcome::errno(carrick_abi::LINUX_ESRCH),
+        "a tracee that died instead of settling is ESRCH"
+    );
+}

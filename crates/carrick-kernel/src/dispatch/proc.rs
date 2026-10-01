@@ -370,6 +370,22 @@ fn ptrace_text_data_addr_is_invalid(addr: GuestPtr) -> bool {
     signed_addr < 0 || addr.0 < 4096
 }
 
+/// Lower a refused ptrace-stop admission: no stop is `ESRCH`; a published but
+/// unsettled stop parks the request until the tracee settles into it.
+fn ptrace_stop_refusal_outcome(
+    refusal: crate::kernel::objects::PtraceStopRefusal,
+    tracee: crate::kernel::TaskKey,
+) -> DispatchOutcome {
+    match refusal {
+        crate::kernel::objects::PtraceStopRefusal::NotStopped => {
+            DispatchOutcome::errno(LINUX_ESRCH)
+        }
+        crate::kernel::objects::PtraceStopRefusal::Unsettled(precheck) => {
+            DispatchOutcome::WaitOnPtraceStopSettle { tracee, precheck }
+        }
+    }
+}
+
 fn ptrace_user_addr_is_invalid(addr: GuestPtr) -> bool {
     let signed_addr = addr.0 as i64;
     signed_addr < 0 || addr.0 > 4096
@@ -2642,7 +2658,9 @@ impl<'a> ProcView<'a> {
                             .begin_ptrace_memory_access(process.task_key(), target_key)
                         {
                             Ok(witness) => witness,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            Err(refusal) => {
+                                return Ok(ptrace_stop_refusal_outcome(refusal, target_key));
+                            }
                         };
                         let relation = cx.with_execution_lease(|lease| {
                             kernel.foreign_mm(cx.kernel, lease, target_key)
@@ -2719,7 +2737,9 @@ impl<'a> ProcView<'a> {
                             .begin_ptrace_memory_access(process.task_key(), target_key)
                         {
                             Ok(witness) => witness,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            Err(refusal) => {
+                                return Ok(ptrace_stop_refusal_outcome(refusal, target_key));
+                            }
                         };
                         let relation = cx.with_execution_lease(|lease| {
                             kernel.foreign_mm(cx.kernel, lease, target_key)
@@ -2836,8 +2856,17 @@ impl<'a> ProcView<'a> {
                         }
                     }
                     LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => {
-                        if target().is_none() {
-                            DispatchOutcome::errno(LINUX_ESRCH)
+                        let Some(target_key) = target() else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        // Like every request but TRACEME/ATTACH/KILL, the USER
+                        // area is only reachable through a ptrace-stop: ESRCH
+                        // when there is none, and a wait — never ESRCH — when
+                        // the stop is published but not yet settled.
+                        if let Err(refusal) =
+                            kernel.ptrace_stop_admission(process.task_key(), target_key)
+                        {
+                            ptrace_stop_refusal_outcome(refusal, target_key)
                         } else if ptrace_user_addr_is_invalid(addr) {
                             DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)
                         } else {
@@ -6947,8 +6976,16 @@ mod kernel_process_dispatch_tests {
         );
     }
 
+    /// A stop published (and so already reportable to the tracer's `wait`)
+    /// but not yet settled by the tracee is NOT a reason for `ESRCH`:
+    /// ptrace(2) promises a tracee observed in ptrace-stop stays stopped and
+    /// that requests operate on it. The request parks on the tracer's wake
+    /// generation until the tracee settles, then operates with Linux
+    /// semantics. Red-first: before the settle wait existed every request
+    /// below answered `ESRCH` (`ptraceinvaliderrno` saw it intermittently
+    /// in place of the oracle's `EIO`).
     #[test]
-    fn hvpatch_ptrace_memory_rejects_unsettled_pending_stop_target() {
+    fn hvpatch_ptrace_requests_wait_for_unsettled_reported_stop_then_operate() {
         let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_149);
         let target = process_vm_target_with_payload(&root, 61_150, b"UNSETTLE");
         assert!(root.kernel().claim_ptrace_traceme(&target));
@@ -6957,12 +6994,21 @@ mod kernel_process_dispatch_tests {
             root.kernel()
                 .stop_task_for_ptrace(target.task().key().id, stop)
         );
-        // Note: settle_task_ptrace_stop is deliberately NOT called here!
+        // Note: settle_task_ptrace_stop is deliberately NOT called yet.
         let root = refreshed(&root);
-        let target_pid = target.task().key().id.raw();
+        let target_key = target.task().key();
+        let target_pid = target_key.id.raw();
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        let mut unsettled_precheck = None;
+        let mut assert_waits = |outcome: DispatchOutcome, what: &str| match outcome {
+            DispatchOutcome::WaitOnPtraceStopSettle { tracee, precheck } => {
+                assert_eq!(tracee, target_key, "{what} must wait on the exact tracee");
+                unsettled_precheck = Some(precheck);
+            }
+            other => panic!("{what} on an unsettled reported stop must wait, got {other:?}"),
+        };
 
-        assert_eq!(
+        assert_waits(
             dispatch_with_lease(
                 &mut dispatcher,
                 &root,
@@ -6971,11 +7017,9 @@ mod kernel_process_dispatch_tests {
                 [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
                 Some(&lease),
             ),
-            DispatchOutcome::errno(LINUX_ESRCH),
-            "unsettled pending-stop target must return ESRCH on peek",
+            "PEEKDATA",
         );
-
-        assert_eq!(
+        assert_waits(
             dispatch_with_lease(
                 &mut dispatcher,
                 &root,
@@ -6991,9 +7035,84 @@ mod kernel_process_dispatch_tests {
                 ],
                 Some(&lease),
             ),
-            DispatchOutcome::errno(LINUX_ESRCH),
-            "unsettled pending-stop target must return ESRCH on poke",
+            "POKEDATA",
         );
+        assert_waits(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKUSER, target_pid as u64, 4097, 0, 0, 0],
+            ),
+            "PEEKUSER",
+        );
+        let precheck = unsettled_precheck.expect("a waiting request carries its precheck");
+        assert_eq!(
+            precheck.wake_generation(),
+            root.task().wake_generation(),
+            "nothing has woken the tracer while the stop is unsettled"
+        );
+
+        assert_eq!(
+            root.kernel().settle_task_ptrace_stop(target_key.id),
+            crate::kernel::objects::PtraceStopSettlement::Stopped,
+        );
+        assert_ne!(
+            root.task().wake_generation(),
+            precheck.wake_generation(),
+            "settlement is the producer edge: it must move the tracer's wake generation"
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::returned_raw_u64(u64::from_le_bytes(*b"UNSETTLE")),
+            "the re-dispatched peek operates on the settled stop",
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKUSER, target_pid as u64, 4097, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+            "the re-dispatched invalid PEEKUSER answers Linux's EIO, not ESRCH",
+        );
+    }
+
+    /// The settle wait is for a stop that still exists: a tracee that is
+    /// traced but running, or whose stop already consumed a resume, is ESRCH
+    /// for every stop-gated request, PEEKUSER included.
+    #[test]
+    fn hvpatch_ptrace_user_area_requires_a_ptrace_stop() {
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_151);
+        let target = process_vm_target_with_payload(&root, 61_152, b"RUNNINGU");
+        assert!(root.kernel().claim_ptrace_traceme(&target));
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        for request in [LINUX_PTRACE_PEEKUSER, LINUX_PTRACE_POKEUSER] {
+            assert_eq!(
+                dispatch(
+                    &mut dispatcher,
+                    &root,
+                    &mut memory,
+                    SYS_PTRACE,
+                    [request, target_pid as u64, 4097, 0, 0, 0],
+                ),
+                DispatchOutcome::errno(LINUX_ESRCH),
+                "request {request} on a running tracee is ESRCH before address validation",
+            );
+        }
     }
 
     #[test]

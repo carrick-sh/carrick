@@ -351,6 +351,68 @@ pub enum PtraceStopSettlement {
     Resumed { signal: Option<LinuxSignal> },
 }
 
+/// The tracer's wake generation, sampled before a ptrace request found its
+/// tracee's stop published but not yet settled.
+///
+/// A ptrace-stop becomes reportable to `wait(2)` as soon as it is published,
+/// before the tracee has finished retiring onto it; ptrace(2) promises that a
+/// tracee observed in ptrace-stop stays stopped and that requests operate on
+/// it. A request that arrives in that window therefore waits for the
+/// settlement edge instead of failing. The settling tracee publishes
+/// `settled` and only then wakes its tracer, so a generation read before the
+/// stop state was inspected is necessarily older than that wake. The only
+/// constructor is the admission check, so "sampled after the state" is not
+/// expressible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct PtraceSettlePrecheck(u64);
+
+impl PtraceSettlePrecheck {
+    /// The tracer's wake generation as of the admission check.
+    pub const fn wake_generation(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(wake_generation: u64) -> Self {
+        Self(wake_generation)
+    }
+}
+
+/// Why a tracer may not operate on a tracee's ptrace-stop right now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PtraceStopRefusal {
+    /// No ptrace-stop exists for this tracer: the tracee is running, exiting,
+    /// already resumed by a recorded command, or traced by someone else.
+    /// Linux answers `ESRCH`.
+    NotStopped,
+    /// The stop is published (and may already have been reported by
+    /// `wait(2)`) but the tracee has not settled into it. The request must
+    /// wait for that edge, then re-evaluate.
+    Unsettled(PtraceSettlePrecheck),
+}
+
+/// The exact ptrace-stop generation an admission was granted against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtraceStopGeneration(u64);
+
+fn ptrace_stop_admission_locked(
+    state: &TaskJobControl,
+    tracer: TaskKey,
+    precheck: PtraceSettlePrecheck,
+) -> Result<PtraceStopGeneration, PtraceStopRefusal> {
+    if state.ptrace_tracer != Some(tracer)
+        || !state.stopped_by_ptrace
+        || state.stopped_by.is_none()
+        || state.ptrace_resume_command.is_some()
+    {
+        return Err(PtraceStopRefusal::NotStopped);
+    }
+    if !state.ptrace_stop_settled {
+        return Err(PtraceStopRefusal::Unsettled(precheck));
+    }
+    Ok(PtraceStopGeneration(state.ptrace_stop_generation))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PtraceSynchronousFault {
     pub signal: LinuxSignal,
@@ -1383,28 +1445,42 @@ impl Task {
         self.job_control.lock().stopped_by.is_some()
     }
 
-    pub fn begin_ptrace_memory_access(
-        self: &Arc<Self>,
-        tracer: TaskKey,
-    ) -> Result<PtraceMemoryAccessWitness, carrick_abi::LinuxErrno> {
+    /// Admit `tracer` to operate on this task's current ptrace-stop.
+    ///
+    /// The tracer's wake generation is sampled BEFORE the stop state is read,
+    /// so a refusal of [`PtraceStopRefusal::Unsettled`] carries a precheck
+    /// that the settlement edge (which publishes `settled` and only then
+    /// wakes the tracer) necessarily moves past. See
+    /// [`PtraceSettlePrecheck`].
+    pub fn ptrace_stop_admission(
+        &self,
+        tracer: &Task,
+    ) -> Result<PtraceStopGeneration, PtraceStopRefusal> {
+        let precheck = PtraceSettlePrecheck(tracer.wake_generation());
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != TaskLifecycle::Live {
-            return Err(carrick_abi::LINUX_ESRCH);
+            return Err(PtraceStopRefusal::NotStopped);
         }
         let job_control = self.job_control.lock();
-        if job_control.ptrace_tracer != Some(tracer)
-            || !job_control.stopped_by_ptrace
-            || job_control.stopped_by.is_none()
-            || !job_control.ptrace_stop_settled
-            || job_control.ptrace_resume_command.is_some()
-        {
-            return Err(carrick_abi::LINUX_ESRCH);
+        ptrace_stop_admission_locked(&job_control, tracer.key(), precheck)
+    }
+
+    pub fn begin_ptrace_memory_access(
+        self: &Arc<Self>,
+        tracer: &Task,
+    ) -> Result<PtraceMemoryAccessWitness, PtraceStopRefusal> {
+        let precheck = PtraceSettlePrecheck(tracer.wake_generation());
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return Err(PtraceStopRefusal::NotStopped);
         }
+        let job_control = self.job_control.lock();
+        let stop = ptrace_stop_admission_locked(&job_control, tracer.key(), precheck)?;
         Ok(PtraceMemoryAccessWitness {
             task: Arc::clone(self),
-            tracer,
+            tracer: tracer.key(),
             mm_id: self.shared().mm().id(),
-            stop_generation: job_control.ptrace_stop_generation,
+            stop_generation: stop.0,
         })
     }
 
@@ -1548,19 +1624,24 @@ impl Task {
         true
     }
 
-    pub(in crate::kernel) fn settle_ptrace_stop(&self) -> PtraceStopSettlement {
+    /// Settle this task onto its published ptrace-stop. The second value is
+    /// true exactly when this call ended the stop's unsettled window — the
+    /// edge a tracer request parked on [`PtraceStopRefusal::Unsettled`] waits
+    /// for — whether the stop is now settled or consumed a recorded resume.
+    pub(in crate::kernel) fn settle_ptrace_stop(&self) -> (PtraceStopSettlement, bool) {
         let signal_generation = self.lock_signal_generation();
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != TaskLifecycle::Live {
-            return PtraceStopSettlement::NotPtraceStopped;
+            return (PtraceStopSettlement::NotPtraceStopped, false);
         }
         let mut state = self.job_control.lock();
         if !state.stopped_by_ptrace {
-            return PtraceStopSettlement::NotPtraceStopped;
+            return (PtraceStopSettlement::NotPtraceStopped, false);
         }
+        let newly_settled = !state.ptrace_stop_settled;
         state.ptrace_stop_settled = true;
         let Some(command) = state.ptrace_resume_command.take() else {
-            return PtraceStopSettlement::Stopped;
+            return (PtraceStopSettlement::Stopped, newly_settled);
         };
         state.stopped_by = None;
         state.stopped_by_ptrace = false;
@@ -1572,7 +1653,9 @@ impl Task {
         drop(lifecycle);
         drop(signal_generation);
         self.job_control_changed.notify_all();
-        settlement
+        // A recorded resume also ends the unsettled window: a parked request
+        // must re-evaluate and see the stop is gone (ESRCH).
+        (settlement, newly_settled)
     }
 
     pub(in crate::kernel) fn detach_from_ptrace(&self, tracer: TaskKey) -> bool {

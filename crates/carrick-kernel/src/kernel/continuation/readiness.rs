@@ -444,6 +444,7 @@ impl SignalReadinessProbe {
         // exit edge that already fired. See `ChildWaitPrecheck`.
         let observed_task_wake = match state.detail {
             ContinuationDetail::Process { precheck, .. } => precheck.wake_generation(),
+            ContinuationDetail::PtraceStop { precheck, .. } => precheck.wake_generation(),
             _ => state.authority.task_wake_generation,
         };
         Self {
@@ -471,6 +472,12 @@ impl SignalReadinessProbe {
         if self.family == ContinuationFamily::WaitOnHvpatchChild {
             return Some(ContinuationEvent::Ready);
         }
+        if self.family == ContinuationFamily::PtraceStopSettle {
+            // Any tracer wake is a redispatch hint: the ptrace request
+            // re-reads the tracee's stop itself. A SIGKILL still wins so the
+            // delivery tail terminates the tracer instead of re-parking.
+            return self.event().or(Some(ContinuationEvent::Ready));
+        }
         self.event()
     }
 
@@ -484,7 +491,13 @@ impl SignalReadinessProbe {
         }
         let authority = context.signal_authority();
         let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
-        if self.family == ContinuationFamily::VforkParent {
+        if matches!(
+            self.family,
+            ContinuationFamily::VforkParent | ContinuationFamily::PtraceStopSettle
+        ) {
+            // A ptrace request waiting out its tracee's stop settlement is
+            // killable-only for the same reason: it has performed nothing,
+            // and ptrace(2) never fails it with EINTR.
             // Linux waits for vfork completion in TASK_KILLABLE. That means
             // only SIGKILL may interrupt the wait; caught signals and other
             // default actions stay pending until the exact child exec/exit
@@ -765,6 +778,15 @@ impl ReadinessProbe {
                 }
             }
             ContinuationDetail::Vfork { wait, .. } => Self::Vfork { wait: wait.clone() },
+            // Enroll against the tracer generation the ptrace admission
+            // sampled before it read the tracee's stop: the settlement edge
+            // publishes `settled` and then wakes the tracer, so it is always
+            // past this reading. See `PtraceSettlePrecheck`.
+            ContinuationDetail::PtraceStop { precheck, .. } => Self::TaskWake {
+                task: state.authority.task_ref.clone(),
+                observed: precheck.wake_generation(),
+                deadline: state.deadline,
+            },
             ContinuationDetail::Sleep => state
                 .deadline
                 .map_or(Self::Passive { deadline: None }, |deadline| Self::Timer {
