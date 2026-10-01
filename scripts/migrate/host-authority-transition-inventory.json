@@ -16100,5 +16100,32 @@
       "line_end": 289,
       "line_start": 289
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-SYMLINK-METADATA",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "configured external bind source selected at mount creation"
+    },
+    "expansion": null,
+    "operation": "std::fs::symlink_metadata",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-vfs/src/vfs/bind.rs:73 in `BindVfs::new`, `std::fs::symlink_metadata` inspects only the configured host bind source, before admitting any guest-visible cached state. A terminal alias is resolved once to select the source object whose inode cohort owns later publication; failed sources preserve existing lookup behavior.",
+    "review_id": "HA-000694",
+    "source": {
+      "byte_end": 3259,
+      "byte_start": 3234,
+      "column": 16,
+      "column_end": 41,
+      "column_start": 16,
+      "file": "crates/carrick-vfs/src/vfs/bind.rs",
+      "line": 73,
+      "line_end": 73,
+      "line_start": 73
+    }
   }
 ]
