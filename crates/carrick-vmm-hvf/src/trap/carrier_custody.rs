@@ -1401,16 +1401,27 @@ pub(crate) struct CarrierStage2Pin {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for CarrierStage2Pin {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut state = self.custody.state.lock();
-        let Some(record) = state.stage2_records.get_mut(&self.identity.record_id) else {
+impl CarrierStage2Pin {
+    /// Hand this exact record pin to a caller that releases it later with
+    /// [`CarrierVmCustody::release_stage2_pin`] (an allocation-free
+    /// type-erased retention). Dropping the returned identity releases
+    /// nothing.
+    pub(crate) fn into_transferred_identity(mut self) -> CarrierStage2RecordIdentity {
+        self.active = false;
+        self.identity
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierVmCustody {
+    /// Release one pin on the exact record `identity` (the drop half of
+    /// [`Self::pin_stage2_record`]).
+    pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
+        let mut state = self.state.lock();
+        let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return;
         };
-        if CarrierVmCustody::stage2_identity_mismatch(record, self.identity).is_some() {
+        if CarrierVmCustody::stage2_identity_mismatch(record, identity).is_some() {
             return;
         }
         record.snapshot.pin_count = record.snapshot.pin_count.saturating_sub(1);
@@ -1425,8 +1436,18 @@ impl Drop for CarrierStage2Pin {
             && record.snapshot.terminalized_by_vm_destroy
             && record.snapshot.superseded_by_rebind;
         if remove_terminal_predecessor {
-            state.stage2_records.remove(&self.identity.record_id);
+            state.stage2_records.remove(&identity.record_id);
         }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for CarrierStage2Pin {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.custody.release_stage2_pin(self.identity);
         self.active = false;
     }
 }

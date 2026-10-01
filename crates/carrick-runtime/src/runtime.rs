@@ -2401,8 +2401,8 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.mem.write_bytes_unchecked(address, bytes)
     }
-    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
-        self.mem.host_ptr_for_read(address, len)
+    fn host_read(&self, address: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
+        self.mem.host_read(address, len)
     }
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
         self.mem.host_ptr_for_write(address, len)

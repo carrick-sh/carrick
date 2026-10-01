@@ -942,23 +942,28 @@ pub trait GuestMemory {
         None
     }
 
-    /// Host pointer for a CONTIGUOUS guest range usable for zero-copy host I/O
-    /// (send straight out of / recv straight into guest memory), valid IFF the
-    /// whole `[address, address+len)` lives in one mapped region so the host
-    /// backing is contiguous. Returns `None` when zero-copy is not applicable
-    /// (multi-region, unmapped, or — for writes — not guest-writable); the
-    /// caller MUST then fall back to `read_bytes`/`write_bytes`. The pointer is
-    /// valid only for the current syscall dispatch (the issuing vCPU is in its
-    /// own trap handler and the op runs before any lock-releasing wait); an
-    /// EAGAIN-parked syscall re-dispatches and re-resolves. Default: `None`
-    /// (the in-memory backend has no contiguous host backing to expose).
+    /// Admitted zero-copy SOURCE for a host call that reads a CONTIGUOUS guest
+    /// range straight out of guest memory (send/write/pwritev). Returns `None`
+    /// when zero-copy is not applicable (multi-region, unmapped, PROT_NONE, or
+    /// the backing could not be retained); the caller MUST then fall back to
+    /// `read_bytes`/`read_into`, whose copy is retained the same way.
     ///
-    /// SAFETY (using the pointer): touch at most `len` bytes. A concurrent guest
-    /// write to those bytes is a guest bug (matches Linux) and tolerated; the
-    /// mapping itself stays put for the dispatch.
-    fn host_ptr_for_read(&self, _address: u64, _len: usize) -> Option<*const u8> {
+    /// The returned [`HostRead`] is the only way to obtain the host pointer and
+    /// it retains the exact backing owner (owner, host VA and generation) until
+    /// it drops: a sibling's `munmap`/`MAP_FIXED`/`mremap` or a COW repoint
+    /// retires the frame only after the host call ends, so the host can never
+    /// read a recycled frame that another address space now owns. Hold it
+    /// across the whole host call. A concurrent guest write to those bytes is a
+    /// guest race (matches Linux) and tolerated.
+    fn host_read(&self, _address: u64, _len: usize) -> Option<HostRead> {
         None
     }
+    /// Host pointer for a CONTIGUOUS, guest-writable range usable as a
+    /// zero-copy DESTINATION (recv/read straight into guest memory), or `None`
+    /// (multi-region, unmapped, read-only); the caller then uses
+    /// `write_bytes`. The pointer is a request, not a grant: dereference it only
+    /// inside a [`HostWriteGuard`] built from it, which re-validates and retains
+    /// the exact backing.
     fn host_ptr_for_write(&mut self, _address: u64, _len: usize) -> Option<*mut u8> {
         None
     }
@@ -1023,6 +1028,98 @@ pub trait BorrowedTtbr0Admission: Send {
 /// and test doubles that represent the current address space implement this
 /// explicitly.
 pub trait CurrentMmMemory: GuestMemory {}
+
+/// Backend retention behind a [`HostRead`]: whatever keeps the exact guest
+/// backing alive and un-recycled. [`HostRead`] calls [`Self::release`] exactly
+/// once, when it drops. Backends can usually coerce an `Arc` they already
+/// hold, so admitting a read allocates nothing.
+pub trait HostReadRetention: Send + Sync {
+    fn release(&self);
+}
+
+/// An admitted zero-copy source: `len` bytes of guest memory at a host pointer
+/// whose backing the issuing backend retains until this value drops. Obtained
+/// only from [`GuestMemory::host_read`]; it is deliberately not `Send` and not
+/// a slice, so its bytes are never viewed as a Rust reference (other vCPUs may
+/// write them concurrently).
+pub struct HostRead {
+    guest: GuestVa,
+    host: *const u8,
+    len: usize,
+    retention: Option<std::sync::Arc<dyn HostReadRetention>>,
+}
+
+impl HostRead {
+    /// Backend constructor. `retention` must keep `[host, host+len)` mapped
+    /// and owned by `guest`'s address space until it is released. `None` is
+    /// only for backends whose backing is never unmapped or recycled while the
+    /// guest memory value lives (in-process test memories, VM-control
+    /// apertures).
+    ///
+    /// # Safety
+    /// `host` must be valid for reads of `len` bytes until the returned value
+    /// drops.
+    pub unsafe fn retained(
+        guest: GuestVa,
+        host: *const u8,
+        len: usize,
+        retention: Option<std::sync::Arc<dyn HostReadRetention>>,
+    ) -> Self {
+        Self {
+            guest,
+            host,
+            len,
+            retention,
+        }
+    }
+
+    pub fn guest(&self) -> GuestVa {
+        self.guest
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The host pointer, for passing straight to a host call (or a raw copy)
+    /// while `self` is alive. Never build a Rust reference over it.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.host
+    }
+
+    /// Raw copy of the retained bytes into private host memory.
+    ///
+    /// Copies `min(dst.len(), self.len())` bytes and returns that count.
+    pub fn copy_into(&self, dst: &mut [u8]) -> usize {
+        let len = dst.len().min(self.len);
+        // SAFETY: `retained`'s contract keeps `[host, host+len)` readable while
+        // `self` lives; `dst` is private and cannot overlap guest memory.
+        unsafe { std::ptr::copy_nonoverlapping(self.host, dst.as_mut_ptr(), len) };
+        len
+    }
+}
+
+impl Drop for HostRead {
+    fn drop(&mut self) {
+        if let Some(retention) = self.retention.take() {
+            retention.release();
+        }
+    }
+}
+
+impl std::fmt::Debug for HostRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostRead")
+            .field("guest", &self.guest)
+            .field("len", &self.len)
+            .field("retained", &self.retention.is_some())
+            .finish()
+    }
+}
 
 /// One already-resolved zero-copy destination. This is a request, not a grant;
 /// constructing it does not authorize a write or retain its backing.

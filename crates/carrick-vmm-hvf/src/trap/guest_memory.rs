@@ -275,6 +275,7 @@ impl HvfVmState {
     ) -> Result<(), MemoryError> {
         let length = dst.len();
         // PROT_NONE gated once in the default `GuestMemory::read_bytes`/`read_into`.
+        let custody = self.carrier_vm_custody();
         let mut copied = 0usize;
         while copied < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
@@ -282,7 +283,7 @@ impl HvfVmState {
             // translated overlay IPA, not the VA (see `syscall_buffer_lookup_addr`).
             // Identity otherwise — no walk. PROT_NONE was already gated on the VA.
             let translated_lookup = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
-            let (_lookup_address, mapping_start, mapping_end, mapping_ipa, host_addr) = {
+            let view = {
                 // Private-overlay descriptors are keyed by their translated
                 // IPA, while a boot brk descriptor remains keyed by Linux VA
                 // even after HVPatch repoints its stage-1 leaf to a reusable
@@ -290,11 +291,20 @@ impl HvfVmState {
                 // but join the latter through mapping_for_range's authoritative
                 // VA -> stage-1 IPA -> live global-owner path when the direct
                 // IPA lookup has no descriptor.
+                //
+                // The copy itself runs inside the selection, under the exact
+                // owner pin (`copy_guest_mapping_out`): a sibling's unmap or a
+                // COW repoint cannot retire and recycle the frame mid-copy.
                 let resolved =
                     resolve_guest_copy_mapping(translated_lookup, chunk_address, |lookup| {
-                        self.mapping_for_range(lookup, chunk_len)
+                        self.task.copy_guest_mapping_out(
+                            &custody,
+                            lookup,
+                            chunk_address,
+                            &mut dst[copied..copied + chunk_len],
+                        )
                     });
-                let Some((lookup_address, mapping)) = resolved else {
+                let Some((_lookup_address, copied_view)) = resolved else {
                     if let Some(state) = self.deferred_anonymous_state() {
                         let chunk = &mut dst[copied..copied + chunk_len];
                         if state
@@ -358,33 +368,16 @@ impl HvfVmState {
                     copied += chunk_len;
                     continue;
                 };
-                (
-                    lookup_address,
-                    mapping.start,
-                    mapping.end,
-                    mapping.ipa,
-                    mapping.host_addr,
-                )
+                copied_view?
             };
             self.emit_guest_mem_copy_decision(
                 crate::probes::guest_mem_dir::READ_GUEST,
                 chunk_address,
                 chunk_len,
-                mapping_start,
-                mapping_end,
-                mapping_ipa,
+                view.start,
+                view.end,
+                view.ipa,
             );
-            // Read directly out of the host buffer. Works for both
-            // applevisor-owned mappings (the parent case) and raw mappings
-            // we re-created in a forked child via hv_vm_map.
-            let chunk_offset = (chunk_address - mapping_start) as usize;
-            unsafe {
-                volatile_copy_from_guest(
-                    host_addr.add(chunk_offset),
-                    dst.as_mut_ptr().add(copied),
-                    chunk_len,
-                );
-            }
             copied += chunk_len;
         }
         crate::probes::guest_mem_bytes(
@@ -552,15 +545,20 @@ impl HvfVmState {
         first.map(|(_, _, _, _, _, host)| host)
     }
 
-    /// Host pointer for a contiguous guest range (zero-copy send source), or
-    /// `None` if any page resolves to another physical fragment. See
-    /// `GuestMemory::host_ptr_for_read`.
-    pub(crate) fn host_ptr_for_read(&self, address: u64, length: usize) -> Option<*const u8> {
+    /// Admitted zero-copy source for a contiguous guest range (send/write
+    /// source), retaining the exact backing owner until the returned value
+    /// drops; `None` if any page resolves to another physical fragment or the
+    /// owner cannot be retained. See `GuestMemory::host_read`.
+    pub(crate) fn host_read(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Option<carrick_guest_mem::HostRead> {
         if length == 0 || self.range_no_access(address, length) {
             return None;
         }
-        self.contiguous_guest_host_ptr(address, length)
-            .map(|ptr| ptr as *const u8)
+        let custody = self.carrier_vm_custody();
+        self.task.admit_host_read(&custody, address, length)
     }
 
     /// Host pointer for a contiguous guest range as a zero-copy recv DESTINATION,
@@ -1177,7 +1175,14 @@ impl HvfTaskState {
         };
         let write = self
             .with_mapping_for_range_in(custody, lookup_address, bytes.len(), |source| {
-                source.begin_write(self, custody, copy_address, bytes.len(), None)
+                source.begin_access(
+                    super::host_writes::HostAccess::Write,
+                    self,
+                    custody,
+                    copy_address,
+                    bytes.len(),
+                    None,
+                )
             })
             .ok_or_else(error)??;
         // SAFETY: the selected live mapping contains this complete fragment;
@@ -1186,6 +1191,40 @@ impl HvfTaskState {
             volatile_copy_to_guest(bytes.as_ptr(), write.pointer, bytes.len());
         }
         Ok(write.view)
+    }
+
+    /// Read twin of [`Self::copy_guest_mapping_in`]: copy one page-bounded
+    /// fragment out of the selected live mapping while its exact backing owner
+    /// is pinned, so a concurrent retirement cannot recycle the frame (and hand
+    /// another mm's bytes to this copy) mid-copy. `None` when no live mapping
+    /// covers the fragment; `Some(Err)` when one does but its owner is no
+    /// longer the exact live incarnation.
+    pub(crate) fn copy_guest_mapping_out(
+        &self,
+        custody: &CarrierVmCustody,
+        lookup_address: u64,
+        copy_address: u64,
+        dst: &mut [u8],
+    ) -> Option<Result<MappingView, MemoryError>> {
+        let read =
+            self.with_mapping_for_range_in(custody, lookup_address, dst.len(), |source| {
+                source.begin_access(
+                    super::host_writes::HostAccess::Read,
+                    self,
+                    custody,
+                    copy_address,
+                    dst.len(),
+                    None,
+                )
+            })?;
+        Some(read.map(|read| {
+            // SAFETY: the selected live mapping contains this complete fragment
+            // and its exact owner stays pinned until `read` drops.
+            unsafe {
+                volatile_copy_from_guest(read.pointer, dst.as_mut_ptr(), dst.len());
+            }
+            read.view
+        }))
     }
 }
 

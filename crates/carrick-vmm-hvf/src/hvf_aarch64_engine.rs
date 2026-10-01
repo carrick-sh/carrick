@@ -2540,8 +2540,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.guest_range_is_writable(va, len)
     }
 
-    fn host_ptr_for_read(&self, va: u64, len: usize) -> Option<*const u8> {
-        self.state.host_ptr_for_read(va, len)
+    fn host_read(&self, va: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
+        self.state.host_read(va, len)
     }
 
     fn host_ptr_for_write(&mut self, va: u64, len: usize) -> Option<*mut u8> {

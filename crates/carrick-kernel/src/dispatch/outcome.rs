@@ -1066,12 +1066,22 @@ impl GuestMemory for LinearMemory {
         Ok(())
     }
 
-    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+    fn host_read(&self, address: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
         let offset = address.checked_sub(self.base)?;
         let offset = usize::try_from(offset).ok()?;
         let end = offset.checked_add(len)?;
         if end <= self.bytes.len() {
-            Some(self.bytes[offset..end].as_ptr())
+            // SAFETY: the linear backing lives as long as this memory and is
+            // never unmapped or recycled; the caller holds `&self` only for the
+            // lookup, but no host call outlives the dispatch that owns it.
+            Some(unsafe {
+                carrick_guest_mem::HostRead::retained(
+                    carrick_guest_mem::GuestVa(address),
+                    self.bytes[offset..end].as_ptr(),
+                    len,
+                    None,
+                )
+            })
         } else {
             None
         }

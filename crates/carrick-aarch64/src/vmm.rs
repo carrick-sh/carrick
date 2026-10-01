@@ -1233,11 +1233,14 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         true
     }
 
-    /// Host pointer for a CONTIGUOUS guest range usable for zero-copy host I/O,
-    /// valid IFF the whole `[va, va+len)` is one mapped region (and, for writes,
-    /// guest-writable). `None` ⇒ the caller falls back to `read_bytes`/`write_bytes`.
-    /// Default `None` (KVM uses the identity copy path); HVF resolves its region.
-    fn host_ptr_for_read(&self, _va: u64, _len: usize) -> Option<*const u8> {
+    /// Zero-copy host access to a CONTIGUOUS guest range, valid IFF the whole
+    /// `[va, va+len)` is one mapped region (and, for writes, guest-writable).
+    /// A read source is returned as an admitted [`carrick_guest_mem::HostRead`]
+    /// that retains its backing; a write destination is a request admitted by
+    /// `begin_host_write`. `None` ⇒ the caller falls back to
+    /// `read_bytes`/`write_bytes`. Default `None` (KVM uses the identity copy
+    /// path); HVF resolves and retains its region.
+    fn host_read(&self, _va: u64, _len: usize) -> Option<carrick_guest_mem::HostRead> {
         None
     }
     fn host_ptr_for_write(&mut self, _va: u64, _len: usize) -> Option<*mut u8> {

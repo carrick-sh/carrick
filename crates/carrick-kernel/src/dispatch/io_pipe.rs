@@ -397,6 +397,13 @@ pub(crate) fn read_host_pipe(
 enum HostWritePayload<'a> {
     Borrowed(&'a [u8]),
     Owned(Vec<u8>),
+    /// The first `len` bytes of an admitted guest source, retained for the
+    /// whole call. Read only through raw pointers: never a Rust slice over
+    /// guest memory another vCPU may write.
+    Guest {
+        read: &'a carrick_guest_mem::HostRead,
+        len: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -491,17 +498,48 @@ impl<'a> HostPipeWriteTarget<'a> {
 }
 
 impl<'a> HostWritePayload<'a> {
-    fn as_slice(&self) -> &[u8] {
+    fn len(&self) -> usize {
         match self {
-            HostWritePayload::Borrowed(bytes) => bytes,
-            HostWritePayload::Owned(bytes) => bytes,
+            HostWritePayload::Borrowed(bytes) => bytes.len(),
+            HostWritePayload::Owned(bytes) => bytes.len(),
+            HostWritePayload::Guest { len, .. } => *len,
         }
+    }
+
+    /// Base pointer of the payload, valid for `len()` bytes while `self` lives.
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            HostWritePayload::Borrowed(bytes) => bytes.as_ptr(),
+            HostWritePayload::Owned(bytes) => bytes.as_ptr(),
+            HostWritePayload::Guest { read, .. } => read.as_ptr(),
+        }
+    }
+
+    /// Private copy of the first `dst.len()` bytes (fewer if shorter), for
+    /// content predicates.
+    fn head<'b>(&self, dst: &'b mut [u8]) -> &'b [u8] {
+        let len = dst.len().min(self.len());
+        // SAFETY: `as_ptr` is valid for `len()` bytes; `dst` is private.
+        unsafe { std::ptr::copy_nonoverlapping(self.as_ptr(), dst.as_mut_ptr(), len) };
+        &dst[..len]
+    }
+
+    #[cfg(any(feature = "trace-io", feature = "trace-tty"))]
+    fn trace_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0_u8; self.len()];
+        self.head(&mut bytes);
+        bytes
     }
 
     fn into_owned(self) -> Vec<u8> {
         match self {
             HostWritePayload::Borrowed(bytes) => bytes.to_vec(),
             HostWritePayload::Owned(bytes) => bytes,
+            HostWritePayload::Guest { read, len } => {
+                let mut bytes = vec![0_u8; len];
+                read.copy_into(&mut bytes);
+                bytes
+            }
         }
     }
 }
@@ -543,6 +581,22 @@ pub(crate) fn write_host_pipe(
     target: HostPipeWriteTarget<'_>,
 ) -> Result<DispatchOutcome, super::outcome::DispatchError> {
     write_host_pipe_payload(HostWritePayload::Borrowed(bytes), target)
+}
+
+/// Write the first `len` bytes of an admitted guest source straight from guest
+/// memory; `read` retains its backing for the whole call.
+pub(crate) fn write_host_pipe_guest(
+    read: &carrick_guest_mem::HostRead,
+    len: usize,
+    target: HostPipeWriteTarget<'_>,
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
+    write_host_pipe_payload(
+        HostWritePayload::Guest {
+            read,
+            len: len.min(read.len()),
+        },
+        target,
+    )
 }
 
 pub(crate) fn write_host_pipe_owned(
@@ -605,23 +659,25 @@ fn write_host_pipe_payload(
     // per cold `go build` — so it goes to the lock-free ring only. Logging it
     // would be debug spam on a healthy run, and the per-write cost is what
     // made `trace-io` perturb this bug out of existence.
-    if crate::event_ring::payload_starts_at_ar_magic(payload.as_slice()) {
+    let mut head_buf = [0_u8; 64];
+    let head = payload.head(&mut head_buf);
+    if crate::event_ring::payload_starts_at_ar_magic(head) {
         let offset = fs::host_fd_offset(HostFd(host_fd)).map_or(-1, |offset| offset as u32 as i32);
         crate::event_ring::rec(
             crate::event_ring::ARMAGIC,
             host_fd,
             offset,
-            payload.as_slice().len() as u32 as i32,
+            payload.len() as u32 as i32,
         );
-        note_ar_magic_write(host_fd, payload.as_slice().len());
+        note_ar_magic_write(host_fd, payload.len());
     }
-    if crate::event_ring::payload_starts_at_ar_member_header(payload.as_slice()) {
+    if crate::event_ring::payload_starts_at_ar_member_header(head) {
         let offset = fs::host_fd_offset(HostFd(host_fd));
         crate::event_ring::rec(
             crate::event_ring::ARWRITE,
             host_fd,
             offset.map_or(-1, |offset| offset as u32 as i32),
-            payload.as_slice().len() as u32 as i32,
+            payload.len() as u32 as i32,
         );
         // Offset 0 means the archive magic is being skipped: the file will not
         // be a valid `ar` archive. Report it once, at the moment it happens.
@@ -637,7 +693,7 @@ fn write_host_pipe_payload(
             tracing::error!(
                 target: "carrick::dispatch::fs",
                 host_fd,
-                length = payload.as_slice().len(),
+                length = payload.len(),
                 ?prior_magic,
                 "ar member header written at offset 0; the archive will lack its magic"
             );
@@ -645,8 +701,8 @@ fn write_host_pipe_payload(
     }
 
     #[cfg(feature = "trace-io")]
-    if !payload.as_slice().is_empty() {
-        let bytes = payload.as_slice();
+    if payload.len() != 0 {
+        let bytes = payload.trace_bytes();
         // Offset the write will START at, captured before it advances the
         // description. A buffer beginning with an `ar` member header is normal
         // at a nonzero offset and corrupt at 0.
@@ -668,7 +724,7 @@ fn write_host_pipe_payload(
     let mut offset = 0usize;
     loop {
         #[cfg(feature = "trace-tty")]
-        if payload.as_slice().contains(&0x0a) {
+        if payload.trace_bytes().contains(&0x0a) {
             unsafe {
                 let isatty = libc::isatty(host_fd);
                 let mut t: libc::termios = core::mem::zeroed();
@@ -681,7 +737,7 @@ fn write_host_pipe_payload(
                 let oflag = t.c_oflag;
                 let lflag = t.c_lflag;
                 let rdev = st.st_rdev;
-                let blen = payload.as_slice().len();
+                let blen = payload.len();
                 eprintln!(
                     "[TTYDBG-PRE] host_fd={host_fd} isatty={isatty} tg={tg} oflag=0x{oflag:x} lflag=0x{lflag:x} outq={outq} flags=0x{fl:x} rdev={rdev} n={blen}"
                 );
@@ -692,8 +748,8 @@ fn write_host_pipe_payload(
         // dispatcher lock released. BLOCKING-IO-OK: non-blocking by
         // construction, the lock is never held across a blocking write.
         let n = {
-            let bytes = payload.as_slice();
-            let mut len = bytes.len() - offset;
+            let base = payload.as_ptr();
+            let mut len = payload.len() - offset;
             if write_kind == HostWriteKind::PipeLike
                 && let Some((capacity, queued)) = pipe_state
                 && let Some(room) = host_pipe_write_room(capacity, queued.saturating_add(offset))
@@ -755,11 +811,7 @@ fn write_host_pipe_payload(
                                 if is_append {
                                     let saved = libc::lseek(host_fd, 0, libc::SEEK_CUR);
                                     libc::lseek(host_fd, 0, libc::SEEK_END);
-                                    let w = libc::write(
-                                        host_fd,
-                                        bytes[offset..].as_ptr() as *const _,
-                                        len,
-                                    );
+                                    let w = libc::write(host_fd, base.add(offset) as *const _, len);
                                     if saved >= 0 {
                                         libc::lseek(host_fd, saved, libc::SEEK_SET);
                                     }
@@ -767,13 +819,13 @@ fn write_host_pipe_payload(
                                 } else {
                                     libc::pwrite(
                                         host_fd,
-                                        bytes[offset..].as_ptr() as *const _,
+                                        base.add(offset) as *const _,
                                         len,
                                         (off + offset as i64) as libc::off_t,
                                     )
                                 }
                             }
-                            None => libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len),
+                            None => libc::write(host_fd, base.add(offset) as *const _, len),
                         }
                     };
                     if n > 0 {
@@ -792,11 +844,7 @@ fn write_host_pipe_payload(
                                 if is_append {
                                     let saved = libc::lseek(host_fd, 0, libc::SEEK_CUR);
                                     libc::lseek(host_fd, 0, libc::SEEK_END);
-                                    let w = libc::write(
-                                        host_fd,
-                                        bytes[offset..].as_ptr() as *const _,
-                                        len,
-                                    );
+                                    let w = libc::write(host_fd, base.add(offset) as *const _, len);
                                     if saved >= 0 {
                                         libc::lseek(host_fd, saved, libc::SEEK_SET);
                                     }
@@ -804,13 +852,13 @@ fn write_host_pipe_payload(
                                 } else {
                                     libc::pwrite(
                                         host_fd,
-                                        bytes[offset..].as_ptr() as *const _,
+                                        base.add(offset) as *const _,
                                         len,
                                         (off + offset as i64) as libc::off_t,
                                     )
                                 }
                             }
-                            None => libc::write(host_fd, bytes[offset..].as_ptr() as *const _, len),
+                            None => libc::write(host_fd, base.add(offset) as *const _, len),
                         }
                     }
                 }
@@ -826,7 +874,7 @@ fn write_host_pipe_payload(
             n
         };
         #[cfg(feature = "trace-tty")]
-        if payload.as_slice().contains(&0x0a) {
+        if payload.trace_bytes().contains(&0x0a) {
             unsafe {
                 let mut outq: libc::c_int = -1;
                 libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);
@@ -862,7 +910,8 @@ fn write_host_pipe_payload(
                     && write_kind != HostWriteKind::RegularFile
                     && let Some(result) = try_small_nonblocking_write(
                         host_fd,
-                        payload.as_slice(),
+                        payload.as_ptr(),
+                        payload.len(),
                         socket_flow.as_ref(),
                         socket_cred,
                         is_stream,
@@ -902,7 +951,7 @@ fn write_host_pipe_payload(
         }
         if block_until_complete {
             offset += n as usize;
-            if offset < payload.as_slice().len() {
+            if offset < payload.len() {
                 // A signal that arrives mid-write interrupts it on Linux,
                 // returning the partial count; check between chunks so a long
                 // write doesn't ignore an armed alarm (or a pending quiesce).
@@ -925,9 +974,7 @@ fn write_host_pipe_payload(
                 }
                 continue;
             }
-            return Ok(DispatchOutcome::returned_len_or_errno(
-                payload.as_slice().len(),
-            ));
+            return Ok(DispatchOutcome::returned_len_or_errno(payload.len()));
         }
         return Ok(DispatchOutcome::returned_isize_or_errno(n));
     }
@@ -948,18 +995,19 @@ mod host_wait_policy_tests {
 
 fn try_small_nonblocking_write(
     host_fd: i32,
-    bytes: &[u8],
+    base: *const u8,
+    total: usize,
     socket_flow: Option<&Arc<crate::kernel::UnixFlow>>,
     socket_cred: Option<crate::kernel::SocketPeerCred>,
     is_stream: bool,
 ) -> Option<Result<usize, LinuxErrno>> {
-    if bytes.len() <= 1 {
+    if total <= 1 {
         return None;
     }
     const RETRIES: [usize; 6] = [16 * 1024, 4 * 1024, 1024, 256, 64, 1];
     for cap in RETRIES {
-        let len = bytes.len().min(cap);
-        if len == 0 || len == bytes.len() {
+        let len = total.min(cap);
+        if len == 0 || len == total {
             continue;
         }
         // BLOCKING-IO-OK: this path is reached only after a prior write to the
@@ -968,7 +1016,7 @@ fn try_small_nonblocking_write(
         // block — the loop treats EAGAIN as "retry a smaller chunk".
         let n = if let (Some(flow), Some(cred)) = (socket_flow, socket_cred) {
             let mut ledger = flow.lock_ledger();
-            let n = unsafe { libc::write(host_fd, bytes.as_ptr().cast(), len) };
+            let n = unsafe { libc::write(host_fd, base.cast(), len) };
             if n > 0 {
                 if is_stream {
                     ledger.push_stream(n as usize, cred);
@@ -979,7 +1027,7 @@ fn try_small_nonblocking_write(
             drop(ledger);
             n
         } else {
-            unsafe { libc::write(host_fd, bytes.as_ptr().cast(), len) }
+            unsafe { libc::write(host_fd, base.cast(), len) }
         };
         match n.host_syscall_errno() {
             Ok(value) if value > 0 => return Some(Ok(value as usize)),
