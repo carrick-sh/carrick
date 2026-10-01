@@ -304,6 +304,21 @@ impl El1FrameGrantStats {
     }
 }
 
+/// Every EL1 frame grant of the published carrier whose exact return is still
+/// outstanding: its owner's IPA extent, the granting MM, whether its
+/// retirement is pending (and why), and its stage-2 record's pins. Empty when
+/// every grant returned. A diagnostic for return-balance witnesses.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn el1_frame_grant_unreturned() -> Vec<String> {
+    let carrier = persistent_carrier_cell().lock();
+    match carrier.as_ref() {
+        Some(PersistentCarrierCellEntry::Published(carrier)) => {
+            global_frame::unreturned_el1_grant_census(&carrier.carrier_foreign_mm_transport.custody)
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Snapshot only the currently published carrier; absence is incomplete.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
