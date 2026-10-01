@@ -721,6 +721,10 @@ impl ArmedSpanCandidate {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CowArmedRanges {
     pub(crate) ranges: Vec<carrick_aarch64::vmm::ForkCowRange>,
+    /// Advances on every non-empty [`Self::arm`] and never moves back (a
+    /// [`Self::restore`] rolls back the ranges, not the fact that an arm
+    /// write-protected leaves in between).
+    generation: carrick_hal::CowArmGeneration,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -732,6 +736,7 @@ impl CowArmedRanges {
         if ranges.is_empty() {
             return;
         }
+        self.generation = self.generation.next();
         if !self.ranges.is_empty() {
             self.ranges.retain(|old| {
                 !ranges.iter().any(|r| {
@@ -743,6 +748,11 @@ impl CowArmedRanges {
         self.ranges.extend_from_slice(ranges);
         self.ranges.sort_by_key(|range| (range.va, range.len));
         self.ranges.dedup();
+    }
+
+    /// The arm generation a COW resolution completes under.
+    pub(crate) fn generation(&self) -> carrick_hal::CowArmGeneration {
+        self.generation
     }
 
     pub(crate) fn snapshot(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {

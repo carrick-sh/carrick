@@ -61,12 +61,12 @@ pub use futex::{
 };
 pub mod threaded;
 pub use threaded::{
-    Aarch64CoreRegisters, CowFaultResolution, El1FrameGrantReady, El1FrameGrantRequest,
-    ExecPredecessorIdentity, ForkLeafDisposition, ForkProjectionError, ForkProjectionPlan,
-    ForkProjectionRange, FrameBackingAuthentication, FrameCowAuthority, FrameCowIdentity,
-    FrameCowOwnerInventory, FrameCowOwnerLease, FrameCowQuiesce, FutexOutcome, GenericVcpuRegistry,
-    GuestEntryRegs, GuestLeaveWake, GuestLeaveWatch, GuestWaitRegisters, HostVa,
-    HvpatchChildKernelToken, HvpatchChildTokenIssuer, HvpatchChildTokenVerifier,
+    Aarch64CoreRegisters, CowArmGeneration, CowFaultResolution, El1FrameGrantReady,
+    El1FrameGrantRequest, ExecPredecessorIdentity, ForkLeafDisposition, ForkProjectionError,
+    ForkProjectionPlan, ForkProjectionRange, FrameBackingAuthentication, FrameCowAuthority,
+    FrameCowIdentity, FrameCowOwnerInventory, FrameCowOwnerLease, FrameCowQuiesce, FutexOutcome,
+    GenericVcpuRegistry, GuestEntryRegs, GuestLeaveWake, GuestLeaveWatch, GuestWaitRegisters,
+    HostVa, HvpatchChildKernelToken, HvpatchChildTokenIssuer, HvpatchChildTokenVerifier,
     HvpatchVerifiedChildKernelBinding, InGuestFlag, PlatformFutex, ProcessForkRequest, RegAccess,
     SharedFutexLocation, SignalPumpControl, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn,
     VcpuLeaseChangeSubscription, VcpuLeaseDrainEnrollment, VcpuLeaseDrainGuard, VcpuLeaseDrainPoll,
