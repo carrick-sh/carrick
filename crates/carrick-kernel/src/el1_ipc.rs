@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use carrick_el1_abi::ipc::{
     HostResourceToken, IPC_DIRECTORY_BYTES, IPC_MAX_OBJECTS, IPC_MAX_OFDS, IPC_OBJECT_SEGMENT,
     IPC_OFD_SEGMENT, IPC_PIPE_PAGE_SIZE, IPC_POOL_ALIGN, IPC_POOL_AREAS, IPC_STOCK_RING_BYTES,
-    IpcDirectory, IpcError, IpcObjectHandle, IpcPipeStorage, IpcRegion, IpcReleased,
+    IpcDirectory, IpcError, IpcObjectHandle, IpcPipeStorage, IpcRegion, IpcReleased, IpcWake,
     descriptor_extent_bytes, fd, ipc_descriptor_area, ipc_ring_area, pipe,
 };
 use parking_lot::Mutex;
@@ -284,6 +284,19 @@ impl HostDescriptionFlags {
             | (u64::from(flags.append) * carrick_abi::LINUX_O_APPEND)
             | (u64::from(flags.nonblock) * carrick_abi::LINUX_O_NONBLOCK)
             | (u64::from(flags.asynchronous) * carrick_abi::LINUX_O_ASYNC)
+    }
+
+    /// The shared open file description's identity (index and generation,
+    /// packed), the epoll item key of the open file this view describes.
+    /// `None` once retired.
+    pub(crate) fn ofd_key(&self) -> Option<u64> {
+        match &*self.state.lock() {
+            HostDescriptionState::Live(pin) => {
+                let key = pin.key();
+                Some((u64::from(key.index) << 32) | (key.generation & u64::from(u32::MAX)))
+            }
+            HostDescriptionState::Retired(_) => None,
+        }
     }
 
     pub(crate) fn set_linux_flags(&self, value: u64) {
@@ -632,6 +645,19 @@ impl HostIpc {
         true
     }
 
+    /// Deliver every host wake a publication owed: the object's own (its
+    /// host subscribers), and each zone epoll's it queued an item on (that
+    /// epoll's host-side waiters). Each is consumed only where owed.
+    pub fn service_wake(&self, wake: &IpcWake) {
+        if !wake.host_owed {
+            return;
+        }
+        self.service_host_wake(wake.object);
+        for epoll in wake.epolls.iter() {
+            self.service_host_wake(epoll);
+        }
+    }
+
     /// The live delivery target registered for exactly `object`'s
     /// incarnation, held strongly so it outlives the consumption it justifies.
     fn host_wake_target(&self, object: IpcObjectHandle) -> Option<HostWakeDelivery> {
@@ -795,6 +821,14 @@ impl HostIpc {
         Ok(object)
     }
 
+    /// A zone epoll record ([`carrick_el1_abi::ipc::epoll`]) with an empty
+    /// interest list. Its `Readable` wait key is bound like an object's.
+    pub fn create_epoll(&self) -> Result<IpcObjectHandle, AdmissionError> {
+        let object = self.with_object(|region| region.create_epoll(&HostLockWait))?;
+        self.bind_waits(object);
+        Ok(object)
+    }
+
     pub(crate) fn resize_pipe(
         &self,
         object: IpcObjectHandle,
@@ -937,9 +971,7 @@ impl HostIpc {
                 drop(guard);
                 delivery.deliver();
             }
-            if wake.host_owed {
-                self.service_host_wake(wake.object);
-            }
+            self.service_wake(&wake);
         }
         if let IpcReleased::Host(token) = released {
             let resource = self

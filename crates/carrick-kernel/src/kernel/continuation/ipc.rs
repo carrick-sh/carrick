@@ -20,7 +20,9 @@ use carrick_abi::{LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EPIPE, LinuxErr
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{PrefixCopy, StepStatus, transfer};
 pub use carrick_el1::substrate::ipc::{from_sched_token, to_sched_token, wait_key};
-use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
+use carrick_el1_abi::ipc::pipe::WaitFor;
+#[cfg(test)]
+use carrick_el1_abi::ipc::pipe::WakeSet;
 use carrick_el1_abi::ipc::{
     IpcError, IpcHandback, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
     IpcRegion, IpcReleased, IpcWake, OfdPin, RawIpcOpToken,
@@ -82,21 +84,22 @@ impl IpcHostServices for ZoneHostServices {
     fn wake(&self, wake: IpcWake) {
         // The owed host wake goes through the same owner delivery as a
         // host-side pipe/eventfd change (`service_host_wake`).
-        if wake.host_owed {
-            self.owner.service_host_wake(wake.object);
-        }
-        let object = wake.object;
-        let lanes = WakeSet {
-            readers: wake.readers,
-            writers: wake.writers,
-        };
+        self.owner.service_wake(&wake);
         let Some(zone) = crate::el1_zone::zone() else {
             return;
         };
-        for (lane, due) in [
-            (WaitFor::Readable, lanes.readers),
-            (WaitFor::Writable, lanes.writers),
-        ] {
+        // The object's own lanes, then each zone epoll it queued items on.
+        let lanes = [
+            (wake.object, WaitFor::Readable, wake.readers),
+            (wake.object, WaitFor::Writable, wake.writers),
+        ]
+        .into_iter()
+        .chain(
+            wake.epolls
+                .iter()
+                .map(|epoll| (epoll, WaitFor::Readable, true)),
+        );
+        for (object, lane, due) in lanes {
             let Some(key) = due.then(|| wait_key(object, lane)).flatten() else {
                 continue;
             };
@@ -269,7 +272,7 @@ pub fn finish(
                     freed: false,
                 } => wake.wake(w),
                 IpcReleased::Host(token) => wake.release_host(token)?,
-                IpcReleased::Object { freed: true, .. } => {}
+                IpcReleased::Object { freed: true, .. } | IpcReleased::Epoll => {}
             }
         }
     }

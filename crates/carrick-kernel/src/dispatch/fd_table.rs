@@ -161,6 +161,17 @@ pub(crate) struct EventFdState {
     pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 impl EventFdState {
+    /// This eventfd as a zone epoll member (its object and its OFD's
+    /// identity), while its description is live.
+    pub(crate) fn zone_member(&self) -> Option<crate::dispatch::net::epoll_zone::ZoneMember> {
+        let file_key = self.lifetime.lock().as_ref()?.flags().ofd_key()?;
+        Some(crate::dispatch::net::epoll_zone::ZoneMember {
+            owner: Arc::clone(&self.owner),
+            object: self.object,
+            kind: carrick_el1_abi::ipc::epoll::EpollMember::EventFd,
+            file_key,
+        })
+    }
     /// The reader-wake sequence of this eventfd incarnation (see
     /// `PipeInner::read_arrival_generation`). `None` once retired.
     pub(crate) fn read_arrival_generation(&self) -> Option<u64> {
@@ -241,9 +252,7 @@ impl EventFdState {
         delivery.collect(wake);
         drop(guard);
         delivery.deliver();
-        if wake.host_owed {
-            self.owner.service_host_wake(self.object);
-        }
+        self.owner.service_wake(&wake);
         step.result.map_err(|error| match error {
             carrick_el1_abi::ipc::pipe::Error::WouldBlock(_) => carrick_abi::LINUX_EAGAIN,
             carrick_el1_abi::ipc::pipe::Error::Fault => carrick_abi::LINUX_EFAULT,
@@ -1427,6 +1436,11 @@ pub(crate) enum OpenDescription {
         /// Wait queue embedded in this epoll instance so that waiters (via poll/ppoll WaitSet)
         /// and nested parent epoll instances are notified when any registered target becomes ready.
         wait_queue: Arc<crate::kernel::WaitQueue>,
+        /// The shared zone record: the one authority for every item whose
+        /// member is an IPC object (eventfd, pipe end), which never enters
+        /// `interest`. `None` without an IPC authority (every item is then
+        /// in `interest`). See `dispatch::net::epoll_zone`.
+        zone: Option<Arc<crate::dispatch::net::epoll_zone::ZoneEpoll>>,
     },
     /// A Linux pidfd referring to a process. Mirrored-process backends watch a
     /// host process through `EVFILT_PROC`/native pidfd. HvPatch instead arms an
@@ -2098,6 +2112,22 @@ impl WaitQueueKind {
 }
 
 impl OpenDescription {
+    /// This description as a zone epoll member: an eventfd or a pipe end,
+    /// with its OFD's identity (the epoll item's file). `None` for every
+    /// other kind, whose epoll items live in the host half.
+    pub(crate) fn zone_epoll_member(&self) -> Option<crate::dispatch::net::epoll_zone::ZoneMember> {
+        match self {
+            OpenDescription::EventFd { state, .. } => state.zone_member(),
+            OpenDescription::PipeReader { pipe, .. } => {
+                pipe.zone_member(carrick_el1_abi::ipc::pipe::End::Reader)
+            }
+            OpenDescription::PipeWriter { pipe, .. } => {
+                pipe.zone_member(carrick_el1_abi::ipc::pipe::End::Writer)
+            }
+            _ => None,
+        }
+    }
+
     /// The host fd whose inode a guest file mapping may alias live: a host
     /// regular file, or a memfd whose bytes live in an unlinked host file.
     /// In-memory contents have no host object and take the snapshot path.
@@ -2482,6 +2512,9 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::PipeWriter { pipe, .. } => {
                 pipe.endpoint_status_flags(carrick_el1_abi::ipc::pipe::End::Writer)
             }
+            OpenDescription::Epoll {
+                zone: Some(zone), ..
+            } => zone.status_flags(),
             _ => None,
         }
     }
@@ -2495,6 +2528,15 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             &*self.read(),
             OpenDescription::Epoll { .. } | OpenDescription::Closed { was_epoll: true }
         )
+    }
+
+    fn epoll_zone_items(&self) -> usize {
+        match &*self.read() {
+            OpenDescription::Epoll {
+                zone: Some(zone), ..
+            } => zone.zone_items(),
+            _ => 0,
+        }
     }
 
     fn epoll_targets(&self) -> Option<Vec<std::sync::Arc<crate::kernel::FileDescription>>> {
@@ -2649,6 +2691,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 synthetic_interest_count,
                 pending_ready,
                 kqueue,
+                zone,
                 ..
             } => {
                 if !interest.intersects(
@@ -2656,7 +2699,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 ) {
                     return LinuxEpollEvents::empty();
                 }
-                if !pending_ready.is_empty() {
+                if !pending_ready.is_empty() || zone.as_ref().is_some_and(|zone| zone.ready()) {
                     return LinuxEpollEvents::IN
                         & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP);
                 }
@@ -3018,6 +3061,12 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
     }
     fn on_last_fd_ref(&self) {
         let mut description = self.write();
+        // `man 7 epoll`: the open file's last descriptor removes its items
+        // from every epoll interest list (zone half; the host half detaches
+        // through `detach_description_from_all_epolls`).
+        if let Some(member) = description.zone_epoll_member() {
+            crate::dispatch::net::epoll_zone::detach_member_file(&member);
+        }
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
                 pipe.release_endpoint(carrick_el1_abi::ipc::pipe::End::Reader)
@@ -3026,6 +3075,12 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 pipe.release_endpoint(carrick_el1_abi::ipc::pipe::End::Writer)
             }
             OpenDescription::EventFd { state, .. } => state.close(),
+            OpenDescription::Epoll {
+                zone: Some(zone), ..
+            } => {
+                zone.close();
+                return;
+            }
             _ => return,
         }
         // Retire IPC backing and its host observation atomically under the

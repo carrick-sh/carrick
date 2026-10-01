@@ -48,14 +48,22 @@ impl ObjectWakeDelivery {
         let Some(zone) = zone() else {
             return;
         };
-        for (active, direction) in [
+        // The object's own lanes, then the readable lane of every zone
+        // epoll the change queued an item on.
+        let lanes = [
             (wake.readers, carrick_el1_abi::ipc::pipe::WaitFor::Readable),
             (wake.writers, carrick_el1_abi::ipc::pipe::WaitFor::Writable),
-        ] {
-            if !active {
-                continue;
-            }
-            let Some(key) = carrick_el1_abi::ipc::object_wait_key(wake.object, direction) else {
+        ]
+        .into_iter()
+        .filter(|(active, _)| *active)
+        .map(|(_, direction)| (wake.object, direction))
+        .chain(
+            wake.epolls
+                .iter()
+                .map(|epoll| (epoll, carrick_el1_abi::ipc::pipe::WaitFor::Readable)),
+        );
+        for (object, direction) in lanes {
+            let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, direction) else {
                 continue;
             };
             let Ok(queue) = zone.object_wait(key, &HostLockWait) else {

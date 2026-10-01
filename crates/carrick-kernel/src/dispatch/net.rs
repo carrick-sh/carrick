@@ -262,6 +262,7 @@ pub(super) fn host_socket_is_connected(host_fd: i32) -> bool {
     rc == 0
 }
 pub(super) mod epoll_ops;
+pub(crate) mod epoll_zone;
 #[cfg(test)]
 use epoll_ops::epoll_kqueue_for_wake_test;
 pub(in crate::dispatch) use epoll_ops::{IoRearm, WriteRearm};
@@ -676,6 +677,19 @@ impl<'a> NetView<'a> {
                     None => described(),
                 },
                 OpenDescription::EventFd { .. } => described(),
+                // A zone epoll's kqueue is not a complete mirror: a zone
+                // member's change reaches it only while a host-side waiter
+                // is subscribed (the enrollment this wait makes), so the
+                // description is probed after enrollment (contract
+                // kernel.el1.epoll-zone).
+                OpenDescription::Epoll {
+                    kqueue,
+                    zone: Some(_),
+                    ..
+                } => proxied(
+                    HostWaitTarget::new(HostFd(kqueue.poll_fd()), LinuxPollEvents::IN),
+                    HostProxyCoverage::HostPeersOnly,
+                ),
                 OpenDescription::Epoll { kqueue, .. } => readiness(kqueue.poll_fd()),
                 OpenDescription::Pidfd { kqueue, .. } => direct(kqueue.poll_fd()),
                 // An in-zone instance's host fd is a wake source only: EL1
@@ -1205,6 +1219,7 @@ mod netlink_readiness_tests {
                     crate::dispatch::new_epoll_wake_registry(),
                 )),
                 wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+                zone: None,
             })),
             0,
             0,
@@ -1282,6 +1297,7 @@ mod netlink_readiness_tests {
                     crate::dispatch::new_epoll_wake_registry(),
                 )),
                 wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+                zone: None,
             })),
             0,
             0,
@@ -1336,6 +1352,7 @@ mod netlink_readiness_tests {
                         crate::dispatch::new_epoll_wake_registry(),
                     )),
                     wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+                    zone: None,
                 })),
                 0,
                 0,
@@ -1463,6 +1480,7 @@ mod netlink_readiness_tests {
                     crate::dispatch::new_epoll_wake_registry(),
                 )),
                 wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+                zone: None,
             })),
             0,
             0,
@@ -1616,6 +1634,7 @@ mod netlink_readiness_tests {
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::clone(&epoll_kqueue),
                 wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+                zone: None,
             })),
             0,
             0,
@@ -1723,6 +1742,7 @@ mod netlink_readiness_tests {
                 crate::dispatch::new_epoll_wake_registry(),
             )),
             wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+            zone: None,
         }));
         let epoll_open_file =
             OpenFile::from_open_description_with_status_flags(Arc::clone(&epoll_backing), 0, 0);
@@ -1782,6 +1802,7 @@ mod netlink_readiness_tests {
                 crate::dispatch::new_epoll_wake_registry(),
             )),
             wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+            zone: None,
         }));
         let epoll_open_file =
             OpenFile::from_open_description_with_status_flags(Arc::clone(&epoll_backing), 0, 0);
@@ -1981,6 +2002,7 @@ mod netlink_readiness_tests {
                         crate::dispatch::new_epoll_wake_registry(),
                     )),
                     wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+                    zone: None,
                 })),
                 0,
                 0,
