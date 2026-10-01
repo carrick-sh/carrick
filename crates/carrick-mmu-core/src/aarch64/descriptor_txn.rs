@@ -2633,7 +2633,14 @@ where
                 tables_linked: u8::try_from(tables_linked).unwrap_or(u8::MAX),
                 reclaimed,
                 live_stores: u32::try_from(stored).unwrap_or(u32::MAX),
-                flush_required: stored != 0,
+                // A TLB caches only valid descriptors: only a store over a
+                // valid one (changed, removed or split) leaves a stale
+                // translation to invalidate. Making an invalid descriptor
+                // valid, the first touch, needs none.
+                flush_required: journal
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.before & VALID != 0),
             })
         }
         Err(refusal) => {
@@ -4300,6 +4307,40 @@ mod tests {
                     (destination + index as u64 * PT_PAGE) | expected
                 );
             }
+        }
+
+        /// A receipt requires the ASID invalidation exactly when a store
+        /// replaced a valid descriptor: a TLB caches only valid ones.
+        /// Publishing a prepared page (invalid -> valid) leaves nothing
+        /// stale; arming that resident page for COW (valid -> read-only)
+        /// does.
+        #[test]
+        fn flush_is_required_exactly_when_a_valid_descriptor_is_replaced() {
+            let words = fixture(3);
+            let first_touch = applied(run(
+                &words,
+                prepare(4, PageSpan::new(VA, PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            assert!(first_touch.live_stores > 0);
+            assert!(!first_touch.flush_required, "invalid -> valid");
+            let publish = applied(run(
+                &words,
+                DescriptorOp::Publish {
+                    span: PageSpan::new(VA + PT_PAGE, PT_PAGE),
+                    expected_ipa: SubstrateGpa(IPA + PT_PAGE),
+                    access: LeafAccess::Read,
+                },
+                &TableGrants::NONE,
+            ));
+            assert!(publish.live_stores > 0);
+            assert!(!publish.flush_required, "prepared -> resident");
+            let retire = applied(run(
+                &words,
+                DescriptorOp::Retire(PageSpan::new(VA, PT_PAGE)),
+                &TableGrants::NONE,
+            ));
+            assert!(retire.flush_required, "valid -> retired");
         }
 
         /// The host's COW span keeps a page with no leaf at all (an untouched
