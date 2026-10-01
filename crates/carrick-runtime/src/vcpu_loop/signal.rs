@@ -898,15 +898,15 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
                 let current = plan
                     .as_ref()
                     .map(|plan| (plan.start(), plan.len(), plan.prot()));
-                // A sibling's adjacent mapping may have merged into the
-                // armed extent while EL1 held the transaction: the published
-                // span is still armed and settles; a span that lost its
-                // arming or protection fails stopped.
+                // The arming may have moved while EL1 held the transaction
+                // (an adjacent mapping merged, a sibling committed other
+                // pages); only the faulting page commits, so it settles while
+                // that page is still armed with the published protection.
                 let plan = plan
                     .filter(|plan| plan.covers_published(pending.plan))
                     .ok_or_else(|| {
                         TrapError::Hypervisor(format!(
-                            "EL1 published grant {:?} but its first-touch span lost its arming: \
+                            "EL1 published grant {:?} but its faulting page lost its arming: \
                              fault 0x{:x}, published {:x?}, now {:x?}",
                             pending.txn.id, pending.fault_va, pending.plan, current
                         ))

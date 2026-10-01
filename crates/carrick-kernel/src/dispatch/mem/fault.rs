@@ -747,20 +747,18 @@ impl ResidentFrameGrantPlan<'_> {
         self.prot
     }
 
-    /// Whether a grant published earlier for `(start, len, prot)` is still
-    /// wholly first-touch armed with the same protection. The arming may
-    /// have grown since (an adjacent mapping merged into the extent while
-    /// EL1 held the transaction); the published span stays valid and only
-    /// its faulting page commits. A shrunk or reprotected span does not.
+    /// Whether a grant published earlier for `(start, len, prot)` may
+    /// commit this plan's faulting page. Settlement commits only that page,
+    /// so it needs that page still armed (this plan exists) with the
+    /// published protection, inside the published span. The rest of the
+    /// arming may have moved while EL1 held the transaction: an adjacent
+    /// mapping merged into the extent, or a sibling's first touch committed
+    /// other pages of the span. A reprotected arming does not settle.
     pub fn covers_published(&self, (start, len, prot): (u64, u64, u64)) -> bool {
         let Some(end) = start.checked_add(len) else {
             return false;
         };
-        prot == self.prot
-            && len != 0
-            && self.start <= start
-            && end <= self.start.saturating_add(self.len)
-            && (start..end).contains(&self.fault_page)
+        prot == self.prot && (start..end).contains(&self.fault_page)
     }
 }
 
