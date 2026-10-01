@@ -638,6 +638,295 @@ impl std::ops::Deref for AliasScopeBucket {
     }
 }
 
+/// The operation that mutated the carrier alias registry. Every write lock
+/// names one (`alias_registry_write`), so a transaction that planned against
+/// one registry view and committed against another can name the writer that
+/// changed it instead of reporting only the difference.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AliasRegistryWriter {
+    /// A plain `alias_registry().lock()` mutated rows. Any log entry with
+    /// this writer is itself a defect: the site bypassed attribution.
+    #[default]
+    Unattributed,
+    /// Exact process-alias retirement committing its own plan.
+    ProcessAliasRetirement,
+    /// Non-persistent (legacy) unmap that retires without a plan.
+    LegacyProcessAliasUnmap,
+    /// `register_shared_alias`: fault, COW, grant, fork or foreign publication.
+    SharedAliasRegistration,
+    /// Carrier task-state publication of a prepared task's pending aliases.
+    TaskReceiptPublication,
+    /// Exact retirement of a task-state publication receipt.
+    TaskReceiptRetirement,
+    /// Process-exit retirement of an owned scope and its global rows.
+    ProcessExitRetirement,
+    /// Generic external mutation (`mutate_external_alias_state`).
+    ExternalMutation,
+    /// Bounded external mutation (`mutate_known_external_alias_state`).
+    KnownExternalMutation,
+    /// Fork-time pruning of superseded COW shadow rows.
+    ForkShadowPrune,
+    /// Exec reset of the whole registry.
+    ExecveClear,
+}
+
+/// The address space on whose behalf a writer mutated the registry, when
+/// the writer knows it. A writer may change rows of scopes it does not own
+/// (a retired physical projection removes every scope's rows of it).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AliasWriterActor {
+    #[default]
+    Unknown,
+    Mm {
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    },
+}
+
+/// One row-changing registry mutation: the scope it changed, that scope's
+/// revision after the change, and who made it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AliasRegistryMutation {
+    pub(crate) scope: AliasOwnershipScope,
+    pub(crate) scope_revision: u64,
+    pub(crate) writer: AliasRegistryWriter,
+    pub(crate) actor: AliasWriterActor,
+    pub(crate) site: Option<&'static std::panic::Location<'static>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Display for AliasRegistryMutation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scope = |scope: AliasOwnershipScope| match scope {
+            AliasOwnershipScope::MmRootSlot { base, .. } => format!("mm{base:x}"),
+            AliasOwnershipScope::ContainerRoot(token) => format!("ct{}", token.raw()),
+            AliasOwnershipScope::Global => "global".to_owned(),
+        };
+        let actor = match self.actor {
+            AliasWriterActor::Unknown => "?".to_owned(),
+            AliasWriterActor::Mm {
+                mm_root_slot: Some((base, _)),
+                ..
+            } => format!("mm{base:x}"),
+            AliasWriterActor::Mm { container_root, .. } => format!("ct{}", container_root.raw()),
+        };
+        write!(
+            f,
+            "{:?}@{}#{} by {actor}",
+            self.writer,
+            scope(self.scope),
+            self.scope_revision
+        )?;
+        if let Some(site) = self.site {
+            let file = site.file().rsplit('/').next().unwrap_or(site.file());
+            write!(f, "({file}:{})", site.line())?;
+        }
+        Ok(())
+    }
+}
+
+/// Bounded history of registry mutations, oldest first. It is written only
+/// under the registry lock, so its order is the mutation order.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AliasRegistryMutationLog {
+    entries: std::collections::VecDeque<AliasRegistryMutation>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AliasRegistryMutationLog {
+    pub(crate) const CAPACITY: usize = 256;
+
+    fn push(&mut self, mutation: AliasRegistryMutation) {
+        if self.entries.len() == Self::CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(mutation);
+    }
+
+    /// Mutations of `scope` made after it stood at `revision`, and whether
+    /// the log still reaches back to that revision.
+    pub(crate) fn since(
+        &self,
+        scope: AliasOwnershipScope,
+        revision: u64,
+    ) -> (Vec<AliasRegistryMutation>, bool) {
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.scope == scope && entry.scope_revision > revision)
+            .copied()
+            .collect();
+        let complete = entries
+            .first()
+            .is_none_or(|first| first.scope_revision == revision.saturating_add(1));
+        (entries, complete)
+    }
+}
+
+/// A process-alias retirement plan as the commit re-authenticates it: the
+/// leases it retires, the process-visible scope revisions it read, and how
+/// many visible rows co-held the window's physical extents.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AliasUnmapPlanAuthority<'plan> {
+    pub(crate) planned_leases: &'plan std::collections::BTreeSet<(u64, u64)>,
+    pub(crate) visible_revisions: Option<AliasVisibleRevisions>,
+}
+
+/// What a commit found when it re-authenticated a plan under the registry
+/// lock.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AliasUnmapCommit {
+    /// The rows were retired; these are the leases that left the process.
+    Retired(std::collections::BTreeSet<(u64, u64)>),
+    /// A writer outside the plan's MM guard changed the window's lease set
+    /// between plan and commit. Nothing was mutated: the caller restarts the
+    /// whole transaction from a fresh plan.
+    Stale {
+        live_leases: std::collections::BTreeSet<(u64, u64)>,
+    },
+}
+
+/// Retire `[va, va+len)` from the process-visible scopes exactly as planned,
+/// or report the plan stale WITHOUT mutating anything.
+///
+/// The plan was made under the MM guard, but the registry is carrier-global
+/// and some of its writers do not hold that guard: another MM's COW or unmap
+/// retires a physical projection and removes every scope's rows of it. When
+/// such a writer removed a row that co-held one of this window's extents,
+/// unregistering against the plan would retire a lease the plan did not
+/// reserve (or keep one it did), so the commit must see that before it
+/// mutates. Unchanged visible-scope revisions prove the plan still holds;
+/// otherwise the plan is recomputed against the live rows under this same
+/// lock.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn commit_planned_unregister_in(
+    registry: &mut AliasRegistry,
+    va: u64,
+    len: usize,
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+    plan: AliasUnmapPlanAuthority<'_>,
+) -> AliasUnmapCommit {
+    let unchanged = plan
+        .visible_revisions
+        .is_none_or(|revisions| revisions.unchanged(registry));
+    if !unchanged {
+        let (live_leases, _) =
+            registry.plan_unregister_process_alias(va, len, mm_root_slot, container_root);
+        if live_leases != *plan.planned_leases {
+            return AliasUnmapCommit::Stale { live_leases };
+        }
+    }
+    AliasUnmapCommit::Retired(unregister_alias_in(
+        registry,
+        va,
+        len,
+        mm_root_slot,
+        container_root,
+    ))
+}
+
+/// Visible rows naming any physical extent of the rows overlapping
+/// `[va, va+len)`: everything a retirement plan for that window read. Writers
+/// outside the MM guard only remove such rows, so a restarted plan must see
+/// strictly fewer of them; that is the restart bound.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn alias_unmap_footprint(
+    registry: &AliasRegistry,
+    window_rows: &[AliasBacking],
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+) -> Vec<AliasBacking> {
+    registry.visible_extent_rows(
+        window_rows
+            .iter()
+            .map(|alias| (alias.physical_ipa, alias.physical_size as u64)),
+        mm_root_slot,
+        container_root,
+    )
+}
+
+/// One alias row in a fatal-report-sized form: semantic span, physical
+/// extent, owner incarnation and scope.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn compact_alias_row(alias: &AliasBacking) -> String {
+    let scope = match alias.ownership_scope {
+        AliasOwnershipScope::MmRootSlot { base, .. } => format!("mm{base:x}"),
+        AliasOwnershipScope::ContainerRoot(token) => format!("ct{}", token.raw()),
+        AliasOwnershipScope::Global => "global".to_owned(),
+    };
+    format!(
+        "{:x}+{:x}->{:x}+{:x}/h{:x}g{}@{scope}",
+        alias.start,
+        alias.size,
+        alias.physical_ipa,
+        alias.physical_size,
+        alias.physical_host_addr,
+        alias.owner_generation
+    )
+}
+
+/// The process-visible scope revisions a plan observed. A commit that finds
+/// the registry changed compares against these to name the writers.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AliasVisibleRevisions {
+    scopes: [(AliasOwnershipScope, u64); 2],
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AliasVisibleRevisions {
+    pub(crate) fn capture(
+        registry: &AliasRegistry,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> Self {
+        let scopes = AliasRegistry::process_visible_scopes(mm_root_slot, container_root)
+            .map(|scope| (scope, registry.scope_revision(scope)));
+        Self { scopes }
+    }
+
+    /// Whether no process-visible scope changed since capture.
+    pub(crate) fn unchanged(&self, registry: &AliasRegistry) -> bool {
+        self.scopes
+            .iter()
+            .all(|&(scope, revision)| registry.scope_revision(scope) == revision)
+    }
+
+    /// Every logged mutation of a visible scope since capture, rendered for a
+    /// fatal report; `truncated` marks a scope whose history left the log.
+    pub(crate) fn writers_since(&self, registry: &AliasRegistry) -> String {
+        let mut out = String::new();
+        for (scope, revision) in self.scopes {
+            let now = registry.scope_revision(scope);
+            if now == revision {
+                continue;
+            }
+            let (entries, complete) = registry.mutation_log.since(scope, revision);
+            out.push_str(&format!("[{revision}->{now}"));
+            if !complete {
+                out.push_str(" truncated");
+            }
+            out.push(':');
+            for entry in entries {
+                out.push(' ');
+                out.push_str(&entry.to_string());
+            }
+            out.push(']');
+        }
+        if out.is_empty() {
+            out.push_str("[no visible-scope mutation]");
+        }
+        out
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AliasRegistry {
@@ -698,6 +987,12 @@ pub(crate) struct AliasRegistry {
     /// extent beside many narrow ones.
     pub(crate) physical_classes_by_scope:
         std::collections::BTreeMap<AliasOwnershipScope, AliasClassIndex>,
+    /// The writer holding the lock now; see [`AliasRegistryWriter`].
+    pub(crate) writer: AliasRegistryWriter,
+    pub(crate) writer_actor: AliasWriterActor,
+    pub(crate) writer_site: Option<&'static std::panic::Location<'static>>,
+    /// Row-changing mutations, attributed to their writer.
+    pub(crate) mutation_log: AliasRegistryMutationLog,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -730,6 +1025,43 @@ impl AliasRegistry {
                 *entry
             );
         });
+        let scope_revision = *entry;
+        self.mutation_log.push(AliasRegistryMutation {
+            scope,
+            scope_revision,
+            writer: self.writer,
+            actor: self.writer_actor,
+            site: self.writer_site,
+        });
+    }
+
+    pub(crate) fn scope_revision(&self, scope: AliasOwnershipScope) -> u64 {
+        self.scope_revisions.get(&scope).copied().unwrap_or(0)
+    }
+
+    /// Every row of a process-visible scope whose physical extent is one of
+    /// `extents`, in index order.
+    pub(crate) fn visible_extent_rows(
+        &self,
+        extents: impl IntoIterator<Item = (u64, u64)>,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> Vec<AliasBacking> {
+        let extents: std::collections::BTreeSet<_> = extents.into_iter().collect();
+        let mut rows = Vec::new();
+        for (physical_ipa, physical_size) in extents {
+            for scope in Self::process_visible_scopes(mm_root_slot, container_root) {
+                if let Some(found) = self.by_scope_physical_start.get(&(scope, physical_ipa)) {
+                    rows.extend(
+                        found
+                            .iter()
+                            .filter(|(_, alias)| alias.physical_size as u64 == physical_size)
+                            .map(|(_, alias)| *alias),
+                    );
+                }
+            }
+        }
+        rows
     }
 
     /// Max revision across the two scopes a process can see. The fork cache
@@ -3356,13 +3688,14 @@ pub(crate) fn retired_alias_disarm_spans(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[track_caller]
 pub(crate) fn unregister_alias(
     va: u64,
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
 ) -> std::collections::BTreeSet<(u64, u64)> {
-    let mut registry = alias_registry().lock();
+    let mut registry = alias_registry_write(AliasRegistryWriter::LegacyProcessAliasUnmap);
     unregister_alias_in(&mut registry, va, len, mm_root_slot, container_root)
 }
 
@@ -3471,8 +3804,9 @@ pub(crate) fn unregister_alias_in(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[track_caller]
 pub(crate) fn clear_alias_registry() {
-    alias_registry().lock().clear();
+    alias_registry_write(AliasRegistryWriter::ExecveClear).clear();
 }
 
 /// Bounds lazy alias remaps per backing IPA, not per guest-run interval.

@@ -264,6 +264,14 @@ pub(crate) struct InventoryLeaseRetirement {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PreparedProcessAliasRetirement {
     pub(crate) planned_leases: std::collections::BTreeSet<(u64, u64)>,
+    /// The process-visible registry revisions the plan read; `None` for a
+    /// grant whose alias was never registered.
+    pub(crate) visible_revisions: Option<AliasVisibleRevisions>,
+    /// Every visible row naming a physical extent of the window, as the plan
+    /// read them. Writers outside the MM guard only remove such rows, so a
+    /// restarted plan must read strictly fewer (the restart bound), and a
+    /// fatal report names the co-holder that vanished.
+    pub(crate) read_rows: Vec<AliasBacking>,
     pub(crate) diagnostic_before: Vec<AliasBacking>,
     pub(crate) disarm_spans: Vec<CowArmedSpan>,
     pub(crate) inventory: Option<InventoryLeaseRetirement>,

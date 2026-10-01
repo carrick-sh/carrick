@@ -368,10 +368,17 @@ enum AliasRetirementRows {
     NeverRegistered,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AliasRetirementAuthorityState {
     Pending,
     AppliedWithReplacement,
+}
+
+/// A retirement attempt whose plan an out-of-guard writer made stale; it
+/// mutated nothing. `writers` names who changed the window.
+#[derive(Debug)]
+struct StaleAliasRetirement {
+    writers: String,
 }
 
 impl HvfVmState {
@@ -397,7 +404,7 @@ impl HvfVmState {
                 .iter()
                 .map(mapped_region_process_alias_key)
                 .collect();
-            let mut registry = alias_registry().lock();
+            let mut registry = alias_registry_write(AliasRegistryWriter::ForkShadowPrune);
             let stale: Vec<AliasBacking> = registry
                 .process_visible_ordered(self.mm_root_slot, self.container_root)
                 .into_iter()
@@ -1716,6 +1723,8 @@ impl HvfVmState {
         }
         let prepared = self.reserve_process_alias_retirement(PreparedProcessAliasRetirement {
             planned_leases: leases,
+            visible_revisions: None,
+            read_rows: Vec::new(),
             diagnostic_before: Vec::new(),
             disarm_spans: Vec::new(),
             inventory: Some(inventory),
@@ -4012,6 +4021,10 @@ impl HvfTaskState {
                 // must not clone/diff or retain-scan carrier-global state.
                 let retired = [RetiredStage2Projection::from(split.old)];
                 let cleanup = mutate_known_external_alias_state(
+                    AliasWriterActor::Mm {
+                        mm_root_slot: self.mm_root_slot,
+                        container_root: self.container_root,
+                    },
                     |registry| retired_projection_mutation_keys(registry, &retired, &[]),
                     |registry| remove_rows_for_retired_stage2_projections(registry, &retired),
                 );
@@ -5725,8 +5738,10 @@ impl HvfVmState {
         let authority = self.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
         })?;
-        let (planned_leases, registry_before, diagnostic_before) = {
+        let (planned_leases, visible_revisions, read_rows, registry_before, diagnostic_before) = {
             let registry = alias_registry().lock();
+            let visible_revisions =
+                AliasVisibleRevisions::capture(&registry, self.mm_root_slot, self.container_root);
             let (planned_leases, registry_before) = registry.plan_unregister_process_alias(
                 va,
                 len,
@@ -5738,7 +5753,19 @@ impl HvfVmState {
             } else {
                 Vec::new()
             };
-            (planned_leases, registry_before, diagnostic_before)
+            let read_rows = alias_unmap_footprint(
+                &registry,
+                &registry_before,
+                self.mm_root_slot,
+                self.container_root,
+            );
+            (
+                planned_leases,
+                visible_revisions,
+                read_rows,
+                registry_before,
+                diagnostic_before,
+            )
         };
         let disarm_spans = retired_alias_disarm_spans(
             &registry_before,
@@ -5775,6 +5802,8 @@ impl HvfVmState {
         };
         Ok(PreparedProcessAliasRetirement {
             planned_leases,
+            visible_revisions: Some(visible_revisions),
+            read_rows,
             diagnostic_before,
             disarm_spans,
             inventory,
@@ -5824,6 +5853,19 @@ impl HvfVmState {
         )
     }
 
+    /// Commit a prepared retirement, restarting it from a fresh plan when a
+    /// writer outside this MM's guard changed the window's lease set after
+    /// preparation (see [`commit_planned_unregister_in`]).
+    ///
+    /// The restart is a transaction restart, not a retry: a stale attempt
+    /// mutates nothing and drops its reservation, and the next attempt is a
+    /// complete preparation under the guard the caller still holds. It is
+    /// bounded: rows of this MM's owned scope are added only under its guard,
+    /// so an out-of-guard writer can only REMOVE rows the plan read (another
+    /// MM retiring a projection removes every scope's rows of it). Each
+    /// restart therefore reads strictly fewer rows than the last, and a
+    /// restart that does not is an ownership violation reported fatally with
+    /// the writers that caused it.
     fn commit_process_alias_retirement_inner(
         &mut self,
         va: u64,
@@ -5833,6 +5875,44 @@ impl HvfVmState {
         authority_state: AliasRetirementAuthorityState,
         rows: AliasRetirementRows,
     ) -> Result<(), TrapError> {
+        let mut prepared = prepared;
+        loop {
+            let read = prepared.read_rows.len();
+            let Some(stale) = self.try_commit_process_alias_retirement(
+                va,
+                len,
+                prepared,
+                registry,
+                authority_state,
+                rows,
+            )?
+            else {
+                return Ok(());
+            };
+            prepared = self.prepare_process_alias_retirement(va, len)?;
+            if prepared.read_rows.len() >= read {
+                carrick_fatal!(
+                    "hvpatch::host_alias",
+                    "HVPatch alias retirement restart read {} rows after {read}: a writer outside the mm guard added rows: va={va:#x} len={len:#x} mm={:?} writers={}",
+                    prepared.read_rows.len(),
+                    self.mm_root_slot,
+                    stale.writers,
+                );
+            }
+        }
+    }
+
+    /// One attempt of [`Self::commit_process_alias_retirement_inner`]:
+    /// `Some` when the plan was stale and nothing was mutated.
+    fn try_commit_process_alias_retirement(
+        &mut self,
+        va: u64,
+        len: usize,
+        prepared: PreparedProcessAliasRetirement,
+        registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
+        authority_state: AliasRetirementAuthorityState,
+        rows: AliasRetirementRows,
+    ) -> Result<Option<StaleAliasRetirement>, TrapError> {
         if prepared.inventory.is_some() && registry.is_none() {
             return Err(TrapError::Hypervisor(
                 "alias retirement inventory publication lacks frame registry guard".to_owned(),
@@ -5847,6 +5927,8 @@ impl HvfVmState {
         let custody = self.carrier_vm_custody();
         let PreparedProcessAliasRetirement {
             planned_leases,
+            visible_revisions,
+            read_rows,
             diagnostic_before,
             disarm_spans,
             inventory,
@@ -5858,16 +5940,70 @@ impl HvfVmState {
         }
         // A grant whose alias was never registered has no registry rows to
         // retire; its planned leases are exactly its own publication.
-        let actual_leases = if registered {
-            unregister_alias(va, len, self.mm_root_slot, self.container_root)
-        } else {
-            planned_leases.clone()
-        };
-        if actual_leases != planned_leases {
-            carrick_fatal!(
-                "hvpatch::host_alias",
-                "HVPatch alias registry changed under the mm guard: planned={planned_leases:?} actual={actual_leases:?}"
-            );
+        if registered {
+            let mut aliases = alias_registry_write(AliasRegistryWriter::ProcessAliasRetirement);
+            let actual = match commit_planned_unregister_in(
+                &mut aliases,
+                va,
+                len,
+                self.mm_root_slot,
+                self.container_root,
+                AliasUnmapPlanAuthority {
+                    planned_leases: &planned_leases,
+                    visible_revisions,
+                },
+            ) {
+                AliasUnmapCommit::Retired(actual) => actual,
+                AliasUnmapCommit::Stale { live_leases } => {
+                    let writers = visible_revisions.map_or_else(
+                        || "[unplanned registered retirement]".to_owned(),
+                        |revisions| revisions.writers_since(&aliases),
+                    );
+                    drop(aliases);
+                    // A pre-applied retirement already committed its inventory
+                    // with this plan inside the replacement's own commit; it
+                    // cannot restart.
+                    if authority_state != AliasRetirementAuthorityState::Pending {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "HVPatch pre-applied alias retirement went stale: va={va:#x} len={len:#x} mm={:?} planned={planned_leases:x?} live={live_leases:x?} writers={writers}",
+                            self.mm_root_slot,
+                        );
+                    }
+                    return Ok(Some(StaleAliasRetirement { writers }));
+                }
+            };
+            if actual != planned_leases {
+                let writers = visible_revisions.map_or_else(
+                    || "[unplanned registered retirement]".to_owned(),
+                    |revisions| revisions.writers_since(&aliases),
+                );
+                let differing: Vec<_> = actual
+                    .symmetric_difference(&planned_leases)
+                    .copied()
+                    .collect();
+                let now_rows = aliases.visible_extent_rows(
+                    differing.iter().copied(),
+                    self.mm_root_slot,
+                    self.container_root,
+                );
+                let plan_rows: Vec<_> = read_rows
+                    .iter()
+                    .filter(|alias| {
+                        differing.contains(&(alias.physical_ipa, alias.physical_size as u64))
+                    })
+                    .map(compact_alias_row)
+                    .collect();
+                let now_rows: Vec<_> = now_rows.iter().map(compact_alias_row).collect();
+                drop(aliases);
+                carrick_fatal!(
+                    "hvpatch::host_alias",
+                    "HVPatch alias retirement disagrees with its authenticated plan: va={va:#x} len={len:#x} mm={:?} planned={} actual={} differing={differing:x?} writers={writers} plan_co_holders={plan_rows:?} now_rows={now_rows:?}",
+                    self.mm_root_slot,
+                    planned_leases.len(),
+                    actual.len(),
+                );
+            }
         }
         if registered {
             record_alias_unmap_lifecycle(
@@ -5894,7 +6030,7 @@ impl HvfVmState {
             for span in disarm_spans {
                 armed.disarm(span);
             }
-            return Ok(());
+            return Ok(None);
         };
         let apply_result = match authority_state {
             AliasRetirementAuthorityState::Pending => {
@@ -5996,6 +6132,10 @@ impl HvfVmState {
             self.retire_stage2_extent(ipa, length)?;
             let retired = [retired];
             let cleanup = mutate_known_external_alias_state(
+                AliasWriterActor::Mm {
+                    mm_root_slot: self.mm_root_slot,
+                    container_root: self.container_root,
+                },
                 |registry| retired_projection_mutation_keys(registry, &retired, &[]),
                 |registry| remove_rows_for_retired_stage2_projections(registry, &retired),
             );
@@ -6031,7 +6171,7 @@ impl HvfVmState {
         for span in disarm_spans {
             armed.disarm(span);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Resolve a guest VA range to a [`MappingView`] (host pointer + bounds +

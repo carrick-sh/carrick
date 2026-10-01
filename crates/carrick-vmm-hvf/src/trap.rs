@@ -762,6 +762,61 @@ pub(crate) fn alias_registry() -> &'static parking_lot::Mutex<AliasRegistry> {
     CELL.get_or_init(|| parking_lot::Mutex::new(AliasRegistry::default()))
 }
 
+/// The registry write lock, attributed to its writer. Every row-changing
+/// mutation made while this guard is held is logged against `writer` and the
+/// caller's source site.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct AliasRegistryWriteGuard<'a> {
+    guard: parking_lot::MutexGuard<'a, AliasRegistry>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[track_caller]
+pub(crate) fn alias_registry_write(
+    writer: AliasRegistryWriter,
+) -> AliasRegistryWriteGuard<'static> {
+    alias_registry_write_as(writer, AliasWriterActor::Unknown)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[track_caller]
+pub(crate) fn alias_registry_write_as(
+    writer: AliasRegistryWriter,
+    actor: AliasWriterActor,
+) -> AliasRegistryWriteGuard<'static> {
+    let site = std::panic::Location::caller();
+    let mut guard = alias_registry().lock();
+    guard.writer = writer;
+    guard.writer_actor = actor;
+    guard.writer_site = Some(site);
+    AliasRegistryWriteGuard { guard }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for AliasRegistryWriteGuard<'_> {
+    type Target = AliasRegistry;
+
+    fn deref(&self) -> &AliasRegistry {
+        &self.guard
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::DerefMut for AliasRegistryWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut AliasRegistry {
+        &mut self.guard
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for AliasRegistryWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.guard.writer = AliasRegistryWriter::Unattributed;
+        self.guard.writer_actor = AliasWriterActor::Unknown;
+        self.guard.writer_site = None;
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 type GlobalFrameHostOwnerDirectory =
     parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameOwnerEntry>>;
@@ -4602,6 +4657,7 @@ fn scoped_alias_epoch_update(
 ///
 /// Measured 2026-08-30: the single-pass version was 45.4% of all carrier user
 /// CPU under a 1,000-child fork/exit storm.
+#[track_caller]
 fn retire_process_aliases(
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
@@ -4609,7 +4665,7 @@ fn retire_process_aliases(
 ) {
     // Replay sets and version chains live in AliasScopeBucket; only the
     // alias_registry() lock is held.
-    let mut registry = alias_registry().lock();
+    let mut registry = alias_registry_write(AliasRegistryWriter::ProcessExitRetirement);
     retire_process_aliases_in(&mut registry, mm_root_slot, container_root, global_keep);
 }
 
@@ -4687,11 +4743,12 @@ pub(crate) fn retire_process_aliases_in(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[track_caller]
 fn mutate_external_alias_state<R>(mutate: impl FnOnce(&mut AliasRegistry) -> R) -> R {
     // Replay sets and version chains live in AliasScopeBucket; only the
     // alias_registry() lock is held. A mutation becomes the new effective
     // base and invalidates older receipt versions for touched keys.
-    let mut registry = alias_registry().lock();
+    let mut registry = alias_registry_write(AliasRegistryWriter::ExternalMutation);
     mutate_external_alias_state_in(&mut registry, mutate)
 }
 
@@ -4799,7 +4856,9 @@ fn mutate_external_alias_state_in<R>(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[track_caller]
 fn mutate_known_external_alias_state<R>(
+    actor: AliasWriterActor,
     affected: impl FnOnce(&AliasRegistry) -> (Vec<AliasVersionKey>, Vec<u64>),
     mutate: impl FnOnce(&mut AliasRegistry) -> R,
 ) -> R {
@@ -4807,7 +4866,7 @@ fn mutate_known_external_alias_state<R>(
     // alias_registry() lock is held. Unlike the generic external mutator,
     // the caller identifies the bounded keys it can change, so no carrier-wide
     // registry clone or diff is required on COW/exec.
-    let mut registry = alias_registry().lock();
+    let mut registry = alias_registry_write_as(AliasRegistryWriter::KnownExternalMutation, actor);
     let (alias_keys, replay_ipas) = affected(&registry);
     let alias_keys = alias_keys
         .into_iter()
@@ -4916,7 +4975,7 @@ impl AliasPublicationReceipt {
         owner: HvpatchCarrierTaskStateKey,
         aliases: &[AliasBacking],
     ) -> Result<Self, TrapError> {
-        let mut registry = alias_registry().lock();
+        let mut registry = alias_registry_write(AliasRegistryWriter::TaskReceiptPublication);
         let mut alias_increments = std::collections::BTreeMap::<AliasVersionKey, u64>::new();
         let mut replay_increments =
             std::collections::BTreeMap::<(AliasOwnershipScope, u64), u64>::new();
@@ -5020,7 +5079,7 @@ impl AliasPublicationReceipt {
     }
 
     fn retire_exact(self) {
-        let mut registry = alias_registry().lock();
+        let mut registry = alias_registry_write(AliasRegistryWriter::TaskReceiptRetirement);
         let mut pending_alias_values =
             std::collections::BTreeMap::<AliasVersionKey, Option<AliasBacking>>::new();
         let mut alias_mutations = Vec::<(AliasVersionKey, Option<AliasBacking>)>::new();
