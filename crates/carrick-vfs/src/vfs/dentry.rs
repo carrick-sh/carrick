@@ -202,6 +202,7 @@ struct FastPathCache {
 }
 
 pub struct DentryCache {
+    pub coherence: Arc<crate::fs_resolve_cache::FsCacheCoherence>,
     proc_gen: AtomicU64,
     shared_path_gen: AtomicU64,
     local_path_bumps: AtomicU64,
@@ -237,7 +238,7 @@ pub struct DentryCache {
 
 impl Default for DentryCache {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, Arc::default())
     }
 }
 
@@ -277,7 +278,7 @@ struct FillComponentParams<'a> {
 }
 
 impl DentryCache {
-    pub fn new(is_shared: bool) -> Self {
+    pub fn new(is_shared: bool, coherence: Arc<crate::fs_resolve_cache::FsCacheCoherence>) -> Self {
         let eviction_enabled = std::env::var("CARRICK_DENTRY_EVICT")
             .ok()
             .is_none_or(|v| v != "0");
@@ -287,13 +288,22 @@ impl DentryCache {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(32 * 1024 * 1024);
 
-        Self::new_with_capacity(is_shared, capacity_bytes, eviction_enabled)
+        Self::with_coherence(is_shared, capacity_bytes, eviction_enabled, coherence)
     }
 
     pub fn new_with_capacity(
         is_shared: bool,
         capacity_bytes: usize,
         eviction_enabled: bool,
+    ) -> Self {
+        Self::with_coherence(is_shared, capacity_bytes, eviction_enabled, Arc::default())
+    }
+
+    pub fn with_coherence(
+        is_shared: bool,
+        capacity_bytes: usize,
+        eviction_enabled: bool,
+        coherence: Arc<crate::fs_resolve_cache::FsCacheCoherence>,
     ) -> Self {
         let root_gen = Arc::new(AtomicU64::new(1));
         let root_dir = DirEntry {
@@ -321,9 +331,10 @@ impl DentryCache {
         path_to_dir_id.insert("".to_string(), DentryId::ROOT);
 
         Self {
+            coherence: Arc::clone(&coherence),
             proc_gen: AtomicU64::new(crate::fs_resolve_cache::current_process_generation()),
-            shared_path_gen: AtomicU64::new(crate::fs_resolve_cache::current_generation()),
-            local_path_bumps: AtomicU64::new(crate::fs_resolve_cache::local_path_bump_count()),
+            shared_path_gen: AtomicU64::new(coherence.current_generation()),
+            local_path_bumps: AtomicU64::new(coherence.local_path_bump_count()),
             last_dispatch_hook_gen: AtomicU64::new(1),
             reset_lock: Mutex::new(()),
             mutation_gen: AtomicU64::new(1),
@@ -391,15 +402,15 @@ impl DentryCache {
     fn combined_generation(&self) -> u64 {
         self.mutation_gen
             .load(Ordering::Relaxed)
-            .wrapping_add(crate::fs_resolve_cache::current_generation())
+            .wrapping_add(self.coherence.current_generation())
     }
 
     fn bump_mutation(&self) {
         self.mutation_gen.fetch_add(1, Ordering::SeqCst);
         let observed = self.shared_path_gen.load(Ordering::SeqCst);
-        let current = crate::fs_resolve_cache::current_generation();
+        let current = self.coherence.current_generation();
         let previous_local = self.local_path_bumps.load(Ordering::SeqCst);
-        let current_local = crate::fs_resolve_cache::local_path_bump_count();
+        let current_local = self.coherence.local_path_bump_count();
         // A local backend mutation publishes its generation before calling
         // the dentry hook. Preserve unaffected names only when that one bump
         // followed the generation already observed by this cache. A sibling
@@ -426,9 +437,9 @@ impl DentryCache {
             return;
         }
         let observed = self.shared_path_gen.load(Ordering::SeqCst);
-        let current = crate::fs_resolve_cache::current_generation();
+        let current = self.coherence.current_generation();
         let previous_local = self.local_path_bumps.load(Ordering::SeqCst);
-        let current_local = crate::fs_resolve_cache::local_path_bump_count();
+        let current_local = self.coherence.local_path_bump_count();
         if current.wrapping_sub(observed) == current_local.wrapping_sub(previous_local) {
             self.local_path_bumps.store(current_local, Ordering::SeqCst);
             self.shared_path_gen.store(current, Ordering::SeqCst);
@@ -480,7 +491,7 @@ impl DentryCache {
     ///   answering from an unverified name.
     fn check_fork(&self) {
         let cur_gen = crate::fs_resolve_cache::current_process_generation();
-        let shared_gen = crate::fs_resolve_cache::current_generation();
+        let shared_gen = self.coherence.current_generation();
         let proc_stale = self.proc_gen.load(Ordering::SeqCst) != cur_gen;
         let shared_stale = self.shared_path_gen.load(Ordering::SeqCst) != shared_gen;
         if proc_stale || shared_stale {
@@ -598,10 +609,8 @@ impl DentryCache {
                 // self-cleans without needing a rebuild here.
             }
             self.proc_gen.store(cur_gen, Ordering::SeqCst);
-            self.local_path_bumps.store(
-                crate::fs_resolve_cache::local_path_bump_count(),
-                Ordering::SeqCst,
-            );
+            self.local_path_bumps
+                .store(self.coherence.local_path_bump_count(), Ordering::SeqCst);
             self.shared_path_gen.store(shared_gen, Ordering::SeqCst);
             self.mutation_gen.fetch_add(1, Ordering::SeqCst);
             self.last_dispatch_hook_gen
@@ -1265,7 +1274,7 @@ impl DentryCache {
     fn walk_generation(&self) -> (u64, u64, u64) {
         (
             self.mutation_gen.load(Ordering::SeqCst),
-            crate::fs_resolve_cache::current_generation(),
+            self.coherence.current_generation(),
             crate::fs_resolve_cache::current_process_generation(),
         )
     }
@@ -3291,7 +3300,7 @@ mod tests {
         let b = tempdir().unwrap();
         let backend_a = HostFsBackend::from_path(a.path()).unwrap();
         let backend_b = HostFsBackend::from_path(b.path()).unwrap();
-        let cache_b = DentryCache::new(false);
+        let cache_b = DentryCache::new(false, std::sync::Arc::clone(backend_b.cache_coherence()));
         cache_b.stat("/", true, &backend_b, None).unwrap();
         let before = cache_b.combined_generation();
         backend_a.make_dir("/only-a").unwrap();
@@ -3302,7 +3311,7 @@ mod tests {
     fn test_dentry_cache_positive_and_negative() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         // Create a file
         let file_path = tmp.path().join("foo.txt");
@@ -3346,7 +3355,7 @@ mod tests {
     fn test_dentry_cache_symlink() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         let target_path = tmp.path().join("target.txt");
         fs::write(&target_path, b"symlink target").unwrap();
@@ -3374,7 +3383,7 @@ mod tests {
         fs::write(dir.join("target"), b"target").unwrap();
         std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         assert_eq!(
             cache
@@ -3413,7 +3422,7 @@ mod tests {
     fn test_dentry_cache_dir_generation() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         let subdir = tmp.path().join("subdir");
         fs::create_dir(&subdir).unwrap();
@@ -3449,7 +3458,7 @@ mod tests {
 
         let upper_tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(upper_tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         // 1. Stat symlink in lower
         let st = cache
@@ -3509,7 +3518,7 @@ mod tests {
     fn test_dentry_cache_inode_invalidation_and_hard_links() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         // 1. Create file with 5 bytes
         let file_path = tmp.path().join("foo.txt");
@@ -3575,7 +3584,7 @@ mod tests {
     fn test_dentry_cache_repeated_mkdir_rmdir_cycles() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         // Pre-create parent directory /tmp
         fs::create_dir_all(tmp.path().join("tmp")).unwrap();
@@ -3608,7 +3617,7 @@ mod tests {
     fn test_dentry_cache_5000_dirs_preserves_earlier_entry() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         for i in 0..5000 {
             let dir_name = format!("dir_{i}");
@@ -3705,7 +3714,7 @@ mod tests {
     fn test_dentry_cache_exchange_preserves_both_entries() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         let path_a = tmp.path().join("file_a.txt");
         let path_b = tmp.path().join("file_b.txt");
@@ -3853,7 +3862,7 @@ mod tests {
     fn test_sibling_bump_preserves_pinned_dir_revalidates_names() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         let pinned_dir = tmp.path().join("pinned_dir");
         fs::create_dir_all(&pinned_dir).unwrap();
@@ -3884,7 +3893,7 @@ mod tests {
             pinned_dir.join("new_name.txt"),
         )
         .unwrap();
-        crate::fs_resolve_cache::simulate_sibling_path_bump();
+        cache.coherence.simulate_sibling_path_bump();
 
         // `check_fork` is checked lazily: only a call that actually walks
         // the cache (lookup/stat) observes and reconciles the bump. Trigger
@@ -3934,7 +3943,7 @@ mod tests {
     fn test_sibling_rename_of_pinned_dir_moves_identity_not_name() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         let pinned_dir = tmp.path().join("pinned_dir");
         fs::create_dir_all(&pinned_dir).unwrap();
@@ -3951,7 +3960,7 @@ mod tests {
         // A sibling process renames the pinned directory itself (not just a
         // child of it) and bumps only the shared path generation.
         fs::rename(&pinned_dir, tmp.path().join("moved")).unwrap();
-        crate::fs_resolve_cache::simulate_sibling_path_bump();
+        cache.coherence.simulate_sibling_path_bump();
 
         // The OLD path must ENOENT -- it is not a directory any more, and
         // must not be answered from the kept object under its old name.
@@ -3991,7 +4000,7 @@ mod tests {
     fn test_sibling_rmdir_of_pinned_dir_orphans_without_panic() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         let pinned_dir = tmp.path().join("pinned_dir");
         fs::create_dir_all(&pinned_dir).unwrap();
@@ -4007,7 +4016,7 @@ mod tests {
 
         // A sibling empties and rmdirs the pinned directory, then bumps.
         fs::remove_dir(&pinned_dir).unwrap();
-        crate::fs_resolve_cache::simulate_sibling_path_bump();
+        cache.coherence.simulate_sibling_path_bump();
 
         assert_eq!(
             cache.stat("/pinned_dir", false, &backend, None),
@@ -4081,7 +4090,7 @@ mod tests {
     fn test_warm_cache_per_entry_invalidation() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         let test_dir = tmp.path().join("test_dir");
         fs::create_dir(&test_dir).unwrap();
@@ -4151,7 +4160,7 @@ mod tests {
 
         let upper_tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(upper_tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
 
         // Warm /tmp
         let _ = cache.stat("/tmp", false, &backend, Some(&rootfs)).unwrap();
@@ -4182,7 +4191,7 @@ mod tests {
     fn test_shared_generation_invalidates_positive_and_negative_names() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
+        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
         fs::create_dir(tmp.path().join("parent")).unwrap();
         fs::write(tmp.path().join("parent/existing"), b"old").unwrap();
 
@@ -4201,7 +4210,7 @@ mod tests {
         // generation bumped by the backend.
         fs::remove_file(tmp.path().join("parent/existing")).unwrap();
         fs::write(tmp.path().join("parent/new"), b"new").unwrap();
-        crate::fs_resolve_cache::simulate_sibling_path_bump();
+        cache.coherence.simulate_sibling_path_bump();
 
         assert_eq!(
             cache.stat("/parent/existing", false, &backend, None),

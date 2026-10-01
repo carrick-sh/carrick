@@ -172,6 +172,25 @@ HEAD, SHA-256, CDHash, LC_UUID, hypervisor entitlement, `__dof_carrick`, and
 run-ID-scoped cleanup. A focused contract proves only its named family; it does
 not close the frozen suite or ecosystem denominator.
 
+## Filesystem cache cohort
+
+`kernel.fs.cache-cohort` covers cached path, directory topology, root-marker,
+and guest-metadata observations. Independent backing namespaces must not
+invalidate each other; observers admitted to the same backing cohort, including
+host-fork descendants, must observe its publications. The structural budget is
+zero additional dentry host opens in kernel B after kernel A mutates its own
+namespace. VM-free bindings are
+`independent_kernels_keep_all_fs_generations_and_cached_names_isolated`,
+`independent_backing_namespace_mutation_keeps_other_cache_generation`, and
+`cohort_generation_words_survive_host_fork`.
+
+Host self-reexec preserves the historical anonymous-mapping boundary: reopening
+the durable root establishes a fresh coherence cohort. The binding
+`host_backend_reexec_authority_reattaches_exact_root` pins this distinction.
+Pre-admission layer-cache extraction publishes no coherence generations;
+backend-owned extraction publishes to its observing cohort. Signed file probes
+provide integration evidence; full oracle and promotion remain director-owned.
+
 ## Executor empty host queue
 
 `kernel.executor.empty-host-steal` covers an executor seeking host-runnable

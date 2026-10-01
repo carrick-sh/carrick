@@ -446,13 +446,13 @@ fn prepare_host_backend(
             .and_then(|id| detached_stable_scratch_path(id).map(|path| (id.to_owned(), path))),
     };
     let mut host = if let Some(scratch) = exec_overlay {
-        HostFsBackend::attach(scratch.as_std_path()).map_err(|e| {
+        HostFsBackend::attach(scratch.as_std_path(), std::sync::Arc::default()).map_err(|e| {
             RuntimeError::FsBackend(anyhow::anyhow!(
                 "failed to attach container overlay {scratch}: {e}"
             ))
         })?
     } else if let Some((_, scratch)) = &managed_scratch {
-        HostFsBackend::attach_or_create(scratch).map_err(|e| {
+        HostFsBackend::attach_or_create(scratch, std::sync::Arc::default()).map_err(|e| {
             RuntimeError::FsBackend(anyhow::anyhow!("failed to create container overlay: {e}"))
         })?
     } else {

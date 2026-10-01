@@ -297,7 +297,10 @@ impl RootFsVfs {
         Self {
             rootfs: None,
             overlay: Box::new(MemoryBackend::new()),
-            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(
+                false,
+                std::sync::Arc::default(),
+            )),
             namespace_mutations: Arc::default(),
         }
     }
@@ -306,15 +309,20 @@ impl RootFsVfs {
         Self {
             rootfs: Some(rootfs),
             overlay: Box::new(MemoryBackend::new()),
-            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(
+                false,
+                std::sync::Arc::default(),
+            )),
             namespace_mutations: Arc::default(),
         }
     }
 
     /// Swap the writable overlay. Returns the previously-installed
     /// backend so the caller can decide what to do with it.
-    pub fn set_overlay(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(backend.is_shared()));
+    pub fn set_overlay(&mut self, mut backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
+        let coherence = Arc::clone(&self.dentry_cache.coherence);
+        backend.set_cache_coherence(Arc::clone(&coherence));
+        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(backend.is_shared(), coherence));
         std::mem::replace(&mut self.overlay, backend)
     }
 
@@ -573,7 +581,10 @@ impl RootFsVfs {
     /// Reset dentry cache on rootfs layer mutation.
     pub fn reset_dentry_cache(&mut self) {
         let is_shared = self.dentry_cache.is_shared();
-        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(is_shared));
+        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(
+            is_shared,
+            Arc::clone(&self.dentry_cache.coherence),
+        ));
     }
 
     /// Create raw host fd in writable overlay and announce creation to dentry cache.
@@ -750,7 +761,7 @@ impl RootFsVfs {
 
     /// Set mode on an open host file descriptor and update dentry cache.
     pub fn fset_mode(&self, raw_fd: std::os::fd::RawFd, mode: u32) {
-        crate::fs_backend::fset_mode(raw_fd, mode);
+        crate::fs_backend::fset_mode(Some(&self.dentry_cache.coherence), raw_fd, mode);
         self.overlay.note_meta_xattr_written();
         self.invalidate_host_fd(raw_fd);
     }
@@ -762,7 +773,7 @@ impl RootFsVfs {
         uid: Option<carrick_abi::NsUid>,
         gid: Option<carrick_abi::NsGid>,
     ) {
-        crate::fs_backend::fset_owner_xattr(raw_fd, uid, gid);
+        crate::fs_backend::fset_owner_xattr(Some(&self.dentry_cache.coherence), raw_fd, uid, gid);
         self.overlay.note_meta_xattr_written();
         self.invalidate_host_fd(raw_fd);
     }
@@ -3468,7 +3479,10 @@ mod tests {
         let v = RootFsVfs {
             rootfs: Some(rootfs_with_files()),
             overlay: Box::new(backend),
-            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(
+                false,
+                std::sync::Arc::default(),
+            )),
             namespace_mutations: Arc::default(),
         };
 
@@ -3485,7 +3499,10 @@ mod tests {
         let v = RootFsVfs {
             rootfs: None,
             overlay: Box::new(backend),
-            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(
+                false,
+                std::sync::Arc::default(),
+            )),
             namespace_mutations: Arc::default(),
         };
 
@@ -3506,7 +3523,10 @@ mod tests {
         let v = RootFsVfs {
             rootfs: None,
             overlay: Box::new(backend),
-            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(
+                false,
+                std::sync::Arc::default(),
+            )),
             namespace_mutations: Arc::default(),
         };
 
@@ -3842,7 +3862,10 @@ mod tests {
         let v = RootFsVfs {
             rootfs: None,
             overlay: Box::new(backend),
-            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(
+                false,
+                std::sync::Arc::default(),
+            )),
             namespace_mutations: Arc::default(),
         };
 

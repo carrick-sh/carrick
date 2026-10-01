@@ -513,6 +513,12 @@ impl Drop for ArchiveTransactionGuard<'_> {
 /// aware (see module docs); the dispatcher does its own overlay-first
 /// merging with the read-only rootfs underneath.
 pub trait FsBackend: Send + Sync {
+    /// Admit this writable backing into the observing rootfs cohort.
+    fn set_cache_coherence(
+        &mut self,
+        _coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
+    ) {
+    }
     /// Return the backend's mutation exclusion only when all namespace-changing
     /// methods participate. Unknown backends fail closed for archive import.
     #[doc(hidden)]

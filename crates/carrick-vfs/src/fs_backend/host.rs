@@ -214,6 +214,7 @@ macro_rules! host_open {
 // path only; on non-macOS those fields are populated but never read.
 #[allow(dead_code)]
 pub struct HostFsBackend {
+    pub(crate) coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
     /// The kernel-rooted sandbox handle. ALL fs operations on the
     /// scratch dir go through this.
     pub(crate) root_fd: std::sync::Arc<std::os::fd::OwnedFd>,
@@ -1049,6 +1050,10 @@ impl HostFsBackend {
     /// under `scratch_root` (default `~/.carrick/scratch/<pid>`).
     /// Sweeps orphans (directories whose lockfile is no longer
     /// flock'd) before allocating a new one.
+    pub fn cache_coherence(&self) -> &std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence> {
+        &self.coherence
+    }
+
     pub fn new() -> std::io::Result<Self> {
         let scratch_root = default_scratch_root()?;
         Self::new_in(&scratch_root)
@@ -1087,6 +1092,7 @@ impl HostFsBackend {
         let root_path = scratch.path().to_path_buf();
         let proc_gen = crate::fs_resolve_cache::current_process_generation();
         Ok(Self {
+            coherence: std::sync::Arc::default(),
             root_fd,
             root_path,
             archive_mutation_gate: ArchiveMutationGate::default(),
@@ -1139,6 +1145,7 @@ impl HostFsBackend {
         rootfs
             .extract_to_dir(&self.root_path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.coherence.bump_meta_generation();
         Ok(())
     }
 
@@ -1152,6 +1159,7 @@ impl HostFsBackend {
         let fast_fs = fast_fs_enabled();
         let proc_gen = crate::fs_resolve_cache::current_process_generation();
         Self {
+            coherence: std::sync::Arc::default(),
             root_fd,
             root_path,
             archive_mutation_gate: ArchiveMutationGate::default(),
@@ -1219,14 +1227,22 @@ impl HostFsBackend {
 
     /// Open an EXISTING scratch directory as the writable overlay WITHOUT owning
     /// its lifetime (no `TempDir` auto-delete, no lockfile).
-    pub fn attach(path: &Path) -> std::io::Result<Self> {
-        Self::from_path(path)
+    pub fn attach(
+        path: &Path,
+        coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
+    ) -> std::io::Result<Self> {
+        let mut backend = Self::from_path(path)?;
+        backend.coherence = coherence;
+        Ok(backend)
     }
 
     /// Like [`HostFsBackend::attach`], but creates `path` first if it is absent.
-    pub fn attach_or_create(path: &Path) -> std::io::Result<Self> {
+    pub fn attach_or_create(
+        path: &Path,
+        coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(path)?;
-        Self::attach(path)
+        Self::attach(path, coherence)
     }
 
     /// Snapshot the current contained root for native host self-reexec.
@@ -1321,11 +1337,11 @@ impl HostFsBackend {
         if !self.fast_fs {
             return self.dir_fd_for_after_reclaim(
                 dir,
-                crate::fs_resolve_cache::current_dir_generation(),
+                self.coherence.current_dir_generation(),
                 hops,
             );
         }
-        let generation = crate::fs_resolve_cache::current_dir_generation();
+        let generation = self.coherence.current_dir_generation();
         let proc_gen = crate::fs_resolve_cache::current_process_generation();
 
         // Adopt-and-clear if we crossed a host fork: a child must not trust
@@ -1645,7 +1661,7 @@ impl HostFsBackend {
         if let Ok(fd) = self.dir_fd_for(parent) {
             return Ok(fd);
         }
-        let generation = crate::fs_resolve_cache::current_dir_generation();
+        let generation = self.coherence.current_dir_generation();
         let mut current = self.dir_fd_for(Path::new(""))?;
         let mut walked = PathBuf::new();
         let flags = libc::O_RDONLY
@@ -2497,12 +2513,12 @@ impl HostFsBackend {
     fn stamp_root_marker(&self, name: &[u8], seen: &std::sync::atomic::AtomicBool) {
         use std::os::fd::AsRawFd;
         if let Some(fd) = self.root_meta_fd() {
-            fset_u32_xattr(fd.as_raw_fd(), name, 1);
+            fset_u32_xattr(Some(&self.coherence), fd.as_raw_fd(), name, 1);
         }
         seen.store(true, std::sync::atomic::Ordering::Relaxed);
         // After the xattr is durable: every process's cached ABSENT reading of
         // any root marker is now stale (see `current_marker_generation`).
-        crate::fs_resolve_cache::bump_marker_generation();
+        self.coherence.bump_marker_generation();
     }
 
     /// Record that entries under this root MAY carry guest metadata xattrs
@@ -2537,7 +2553,7 @@ impl HostFsBackend {
         if self.marker_seen.load(Relaxed) {
             return true;
         }
-        let now = crate::fs_resolve_cache::current_marker_generation();
+        let now = self.coherence.current_marker_generation();
         if self.marker_absent_gen.load(Relaxed) == now {
             return false;
         }
@@ -2566,7 +2582,12 @@ impl HostFsBackend {
         if fget_u32_xattr(src_parent_fd, CARRICK_DIR_HAS_MARKERS_XATTR).is_none() {
             return;
         }
-        fset_u32_xattr(dst_parent_fd, CARRICK_DIR_HAS_MARKERS_XATTR, 1);
+        fset_u32_xattr(
+            Some(&self.coherence),
+            dst_parent_fd,
+            CARRICK_DIR_HAS_MARKERS_XATTR,
+            1,
+        );
         let parent_rel = dst_rel.parent().unwrap_or_else(|| Path::new(""));
         self.marker_dirs.write().insert(parent_rel.to_path_buf());
     }
@@ -2576,7 +2597,7 @@ impl HostFsBackend {
         if self.whiteout_seen.load(Relaxed) {
             return true;
         }
-        let now = crate::fs_resolve_cache::current_marker_generation();
+        let now = self.coherence.current_marker_generation();
         if self.whiteout_absent_gen.load(Relaxed) == now {
             return false;
         }
@@ -2600,7 +2621,7 @@ impl HostFsBackend {
         if self.symlink_seen.load(Relaxed) {
             return true;
         }
-        let now = crate::fs_resolve_cache::current_marker_generation();
+        let now = self.coherence.current_marker_generation();
         if self.symlink_absent_gen.load(Relaxed) == now {
             return false;
         }
@@ -2753,7 +2774,7 @@ impl HostFsBackend {
         // This is the deletion's cross-process linearization point: the
         // sidecar is durable before every forked process's cached-absent
         // generation becomes stale.
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         Ok(())
     }
 
@@ -2935,8 +2956,8 @@ impl HostFsBackend {
         //     revalidation cannot see that — the inode, ctime and size are all
         //     unchanged at the new location.
         let proc_gen = crate::fs_resolve_cache::current_process_generation();
-        let meta_generation = crate::fs_resolve_cache::current_meta_generation();
-        let dir_generation = crate::fs_resolve_cache::current_dir_generation();
+        let meta_generation = self.coherence.current_meta_generation();
+        let dir_generation = self.coherence.current_dir_generation();
         let cached = {
             use std::sync::atomic::Ordering::Relaxed;
             let mut map = self.stat_cache.lock();
@@ -3058,8 +3079,8 @@ impl HostFsBackend {
         // Sampled BEFORE the xattr read: a writer landing between the read
         // and the insert bumps past this value, so the entry is born stale
         // and refills on its first hit instead of serving the pre-write bytes.
-        let meta_generation = crate::fs_resolve_cache::current_meta_generation();
-        let dir_generation = crate::fs_resolve_cache::current_dir_generation();
+        let meta_generation = self.coherence.current_meta_generation();
+        let dir_generation = self.coherence.current_dir_generation();
         let (override_mode, uid, gid, is_socket) = if self.serves_plain_metadata() {
             (None, None, None, false)
         } else {
@@ -3200,6 +3221,7 @@ impl HostFsBackend {
         if stats.mode_xattrs > 0 {
             self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
         }
+        self.coherence.bump_meta_generation();
         Ok(stats)
     }
 
@@ -3617,12 +3639,18 @@ pub(crate) fn is_guest_xattr_namespace(name: &str) -> bool {
 }
 
 #[allow(dead_code)]
-fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
+fn fremove_xattr(
+    coherence: Option<&crate::fs_resolve_cache::FsCacheCoherence>,
+    fd: std::os::fd::RawFd,
+    name: &[u8],
+) {
     // Best-effort: a missing stale override is the common case on every host.
     unsafe {
         carrick_portable::fremovexattr(fd, name.as_ptr().cast());
     }
-    crate::fs_resolve_cache::bump_meta_generation();
+    if let Some(coherence) = coherence {
+        coherence.bump_meta_generation();
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -3670,7 +3698,12 @@ fn lget_u32_xattr(path: *const libc::c_char, name: &[u8]) -> Option<u32> {
     (n == 4).then(|| u32::from_le_bytes(v))
 }
 
-pub(crate) fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
+pub(crate) fn fset_u32_xattr(
+    coherence: Option<&crate::fs_resolve_cache::FsCacheCoherence>,
+    fd: std::os::fd::RawFd,
+    name: &[u8],
+    val: u32,
+) {
     let v = val.to_le_bytes();
     // Portable fd-xattr (Linux fsetxattr / macOS f*xattr+position / FreeBSD extattr_set_fd).
     unsafe {
@@ -3682,7 +3715,9 @@ pub(crate) fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
             0,
         );
     }
-    crate::fs_resolve_cache::bump_meta_generation();
+    if let Some(coherence) = coherence {
+        coherence.bump_meta_generation();
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3705,11 +3740,19 @@ pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
     fget_u32_xattr(fd, CARRICK_MODE_XATTR)
 }
 
-pub(crate) fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
-    fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode);
+pub(crate) fn fset_mode_xattr(
+    coherence: Option<&crate::fs_resolve_cache::FsCacheCoherence>,
+    fd: std::os::fd::RawFd,
+    mode: u32,
+) {
+    fset_u32_xattr(coherence, fd, CARRICK_MODE_XATTR, mode);
 }
 
-pub(crate) fn fset_mode(fd: std::os::fd::RawFd, mode: u32) {
+pub(crate) fn fset_mode(
+    coherence: Option<&crate::fs_resolve_cache::FsCacheCoherence>,
+    fd: std::os::fd::RawFd,
+    mode: u32,
+) {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe { host_fstat!(fd, &mut st) };
     if rc == 0 {
@@ -3723,18 +3766,23 @@ pub(crate) fn fset_mode(fd: std::os::fd::RawFd, mode: u32) {
             let native_mode = if owner_ok { mode } else { mode | 0o700 };
             let _ = unsafe { libc::fchmod(fd, native_mode as libc::mode_t) };
             if owner_ok {
-                fremove_xattr(fd, CARRICK_MODE_XATTR);
+                fremove_xattr(coherence, fd, CARRICK_MODE_XATTR);
                 return;
             }
         }
     }
-    fset_mode_xattr(fd, mode);
+    fset_mode_xattr(coherence, fd, mode);
 }
 
 /// 8-byte little-endian xattr write/read, mirroring the u32 helpers above. Used
 /// for the device-node `st_rdev` (a 64-bit `dev_t`).
 #[allow(dead_code)]
-fn fset_u64_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u64) {
+fn fset_u64_xattr(
+    coherence: Option<&crate::fs_resolve_cache::FsCacheCoherence>,
+    fd: std::os::fd::RawFd,
+    name: &[u8],
+    val: u64,
+) {
     let v = val.to_le_bytes();
     // Portable fd-xattr (carrick-portable maps the per-OS position/options args).
     unsafe {
@@ -3746,7 +3794,9 @@ fn fset_u64_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u64) {
             0,
         );
     }
-    crate::fs_resolve_cache::bump_meta_generation();
+    if let Some(coherence) = coherence {
+        coherence.bump_meta_generation();
+    }
 }
 
 fn fget_u64_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u64> {
@@ -3848,15 +3898,16 @@ pub(crate) fn fget_owner_xattr(fd: std::os::fd::RawFd) -> (Option<NsUid>, Option
 
 /// Set the (uid, gid) owner xattrs on an open fd.
 pub(crate) fn fset_owner_xattr(
+    coherence: Option<&crate::fs_resolve_cache::FsCacheCoherence>,
     fd: std::os::fd::RawFd,
     uid: Option<carrick_abi::NsUid>,
     gid: Option<carrick_abi::NsGid>,
 ) {
     if let Some(u) = uid {
-        fset_u32_xattr(fd, CARRICK_UID_XATTR, u.raw());
+        fset_u32_xattr(coherence, fd, CARRICK_UID_XATTR, u.raw());
     }
     if let Some(g) = gid {
-        fset_u32_xattr(fd, CARRICK_GID_XATTR, g.raw());
+        fset_u32_xattr(coherence, fd, CARRICK_GID_XATTR, g.raw());
     }
 }
 
@@ -3923,8 +3974,8 @@ fn write_device_xattrs(backend: &HostFsBackend, rel: &Path, full_mode: u32, dev:
     #[cfg(not(target_os = "macos"))]
     {
         let _ = with_entry_fd(backend, rel, false, true, |fd| {
-            fset_u32_xattr(fd, CARRICK_MODE_XATTR, full_mode);
-            fset_u64_xattr(fd, CARRICK_RDEV_XATTR, dev);
+            fset_u32_xattr(Some(&backend.coherence), fd, CARRICK_MODE_XATTR, full_mode);
+            fset_u64_xattr(Some(&backend.coherence), fd, CARRICK_RDEV_XATTR, dev);
         });
     }
 }
@@ -3976,21 +4027,21 @@ fn symlink_get_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8]) -> Op
 #[cfg(target_os = "macos")]
 fn symlink_set_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: u32) {
     if let Ok(fd) = backend.metadata_fd(rel, false) {
-        fset_u32_xattr(fd.as_raw_fd(), name, val);
+        fset_u32_xattr(Some(&backend.coherence), fd.as_raw_fd(), name, val);
     }
 }
 
 #[cfg(target_os = "macos")]
 fn path_set_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: u32) {
     if let Ok(fd) = backend.metadata_fd(rel, false) {
-        fset_u32_xattr(fd.as_raw_fd(), name, val);
+        fset_u32_xattr(Some(&backend.coherence), fd.as_raw_fd(), name, val);
     }
 }
 
 #[cfg(target_os = "macos")]
 fn path_set_u64_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: u64) {
     if let Ok(fd) = backend.metadata_fd(rel, false) {
-        fset_u64_xattr(fd.as_raw_fd(), name, val);
+        fset_u64_xattr(Some(&backend.coherence), fd.as_raw_fd(), name, val);
     }
 }
 
@@ -4121,7 +4172,7 @@ fn symlink_set_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: 
             libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len());
         }
     }
-    crate::fs_resolve_cache::bump_meta_generation();
+    backend.coherence.bump_meta_generation();
 }
 
 /// Remove any xattr sidecars belonging to the symlink `rel` (called from the
@@ -4195,10 +4246,10 @@ pub(crate) fn write_owner_xattr(
     }
     let _ = with_entry_fd(backend, rel, is_dir, !is_dir, |fd| {
         if let Some(uid) = uid {
-            fset_u32_xattr(fd, CARRICK_UID_XATTR, uid.raw());
+            fset_u32_xattr(Some(&backend.coherence), fd, CARRICK_UID_XATTR, uid.raw());
         }
         if let Some(gid) = gid {
-            fset_u32_xattr(fd, CARRICK_GID_XATTR, gid.raw());
+            fset_u32_xattr(Some(&backend.coherence), fd, CARRICK_GID_XATTR, gid.raw());
         }
     });
 }
@@ -4246,6 +4297,12 @@ fn read_whiteout_leaf_from_marker(
 }
 
 impl FsBackend for HostFsBackend {
+    fn set_cache_coherence(
+        &mut self,
+        coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
+    ) {
+        self.coherence = coherence;
+    }
     fn statfs(&self) -> Option<carrick_abi::LinuxStatfs> {
         let mut native = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         // SAFETY: `root_fd` is the live directory authority for this backend,
@@ -4649,7 +4706,7 @@ impl FsBackend for HostFsBackend {
         // marker second makes the absent-stamp sound: a stamp taken at
         // generation G proves the marker was absent at some point ≥ the G
         // bump, and any later FIFO creation bumps past G.
-        let now = crate::fs_resolve_cache::current_marker_generation();
+        let now = self.coherence.current_marker_generation();
         if self.fifo_absent_gen.load(Relaxed) == now {
             return false;
         }
@@ -4677,7 +4734,7 @@ impl FsBackend for HostFsBackend {
         if self.meta_xattr_seen.load(Relaxed) {
             return false;
         }
-        let now = crate::fs_resolve_cache::current_marker_generation();
+        let now = self.coherence.current_marker_generation();
         let meta_absent = self.meta_xattr_absent_gen.load(Relaxed) == now
             || match self.root_marker_xattr(CARRICK_HAS_META_XATTRS_XATTR) {
                 RootMarker::Present => {
@@ -4709,7 +4766,7 @@ impl FsBackend for HostFsBackend {
         if self.marker_dirs.read().contains(rel) {
             return true;
         }
-        let marker_generation = crate::fs_resolve_cache::current_marker_generation();
+        let marker_generation = self.coherence.current_marker_generation();
         if self
             .marker_absent_dirs
             .read()
@@ -4870,12 +4927,12 @@ impl FsBackend for HostFsBackend {
                     if raw >= 0 {
                         let fd =
                             std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-                        let generation = crate::fs_resolve_cache::current_dir_generation();
+                        let generation = self.coherence.current_dir_generation();
                         self.publish_dir_fd(rel.as_path(), &fd, generation);
                     }
                 }
                 self.clear_whiteout_normalized(rel.as_path());
-                crate::fs_resolve_cache::bump_generation();
+                self.coherence.bump_generation();
                 return Ok(());
             }
         };
@@ -4894,7 +4951,7 @@ impl FsBackend for HostFsBackend {
             }
         }
         self.clear_whiteout_normalized(rel.as_path());
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         Ok(())
     }
 
@@ -4926,7 +4983,7 @@ impl FsBackend for HostFsBackend {
         }
         unsafe { libc::close(fd) };
         self.clear_whiteout_normalized(&normalized);
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         Ok(())
     }
 
@@ -4948,7 +5005,7 @@ impl FsBackend for HostFsBackend {
             .and_then(cstring_from_osstr)
             .ok_or(BackendError::Invalid)?;
         self.stamp_fifo_marker();
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         let rc = unsafe {
             libc::mkfifoat(
                 parent_fd.as_raw_fd(),
@@ -4988,10 +5045,15 @@ impl FsBackend for HostFsBackend {
             .and_then(cstring_from_osstr)
             .ok_or(BackendError::Invalid)?;
         self.stamp_marker_node_marker();
-        fset_u32_xattr(parent_fd.as_raw_fd(), CARRICK_DIR_HAS_MARKERS_XATTR, 1);
+        fset_u32_xattr(
+            Some(&self.coherence),
+            parent_fd.as_raw_fd(),
+            CARRICK_DIR_HAS_MARKERS_XATTR,
+            1,
+        );
         let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
         self.marker_dirs.write().insert(parent_rel.to_path_buf());
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o600) };
@@ -5002,8 +5064,8 @@ impl FsBackend for HostFsBackend {
                 None => Err(BackendError::Io),
             };
         }
-        fset_u32_xattr(fd, CARRICK_SOCKET_XATTR, 1);
-        fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode & 0o7777);
+        fset_u32_xattr(Some(&self.coherence), fd, CARRICK_SOCKET_XATTR, 1);
+        fset_u32_xattr(Some(&self.coherence), fd, CARRICK_MODE_XATTR, mode & 0o7777);
         unsafe { libc::close(fd) };
         Ok(())
     }
@@ -5022,10 +5084,15 @@ impl FsBackend for HostFsBackend {
             }
         };
         self.stamp_marker_node_marker();
-        fset_u32_xattr(parent_fd.as_raw_fd(), CARRICK_DIR_HAS_MARKERS_XATTR, 1);
+        fset_u32_xattr(
+            Some(&self.coherence),
+            parent_fd.as_raw_fd(),
+            CARRICK_DIR_HAS_MARKERS_XATTR,
+            1,
+        );
         let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
         self.marker_dirs.write().insert(parent_rel.to_path_buf());
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o600) };
@@ -5094,7 +5161,7 @@ impl FsBackend for HostFsBackend {
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
         self.clear_whiteout_normalized(&normalized);
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         Ok(())
     }
 
@@ -5218,7 +5285,7 @@ impl FsBackend for HostFsBackend {
             }
         }
         if rc == 0 {
-            crate::fs_resolve_cache::bump_generation();
+            self.coherence.bump_generation();
             if removed_dir {
                 let parent = rel.parent().unwrap_or_else(|| Path::new(""));
                 self.dir_gen_for(parent)
@@ -5255,7 +5322,7 @@ impl FsBackend for HostFsBackend {
         let _ = self.remove_entry_checked(path);
         let res = self.write_whiteout_normalized(&normalized);
         if res.is_ok() {
-            crate::fs_resolve_cache::bump_generation();
+            self.coherence.bump_generation();
         }
         res
     }
@@ -5513,9 +5580,9 @@ impl FsBackend for HostFsBackend {
             }
         }
 
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         if changes_dir_topology {
-            crate::fs_resolve_cache::bump_dir_generation();
+            self.coherence.bump_dir_generation();
             let src_parent = src_rel.parent().unwrap_or_else(|| Path::new(""));
             let dst_parent = dst_rel.parent().unwrap_or_else(|| Path::new(""));
             self.dir_gen_for(src_parent)
@@ -5627,8 +5694,8 @@ impl FsBackend for HostFsBackend {
                 return Err(BackendError::Io);
             }
         }
-        crate::fs_resolve_cache::bump_generation();
-        crate::fs_resolve_cache::bump_dir_generation();
+        self.coherence.bump_generation();
+        self.coherence.bump_dir_generation();
         self.drop_dir_cache();
         if self.use_stat_cache {
             self.drop_stat_cache_after_rename();
@@ -5864,9 +5931,9 @@ impl FsBackend for HostFsBackend {
         // itself still opens fresh below. Sample the generation at entry for the
         // store stamp, but validate a hit against the FRESH current generation
         // so a mutation between entry and lookup also invalidates.
-        let gen_at_entry = crate::fs_resolve_cache::current_generation();
+        let gen_at_entry = self.coherence.current_generation();
         let cached = {
-            let now = crate::fs_resolve_cache::current_generation();
+            let now = self.coherence.current_generation();
             let proc_gen = crate::fs_resolve_cache::current_process_generation();
             let mut guard = self.watch_res_cache.lock();
             if self.watch_cache_proc_gen.load(Relaxed) != proc_gen {
@@ -6047,7 +6114,7 @@ impl FsBackend for HostFsBackend {
             .ok_or(BackendError::Invalid)?;
         let target_c = std::ffi::CString::new(target).map_err(|_| BackendError::Invalid)?;
         self.stamp_root_marker(CARRICK_HAS_SYMLINKS_XATTR, &self.symlink_seen);
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         let rc = unsafe {
             libc::symlinkat(target_c.as_ptr(), parent_fd.as_raw_fd(), leaf_name.as_ptr())
         };
@@ -6092,7 +6159,7 @@ impl FsBackend for HostFsBackend {
             dst_parent_fd.as_raw_fd(),
             dst_rel,
         );
-        crate::fs_resolve_cache::bump_generation();
+        self.coherence.bump_generation();
         Ok(())
     }
 
@@ -6160,12 +6227,12 @@ impl FsBackend for HostFsBackend {
                 .host_syscall_errno()
                 .map_err(BackendError::Host)?;
             if owner_ok {
-                fremove_xattr(fd.as_raw_fd(), CARRICK_MODE_XATTR);
+                fremove_xattr(Some(&self.coherence), fd.as_raw_fd(), CARRICK_MODE_XATTR);
                 return Ok(());
             }
         }
         self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
-        fset_mode_xattr(fd.as_raw_fd(), mode);
+        fset_mode_xattr(Some(&self.coherence), fd.as_raw_fd(), mode);
         Ok(())
     }
 
@@ -6554,7 +6621,7 @@ impl FsBackend for HostFsBackend {
             expected.push(b'/');
             expected.extend_from_slice(parent.as_os_str().as_bytes());
 
-            let generation = crate::fs_resolve_cache::current_dir_generation();
+            let generation = self.coherence.current_dir_generation();
             let proc_gen = crate::fs_resolve_cache::current_process_generation();
 
             // Check dir_cache first: if parent is cached and valid, it is already proven
@@ -6648,7 +6715,7 @@ impl FsBackend for HostFsBackend {
             }
             let root_prefix = self.root_prefix.as_deref()?;
             let normalized = normalize(path)?;
-            let generation = crate::fs_resolve_cache::current_dir_generation();
+            let generation = self.coherence.current_dir_generation();
             let proc_gen = crate::fs_resolve_cache::current_process_generation();
 
             let mut expected =
@@ -6916,7 +6983,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn structural_generation(&self) -> u64 {
-        crate::fs_resolve_cache::current_generation()
+        self.coherence.current_generation()
     }
 
     fn name(&self) -> &'static str {

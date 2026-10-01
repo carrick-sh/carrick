@@ -581,6 +581,8 @@ impl FsState {
         snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
     ) -> Self {
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));
+        let rootfs_vfs = std::sync::Arc::new(carrick_vfs::RootFsVfs::new());
+        let coherence = std::sync::Arc::clone(&rootfs_vfs.dentry_cache.coherence);
         Self {
             host_io: std::sync::Arc::new(crate::dispatch::SystemHostIo),
             vfs_mounts: std::sync::Arc::new({
@@ -647,13 +649,12 @@ impl FsState {
                 use std::os::unix::fs::PermissionsExt as _;
                 let _ =
                     std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));
-                m.mount(
-                    "/dev/shm",
-                    Box::new(carrick_vfs::BindVfs::new("/dev/shm", shm_host, false)),
-                );
+                let mut shm = carrick_vfs::BindVfs::new("/dev/shm", shm_host, false);
+                carrick_vfs::Vfs::set_cache_coherence(&mut shm, std::sync::Arc::clone(&coherence));
+                m.mount("/dev/shm", Box::new(shm));
                 m
             }),
-            rootfs_vfs: std::sync::Arc::new(carrick_vfs::RootFsVfs::new()),
+            rootfs_vfs,
             executable_authorities: std::sync::Arc::new(
                 super::super::executable_authority::ExecutableAuthorityRegistry::default(),
             ),
@@ -662,7 +663,7 @@ impl FsState {
             fanotify_registry: crate::fanotify::FanotifyRegistry::default(),
             dnotify_registry: parking_lot::Mutex::new(Vec::new()),
             dnotify_active: std::sync::atomic::AtomicBool::new(false),
-            resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
+            resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(coherence),
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
             host_sparse_extents: HostSparseExtentsRegistry::new(),
@@ -686,7 +687,9 @@ impl FsState {
                 self.dnotify_active
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
-            resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(),
+            resolve_cache: carrick_vfs::fs_resolve_cache::ResolveCache::new(std::sync::Arc::clone(
+                &self.rootfs_vfs.dentry_cache.coherence,
+            )),
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
             host_sparse_extents: self.host_sparse_extents.clone(),
@@ -1328,5 +1331,60 @@ mod stdio_sink_tests {
             fs.try_rootfs_vfs_mut(),
             Err(crate::run_result::RuntimeError::Configuration(_))
         ));
+    }
+
+    #[test]
+    fn independent_kernels_keep_all_fs_generations_and_cached_names_isolated() {
+        let scratch_a = tempfile::tempdir().unwrap();
+        let scratch_b = tempfile::tempdir().unwrap();
+        let mut a = SyscallDispatcher::new();
+        let mut b = SyscallDispatcher::new();
+        a.set_fs_backend(Box::new(
+            carrick_vfs::fs_backend::HostFsBackend::from_path(scratch_a.path()).unwrap(),
+        ));
+        b.set_fs_backend(Box::new(
+            carrick_vfs::fs_backend::HostFsBackend::from_path(scratch_b.path()).unwrap(),
+        ));
+        let snapshot = |c: &carrick_vfs::fs_resolve_cache::FsCacheCoherence| {
+            [
+                c.current_generation(),
+                c.current_dir_generation(),
+                c.current_marker_generation(),
+                c.current_meta_generation(),
+            ]
+        };
+        b.fs.rootfs_vfs
+            .overlay
+            .set_file_contents("/stable", b"b".to_vec())
+            .unwrap();
+        b.fs.rootfs_vfs.dentry_stat("/stable", true).unwrap();
+        let c = &b.fs.rootfs_vfs.dentry_cache.coherence;
+        let before = snapshot(c);
+        b.fs.resolve_cache
+            .put("/stable".into(), "/stable".into(), before[0]);
+        let opens = b.fs.rootfs_vfs.dentry_cache.host_open_count();
+        a.fs.rootfs_vfs.overlay.make_dir("/old").unwrap();
+        a.fs.rootfs_vfs
+            .overlay
+            .rename_overlay_entry("/old", "/new")
+            .unwrap();
+        a.fs.rootfs_vfs
+            .overlay
+            .create_socket("/socket", 0o600)
+            .unwrap();
+        a.fs.rootfs_vfs.set_mode("/socket", 0o644).unwrap();
+        assert_eq!(snapshot(c), before);
+        assert_eq!(
+            b.fs.resolve_cache
+                .get("/stable", c.current_generation())
+                .as_deref(),
+            Some("/stable")
+        );
+        b.fs.rootfs_vfs.dentry_stat("/stable", true).unwrap();
+        assert_eq!(
+            b.fs.rootfs_vfs.dentry_cache.host_open_count(),
+            opens,
+            "unrelated cohort must not reconcile cached names"
+        );
     }
 }

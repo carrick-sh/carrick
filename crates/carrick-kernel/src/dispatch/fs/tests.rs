@@ -2231,7 +2231,9 @@ mod serial_host {
         std::fs::write(lower.path().join("walk/file.txt"), b"lower file").unwrap();
         std::fs::write(lower.path().join("walk/sub/deep.txt"), b"deep").unwrap();
         std::os::unix::fs::symlink("file.txt", lower.path().join("walk/link")).unwrap();
-        let lower_metadata = carrick_vfs::fs_backend::HostFsBackend::attach(lower.path()).unwrap();
+        let lower_metadata =
+            carrick_vfs::fs_backend::HostFsBackend::attach(lower.path(), std::sync::Arc::default())
+                .unwrap();
         lower_metadata.set_mode("/walk/file.txt", 0o4711).unwrap();
         lower_metadata
             .set_owner(

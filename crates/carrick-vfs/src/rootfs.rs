@@ -739,7 +739,7 @@ impl ContainedExtractor {
             return Err(RootFsError::Io(std::io::Error::last_os_error()));
         }
         if needs_override {
-            crate::fs_backend::fset_mode_xattr(fd.as_raw_fd(), mode);
+            crate::fs_backend::fset_mode_xattr(None, fd.as_raw_fd(), mode);
             stats.mode_xattrs += 1;
         } else {
             let name = CString::new(crate::fs_backend::CARRICK_MODE_XATTR_NAME)
@@ -779,7 +779,7 @@ impl ContainedExtractor {
             unsafe {
                 libc::fchmod(f.as_raw_fd(), (mode | 0o600) as libc::mode_t);
             }
-            crate::fs_backend::fset_mode_xattr(f.as_raw_fd(), mode);
+            crate::fs_backend::fset_mode_xattr(None, f.as_raw_fd(), mode);
             stats.mode_xattrs += 1;
         } else {
             unsafe {
@@ -818,7 +818,7 @@ impl ContainedExtractor {
             unsafe {
                 libc::fchmod(f.as_raw_fd(), (mode | 0o600) as libc::mode_t);
             }
-            crate::fs_backend::fset_mode_xattr(f.as_raw_fd(), mode);
+            crate::fs_backend::fset_mode_xattr(None, f.as_raw_fd(), mode);
             stats.mode_xattrs += 1;
         } else {
             unsafe {
@@ -1007,7 +1007,7 @@ impl RootFs {
     /// Reads are capability-rooted through [`HostFsBackend`], while this type
     /// deliberately exposes no mutation methods for the lower.
     pub fn from_immutable_host_dir(path: &Path) -> Result<Self, RootFsError> {
-        let backend = HostFsBackend::attach(path)?;
+        let backend = HostFsBackend::attach(path, std::sync::Arc::default())?;
         // The cache entry root carries no metadata-xattr root marker (the
         // extraction wrote per-entry xattrs directly); its CLEAN sentinel file
         // is the only proof that none exist. Absent sentinel = assume xattrs,

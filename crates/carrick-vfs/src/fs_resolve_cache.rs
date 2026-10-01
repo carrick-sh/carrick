@@ -41,6 +41,186 @@ const META_GENERATION_SLOT: usize = 3;
 /// Number of generation words in the shared page.
 const GENERATION_SLOTS: usize = 4;
 
+/// Generation authority for one admitted backing-filesystem cohort.
+/// Anonymous MAP_SHARED words survive host fork, but not host self-reexec.
+/// Reexec admission deliberately creates a fresh cohort, preserving the
+/// previous anonymous-mapping boundary; no mapping is transported in the capsule.
+pub struct FsCacheCoherence {
+    words: std::ptr::NonNull<AtomicU64>,
+    local_path_bumps: AtomicU64,
+}
+
+// SAFETY: the mapping is owned until Drop and is accessed only through atomics.
+unsafe impl Send for FsCacheCoherence {}
+// SAFETY: concurrent access to shared words and local counters is atomic.
+unsafe impl Sync for FsCacheCoherence {}
+
+impl Default for FsCacheCoherence {
+    fn default() -> Self {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_SHARED,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            // A private fallback would silently destroy cross-fork coherence.
+            std::alloc::handle_alloc_error(
+                std::alloc::Layout::new::<[AtomicU64; GENERATION_SLOTS]>(),
+            );
+        }
+        let words =
+            std::ptr::NonNull::new(p.cast::<AtomicU64>()).unwrap_or_else(|| std::process::abort());
+        for slot in 0..GENERATION_SLOTS {
+            // SAFETY: four aligned AtomicU64s fit in the owned writable mapping.
+            unsafe {
+                words.as_ptr().add(slot).write(AtomicU64::new(1));
+            }
+        }
+        ensure_atfork_installed();
+        Self {
+            words,
+            local_path_bumps: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Drop for FsCacheCoherence {
+    fn drop(&mut self) {
+        // SAFETY: the last owner releases this process's mapping only. Forked
+        // descendants retain their own virtual mapping of the shared backing.
+        unsafe {
+            libc::munmap(self.words.as_ptr().cast(), 4096);
+        }
+    }
+}
+
+impl FsCacheCoherence {
+    fn generation_word_at(&self, slot: usize) -> &AtomicU64 {
+        debug_assert!(slot < GENERATION_SLOTS);
+        // SAFETY: slot is one of the four module constants; mapping lives as
+        // long as this authority and references cannot outlive it.
+        unsafe { &*self.words.as_ptr().add(slot) }
+    }
+    fn generation_word(&self) -> &AtomicU64 {
+        self.generation_word_at(PATH_GENERATION_SLOT)
+    }
+    pub(crate) fn local_path_bump_count(&self) -> u64 {
+        self.local_path_bumps.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    pub(crate) fn simulate_sibling_path_bump(&self) {
+        self.generation_word().fetch_add(1, Ordering::SeqCst);
+    }
+    /// Current fs-structure generation. A cache entry stamped with this value is
+    /// valid until the next structural mutation.
+    pub fn current_generation(&self) -> u64 {
+        self.generation_word().load(Ordering::SeqCst)
+    }
+
+    /// Invalidate every process's resolve cache by bumping the shared generation.
+    /// Call from every structural fs mutation (mkdir/rmdir/rename/symlink/link/
+    /// unlink/mknod/create), NOT from content writes.
+    pub fn bump_generation(&self) {
+        self.generation_word().fetch_add(1, Ordering::SeqCst);
+        self.local_path_bumps.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current DIRECTORY-TOPOLOGY generation — the one the kernel's directory
+    /// cache stamps its open dirfds with.
+    ///
+    /// This is deliberately a SECOND, much slower-moving counter than
+    /// [`current_generation`]. A cached dirfd names an *inode*, so it is only
+    /// invalidated by an operation that can change which inode an existing
+    /// directory PATH names: a rename or exchange involving a directory, and a
+    /// directory removal. Creating a file, writing one, unlinking one, or creating
+    /// a new directory cannot — a new name cannot re-point an existing one.
+    ///
+    /// That distinction is what makes a directory cache viable on a build
+    /// workload. A cold `go build` performs thousands of file creations and
+    /// unlinks, every one of which bumps the path generation and so flushes the
+    /// resolve cache; almost none of them touch directory topology, so the dirfds
+    /// survive and the walk they replace is never repaid.
+    pub fn current_dir_generation(&self) -> u64 {
+        self.generation_word_at(DIR_GENERATION_SLOT)
+            .load(Ordering::SeqCst)
+    }
+
+    /// Invalidate every process's directory cache. Call ONLY from an operation
+    /// that can re-point an existing directory path — rename/exchange where either
+    /// side is a directory, and directory removal (including a whiteout that hides
+    /// one). See [`current_dir_generation`] for why the set is this narrow.
+    ///
+    /// Returns the generation this call established. A caller that knows EXACTLY
+    /// which of its own cached entries the mutation invalidated can re-stamp the
+    /// survivors with this value (see
+    /// `HostFsBackend::evict_dir_cache_subtree_restamping`) instead of paying the
+    /// global invalidation it just imposed on every other process. Using the
+    /// returned value rather than a fresh `current_dir_generation()` read is what
+    /// makes that sound: if a SIBLING process bumps in between, the survivors stay
+    /// stamped at the older value and are correctly invalidated on their next read.
+    pub fn bump_dir_generation(&self) -> u64 {
+        self.generation_word_at(DIR_GENERATION_SLOT)
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    /// Current sandbox-root MARKER generation — the one the host backend's
+    /// "no FIFO / marker node / metadata xattr / whiteout / symlink anywhere in
+    /// the upper" answers are stamped with.
+    ///
+    /// A third, near-static counter. Those answers are read from durable root
+    /// xattrs that only ever go absent → present, and only a marker STAMP
+    /// (`stamp_root_marker`) can change one; a file creation or unlink cannot.
+    /// Keying the absent readings on [`current_generation`] instead made every
+    /// structural mutation invalidate all five, so a create/unlink loop re-read
+    /// the root xattr (`openat`+`fgetxattr`+`close`) several times per guest
+    /// syscall — 3 of the 12 host opens behind one guest `unlink`.
+    pub fn current_marker_generation(&self) -> u64 {
+        self.generation_word_at(MARKER_GENERATION_SLOT)
+            .load(Ordering::SeqCst)
+    }
+
+    /// Invalidate every process's absent-marker readings. Call ONLY after a root
+    /// marker xattr has been stamped present (the stamp first, then the bump, so
+    /// a reader that sampled the old generation before the stamp is born stale).
+    pub fn bump_marker_generation(&self) {
+        self.generation_word_at(MARKER_GENERATION_SLOT)
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current guest-METADATA generation — the one the host backend's stat cache
+    /// stamps each entry with.
+    ///
+    /// A cached `RealStat` carries fields the host inode cannot answer: the guest
+    /// mode override, owner uid/gid, and the AF_UNIX-socket marker, all read from
+    /// carrick's own `user.carrick.*` xattrs. Their ONLY writers are carrick's
+    /// own metadata helpers, and every one bumps this word after writing. So an
+    /// entry stamped with the current value still holds those fields even when
+    /// the inode's ctime/mtime/size moved — a directory gaining or losing a
+    /// child, a file being appended — and revalidation can serve it with just the
+    /// fresh volatile fields instead of refilling (a second `fstatat` plus an
+    /// `openat`+`flistxattr`+`close` xattr pass). A create/unlink loop used to pay
+    /// that refill for the parent directory on every iteration.
+    pub fn current_meta_generation(&self) -> u64 {
+        self.generation_word_at(META_GENERATION_SLOT)
+            .load(Ordering::SeqCst)
+    }
+
+    /// Invalidate every process's cached guest-metadata readings. Call from every
+    /// writer of a `user.carrick.*` metadata xattr (mode/uid/gid/socket/rdev), set
+    /// OR remove, AFTER the write lands — a reader that stamped the old generation
+    /// before the write then revalidates through a refill.
+    pub fn bump_meta_generation(&self) {
+        self.generation_word_at(META_GENERATION_SLOT)
+            .fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// The shared generation words, one `MAP_SHARED` page, shared with every
 /// host-forked descendant so a mutation in any process invalidates every
 /// process's caches.
@@ -241,6 +421,7 @@ pub fn bump_meta_generation() {
 /// itself is fork-copied like the rest of the address space; the shared
 /// generation is what makes stale copies re-resolve.
 pub struct ResolveCache {
+    pub coherence: std::sync::Arc<FsCacheCoherence>,
     map: RwLock<HashMap<String, (String, u64)>>,
 }
 
@@ -250,13 +431,14 @@ const MAX_ENTRIES: usize = 8192;
 
 impl Default for ResolveCache {
     fn default() -> Self {
-        Self::new()
+        Self::new(std::sync::Arc::default())
     }
 }
 
 impl ResolveCache {
-    pub fn new() -> Self {
+    pub fn new(coherence: std::sync::Arc<FsCacheCoherence>) -> Self {
         Self {
+            coherence,
             map: RwLock::new(HashMap::new()),
         }
     }
@@ -299,7 +481,7 @@ mod tests {
 
     #[test]
     fn hit_is_served_until_the_generation_moves_on() {
-        let c = ResolveCache::new();
+        let c = ResolveCache::new(std::sync::Arc::default());
         c.put("/tmp/x/file".into(), "/tmp/x/file".into(), 5);
         // Same generation -> hit.
         assert_eq!(c.get("/tmp/x/file", 5).as_deref(), Some("/tmp/x/file"));
@@ -316,14 +498,14 @@ mod tests {
         // mutation advanced it to 6 DURING the resolve; the reader stores with
         // its stale sample. A get at the current generation (6) must miss, so
         // the racing pre-mutation resolution is never served.
-        let c = ResolveCache::new();
+        let c = ResolveCache::new(std::sync::Arc::default());
         c.put("/raced".into(), "/raced".into(), 5);
         assert_eq!(c.get("/raced", 6), None);
     }
 
     #[test]
     fn absent_key_misses() {
-        let c = ResolveCache::new();
+        let c = ResolveCache::new(std::sync::Arc::default());
         assert_eq!(c.get("/never/put", 1), None);
     }
 

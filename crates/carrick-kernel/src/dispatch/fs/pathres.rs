@@ -420,14 +420,23 @@ impl<'a> FsView<'a> {
         // Sample the generation at ENTRY, before reading any fs state: a new
         // entry is stamped with this, so a mutation racing our resolve (which
         // bumps to a higher generation) leaves the entry born stale.
-        let gen_at_entry = carrick_vfs::fs_resolve_cache::current_generation();
+        let gen_at_entry = self
+            .fs
+            .rootfs_vfs
+            .dentry_cache
+            .coherence
+            .current_generation();
         if let Some(ref key) = lookup_key {
             // Validate the lookup against the FRESH current generation (read
             // now, not `gen_at_entry`) so a mutation between entry and here also
             // invalidates.
             if let Some(hit) = self.fs.resolve_cache.get(
                 key.as_str(),
-                carrick_vfs::fs_resolve_cache::current_generation(),
+                self.fs
+                    .rootfs_vfs
+                    .dentry_cache
+                    .coherence
+                    .current_generation(),
             ) {
                 // Still enforce DAC search permission per call — it depends on
                 // live creds, not the path structure (a no-op for root, the hot
