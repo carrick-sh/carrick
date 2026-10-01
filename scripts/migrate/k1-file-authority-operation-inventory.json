@@ -14858,7 +14858,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 377,
+      "line": 379,
       "categories": [
         "mapping"
       ],
@@ -14867,7 +14867,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 378,
+      "line": 380,
       "categories": [
         "mapping"
       ],
@@ -14876,7 +14876,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 432,
+      "line": 442,
       "categories": [
         "mapping"
       ],
@@ -14885,7 +14885,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 433,
+      "line": 443,
       "categories": [
         "mapping"
       ],
@@ -21312,7 +21312,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5905,
+      "line": 5908,
       "categories": [
         "mapping"
       ],
@@ -21321,7 +21321,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5913,
+      "line": 5916,
       "categories": [
         "mapping"
       ],
@@ -21330,7 +21330,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5929,
+      "line": 5932,
       "categories": [
         "mapping"
       ],
@@ -21393,7 +21393,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor/settlement.rs",
-      "line": 188,
+      "line": 193,
       "categories": [
         "mapping"
       ],
