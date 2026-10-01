@@ -4486,6 +4486,92 @@ impl PageTableManager {
         Ok(out)
     }
 
+    /// [`Self::debug_walk_host`] for many pages: `visit` receives each page and
+    /// its live walk, exactly as `debug_walk_host` would return it, but each
+    /// table arena is resolved through `resolver` once for the whole call
+    /// rather than once per level of every page.
+    ///
+    /// The per-page walk asked the resolver for the arena at every level, and
+    /// a host resolver answers that with an index search over the VM's
+    /// mappings; revalidating one 256-page EL1 grant cost ~1k such searches.
+    /// The arena's host mapping cannot move while the caller holds the
+    /// exclusion that makes the walk meaningful, so one resolution per arena
+    /// is the same answer.
+    ///
+    /// # Safety
+    /// As [`Self::debug_walk_host`], and the live tables and their host
+    /// mappings must not change for the duration of the call.
+    pub unsafe fn debug_walk_host_pages(
+        &self,
+        resolver: impl HostArenaResolver,
+        pages: impl IntoIterator<Item = u64>,
+        mut visit: impl FnMut(u64, Result<[u64; 4], PageTableError>),
+    ) {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        // (arena base, host pointer, bytes the pointer was resolved for)
+        let mut resolved: Vec<(u64, *const u8, usize)> = Vec::new();
+        let mut host_for = |base: u64, len: usize| -> Option<*const u8> {
+            if let Some(&(_, host, covered)) = resolved.iter().find(|&&(arena, _, _)| arena == base)
+                && len <= covered
+            {
+                return Some(host);
+            }
+            let covered = self
+                .arenas
+                .iter()
+                .find(|entry| entry.base == base)
+                .map_or(len, |entry| entry.capacity.max(len));
+            let host = resolver.host_const_ptr_for_range(base, covered)?;
+            resolved.retain(|&(arena, _, _)| arena != base);
+            resolved.push((base, host, covered));
+            Some(host)
+        };
+        for va in pages {
+            let idx = indices(va);
+            let mut out = [0_u64; 4];
+            let mut current_base = self.arenas[0].base;
+            let mut table_off = 0_usize;
+            let mut result = Ok(());
+            #[allow(clippy::needless_range_loop)]
+            for level in 0..4_usize {
+                let off = table_off + idx[level] * 8;
+                let Some(host) = host_for(current_base, off + 8) else {
+                    result = Err(PageTableError::UnresolvedArena(current_base));
+                    break;
+                };
+                let desc = unsafe {
+                    let slot = host.add(off).cast::<AtomicU64>();
+                    (*slot).load(Ordering::Acquire)
+                };
+                out[level] = desc;
+                if level == 3 {
+                    break;
+                }
+                let valid = desc & VALID != 0;
+                let is_table = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
+                if !(valid && is_table) {
+                    break;
+                }
+                let child_pa = desc & PA_MASK_TABLE;
+                let live_child = self.arenas.iter().enumerate().find_map(|(arena, entry)| {
+                    let offset = child_pa.checked_sub(entry.base)?;
+                    let end = offset.checked_add(PT_PAGE)?;
+                    (offset.is_multiple_of(PT_PAGE) && end <= entry.capacity as u64)
+                        .then_some(TableLocation::new(arena, offset as usize))
+                });
+                match live_child {
+                    Some(loc) => {
+                        current_base = self.arenas[loc.arena].base;
+                        table_off = loc.offset;
+                    }
+                    None => break,
+                }
+            }
+            visit(va, result.map(|()| out));
+        }
+    }
+
     /// Translate a guest VA to its stage-1 output address, returning error on failed resolution.
     pub fn try_translate(&self, va: u64) -> Result<Option<u64>, PageTableError> {
         self.try_translate_with_invalid_leaf(va, false)
@@ -9179,6 +9265,86 @@ mod tests {
         assert_eq!(popped, vec![ext_base.0]);
         assert_eq!(returned.lock().unwrap().as_slice(), &[ext_base]);
         assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
+    }
+
+    /// Contract `kernel.el1.grant-commit-revalidation`: revalidating an EL1
+    /// grant's committed pages reads the live tables through the host
+    /// resolver once per table arena, not once per page and level. The
+    /// per-page walk resolved the arena at every level of every page (four
+    /// index searches per page; a 256-page grant cost ~1k lookups), which the
+    /// 2026-10-01 A/B measured at ~4% of carrier CPU on cpython and Node.
+    #[test]
+    fn debug_walk_host_pages_resolves_each_arena_once_however_many_pages() {
+        let mut mgr = hvpatch_manager();
+        const PAGES: u64 = 256;
+        let va = LINUX_MMAP_BASE + 0x20_0000;
+        mgr.set_rw(va, (PAGES * 0x1000) as usize, false, None)
+            .expect("map the grant window");
+        let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let full = [(mgr.base(), host.as_mut_ptr())];
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&full[..]).unwrap() };
+        let lookups = core::cell::Cell::new(0_usize);
+        let base = mgr.base();
+        let host_ptr = host.as_ptr();
+        let resolver = unsafe {
+            crate::aarch64::const_resolver(|arena: u64| -> Option<*const u8> {
+                lookups.set(lookups.get() + 1);
+                (arena == base).then_some(host_ptr)
+            })
+        };
+        let mut seen = 0_u64;
+        unsafe {
+            mgr.debug_walk_host_pages(
+                resolver,
+                (0..PAGES).map(|i| va + i * 0x1000),
+                |page, walk| {
+                    assert_eq!(walk, Ok(mgr.debug_walk(page)), "page 0x{page:x}");
+                    seen += 1;
+                },
+            );
+        }
+        assert_eq!(seen, PAGES);
+        assert_eq!(lookups.get(), 1, "one resolution of the one table arena");
+    }
+
+    /// The batched walk is the per-page walk: same descriptors at every
+    /// level, including pages that cross into another L3 table and pages
+    /// whose walk stops at an invalid upper level.
+    #[test]
+    fn debug_walk_host_pages_matches_the_per_page_walk() {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut mgr = hvpatch_manager();
+        let boundary = LINUX_MMAP_BASE + 3 * TWO_MIB;
+        mgr.set_rw(boundary - 0x4000, 0x8000, false, None)
+            .expect("map across an L3 boundary");
+        let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let full = [(mgr.base(), host.as_mut_ptr())];
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&full[..]).unwrap() };
+        let base = mgr.base();
+        let host_ptr = host.as_ptr();
+        let resolver = || unsafe {
+            crate::aarch64::const_resolver(move |arena: u64| -> Option<*const u8> {
+                (arena == base).then_some(host_ptr)
+            })
+        };
+        let pages = [
+            boundary - 0x4000,
+            boundary - 0x1000,
+            boundary,
+            boundary + 0x3000,
+            boundary + 0x10_0000,
+            LINUX_MMAP_BASE + 40 * TWO_MIB,
+            0x1000,
+        ];
+        let mut batched = Vec::new();
+        unsafe {
+            mgr.debug_walk_host_pages(resolver(), pages, |page, walk| batched.push((page, walk)));
+        }
+        let single: Vec<_> = pages
+            .iter()
+            .map(|&page| (page, unsafe { mgr.debug_walk_host(resolver(), page) }))
+            .collect();
+        assert_eq!(batched, single);
     }
 
     #[test]

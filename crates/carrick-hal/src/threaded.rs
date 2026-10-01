@@ -3078,11 +3078,13 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         ))
     }
 
-    /// Authenticate a guest-committed grant page against the current live
-    /// stage-1 leaf before the host adopts its residency bitmap bit.
-    fn live_el1_grant_page(&self, _va: u64, _expected_ipa: u64) -> bool {
-        false
-    }
+    /// Authenticate guest-committed pages of one grant against the current
+    /// live stage-1 leaves before the host adopts their residency bits:
+    /// `resident` is called for each `(va, expected_ipa)` whose live leaf is
+    /// EL1-resident and maps exactly `expected_ipa`. One call per grant reads
+    /// the live root once and resolves each table arena once, however many
+    /// pages the grant committed.
+    fn live_el1_grant_pages(&self, _pages: &[(u64, u64)], _resident: &mut dyn FnMut(u64)) {}
 
     /// Refresh fork-private backend state after the child frame inventory and
     /// exact MM/COW authority are live, but before the child enters guest code.
