@@ -1049,6 +1049,8 @@ impl MemState {
         let mut forked = self.clone();
         // The child's own provenance, before any root fact is handed over.
         forked.deferred_anonymous = std::sync::Arc::new(self.deferred_anonymous.fork_private());
+        // The parent's grants, stock included, stay the parent's.
+        forked.first_touch_stock.clear();
         let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
             // A twin's clone is no fork twin of its own.
             if let Some(arena) = forked.host_arena_mut() {

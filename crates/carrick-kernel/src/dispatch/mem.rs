@@ -386,6 +386,11 @@ pub struct MemState {
     /// it too, so the error direction is always "scrub something already zero",
     /// never "hand back stale bytes".
     pub mmap_writable_high: u64,
+    /// Delegated MM: spans of committed root-owned grants that also covered
+    /// root holes (first-touch stock, `fault::root_grant_for_page`). Only
+    /// these can hold unused stock, so returning it costs nothing while the
+    /// list is empty. Never inherited: a fork child holds no parent grant.
+    pub(in crate::dispatch) first_touch_stock: Vec<carrick_el1_abi::ReservationRange>,
     /// Sub-allocator for the boot-mapped shared aperture. Guest `MAP_SHARED`
     /// mmaps carve sub-ranges here; the aperture itself is `hv_vm_map`'d once
     /// at boot, so no stage-2 mutation happens at mmap time.
@@ -557,6 +562,7 @@ impl MemState {
             semantic_vmas: VmaMap::new(),
             anonymous: anonymous::AnonymousAuthority::HostSetup(anonymous::HostArena::new(layout)),
             mmap_writable_high: layout.mmap_base,
+            first_touch_stock: Vec::new(),
             shared: crate::shared_aperture::SharedAperture::new(),
             overlay: crate::shared_aperture::SharedAperture::with_window(
                 crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
