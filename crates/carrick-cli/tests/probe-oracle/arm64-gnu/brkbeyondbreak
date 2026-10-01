@@ -1,0 +1,29 @@
+bcbf0abb61339340
+brk_moves_ok=true
+same_page_read signal=0
+same_page_write signal=0
+same_page_exec signal=11 code=2
+next_page_read signal=11 code=1
+next_page_write signal=11 code=1
+next_page_exec signal=11 code=1
+after_shrink_read signal=11 code=1
+after_shrink_write signal=11 code=1
+after_shrink_exec signal=11 code=1
+regrown_zero=true
+fork_child_inside_read segv_code=0
+fork_child_beyond_read segv_code=1
+fork_child_shrunk_read segv_code=1
+fork_parent_read signal=0
+exec_fill_ok=true
+after_exec_next_page_read signal=11 code=1
+after_exec_next_page_write signal=11 code=1
+after_exec_next_page_exec signal=11 code=1
+after_exec_plus_64k_read signal=11 code=1
+after_exec_plus_64k_write signal=11 code=1
+after_exec_plus_64k_exec signal=11 code=1
+after_exec_plus_1m_read signal=11 code=1
+after_exec_plus_1m_write signal=11 code=1
+after_exec_plus_1m_exec signal=11 code=1
+after_exec_plus_3m_read signal=11 code=1
+after_exec_plus_3m_write signal=11 code=1
+after_exec_plus_3m_exec signal=11 code=1

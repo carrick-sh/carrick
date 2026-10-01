@@ -3514,19 +3514,12 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
         AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     mgr.set_multi_vcpu(true);
-    let heap_size = usize::try_from(LINUX_HEAP_SIZE).unwrap_or_else(|_| {
+    if let Err(error) = seal_heap_window(&mut mgr) {
         carrick_fatal!(
             "mem::stage1_tables",
-            "configured Linux heap size {:#x} exceeded host pointer width during stage-1 identity page table initialization",
-            LINUX_HEAP_SIZE
-        );
-    });
-    if mgr.set_prot_none(LINUX_HEAP_BASE, heap_size, None).is_err() {
-        carrick_fatal!(
-            "mem::stage1_tables",
-            "failed to apply PROT_NONE to heap region at {:#x} (size {:#x}) in initial stage-1 page tables",
+            "failed to apply PROT_NONE to heap region at {:#x} (size {:#x}) in initial stage-1 page tables: {error:?}",
             LINUX_HEAP_BASE,
-            heap_size
+            LINUX_HEAP_SIZE
         );
     }
     match mgr.into_bytes() {
@@ -3538,6 +3531,27 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
             );
         }
     }
+}
+
+/// Make the whole heap window `[LINUX_HEAP_BASE, +LINUX_HEAP_SIZE)` unmapped
+/// in a fresh image's stage-1 tables.
+///
+/// A new image has no program break above `heap_base`: Linux maps heap pages
+/// only as `brk` grows, so every access past the break faults. The leaves keep
+/// their output address as PROT_NONE so `brk` growth re-validates them in
+/// place. Every builder of a fresh image (boot, exec rebuild) seals the window
+/// after laying out its mappings; a remap of the heap's backing that is not
+/// followed by this seal hands the image a readable, writable and executable
+/// heap.
+pub fn seal_heap_window(
+    mgr: &mut carrick_mmu_core::aarch64::PageTableManager,
+) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+    const HEAP_LEN: usize = {
+        assert!(LINUX_HEAP_SIZE <= usize::MAX as u64);
+        LINUX_HEAP_SIZE as usize
+    };
+    mgr.set_prot_none(LINUX_HEAP_BASE, HEAP_LEN, None)
+        .map(|_| ())
 }
 
 /// Build the per-mm HVPatch stage-1 image.

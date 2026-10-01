@@ -129,6 +129,14 @@
     "excluded": false,
     "runner": "conformance_bridge_udp_sendto_unreachable"
   },
+  "brkbeyondbreak": {
+    "class": "conformance",
+    "contract_ids": [
+      "kernel.mm.exec-heap-window"
+    ],
+    "excluded": false,
+    "runner": "generic"
+  },
   "brkheapgrow": {
     "class": "conformance",
     "excluded": false,

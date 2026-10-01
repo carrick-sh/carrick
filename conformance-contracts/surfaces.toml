@@ -638,3 +638,7 @@ contracts = ["kernel.el1.deferred-handback-identity", "kernel.el1.guest-schedule
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/format_time.rs"
 contracts = ["kernel.time.coarse-clock-vdso"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs"
+contracts = ["kernel.mm.exec-heap-window"]
