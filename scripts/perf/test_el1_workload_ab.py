@@ -197,7 +197,8 @@ class ReportTest(unittest.TestCase):
         }
         cpu_summary = {
             "sample_population": 100, "guest_execution_samples": 60, "host_syscall_samples": 20,
-            "fault_service_samples": 10, "executor_scheduling_samples": 5, "el1_mailbox_samples": 1,
+            "fault_service_samples": 8, "executor_scheduling_samples": 5, "lifecycle_samples": 2,
+            "el1_mailbox_samples": 1,
             "lock_wait_samples": 1, "other_samples": 3,
         }
         attribution = {"workloads": {"go-build": {"lane-on": {
@@ -215,7 +216,8 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(report["workloads"]["go-build"]["lane-off"]["elapsed_over_docker"], 4.0)
         table = ab.render_report(report)
         self.assertEqual(on["carrier_cpu_share"]["guest"], 0.6)
-        self.assertIn("| go-build | lane-on | 1000 | 500 | 10.00 | 2.00x | 2.00x | 4/3/2/1 | 4/3/2/1 | 60/20/10/5 |", table)
+        self.assertEqual(on["carrier_cpu_share"]["lifecycle"], 0.02)
+        self.assertIn("| go-build | lane-on | 1000 | 500 | 10.00 | 2.00x | 2.00x | 4/3/2/1 | 4/3/2/1 | 60/20/8/5/2 |", table)
 
 
 if __name__ == "__main__":

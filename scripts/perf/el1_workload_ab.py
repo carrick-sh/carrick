@@ -75,6 +75,7 @@ CARRIER_SHARE_KEYS = (
     ("syscall", "host_syscall"),
     ("fault", "fault_service"),
     ("sched", "executor_scheduling"),
+    ("lifecycle", "lifecycle"),
     ("el1-mailbox", "el1_mailbox"),
     ("lock", "lock_wait"),
     ("other", "other"),
@@ -687,7 +688,7 @@ def render_report(report: dict[str, object]) -> str:
     arms = report["arms"]  # type: ignore[index]
     labels = [arms["A"]["label"], arms["B"]["label"]]  # type: ignore[index]
     lines = [
-        "| workload | arm | wall ms | window ms | cpu s | wall/docker | window/docker | exits syscall/fault/kick-idle/other | host ms syscall/fault/kick-idle/other | carrier CPU % guest/syscall/fault/sched |",
+        "| workload | arm | wall ms | window ms | cpu s | wall/docker | window/docker | exits syscall/fault/kick-idle/other | host ms syscall/fault/kick-idle/other | carrier CPU % guest/syscall/fault/sched/lifecycle |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, entry in report["workloads"].items():  # type: ignore[union-attr]
@@ -704,7 +705,7 @@ def render_report(report: dict[str, object]) -> str:
                 f"| {fmt(row.get('workload_over_docker'), '.2f')}x "
                 f"| {'/'.join(str(exits[k]) for k in order) if exits else '-'} "
                 f"| {'/'.join(format(host[k], '.0f') for k in order) if host else '-'} "
-                f"| {'/'.join(format(100 * share[k], '.0f') for k in ('guest', 'syscall', 'fault', 'sched')) if share else '-'} |"
+                f"| {'/'.join(format(100 * share[k], '.0f') for k in ('guest', 'syscall', 'fault', 'sched', 'lifecycle')) if share else '-'} |"
             )
     return "\n".join(lines)
 

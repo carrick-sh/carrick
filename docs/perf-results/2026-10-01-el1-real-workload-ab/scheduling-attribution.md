@@ -246,3 +246,26 @@ fault and lifecycle cost rather than scheduling.
 `clock_gettime` calls to the host (the largest forwarded row; see the campaign
 exit attribution). That points to a clock id the vDSO does not serve, and is
 worth a separate look.
+
+## Classifier fixed (follow-up)
+
+The profile now symbolizes without debug-map stabs and files each stack by
+its leaf-most named frame. `run_executor_loop` and `executor_worker` are only
+a fallback (loop residual and inlined callees such as the nudge `write`).
+Fault settlement is filed as `fault_service/mm-mutation-settle`. Fork/clone
+service, fork-quiesce parks, exit teardown and CLI startup are filed in a new
+`lifecycle` bucket. The same `el1ab-202610010107` raw streams, re-read by
+`carrick __hvpatch-carrier-cpu-attribution-validate` against the capture
+binary (`CARRICK_BIN`, sha256 `c2c6b14f…`), now split as follows:
+
+| lane off | sched old → new | mm-mutation-settle | lifecycle (fork-clone / quiesce-park / teardown / startup) | lock wait old → new |
+|---|---|---|---|---|
+| go-build | 968 (11.5%) → 619 (7.4%) | 92 | 262 (36 / 42 / 100 / 84) | 3 → 50 |
+| cpython-threading | 1220 (13.7%) → 401 (4.5%) | 78 | 1574 (1084 / 7 / 410 / 73) | 2 → 74 |
+| node-core-worker-message-port | 1862 (16.7%) → 1164 (10.5%) | 346 | 306 (48 / 116 / 102 / 40) | 7 → 102 |
+
+cpython's `fork-clone` row is mostly thread creation that the old profile
+filed under `host_syscall/dispatch` through `service_outcome`:
+`spawn_persistent_hvpatch_clone_thread` → `HvpatchTaskOnlyEngineState::activate_child`
+→ `TaskMappingIndex::insert`, rebuilt per cloned thread. It is about 12% of
+cpython's carrier CPU and is worth its own investigation.
