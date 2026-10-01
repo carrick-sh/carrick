@@ -7433,3 +7433,336 @@ fn a_frame_split_across_one_mms_extents_is_still_solely_owned() {
     inventory.frames.lock().references.insert(frame, 4);
     assert_eq!(route_for(&inventory, base + 0x4000, 4), CowWriteRoute::Copy);
 }
+
+/// One mm holding the exact owner of a fresh reusable global lease as its
+/// only inventory extent, ready for process-terminal retirement against the
+/// Kernel population `kernel` and the shared backend registry `frames`.
+fn exit_task_holding_owned_lease(
+    mm: u64,
+    guest_start: u64,
+    frame: u64,
+    mapping: u64,
+    kernel: &std::sync::Arc<PerFrameKernel>,
+    frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+) -> (HvfTaskState, (u64, u64), u64, carrick_hal::FrameId) {
+    let mut lease =
+        GlobalFrameStage2Lease::reserve(0x4000, 0x4000).expect("reserve global frame IPA");
+    let key = lease.key();
+    let guest_mapping = GuestMapping {
+        guest_start,
+        mapped_size: key.1,
+        ipa_start: key.0,
+        perms: carrick_mem::elf::SegmentPerms {
+            read: true,
+            write: true,
+            execute: false,
+        },
+        shared: false,
+        image: std::sync::Arc::new(vec![0u8; key.1 as usize]),
+        payload_size: key.1,
+        offset_in_mapping: 0,
+        private_file_backing: None,
+    };
+    let mut region = prepare_exec_region_raw(&guest_mapping).expect("prepare exec region");
+    lease.mark_mapped();
+    let generation =
+        publish_exec_region_host_owner(&mut region, lease).expect("publish exec region host owner");
+    let stage2_owner = mapped_region_stage2_owner_identity(&region)
+        .expect("published exec region has a physical owner identity");
+    disarm_test_owner_stage2_unmap(key, generation);
+    mark_el1_frame_grant_in(
+        legacy_test_carrier_vm_custody(),
+        key.0,
+        key.1,
+        mm,
+        generation,
+    )
+    .unwrap();
+    let frame = carrick_hal::FrameId::from_kernel_allocation(id(frame));
+    let mapping = carrick_hal::MappingId::from_kernel_allocation(id(mapping));
+    let mut task = hvpatch_task_state_test_fixture(mm, key.0, mm as i32);
+    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::PerFrame(
+        std::sync::Arc::clone(kernel),
+    )));
+    task.mappings = TaskMappingIndex::from_region(region);
+    {
+        let mut inventory = task.frame_inventory.lock();
+        inventory.frames = std::sync::Arc::clone(frames);
+        inventory.initialized = true;
+        inventory.extents.insert(
+            key,
+            InventoryExtent {
+                frame,
+                mapping,
+                backing: InventoryBackingIdentity::Private(mm),
+                stage2_base: key.0,
+                stage2_length: key.1,
+                stage2_owner,
+            },
+        );
+        {
+            let mut registry = inventory.frames.lock();
+            registry.references.insert(frame, 1);
+            registry.extent_references.insert((frame, key.0, key.1), 1);
+            registry.stage2_references.insert(key, 1);
+        }
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(8).unwrap();
+        inventory.retirement_reservation = Some(
+            carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                carrick_hal::FrameInventoryProvenance::from_kernel_entropy([mm as u8; 32]),
+                carrick_hal::FrameInventoryBatch::prepare(
+                    carrick_hal::KernelTransactionId::from_kernel_allocation(id(mm)),
+                    capacity,
+                )
+                .unwrap(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+    }
+    kernel.counts.lock().insert(frame, 1);
+    (task, key, generation, frame)
+}
+
+/// A fork sibling of `owner_task`: a second mm whose only inventory extent
+/// names the same frame under the same owner incarnation, as fork
+/// materialization leaves it, with its backend references added.
+fn fork_sibling_of(
+    owner_task: &HvfTaskState,
+    mm: u64,
+    mapping: u64,
+    kernel: &std::sync::Arc<PerFrameKernel>,
+) -> HvfTaskState {
+    let (key, extent, frames) = {
+        let inventory = owner_task.frame_inventory.lock();
+        let (&key, &extent) = inventory.extents.iter().next().expect("one extent");
+        (key, extent, std::sync::Arc::clone(&inventory.frames))
+    };
+    let mut task = hvpatch_task_state_test_fixture(mm, key.0, mm as i32);
+    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::PerFrame(
+        std::sync::Arc::clone(kernel),
+    )));
+    let mut inventory = task.frame_inventory.lock();
+    inventory.frames = std::sync::Arc::clone(&frames);
+    inventory.initialized = true;
+    inventory.extents.insert(
+        key,
+        InventoryExtent {
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(mapping)),
+            backing: InventoryBackingIdentity::Private(mm),
+            ..extent
+        },
+    );
+    {
+        let mut registry = frames.lock();
+        *registry.references.get_mut(&extent.frame).unwrap() += 1;
+        *registry
+            .extent_references
+            .get_mut(&(extent.frame, key.0, key.1))
+            .unwrap() += 1;
+        *registry.stage2_references.get_mut(&key).unwrap() += 1;
+    }
+    let capacity = carrick_hal::FrameEventCapacity::for_event_count(8).unwrap();
+    inventory.retirement_reservation = Some(
+        carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([mm as u8; 32]),
+            carrick_hal::FrameInventoryBatch::prepare(
+                carrick_hal::KernelTransactionId::from_kernel_allocation(id(mm)),
+                capacity,
+            )
+            .unwrap(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    drop(inventory);
+    *kernel.counts.lock().get_mut(&extent.frame).unwrap() += 1;
+    task
+}
+
+fn carries_conditional_retire_of(task: &mut HvfTaskState, frame: carrick_hal::FrameId) -> bool {
+    let commit = HvfVmState::take_task_state_retirement_inventory(task).expect("retirement commit");
+    commit.batch().events().iter().any(|event| {
+        matches!(
+            *event,
+            carrick_hal::FrameInventoryEvent::RetireFrameIfLastUnmap { frame: retiring, .. }
+                if retiring == frame
+        )
+    })
+}
+
+/// A fork parent and child map one grant frame and both exit. Each
+/// retirement decides before its Kernel unmap is applied, so neither can
+/// know whose unmap is last (signed `el1_anonymous_discard_and_exit_return_frames`
+/// leaked the grant 12 of 14 runs when both declined). The retirement that
+/// drops the last backend reference carries `RetireFrameIfLastUnmap`; the
+/// Kernel retires the frame in whichever batch applies the last unmap, and
+/// the retirement whose batch that was retires the exact owner, in either
+/// apply order.
+#[test]
+fn fork_siblings_retiring_together_retire_the_shared_grant_in_either_apply_order() {
+    for parent_applies_first in [true, false] {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+        let observer = El1FrameGrantObserver::new(legacy_test_carrier_vm_custody());
+        let before = observer.snapshot();
+        let kernel = std::sync::Arc::new(PerFrameKernel::default());
+        let frames =
+            std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+        let (mut parent, key, generation, frame) =
+            exit_task_holding_owned_lease(12, 0x40_0000, 41, 42, &kernel, &frames);
+        let mut child = fork_sibling_of(&parent, 13, 43, &kernel);
+        assert_eq!(kernel.counts.lock()[&frame], 2);
+
+        // The child decides first: the parent still holds a backend
+        // reference, so the child neither retires nor carries a retirement.
+        HvfVmState::retire_task_state_process_mappings(&mut child).unwrap();
+        assert!(!carries_conditional_retire_of(&mut child, frame));
+        // The parent drops the last backend reference while the Kernel still
+        // counts the child's pending unmap: it carries the conditional.
+        HvfVmState::retire_task_state_process_mappings(&mut parent).unwrap();
+        assert!(carries_conditional_retire_of(&mut parent, frame));
+        assert_eq!(global_frame_host_owner_generation(key.0, key.1), generation);
+
+        // Kernel applies, in this order: the first leaves one mapping (the
+        // conditional, if carried, defers); the second unmaps the last one
+        // and the Kernel retires the frame in that batch.
+        let (first, second) = if parent_applies_first {
+            (&parent, &child)
+        } else {
+            (&child, &parent)
+        };
+        kernel.counts.lock().insert(frame, 1);
+        assert_eq!(
+            HvfVmState::settle_task_state_declined_lease_remainders(first).unwrap(),
+            0,
+            "the Kernel still knows the frame after the first apply"
+        );
+        assert_eq!(global_frame_host_owner_generation(key.0, key.1), generation);
+        kernel.counts.lock().remove(&frame);
+        assert_eq!(
+            HvfVmState::settle_task_state_declined_lease_remainders(second).unwrap(),
+            1,
+            "the retirement whose batch retired the frame retires its owner"
+        );
+        assert_eq!(global_frame_host_owner_generation(key.0, key.1), 0);
+        let after = observer.snapshot();
+        assert!(after.complete);
+        assert_eq!(after.returns_completed - before.returns_completed, 1);
+        assert_eq!(after.bytes_returned - before.bytes_returned, key.1);
+    }
+}
+
+/// An owner is authenticated by generation, never by address: once that
+/// incarnation is gone and a successor owns the same lease, a remainder that
+/// names the old one leaves the successor untouched.
+#[test]
+fn a_declined_remainder_never_retires_a_successor_owner_at_the_same_lease() {
+    let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (mut holder, key, generation, frame) =
+        exit_task_holding_owned_lease(14, 0x40_0000, 61, 62, &kernel, &frames);
+    kernel.counts.lock().insert(frame, 2);
+    HvfVmState::retire_task_state_process_mappings(&mut holder).unwrap();
+    assert_eq!(holder.frame_inventory.lock().declined_leases.len(), 1);
+
+    // The incarnation leaves by another path; a successor takes the lease.
+    let outcome = retire_global_frame_host_owner_if_generation_in(
+        legacy_test_carrier_vm_custody(),
+        key.0,
+        key.1,
+        generation,
+    );
+    assert!(matches!(
+        outcome,
+        GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+    ));
+    let other_frames =
+        std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (_successor, successor_key, successor_generation, _) =
+        exit_task_holding_owned_lease(15, 0x80_0000, 71, 72, &kernel, &other_frames);
+    assert_eq!(successor_key, key, "the allocator reuses the retired lease");
+    assert_ne!(successor_generation, generation);
+    kernel.counts.lock().remove(&frame);
+
+    assert_eq!(
+        HvfVmState::settle_task_state_declined_lease_remainders(&holder).unwrap(),
+        0
+    );
+    assert_eq!(
+        global_frame_host_owner_generation(key.0, key.1),
+        successor_generation
+    );
+}
+
+/// The unmap form: T4b reconciliation returns owed stock by retiring an
+/// EL1-unmapped sub-range through the alias lease retirement. When it drops
+/// the last backend reference while a fork sibling's unmap is still pending
+/// in the Kernel, it must carry the conditional retirement and leave the
+/// remainder it settles after its apply.
+#[test]
+fn an_unmap_retirement_racing_a_sibling_unmap_carries_the_conditional_retire() {
+    let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+    let observer = El1FrameGrantObserver::new(legacy_test_carrier_vm_custody());
+    let before = observer.snapshot();
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (unmapping, key, generation, frame) =
+        exit_task_holding_owned_lease(16, 0x40_0000, 81, 82, &kernel, &frames);
+    let retirement = {
+        let mut inventory = unmapping.frame_inventory.lock();
+        let retirement = HvfVmState::inventory_lease_retirement_shape(
+            &inventory,
+            &std::collections::BTreeSet::from([AuthenticatedLease::new(key, generation)]),
+            &|_| Ok(Some(2)),
+        )
+        .unwrap();
+        assert!(retirement.frames.is_empty(), "a sibling's unmap is pending");
+        assert_eq!(
+            retirement.conditional_frames,
+            std::collections::BTreeSet::from([frame])
+        );
+        assert_eq!(retirement.event_count(), 2);
+        HvfVmState::commit_inventory_lease_retirement(&mut inventory, &retirement).unwrap();
+        retirement
+    };
+    assert_eq!(retirement.declined.len(), 1);
+    let settle = |declined: Vec<DeclinedLeaseRemainder>| {
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+            0,
+            0,
+        );
+        HvfVmState::settle_declined_lease_remainders(
+            legacy_test_carrier_vm_custody(),
+            &frames,
+            &TestFrameMappingCount::PerFrame(std::sync::Arc::clone(&kernel)),
+            declined,
+            &registry,
+        )
+        .unwrap()
+    };
+    // Its own apply left the sibling's mapping: the conditional deferred.
+    kernel.counts.lock().insert(frame, 1);
+    assert_eq!(settle(retirement.declined.clone()), 0);
+    assert_eq!(global_frame_host_owner_generation(key.0, key.1), generation);
+    // Applied as the last unmap, the Kernel retired the frame in this batch.
+    kernel.counts.lock().remove(&frame);
+    assert_eq!(settle(retirement.declined.clone()), 1);
+    assert_eq!(global_frame_host_owner_generation(key.0, key.1), 0);
+    assert_eq!(
+        observer.snapshot().returns_completed - before.returns_completed,
+        1
+    );
+}
+
+/// A shared-file frame stays published for later mappers, so a retirement
+/// never leaves it a pending Kernel retirement a new mapping could race.
+#[test]
+fn a_shared_file_frame_never_carries_a_conditional_retire() {
+    assert!(!carries_conditional_retire(1, 1, Some(2), false));
+    assert!(carries_conditional_retire(1, 1, Some(2), true));
+    assert!(!carries_conditional_retire(2, 1, Some(2), true));
+    assert!(!carries_conditional_retire(1, 1, Some(1), true));
+    assert!(!carries_conditional_retire(1, 1, None, true));
+}

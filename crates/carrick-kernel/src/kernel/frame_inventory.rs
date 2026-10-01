@@ -137,7 +137,13 @@ struct ReservationRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameEntry {
     length: FrameLength,
-    mapping_count: usize,
+    /// `u32` keeps the entry at 16 bytes with the flag below
+    /// (`high_alias_frame_keeps_constant_size_apply_state`); exhausting it
+    /// is `MappingCountExhausted`, as it was for `usize`.
+    mapping_count: u32,
+    /// A `RetireFrameIfLastUnmap` found mappings remaining: the batch that
+    /// applies the last unmap retires the frame.
+    retire_on_last_unmap: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -688,7 +694,10 @@ impl FrameInventoryAuthority {
 
     pub fn frame_mapping_count(&self, frame: FrameId) -> Option<usize> {
         let state = self.state.lock();
-        state.frames.get(&frame).map(|entry| entry.mapping_count)
+        state
+            .frames
+            .get(&frame)
+            .map(|entry| entry.mapping_count as usize)
     }
 
     /// Query extent liveness for a batch of candidate extents and reference
@@ -714,7 +723,12 @@ impl FrameInventoryAuthority {
             .collect();
         let frame_counts = frames
             .iter()
-            .map(|&frame| state.frames.get(&frame).map(|entry| entry.mapping_count))
+            .map(|&frame| {
+                state
+                    .frames
+                    .get(&frame)
+                    .map(|entry| entry.mapping_count as usize)
+            })
             .collect();
         (extent_liveness, frame_counts)
     }
@@ -817,6 +831,7 @@ fn apply_event(
                     FrameEntry {
                         length,
                         mapping_count: 0,
+                        retire_on_last_unmap: false,
                     },
                 );
             }
@@ -837,6 +852,8 @@ fn apply_event(
                 .mapping_count
                 .checked_add(1)
                 .ok_or(FrameInventoryError::MappingCountExhausted(frame))?;
+            // A new holder owns the frame's retirement from here on.
+            frame_entry.retire_on_last_unmap = false;
             state.insert_mapping(
                 mapping,
                 MappingEntry {
@@ -908,7 +925,17 @@ fn apply_event(
                 .mapping_count
                 .checked_sub(1)
                 .ok_or(FrameInventoryError::MappingCountUnderflow(frame_id))?;
+            let retire = frame.mapping_count == 0 && frame.retire_on_last_unmap;
             state.unmap_mapping(mapping, frame_id, generation);
+            if retire {
+                tracing::debug!(
+                    ?mm,
+                    ?transaction,
+                    frame = ?frame_id,
+                    "frame inventory: last unmap applies the pending retirement"
+                );
+                state.retire_frame(frame_id);
+            }
         }
         FrameInventoryEvent::RetireFrame {
             frame, generation, ..
@@ -933,8 +960,61 @@ fn apply_event(
             }
             state.retire_frame(frame);
         }
+        FrameInventoryEvent::RetireFrameIfLastUnmap {
+            frame, generation, ..
+        } => {
+            let outcome = match state.frame(frame).copied() {
+                // An earlier holder's pending retirement already ran in this
+                // batch's last unmap, or another holder's batch retired it.
+                None => ConditionalRetirement::AlreadyRetired,
+                Some(entry) if entry.mapping_count == 0 => {
+                    let expected = state
+                        .last_unmapped
+                        .get(&frame)
+                        .copied()
+                        .ok_or(FrameInventoryError::RetireWithoutUnmap(frame))?;
+                    if generation != expected {
+                        return Err(FrameInventoryError::FrameGenerationMismatch {
+                            frame,
+                            expected: expected.raw(),
+                            actual: generation.raw(),
+                        });
+                    }
+                    state.retire_frame(frame);
+                    ConditionalRetirement::Retired
+                }
+                Some(entry) if entry.retire_on_last_unmap => ConditionalRetirement::AlreadyPending,
+                Some(_) => {
+                    let entry = state
+                        .frame_mut(frame)
+                        .ok_or(FrameInventoryError::RetiredFrame(frame))?;
+                    entry.retire_on_last_unmap = true;
+                    ConditionalRetirement::Deferred
+                }
+            };
+            tracing::debug!(
+                ?mm,
+                ?transaction,
+                ?frame,
+                ?outcome,
+                "frame inventory conditional retirement"
+            );
+        }
     }
     Ok(())
+}
+
+/// What one `RetireFrameIfLastUnmap` did, for the trace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConditionalRetirement {
+    /// This batch applied the last unmap: the frame retired here.
+    Retired,
+    /// Mappings remain; the batch applying the last unmap retires it.
+    Deferred,
+    /// Another holder already left the same pending retirement.
+    AlreadyPending,
+    /// The frame was retired before this event.
+    AlreadyRetired,
 }
 
 fn live_mapping_mut<'a>(
@@ -1827,6 +1907,176 @@ mod tests {
             .expect("retire last cross-mm alias");
         assert!(fixture.authority.snapshot().frames.is_empty());
         assert!(fixture.authority.snapshot().mappings.is_empty());
+    }
+
+    /// Two mms map one frame (a fork parent and child) and both retire. A
+    /// retirement decides before its unmap is applied, so neither can know
+    /// whose unmap will be last: each batch that dropped the last backend
+    /// reference carries `RetireFrameIfLastUnmap`. Whatever the apply order
+    /// and whichever batches carry it, the frame retires exactly in the batch
+    /// that applies its last unmap, and every other carrier is a no-op.
+    #[test]
+    fn conditional_retire_runs_in_whichever_batch_applies_the_last_unmap() {
+        // (mm1 applies first, first applier carries, second applier carries)
+        for (first_mm1, first_carries, second_carries) in [
+            (true, true, true),
+            (false, true, true),
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (false, false, true),
+        ] {
+            let fixture = Fixture::new();
+            let mut ids = None;
+            let first = fixture.batch(2, |transaction, reservation| {
+                let frame = reservation.claim_frame().expect("frame");
+                let mapping = reservation.claim_mapping().expect("mapping");
+                ids = Some((frame, mapping));
+                prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
+            });
+            fixture.authority.apply(fixture.mm1, first).expect("parent");
+            let (frame, parent_mapping) = ids.expect("parent IDs");
+            let mut child_mapping = None;
+            let child = fixture.batch(2, |transaction, reservation| {
+                let mapping = reservation.claim_mapping().expect("mapping");
+                child_mapping = Some(mapping);
+                prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
+            });
+            fixture.authority.apply(fixture.mm2, child).expect("child");
+            let child_mapping = child_mapping.expect("child mapping");
+
+            let unmap = |mapping, carries: bool| {
+                fixture.batch(2, |transaction, reservation| {
+                    reservation
+                        .push(FrameInventoryEvent::UnmapMapping {
+                            transaction,
+                            mapping,
+                            generation: generation(2),
+                        })
+                        .expect("unmap");
+                    if carries {
+                        reservation
+                            .push(FrameInventoryEvent::RetireFrameIfLastUnmap {
+                                transaction,
+                                frame,
+                                generation: generation(2),
+                            })
+                            .expect("conditional retire");
+                    }
+                })
+            };
+            // Both decide before either applies.
+            let parent_retire = unmap(
+                parent_mapping,
+                if first_mm1 {
+                    first_carries
+                } else {
+                    second_carries
+                },
+            );
+            let child_retire = unmap(
+                child_mapping,
+                if first_mm1 {
+                    second_carries
+                } else {
+                    first_carries
+                },
+            );
+            let (first, second) = if first_mm1 {
+                ((fixture.mm1, parent_retire), (fixture.mm2, child_retire))
+            } else {
+                ((fixture.mm2, child_retire), (fixture.mm1, parent_retire))
+            };
+            fixture
+                .authority
+                .apply(first.0, first.1)
+                .expect("first unmap");
+            assert_eq!(
+                fixture.authority.frame_mapping_count(frame),
+                Some(1),
+                "the sibling still maps the frame after the first unmap"
+            );
+            fixture
+                .authority
+                .apply(second.0, second.1)
+                .expect("last unmap");
+            assert_eq!(
+                fixture.authority.frame_mapping_count(frame),
+                None,
+                "the last unmap retires the frame: first_mm1={first_mm1} \
+                 carries=({first_carries}, {second_carries})"
+            );
+            assert!(fixture.authority.snapshot().frames.is_empty());
+        }
+    }
+
+    /// A pending conditional retirement belongs to the population that was
+    /// leaving. A later publication of the frame starts a new population and
+    /// cancels it: the new holder's own retirement decides.
+    #[test]
+    fn a_new_mapping_cancels_a_pending_conditional_retire() {
+        let fixture = Fixture::new();
+        let mut ids = None;
+        let first = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("frame");
+            let mapping = reservation.claim_mapping().expect("mapping");
+            ids = Some((frame, mapping));
+            prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
+        });
+        fixture.authority.apply(fixture.mm1, first).expect("first");
+        let (frame, first_mapping) = ids.expect("IDs");
+        let mut second_mapping = None;
+        let second = fixture.batch(2, |transaction, reservation| {
+            let mapping = reservation.claim_mapping().expect("mapping");
+            second_mapping = Some(mapping);
+            prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
+        });
+        fixture
+            .authority
+            .apply(fixture.mm2, second)
+            .expect("second");
+        let conditional = fixture.batch(2, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: first_mapping,
+                    generation: generation(2),
+                })
+                .expect("unmap");
+            reservation
+                .push(FrameInventoryEvent::RetireFrameIfLastUnmap {
+                    transaction,
+                    frame,
+                    generation: generation(2),
+                })
+                .expect("conditional");
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, conditional)
+            .expect("defer");
+        let third = fixture.batch(2, |transaction, reservation| {
+            let mapping = reservation.claim_mapping().expect("mapping");
+            prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, third)
+            .expect("republish");
+        let unmap_second = fixture.batch(1, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: second_mapping.expect("second mapping"),
+                    generation: generation(2),
+                })
+                .expect("unmap");
+        });
+        fixture
+            .authority
+            .apply(fixture.mm2, unmap_second)
+            .expect("unmap");
+        assert_eq!(fixture.authority.frame_mapping_count(frame), Some(1));
     }
 
     #[test]

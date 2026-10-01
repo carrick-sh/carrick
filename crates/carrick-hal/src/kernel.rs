@@ -189,6 +189,22 @@ pub enum FrameInventoryEvent {
         frame: FrameId,
         generation: MappingGeneration,
     },
+    /// Retire `frame` once its last mapping is unmapped, deciding at apply
+    /// time rather than when the backend built the batch.
+    ///
+    /// A backend that drops the last backend reference to a frame while the
+    /// Kernel still counts another mm's mapping cannot retire it: that
+    /// mapping's unmap may be decided but not yet applied (a fork parent and
+    /// child retiring together). This event carries the retirement with the
+    /// unmap instead. If this batch's unmap of `frame` (at `generation`) took
+    /// its count to zero, the frame retires here; if mappings remain, the
+    /// Kernel retires it in whichever later batch applies its last unmap. A
+    /// later publication of the frame cancels the pending retirement.
+    RetireFrameIfLastUnmap {
+        transaction: KernelTransactionId,
+        frame: FrameId,
+        generation: MappingGeneration,
+    },
 }
 
 impl FrameInventoryEvent {
@@ -198,7 +214,8 @@ impl FrameInventoryEvent {
             | Self::PublishMapping { transaction, .. }
             | Self::ProtectMapping { transaction, .. }
             | Self::UnmapMapping { transaction, .. }
-            | Self::RetireFrame { transaction, .. } => transaction,
+            | Self::RetireFrame { transaction, .. }
+            | Self::RetireFrameIfLastUnmap { transaction, .. } => transaction,
         }
     }
 
@@ -208,7 +225,8 @@ impl FrameInventoryEvent {
             | Self::PublishMapping { generation, .. }
             | Self::ProtectMapping { generation, .. }
             | Self::UnmapMapping { generation, .. }
-            | Self::RetireFrame { generation, .. } => generation,
+            | Self::RetireFrame { generation, .. }
+            | Self::RetireFrameIfLastUnmap { generation, .. } => generation,
         }
     }
 }
