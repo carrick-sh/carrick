@@ -1760,6 +1760,26 @@ pub fn retire_detached_task_shared_root_with_proof(
     )
 }
 
+/// Retire the owners this detached task's process retirement left once the
+/// Kernel applied it (see `DeclinedLeaseRemainder`).
+pub fn settle_detached_task_engine_declined_remainders(
+    state: &mut HvpatchTaskEngineState,
+) -> Result<(), TrapError> {
+    HvfVmState::settle_task_state_declined_lease_remainders(&state.backend_mut().state.task)
+        .map(|_| ())
+}
+
+/// [`settle_detached_task_engine_declined_remainders`] for a task-only engine.
+pub fn settle_detached_task_only_engine_declined_remainders(
+    state: &HvpatchTaskOnlyEngineState,
+) -> Result<(), TrapError> {
+    let parked = state.parked_task.lock();
+    let task = parked.as_ref().ok_or_else(|| {
+        TrapError::Hypervisor("detached task-only settlement has no parked task state".to_owned())
+    })?;
+    HvfVmState::settle_task_state_declined_lease_remainders(task).map(|_| ())
+}
+
 pub fn retire_detached_task_only_engine(
     state: &HvpatchTaskOnlyEngineState,
 ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
