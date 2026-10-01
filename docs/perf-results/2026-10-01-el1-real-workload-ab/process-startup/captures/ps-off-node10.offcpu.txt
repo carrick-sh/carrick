@@ -1,0 +1,26 @@
+total off-cpu 88.99 s
+     44355 ms  runqueue-park
+     14354 ms  other:__rust_begin_short_backtrace (in carrick < call_once$u7b$$u7b$vtable.shim$u7d$$u7d$ < _RNvNvMs0_NtNtNtCsaLOjE9VYtxK_3std3sys6t
+      7836 ms  other:unsymbolized
+      5659 ms  other:wait_until_internal (in carrick-main) +  < wait_preemption_work (in carrick-main) + < __rust_begin_short_backtrace (in carrick
+      5588 ms  other:wait_until_internal (in carrick-main) +  < wait_supervised (in carrick-main) + 328 < wait (in carrick-main) + 136
+      4870 ms  fork
+       954 ms  other:attach_exec_private_file_backings (in ca < execve_rebuild_inner (in carrick-main) + < execve_rebuild (in carrick-main) + 56
+       922 ms  zone-idle-entry
+       434 ms  pt/fork-quiesce
+       384 ms  other:lock_slow (in carrick-main) + 648 < with_hvpatch_exec_cache (in carrick-main < load_execve_image (in carrick-main) + 29
+       289 ms  other:_RNvMs_NtNtCsaLOjE9VYtxK_3std6thread6thr < _$u7b$$u7b$closure$u7d$$u7d$ (in carrick < recv (in carrick-main) + 324
+       216 ms  other:lock_slow (in carrick-main) + 648 < try_commit_process_alias_retirement (in  < commit_process_alias_retirement_inner (i
+       204 ms  other:lock_slow (in carrick-main) + 648 < plan_process_alias_retirement (in carric < unregister_process_alias (in carrick-mai
+       197 ms  other:lock_slow (in carrick-main) + 648 < prepare_el1_frame_grant (in carrick-main < resolve_mutating_fault (in carrick-main)
+       124 ms  other:lock_slow (in carrick-main) + 648 < try_init (in carrick-main) + 2152 < call_mut (in carrick-main) + 548
+       117 ms  other:lock_slow (in carrick-main) + 648 < try_init (in carrick-main) + 2152 < mapping_for_range_in (in carrick-main) +
+        94 ms  other:lock_slow (in carrick-main) + 648 < read_guest_bytes_into (in carrick-main)  < read_guest_bytes (in carrick-main) + 124
+        92 ms  other:run_executor_loop (in carrick-main) + 12 < executor_worker (in carrick-main) + 5928 < __rust_begin_short_backtrace (in carrick
+        90 ms  other:open_file_readonly (in carrick-main) + 1 < acquire_exec_source (in carrick-main) +  < load_execve_image (in carrick-main) + 26
+        79 ms  other:lock_slow (in carrick-main) + 648 < global_frame_host_owner_matches_in (in c < <deduplicated_symbol> (in carrick-main) 
+        77 ms  other:lock_slow (in carrick-main) + 648 < mapping_for_range_in (in carrick-main) + < resolve_guest_copy_mapping (in carrick-m
+        75 ms  other:lock_slow (in carrick-main) + 648 < restore_submission_authority (in carrick < run_executor_loop (in carrick-main) + 98
+        67 ms  other:run (in carrick-main) + 16 < run_to_exit (in carrick-main) + 472 < run (in carrick-main) + 424
+        64 ms  other:lock_slow (in carrick-main) + 648 < ensure_sparse_mmap_backing_censused (in  < ensure_sparse_mmap_backing (in carrick-m
+        61 ms  other:lock_slow (in carrick-main) + 648 < retire_stage2_candidate_if_unreferenced  < retire_task_state_process_mappings_inner

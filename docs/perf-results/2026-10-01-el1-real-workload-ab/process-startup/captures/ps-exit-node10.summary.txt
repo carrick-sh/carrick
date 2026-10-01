@@ -1,0 +1,29 @@
+[2m2026-10-01T12:05:59.411228Z[0m [33m WARN[0m [2mcarrick::commands[0m[2m:[0m carrick trace: not root; re-executing under sudo
+LOOP lanes=10 N=6 per_process_ms=726.8
+HVPatch exit attribution (instrumented run; counts citable, times inflated): exits=95413 forwarded_syscalls=37639 guest_oncpu_ms=2144.8 (35.2%) host_oncpu_ms=3940.7 (64.8%)
+  bucket fault      exits=     39144 ( 41.0%) host_oncpu_ms=     895.6
+  bucket kick-idle  exits=      4395 (  4.6%) host_oncpu_ms=     117.1
+  bucket other      exits=     13661 ( 14.3%) host_oncpu_ms=     884.7
+  bucket syscall    exits=     38213 ( 40.1%) host_oncpu_ms=    2043.4
+    class canceled     exits=      1327 host_oncpu_ms=      10.1
+    class idle         exits=      2522 host_oncpu_ms=     100.0
+    class kick         exits=       546 host_oncpu_ms=       7.0
+    class maintenance  exits=     13479 host_oncpu_ms=     884.2
+    class syscall      exits=     77539 host_oncpu_ms=    2043.4
+    hvc#2 not-svc ec=0x18    exits=       182 host_oncpu_ms=       0.5
+    hvc#2 not-svc ec=0x24    exits=     39144 host_oncpu_ms=     895.6
+  forwarded nr=215  munmap               count=      4660 wall_ms=     957.6 oncpu_ms=     528.4
+  forwarded nr=134  rt_sigaction         count=      4502 wall_ms=      41.5 oncpu_ms=      16.6
+  forwarded nr=222  mmap                 count=      3924 wall_ms=     743.1 oncpu_ms=     429.8
+  forwarded nr=135  rt_sigprocmask       count=      3055 wall_ms=      94.1 oncpu_ms=      22.3
+  forwarded nr=233  madvise              count=      2128 wall_ms=     249.0 oncpu_ms=     111.5
+  forwarded nr=25   fcntl                count=      1627 wall_ms=       7.0 oncpu_ms=       4.4
+  forwarded nr=226  mprotect             count=      1591 wall_ms=     414.6 oncpu_ms=     236.6
+  forwarded nr=57   close                count=      1300 wall_ms=      22.4 oncpu_ms=      18.5
+  forwarded nr=80   fstat                count=      1207 wall_ms=      19.3 oncpu_ms=       8.6
+  forwarded nr=22   epoll_pwait          count=      1121 wall_ms=      58.0 oncpu_ms=      16.9
+  forwarded nr=214  brk                  count=      1046 wall_ms=      74.0 oncpu_ms=      40.8
+  forwarded nr=174  getuid               count=       904 wall_ms=       9.5 oncpu_ms=       1.2
+  forwarded nr=175  geteuid              count=       904 wall_ms=       3.6 oncpu_ms=       0.9
+  forwarded nr=176  getgid               count=       904 wall_ms=       1.8 oncpu_ms=       0.9
+  forwarded nr=177  getegid              count=       904 wall_ms=       3.0 oncpu_ms=       0.9
