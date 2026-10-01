@@ -5084,6 +5084,80 @@ fn bind_mount_rejects_o_directory_for_regular_file() {
 }
 
 #[test]
+fn independent_bind_cohorts_observe_shared_host_namespace() {
+    let host = tempfile::tempdir().unwrap();
+    std::fs::create_dir(host.path().join("old")).unwrap();
+    std::fs::write(host.path().join("old/file"), b"original").unwrap();
+    let mut a = SyscallDispatcher::new();
+    let mut b = SyscallDispatcher::new();
+    for dispatcher in [&mut a, &mut b] {
+        dispatcher.register_mount(
+            "/bind",
+            Box::new(carrick_vfs::BindVfs::new("/bind", host.path(), false)),
+        );
+    }
+    assert!(!std::sync::Arc::ptr_eq(
+        &a.fs.rootfs_vfs.dentry_cache.coherence,
+        &b.fs.rootfs_vfs.dentry_cache.coherence,
+    ));
+    let lookup = |path: &str| {
+        let resolved = b.fs_view().resolve_at_path(LINUX_AT_FDCWD, path)?;
+        b.fs_view().layered_metadata(&resolved)
+    };
+    assert_eq!(lookup("/bind/old/file").unwrap().size, 8);
+    assert!(lookup("/bind/new/file").is_err());
+    a.fs.vfs_mounts
+        .resolve("/bind/old")
+        .unwrap()
+        .vfs
+        .rename("/bind/old", "/bind/new")
+        .unwrap();
+    assert!(lookup("/bind/old/file").is_err());
+    assert_eq!(lookup("/bind/new/file").unwrap().size, 8);
+    a.fs.vfs_mounts
+        .resolve("/bind/new/file")
+        .unwrap()
+        .vfs
+        .unlink("/bind/new/file")
+        .unwrap();
+    assert!(lookup("/bind/new/file").is_err());
+    std::fs::write(host.path().join("new/file"), b"replacement").unwrap();
+    assert_eq!(lookup("/bind/new/file").unwrap().size, 11);
+}
+
+#[test]
+fn independent_bind_cohorts_observe_replaced_intermediate_symlink() {
+    let host = tempfile::tempdir().unwrap();
+    std::fs::create_dir(host.path().join("old")).unwrap();
+    std::fs::create_dir(host.path().join("new")).unwrap();
+    std::fs::write(host.path().join("old/file"), b"old").unwrap();
+    std::fs::write(host.path().join("new/file"), b"replacement").unwrap();
+    std::os::unix::fs::symlink("old", host.path().join("link")).unwrap();
+    std::os::unix::fs::symlink("new", host.path().join("next")).unwrap();
+    let mut a = SyscallDispatcher::new();
+    let mut b = SyscallDispatcher::new();
+    for dispatcher in [&mut a, &mut b] {
+        dispatcher.register_mount(
+            "/bind",
+            Box::new(carrick_vfs::BindVfs::new("/bind", host.path(), false)),
+        );
+    }
+    let resolve = || {
+        b.fs_view()
+            .resolve_at_path(LINUX_AT_FDCWD, "/bind/link/file")
+            .unwrap()
+    };
+    assert_eq!(resolve(), "/bind/old/file");
+    a.fs.vfs_mounts
+        .resolve("/bind/next")
+        .unwrap()
+        .vfs
+        .rename("/bind/next", "/bind/link")
+        .unwrap();
+    assert_eq!(resolve(), "/bind/new/file");
+}
+
+#[test]
 fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
     let common = std::sync::Arc::new(crate::kernel::DescriptionCommon::new(LINUX_O_RDWR));
