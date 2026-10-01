@@ -390,15 +390,14 @@ pub enum GuestPreparedCommitError {
 ///
 /// # Safety
 ///
-/// `words` names a writable table view whose first word is at
-/// `physical_base` and that holds every table of the graph rooted at `root`;
-/// the exact-MM editor excludes every other host or guest mutation of this
-/// graph.
+/// `words` names the writable primary table arena for `physical_base` (the
+/// root) and `extra`, when present, every other arena of the graph; the
+/// exact-MM editor excludes every other host or guest mutation of this graph.
 pub unsafe fn commit_existing_el1_prepared_page(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
     byte_len: usize,
-    root: u64,
+    extra: Option<descriptor_txn::TableWindow>,
     va: u64,
     expected_ipa: u64,
     access: LeafAccess,
@@ -408,13 +407,17 @@ pub unsafe fn commit_existing_el1_prepared_page(
     let maintenance = descriptor_txn::CallerInvalidatesAsid;
     let Ok(live) = (unsafe {
         descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+            .and_then(|live| match extra {
+                Some(window) => live.with_window(window),
+                None => Ok(live),
+            })
     }) else {
         return Err(GuestPreparedCommitError::BadAddress);
     };
     let mut journal = descriptor_txn::InlineJournal::new();
     let outcome = descriptor_txn::execute_descriptor_op(
         &live,
-        SubstrateGpa(root),
+        SubstrateGpa(physical_base),
         DescriptorOp::Publish {
             span: PageSpan::new(va, PT_PAGE),
             expected_ipa: SubstrateGpa(expected_ipa),
@@ -736,7 +739,7 @@ pub unsafe fn protect_existing_el1_private_pages(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
     byte_len: usize,
-    root: u64,
+    extra: Option<descriptor_txn::TableWindow>,
     edit: GuestPermissionEdit,
 ) -> Result<usize, GuestPermissionEditError> {
     use descriptor_txn::{DescriptorOp, DescriptorOutcome, DescriptorRefusal};
@@ -744,13 +747,17 @@ pub unsafe fn protect_existing_el1_private_pages(
     let maintenance = descriptor_txn::CallerInvalidatesAsid;
     let Ok(live) = (unsafe {
         descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+            .and_then(|live| match extra {
+                Some(window) => live.with_window(window),
+                None => Ok(live),
+            })
     }) else {
         return Err(GuestPermissionEditError::BadRange);
     };
     let mut journal = descriptor_txn::InlineJournal::new();
     match descriptor_txn::execute_descriptor_op(
         &live,
-        SubstrateGpa(root),
+        SubstrateGpa(physical_base),
         DescriptorOp::Protect(edit),
         &descriptor_txn::TableGrants::NONE,
         &mut journal,
@@ -795,7 +802,7 @@ pub unsafe fn retire_existing_el1_private_pages(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
     byte_len: usize,
-    root: u64,
+    extra: Option<descriptor_txn::TableWindow>,
     va: u64,
     len: u64,
 ) -> Result<usize, GuestRetirementError> {
@@ -804,13 +811,17 @@ pub unsafe fn retire_existing_el1_private_pages(
     let maintenance = descriptor_txn::CallerInvalidatesAsid;
     let Ok(live) = (unsafe {
         descriptor_txn::PrimaryTableWords::new(words, physical_base, byte_len, &maintenance)
+            .and_then(|live| match extra {
+                Some(window) => live.with_window(window),
+                None => Ok(live),
+            })
     }) else {
         return Err(GuestRetirementError::BadRange);
     };
     let mut journal = descriptor_txn::InlineJournal::new();
     match descriptor_txn::execute_descriptor_op(
         &live,
-        SubstrateGpa(root),
+        SubstrateGpa(physical_base),
         DescriptorOp::Retire(PageSpan::new(va, len)),
         &descriptor_txn::TableGrants::NONE,
         &mut journal,
@@ -2258,7 +2269,7 @@ impl PageTableManager {
     /// spare tail of the primary arena, then the extension arenas, then new
     /// extension arenas taken from `source` exactly as the host editor grows
     /// (every arena is a slot of the table pool EL1 reaches, see
-    /// `carrick_el1_abi::stage1_table_view`). The host remains the only
+    /// `carrick_el1_abi::stage1_table_pool_window`). The host remains the only
     /// allocator of table-page identity; EL1 fills and links the pages it
     /// uses. Nothing is reserved on failure; an arena taken from `source`
     /// stays with the image for later tables.
@@ -5533,7 +5544,7 @@ impl PageTableManager {
 
     /// Map Carrick-owned EL1 data at `[va, va + len)`: AP=00 (EL1 read/write,
     /// no EL0 access), never executable at either level. The stage-1 table
-    /// pool view (`carrick_el1_abi::stage1_table_view`) is mapped this way.
+    /// pool view (`carrick_el1_abi::stage1_table_pool_window`) is mapped this way.
     pub fn map_kernel_data_aliased(
         &mut self,
         va: u64,
@@ -9947,7 +9958,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     GuestPermissionEdit {
                         va,
                         len: 2 * PT_PAGE,
@@ -9988,7 +9999,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     GuestPermissionEdit {
                         va,
                         len: 2 * PT_PAGE,
@@ -10036,7 +10047,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     GuestPermissionEdit {
                         va,
                         len: 1 << 21,
@@ -10065,7 +10076,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     GuestPermissionEdit {
                         va: va + PT_PAGE,
                         len: PT_PAGE,
@@ -10106,7 +10117,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     va,
                     1 << 21,
                 )
@@ -10138,7 +10149,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     leaf_va,
                     PT_PAGE,
                 )
@@ -10177,7 +10188,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     va + PT_PAGE,
                     PT_PAGE,
                 )
@@ -10194,7 +10205,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     va,
                     1 << 21,
                 )
@@ -10261,7 +10272,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     va,
                     5 * PT_PAGE,
                 )
@@ -10283,7 +10294,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
-                    root,
+                    None,
                     va,
                     PT_PAGE,
                 )
@@ -10918,7 +10929,7 @@ mod tests {
                 words.as_mut_ptr(),
                 root,
                 len,
-                root,
+                None,
                 va,
                 expected_ipa,
                 access,
@@ -10995,7 +11006,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     byte_len,
-                    root,
+                    None,
                     GuestPermissionEdit {
                         va,
                         len: PT_PAGE,
@@ -11026,7 +11037,7 @@ mod tests {
                         words.as_mut_ptr(),
                         root,
                         byte_len,
-                        root,
+                        None,
                         va,
                         PT_PAGE,
                     )
@@ -11296,7 +11307,7 @@ mod tests {
                         words,
                         LINUX_PAGE_TABLES_BASE,
                         LINUX_PAGE_TABLES_SIZE as usize,
-                        LINUX_PAGE_TABLES_BASE,
+                        None,
                         edit,
                     )
                 },
@@ -11337,7 +11348,7 @@ mod tests {
                         words,
                         LINUX_PAGE_TABLES_BASE,
                         LINUX_PAGE_TABLES_SIZE as usize,
-                        LINUX_PAGE_TABLES_BASE,
+                        None,
                         GuestPermissionEdit {
                             readable: true,
                             writable: true,
@@ -11435,7 +11446,7 @@ mod tests {
                             words,
                             LINUX_PAGE_TABLES_BASE,
                             LINUX_PAGE_TABLES_SIZE as usize,
-                            LINUX_PAGE_TABLES_BASE,
+                            None,
                             edit,
                         )
                     },

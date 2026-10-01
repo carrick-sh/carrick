@@ -309,13 +309,16 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError> {
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-        let (words, physical_base, byte_len) = carrick_el1_abi::stage1_table_view();
+        let physical_base = ttbr0 & TTBR_BADDR_MASK;
+        let words =
+            carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64;
+        let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
         unsafe {
             carrick_mmu_core::aarch64::protect_existing_el1_private_pages(
                 words,
                 physical_base,
                 byte_len,
-                ttbr0 & TTBR_BADDR_MASK,
+                Some(carrick_el1_abi::stage1_table_pool_window()),
                 edit,
             )?;
         }
@@ -337,13 +340,16 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
         len: u64,
     ) -> Result<(), GuestRetirementError> {
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-        let (words, physical_base, byte_len) = carrick_el1_abi::stage1_table_view();
+        let physical_base = ttbr0 & TTBR_BADDR_MASK;
+        let words =
+            carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64;
+        let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
         unsafe {
             carrick_mmu_core::aarch64::retire_existing_el1_private_pages(
                 words,
                 physical_base,
                 byte_len,
-                ttbr0 & TTBR_BADDR_MASK,
+                Some(carrick_el1_abi::stage1_table_pool_window()),
                 address,
                 len,
             )?;
@@ -454,14 +460,27 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
     fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> RangeBacking {
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let root = ttbr0 & TTBR_BADDR_MASK;
-        let (words, view_base, byte_len) = carrick_el1_abi::stage1_table_view();
+        let primary = carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
+            words: carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
+                as *mut core::sync::atomic::AtomicU64,
+            physical_base: root,
+            byte_len: carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+        };
+        let pool = carrick_el1_abi::stage1_table_pool_window();
         let read = |pa: u64| {
-            let offset = pa.checked_sub(view_base)?;
-            (offset.is_multiple_of(8) && offset.checked_add(8)? <= byte_len as u64).then(|| {
-                // SAFETY: the table view maps every stage-1 table arena at
-                // its own address; the caller holds the MM's exact editor,
-                // and the offset was bounds-checked above.
-                unsafe { (*words.add((offset / 8) as usize)).load(Ordering::Acquire) }
+            [primary, pool].iter().find_map(|window| {
+                let offset = pa.checked_sub(window.physical_base)?;
+                (offset.is_multiple_of(8) && offset.checked_add(8)? <= window.byte_len as u64).then(
+                    || {
+                        // SAFETY: the primary alias maps this MM's primary
+                        // arena at `root`, and the pool window every arena at
+                        // its own address; the caller holds the MM's exact
+                        // editor, and the offset was bounds-checked above.
+                        unsafe {
+                            (*window.words.add((offset / 8) as usize)).load(Ordering::Acquire)
+                        }
+                    },
+                )
             })
         };
         classify_stage1_range(&read, root, va, len)
