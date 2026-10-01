@@ -2186,6 +2186,7 @@ fn trusted_dirent_stream_owns_its_seek_offset() {
 mod serial_host {
     use super::*;
 
+    #[cfg(test)]
     #[test]
     fn cohort_generation_words_survive_host_fork() {
         let cohort = crate::fs_resolve_cache::FsCacheCoherence::default();
