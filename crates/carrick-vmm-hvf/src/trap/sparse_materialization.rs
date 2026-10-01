@@ -332,8 +332,6 @@ pub(super) fn publish_frame_grant(
         )?
     };
     let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
-    let commit = reservation.commit(());
-    let challenge = commit.receipt_challenge();
     let physical_length = carrick_hal::FrameLength::from_mapping_extent(
         std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| {
             carrick_fatal!(
@@ -342,14 +340,32 @@ pub(super) fn publish_frame_grant(
             );
         }),
     );
-    let applied = context.authority.apply_frame_grant(
-        commit,
-        inventory_mapping.mapping,
-        inventory_mapping.frame,
-        carrick_guest_mem::Gpa(physical_ipa),
-        physical_length,
-    );
-    let (receipt, authenticated_owner_generation) = match applied {
+    let apply_grant = |commit: carrick_hal::FrameInventoryCommit<()>| {
+        let challenge = commit.receipt_challenge();
+        context
+            .authority
+            .apply_frame_grant(
+                commit,
+                inventory_mapping.mapping,
+                inventory_mapping.frame,
+                carrick_guest_mem::Gpa(physical_ipa),
+                physical_length,
+            )
+            .map(|applied| (challenge, applied))
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))
+    };
+    // A folded predecessor retirement publishes and drops its backend
+    // references as one step with the grant (`apply_inventory_lease_retirement`).
+    let applied = match retirement {
+        None => apply_grant(reservation.commit(())),
+        Some(retirement) => HvfVmState::apply_inventory_lease_retirement(
+            &context.state.frame_inventory.ledger,
+            retirement,
+            reservation,
+            apply_grant,
+        ),
+    };
+    let (challenge, (receipt, authenticated_owner_generation)) = match applied {
         Ok(applied) => applied,
         Err(error) => {
             if let Err(rollback) = HvfVmState::rollback_unpublished_mappings(
