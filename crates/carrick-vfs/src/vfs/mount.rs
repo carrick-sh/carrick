@@ -49,12 +49,24 @@ impl Default for VfsMounts {
 }
 
 impl VfsMounts {
-    /// Re-admit bind aliases when the writable root backing is replaced.
+    pub fn set_bind_cache_cohorts(&mut self, cohorts: &crate::fs_resolve_cache::BindCacheCohorts) {
+        for entry in &mut self.entries {
+            if let Some(source) = entry.vfs.bind_source()
+                && let Ok(coherence) = cohorts.admit(source)
+            {
+                entry.vfs.set_cache_coherence(coherence);
+            }
+        }
+    }
+    /// Update root-owned mounts without changing independently admitted binds.
     pub fn set_cache_coherence(
         &mut self,
         coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
     ) {
         for entry in &mut self.entries {
+            if entry.vfs.bind_source().is_some() {
+                continue;
+            }
             entry
                 .vfs
                 .set_cache_coherence(std::sync::Arc::clone(&coherence));

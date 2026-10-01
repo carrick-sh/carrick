@@ -260,12 +260,90 @@ pub fn init() {
     ensure_atfork_installed();
 }
 
+struct BindSource {
+    // Keep the admitted inode alive so its identity cannot be recycled while
+    // cache entries still hold this cohort.
+    _root: std::fs::File,
+    coherence: std::sync::Weak<FsCacheCoherence>,
+}
+
+/// Shared bind-source admission, owned by a carrier rather than the process.
+#[derive(Default)]
+pub struct BindCacheCohorts {
+    sources: parking_lot::Mutex<HashMap<crate::vfs::dentry::InodeIdentity, BindSource>>,
+}
+
+impl BindCacheCohorts {
+    pub fn admit(
+        &self,
+        source: &std::path::Path,
+    ) -> std::io::Result<std::sync::Arc<FsCacheCoherence>> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(target_os = "macos")]
+        options.custom_flags(libc::O_EVTONLY);
+        #[cfg(target_os = "linux")]
+        options.custom_flags(libc::O_PATH);
+        let root = options.open(source)?;
+        let metadata = root.metadata()?;
+        let identity = crate::vfs::dentry::InodeIdentity::new(metadata.dev(), metadata.ino());
+        let mut sources = self.sources.lock();
+        sources.retain(|_, source| source.coherence.strong_count() != 0);
+        if let Some(cohort) = sources
+            .get(&identity)
+            .and_then(|source| source.coherence.upgrade())
+        {
+            return Ok(cohort);
+        }
+        let cohort = std::sync::Arc::default();
+        sources.insert(
+            identity,
+            BindSource {
+                _root: root,
+                coherence: std::sync::Arc::downgrade(&cohort),
+            },
+        );
+        Ok(cohort)
+    }
+}
+
+/// One authority observed before reading a path component.
+#[derive(Clone)]
+pub struct CoherenceStamp {
+    coherence: std::sync::Arc<FsCacheCoherence>,
+    generation: u64,
+}
+
+impl CoherenceStamp {
+    pub fn observe(coherence: &std::sync::Arc<FsCacheCoherence>) -> Self {
+        Self {
+            coherence: std::sync::Arc::clone(coherence),
+            generation: coherence.current_generation(),
+        }
+    }
+    pub fn same_authority(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.coherence, &other.coherence)
+    }
+    fn is_current(&self) -> bool {
+        self.coherence.current_generation() == self.generation
+    }
+}
+
+#[derive(Clone)]
+pub struct CachedResolve {
+    pub path: String,
+    pub dependencies: Vec<CoherenceStamp>,
+    root_generation: u64,
+}
+
 /// Per-process resolve cache, validated against the shared generation. The map
 /// itself is fork-copied like the rest of the address space; the shared
 /// generation is what makes stale copies re-resolve.
 pub struct ResolveCache {
     pub coherence: std::sync::Arc<FsCacheCoherence>,
-    map: RwLock<HashMap<String, (String, u64)>>,
+    map: RwLock<HashMap<String, CachedResolve>>,
 }
 
 /// Bound the map so a path-diverse workload can't grow it without limit; the
@@ -279,6 +357,9 @@ impl Default for ResolveCache {
 }
 
 impl ResolveCache {
+    pub fn clear(&self) {
+        self.map.write().clear();
+    }
     pub fn new(coherence: std::sync::Arc<FsCacheCoherence>) -> Self {
         Self {
             coherence,
@@ -290,10 +371,15 @@ impl ResolveCache {
     /// stamped generation no longer matches `current` (the caller passes the
     /// live [`FsCacheCoherence::current_generation`], read at the get, so a mutation between an
     /// entry's birth and this lookup invalidates it).
-    pub fn get(&self, key: &str, current: u64) -> Option<String> {
+    pub fn get(&self, key: &str, current: u64) -> Option<CachedResolve> {
         let guard = self.map.read();
         match guard.get(key) {
-            Some((abs, stamped)) if *stamped == current => Some(abs.clone()),
+            Some(entry)
+                if entry.root_generation == current
+                    && entry.dependencies.iter().all(CoherenceStamp::is_current) =>
+            {
+                Some(entry.clone())
+            }
             _ => None,
         }
     }
@@ -305,7 +391,13 @@ impl ResolveCache {
     /// so a racing pre-mutation resolution is never served. (Seqlock-style: the
     /// mutation side bumps AFTER it completes; the reader stamps the value it
     /// saw at entry.)
-    pub fn put(&self, key: String, abs: String, gen_at_lookup: u64) {
+    pub fn put(
+        &self,
+        key: String,
+        abs: String,
+        gen_at_lookup: u64,
+        dependencies: Vec<CoherenceStamp>,
+    ) {
         let stamped = gen_at_lookup;
         let mut guard = self.map.write();
         if guard.len() >= MAX_ENTRIES && !guard.contains_key(&key) {
@@ -314,7 +406,14 @@ impl ResolveCache {
             // workload ever trips this.
             guard.clear();
         }
-        guard.insert(key, (abs, stamped));
+        guard.insert(
+            key,
+            CachedResolve {
+                path: abs,
+                root_generation: stamped,
+                dependencies,
+            },
+        );
     }
 }
 
@@ -325,14 +424,20 @@ mod tests {
     #[test]
     fn hit_is_served_until_the_generation_moves_on() {
         let c = ResolveCache::new(std::sync::Arc::default());
-        c.put("/tmp/x/file".into(), "/tmp/x/file".into(), 5);
+        c.put("/tmp/x/file".into(), "/tmp/x/file".into(), 5, Vec::new());
         // Same generation -> hit.
-        assert_eq!(c.get("/tmp/x/file", 5).as_deref(), Some("/tmp/x/file"));
+        assert_eq!(
+            c.get("/tmp/x/file", 5).map(|hit| hit.path).as_deref(),
+            Some("/tmp/x/file")
+        );
         // A structural mutation advanced the generation -> stale -> miss.
-        assert_eq!(c.get("/tmp/x/file", 6), None);
+        assert!(c.get("/tmp/x/file", 6).is_none());
         // Re-populating at the new generation -> hit again.
-        c.put("/tmp/x/file".into(), "/tmp/x/file".into(), 6);
-        assert_eq!(c.get("/tmp/x/file", 6).as_deref(), Some("/tmp/x/file"));
+        c.put("/tmp/x/file".into(), "/tmp/x/file".into(), 6, Vec::new());
+        assert_eq!(
+            c.get("/tmp/x/file", 6).map(|hit| hit.path).as_deref(),
+            Some("/tmp/x/file")
+        );
     }
 
     #[test]
@@ -342,14 +447,14 @@ mod tests {
         // its stale sample. A get at the current generation (6) must miss, so
         // the racing pre-mutation resolution is never served.
         let c = ResolveCache::new(std::sync::Arc::default());
-        c.put("/raced".into(), "/raced".into(), 5);
-        assert_eq!(c.get("/raced", 6), None);
+        c.put("/raced".into(), "/raced".into(), 5, Vec::new());
+        assert!(c.get("/raced", 6).is_none());
     }
 
     #[test]
     fn absent_key_misses() {
         let c = ResolveCache::new(std::sync::Arc::default());
-        assert_eq!(c.get("/never/put", 1), None);
+        assert!(c.get("/never/put", 1).is_none());
     }
 
     #[test]

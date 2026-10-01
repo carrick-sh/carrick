@@ -398,6 +398,7 @@ impl CarrierKernelRoot {
 }
 
 struct CarrierInner {
+    bind_cache_cohorts: Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts>,
     generation: u64,
     scope: CarrierScopeId,
     process_epoch: u64,
@@ -431,6 +432,11 @@ pub struct CarrierRuntime {
 }
 
 impl CarrierRuntime {
+    pub(crate) fn bind_cache_cohorts(
+        &self,
+    ) -> Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts> {
+        Arc::clone(&self.inner.bind_cache_cohorts)
+    }
     /// Install the scheduling policy this carrier's run queue will use.
     ///
     /// CARRIER-scoped, because HVPatch multiplexes every Linux task of every
@@ -479,6 +485,7 @@ impl CarrierRuntime {
             .map_err(|error| RuntimeError::CarrierFailed(error.to_string()))?;
         let scope = CarrierScopeId::from_process_env_or_random()?;
         let inner = Arc::new(CarrierInner {
+            bind_cache_cohorts: Arc::default(),
             generation,
             scope,
             process_epoch: CARRIER_PROCESS_EPOCH.load(Ordering::Acquire),

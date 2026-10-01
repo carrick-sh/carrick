@@ -191,6 +191,30 @@ Pre-admission layer-cache extraction publishes no coherence generations;
 backend-owned extraction publishes to its observing cohort. Signed file probes
 provide integration evidence; full oracle and promotion remain director-owned.
 
+External binds have no dentry/stat or capacity cache: `BindVfs::lookup`,
+`lookup_nofollow`, and `real_stat` read host metadata per call. The rootfs
+dentry cache is bypassed by mount routing. Ordinary host rename/unlink/create
+visibility already passes on `4a2307912`, pinned by
+`independent_bind_cohorts_observe_shared_host_namespace`.
+
+The resolve cache does retain intermediate-symlink rewrites and formerly
+trusted only the rootfs generation. On `4a2307912`,
+`independent_bind_cohorts_observe_replaced_intermediate_symlink` fails:
+after replacing `link -> old` with `link -> new`, B keeps `/bind/old/file`.
+A carrier-owned `BindCacheCohorts` registry admits each bind source by the
+host root's `(st_dev, st_ino)` identity, pinning that inode while observers
+remain. Prepared rootfs cohorts in that carrier join the same source cohort;
+fork descendants retain it. Resolve entries stamp only the bind authorities
+actually read, before their component reads, including nested resolutions.
+Bind namespace publications invalidate those dependent entries while unrelated
+rootfs generations and cache work remain independent.
+
+The historical external-writer boundary remains explicit: host mutations that
+do not publish through an admitted cohort can still leave a cached symlink
+rewrite stale. There is no process registry or cross-carrier authority, and
+self-reexec starts fresh admission. Failed source admission leaves ordinary
+host lookup errors intact rather than manufacturing a shared authority.
+
 ## Executor empty host queue
 
 `kernel.executor.empty-host-steal` covers an executor seeking host-runnable

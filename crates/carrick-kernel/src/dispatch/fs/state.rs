@@ -138,6 +138,7 @@ pub(crate) struct FsState {
     /// falls through to the legacy code path, which reads the rootfs +
     /// overlay from [`Self::rootfs_vfs`].
     pub vfs_mounts: std::sync::Arc<carrick_vfs::VfsMounts>,
+    pub bind_cache_cohorts: std::sync::Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts>,
 
     /// The `/` mount: immutable OCI rootfs + writable overlay
     /// ([`FsBackend`]). Held as a typed field rather than mounted in
@@ -585,6 +586,7 @@ impl FsState {
         let coherence = std::sync::Arc::clone(&rootfs_vfs.dentry_cache.coherence);
         Self {
             host_io: std::sync::Arc::new(crate::dispatch::SystemHostIo),
+            bind_cache_cohorts: std::sync::Arc::default(),
             vfs_mounts: std::sync::Arc::new({
                 let mut m = carrick_vfs::VfsMounts::new();
                 m.mount(
@@ -673,6 +675,7 @@ impl FsState {
     pub(in crate::dispatch) fn fork_clone(&self) -> Self {
         Self {
             host_io: std::sync::Arc::clone(&self.host_io),
+            bind_cache_cohorts: std::sync::Arc::clone(&self.bind_cache_cohorts),
             vfs_mounts: std::sync::Arc::clone(&self.vfs_mounts),
             rootfs_vfs: std::sync::Arc::clone(&self.rootfs_vfs),
             executable_authorities: std::sync::Arc::clone(&self.executable_authorities),
@@ -1361,7 +1364,7 @@ mod stdio_sink_tests {
         let c = &b.fs.rootfs_vfs.dentry_cache.coherence;
         let before = snapshot(c);
         b.fs.resolve_cache
-            .put("/stable".into(), "/stable".into(), before[0]);
+            .put("/stable".into(), "/stable".into(), before[0], Vec::new());
         let opens = b.fs.rootfs_vfs.dentry_cache.host_open_count();
         a.fs.rootfs_vfs.overlay.make_dir("/old").unwrap();
         a.fs.rootfs_vfs
@@ -1377,6 +1380,7 @@ mod stdio_sink_tests {
         assert_eq!(
             b.fs.resolve_cache
                 .get("/stable", c.current_generation())
+                .map(|hit| hit.path)
                 .as_deref(),
             Some("/stable")
         );

@@ -1060,6 +1060,14 @@ impl<'a> std::fmt::Debug for OpenContext<'a> {
 /// guest's per-thread vCPUs; mounts that hold mutable host state (the pty
 /// table, the writable overlay) carry their own interior locking.
 pub trait Vfs: Send + Sync {
+    fn bind_source(&self) -> Option<&std::path::Path> {
+        None
+    }
+    fn cache_coherence(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>> {
+        None
+    }
     /// Assign coherence when a host bind is admitted into a rootfs namespace.
     fn set_cache_coherence(
         &mut self,
