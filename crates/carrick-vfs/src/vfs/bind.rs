@@ -66,6 +66,15 @@ impl BindVfs {
         // host paths. Preserve a failing path verbatim so ordinary VFS access
         // reports its real host error; capsule validation then fails closed.
         let host_path = std::path::absolute(&host_path).unwrap_or(host_path);
+        // A terminal source alias names the admitted object, not a guest
+        // symlink at the mount point. Fix that source before admitting its
+        // inode cohort; subsequent alias retargeting cannot change authority.
+        let host_path =
+            if std::fs::symlink_metadata(&host_path).is_ok_and(|metadata| metadata.is_symlink()) {
+                std::fs::canonicalize(&host_path).unwrap_or(host_path)
+            } else {
+                host_path
+            };
         Self {
             coherence: std::sync::Arc::default(),
             mount_point: mount_point.into(),
