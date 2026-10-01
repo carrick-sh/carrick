@@ -226,9 +226,9 @@ pub use prepare::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrick_vmm_hvf::{
     El1FrameGrantStats, HostCowLedger, HostCowSnapshot, MetadataGrantStats,
-    arm_deny_next_metadata_grant, el1_frame_grant_stats, host_cow_observe_current,
-    host_cow_snapshot, metadata_grant_stats, read_el1_counters, read_el1_region_host_ptr,
-    reset_el1_counters, reset_metadata_grant_state,
+    arm_deny_next_metadata_grant, el1_frame_grant_stats, el1_frame_grant_unreturned,
+    host_cow_observe_current, host_cow_snapshot, metadata_grant_stats, read_el1_counters,
+    read_el1_region_host_ptr, reset_el1_counters, reset_metadata_grant_state,
 };
 
 /// Carrier-wide count of vCPU exits to the host (every `hv_vcpu_run` return).
@@ -271,6 +271,11 @@ pub struct El1FrameGrantStats {
 pub use carrick_aarch64::resume_invalidation::{
     ResumeInvalidationStats, stats as resume_invalidation_stats,
 };
+/// Non-HVF hosts publish no EL1 frame grants.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn el1_frame_grant_unreturned() -> Vec<String> {
+    Vec::new()
+}
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
