@@ -1142,11 +1142,13 @@ impl HostFsBackend {
     /// scratch root, then register every path as "known" so the
     /// backend's lookup returns it.
     pub fn seed_from_rootfs(&mut self, rootfs: &crate::rootfs::RootFs) -> std::io::Result<()> {
-        rootfs
+        let result = rootfs
             .extract_to_dir(&self.root_path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()));
+        // Raw pre-admission extraction has no authority. This backend does:
+        // even a partial failure may have changed visible metadata.
         self.coherence.bump_meta_generation();
-        Ok(())
+        result
     }
 
     /// Construct against an already-allocated root fd without
@@ -3217,11 +3219,12 @@ impl HostFsBackend {
             return Ok(crate::rootfs::ExtractStats::default());
         }
         let stats = crate::rootfs::extract_layer_paths_to_dir(paths, &self.root_path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()));
+        self.coherence.bump_meta_generation();
+        let stats = stats?;
         if stats.mode_xattrs > 0 {
             self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
         }
-        self.coherence.bump_meta_generation();
         Ok(stats)
     }
 
@@ -4297,11 +4300,10 @@ fn read_whiteout_leaf_from_marker(
 }
 
 impl FsBackend for HostFsBackend {
-    fn set_cache_coherence(
-        &mut self,
-        coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
-    ) {
-        self.coherence = coherence;
+    fn cache_coherence(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>> {
+        Some(&self.coherence)
     }
     fn statfs(&self) -> Option<carrick_abi::LinuxStatfs> {
         let mut native = std::mem::MaybeUninit::<libc::statvfs>::uninit();

@@ -319,9 +319,10 @@ impl RootFsVfs {
 
     /// Swap the writable overlay. Returns the previously-installed
     /// backend so the caller can decide what to do with it.
-    pub fn set_overlay(&mut self, mut backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        let coherence = Arc::clone(&self.dentry_cache.coherence);
-        backend.set_cache_coherence(Arc::clone(&coherence));
+    pub fn set_overlay(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
+        // The backing owns its cohort. Retagging it would split other live
+        // observers, and would couple a returned old backing to a new one.
+        let coherence = backend.cache_coherence().cloned().unwrap_or_default();
         self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(backend.is_shared(), coherence));
         std::mem::replace(&mut self.overlay, backend)
     }
