@@ -3407,10 +3407,13 @@ pub(crate) fn unregister_alias_entries(
         return std::collections::BTreeSet::new();
     }
 
+    // A lease is an incarnation, not an address: a row naming an older
+    // incarnation of the same extent (a COW shadow that outlived the lease a
+    // child borrowed) neither retires nor co-holds the live one.
     let mut candidates = std::collections::BTreeSet::new();
     let mut touched_scopes = std::collections::BTreeSet::new();
     for (_, entry) in &overlapping {
-        candidates.insert((entry.physical_ipa, entry.physical_size as u64));
+        candidates.insert(AuthenticatedLease::of_alias(entry));
         touched_scopes.insert(entry.ownership_scope);
     }
 
@@ -3541,20 +3544,67 @@ pub(crate) fn unregister_alias_entries(
     }
 
     let scopes = AliasRegistry::process_visible_scopes(mm_root_slot, container_root);
-    candidates.retain(|&(physical_ipa, physical_size)| {
+    candidates.retain(|candidate| {
+        let (physical_ipa, _) = candidate.lease();
+        let mut other_incarnation = false;
         let retained = scopes.iter().any(|&scope| {
             registry
                 .by_scope_physical_start
                 .get(&(scope, physical_ipa))
                 .is_some_and(|rows| {
                     note_alias_state_rows_scanned(rows.len());
-                    rows.iter()
-                        .any(|(_, alias)| alias.physical_size as u64 == physical_size)
+                    rows.iter().any(|(_, alias)| {
+                        let lease = AuthenticatedLease::of_alias(alias);
+                        other_incarnation |=
+                            lease.lease() == candidate.lease() && lease != *candidate;
+                        lease == *candidate
+                    })
                 })
         });
+        if !retained && other_incarnation {
+            note_alias_stale_incarnation_co_holder();
+        }
         !retained
     });
-    candidates
+    candidates.iter().map(AuthenticatedLease::lease).collect()
+}
+
+/// Process-wide alias-retirement census: transaction restarts after an
+/// out-of-guard writer made a plan stale, and leases that retired although a
+/// row of an OLDER incarnation of their extent survived (each one a lease the
+/// extent-only match used to leak).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static ALIAS_RETIREMENT_RESTARTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static ALIAS_STALE_INCARNATION_CO_HOLDERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn note_alias_retirement_restart() {
+    ALIAS_RETIREMENT_RESTARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn note_alias_stale_incarnation_co_holder() {
+    ALIAS_STALE_INCARNATION_CO_HOLDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot of the alias-retirement census.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AliasRetirementCensus {
+    pub restarts: u64,
+    pub stale_incarnation_co_holders: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn alias_retirement_census() -> AliasRetirementCensus {
+    AliasRetirementCensus {
+        restarts: ALIAS_RETIREMENT_RESTARTS.load(std::sync::atomic::Ordering::Relaxed),
+        stale_incarnation_co_holders: ALIAS_STALE_INCARNATION_CO_HOLDERS
+            .load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

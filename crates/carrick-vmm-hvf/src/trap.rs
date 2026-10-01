@@ -348,6 +348,8 @@ pub use guest_cow::CarrierGuestCowSettlement;
 mod memory_protection;
 pub(crate) use self::memory_protection::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use self::memory_protection::{AliasRetirementCensus, alias_retirement_census};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use carrier_custody::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use foreign_mm::HvpatchMmRootRetirementProof;
@@ -4661,12 +4663,54 @@ fn scoped_alias_epoch_update(
 fn retire_process_aliases(
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
+    retired: &[RetiredStage2Projection],
     global_keep: impl FnMut(&AliasBacking) -> bool,
 ) {
     // Replay sets and version chains live in AliasScopeBucket; only the
     // alias_registry() lock is held.
-    let mut registry = alias_registry_write(AliasRegistryWriter::ProcessExitRetirement);
-    retire_process_aliases_in(&mut registry, mm_root_slot, container_root, global_keep);
+    let mut registry = alias_registry_write_as(
+        AliasRegistryWriter::ProcessExitRetirement,
+        AliasWriterActor::Mm {
+            mm_root_slot,
+            container_root,
+        },
+    );
+    retire_exited_process_rows_in(
+        &mut registry,
+        mm_root_slot,
+        container_root,
+        retired,
+        global_keep,
+    );
+}
+
+/// Process exit: drop every row the exiting MM owns, and every other scope's
+/// rows naming an incarnation this exit retired.
+///
+/// The second half is what the COW and unmap retirements already do. Without
+/// it, an incarnation whose LAST user was this process survived as rows in
+/// other MMs -- typically a parent's COW shadow, left when this child
+/// borrowed the frame at the split -- naming a recycled IPA. Those rows then
+/// co-held the parent's later, unrelated incarnation of the same IPA and were
+/// removed only by whichever MM next happened to retire that old identity,
+/// outside the parent's guard.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retire_exited_process_rows_in(
+    registry: &mut AliasRegistry,
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+    retired: &[RetiredStage2Projection],
+    global_keep: impl FnMut(&AliasBacking) -> bool,
+) -> RetiredProjectionCleanup {
+    retire_process_aliases_in(registry, mm_root_slot, container_root, global_keep);
+    if retired.is_empty() {
+        return RetiredProjectionCleanup::default();
+    }
+    mutate_known_external_alias_state_in(
+        registry,
+        |registry| retired_projection_mutation_keys(registry, retired, &[]),
+        |registry| remove_rows_for_retired_stage2_projections(registry, retired),
+    )
 }
 
 /// The body of [`retire_process_aliases`], against explicitly supplied
@@ -4867,7 +4911,16 @@ fn mutate_known_external_alias_state<R>(
     // the caller identifies the bounded keys it can change, so no carrier-wide
     // registry clone or diff is required on COW/exec.
     let mut registry = alias_registry_write_as(AliasRegistryWriter::KnownExternalMutation, actor);
-    let (alias_keys, replay_ipas) = affected(&registry);
+    mutate_known_external_alias_state_in(&mut registry, affected, mutate)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mutate_known_external_alias_state_in<R>(
+    registry: &mut AliasRegistry,
+    affected: impl FnOnce(&AliasRegistry) -> (Vec<AliasVersionKey>, Vec<u64>),
+    mutate: impl FnOnce(&mut AliasRegistry) -> R,
+) -> R {
+    let (alias_keys, replay_ipas) = affected(registry);
     let alias_keys = alias_keys
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -4888,7 +4941,7 @@ fn mutate_known_external_alias_state<R>(
             }
         }
     }
-    let result = mutate(&mut registry);
+    let result = mutate(registry);
     for &(start, ipa, scope) in &alias_keys {
         let key = (start, ipa, scope);
         let after = registry.find_by_key(start, ipa, scope);
