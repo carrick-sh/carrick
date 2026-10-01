@@ -104,7 +104,7 @@ impl GuestMemory for CarrierCopyMemory<'_> {
     ) -> Result<(), RepointPrivateError> {
         Err(RepointPrivateError::Clean(MemoryError::Unsupported))
     }
-    fn repoint_shared_leaf(&mut self, _: u64, _: u64, _: usize) -> Result<(), MemoryError> {
+    fn repoint_shared_leaf(&mut self, _: u64, _: u64, _: usize, _: u64) -> Result<(), MemoryError> {
         Err(MemoryError::Unsupported)
     }
     fn restore_shared_identity(&mut self, _: u64, _: usize) -> Result<(), MemoryError> {

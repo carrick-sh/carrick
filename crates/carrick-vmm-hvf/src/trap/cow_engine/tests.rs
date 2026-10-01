@@ -1049,11 +1049,29 @@ fn frame_cow_repoints_only_pages_that_name_the_faulting_frame() {
     );
     // The original 64-page region: semantic IPA at compound offset 0x1000.
     tables
-        .map_aliased(base, old_frame + PAGE, 64 * PAGE, false, None)
+        .map_aliased(
+            base,
+            old_frame + PAGE,
+            64 * PAGE,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("map the original region");
     // The MAP_FIXED replacement of pages 0..8 on its own frame.
     tables
-        .map_aliased(base, replacement + PAGE, 8 * PAGE, false, None)
+        .map_aliased(
+            base,
+            replacement + PAGE,
+            8 * PAGE,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("map the replacement");
     let task = HvfTaskState::neutral();
     task.page_tables_authority().set_manager(tables);

@@ -861,12 +861,14 @@ pub trait GuestMemory {
     /// Repoint guest VA `[va, va+len)` to target stage-1 output IPA `target_ipa`.
     /// Used for `MREMAP_FIXED` moves of pages within an existing shared extent:
     /// the destination leaf is repointed to the existing extent's IPA for that
-    /// file offset without minting a new host mmap or stage-2 mapping.
+    /// file offset without minting a new host mmap or stage-2 mapping. The
+    /// destination leaves carry exactly the moved mapping's Linux `prot`.
     fn repoint_shared_leaf(
         &mut self,
         _va: u64,
         _target_ipa: u64,
         _len: usize,
+        _prot: u64,
     ) -> Result<(), MemoryError> {
         Ok(())
     }

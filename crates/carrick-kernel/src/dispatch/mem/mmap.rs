@@ -2752,7 +2752,7 @@ impl<'a> MemView<'a> {
 
                 // Repoint destination stage-1 leaf to the existing shared extent.
                 if let Err(err) = memory
-                    .repoint_shared_leaf(va, destination_leaf_ipa, new_len)
+                    .repoint_shared_leaf(va, destination_leaf_ipa, new_len, pf.bits())
                 {
                     return fail(
                         SharedFileFixedMremapError::RepointSharedLeaf { source: err },

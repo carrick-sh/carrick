@@ -648,7 +648,10 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
                     mapping.guest_start,
                     mapping.ipa_start,
                     mapping.mapped_size,
-                    mapping.perms.write,
+                    carrick_mmu_core::aarch64::UserLeafAccess {
+                        writable: mapping.perms.write,
+                        executable: mapping.perms.execute,
+                    },
                     None,
                 )
             };
@@ -668,7 +671,7 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
         .map_err(|error| {
             TrapError::Hypervisor(format!("reserve sparse HVPatch mmap arena: {error:?}"))
         })?;
-    reapply_global_exec_readonly_spans(&mut page_tables, &global.ro_spans)?;
+    reapply_global_exec_page_spans(&mut page_tables, &global.ro_spans, &global.rw_spans)?;
     for mapping in &global.mappings {
         let expected = (!is_sparse_hvpatch_mmap_mapping(mapping)).then_some(mapping.ipa_start);
         if page_tables.translate(mapping.guest_start) != expected {
@@ -730,28 +733,18 @@ pub(crate) fn is_sparse_hvpatch_mmap_mapping(mapping: &GuestMapping) -> bool {
         && !mapping.shared
 }
 
+/// Re-apply the ELF page spans after the exec remap gave every mapping its
+/// own region permission: `.text`/`.rodata` read-only, `.data`/`.bss`
+/// read/write and non-executable (the merged image region is RWX).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn reapply_global_exec_readonly_spans(
+pub(crate) fn reapply_global_exec_page_spans(
     page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
     ro_spans: &[carrick_mem::elf::RoSpan],
+    rw_spans: &[carrick_mem::elf::RwSpan],
 ) -> Result<(), TrapError> {
-    for span in ro_spans {
-        let len = usize::try_from(span.len).map_err(|_| {
-            TrapError::Hypervisor(format!(
-                "HVPatch exec read-only span at 0x{:x} is too large: {}",
-                span.start, span.len
-            ))
-        })?;
-        page_tables
-            .set_readonly(span.start, len, span.exec, None)
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "restore HVPatch exec read-only span at 0x{:x}: {error:?}",
-                    span.start
-                ))
-            })?;
-    }
-    Ok(())
+    carrick_mem::memory::apply_image_page_spans(page_tables, ro_spans, rw_spans).map_err(|error| {
+        TrapError::Hypervisor(format!("restore HVPatch exec PT_LOAD protection: {error}"))
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

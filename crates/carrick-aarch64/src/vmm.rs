@@ -1047,6 +1047,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _target_ipa: u64,
         _len: usize,
         _content: Option<&[u8]>,
+        _access: carrick_mmu_core::aarch64::UserLeafAccess,
         _services: &mut dyn Stage1Services,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(

@@ -1224,7 +1224,10 @@ impl HvfTaskState {
                     mapping.start,
                     ipa,
                     mapping.end.saturating_sub(mapping.start),
-                    mapping.guest_writable,
+                    carrick_mmu_core::aarch64::UserLeafAccess {
+                        writable: mapping.guest_writable,
+                        executable: u64::from(mapping.perms) & 4 != 0,
+                    },
                     None,
                 )
             };
@@ -1753,7 +1756,16 @@ mod tests {
         let current_ipa = 0x009b_4000_1000;
         let len = 0x4000;
         page_tables
-            .map_private_aliased(va, old_ipa, len, true, None)
+            .map_private_aliased(
+                va,
+                old_ipa,
+                len,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable: true,
+                    executable: true,
+                },
+                None,
+            )
             .expect("seed deferred anonymous range");
         page_tables
             .set_prot_none(va, len as usize, None)
@@ -1805,7 +1817,16 @@ mod tests {
         let alias_va = block_va + 0x77_000;
         let alias_ipa = child_ipa + 0x77_000;
         page_tables
-            .map_private_aliased(block_va, old_ipa, 0x20_0000, true, None)
+            .map_private_aliased(
+                block_va,
+                old_ipa,
+                0x20_0000,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable: true,
+                    executable: true,
+                },
+                None,
+            )
             .expect("map parent block");
         page_tables
             .set_prot_none(block_va, 0x20_0000, None)
@@ -2004,7 +2025,16 @@ mod tests {
             );
 
             parent
-                .map_private_aliased(block_va, old_ipa, 0x20_0000, true, None)
+                .map_private_aliased(
+                    block_va,
+                    old_ipa,
+                    0x20_0000,
+                    carrick_mmu_core::aarch64::UserLeafAccess {
+                        writable: true,
+                        executable: true,
+                    },
+                    None,
+                )
                 .expect("map an older 2 MiB alias block");
             parent
                 .set_prot_none(block_va, 0x20_0000, None)
@@ -2058,7 +2088,16 @@ mod tests {
         let old_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
         let overlay_ipa = old_ipa + 0x20_0000;
         page_tables
-            .map_private_aliased(va, overlay_ipa, 0x20_0000, true, None)
+            .map_private_aliased(
+                va,
+                overlay_ipa,
+                0x20_0000,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable: true,
+                    executable: true,
+                },
+                None,
+            )
             .expect("map current COW overlay");
         page_tables
             .set_prot_none(va, 0x20_0000, None)
@@ -2101,7 +2140,16 @@ mod tests {
         let old_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x80_0000;
         let target_ipa = old_ipa + 0x20_0000;
         page_tables
-            .map_private_aliased(va, old_ipa, 0x20_0000, true, None)
+            .map_private_aliased(
+                va,
+                old_ipa,
+                0x20_0000,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable: true,
+                    executable: true,
+                },
+                None,
+            )
             .expect("map parent block");
         page_tables
             .set_prot_none(va, 0x20_0000, None)

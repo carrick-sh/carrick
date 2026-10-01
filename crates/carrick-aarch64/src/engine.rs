@@ -38,7 +38,7 @@ use carrick_hal::{
 use carrick_mem::memory::AddressSpace;
 use carrick_mmu_core::aarch64::{
     LiveDescriptorOwner, PageTableApplyOutcome, PageTableError, PageTableManager, PtOp,
-    TerminalRule,
+    TerminalRule, UserLeafAccess,
 };
 
 pub use crate::stage1_authority::{ShareState, Stage1Authority, Stage1Editor};
@@ -2515,6 +2515,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         target_ipa: u64,
         len: usize,
         content: Option<&[u8]>,
+        access: UserLeafAccess,
     ) -> Result<(), MemoryError> {
         let slot = self.mailbox_slot();
         let carrier_root = self.vm.carrier_maintenance_root().ok();
@@ -2528,7 +2529,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             required_invalidation: None,
         };
         self.vm
-            .repoint_guest_alias(va, target_ipa, len, content, &mut services)
+            .repoint_guest_alias(va, target_ipa, len, content, access, &mut services)
             .map_err(|error| MemoryError::HostMap(format!("guest alias publication: {error}")))
     }
 
@@ -3497,8 +3498,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                     MemoryError::HostMap(format!("guest shared identity restore: {error}"))
                 });
         }
+        // The aperture leaf goes back to its own frame read/write and
+        // non-executable; the caller publishes the mapping's protection next.
         self.pt_edit_and_flush_after_adopting(va, len, |mgr| {
-            mgr.map_aliased(va, va, len_u64, true)
+            mgr.map_aliased(va, va, len_u64, UserLeafAccess::READ_WRITE)
                 .map(|changed| PageTableApplyOutcome::new(changed, changed))
         })
     }
@@ -3590,7 +3593,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             })?;
         if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
             return self
-                .repoint_guest_alias(va, overlay_ipa, len, Some(content))
+                .repoint_guest_alias(
+                    va,
+                    overlay_ipa,
+                    len,
+                    Some(content),
+                    UserLeafAccess::READ_WRITE,
+                )
                 .map_err(RepointPrivateError::indeterminate);
         }
         let dst = self.vm.host_ptr(overlay_ipa, len.max(1)).ok_or_else(|| {
@@ -3620,7 +3629,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // partial leaves after this candidate was recycled.
         let outcome = self
             .pt_edit_locked(|mgr| {
-                mgr.map_aliased(va, overlay_ipa, len as u64, true)
+                // Read/write and non-executable until the caller publishes
+                // the new mapping's protection (`protect_range`).
+                mgr.map_aliased(va, overlay_ipa, len as u64, UserLeafAccess::READ_WRITE)
                     .map(|changed| PageTableApplyOutcome::new(changed, changed))
             })
             .map_err(RepointPrivateError::indeterminate)?;
@@ -3642,14 +3653,26 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         va: u64,
         target_ipa: u64,
         len: usize,
+        prot: u64,
     ) -> Result<(), MemoryError> {
+        use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+        let access = UserLeafAccess::from_linux_prot(prot);
+        let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
         if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
-            return self.repoint_guest_alias(va, target_ipa, len, None);
+            self.repoint_guest_alias(va, target_ipa, len, None, access)?;
+            return if prot_none {
+                self.protect_range(va, len, 0)
+            } else {
+                Ok(())
+            };
         }
         let outcome = self
             .pt_edit_locked(|mgr| {
-                mgr.map_aliased(va, target_ipa, len as u64, true)
-                    .map(|changed| PageTableApplyOutcome::new(changed, changed))
+                let mut changed = mgr.map_aliased(va, target_ipa, len as u64, access)?;
+                if prot_none {
+                    changed |= mgr.set_prot_none(va, len)?.changed;
+                }
+                Ok(PageTableApplyOutcome::new(changed, changed))
             })
             .map_err(|e| MemoryError::HostMap(format!("repoint shared leaf pt edit: {e}")))?;
         if !outcome.changed {
@@ -3891,7 +3914,17 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         }
         let mut descriptors = [0_u64; 4];
         let page_table_result = self.pt_edit_and_flush(|mgr| {
-            let changed = mgr.map_aliased(va.raw(), gpa, len, writable)?;
+            // Never executable here: a PROT_EXEC alias is published by the
+            // caller's `protect_range` with the mapping's own protection.
+            let changed = mgr.map_aliased(
+                va.raw(),
+                gpa,
+                len,
+                UserLeafAccess {
+                    writable,
+                    executable: false,
+                },
+            )?;
             descriptors = mgr.debug_walk(va.raw());
             Ok(PageTableApplyOutcome::new(changed, changed))
         });
@@ -6452,7 +6485,16 @@ mod tests {
         let guest_va = carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         let backing_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
         manager
-            .map_aliased(guest_va, backing_ipa, 0x4000, true, None)
+            .map_aliased(
+                guest_va,
+                backing_ipa,
+                0x4000,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable: true,
+                    executable: true,
+                },
+                None,
+            )
             .expect("map high shared-file alias into a global frame");
 
         let resolved = shared_futex_backing_gpa(&manager, guest_va + 4)
@@ -6565,8 +6607,17 @@ mod tests {
         let edit_len: usize = 4 * PAGE_SIZE as usize; // 4 pages in edit: [0..4)
         let total_mapped_len: u64 = 5 * PAGE_SIZE; // 5th page is neighbor [4..5)
 
-        mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true, None)
-            .expect("map initial non-identity pages");
+        mgr.map_private_aliased(
+            base_va,
+            base_ipa,
+            total_mapped_len,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
+            None,
+        )
+        .expect("map initial non-identity pages");
 
         let cow_range_stale_exec = crate::vmm::ForkCowRange {
             va: base_va + PAGE_SIZE,
@@ -6666,8 +6717,17 @@ mod tests {
             carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
 
-        mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true, None)
-            .expect("map initial non-identity pages");
+        mgr.map_private_aliased(
+            base_va,
+            base_ipa,
+            total_mapped_len,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
+            None,
+        )
+        .expect("map initial non-identity pages");
 
         let cow_range_stale_nonexec = crate::vmm::ForkCowRange {
             va: base_va + PAGE_SIZE,

@@ -1163,10 +1163,19 @@ pub(super) fn publish_replacing(
                         sparse_mmap_stage1_error(editor.manager, "begin_undo", error, has_source)
                     })?;
                     HvfVmState::refresh_stage1_exclusivity(editor.manager);
+                    // The leaves are built read-only and non-executable; the
+                    // permission publication below sets the mapping's own
+                    // protection (or PROT_NONE) before the edit commits.
+                    use carrick_mmu_core::aarch64::UserLeafAccess;
                     let aligned_start = align_up(start, TWO_MIB)?.min(end);
                     if start < aligned_start {
                         editor
-                            .map_private_aliased(start, semantic_ipa, aligned_start - start, false)
+                            .map_private_aliased(
+                                start,
+                                semantic_ipa,
+                                aligned_start - start,
+                                UserLeafAccess::READ_ONLY,
+                            )
                             .map_err(|error| {
                                 sparse_mmap_stage1_error(editor.manager, "leading", error, has_source)
                             })?;
@@ -1178,7 +1187,7 @@ pub(super) fn publish_replacing(
                                 aligned_start,
                                 semantic_ipa + (aligned_start - start),
                                 aligned_len,
-                                false,
+                                UserLeafAccess::READ_ONLY,
                             )
                             .map_err(|error| {
                                 sparse_mmap_stage1_error(editor.manager, "bulk", error, has_source)
@@ -1191,7 +1200,7 @@ pub(super) fn publish_replacing(
                                 tail_start,
                                 semantic_ipa + (tail_start - start),
                                 end - tail_start,
-                                false,
+                                UserLeafAccess::READ_ONLY,
                             )
                             .map_err(|error| {
                                 sparse_mmap_stage1_error(editor.manager, "trailing", error, has_source)

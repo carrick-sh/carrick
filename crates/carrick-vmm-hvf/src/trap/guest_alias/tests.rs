@@ -450,7 +450,7 @@ fn guest_host_alias_applies_inventory_before_naming_its_revision() {
             *access,
             AliasAccess::User {
                 writable: false,
-                executable: true
+                executable: false
             }
         );
         assert_eq!(*target, staged.gpa + (span.va - STRADDLING_VA));
@@ -465,7 +465,16 @@ fn guest_host_alias_applies_inventory_before_naming_its_revision() {
 
     // Host lane on the identical image: the same translation, page for page.
     mm.host
-        .map_aliased(STRADDLING_VA, staged.gpa, staged.length, false, None)
+        .map_aliased(
+            STRADDLING_VA,
+            staged.gpa,
+            staged.length,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: false,
+            },
+            None,
+        )
         .unwrap();
     for page in (0..staged.length).step_by(PAGE as usize) {
         let va = STRADDLING_VA + page;
@@ -596,12 +605,23 @@ fn guest_identity_restore_names_the_live_extent_for_a_subrange() {
         access,
         AliasAccess::User {
             writable: true,
-            executable: true
+            executable: false
         }
     );
     assert_eq!(backing.mapping_id.get(), staged.extent.mapping.raw());
     assert_eq!(backing.inventory_revision, nz(REVISION));
-    mm.host.map_aliased(va, va, len, true, None).unwrap();
+    mm.host
+        .map_aliased(
+            va,
+            va,
+            len,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: false,
+            },
+            None,
+        )
+        .unwrap();
     for page in (va - PAGE..va + len + PAGE).step_by(PAGE as usize) {
         let (level, leaf) = guest_leaf(&mm, page);
         let (host_level, host_leaf) = terminal_entry(mm.host.try_debug_walk(page).unwrap());
@@ -682,9 +702,31 @@ fn guest_map_alias_matches_host_map_aliased_page_for_page() {
         // Replacement: an older alias at the same VA onto other output.
         let stale = ipa + 4 * ONE_GIB;
         publish_raw(&mm, va, stale, len, true);
-        mm.host.map_aliased(va, stale, len, true, None).unwrap();
+        mm.host
+            .map_aliased(
+                va,
+                stale,
+                len,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable: true,
+                    executable: true,
+                },
+                None,
+            )
+            .unwrap();
         let transactions = publish_raw(&mm, va, ipa, len, writable);
-        mm.host.map_aliased(va, ipa, len, writable, None).unwrap();
+        mm.host
+            .map_aliased(
+                va,
+                ipa,
+                len,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable,
+                    executable: true,
+                },
+                None,
+            )
+            .unwrap();
         if index == 2 {
             // One transaction per 1 GiB-aligned VA span, not per 2 MiB.
             assert_eq!(transactions, 2);
@@ -729,7 +771,18 @@ fn map_alias_differs_from_a_global_image_only_by_asid_scoping() {
     let va = 0x5000_0000_3000;
     let ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x3000;
     publish_raw(&mm, va, ipa, 2 * PAGE, true);
-    mm.host.map_aliased(va, ipa, 2 * PAGE, true, None).unwrap();
+    mm.host
+        .map_aliased(
+            va,
+            ipa,
+            2 * PAGE,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
+            None,
+        )
+        .unwrap();
     let (level, leaf) = guest_leaf(&mm, va);
     let (host_level, host_leaf) = terminal_entry(mm.host.try_debug_walk(va).unwrap());
     let (guest, host) = (

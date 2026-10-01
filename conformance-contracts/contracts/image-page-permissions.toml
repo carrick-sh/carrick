@@ -1,0 +1,31 @@
+schema_version = 1
+id = "kernel.mm.image-page-permissions"
+title = "Writable memory never executes unless mapped PROT_EXEC"
+guest_surfaces = ["syscall:execve", "syscall:fork", "syscall:mmap", "syscall:mremap", "kernel:stage1_image"]
+semantic_authority = ["man 2 execve", "man 2 mmap", "man 2 mprotect", "conformance-probes/probe-inventory.json:nxwritableimage"]
+fixture = "probe:nxwritableimage"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+Linux maps each ELF PT_LOAD with that segment's own permissions, so .data and
+.bss are read/write and non-executable; the main stack, the brk heap and an
+anonymous read/write mapping are non-executable too, and an instruction fetch
+from any of them is SIGSEGV/SEGV_ACCERR. Carrick merges an image's segments
+into one host region with the union of their permissions and starts every
+identity leaf executable, so the fresh-image builders must give every EL0
+page exactly its mapping's permission: each region its own, then the ELF
+read-only and writable page spans. Every alias publication names its write
+and execute permission explicitly (`UserLeafAccess`); no mapping helper has
+an executable default, and a PROT_EXEC alias is executable only through its
+own published protection. The VM-free bindings bake a two-segment image with
+a stack and require text RO+X, data/bss/stack RW+NX, and require every alias
+leaf to carry exactly the named access; the signed binding runs the probe in
+the generic conformance-next shard (first image, fork child, after execve);
+Docker is the probe oracle. No structural work meter or runtime ratio is
+claimed.
+"""
+
+[bindings]
+vm_free = "carrick-mem::memory::loader_tests::fresh_image_data_bss_and_stack_are_not_executable; carrick-mmu-core::aarch64::tests::alias_leaves_carry_exactly_the_named_access"
+embed = "carrick-conformance-next::probes_shard_0::generic_probe_shard_0"
+docker = "probe:nxwritableimage"

@@ -216,7 +216,10 @@ fn native_code_content_host_write_rejects_changed_second_leaf_and_releases_pin()
             TEST_VA + 4096,
             fixture.installed.owners.0[1].0,
             4096,
-            true,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
             None,
         )
         .unwrap();
@@ -257,7 +260,16 @@ fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read(
     let authority = fixture.task.page_tables_authority();
     let mut tables = authority.snapshot_image().unwrap();
     tables
-        .map_aliased(alias_va, key.0, OWNER_LEN as u64, false, None)
+        .map_aliased(
+            alias_va,
+            key.0,
+            OWNER_LEN as u64,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .unwrap();
     authority.set_manager(tables);
     register_shared_alias(AliasBacking {

@@ -2030,8 +2030,18 @@ where
                                     None,
                                 ));
                             };
-                            if prot_none
-                                && let Err(error) = engine.protect_range(va.raw(), len_bytes, 0)
+                            // The backend publishes the alias read-only or
+                            // read/write and never executable; PROT_NONE and
+                            // PROT_EXEC are the VMA's own protection,
+                            // published here before the guest can see it.
+                            let exec = carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
+                                .contains(carrick_abi::LinuxProtFlags::EXEC);
+                            if (prot_none || exec)
+                                && let Err(error) = engine.protect_range(
+                                    va.raw(),
+                                    len_bytes,
+                                    if prot_none { 0 } else { prot },
+                                )
                             {
                                 return Err(refuse(Site::ProtectNone, error.to_string(), None));
                             }

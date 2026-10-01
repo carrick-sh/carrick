@@ -1016,6 +1016,55 @@ const PT_PAGE: u64 = 0x1000; // stage-1 table page size (4 KiB granule)
 // from the spare tail after them.
 const SPARE_START_OFFSET: u64 = 8 * PT_PAGE;
 
+/// The EL0 permission of a user alias leaf: Linux `PROT_WRITE` and
+/// `PROT_EXEC` of the mapping that owns the range. Every alias publication
+/// names both, so no mapping helper can make a page executable (or writable)
+/// that its owner did not map that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserLeafAccess {
+    pub writable: bool,
+    pub executable: bool,
+}
+
+impl UserLeafAccess {
+    /// Read/write, non-executable: anonymous data, the stack, `brk`.
+    pub const READ_WRITE: Self = Self {
+        writable: true,
+        executable: false,
+    };
+    /// Read-only, non-executable.
+    pub const READ_ONLY: Self = Self {
+        writable: false,
+        executable: false,
+    };
+
+    /// The access a Linux `PROT_*` word grants (`PROT_READ` is implied by a
+    /// valid leaf; `PROT_NONE` is a separate invalidation, not an access).
+    pub const fn from_linux_prot(prot: u64) -> Self {
+        Self {
+            writable: prot & 0x2 != 0,
+            executable: prot & 0x4 != 0,
+        }
+    }
+
+    /// `(block, page)` leaf flags carrying this access plus `scope` (nG).
+    fn leaf_flags(self, scope: u64) -> (u64, u64) {
+        let (mut block, mut page) = if self.writable {
+            (USER_BLOCK_FLAGS, USER_PAGE_FLAGS)
+        } else {
+            (
+                (USER_BLOCK_FLAGS & !AP_MASK) | AP_RO,
+                (USER_PAGE_FLAGS & !AP_MASK) | AP_RO,
+            )
+        };
+        if !self.executable {
+            block |= UXN;
+            page |= UXN;
+        }
+        (block | scope, page | scope)
+    }
+}
+
 /// A protection change applied to a guest VA range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtOp {
@@ -3969,12 +4018,14 @@ impl PageTableManager {
         self.begin_undo()
             .map_err(GuestLeafPublicationError::Manager)?;
 
-        let edit = self.map_private_aliased_with_permissions(
+        let edit = self.map_private_aliased(
             publication.va,
             publication.ipa,
             publication.len,
-            publication.writable,
-            publication.executable,
+            UserLeafAccess {
+                writable: publication.writable,
+                executable: publication.executable,
+            },
             None,
         );
         if let Err(error) = edit {
@@ -4018,12 +4069,14 @@ impl PageTableManager {
         if publication.len == 0 || page < publication.va || page >= end {
             return Err(GuestLeafPublicationError::BadRange);
         }
-        self.map_private_aliased_with_permissions(
+        self.map_private_aliased(
             publication.va,
             publication.ipa,
             publication.len,
-            publication.writable,
-            publication.executable,
+            UserLeafAccess {
+                writable: publication.writable,
+                executable: publication.executable,
+            },
             source.as_deref_mut(),
         )
         .map_err(GuestLeafPublicationError::Manager)?;
@@ -5906,22 +5959,21 @@ impl PageTableManager {
     /// boot Rosetta alias: it maps high guest VAs (which can't be
     /// identity-mapped — HVF's IPA is only 40 bits) down to a low IPA the caller
     /// has `hv_vm_map`'d. Uses 2 MiB blocks when `va`/`ipa`/`len` are 2 MiB
-    /// aligned, else 4 KiB pages. The target VA range must be previously
-    /// unmapped (high space the boot tables never populate). Always Ok(true).
+    /// aligned, else 4 KiB pages. Always Ok(true).
     ///
-    /// `writable`: when false the leaf is built AP=RO (read-only at EL0/EL1)
-    /// while PRESERVING the IPA output address — so a guest store to a
-    /// SHM_RDONLY shmat alias raises a stage-1 permission abort (SIGSEGV),
-    /// matching Linux. The output address must stay the low IPA (NOT VA&mask),
-    /// because an alias is non-identity (VA != IPA); set_readonly/apply would
-    /// rebuild it from the VA and destroy the mapping, which is why writability
-    /// is threaded in HERE instead.
+    /// `access` is the mapping's EL0 permission, both bits named by the
+    /// caller from the Linux protection that owns the range: a non-writable
+    /// leaf is built AP=RO while PRESERVING the IPA output address (a guest
+    /// store to a SHM_RDONLY shmat alias raises a stage-1 permission abort,
+    /// SIGSEGV, matching Linux; set_readonly/apply on an empty leaf would
+    /// rebuild it from the VA), and a non-executable leaf sets UXN. There is
+    /// no executable default.
     pub fn map_aliased(
         &mut self,
         va: u64,
         ipa: u64,
         len: u64,
-        writable: bool,
+        access: UserLeafAccess,
         source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
         let scope = if self.asid_scoped_leaves {
@@ -5929,16 +5981,7 @@ impl PageTableManager {
         } else {
             0
         };
-        let block_flags = if writable {
-            USER_BLOCK_FLAGS | scope
-        } else {
-            (USER_BLOCK_FLAGS & !AP_MASK) | AP_RO | scope
-        };
-        let page_flags = if writable {
-            USER_PAGE_FLAGS | scope
-        } else {
-            (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | scope
-        };
+        let (block_flags, page_flags) = access.leaf_flags(scope);
         self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags, source)
     }
 
@@ -5947,44 +5990,17 @@ impl PageTableManager {
     /// HVPatch uses this for private demand-materialized mmap extents. Their
     /// output lives in a VM-global IPA arena, but the semantic translation is
     /// owned by exactly one mm and must therefore carry nG from its first
-    /// publication. Shared aliases keep using [`Self::map_aliased`].
+    /// publication. Shared aliases keep using [`Self::map_aliased`]. New
+    /// leaves are always ASID-scoped (`nG`) and carry exactly `access`.
     pub fn map_private_aliased(
         &mut self,
         va: u64,
         ipa: u64,
         len: u64,
-        writable: bool,
+        access: UserLeafAccess,
         source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
-        self.map_private_aliased_with_permissions(va, ipa, len, writable, true, source)
-    }
-
-    /// Build a per-mm private VA→IPA translation with explicit Linux write and
-    /// execute permissions. New leaves are always ASID-scoped (`nG`).
-    pub fn map_private_aliased_with_permissions(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        writable: bool,
-        executable: bool,
-        source: Option<&mut dyn TableArenaSource>,
-    ) -> Result<bool, PageTableError> {
-        let block_flags = if writable {
-            USER_BLOCK_FLAGS | NON_GLOBAL
-        } else {
-            (USER_BLOCK_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
-        };
-        let mut block_flags = block_flags;
-        let mut page_flags = if writable {
-            USER_PAGE_FLAGS | NON_GLOBAL
-        } else {
-            (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
-        };
-        if !executable {
-            block_flags |= UXN;
-            page_flags |= UXN;
-        }
+        let (block_flags, page_flags) = access.leaf_flags(NON_GLOBAL);
         self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags, source)
     }
 
@@ -6367,6 +6383,17 @@ mod tests {
             Ok(())
         }
     }
+
+    /// The executable leaves these fixtures were written against; the
+    /// production callers name their mapping's own access.
+    const RWX: UserLeafAccess = UserLeafAccess {
+        writable: true,
+        executable: true,
+    };
+    const RX: UserLeafAccess = UserLeafAccess {
+        writable: false,
+        executable: true,
+    };
     use alloc::boxed::Box;
     use alloc::vec;
     use carrick_mem::memory::{
@@ -7778,6 +7805,35 @@ mod tests {
         }
     }
 
+    /// `kernel.mm.image-page-permissions`: an alias leaf carries exactly the
+    /// access its caller names. A mapping without `PROT_EXEC` sets UXN; no
+    /// alias helper has an executable default.
+    #[test]
+    fn alias_leaves_carry_exactly_the_named_access() {
+        let mut pt = manager();
+        let cases = [
+            (UserLeafAccess::READ_WRITE, AP_RW | UXN),
+            (UserLeafAccess::READ_ONLY, AP_RO | UXN),
+            (RWX, AP_RW),
+            (RX, AP_RO),
+            (UserLeafAccess::from_linux_prot(0x1 | 0x4), AP_RO),
+            (UserLeafAccess::from_linux_prot(0x1 | 0x2), AP_RW | UXN),
+        ];
+        for (index, (access, expected)) in cases.into_iter().enumerate() {
+            let shared = LINUX_MMAP_BASE + (index as u64) * 0x20_0000;
+            let private = shared + 0x10_0000;
+            let ipa = LINUX_ALIAS_IPA_BASE + (index as u64) * 0x20_0000;
+            pt.map_aliased(shared, ipa, 0x1000, access, None)
+                .expect("shared alias");
+            pt.map_private_aliased(private, ipa + 0x10_0000, 0x1000, access, None)
+                .expect("private alias");
+            for va in [shared, private] {
+                let leaf = terminal_descriptor(pt.debug_walk(va));
+                assert_eq!(leaf & (AP_MASK | UXN), expected, "{access:?} at {va:#x}");
+            }
+        }
+    }
+
     #[test]
     fn stage1_publication_refuses_outputs_in_the_gic_window() {
         let mut pt = manager();
@@ -7786,7 +7842,7 @@ mod tests {
                 LINUX_MMAP_BASE,
                 LINUX_GIC_REDISTRIBUTOR_BASE,
                 0x4000,
-                true,
+                RWX,
                 None
             ),
             Err(PageTableError::GicWindowOutput)
@@ -7796,12 +7852,12 @@ mod tests {
                 LINUX_MMAP_BASE,
                 LINUX_GIC_WINDOW_BASE - 0x2000,
                 0x4000,
-                true,
+                RWX,
                 None
             ),
             Err(PageTableError::GicWindowOutput)
         );
-        pt.map_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
+        pt.map_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, RWX, None)
             .expect("an ordinary alias");
         assert_eq!(
             pt.repoint_preserving_attributes(LINUX_MMAP_BASE, LINUX_GIC_WINDOW_BASE, 0x4000, None),
@@ -7851,7 +7907,7 @@ mod tests {
                 m.set_rw(LINUX_HEAP_BASE, 0x2000, false, None).ok();
             }),
             Box::new(|m: &mut PageTableManager| {
-                m.map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x8000, false, None)
+                m.map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x8000, RX, None)
                     .ok();
             }),
             Box::new(|m: &mut PageTableManager| {
@@ -7882,7 +7938,7 @@ mod tests {
                 .set_readonly(LINUX_HEAP_BASE, 0x8000, false, None)
                 .ok();
             journalled
-                .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
+                .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, RX, None)
                 .ok();
 
             let oracle = journalled.snapshot_image().expect("snapshot oracle");
@@ -7939,7 +7995,7 @@ mod tests {
         assert!(!fresh.undo_replaced_valid_descriptor(), "closed journal");
         fresh.begin_undo().unwrap();
         fresh
-            .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
+            .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, RX, None)
             .expect("map fresh hole");
         fresh
             .set_prot_none(LINUX_MMAP_BASE, 0x4000, None)
@@ -7954,7 +8010,7 @@ mod tests {
         replacing.set_multi_vcpu(false);
         replacing.set_stage1_exclusive(true);
         replacing
-            .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
+            .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, RX, None)
             .expect("map before the transaction");
         replacing.begin_undo().unwrap();
         replacing
@@ -8008,7 +8064,7 @@ mod tests {
 
         let shared_va = LINUX_SHARED_FILE_BASE;
         let shared_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
-        mgr.map_aliased(shared_va, shared_ipa, 0x4000, true, None)
+        mgr.map_aliased(shared_va, shared_ipa, 0x4000, RWX, None)
             .expect("publish physically shared per-mm alias");
         assert_ne!(
             leaf(&mgr, shared_va) & NON_GLOBAL,
@@ -8018,7 +8074,7 @@ mod tests {
 
         let private_va = LINUX_PRIVATE_OVERLAY_BASE;
         let first_private_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
-        mgr.map_private_aliased(private_va, first_private_ipa, 0x4000, true, None)
+        mgr.map_private_aliased(private_va, first_private_ipa, 0x4000, RWX, None)
             .expect("publish private alias");
         let replacement_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x60_0000;
         mgr.repoint_preserving_attributes(private_va, replacement_ipa, 0x4000, None)
@@ -8027,7 +8083,7 @@ mod tests {
 
         let mut compatibility = manager();
         compatibility
-            .map_aliased(shared_va, shared_ipa, 0x4000, true, None)
+            .map_aliased(shared_va, shared_ipa, 0x4000, RWX, None)
             .expect("publish compatibility alias");
         assert_eq!(
             leaf(&compatibility, shared_va) & NON_GLOBAL,
@@ -8043,7 +8099,7 @@ mod tests {
             test_layout(),
         );
         reconstructed
-            .map_aliased(shared_va, shared_ipa, 0x4000, true, None)
+            .map_aliased(shared_va, shared_ipa, 0x4000, RWX, None)
             .expect("publish alias after reconstructing the editor");
         assert_ne!(
             leaf(&reconstructed, shared_va) & NON_GLOBAL,
@@ -8056,7 +8112,7 @@ mod tests {
     fn host_walk_matches_the_copying_walk() {
         let mut mgr = manager();
         let va = LINUX_HEAP_BASE;
-        mgr.map_private_aliased(va, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
+        mgr.map_private_aliased(va, LINUX_ALIAS_IPA_BASE, 0x4000, RWX, None)
             .expect("map a private alias to force a full four-level walk");
         let bytes = mgr.as_bytes().to_vec();
         let base = mgr.base();
@@ -8077,7 +8133,7 @@ mod tests {
     fn snapshot_into_reproduces_snapshot_and_keeps_the_buffer() {
         let mut source = manager();
         source
-            .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
+            .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, RWX, None)
             .expect("split a block so the source has allocator state to carry");
 
         let mut recycled = manager();
@@ -8107,7 +8163,7 @@ mod tests {
     fn snapshot_copies_only_populated_prefix_and_preserves_capacity() {
         let mut source = manager();
         source
-            .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
+            .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, RWX, None)
             .expect("split a block so the source has allocator state to carry");
 
         let populated = source.copied_bytes();
@@ -8239,7 +8295,7 @@ mod tests {
         let va = LINUX_PRIVATE_OVERLAY_BASE + 0x20_0000;
         let old_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
         let new_ipa = old_ipa + 0x20_0000;
-        mgr.map_private_aliased(va, old_ipa, 0x20_0000, true, None)
+        mgr.map_private_aliased(va, old_ipa, 0x20_0000, RWX, None)
             .expect("map aligned private block");
         mgr.set_prot_none(va, 0x20_0000, None)
             .expect("arm untouched block for first touch");
@@ -8279,7 +8335,7 @@ mod tests {
         mgr.declare_offline_private_image();
         let va = LINUX_PRIVATE_OVERLAY_BASE + 0x20_0000;
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
-        mgr.map_private_aliased(va, ipa, 0x20_0000, true, None)
+        mgr.map_private_aliased(va, ipa, 0x20_0000, RWX, None)
             .expect("seed a block grant");
         mgr.mark_guest_private_publication(GuestLeafPublication {
             va,
@@ -8312,7 +8368,7 @@ mod tests {
 
         let retired_va = va + 0x20_0000;
         let retired_ipa = ipa + 0x80_0000;
-        mgr.map_private_aliased(retired_va, retired_ipa, 0x20_0000, true, None)
+        mgr.map_private_aliased(retired_va, retired_ipa, 0x20_0000, RWX, None)
             .expect("seed the next block grant");
         mgr.mark_guest_private_publication(GuestLeafPublication {
             va: retired_va,
@@ -8496,14 +8552,14 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_SHARED_FILE_BASE + 0x4000;
         let overlay = LINUX_PRIVATE_OVERLAY_BASE + 0x8000;
-        mgr.map_aliased(va, overlay, 0x1000, true, None)
+        mgr.map_aliased(va, overlay, 0x1000, RWX, None)
             .expect("private overlay");
         mgr.set_readonly(va, 0x1000, false, None)
             .expect("protect overlay readonly");
         assert_eq!(mgr.translate(va), Some(overlay));
 
         mgr.invalidate(va, 0x1000, None).expect("unmap overlay");
-        mgr.map_aliased(va, va, 0x1000, true, None)
+        mgr.map_aliased(va, va, 0x1000, RWX, None)
             .expect("restore shared identity");
         mgr.set_rw(va, 0x1000, false, None)
             .expect("protect restored shared mapping");
@@ -8519,9 +8575,9 @@ mod tests {
         let mut mgr = manager();
         let va1 = 0x100_0020_0000u64;
         let va2 = va1 + (1 << 21);
-        mgr.map_aliased(va1, 0x80_0000, 0x1000, true, None)
+        mgr.map_aliased(va1, 0x80_0000, 0x1000, RWX, None)
             .expect("alias 1");
-        mgr.map_aliased(va2, 0xA0_0000, 0x1000, true, None)
+        mgr.map_aliased(va2, 0xA0_0000, 0x1000, RWX, None)
             .expect("alias 2");
         assert!(
             mgr.is_valid(va1) && mgr.is_valid(va2),
@@ -8549,7 +8605,7 @@ mod tests {
         let bulk = 128 * (1u64 << 20);
         let len = bulk + 0x4000;
         let ok = mgr
-            .map_aliased(va, ipa, len, true, None)
+            .map_aliased(va, ipa, len, RWX, None)
             .expect("large unaligned alias must not exhaust the table pool");
         assert!(ok);
         assert!(mgr.is_valid(va), "first block of the bulk is mapped");
@@ -8574,7 +8630,7 @@ mod tests {
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE;
         let len = 0x1_0000;
-        mgr.map_aliased(va, ipa, len, true, None).expect("map");
+        mgr.map_aliased(va, ipa, len, RWX, None).expect("map");
         assert_eq!(mgr.translate(va), Some(ipa));
         assert_eq!(mgr.translate(va + 0xabc), Some(ipa + 0xabc));
         assert_eq!(mgr.translate(va + 0x3000 + 0x10), Some(ipa + 0x3000 + 0x10));
@@ -8589,8 +8645,7 @@ mod tests {
         let len = 0xc1_0000;
         let probe = 0x80_e280;
 
-        mgr.map_aliased(va, ipa, len, true, None)
-            .expect("map image");
+        mgr.map_aliased(va, ipa, len, RWX, None).expect("map image");
         let expected = ipa + (probe - va);
         assert_eq!(mgr.translate(probe), Some(expected));
 
@@ -8608,7 +8663,7 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
-        mgr.map_aliased(va, ipa, 0x4000, true, None).expect("map");
+        mgr.map_aliased(va, ipa, 0x4000, RWX, None).expect("map");
         mgr.invalidate(va, 0x4000, None).expect("invalidate");
 
         assert_eq!(mgr.translate(va + 0x123), None);
@@ -8624,7 +8679,7 @@ mod tests {
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE;
         let len = 2 * ONE_GIB + 4 * 0x1000;
-        mgr.map_aliased(va, ipa, len, true, None)
+        mgr.map_aliased(va, ipa, len, RWX, None)
             .expect("a 2 GiB + 16 KiB alias must map");
         let (after, _, _, _) = mgr.pool_stats();
         assert!(
@@ -8647,7 +8702,7 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE;
-        mgr.map_aliased(va, ipa, ONE_GIB, true, None)
+        mgr.map_aliased(va, ipa, ONE_GIB, RWX, None)
             .expect("a 1 GiB alias must map");
         let walk = mgr.debug_walk(va);
         assert_ne!(walk[1] & VALID, 0, "L1 leaf must be valid");
@@ -8669,7 +8724,7 @@ mod tests {
         let ipa = LINUX_ALIAS_IPA_BASE + FOUR_KIB;
         let before = mgr.pool_stats();
         assert_eq!(
-            mgr.map_aliased(va, ipa, ONE_GIB, true, None),
+            mgr.map_aliased(va, ipa, ONE_GIB, RWX, None),
             Err(PageTableError::OutOfTables)
         );
         assert_eq!(
@@ -8691,7 +8746,7 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_HIGH_VA_THRESHOLD + 2 * TWO_MIB;
         let ipa = LINUX_ALIAS_IPA_BASE + 4 * TWO_MIB;
-        mgr.map_aliased(va, ipa, TWO_MIB, false, None)
+        mgr.map_aliased(va, ipa, TWO_MIB, RX, None)
             .expect("map aligned block");
         mgr.invalidate(va, TWO_MIB as usize, None)
             .expect("invalidate aligned block");
@@ -8715,7 +8770,7 @@ mod tests {
         let va = LINUX_MMAP_BASE + 0x41_000;
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x81_000;
         let len = 0x23_000;
-        mgr.map_private_aliased(va, ipa, len, false, None)
+        mgr.map_private_aliased(va, ipa, len, RX, None)
             .expect("install exact private output");
         assert_ne!(
             terminal_descriptor(mgr.debug_walk(va)) & NON_GLOBAL,
@@ -8758,9 +8813,9 @@ mod tests {
         let b_va = a_va + a_len;
         let b_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
         let b_len = 0x2_2000;
-        mgr.map_aliased(a_va, a_ipa, a_len, true, None)
+        mgr.map_aliased(a_va, a_ipa, a_len, RWX, None)
             .expect("map A");
-        mgr.map_aliased(b_va, b_ipa, b_len, true, None)
+        mgr.map_aliased(b_va, b_ipa, b_len, RWX, None)
             .expect("map B");
         assert_eq!(mgr.translate(b_va + 0x1000), Some(b_ipa + 0x1000));
         assert_eq!(
@@ -8778,12 +8833,12 @@ mod tests {
         let b_va = a_va + a_len;
         let b_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
 
-        mgr.map_aliased(b_va, b_ipa, 0x1000, true, None)
+        mgr.map_aliased(b_va, b_ipa, 0x1000, RWX, None)
             .expect("map neighbor B first");
         let b_before = mgr.debug_walk(b_va)[3];
         assert_eq!(mgr.translate(b_va), Some(b_ipa));
 
-        mgr.map_aliased(a_va, a_ipa, a_len, true, None)
+        mgr.map_aliased(a_va, a_ipa, a_len, RWX, None)
             .expect("map sub-16 KiB A");
 
         assert_eq!(
@@ -9137,7 +9192,7 @@ mod tests {
         let alias_va = LINUX_HIGH_VA_THRESHOLD + 0x20_0000;
         let alias_ipa = LINUX_ALIAS_IPA_BASE + 0x40_0000;
         mgr.set_prot_none(invalid_va, 0x1000, None).expect("split");
-        mgr.map_aliased(alias_va, alias_ipa, 0x3000, false, None)
+        mgr.map_aliased(alias_va, alias_ipa, 0x3000, RX, None)
             .expect("alias");
         let identity_va = LINUX_HEAP_BASE + 0x1234;
         let before_identity = mgr.translate(identity_va);
@@ -9330,7 +9385,7 @@ mod tests {
         let va = LINUX_MMAP_BASE + 8 * TWO_MIB;
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1234_5000;
         let probe = va + 0x5000;
-        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true, None)
+        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, RWX, None)
             .expect("publish sparse extent");
         mgr.set_prot_none(va, (TWO_MIB - 0x1000) as usize, None)
             .expect("arm first touch");
@@ -9356,7 +9411,7 @@ mod tests {
         mgr.declare_offline_private_image();
         let va = LINUX_MMAP_BASE + 8 * TWO_MIB;
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1234_5000;
-        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true, None)
+        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, RWX, None)
             .expect("publish sparse extent");
         let (in_use_before, _, _, _) = mgr.pool_stats();
         mgr.invalidate(va, (TWO_MIB - 0x1000) as usize, None)
@@ -9392,7 +9447,7 @@ mod tests {
             block,
             LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x7000,
             0x1000,
-            true,
+            RWX,
             None,
         )
         .expect("publish one page");
@@ -10011,7 +10066,7 @@ mod tests {
         for (i, &offset) in island_offsets.iter().enumerate() {
             let va = base + offset;
             let ipa = ipa_base + (i as u64) * 0x20_0000;
-            mgr.map_aliased(va, ipa, 2 * 1024 * 1024, true, None)
+            mgr.map_aliased(va, ipa, 2 * 1024 * 1024, RWX, None)
                 .expect("map island");
             assert!(mgr.is_valid(va), "island at {va:#x} must be valid");
         }
@@ -10158,9 +10213,9 @@ mod tests {
         let old_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
         let target_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
         let mut host = hvpatch_manager();
-        host.map_private_aliased(retired, old_ipa, 0x4000, true, None)
+        host.map_private_aliased(retired, old_ipa, 0x4000, RWX, None)
             .expect("map table that will retire");
-        host.map_private_aliased(sentinel, old_ipa + TWO_MIB, 0x1000, true, None)
+        host.map_private_aliased(sentinel, old_ipa + TWO_MIB, 0x1000, RWX, None)
             .expect("keep the shared L2 table live");
         let reclaimed_l3 = host.debug_walk(retired)[2] & PA_MASK_TABLE;
         let stale_leaf = terminal_descriptor(host.debug_walk(retired));
@@ -10190,7 +10245,7 @@ mod tests {
             stale_leaf,
         );
 
-        host.map_private_aliased(target, target_ipa, 0x4000, true, None)
+        host.map_private_aliased(target, target_ipa, 0x4000, RWX, None)
             .expect("partially populate the reused L3");
         unsafe {
             host.sync_to_host(&*resolver)
@@ -10221,7 +10276,7 @@ mod tests {
         let mut mgr = hvpatch_manager();
         let va = 0x50_0000;
         let ipa = 0x80_0000;
-        mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
+        mgr.map_aliased(va, ipa, 0x1000, RX, None).expect("map");
         unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
 
         unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
@@ -10282,7 +10337,7 @@ mod tests {
         let mut mgr = hvpatch_manager();
         let va = 0x50_0000;
         let ipa = 0x80_0000;
-        mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
+        mgr.map_aliased(va, ipa, 0x1000, RX, None).expect("map");
         unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
 
         unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
@@ -10323,8 +10378,7 @@ mod tests {
         let mut mgr = hvpatch_manager();
         let va = 0x50_0000;
         let ipa_a = 0x80_0000;
-        mgr.map_aliased(va, ipa_a, 0x1000, false, None)
-            .expect("map");
+        mgr.map_aliased(va, ipa_a, 0x1000, RX, None).expect("map");
         unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
 
         unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
@@ -10335,7 +10389,7 @@ mod tests {
 
         // Mutate to ipa_b
         let ipa_b = 0x90_0000;
-        mgr.map_aliased(va, ipa_b, 0x1000, false, None)
+        mgr.map_aliased(va, ipa_b, 0x1000, RX, None)
             .expect("remap to B");
         assert_eq!(
             mgr.translate(va),
@@ -10369,10 +10423,8 @@ mod tests {
         let ipa1 = 0x1000;
         let ipa2 = 0x2000;
 
-        mgr1.map_aliased(va, ipa1, 0x1000, false, None)
-            .expect("map 1");
-        mgr2.map_aliased(va, ipa2, 0x1000, false, None)
-            .expect("map 2");
+        mgr1.map_aliased(va, ipa1, 0x1000, RX, None).expect("map 1");
+        mgr2.map_aliased(va, ipa2, 0x1000, RX, None).expect("map 2");
 
         unsafe {
             mgr1.restore_quiesced_snapshot_to_host(&*resolver).unwrap();
@@ -10435,7 +10487,7 @@ mod tests {
         let mut mgr = hvpatch_manager();
         let va = 0x60_0000;
         let ipa = 0x70_0000;
-        mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
+        mgr.map_aliased(va, ipa, 0x1000, RX, None).expect("map");
         unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
         unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
 
@@ -10469,7 +10521,7 @@ mod tests {
         let mut mgr = hvpatch_manager();
         let va = 0x50_0000;
         let ipa = 0x80_0000;
-        mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
+        mgr.map_aliased(va, ipa, 0x1000, RX, None).expect("map");
 
         // Snapshot image
         let snap = mgr.snapshot_image().expect("snapshot");
@@ -13221,23 +13273,23 @@ mod tests {
         let ipa = LINUX_ALIAS_IPA_BASE;
         let mut image = hvpatch_manager();
         image
-            .map_aliased(g + TWO_MIB, ipa, PT_PAGE, true, None)
+            .map_aliased(g + TWO_MIB, ipa, PT_PAGE, RWX, None)
             .unwrap();
         image
-            .map_aliased(g + 2 * TWO_MIB, ipa + 0x10_0000, 2 * PT_PAGE, true, None)
+            .map_aliased(g + 2 * TWO_MIB, ipa + 0x10_0000, 2 * PT_PAGE, RWX, None)
             .unwrap();
         // Keeps G's L2 table live.
         image
-            .map_aliased(g + 3 * TWO_MIB, ipa + 0x20_0000, PT_PAGE, true, None)
+            .map_aliased(g + 3 * TWO_MIB, ipa + 0x20_0000, PT_PAGE, RWX, None)
             .unwrap();
         image
-            .map_aliased(g + 4 * TWO_MIB, ipa + 0x40_0000, TWO_MIB, false, None)
+            .map_aliased(g + 4 * TWO_MIB, ipa + 0x40_0000, TWO_MIB, RX, None)
             .unwrap();
         image
-            .map_aliased(g2, ipa + 0x60_0000, PT_PAGE, true, None)
+            .map_aliased(g2, ipa + 0x60_0000, PT_PAGE, RWX, None)
             .unwrap();
         image
-            .map_aliased(g2 + 4 * TWO_MIB, ipa + 0x70_0000, PT_PAGE, true, None)
+            .map_aliased(g2 + 4 * TWO_MIB, ipa + 0x70_0000, PT_PAGE, RWX, None)
             .unwrap();
         let ident_va = g + 8 * TWO_MIB;
         let l2_table = image.debug_walk(g + TWO_MIB)[1] & PA_MASK_TABLE;
@@ -13377,13 +13429,13 @@ mod tests {
         let (mut mgr, resolver) = create_live_fixture();
         let g = LINUX_HIGH_VA_THRESHOLD;
         mgr.begin_undo().unwrap();
-        mgr.map_aliased(g + TWO_MIB, LINUX_ALIAS_IPA_BASE, PT_PAGE, true, None)
+        mgr.map_aliased(g + TWO_MIB, LINUX_ALIAS_IPA_BASE, PT_PAGE, RWX, None)
             .unwrap();
         mgr.map_aliased(
             g + 2 * TWO_MIB,
             LINUX_ALIAS_IPA_BASE + 0x10_0000,
             PT_PAGE,
-            true,
+            RWX,
             None,
         )
         .unwrap();
@@ -13461,14 +13513,14 @@ mod tests {
         let g = LINUX_HIGH_VA_THRESHOLD;
         let mut image = hvpatch_manager();
         image
-            .map_aliased(g + TWO_MIB, LINUX_ALIAS_IPA_BASE, PT_PAGE, true, None)
+            .map_aliased(g + TWO_MIB, LINUX_ALIAS_IPA_BASE, PT_PAGE, RWX, None)
             .unwrap();
         image
             .map_aliased(
                 g + 2 * TWO_MIB,
                 LINUX_ALIAS_IPA_BASE + 0x10_0000,
                 PT_PAGE,
-                true,
+                RWX,
                 None,
             )
             .unwrap();

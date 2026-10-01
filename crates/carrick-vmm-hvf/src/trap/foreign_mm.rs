@@ -4613,7 +4613,15 @@ pub mod foreign_cow_test_support {
                             .unmap_aliased(start, 0x1000)
                             .map_err(|e| format!("unmap: {e:?}"))?;
                         editor
-                            .map_aliased(start, old + 0x1000, 0x1000, true)
+                            .map_aliased(
+                                start,
+                                old + 0x1000,
+                                0x1000,
+                                carrick_mmu_core::aarch64::UserLeafAccess {
+                                    writable: true,
+                                    executable: true,
+                                },
+                            )
                             .map_err(|e| format!("remap: {e:?}"))?;
                         Ok(())
                     },
@@ -4757,7 +4765,10 @@ pub mod foreign_cow_test_support {
                     data_va + offset,
                     data_ipa.0 + offset,
                     OWNER_LEN,
-                    false,
+                    carrick_mmu_core::aarch64::UserLeafAccess {
+                        writable: false,
+                        executable: true,
+                    },
                     None,
                 )
                 .map_err(|error| format!("map carrier fixture COW leaf: {error:?}"))?;

@@ -3047,7 +3047,8 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.el1.anonymous-reservations",
-        "kernel.mm.backing-maintenance-lookup"
+        "kernel.mm.backing-maintenance-lookup",
+        "kernel.mm.image-page-permissions"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -3138,6 +3139,7 @@
         "kernel.exec.stage1-image",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.exec-heap-window",
+        "kernel.mm.image-page-permissions",
         "kernel.time.realtime-calibration"
       ],
       "claims": [],
@@ -3164,6 +3166,7 @@
         "kernel.fork.mappings",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
+        "kernel.mm.image-page-permissions",
         "kernel.mm.metadata-refusal",
         "kernel.mm.pt-pause-drain-acknowledgement",
         "kernel.mm.retained-fragment-query",

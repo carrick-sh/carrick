@@ -510,6 +510,7 @@ impl GuestMemory for ProtectionTrackingMemory {
         va: u64,
         target_ipa: u64,
         len: usize,
+        _prot: u64,
     ) -> Result<(), MemoryError> {
         self.repointed_shared_leaves.push((va, target_ipa, len));
         if self.fail_repoint {

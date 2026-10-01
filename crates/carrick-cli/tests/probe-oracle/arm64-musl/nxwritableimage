@@ -1,0 +1,19 @@
+ff9e81d203c530eb
+data_exec segv_code=2
+bss_exec segv_code=2
+stack_exec segv_code=2
+brk_heap_exec segv_code=2
+malloc_heap_exec segv_code=2
+mmap_rw_exec segv_code=2
+fork_child_data_exec segv_code=2
+fork_child_bss_exec segv_code=2
+fork_child_stack_exec segv_code=2
+fork_child_brk_heap_exec segv_code=2
+fork_child_malloc_heap_exec segv_code=2
+fork_child_mmap_rw_exec segv_code=2
+after_exec_data_exec segv_code=2
+after_exec_bss_exec segv_code=2
+after_exec_stack_exec segv_code=2
+after_exec_brk_heap_exec segv_code=2
+after_exec_malloc_heap_exec segv_code=2
+after_exec_mmap_rw_exec segv_code=2
