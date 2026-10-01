@@ -2798,11 +2798,16 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
             OpenDescription::PipeWriter { pipe, .. } => {
+                // `man 7 pipe` / Linux pipe poll: the write end is POLLOUT
+                // while the ring has room and POLLERR once every read end
+                // is closed; the two are independent (a write end whose
+                // reader closed reports EPOLLOUT|EPOLLERR).
                 let state = pipe.snapshot();
                 let mut ready = LinuxEpollEvents::empty();
                 if state.readers == 0 {
                     ready |= LinuxEpollEvents::ERR;
-                } else if crate::dispatch::fs::pipe::pipe_writer_is_writable(&state) {
+                }
+                if crate::dispatch::fs::pipe::pipe_writer_is_writable(&state) {
                     ready |= LinuxEpollEvents::OUT;
                 }
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
