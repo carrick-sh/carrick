@@ -194,6 +194,7 @@ impl PendingExecStage2Cleanup {
             root_proof = Some(retired_root.proof);
         }
         let (removed_aliases, preserved_aliases) = mutate_known_external_alias_state(
+            AliasWriterActor::Unknown,
             |registry| {
                 retired_projection_mutation_keys(
                     registry,

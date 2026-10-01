@@ -1927,6 +1927,143 @@ mod alias_registry_tests {
         }
     }
 
+    /// The 2026-09-30 `hvpatch::host_alias` carrier fatal, VM-free. A
+    /// root-container munmap planned `{Y}`: its window also held a row of
+    /// extent X, but a stale row of an older incarnation of X elsewhere in the
+    /// same scope kept X alive. Before the commit, ANOTHER MM's COW retired
+    /// that older projection and -- holding only its own MM guard -- removed
+    /// every scope's rows of it. Unregistering against the old plan then
+    /// retired X too, a lease the plan never reserved. The commit must see the
+    /// change before it mutates, and the restarted plan must be the live one
+    /// and must have read strictly fewer rows.
+    #[test]
+    fn retirement_commit_detects_an_out_of_guard_co_holder_removal() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT);
+        let (va, len) = (0x1000_4000_u64, 0x8000_usize);
+        let (x, y) = (0x9000_0000_u64, 0x9001_0000_u64);
+        let planned_row = make_test_alias(0x1000_4000, 0x4000, y, 0x4000, scope);
+        let mut live_row = make_test_alias(0x1000_8000, 0x4000, x, 0x4000, scope);
+        live_row.owner_generation = 2125;
+        let mut stale_row = make_test_alias(0x2000_0000, 0x2000, x, 0x4000, scope);
+        stale_row.owner_generation = 1788;
+        let mut registry = AliasRegistry::default();
+        for alias in [planned_row, live_row, stale_row] {
+            registry.push(alias);
+        }
+
+        let visible = AliasVisibleRevisions::capture(&registry, None, ContainerRootToken::ROOT);
+        let (planned, window) =
+            registry.plan_unregister_process_alias(va, len, None, ContainerRootToken::ROOT);
+        assert_eq!(planned, [(y, 0x4000)].into());
+        let footprint = alias_unmap_footprint(&registry, &window, None, ContainerRootToken::ROOT);
+        assert_eq!(footprint.len(), 3);
+
+        // Another MM retires the OLD incarnation of X.
+        let removed = remove_rows_for_retired_stage2_projections(
+            &mut registry,
+            &[RetiredStage2Projection {
+                physical_ipa: x,
+                physical_length: 0x4000,
+                owner: InventoryStage2OwnerIdentity {
+                    host_addr: stale_row.physical_host_addr,
+                    generation: 1788,
+                },
+            }],
+        );
+        assert_eq!(removed.removed_aliases, vec![stale_row]);
+        let rows_before_commit: Vec<_> = registry.iter().copied().collect();
+
+        let outcome = commit_planned_unregister_in(
+            &mut registry,
+            va,
+            len,
+            None,
+            ContainerRootToken::ROOT,
+            AliasUnmapPlanAuthority {
+                planned_leases: &planned,
+                visible_revisions: Some(visible),
+            },
+        );
+        let live: std::collections::BTreeSet<_> = [(x, 0x4000), (y, 0x4000)].into();
+        assert_eq!(
+            outcome,
+            AliasUnmapCommit::Stale {
+                live_leases: live.clone()
+            },
+            "a plan the registry no longer supports must not commit"
+        );
+        assert_eq!(
+            registry.iter().copied().collect::<Vec<_>>(),
+            rows_before_commit,
+            "a stale commit mutated the registry"
+        );
+
+        // The restart: a fresh plan under the same guard is the live one,
+        // read strictly fewer rows, and commits exactly.
+        let visible = AliasVisibleRevisions::capture(&registry, None, ContainerRootToken::ROOT);
+        let (replanned, window) =
+            registry.plan_unregister_process_alias(va, len, None, ContainerRootToken::ROOT);
+        assert_eq!(replanned, live);
+        assert!(
+            alias_unmap_footprint(&registry, &window, None, ContainerRootToken::ROOT).len()
+                < footprint.len()
+        );
+        assert_eq!(
+            commit_planned_unregister_in(
+                &mut registry,
+                va,
+                len,
+                None,
+                ContainerRootToken::ROOT,
+                AliasUnmapPlanAuthority {
+                    planned_leases: &replanned,
+                    visible_revisions: Some(visible),
+                },
+            ),
+            AliasUnmapCommit::Retired(live)
+        );
+        assert_eq!(registry.len(), 0);
+    }
+
+    /// A visible-scope change that leaves this window's lease set alone (a
+    /// row elsewhere in the scope) re-authenticates under the lock and
+    /// commits; only a change to THIS window's leases restarts.
+    #[test]
+    fn retirement_commit_tolerates_unrelated_visible_scope_mutation() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT);
+        let (va, len) = (0x1000_4000_u64, 0x4000_usize);
+        let y = 0x9001_0000_u64;
+        let mut registry = AliasRegistry::default();
+        registry.push(make_test_alias(0x1000_4000, 0x4000, y, 0x4000, scope));
+        let unrelated = make_test_alias(0x3000_0000, 0x4000, 0x9002_0000, 0x4000, scope);
+        registry.push(unrelated);
+        let visible = AliasVisibleRevisions::capture(&registry, None, ContainerRootToken::ROOT);
+        let (planned, _) =
+            registry.plan_unregister_process_alias(va, len, None, ContainerRootToken::ROOT);
+        assert_eq!(
+            registry.remove_exact_values_in_batch(&[unrelated]),
+            vec![unrelated]
+        );
+        assert!(!visible.unchanged(&registry));
+        assert_eq!(
+            commit_planned_unregister_in(
+                &mut registry,
+                va,
+                len,
+                None,
+                ContainerRootToken::ROOT,
+                AliasUnmapPlanAuthority {
+                    planned_leases: &planned,
+                    visible_revisions: Some(visible),
+                },
+            ),
+            AliasUnmapCommit::Retired(planned)
+        );
+        assert_eq!(registry.len(), 0);
+    }
+
     #[test]
     fn forked_stack_grant_keeps_neighbor_and_child_leases_during_partial_discard() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();

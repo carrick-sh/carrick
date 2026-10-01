@@ -3164,6 +3164,10 @@ fn finish_foreign_cow_publication(
     if retired_old_stage2 {
         let retired = [RetiredStage2Projection::from(split.old)];
         let cleanup = mutate_known_external_alias_state(
+            AliasWriterActor::Mm {
+                mm_root_slot: runtime.mm_root_slot,
+                container_root: runtime.container_root,
+            },
             |aliases| retired_projection_mutation_keys(aliases, &retired, &[]),
             |aliases| remove_rows_for_retired_stage2_projections(aliases, &retired),
         );

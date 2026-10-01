@@ -869,15 +869,15 @@ fn replacement_completion_and_rollback_touch_the_right_owner() {
         ],
     );
     assert!(!retire.contains("FrameRegistryGuard::acquire("));
-    let inner = fn_body(source, "fn commit_process_alias_retirement_inner(");
+    let inner = fn_body(source, "fn try_commit_process_alias_retirement(");
     in_order(
         inner,
         &[
             "let registered = rows == AliasRetirementRows::Registered;",
             "if registered {",
             "supersede_cow_receipts(",
-            "let actual_leases = if registered {",
-            "unregister_alias(",
+            "if registered {",
+            "commit_planned_unregister_in(",
         ],
     );
 }
