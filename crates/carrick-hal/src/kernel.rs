@@ -415,14 +415,20 @@ pub struct FrameInventoryApplyReceipt {
 impl FrameInventoryApplyReceipt {
     /// Kernel-owner seam. Callers cannot authenticate a fabricated receipt
     /// without the reservation's opaque provenance retained by the Kernel.
+    ///
+    /// The mapping set is kept sorted, so [`Self::authorizes`] is a binary
+    /// search: a process retirement authenticates every one of its n
+    /// mappings against the receipt, and a linear `contains` made that
+    /// O(n^2) (~0.7 ms of a 2511-mapping cpython teardown).
     #[doc(hidden)]
     pub fn from_kernel_authority(
         provenance: FrameInventoryProvenance,
         transaction: KernelTransactionId,
         mm: NonZeroU64,
         revision: u64,
-        mappings: Vec<(MappingId, FrameId)>,
+        mut mappings: Vec<(MappingId, FrameId)>,
     ) -> Self {
+        mappings.sort_unstable();
         Self {
             provenance,
             transaction,
@@ -445,9 +451,10 @@ impl FrameInventoryApplyReceipt {
     }
 
     pub fn authorizes(&self, mapping: MappingId, frame: FrameId) -> bool {
-        self.mappings.contains(&(mapping, frame))
+        self.mappings.binary_search(&(mapping, frame)).is_ok()
     }
 
+    /// The receipt's exact `(mapping, frame)` set, sorted.
     pub fn mapping_set(&self) -> &[(MappingId, FrameId)] {
         &self.mappings
     }
@@ -557,6 +564,57 @@ mod tests {
 
     fn capacity(raw: usize) -> FrameEventCapacity {
         FrameEventCapacity::for_event_count(raw).expect("valid test capacity")
+    }
+
+    /// A receipt keeps its mapping set sorted however the Kernel listed it,
+    /// so `authorizes` is a search, not a scan: process retirement asks it
+    /// once per mapping, which made a linear scan O(n^2) in the process's
+    /// mapping count.
+    #[test]
+    fn receipt_mapping_set_is_sorted_and_authorizes_exactly() {
+        let n = 4096_u64;
+        let mappings: Vec<_> = (1..=n)
+            .rev()
+            .map(|raw| {
+                (
+                    MappingId::from_kernel_allocation(id(raw)),
+                    FrameId::from_kernel_allocation(id(raw % 97 + 1)),
+                )
+            })
+            .collect();
+        let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
+            FrameInventoryProvenance::from_kernel_entropy([7; 32]),
+            KernelTransactionId::from_kernel_allocation(id(9)),
+            id(3),
+            1,
+            mappings.clone(),
+        );
+        assert!(
+            receipt
+                .mapping_set()
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+        assert_eq!(receipt.mapping_set().len(), mappings.len());
+        for &(mapping, frame) in &mappings {
+            assert!(receipt.authorizes(mapping, frame));
+        }
+        assert!(!receipt.authorizes(
+            MappingId::from_kernel_allocation(id(1)),
+            FrameId::from_kernel_allocation(id(97)),
+        ));
+        assert!(!receipt.authorizes(
+            MappingId::from_kernel_allocation(id(n + 1)),
+            FrameId::from_kernel_allocation(id(1)),
+        ));
+        let source = include_str!("kernel.rs");
+        let authorizes = source
+            .split("pub fn authorizes(&self, mapping: MappingId, frame: FrameId) -> bool {")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }").next())
+            .expect("authorizes body");
+        assert!(authorizes.contains("binary_search"));
+        assert!(!authorizes.contains(".contains("));
     }
 
     #[test]

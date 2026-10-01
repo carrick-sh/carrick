@@ -3227,3 +3227,87 @@ fn committed_child_requires_fresh_exact_kernel_cow_binding() {
     let duplicate = token(31, cow_identity, 5);
     assert!(binding.bind_child_kernel(duplicate).is_err());
 }
+
+/// Contract `kernel.hvpatch.teardown-linear`: authenticating a retirement
+/// receipt is O((n + p) log n) in the retiring mm's mappings n and pending
+/// fork receipts p. It was a `Vec::contains` per expected mapping and a scan
+/// of the expected set per pending receipt (O(n^2) and O(p*n)), and the
+/// Kernel built the receipt with a `contains` per unmap event.
+#[test]
+fn retirement_receipt_authentication_has_no_per_element_scans() {
+    let trap = include_str!("../trap.rs");
+    let authenticate = trap
+        .split("fn authenticate_pending_retirement(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n").next())
+        .expect("authenticate_pending_retirement body");
+    assert!(!authenticate.contains(".iter()\n                    .any("));
+    assert!(!authenticate.contains(".any(|(mapping, _)|"));
+    assert!(authenticate.contains("binary_search"));
+    let kernel = include_str!("../../../carrick-kernel/src/kernel/frame_inventory.rs");
+    let production = kernel
+        .split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .expect("kernel production source");
+    for entry in [
+        "pub fn apply_retirement_with_receipt<T>(",
+        "fn apply_with_receipt_inner<T>(",
+    ] {
+        let body = production
+            .split(entry)
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }\n").next())
+            .unwrap_or_else(|| panic!("{entry} body"));
+        assert!(
+            !body.contains("mappings.contains("),
+            "{entry} must not scan its receipt per event"
+        );
+    }
+}
+
+/// The receipt audit at scale: 20k mappings and 20k pending receipts
+/// authenticate (exactness, not timing: the O(n^2) form also passed this).
+#[test]
+fn retirement_receipt_authentication_is_exact_at_scale() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let mapping = |raw| {
+        carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(raw).unwrap())
+    };
+    let frame =
+        |raw| carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(raw).unwrap());
+    let mm = std::num::NonZeroU64::new(604).unwrap();
+    let n = 20_000_u64;
+    let live: Vec<_> = (1..=n)
+        .map(|raw| (mapping(raw), frame(raw % 501 + 1)))
+        .collect();
+    let ids: Vec<_> = live.iter().map(|&(id, _)| id).collect();
+    let retired = carrick_hal::FrameInventoryRetirementReceipt::from_kernel_authority(
+        test_kernel_apply(
+            retirement_inventory_commit(97, &ids),
+            97,
+            mm,
+            12,
+            live.clone(),
+        ),
+        true,
+    );
+    let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(
+        std::num::NonZeroU64::new(97).unwrap(),
+    );
+    let pending: Vec<_> = live
+        .iter()
+        .map(|&(child_mapping, frame)| PendingForkFrameReceipt {
+            transaction,
+            kind: carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+            parent_mapping: child_mapping,
+            child_mapping,
+            frame,
+            ipa: 0x0020_0000,
+            length: 0x4000,
+        })
+        .collect();
+    assert!(authenticate_pending_retirement(&live, &pending, &retired).ok());
+    let mut drifted = pending.clone();
+    drifted[n as usize / 2].frame = frame(9999);
+    assert!(!authenticate_pending_retirement(&live, &drifted, &retired).ok());
+}
