@@ -46,7 +46,10 @@ pub use self::task::{
     ThreadResources,
 };
 pub(crate) use self::task::{PtraceMemoryAccessWitness, PtraceTextAccess, TaskJobControlEvent};
-pub use self::task::{PtraceStopSettlement, PtraceSynchronousFault};
+pub use self::task::{
+    PtraceSettlePrecheck, PtraceStopGeneration, PtraceStopRefusal, PtraceStopSettlement,
+    PtraceSynchronousFault,
+};
 pub(in crate::kernel) use self::thread::ExecDrain;
 pub use self::thread::{
     BlockedReason, ExecConsumedPredecessorAuthority, ExecutionFailure, ExecutionGeneration,

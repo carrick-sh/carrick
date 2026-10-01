@@ -1148,6 +1148,7 @@ where
             | DispatchOutcome::BlockingFdWait { .. }
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnHvpatchChild { .. }
+            | DispatchOutcome::WaitOnPtraceStopSettle { .. }
             | DispatchOutcome::WaitOnSignals { .. }
             // The single-threaded path dispatches without a thread context,
             // so the in-guest zone never serves its futexes.

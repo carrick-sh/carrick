@@ -1824,6 +1824,7 @@ where
                 | DispatchOutcome::BlockingRecordLock(_)
                 | DispatchOutcome::WaitOnFds { .. }
                 | DispatchOutcome::WaitOnHvpatchChild { .. }
+                | DispatchOutcome::WaitOnPtraceStopSettle { .. }
                 | DispatchOutcome::WaitOnSignals { .. }
                 | DispatchOutcome::WaitOnSleep { .. }
                 | DispatchOutcome::WaitOnSharedWord { .. }) => {

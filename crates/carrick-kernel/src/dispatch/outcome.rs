@@ -928,6 +928,25 @@ pub enum DispatchOutcome {
         /// reading then subscribes past it and parks forever.
         precheck: crate::kernel::ChildWaitPrecheck,
     },
+    /// A ptrace request found its tracee's ptrace-stop published — and
+    /// possibly already reported to the tracer by `wait(2)` — but the tracee
+    /// has not yet settled into it. ptrace(2) guarantees a tracee observed in
+    /// ptrace-stop stays stopped and that requests operate on it, so the
+    /// request must not fail with `ESRCH` in that window: it waits for the
+    /// tracee's own settlement edge, then re-dispatches and re-evaluates
+    /// (Linux semantics again, including `ESRCH` if the tracee died or the
+    /// stop was cancelled meanwhile). Nothing was performed before parking,
+    /// so the re-dispatch is the whole request.
+    ///
+    /// Backend: suspend on the tracer's task wake enrolled against THIS
+    /// `precheck` generation, then re-dispatch the ptrace request. The wait
+    /// is killable only (like a vfork parent): other signals stay pending
+    /// until the request completes.
+    WaitOnPtraceStopSettle {
+        #[serde(skip)]
+        tracee: crate::kernel::TaskKey,
+        precheck: crate::kernel::objects::PtraceSettlePrecheck,
+    },
     /// A synchronous signal wait found no matching signal already pending and
     /// must wait until one of `wait_set` arrives, or until `timeout` elapses.
     /// `rt_sigtimedwait` uses its caller-supplied timeout; `rt_sigsuspend` uses

@@ -2966,7 +2966,7 @@ mod tests {
         let witness = fixture
             .child
             .task()
-            .begin_ptrace_memory_access(root.task().key())
+            .begin_ptrace_memory_access(root.task())
             .expect("settled ptrace text witness");
         let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
 
@@ -3041,7 +3041,7 @@ mod tests {
         let witness = fixture
             .child
             .task()
-            .begin_ptrace_memory_access(root.task().key())
+            .begin_ptrace_memory_access(root.task())
             .expect("settled ptrace text witness");
         let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
 

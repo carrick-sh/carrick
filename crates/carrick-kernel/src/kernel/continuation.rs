@@ -528,6 +528,11 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
         ContinuationDetail::Signals { wait_set, .. } => {
             format!("signals wait_set={:#x}", wait_set.raw())
         }
+        ContinuationDetail::PtraceStop { tracee, .. } => format!(
+            "ptrace-stop tracee={}.{}",
+            tracee.id.raw(),
+            tracee.serial.raw()
+        ),
         ContinuationDetail::Sleep => "sleep".to_owned(),
         ContinuationDetail::Vfork { child, .. } => {
             format!("vfork child={}.{}", child.id.raw(), child.serial.raw())
@@ -823,6 +828,13 @@ pub enum ContinuationDetail {
         wait_set: SigSet,
         block_mask: SigBlockMask,
     },
+    /// A ptrace request parked until its tracee settles into a published
+    /// ptrace-stop. `precheck` is the tracer's wake generation as of the
+    /// admission that found the stop unsettled; enrollment subscribes at it.
+    PtraceStop {
+        tracee: TaskKey,
+        precheck: crate::kernel::objects::PtraceSettlePrecheck,
+    },
     Sleep,
     Vfork {
         child: TaskKey,
@@ -913,6 +925,7 @@ pub enum BlockedContinuation {
     WaitOnSignals(ContinuationState),
     WaitOnSleep(ContinuationState),
     VforkParent(ContinuationState),
+    PtraceStopSettle(ContinuationState),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -937,6 +950,7 @@ pub enum ContinuationFamily {
     WaitOnSignals,
     WaitOnSleep,
     VforkParent,
+    PtraceStopSettle,
 }
 
 impl ContinuationFamily {
@@ -964,6 +978,7 @@ impl ContinuationFamily {
             Self::WaitOnSignals => 15,
             Self::WaitOnSleep => 16,
             Self::VforkParent => 17,
+            Self::PtraceStopSettle => 23,
         }
     }
 
@@ -992,6 +1007,7 @@ impl ContinuationFamily {
             Self::WaitOnSignals => "wait-on-signals",
             Self::WaitOnSleep => "wait-on-sleep",
             Self::VforkParent => "vfork-parent",
+            Self::PtraceStopSettle => "ptrace-stop-settle",
         }
     }
 
@@ -1027,6 +1043,7 @@ pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
             | DispatchOutcome::BlockingFdWait { .. }
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnHvpatchChild { .. }
+            | DispatchOutcome::WaitOnPtraceStopSettle { .. }
             | DispatchOutcome::WaitOnSignals { .. }
             | DispatchOutcome::WaitOnSleep { .. }
     )
@@ -1327,6 +1344,16 @@ impl BlockedContinuation {
                     },
                 ))
             }
+            DispatchOutcome::WaitOnPtraceStopSettle { tracee, precheck } => {
+                // Killable only, like a vfork parent: no temporary mask, and
+                // the signal probe reserves nothing but SIGKILL for it.
+                Self::PtraceStopSettle(new_state(
+                    None,
+                    Vec::new(),
+                    None,
+                    ContinuationDetail::PtraceStop { tracee, precheck },
+                ))
+            }
             DispatchOutcome::WaitOnSignals {
                 wait_set,
                 block_mask,
@@ -1489,7 +1516,8 @@ impl BlockedContinuation {
             | Self::WaitOnHvpatchChild(state)
             | Self::WaitOnSignals(state)
             | Self::WaitOnSleep(state)
-            | Self::VforkParent(state) => state,
+            | Self::VforkParent(state)
+            | Self::PtraceStopSettle(state) => state,
         }
     }
 
@@ -1514,7 +1542,8 @@ impl BlockedContinuation {
             | Self::WaitOnHvpatchChild(state)
             | Self::WaitOnSignals(state)
             | Self::WaitOnSleep(state)
-            | Self::VforkParent(state) => state,
+            | Self::VforkParent(state)
+            | Self::PtraceStopSettle(state) => state,
         }
     }
 
@@ -1540,6 +1569,7 @@ impl BlockedContinuation {
             Self::WaitOnSignals(_) => ContinuationFamily::WaitOnSignals,
             Self::WaitOnSleep(_) => ContinuationFamily::WaitOnSleep,
             Self::VforkParent(_) => ContinuationFamily::VforkParent,
+            Self::PtraceStopSettle(_) => ContinuationFamily::PtraceStopSettle,
         }
     }
 
@@ -1774,6 +1804,9 @@ impl BlockedContinuation {
                 wait_set,
                 block_mask,
             } => fingerprint ^= wait_set.raw() ^ block_mask.raw(),
+            ContinuationDetail::PtraceStop { tracee, precheck } => {
+                fingerprint ^= tracee.serial.raw() ^ precheck.wake_generation();
+            }
             ContinuationDetail::Sleep => {}
             ContinuationDetail::Vfork { child, wait } => {
                 fingerprint ^= child.serial.raw()
