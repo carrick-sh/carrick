@@ -734,7 +734,7 @@ fn frame_grant_sparse_mincore_tracks_only_faulting_pages() {
 // settlement-time plan is wider than the published one; the published span
 // is still armed and must settle. A span that lost its arming must not.
 #[test]
-fn published_frame_grant_survives_an_adjacent_arming_merge() {
+fn published_frame_grant_settles_while_its_fault_page_stays_armed() {
     let dispatcher = SyscallDispatcher::new();
     let base = LINUX_MMAP_BASE;
     let page = dispatcher.linux_page_size();
@@ -776,14 +776,30 @@ fn published_frame_grant_survives_an_adjacent_arming_merge() {
         "only the faulting page commits; the merged pages stay armed"
     );
 
-    // A published span that lost its arming or protection does not settle.
+    // A sibling's first touch committed page 3 of a span another grant
+    // published for fault page 1: the settlement-time plan shrank, but the
+    // faulting page is still armed and still commits (windowcoherence:
+    // published (0x6000a22000, 0x10000), now (0x6000a25000, 0xd000)).
     dispatcher
-        .with_resident_frame_grant_plan_for_test(base, WINDOW, |plan| {
+        .with_resident_frame_grant_plan_for_test(base + page, WINDOW, |plan| {
+            assert_eq!(
+                (plan.start(), plan.len()),
+                (base, 3 * page),
+                "the settlement-time plan shrank inside the published span"
+            );
+            assert!(plan.covers_published((base, 4 * page, prot.bits())));
+            // Reprotected arming, or a span that never held this fault page,
+            // does not settle.
             assert!(!plan.covers_published((base, 4 * page, LinuxProtFlags::READ.bits())));
-            assert!(!plan.covers_published((base, 9 * page, prot.bits())));
-            assert!(!plan.covers_published((base + page, 4 * page, prot.bits())));
+            assert!(!plan.covers_published((base + 2 * page, 2 * page, prot.bits())));
         })
         .unwrap();
+    // A fault page that lost its own arming has no plan at all.
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base + 3 * page, WINDOW, |_| ())
+            .is_none()
+    );
 }
 
 #[test]
