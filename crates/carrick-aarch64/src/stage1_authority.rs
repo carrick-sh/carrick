@@ -68,6 +68,10 @@ struct Stage1AuthorityInner {
     arena_source: Option<Box<dyn TableArenaSource>>,
     /// Publishes extension arenas a guest descriptor transaction grows into.
     arena_publisher: Option<Arc<dyn TableArenaPublisher>>,
+    /// Extension arenas the publisher accepted. An arena the image holds
+    /// but this set lacks (its publication was refused) is published again
+    /// before any guest transaction is returned.
+    published_arenas: Vec<u64>,
     host_resolver: Option<Arc<dyn HostArenaResolver + Send + Sync>>,
     vfork_shares: usize,
     engines: usize,
@@ -232,6 +236,7 @@ impl Stage1Authority {
                 },
                 arena_source: None,
                 arena_publisher: None,
+                published_arenas: Vec::new(),
                 host_resolver: None,
                 vfork_shares: 0,
                 engines: 1,
@@ -457,26 +462,31 @@ impl Stage1Authority {
             Some(source) => Some(source.as_mut()),
             None => None,
         };
-        let arenas_before = manager.extension_arena_bases().len();
         let txn = manager.prepare_guest_descriptor_txn(
             DescriptorTxnId { mm_key, generation },
             op,
             source,
         )?;
-        // A grant from a new arena is usable only once its backing and owner
-        // are published, before EL1 can touch it.
-        if manager.extension_arena_bases().len() != arenas_before {
+        // A grant from a grown arena is usable only once its backing and
+        // owner are published, before EL1 can touch it. An arena whose
+        // publication was refused stays in the image, so membership, not
+        // growth during this call, decides.
+        let arenas = manager.extension_arena_bases();
+        if let Some(&unpublished) = arenas
+            .iter()
+            .find(|base| !inner_ref.published_arenas.contains(base))
+        {
             let published = inner_ref
                 .arena_publisher
                 .as_ref()
                 .is_some_and(|publisher| publisher.publish_extension_arenas(manager).is_ok());
             if !published {
-                let base = manager.extension_arena_bases().last().copied().unwrap_or(0);
                 let _ = manager.abandon_guest_descriptor_txn(&txn);
                 return Err(GuestTxnPrepareError::Manager(
-                    PageTableError::UnresolvedArena(base),
+                    PageTableError::UnresolvedArena(unpublished),
                 ));
             }
+            inner_ref.published_arenas = arenas;
         }
         inner.txn_generation = generation.get();
         Ok(txn)
@@ -3176,6 +3186,123 @@ mod tests {
             host_lane.prepare_guest_descriptor_txn(nz(9), op),
             Err(GuestTxnPrepareError::NotGuestOwned)
         );
+    }
+
+    /// A guest descriptor transaction that grows into a new extension arena
+    /// is returned only after the backend published that arena: EL1 must
+    /// never receive a grant whose backing and owner are unpublished. A
+    /// refused publication returns the grants and keeps refusing until the
+    /// arena is published, even though the image already holds it.
+    #[test]
+    fn guest_transactions_publish_a_grown_arena_before_submission() {
+        use carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        use carrick_mmu_core::aarch64::GuestLeafPublication;
+        use carrick_mmu_core::aarch64::descriptor_txn::{BackingIdentity, PageSpan};
+        use std::num::NonZeroU64;
+        use std::sync::atomic::AtomicBool;
+
+        struct RecordingPublisher {
+            accept: AtomicBool,
+            published: Mutex<Vec<Vec<u64>>>,
+        }
+        impl TableArenaPublisher for RecordingPublisher {
+            fn publish_extension_arenas(&self, manager: &PageTableManager) -> Result<(), String> {
+                if !self.accept.load(Ordering::SeqCst) {
+                    return Err("backend refused".into());
+                }
+                self.published
+                    .lock()
+                    .unwrap()
+                    .push(manager.extension_arena_bases());
+                Ok(())
+            }
+        }
+
+        let nz = |value| NonZeroU64::new(value).unwrap();
+        let va = LINUX_MMAP_BASE + 0x80_0000;
+        let mut manager = test_manager();
+        manager.set_prot_none(va, 0x20_0000, None).unwrap();
+        while manager.alloc_table_for_test().is_ok() {}
+        let mut boot = manager.as_bytes().to_vec();
+        boot.resize(LINUX_PAGE_TABLES_SIZE as usize, 0);
+        let resolver = Arc::new(BufferResolver {
+            buf: std::sync::Mutex::new(boot),
+            base: LINUX_PAGE_TABLES_BASE,
+        });
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        unsafe {
+            authority.bind_live_backing(resolver as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+        authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        let op = DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va,
+                ipa: LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000,
+                len: 4 * 4096,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(va, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(3),
+                mapping_id: nz(4),
+                owner_generation: nz(5),
+                inventory_revision: nz(6),
+            },
+        };
+        assert_eq!(
+            authority.prepare_guest_descriptor_txn(nz(9), op),
+            Err(GuestTxnPrepareError::Manager(PageTableError::OutOfTables)),
+            "the exhausted primary needs an arena for this operation"
+        );
+
+        let extension = LINUX_PAGE_TABLES_BASE + 0x40_0000;
+        let available = Arc::new(Mutex::new(vec![Gpa(extension)]));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        authority
+            .install_source(Box::new(CountingArenaSource {
+                id: TableArenaSourceId(SubstrateGpa(extension)),
+                available: Arc::clone(&available),
+                returned: Arc::clone(&returned),
+            }))
+            .unwrap();
+        let publisher = Arc::new(RecordingPublisher {
+            accept: AtomicBool::new(false),
+            published: Mutex::new(Vec::new()),
+        });
+        authority.set_arena_publisher(Arc::clone(&publisher) as Arc<dyn TableArenaPublisher>);
+
+        // Refused publication: no transaction, the grants come back.
+        for _ in 0..2 {
+            assert_eq!(
+                authority.prepare_guest_descriptor_txn(nz(9), op),
+                Err(GuestTxnPrepareError::Manager(
+                    PageTableError::UnresolvedArena(extension)
+                )),
+                "an unpublished arena is never granted, on the first or a later attempt"
+            );
+        }
+        assert!(publisher.published.lock().unwrap().is_empty());
+
+        // Accepted publication precedes the transaction that names it.
+        publisher.accept.store(true, Ordering::SeqCst);
+        let txn = authority.prepare_guest_descriptor_txn(nz(9), op).unwrap();
+        assert_eq!(
+            publisher.published.lock().unwrap().as_slice(),
+            &[vec![extension]]
+        );
+        let grants = txn.tables.as_slice();
+        assert!(!grants.is_empty());
+        assert_eq!(grants[0], extension, "refused grants were returned");
+        for &page in grants {
+            assert!((extension..extension + 0x20_0000).contains(&page));
+        }
+        // A published arena is not republished for the next transaction.
+        authority.abandon_guest_descriptor_txn(&txn).unwrap();
+        let again = authority.prepare_guest_descriptor_txn(nz(9), op).unwrap();
+        assert_eq!(again.tables.as_slice()[0], extension);
+        assert_eq!(publisher.published.lock().unwrap().len(), 1);
+        assert!(returned.lock().unwrap().is_empty());
     }
 
     #[test]
