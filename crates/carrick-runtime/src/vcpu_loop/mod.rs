@@ -781,6 +781,39 @@ impl KernelState {
 
 pub(crate) type Kernel = Arc<KernelState>;
 
+/// Consecutive identical resolved COW faults that prove a refault livelock.
+const COW_REFAULT_LIMIT: u32 = 4;
+
+/// One "successfully resolved" COW fault as the refault detector sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CowRefaultKey {
+    far: u64,
+    syndrome: u64,
+    translation: Option<u64>,
+    arm_generation: carrick_hal::CowArmGeneration,
+}
+
+/// The last resolved COW fault and how many times in a row it recurred.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CowRefaultWatch {
+    fault: CowRefaultKey,
+    count: u32,
+}
+
+/// Count `fault` against the previous resolved fault; returns the run length.
+fn cow_refault_watch_note(watch: &mut Option<CowRefaultWatch>, fault: CowRefaultKey) -> u32 {
+    match watch {
+        Some(last) if last.fault == fault => {
+            last.count = last.count.saturating_add(1);
+            last.count
+        }
+        _ => {
+            *watch = Some(CowRefaultWatch { fault, count: 1 });
+            1
+        }
+    }
+}
+
 fn thread_should_finish_for_exec_replacement(registry: &ThreadRegistry, tid: ThreadId) -> bool {
     // `exec_replacing_other_thread` is transient. A sibling that reclaimed its
     // vCPU can still be waking from a host wait after the execing thread has
@@ -904,7 +937,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// and wedging every peer waiting in `consume_invalidation_acks` — seen
     /// live on `futexforkrequeue` (core: ffr-livelock-76407). Fail closed
     /// with a named clause instead of spinning.
-    pub(super) cow_refault_watch: Option<(u64, u64, Option<u64>, u32)>,
+    pub(super) cow_refault_watch: Option<CowRefaultWatch>,
     pub(super) reserved_signal: Option<carrick_kernel::kernel::continuation::ReservedSignal>,
     pub(super) this_tid: ThreadId,
     pub(super) threads: VcpuThreadRegistry,
@@ -1056,42 +1089,44 @@ where
     /// Publish both process-visible and per-thread state at the points that
     /// already maintain the thread registry on mature lanes.
     /// Record one "successfully resolved" COW fault and fail closed if the
-    /// IDENTICAL (FAR, ESR, resolved-translation) triple keeps recurring: a
-    /// correct resolution must change the faulting translation, so a repeat
-    /// that lands on the SAME output proves the resolver made no progress,
-    /// and the historical behaviour was a silent 100% CPU refault loop that
-    /// also starved `InvalidateAsid` servicing. (FAR, ESR) alone is NOT
-    /// evidence: a fork loop legitimately re-COWs the same VA once per
-    /// iteration — fork re-arms the parent's span and the wait loop rewrites
-    /// the same stack slot — with a FRESH frame every time (waitexitstorm,
-    /// futexwakeexact and forkstackstorm all tripped the old pair-keyed
-    /// detector on exactly that shape, at ~4 forks per run).
+    /// IDENTICAL (FAR, ESR, resolved-translation, arm-generation) fault keeps
+    /// recurring: a correct resolution must change the faulting translation
+    /// or be undone by a later fork arm, so a repeat with neither proves the
+    /// resolver made no progress, and the historical behaviour was a silent
+    /// 100% CPU refault loop that also starved `InvalidateAsid` servicing.
+    /// (FAR, ESR) alone is NOT evidence: a fork loop legitimately re-COWs the
+    /// same VA once per iteration — fork re-arms the parent's span and the
+    /// wait loop rewrites the same stack slot (waitexitstorm, futexwakeexact
+    /// and forkstackstorm all tripped the old pair-keyed detector at ~4 forks
+    /// per run). Nor is the translation: when the child is gone before the
+    /// parent writes, the parent is the frame's sole owner and the write
+    /// reuses it in place, so every iteration resolves to the SAME output
+    /// (forkstackstorm tripped the translation-keyed detector on its first
+    /// run with sole-owner reuse). The fork's re-arm is what separates them.
     /// The threshold of 4 is pure paranoia headroom over "impossible twice".
     pub(super) fn note_cow_resolution(
         &mut self,
         far: u64,
         syndrome: u64,
         translation: Option<u64>,
+        arm_generation: carrick_hal::CowArmGeneration,
     ) -> Result<(), RuntimeError> {
-        const COW_REFAULT_LIMIT: u32 = 4;
-        match &mut self.cow_refault_watch {
-            Some((last_far, last_esr, last_translation, count))
-                if *last_far == far
-                    && *last_esr == syndrome
-                    && *last_translation == translation =>
-            {
-                *count += 1;
-                if *count >= COW_REFAULT_LIMIT {
-                    return Err(RuntimeError::Configuration(format!(
-                        "HVPatch COW resolution did not satisfy the faulting access: \
-                         identical fault recurred {count} times with unchanged resolution \
-                         (far={far:#x} esr={syndrome:#x} translation={translation:?} tid={}) \
-                         — refault livelock",
-                        self.this_tid
-                    )));
-                }
-            }
-            _ => self.cow_refault_watch = Some((far, syndrome, translation, 1)),
+        let fault = CowRefaultKey {
+            far,
+            syndrome,
+            translation,
+            arm_generation,
+        };
+        let count = cow_refault_watch_note(&mut self.cow_refault_watch, fault);
+        if count >= COW_REFAULT_LIMIT {
+            return Err(RuntimeError::Configuration(format!(
+                "HVPatch COW resolution did not satisfy the faulting access: \
+                 identical fault recurred {count} times with unchanged resolution \
+                 (far={far:#x} esr={syndrome:#x} translation={translation:?} \
+                 arm_generation={} tid={}) — refault livelock",
+                arm_generation.raw(),
+                self.this_tid
+            )));
         }
         Ok(())
     }
@@ -2259,6 +2294,64 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod cow_refault_watch_tests {
+    use super::*;
+
+    fn fault(translation: u64, arm_generation: carrick_hal::CowArmGeneration) -> CowRefaultKey {
+        CowRefaultKey {
+            far: 0x6000_c229_30,
+            syndrome: 0x9200_004f,
+            translation: Some(translation),
+            arm_generation,
+        }
+    }
+
+    /// forkstackstorm with sole-owner reuse: each fork re-arms the parent's
+    /// stack, the child is gone before the parent's write, and the write
+    /// reuses the SAME frame in place. Every resolution names the same
+    /// output, and none of them is a livelock.
+    #[test]
+    fn a_fork_loop_reusing_the_same_frame_is_not_a_refault_livelock() {
+        let mut watch = None;
+        let mut generation = carrick_hal::CowArmGeneration::UNARMED;
+        for _ in 0..64 {
+            generation = generation.next();
+            let run = cow_refault_watch_note(&mut watch, fault(0x9b_00c2_2930, generation));
+            assert!(
+                run < COW_REFAULT_LIMIT,
+                "fork-loop reuse counted as a livelock"
+            );
+        }
+    }
+
+    /// A resolver that leaves the leaf non-writable with no arm in between
+    /// still fails closed at the limit.
+    #[test]
+    fn an_unchanged_resolution_under_one_arm_is_a_refault_livelock() {
+        let mut watch = None;
+        let generation = carrick_hal::CowArmGeneration::UNARMED.next();
+        let runs: Vec<u32> = (0..COW_REFAULT_LIMIT)
+            .map(|_| cow_refault_watch_note(&mut watch, fault(0x9b_00c2_2930, generation)))
+            .collect();
+        assert_eq!(runs.last(), Some(&COW_REFAULT_LIMIT));
+    }
+
+    /// A fresh frame per iteration (the copy route) resets the run, as before.
+    #[test]
+    fn a_fork_loop_copying_to_fresh_frames_is_not_a_refault_livelock() {
+        let mut watch = None;
+        let generation = carrick_hal::CowArmGeneration::UNARMED.next();
+        for frame in 0..64_u64 {
+            let run = cow_refault_watch_note(
+                &mut watch,
+                fault(0x9b_0000_0000 + frame * 0x4000, generation),
+            );
+            assert_eq!(run, 1);
+        }
+    }
 }
 
 #[cfg(test)]

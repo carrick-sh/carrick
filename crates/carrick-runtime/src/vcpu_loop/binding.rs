@@ -4145,10 +4145,13 @@ where
                 // descriptor pair immediately before its typed trigger. Do not
                 // duplicate that pair here: the structural consumer joins and
                 // consumes one sequence per attempted fault.
-                if let carrick_hal::CowFaultResolution::Resolved { translation } =
-                    engine.resolve_frame_cow_fault(syndrome, far)?
+                if let carrick_hal::CowFaultResolution::Resolved {
+                    translation,
+                    arm_generation,
+                } = engine.resolve_frame_cow_fault(syndrome, far)?
                 {
-                    self.state.note_cow_resolution(far, syndrome, translation)?;
+                    self.state
+                        .note_cow_resolution(far, syndrome, translation, arm_generation)?;
                     // EL1 stopped mid-operation and its slot's zone state is
                     // that operation's: re-enter now, never a preemption
                     // point (a reload found the slot still holding it).
@@ -4170,8 +4173,10 @@ where
                 ..
             }) => {
                 let fault_access = signal::el0_fault_access(syndrome);
-                if let carrick_hal::CowFaultResolution::Resolved { translation } =
-                    engine.resolve_frame_cow_fault(syndrome, far)?
+                if let carrick_hal::CowFaultResolution::Resolved {
+                    translation,
+                    arm_generation,
+                } = engine.resolve_frame_cow_fault(syndrome, far)?
                 {
                     if let Some(mm_key) = self.state.zone_mm {
                         signal::cancel_frame_grant_request(
@@ -4181,7 +4186,8 @@ where
                             fault_access,
                         );
                     }
-                    self.state.note_cow_resolution(far, syndrome, translation)?;
+                    self.state
+                        .note_cow_resolution(far, syndrome, translation, arm_generation)?;
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 // The fault probes are load-bearing instruments, not debug

@@ -1500,12 +1500,45 @@ mod generic_registry_tests {
 /// fork loop legitimately re-COWs the same VA to a fresh frame each
 /// iteration — fork re-arms the parent's span and the wait loop rewrites the
 /// same stack slot, so `(FAR, ESR)` alone is not evidence of a livelock.
+///
+/// The translation alone is not evidence either: a sole-owner write REUSES
+/// the frame in place (the leaf keeps its output and gains write), so a fork
+/// loop whose child is gone before the parent's write resolves the same VA to
+/// the SAME output every iteration. What makes each of those a fresh fault is
+/// the fork's re-arm in between, so `Resolved.arm_generation` names the mm's
+/// arm generation when the resolution completed; only a refault with an
+/// unchanged translation AND an unchanged arm generation is a livelock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CowFaultResolution {
     /// Not a COW-resolvable fault; ordinary fault delivery proceeds.
     NotCow,
     /// The mm now owns a writable frame for the fault; retry the instruction.
-    Resolved { translation: Option<u64> },
+    Resolved {
+        translation: Option<u64>,
+        arm_generation: CowArmGeneration,
+    },
+}
+
+/// How many times one mm's fork-COW range set has been armed. Every arm can
+/// write-protect a leaf a previous resolution made writable, so a refault
+/// across an arm is a new fault, never a resolver that made no progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct CowArmGeneration(u64);
+
+impl CowArmGeneration {
+    /// The generation of an mm that has never been armed.
+    pub const UNARMED: Self = Self(0);
+
+    /// The generation after one more arm.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

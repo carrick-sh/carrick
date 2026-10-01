@@ -683,6 +683,36 @@ fn parent_arm_rollback_restores_preexisting_overlapping_ranges_exactly() {
     assert_eq!(armed.ranges, before);
 }
 
+/// The refault detector separates a fork loop's in-place reuse from a
+/// livelock by the arm generation: every arm advances it, an empty arm (no
+/// leaf write-protected) does not, and a rollback of the ranges does not
+/// move it back.
+#[test]
+fn every_arm_advances_the_arm_generation_and_rollback_keeps_it() {
+    let range = carrick_aarch64::vmm::ForkCowRange {
+        va: 0x4000_0000,
+        len: 0x4000,
+        executable: false,
+        kernel_only: false,
+        granule: carrick_aarch64::vmm::CowGranule::Compound,
+    };
+    let mut armed = CowArmedRanges::default();
+    assert_eq!(armed.generation(), carrick_hal::CowArmGeneration::UNARMED);
+    armed.arm(&[]);
+    assert_eq!(armed.generation(), carrick_hal::CowArmGeneration::UNARMED);
+    let before = armed.snapshot();
+    armed.arm(&[range]);
+    let first = armed.generation();
+    assert!(first > carrick_hal::CowArmGeneration::UNARMED);
+    // Re-arming the identical range (the next fork of the loop) is a new arm.
+    armed.disarm_ranges(&[range]);
+    armed.arm(&[range]);
+    let second = armed.generation();
+    assert!(second > first);
+    armed.restore(before);
+    assert_eq!(armed.generation(), second);
+}
+
 #[test]
 fn global_frame_allocator_reuses_only_released_exact_extents() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();

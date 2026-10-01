@@ -4693,6 +4693,7 @@ impl HvfVmState {
             if self.task.refill_guest_cow_pool(&custody, fault_va)? {
                 return Ok(carrick_hal::CowFaultResolution::Resolved {
                     translation: self.translate_va(fault_va),
+                    arm_generation: self.task.cow_armed.lock().generation(),
                 });
             }
             let resolved = self.task.perform_frame_cow(
@@ -4717,6 +4718,7 @@ impl HvfVmState {
             // the resolver made no progress.
             return Ok(carrick_hal::CowFaultResolution::Resolved {
                 translation: self.translate_va(fault_va),
+                arm_generation: self.task.cow_armed.lock().generation(),
             });
         }
 
