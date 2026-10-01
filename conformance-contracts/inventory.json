@@ -2975,7 +2975,8 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.el1.anonymous-reservations",
-        "kernel.mm.backing-maintenance-lookup"
+        "kernel.mm.backing-maintenance-lookup",
+        "kernel.mm.exec-heap-window"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -3107,6 +3108,7 @@
         "kernel.el1.guest-scheduler",
         "kernel.el1.thread-lifecycle",
         "kernel.mm.address-space-occupancy",
+        "kernel.mm.exec-heap-window",
         "kernel.time.realtime-calibration"
       ],
       "claims": [],

@@ -1,0 +1,31 @@
+schema_version = 1
+id = "kernel.mm.exec-heap-window"
+title = "A fresh image maps no heap past its program break"
+guest_surfaces = ["syscall:brk", "syscall:execve", "kernel:stage1_image"]
+semantic_authority = ["man 2 brk", "man 2 execve", "conformance-probes/probe-inventory.json:brkbeyondbreak"]
+fixture = "probe:brkbeyondbreak"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+Linux maps the heap a page at a time: brk(b) makes [start_brk, PAGE_ALIGN(b))
+anonymous read/write and non-executable, and leaves everything above it
+unmapped. An access in the break's own page succeeds, the next page faults
+SIGSEGV/SEGV_MAPERR, an instruction fetch from the heap faults
+SIGSEGV/SEGV_ACCERR, and execve discards the old image's heap entirely, so the
+new image faults on every page past its own break. Carrick's heap window is
+one fixed 128 MiB extent per address space whose stage-1 leaves keep their
+output address while PROT_NONE so brk growth re-validates them in place. Every
+builder of a fresh image (boot and the HVPatch exec rebuild) must leave the
+whole window unmapped after laying out its backed mappings; the exec rebuild
+remapped the window like any other backed extent and handed the successor its
+predecessor's heap readable, writable and executable past the new break. The
+VM-free binding rebuilds an exec plan carrying a heap mapping and requires
+every heap page to translate to nothing; the signed binding runs the probe in
+the generic conformance-next shard; Docker is the probe oracle. No structural
+work meter or runtime ratio is claimed.
+"""
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::frame_inventory::tests::exec_rebuild_leaves_the_heap_window_unmapped"
+embed = "carrick-conformance-next::probes_shard_2::generic_probe_shard_2"
+docker = "probe:brkbeyondbreak"

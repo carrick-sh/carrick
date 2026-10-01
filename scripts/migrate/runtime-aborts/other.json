@@ -260,18 +260,7 @@
       "file": "crates/carrick-mem/src/memory.rs",
       "function": "stage1_identity_page_tables",
       "ordinal_in_function": 1,
-      "fingerprint": "f7d80cf1b8a0cc34507e0a874097c86cc52d0212a874ec5bb09a89ea5c2e2d06",
-      "verdict": "carrier_fault",
-      "failure_domain": "mem::stage1_tables",
-      "rationale": "Configured Linux heap size exceeded host pointer width during stage-1 identity page table initialization.",
-      "sink": "fatal",
-      "domain": "mem::stage1_tables"
-    },
-    {
-      "file": "crates/carrick-mem/src/memory.rs",
-      "function": "stage1_identity_page_tables",
-      "ordinal_in_function": 2,
-      "fingerprint": "a24a0d1eb5253aa4370781d74b7d79f0d2ff2cef6205e6cc3345df700f19daaf",
+      "fingerprint": "046e8e4fed938fb49433a89dfa55e95e94669d7b15a9fb1a69ecf96e4168dbba",
       "verdict": "carrier_fault",
       "failure_domain": "mem::stage1_tables",
       "rationale": "Failure to apply PROT_NONE to heap region in initial stage-1 page tables leaves heap unmapped or unprotected.",
@@ -281,7 +270,7 @@
     {
       "file": "crates/carrick-mem/src/memory.rs",
       "function": "stage1_identity_page_tables",
-      "ordinal_in_function": 3,
+      "ordinal_in_function": 2,
       "fingerprint": "be3df2a03c6495ef9be3bc8065d5246d0c159f276b188be4eb475bd1933dcdf8",
       "verdict": "carrier_fault",
       "failure_domain": "mem::stage1_tables",

@@ -678,6 +678,12 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
             )));
         }
     }
+    // The remap validated the heap mapping like any other backed extent,
+    // which the check above relies on. A fresh image has no break, so the
+    // window starts unmapped; its leaves keep the new frames for `brk`.
+    carrick_mem::memory::seal_heap_window(&mut page_tables).map_err(|error| {
+        TrapError::Hypervisor(format!("seal HVPatch exec heap window: {error:?}"))
+    })?;
     carrick_aarch64::engine::reserve_hvpatch_process_apertures(&mut page_tables).map_err(
         |error| {
             TrapError::Hypervisor(format!(

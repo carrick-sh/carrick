@@ -894,6 +894,65 @@ fn exec_rebuild_keeps_the_el1_cow_copy_window_idle() {
     );
 }
 
+/// A fresh image has no program break above `heap_base`, so every page of
+/// the heap window starts unmapped. The rebuild remaps each backed mapping
+/// to its new frames, and the heap window is one of them: without sealing it
+/// again, the successor image could read, write and execute its whole 128 MiB
+/// heap window, the predecessor's bytes included, past its own break.
+#[test]
+fn exec_rebuild_leaves_the_heap_window_unmapped() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let mut plan = root_exec_test_plan();
+    let mut heap = exec_mapping_for_order(
+        carrick_mem::memory::LINUX_HEAP_BASE,
+        carrick_mem::memory::LINUX_HEAP_SIZE,
+    );
+    heap.perms = carrick_mem::elf::SegmentPerms {
+        read: true,
+        write: true,
+        execute: false,
+    };
+    plan.mappings.push(heap);
+    let GlobalExecPlan { plan: rebuilt, .. } = prepare_global_exec_plan(&plan, None).unwrap();
+    let root = rebuilt.stage1_page_tables_base.unwrap();
+    let table = rebuilt
+        .mappings
+        .iter()
+        .find(|mapping| mapping.ipa_start == root)
+        .expect("rebuilt table mapping");
+    let rebuilt_tables = carrick_mmu_core::aarch64::PageTableManager::new(
+        table.image.as_ref().clone(),
+        root,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    let heap_end = carrick_mem::memory::LINUX_HEAP_BASE + carrick_mem::memory::LINUX_HEAP_SIZE;
+    for va in [
+        carrick_mem::memory::LINUX_HEAP_BASE,
+        carrick_mem::memory::LINUX_HEAP_BASE + 0x1000,
+        carrick_mem::memory::LINUX_HEAP_BASE + 0x20_0000,
+        heap_end - 0x1000,
+    ] {
+        assert_eq!(
+            rebuilt_tables.translate(va),
+            None,
+            "heap page {va:#x} is mapped in a fresh exec image: {:x?}",
+            rebuilt_tables.debug_walk(va)
+        );
+    }
+    assert_eq!(
+        rebuilt_tables.translate(0x20_0000),
+        Some(
+            rebuilt
+                .mappings
+                .iter()
+                .find(|mapping| mapping.guest_start == 0x20_0000)
+                .unwrap()
+                .ipa_start
+        ),
+        "the image's own mappings stay mapped"
+    );
+}
+
 #[test]
 fn root_exec_plan_owns_every_materialized_stage2_extent() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
