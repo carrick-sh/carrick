@@ -269,3 +269,45 @@ filed under `host_syscall/dispatch` through `service_outcome`:
 `spawn_persistent_hvpatch_clone_thread` → `HvpatchTaskOnlyEngineState::activate_child`
 → `TaskMappingIndex::insert`, rebuilt per cloned thread. It is about 12% of
 cpython's carrier CPU and is worth its own investigation.
+
+## Wake-to-run latency per blocked wait (follow-up)
+
+`hvpatch-executor-sched-events.d` now times every blocked continuation
+(lease settlement kind 2) from its scheduler wake to the next `hv_vcpu_run`
+on the executor that claims it, split into wake-to-claim and claim-to-run,
+plus the reactor's ready-to-wake for reactor-sourced wakes, and records how
+the claiming executor got there (a condvar unpark, a guest exit by class,
+or already running host-side). Node shard, lane off, on main 313a1ab00 plus
+the classifier and ledger commits. The host was shared (load average 10-56
+during the captures), so every number here suggests, and none confirms.
+
+| epoll_pwait, µs p50/p90/p99 | wake-to-run | wake-to-claim | claim-to-run |
+|---|---|---|---|
+| before enroll change, `schdiag-lat-b12` (8 s run) | 35/1000/5000 | 30/1000/5000 | 6/8/30 |
+| before, `schdiag-lat-b14` (14 s) | 100/1000/6500 | 80/1000/6500 | 15/30/75 |
+| after, `schdiag-lat-a3` (11 s) | 30/1000/3500 | 20/1000/3500 | 6/9/30 |
+| after, `schdiag-lat-a4` (18 s) | 40/1000/3500 | 30/1000/3500 | 7/30/45 |
+
+- **Most epoll wakes are producer-sourced**, not reactor-sourced: about
+  7-12k of them per run come from another guest thread's write (in-zone
+  pipe, eventfd, message port), against 250-1600 from the reactor.
+- **Claim-to-run is small** (p50 6-15 µs, p99 under 100 µs on quiet
+  runs). Task load and continuation resume are not the latency.
+- **Wake-to-claim is the latency, and it is bimodal.** About 95% of epoll
+  wakes are claimed by an executor that was idling in the guest zone and
+  left `hv_vcpu_run` with exit class 1 (idle), not class 2 (kick): 14227 of
+  14893 in `schdiag-lat-a4`. Wake-to-idle-exit has a mode at about 3 µs
+  (about 40% of wakes, an `IdleSpin` slot polling its run queue) and a
+  second mode at 0.5-1.5 ms (about 25%), the shape of a slot that only
+  notices its placed service record at a time-slice or idle-timer
+  boundary. That second mode is the whole p90 and is far above Linux's
+  futex/epoll wake. It is the next lever: `ZoneTables::place_from_host`
+  sends a reschedule kick only when the chosen slot is `Running` or
+  `IdleWfi`, and a service record placed on a `Running` slot's queue
+  waits behind that slot's current thread.
+- The enrollment change removes executor-side host syscalls per blocked
+  wait (nudge writes 2.00 -> 1.00, enroll `poll` about 0.75 -> 0) but does
+  not move this distribution measurably on this host.
+- With `CARRICK_EL1_SCHED=0` (`schdiag-lat-a5-sched0`) the claim path is
+  a condvar unpark instead, but that run ran under load average 56 and is
+  not comparable.
