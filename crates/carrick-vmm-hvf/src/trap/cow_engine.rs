@@ -941,6 +941,9 @@ impl HvfVmState {
     }
 
     pub(crate) fn activate_exec_inventory(&mut self) -> Result<(), TrapError> {
+        // The predecessor's retirement is applied by now: owners whose last
+        // frame the Kernel retired in it follow the frame.
+        Self::settle_task_state_declined_lease_remainders(&self.task)?;
         let Some(ref mut reg) = self.registration else {
             return Ok(());
         };
@@ -6023,10 +6026,7 @@ impl HvfVmState {
         mut prepared: PreparedProcessAliasRetirement,
     ) -> Result<PreparedProcessAliasRetirement, TrapError> {
         if let Some(retirement) = prepared.inventory.as_ref() {
-            let event_count = retirement
-                .mappings
-                .len()
-                .saturating_add(retirement.frames.len());
+            let event_count = retirement.event_count();
             let authority = self.cow_authority.as_ref().ok_or_else(|| {
                 TrapError::Hypervisor(
                     "HVPatch alias retirement has no inventory authority".to_owned(),
@@ -6484,9 +6484,23 @@ impl HvfVmState {
         if registered {
             self.split_local_rows_for_unmap(va, len);
         }
-        let mut armed = self.cow_armed.lock();
-        for span in disarm_spans {
-            armed.disarm(span);
+        {
+            let mut armed = self.cow_armed.lock();
+            for span in disarm_spans {
+                armed.disarm(span);
+            }
+        }
+        // This retirement's Kernel commit is applied. If its unmap was a
+        // frame's last, the Kernel retired the frame in it; the owner follows.
+        if let (Some(registry), Some(authority)) = (registry, self.cow_authority.clone()) {
+            let frames = std::sync::Arc::clone(&self.frame_inventory.lock().frames);
+            Self::settle_declined_lease_remainders(
+                &custody,
+                &frames,
+                authority.as_ref(),
+                retirement.declined.clone(),
+                registry,
+            )?;
         }
         Ok(None)
     }
