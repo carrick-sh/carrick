@@ -78,8 +78,8 @@ impl PageTableCodec for X8664Mmu {
     type Manager = carrick_mem::pml4::Pml4Manager;
     type Error = carrick_mem::pml4::Pml4Error;
 
-    fn new_manager(bytes: Vec<u8>, base: u64) -> Self::Manager {
-        carrick_mem::pml4::Pml4Manager::new(bytes, base)
+    fn manager_from_live(live: &[u8], base: u64) -> Self::Manager {
+        carrick_mem::pml4::Pml4Manager::new(live.to_vec(), base)
     }
 
     fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
@@ -2457,7 +2457,7 @@ mod tests {
         // walk returns all-zero.
         let base = 0x20_0000u64;
         let bytes = vec![0u8; 4096 * 6];
-        let mgr = X8664Mmu::new_manager(bytes.clone(), base);
+        let mgr = X8664Mmu::manager_from_live(&bytes, base);
         assert_eq!(mgr.translate(0x40_0000), None);
         assert_eq!(X8664Mmu::walk_descriptors(&bytes, base, 0x40_0000), [0; 4]);
     }

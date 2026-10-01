@@ -1304,14 +1304,19 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             ));
         }
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
-        let bytes = self
+        let host = self
             .vm
-            .read_gpa(pt_base, size)
-            .map_err(|_| MemoryError::HostMap("read live page tables".to_string()))?;
+            .host_ptr(pt_base, size)
+            .ok_or_else(|| MemoryError::HostMap("read live page tables".to_string()))?;
+        // SAFETY: `host_ptr` resolved the complete live page-table mapping at
+        // `pt_base` for `size` bytes, and the engine retains that mapping for
+        // this call. The manager copies only the occupied table prefix; the
+        // borrow ends before this returns.
+        let live = unsafe { std::slice::from_raw_parts(host.cast_const(), size) };
         use carrick_hal::PageTableCodec as _;
         Ok(
-            <<Self as ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(
-                bytes, pt_base,
+            <<Self as ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::manager_from_live(
+                live, pt_base,
             ),
         )
     }

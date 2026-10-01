@@ -1,0 +1,37 @@
+schema_version = 1
+id = "kernel.exec.stage1-image"
+title = "An exec image's stage-1 tables cost their occupied size, not the root-slot capacity"
+guest_surfaces = ["syscall:execve", "kernel:stage1_image"]
+semantic_authority = [
+  "man 2 execve: the new image starts with a fresh address space containing only its own mappings",
+  "conformance-probes/probe-inventory.json:execvereset",
+]
+fixture = "unit:carrick-vmm-hvf root_exec_test_plan; unit:carrick-mmu-core hvpatch_manager image; embed:conformance-next exec/fork probe set"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+Every HVPatch exec builds the successor's stage-1 tables from the plan image
+(prepare_global_exec_plan_with_root_backing), installs that image in a pooled
+root slot (prepare_pooled_exec_root_region_in, which records it as the slot's
+populated prefix that recycling zeroes again), and then builds the engine's
+software manager from the live slot (build_page_tables_manager_from_live, run
+eagerly when the exec installs its table-arena source). The root slot is 1.75
+MiB; a /bin/true image occupies about 48 KiB of tables. Each of those steps
+used to carry the full capacity: a 1.75 MiB clone into the plan manager, a
+1.75 MiB zero-padded image copied into the slot and re-zeroed on recycle, and a
+1.75 MiB read_gpa copy plus allocation for the engine manager, about 9 MiB of
+memory traffic and three large allocations per exec. The image and every
+manager built from it now carry only the occupied table prefix
+(PageTableManager::into_occupied_bytes, from_live_image, from_image_prefix);
+the capacity stays the slot's, so later tables still allocate in place. The
+VM-free bindings bound the work directly: building a manager from a 1.75 MiB
+live region allocates no more than its occupied prefix (+4 KiB) and makes no
+capacity-sized allocation, and the exec plan's table payload equals its
+occupied prefix. The signed binding is the exec/fork probe set in the generic
+conformance-next shards. No runtime ratio is claimed.
+"""
+
+[bindings]
+vm_free = "carrick-mmu-core::aarch64::tests::manager_from_live_image_copies_only_occupied_tables; carrick-vmm-hvf::trap::frame_inventory::tests::exec_plan_table_payload_is_the_occupied_prefix"
+embed = "carrick-conformance-next::probes_shard_{0,1,2}::generic_probe_shard_{0,1,2} (CARRICK_PROBE_FILTER=execvereset,execthreads,execsig,forkexecstorm,fexecveprobe,execpipe,execsocket,execfailsurvive,execpermitchurn,clonefilesexec,mmapexecshared,forkprotectexec,brkbeyondbreak)"
+docker = "probe:execvereset"

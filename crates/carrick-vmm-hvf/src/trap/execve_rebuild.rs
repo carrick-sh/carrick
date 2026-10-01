@@ -556,8 +556,8 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
         })?;
     let mut global = plan.clone();
     let mut stage2_leases = std::collections::BTreeMap::new();
-    let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
-        global.mappings[table_index].image.as_ref().clone(),
+    let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::from_live_image(
+        global.mappings[table_index].image.as_ref(),
         old_root,
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
@@ -700,7 +700,10 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
                 "provision hvpatch exec EL1 COW copy window: {error:?}"
             ))
         })?;
-    let table_bytes = page_tables.into_bytes().map_err(|error| {
+    // Only the occupied tables: the slot's tail is zero (fresh, or zeroed
+    // through its recorded prefix on recycle), and every reader rebuilds a
+    // manager with the slot's full capacity.
+    let table_bytes = page_tables.into_occupied_bytes().map_err(|error| {
         TrapError::Hypervisor(format!("execve stage1 into_bytes failed: {error:?}"))
     })?;
     {
@@ -1444,11 +1447,14 @@ impl HvfVmState {
                     .mappings
                     .iter()
                     .find(|mapping| mapping.guest_start == crate::memory::LINUX_PAGE_TABLES_BASE)?;
-                Some(carrick_mmu_core::aarch64::PageTableManager::new(
-                    table.image.as_ref().clone(),
-                    root,
-                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
-                ))
+                Some(
+                    carrick_mmu_core::aarch64::PageTableManager::from_image_prefix(
+                        table.image.as_ref(),
+                        carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        root,
+                        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+                    ),
+                )
             })
         };
         // Exec replaces the exact MM authority as one unit. Old protections,
