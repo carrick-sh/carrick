@@ -10,7 +10,7 @@ import el1_workload_ab as ab
 import native_go_build
 
 
-SUITES = ab.load_suites(ab.REPO / "scripts/conformance/suites.toml")
+SUITES = ab.load_suites(*ab.DEFAULT_MANIFESTS)
 BINARY = pathlib.Path("/opt/carrick")
 
 
@@ -81,6 +81,17 @@ class WorkloadArgvTest(unittest.TestCase):
         self.assertEqual(argv[-1], "test_threading")
         self.assertEqual(workload.timeout_s, SUITES["cpython-threading"]["timeout_s"])
 
+    def test_default_node_workload_is_the_real_shard(self):
+        workload = ab.resolve_workload("node-core-worker-message-port", SUITES)
+        self.assertEqual(workload.manifest, ab.DEFAULT_MANIFESTS[1])
+        argv = ab.carrick_argv(workload, BINARY, "rid")
+        self.assertEqual(argv[-2:], ["--filter", "parallel/test-worker-message-port*"])
+        self.assertIn("node-core-worker-message-port", ab.DEFAULT_WORKLOADS)
+
+    def test_duplicate_suite_declarations_are_refused(self):
+        with self.assertRaises(ValueError):
+            ab.load_suites(ab.DEFAULT_MANIFESTS[1], ab.DEFAULT_MANIFESTS[1])
+
     def test_unknown_workloads_are_refused(self):
         with self.assertRaises(ValueError):
             ab.resolve_workload("not-a-suite", SUITES)
@@ -89,8 +100,9 @@ class WorkloadArgvTest(unittest.TestCase):
         workload = ab.resolve_workload("node-app-smoke", SUITES)
         carrick = " ".join(ab.carrick_argv(workload, BINARY, "conf-1-cN"))
         docker = " ".join(ab.docker_argv(workload, "conf-1-dN"))
-        with mock.patch.object(ab, "harness_dry_run_lines", return_value=(carrick, docker)):
+        with mock.patch.object(ab, "harness_dry_run_lines", return_value=(carrick, docker)) as dry:
             ab.check_against_harness(workload, BINARY)
+        self.assertEqual(dry.call_args.args[2], ab.DEFAULT_MANIFESTS[0])
         with mock.patch.object(ab, "harness_dry_run_lines", return_value=(carrick + " extra", docker)):
             with self.assertRaises(RuntimeError):
                 ab.check_against_harness(workload, BINARY)
