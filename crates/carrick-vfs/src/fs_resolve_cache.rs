@@ -69,14 +69,15 @@ impl Default for FsCacheCoherence {
                 0,
             )
         };
-        if p == libc::MAP_FAILED {
+        if p == libc::MAP_FAILED || p.is_null() {
             // A private fallback would silently destroy cross-fork coherence.
             std::alloc::handle_alloc_error(
                 std::alloc::Layout::new::<[AtomicU64; GENERATION_SLOTS]>(),
             );
         }
-        let words =
-            std::ptr::NonNull::new(p.cast::<AtomicU64>()).unwrap_or_else(|| std::process::abort());
+        // SAFETY: failed and null mappings terminated through the allocation
+        // failure handler above; mmap supplies aligned storage for atomics.
+        let words = unsafe { std::ptr::NonNull::new_unchecked(p.cast::<AtomicU64>()) };
         for slot in 0..GENERATION_SLOTS {
             // SAFETY: four aligned AtomicU64s fit in the owned writable mapping.
             unsafe {
