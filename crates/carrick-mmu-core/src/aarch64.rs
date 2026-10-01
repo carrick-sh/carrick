@@ -441,6 +441,16 @@ pub fn terminal_descriptor_permits_host_buffer(descriptor: u64, access: LeafAcce
     }
 }
 
+/// A terminal descriptor that names no output at all: an invalid leaf (or
+/// missing table) that is not EL1-private and retains no backing. Inside a
+/// delegated reservation root this is a never-touched page whose frame does
+/// not exist yet; a host-invalidated leaf that keeps its output is not absent.
+pub fn terminal_descriptor_is_absent(descriptor: u64) -> bool {
+    descriptor & VALID == 0
+        && el1_private_leaf_state(descriptor) == El1PrivateLeafState::Unowned
+        && descriptor & PA_MASK_4KIB == 0
+}
+
 /// An EL1-private leaf that is invalid, not retired and still records its
 /// granted output: bulk-prepared backing never touched by the guest, or a page
 /// the host invalidated for `PROT_NONE` (which then carries kernel-only AP).

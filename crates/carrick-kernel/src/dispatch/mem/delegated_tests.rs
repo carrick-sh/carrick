@@ -3296,3 +3296,393 @@ fn delegated_first_touch_stock_return_work_is_proportional_to_stock() {
         4 * descent
     );
 }
+
+/// A VM-free EL1 frame-grant venue: records every call, prepares fresh
+/// backing, and publishes on the host lane or as a guest transaction.
+#[derive(Default)]
+struct CopyoutVenue {
+    guest_lane: bool,
+    /// The guest lane's EL1 refuses the publication cleanly.
+    refuse: bool,
+    calls: Vec<String>,
+    requests: Vec<carrick_hal::El1FrameGrantRequest>,
+}
+
+impl carrick_hal::threaded::El1FrameGrantVenue for CopyoutVenue {
+    fn prepare(
+        &mut self,
+        request: carrick_hal::El1FrameGrantRequest,
+    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, carrick_hal::TrapError> {
+        self.calls.push("prepare".to_owned());
+        self.requests.push(request);
+        Ok(Some(carrick_hal::El1FrameGrantReady {
+            physical_ipa: 0x8000_0000 + self.requests.len() as u64 * 0x10_0000,
+            frame_id: self.requests.len() as u64,
+            mapping_id: self.requests.len() as u64,
+            owner_generation: 1,
+            inventory_revision: 1,
+        }))
+    }
+
+    fn publish(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantPublication,
+    ) -> Result<carrick_hal::threaded::El1FrameGrantPublished, carrick_hal::TrapError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::*;
+        use carrick_mmu_core::aarch64::{LeafAccess, SubstrateGpa};
+        self.calls.push("publish".to_owned());
+        if !self.guest_lane {
+            return Ok(carrick_hal::threaded::El1FrameGrantPublished::OnHost);
+        }
+        Ok(carrick_hal::threaded::El1FrameGrantPublished::Submit(
+            DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: std::num::NonZeroU64::new(grant.mm_key).unwrap(),
+                    generation: std::num::NonZeroU64::new(1).unwrap(),
+                },
+                root: SubstrateGpa(0x1000),
+                op: DescriptorOp::Publish {
+                    span: PageSpan::new(grant.fault_va, PAGE),
+                    expected_ipa: SubstrateGpa(grant.ready.physical_ipa),
+                    access: LeafAccess::Write,
+                },
+                tables: TableGrants::NONE,
+            },
+        ))
+    }
+
+    fn apply_guest_publication(
+        &mut self,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        carrick_hal::TrapError,
+    > {
+        use carrick_mmu_core::aarch64::descriptor_txn::*;
+        self.calls.push("apply".to_owned());
+        if self.refuse {
+            return Err(carrick_hal::TrapError::Hypervisor("refused".to_owned()));
+        }
+        let DescriptorOp::Publish { span, .. } = txn.op else {
+            panic!("a copyout grant publishes");
+        };
+        Ok(txn
+            .verify_receipt(&DescriptorReceipt {
+                id: txn.id,
+                digest: txn.digest(),
+                outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                    pages: 1,
+                    resident: span,
+                    tables_linked: 0,
+                    reclaimed: ReclaimedTables::NONE,
+                    live_stores: 1,
+                    flush_required: true,
+                }),
+            })
+            .unwrap())
+    }
+
+    fn settle_receipt(
+        &mut self,
+        _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        _receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        carrick_hal::TrapError,
+    > {
+        unreachable!("no pending grant in these tests")
+    }
+
+    fn complete(
+        &mut self,
+        _grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<(), carrick_hal::TrapError> {
+        self.calls.push("complete".to_owned());
+        Ok(())
+    }
+
+    fn roll_back(
+        &mut self,
+        _grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, carrick_hal::TrapError> {
+        self.calls.push("roll_back".to_owned());
+        Ok(true)
+    }
+}
+
+/// Serve a host copyout of `[address, address + len)` through `venue`
+/// under this MM's host-write mutation authority, as the runtime does.
+fn copyout_grant(
+    dispatcher: &SyscallDispatcher,
+    address: u64,
+    len: u64,
+    venue: &mut CopyoutVenue,
+) -> Result<bool, String> {
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut guard = crate::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
+        &dispatcher.pt_quiesce(),
+        context.shared().mm().id(),
+        dispatcher.mm_mutation_coordinator(),
+        crate::thread::ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
+        crate::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+    )
+    .unwrap();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let granted =
+        dispatcher.grant_for_host_copyout(&mut guard, address, len, venue, &mut |_, _| {
+            calls.borrow_mut().push("settle_pending");
+            Ok(())
+        });
+    assert_eq!(
+        calls.into_inner(),
+        vec!["settle_pending"],
+        "pending guest grants are settled once, before the plan"
+    );
+    granted
+}
+
+/// Contract `kernel.el1.anonymous-reservations` (host copyout): a host
+/// write into a never-touched page of a delegated reservation is served by
+/// the same root-planned EL1 frame grant an EL0 first touch would get, one
+/// grant per contiguous run, never more than the run's power-of-two window,
+/// and a resident page is never granted again.
+#[test]
+fn delegated_host_copyout_is_one_root_grant_per_run() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        8 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    assert!(dispatcher.host_read_sees_fresh_zero(base));
+
+    let mut venue = CopyoutVenue::default();
+    assert_eq!(copyout_grant(&dispatcher, base, PAGE, &mut venue), Ok(true));
+    assert_eq!(venue.calls, ["prepare", "publish"]);
+    assert_eq!(
+        (venue.requests[0].semantic_base, venue.requests[0].len),
+        (base, PAGE),
+        "a one-page copyout backs one page"
+    );
+    assert!(
+        !dispatcher.host_read_sees_fresh_zero(base),
+        "the granted page is resident"
+    );
+    assert!(
+        stock_span(&dispatcher, base).is_none(),
+        "an EL0 first touch after the copyout plans nothing"
+    );
+
+    // A three-page run at page 4: its aligned pieces, exactly the run.
+    let mut venue = CopyoutVenue::default();
+    assert_eq!(
+        copyout_grant(&dispatcher, base + 4 * PAGE, 3 * PAGE, &mut venue),
+        Ok(true)
+    );
+    let backed: Vec<(u64, u64)> = venue
+        .requests
+        .iter()
+        .map(|request| (request.semantic_base, request.len))
+        .collect();
+    assert_eq!(
+        backed,
+        [(base + 4 * PAGE, 2 * PAGE), (base + 6 * PAGE, PAGE)],
+        "the run's aligned pieces, never a page outside it"
+    );
+
+    // Already resident: no grant, no backend call.
+    let mut venue = CopyoutVenue::default();
+    assert_eq!(
+        copyout_grant(&dispatcher, base, PAGE, &mut venue),
+        Ok(false)
+    );
+    assert!(venue.calls.is_empty());
+}
+
+/// An EL0 first touch that committed the page first leaves the copyout
+/// nothing to grant: exactly one frame backs the page in either order.
+#[test]
+fn delegated_host_copyout_after_an_el0_first_touch_grants_nothing() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base, PAGE, |plan| {
+            dispatcher.commit_resident_frame_grant(plan)
+        })
+        .unwrap();
+    let mut venue = CopyoutVenue {
+        guest_lane: true,
+        ..CopyoutVenue::default()
+    };
+    assert_eq!(
+        copyout_grant(&dispatcher, base, PAGE, &mut venue),
+        Ok(false)
+    );
+    assert!(venue.calls.is_empty());
+}
+
+/// Guest lane: the copyout applies EL1's publication on its own vCPU and
+/// commits residency only after the verified receipt and the backend's
+/// completion. A clean refusal rolls the backing back and commits nothing.
+#[test]
+fn delegated_host_copyout_on_the_guest_lane_commits_after_the_receipt() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        2 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+
+    let mut refused = CopyoutVenue {
+        guest_lane: true,
+        refuse: true,
+        ..CopyoutVenue::default()
+    };
+    assert_eq!(
+        copyout_grant(&dispatcher, base, PAGE, &mut refused),
+        Ok(false)
+    );
+    assert_eq!(refused.calls, ["prepare", "publish", "apply", "roll_back"]);
+    assert!(
+        dispatcher.host_read_sees_fresh_zero(base),
+        "a refused grant commits nothing"
+    );
+
+    let mut venue = CopyoutVenue {
+        guest_lane: true,
+        ..CopyoutVenue::default()
+    };
+    assert_eq!(copyout_grant(&dispatcher, base, PAGE, &mut venue), Ok(true));
+    assert_eq!(venue.calls, ["prepare", "publish", "apply", "complete"]);
+    assert!(!dispatcher.host_read_sees_fresh_zero(base));
+}
+
+/// A host read of a never-touched page sees zero without any grant; a
+/// write-only-denied (read-only) page still reads zero, an unmapped page
+/// never does.
+#[test]
+fn delegated_host_read_of_an_untouched_page_is_fresh_zero() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(Placement::Fixed(base), PAGE, READ).unwrap();
+    assert!(dispatcher.host_read_sees_fresh_zero(base));
+    assert!(!dispatcher.host_read_sees_fresh_zero(base + 4 * PAGE));
+    // A read-only page is no copyout target.
+    let mut venue = CopyoutVenue::default();
+    assert_eq!(
+        copyout_grant(&dispatcher, base, PAGE, &mut venue),
+        Ok(false)
+    );
+    assert!(venue.calls.is_empty());
+}
+
+/// Budget: a copyout run of `n` pages at any offset costs at most two
+/// grants per power-of-two size class (its aligned pieces) and backs
+/// exactly the run. Adversarial rows: unaligned starts, odd lengths, a run
+/// crossing a large alignment boundary.
+#[test]
+fn delegated_host_copyout_grants_are_logarithmic_and_exact() {
+    for (offset, pages) in [
+        (0, 1),
+        (1, 1),
+        (3, 3),
+        (5, 7),
+        (7, 13),
+        (1, 64),
+        (63, 2),
+        (1, 255),
+    ] {
+        let dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let base = LINUX_MMAP_BASE + 64 * STOCK_WINDOW;
+        root.guest_mmap(
+            Placement::Fixed(base),
+            512 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+        let start = base + offset * PAGE;
+        let mut venue = CopyoutVenue::default();
+        assert_eq!(
+            copyout_grant(&dispatcher, start, pages * PAGE, &mut venue),
+            Ok(true)
+        );
+        let mut cursor = start;
+        for request in &venue.requests {
+            assert_eq!(request.semantic_base, cursor, "row ({offset}, {pages})");
+            assert!(request.len.is_power_of_two() && request.semantic_base % request.len == 0);
+            cursor += request.len;
+        }
+        assert_eq!(
+            cursor,
+            start + pages * PAGE,
+            "row ({offset}, {pages}) backs the run exactly"
+        );
+        let classes = u64::from(u64::BITS - pages.leading_zeros());
+        assert!(
+            venue.requests.len() as u64 <= 2 * classes,
+            "row ({offset}, {pages}): {} grants, budget {}",
+            venue.requests.len(),
+            2 * classes
+        );
+    }
+}
+
+/// Contract `kernel.el1.anonymous-reservations.host-copyout`: reconciling a
+/// deferred return hands the VA back to the root for placement, so it must
+/// not leave a host protection fact there. A host `unmapped` mark outlived
+/// the acknowledgement: EL1 placed a fresh mapping on the VA without the
+/// host, and every host copyout into it (`recvfrom` into a new buffer,
+/// `write` from one) answered EFAULT from the stale mark.
+#[test]
+fn delegated_returned_va_carries_no_host_protection_fact_into_its_next_mapping() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory =
+        super::tests::ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (64 * PAGE) as usize);
+    let first = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    root.guest_munmap_resident(first, 2 * PAGE);
+    assert_eq!(
+        crate::dispatch::mm_mutation::test_support::with_permit(
+            dispatcher.mm_mutation_coordinator(),
+            |permit| dispatcher.reconcile_el1_deferred_returns(permit, &mut memory),
+        )
+        .unwrap(),
+        1
+    );
+    // The root places the VA again, on its own venue.
+    assert_eq!(
+        root.guest_mmap(
+            Placement::Fixed(first),
+            2 * PAGE,
+            ReservationProtection::READ_WRITE
+        ),
+        Ok(first)
+    );
+    let protections = carrick_guest_mem::GuestMemory::protections(&memory).unwrap();
+    assert!(
+        !protections.range_no_access(first, (2 * PAGE) as usize),
+        "a stale host mark denies host copyout into the root's new mapping"
+    );
+    assert!(!protections.range_no_write(first, (2 * PAGE) as usize));
+}
