@@ -3911,24 +3911,32 @@ mod guest_descriptor_lane_tests {
         }
     }
 
-    /// The fork commits only after its guest arm is applied, and a
-    /// forwarded syscall settles published grants before it is serviced.
+    /// The parent's guest arm is applied as soon as fork preparation recorded
+    /// it, before the parent copyout (which can take a host COW on an armed
+    /// span) and before the fork commits; and a forwarded syscall settles
+    /// published grants before it is serviced.
     #[test]
     fn fork_commit_and_syscall_entry_order_guest_descriptor_work() {
         let lifecycle = include_str!("lifecycle.rs");
-        let commit = lifecycle
-            .split("fn commit_parent(&mut self, memory: &mut E)")
+        let arm = lifecycle
+            .split("fn arm_parent(&mut self, memory: &mut E)")
             .nth(1)
             .and_then(|tail| tail.split("\n    fn ").next())
-            .expect("commit_parent");
-        let take = commit
-            .find("take_guest_fork_arm_txns()")
-            .expect("arm taken");
-        let apply = commit.find("apply_guest_fork_arm(").expect("arm applied");
-        let commit_fork = commit
-            .find("commit_process_fork()")
-            .expect("fork committed");
-        assert!(take < apply && apply < commit_fork);
+            .expect("arm_parent");
+        let take = arm.find("take_guest_fork_arm_txns()").expect("arm taken");
+        let apply = arm.find("apply_guest_fork_arm(").expect("arm applied");
+        assert!(take < apply);
+        let quiesce = include_str!("quiesce.rs");
+        let armed = quiesce
+            .find("ops.arm_parent(memory)")
+            .expect("arm applied in prepare");
+        let copyout = quiesce
+            .find("let parent_outputs_published")
+            .expect("parent copyout");
+        let commit = quiesce
+            .find("ops.commit_parent(memory)")
+            .expect("fork commit");
+        assert!(armed < copyout && copyout < commit);
         let module = include_str!("mod.rs");
         let service = module
             .split("fn service_threaded_syscall_for_executor(")

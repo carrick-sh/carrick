@@ -220,6 +220,11 @@ pub(crate) trait HvpatchProcessBackendOps<E: ThreadedEngine, M: CurrentMmMemory>
     fn last_fork_projection_rows_visited(&self, _memory: &M) -> u64 {
         0
     }
+    /// Make the parent's fork-COW arm live the moment it is recorded, before
+    /// any host write to the parent (the `CLONE_PARENT_SETTID` copyout) can
+    /// take a host COW on an armed span: a later arm would re-arm a span the
+    /// host already made private and disarmed.
+    fn arm_parent(&mut self, _memory: &mut M) {}
     fn commit_parent(&mut self, memory: &mut M) -> Result<(), RuntimeError>;
     fn rollback_parent(&mut self, memory: &mut M) -> Result<(), RuntimeError>;
     fn abort_and_rollback_prepared(
@@ -397,13 +402,16 @@ where
         prepared.abort().map_err(RuntimeError::Trap)
     }
 
-    fn commit_parent(&mut self, memory: &mut E) -> Result<(), RuntimeError> {
+    fn arm_parent(&mut self, memory: &mut E) {
         // Guest-owned lane: the parent's fork-COW arm lands in EL1, in order
-        // and settled, before the fork commits and any parent thread resumes.
+        // and settled, as soon as the backend recorded it.
         let arm = memory.take_guest_fork_arm_txns();
         if !arm.is_empty() {
             super::signal::apply_guest_fork_arm(memory, arm);
         }
+    }
+
+    fn commit_parent(&mut self, memory: &mut E) -> Result<(), RuntimeError> {
         memory.commit_process_fork().map_err(RuntimeError::Trap)
     }
 

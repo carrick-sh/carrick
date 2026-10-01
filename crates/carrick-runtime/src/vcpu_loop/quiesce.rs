@@ -1260,6 +1260,11 @@ where
                 crate::linux_abi::LINUX_EAGAIN.guest_retval(),
             )));
         }
+        // The arm is recorded: make it live before the parent copyout below
+        // can take a host COW on an armed span.
+        if !shares_mm {
+            ops.arm_parent(memory);
+        }
         let _inventory_abandon = inventory_transaction.map(|tx| {
             InventoryAbandon::new(parent_process.kernel_graph().frame_inventory(), [Some(tx)])
         });
