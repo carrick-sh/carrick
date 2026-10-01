@@ -731,6 +731,69 @@ fn lazy_anonymous_mmap_arms_first_touch_without_accessible_backing() {
     }
 }
 
+// V8 frees pages with `mmap(MAP_FIXED|MAP_ANONYMOUS, PROT_NONE)` over a
+// touched range. In the sparse arena that replacement must retire the
+// predecessor's private frames first, exactly as a fixed RW replacement
+// does: the new mapping's reservation refuses to reuse a VA still holding a
+// live EL1-private leaf (node-app-smoke: "prepare ... Refused(Occupied)").
+#[test]
+fn lazy_fixed_prot_none_replacement_retires_its_predecessor() {
+    const SYS_MMAP: u64 = 222;
+    const LENGTH: u64 = 1024 * 1024;
+
+    let dispatcher = SyscallDispatcher::new();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1002));
+    let reporter = CompatReporter::default();
+    let mut memory =
+        CountingMmapMemory::new(LINUX_MMAP_BASE, LENGTH as usize).with_defer_anon(true);
+    let prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+    let mmap = |memory: &mut CountingMmapMemory, address: u64, prot: u64, flags: u64| {
+        threaded_memory_call(
+            &dispatcher,
+            memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([address, LENGTH, prot, flags, u64::MAX, 0]),
+            ),
+        )
+    };
+    let address = returned(mmap(
+        &mut memory,
+        0,
+        prot,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+    )) as u64;
+    assert_eq!(address, LINUX_MMAP_BASE);
+    assert_eq!(memory.unmap_calls.get(), 0);
+    memory.protect_log.borrow_mut().clear();
+
+    let replacement = mmap(
+        &mut memory,
+        address,
+        0,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+    );
+    assert_eq!(returned(replacement), address as i64);
+    assert_eq!(
+        memory.unmap_calls.get(),
+        1,
+        "a PROT_NONE fixed replacement must retire the old backing"
+    );
+    assert_eq!(
+        *memory.protect_log.borrow(),
+        vec![(address, LENGTH as usize, 0)]
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(address, |_| ())
+            .is_none(),
+        "the old mapping's first-touch arming is retired with it"
+    );
+}
+
 #[test]
 fn lazy_fixed_anonymous_replacement_rearms_first_touch_after_retirement() {
     const SYS_MMAP: u64 = 222;

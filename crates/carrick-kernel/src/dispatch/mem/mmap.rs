@@ -1389,9 +1389,34 @@ impl<'a> MemView<'a> {
             // page reclaimed from a prior munmap (which invalidated it) must be
             // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
             // (no TLBI) when the page is already at the target protection.
+            let defer_anonymous = memory.supports_lazy_anonymous_mmap()
+                && this.linux_page_size() == 4096
+                && map_flags.contains(LinuxMmapFlags::PRIVATE)
+                && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
+                // A fixed replacement inside the sparse arena is eligible once
+                // its exact predecessor has been retired below. Fixed holes
+                // outside that arena retain the alias path.
+                && (!fixed_anonymous || in_arena);
+
             let prot_none = prot_flags.is_empty();
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
+                // A fixed PROT_NONE replacement in the sparse arena (V8's
+                // FreePages) retires its predecessor exactly as the general
+                // arm below does: the new reservation never reuses a VA still
+                // holding a live private frame.
+                if fixed_anonymous && defer_anonymous {
+                    if let Err(error) = memory.unmap_range(address, length_usize) {
+                        return Ok(request.refused_by(
+                            MmapRefusal::Internal(
+                                "fixed anonymous predecessor retirement failed",
+                            ),
+                            LINUX_ENOMEM,
+                            format_args!("at {address:#x}+{length:#x}: {error}"),
+                        ));
+                    }
+                    this.remove_mapping_metadata(address, length);
+                }
                 memory.set_mapping_protection_and_sharing(
                     address,
                     length_usize,
@@ -1465,15 +1490,6 @@ impl<'a> MemView<'a> {
                 this.mark_vma_dispatch(&mut host_alias_dispatch);
                 return Ok(DispatchOutcome::returned_u64(address)?);
             }
-
-            let defer_anonymous = memory.supports_lazy_anonymous_mmap()
-                && this.linux_page_size() == 4096
-                && map_flags.contains(LinuxMmapFlags::PRIVATE)
-                && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
-                // A fixed replacement inside the sparse arena is eligible once
-                // its exact predecessor has been retired below. Fixed holes
-                // outside that arena retain the alias path.
-                && (!fixed_anonymous || in_arena);
 
             if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && (!address_uses_alias || defer_anonymous)
