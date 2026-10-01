@@ -273,12 +273,7 @@ pub(super) fn publish_frame_grant(
         .ok_or_else(|| TrapError::Hypervisor("EL1 frame-grant range overflow".to_owned()))?;
     let semantic_len =
         usize::try_from(request.len).map_err(|_| TrapError::MappingTooLarge(request.len))?;
-    let retirement_events = retirement.map_or(0, |retirement| {
-        retirement
-            .mappings
-            .len()
-            .saturating_add(retirement.frames.len())
-    });
+    let retirement_events = retirement.map_or(0, InventoryLeaseRetirement::event_count);
     let mut reservation = context
         .authority
         .reserve(1, 1, 2usize.saturating_add(retirement_events))

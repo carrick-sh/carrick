@@ -261,6 +261,11 @@ impl HvpatchTaskEngineBindingState {
                     ),
                 };
                 apply_commit(commit)?;
+                // The applied retirement may have emptied the population of a
+                // lease an earlier retirement declined; finalize it now.
+                carrick_vmm_hvf::hvf_aarch64_engine::settle_detached_task_engine_declined_remainders(
+                    state,
+                )?;
                 Ok(root_receipt)
             }
             HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
@@ -325,6 +330,9 @@ impl HvpatchTaskEngineBindingState {
                 };
                 state.prepare_inventory_retirement(commit)?;
                 state.apply_inventory_retirement(apply_with_receipt)?;
+                carrick_vmm_hvf::hvf_aarch64_engine::settle_detached_task_only_engine_declined_remainders(
+                    state,
+                )?;
                 Ok(root_receipt)
             }
             #[cfg(test)]
