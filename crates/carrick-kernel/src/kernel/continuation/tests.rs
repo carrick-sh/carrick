@@ -5016,11 +5016,17 @@ fn unrelated_waiter_progress_during_concurrent_host_write() {
     // Wait until locker_thread holds write.lock()
     barrier_locked.wait();
 
-    // An unrelated waiter enrolls and rechecks while write.lock() is held
+    // An unrelated waiter enrolls and rechecks while write.lock() is held.
+    // It must not be able to resolve itself: `enroll()` rechecks the
+    // waiter's own readiness probe, and the previous 1 ms sleep deadline
+    // could elapse before that recheck, leaving the entry Ready (by
+    // timeout) before our explicit publish. A signal wait with no timeout
+    // on a signal nobody sends has no self-resolving probe.
     let sleep_cont = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::WaitOnSleep {
-            duration: Duration::from_millis(1),
-            remaining: None,
+        DispatchOutcome::WaitOnSignals {
+            wait_set: SigSet::from_raw(1 << (12 - 1)), // SIGUSR2
+            block_mask: SigBlockMask::NONE,
+            timeout: None,
         },
         capture(&context, generation),
     )
@@ -5031,6 +5037,21 @@ fn unrelated_waiter_progress_during_concurrent_host_write() {
         .expect("enroll sleep must not block on write lock");
 
     let sleep_token = sleep_reg.wake_token();
+
+    // The sleep must still be Enrolled (not Ready from its own deadline).
+    assert_eq!(
+        service
+            .inner
+            .state
+            .lock()
+            .entries
+            .get(&sleep_token.continuation)
+            .expect("sleep entry")
+            .state,
+        RegistrationState::Enrolled,
+        "the unrelated waiter resolved itself during enroll"
+    );
+
     let sleep_receipt = service
         .inner
         .publish_event(sleep_token, ContinuationEvent::Ready);
