@@ -53,7 +53,7 @@ pub(crate) fn program_sha256() -> String {
     )
 }
 
-/// The four distinct fault classes specified for carrier CPU attribution.
+/// The distinct fault classes specified for carrier CPU attribution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum FaultClass {
@@ -61,6 +61,11 @@ pub(crate) enum FaultClass {
     Cow,
     FrameGrant,
     Stage2,
+    /// The mm-mutation boundary around a mutating fault: acquiring and
+    /// releasing the exact mm's stage-1 authority (`with_mm_mutation_authority`,
+    /// `PtPauseGuard`), settling guest frame grants and reconciling frame
+    /// commits. It runs under the executor loop, but it is fault service.
+    MmMutationSettle,
 }
 
 impl FaultClass {
@@ -70,6 +75,37 @@ impl FaultClass {
             Self::Cow => "cow",
             Self::FrameGrant => "frame-grant",
             Self::Stage2 => "stage-2",
+            Self::MmMutationSettle => "mm-mutation-settle",
+        }
+    }
+}
+
+/// Process-lifecycle work that runs on executor threads (or the CLI main
+/// thread) but is neither per-quantum scheduling nor syscall service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum LifecycleClass {
+    /// Serving fork/clone: building the child's spec and plan, its task
+    /// mapping index and COW arming (`prepare_in_process_fork`,
+    /// `spawn_persistent_hvpatch_clone_thread`, `build_process_spec`).
+    ForkClone,
+    /// Sibling executors parked on `carrick_thread::fork_quiesce::PtQuiesce`
+    /// while another executor holds the mm's page-table pause.
+    ForkQuiescePark,
+    /// Exit/exec teardown: retiring a detached address space, its aliases,
+    /// stage-2 records and frame-inventory receipts.
+    Teardown,
+    /// CLI startup before the guest runs (image reference resolution).
+    Startup,
+}
+
+impl LifecycleClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ForkClone => "fork-clone",
+            Self::ForkQuiescePark => "fork-quiesce-park",
+            Self::Teardown => "teardown",
+            Self::Startup => "startup",
         }
     }
 }
@@ -88,6 +124,7 @@ pub(crate) enum CpuCategory {
     FaultService(FaultClass),
     El1Mailbox,
     ExecutorScheduling,
+    Lifecycle(LifecycleClass),
     LockWait,
     Instrumentation,
     Other,
@@ -210,21 +247,21 @@ impl SymbolTable {
             }
         }
 
-        let mut symbols = Vec::new();
+        let mut entries = Vec::new();
         for (name, nlist) in macho.symbols().flatten() {
             if nlist.is_undefined() || nlist.n_value == 0 {
                 continue;
             }
-            let clean_name = name.strip_prefix('_').unwrap_or(name);
-            let demangled = format!("{:#}", rustc_demangle::demangle(clean_name));
-            symbols.push((nlist.n_value, demangled));
+            entries.push(MachSymbol {
+                addr: nlist.n_value,
+                name,
+                stab: nlist.is_stab(),
+                external: nlist.is_global(),
+            });
         }
 
-        symbols.sort_by_key(|(addr, _)| *addr);
-        symbols.dedup_by_key(|(addr, _)| *addr);
-
         Ok(Self {
-            symbols,
+            symbols: select_mach_symbols(entries),
             text_vmaddr,
         })
     }
@@ -274,6 +311,43 @@ impl SymbolTable {
             None
         }
     }
+}
+
+/// One Mach-O nlist entry, reduced to what address resolution needs.
+#[derive(Clone, Copy, Debug)]
+struct MachSymbol<'a> {
+    addr: u64,
+    name: &'a str,
+    /// A debug-map stab (`N_BNSYM`, `N_FUN`, `N_SO`, ...), not a symbol.
+    stab: bool,
+    /// `N_EXT`: an external symbol, preferred over a local alias.
+    external: bool,
+}
+
+/// Choose exactly one name per address from a Mach-O symbol table.
+///
+/// Debug-map stabs are not symbols: an empty-named `N_BNSYM` precedes every
+/// function that has a debug map, and `N_ENSYM`/`N_SO` entries sit at
+/// addresses with no function. Keeping them let an unnamed entry win the
+/// per-address dedup, so whole frames resolved to `+0x... (in carrick)` and
+/// fell through every classification rule. Only named non-stab entries are
+/// kept, and an external name wins over a local alias at the same address.
+fn select_mach_symbols(entries: Vec<MachSymbol<'_>>) -> Vec<(u64, String)> {
+    let mut named: Vec<MachSymbol<'_>> = entries
+        .into_iter()
+        .filter(|entry| !entry.stab && !entry.name.is_empty())
+        .collect();
+    // Stable sort: among equal (address, linkage) entries the table order wins.
+    named.sort_by_key(|entry| (entry.addr, !entry.external));
+    named.dedup_by_key(|entry| entry.addr);
+    named
+        .into_iter()
+        .map(|entry| {
+            let clean_name = entry.name.strip_prefix('_').unwrap_or(entry.name);
+            let demangled = format!("{:#}", rustc_demangle::demangle(clean_name));
+            (entry.addr, demangled)
+        })
+        .collect()
 }
 
 /// In-process symbol resolution of hex addresses using binary symbol tables.
@@ -340,10 +414,33 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::LockWait);
     }
 
-    // 3. Executor scheduling / park / unpark
+    // 3. Process lifecycle work under the executor loop or the CLI main
+    //    thread. Named before scheduling so the executor root cannot claim it.
+    if let Some(class) = classify_lifecycle_frame(frame) {
+        return Some(CpuCategory::Lifecycle(class));
+    }
+
+    // 4. The mm-mutation boundary of a mutating fault: stage-1 authority
+    //    acquisition/release, grant settlement and commit reconciliation.
+    if frame.contains("settle_guest_frame_grants")
+        || frame.contains("reconcile_guest_frame_commits")
+        || frame.contains("GuestGrantLedger")
+        || frame.contains("mm_quiesce::PtPauseGuard")
+        || frame.contains("with_mm_mutation_authority")
+        || frame.contains("resolve_mutating_fault")
+    {
+        return Some(CpuCategory::FaultService(FaultClass::MmMutationSettle));
+    }
+
+    // 5. Executor scheduling: per-quantum work named by a leafward frame
+    //    (park/claim, wait-service enrollment and continuation resume, task
+    //    load/save on the vCPU, run-state publication, job-control checks,
+    //    guest-leave wakes, zone placement and the receipt log). The executor
+    //    root frames are deliberately NOT here; see `is_executor_root_frame`.
     if frame.contains("idle_condvar")
         || frame.contains("park_spare")
         || frame.contains("RunQueue::")
+        || frame.contains("RunQueueInner::")
         || frame.contains("Scheduler::")
         || frame.contains("take_row_bound")
         || frame.contains("run_worker")
@@ -353,17 +450,40 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         || frame.contains("scheduler_wake")
         || frame.contains("lease_settle")
         || frame.contains("vtimer")
-        || frame.contains("run_executor_loop")
-        || frame.contains("executor_worker")
         || frame.contains("ExecutorRegistration")
+        || frame.contains("ExecutorDirectory::")
         || frame.contains("destroy_raw_vcpu")
-        || frame.contains("executor::")
-        || frame.contains("::schedule")
+        || frame.contains("CarrierWaitService")
+        || frame.contains("wait_service::")
+        || frame.contains("ContinuationDetail")
+        || frame.contains("BlockedContinuation::")
+        || frame.contains("resume_persistent_continuation")
+        || frame.contains("executor::pool::ReceiptLog")
+        || frame.contains("run_state::")
+        || frame.contains("publish_thread_run_state")
+        || frame.contains("ThreadRegistry::")
+        || frame.contains("suspend_for_job_control")
+        || frame.contains("settle_task_ptrace_stop")
+        || frame.contains("GuestLeaveWake::notify")
+        || frame.contains("prepare_zone_handback")
+        || frame.contains("kick_zone_slot")
+        || frame.contains("ZoneTables::")
+        || frame.contains("begin_guest_run")
+        || frame.contains("overlay_task_state_on_live_executor")
+        || frame.contains("reaffirm_resident_task_state")
+        || frame.contains("flush_resident_task")
+        || frame.contains("complete_task_load_barrier")
+        || frame.contains("restore_persistent_executor_invariant")
+        || frame.contains("PersistentExecutor>::load")
+        || frame.contains("PersistentExecutor>::save")
+        || frame.contains("WorkerBoundaryAudit")
+        || frame.contains("audit_persistent_executor_idle")
+        || frame.contains("close_system_charge_window")
     {
         return Some(CpuCategory::ExecutorScheduling);
     }
 
-    // 4. Guest execution (hv_vcpu_run, vcpu execution loop)
+    // 6. Guest execution (hv_vcpu_run, vcpu execution loop)
     if frame.contains("hv_vcpu_run")
         || frame.contains("Vcpu::run")
         || frame.contains("HvfAarch64Vcpu::run")
@@ -376,7 +496,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::GuestExecution);
     }
 
-    // 5. Fault service by fault class
+    // 7. Fault service by fault class
     if frame.contains("commit_resident_frame_grant")
         || frame.contains("prepare_el1_frame_grant")
         || frame.contains("publish_el1_frame_grant_on_host")
@@ -420,7 +540,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::FaultService(FaultClass::FirstTouch));
     }
 
-    // 6. EL1 Mailbox / grant request handling
+    // 8. EL1 Mailbox / grant request handling
     if frame.contains("claim_frame_grant_request")
         || frame.contains("complete_grant")
         || frame.contains("frame_grant_mailbox")
@@ -432,7 +552,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         return Some(CpuCategory::El1Mailbox);
     }
 
-    // 7. Host syscall service by class
+    // 9. Host syscall service by class
     if frame.contains("openat")
         || frame.contains("open_at_path")
         || frame.contains("sys_openat")
@@ -573,30 +693,88 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
     None
 }
 
+fn classify_lifecycle_frame(frame: &str) -> Option<LifecycleClass> {
+    if frame.contains("fork_quiesce::PtQuiesce::park") {
+        return Some(LifecycleClass::ForkQuiescePark);
+    }
+    if frame.contains("prepare_in_process_fork")
+        || frame.contains("build_process_spec")
+        || frame.contains("build_process_plan")
+        || frame.contains("build_sibling_spec")
+        || frame.contains("build_thread_spec")
+        || frame.contains("CowArmedRanges::arm")
+        || frame.contains("ForkTranslationOverlayIndex::")
+        || frame.contains("ForkOverlayOwnerIndex::")
+        || frame.contains("inherited_fork_inventory_extents")
+        || frame.contains("spawn_persistent_hvpatch_clone_thread")
+    {
+        return Some(LifecycleClass::ForkClone);
+    }
+    if frame.contains("retire_detached_address_space")
+        || frame.contains("retire_detached_task_only_engine")
+        || frame.contains("retire_task_state_process_mappings")
+        || frame.contains("retire_process_aliases")
+        || frame.contains("stage_retirement")
+        || frame.contains("FrameInventoryRetirementReceipt::")
+        || frame.contains("authenticate_pending_retirement")
+        || frame.contains("apply_inventory_retirement")
+        || frame.contains("apply_detached_address_space_retirement")
+        || frame.contains("apply_retirement_with_receipt")
+        || frame.contains("HvpatchTaskOnlyEngineState>")
+        || frame.contains("begin_persistent_exit_sibling_drain")
+    {
+        return Some(LifecycleClass::Teardown);
+    }
+    if frame.contains("ImageReference::parse")
+        || frame.contains("carrick_engine::Engine::resolve")
+        || frame.contains("carrick_engine::block_on_oci")
+    {
+        return Some(LifecycleClass::Startup);
+    }
+    None
+}
+
+/// Root frames present on every executor thread. They name the executor,
+/// not the work: a stack is filed as scheduling through them only when no
+/// leafward frame classifies it (the loop's own residual work, and inlined
+/// callees such as the reactor nudge `write` whose callee has no frame).
+fn is_executor_root_frame(frame: &str) -> bool {
+    frame.contains("vcpu_loop::executor::run_executor_loop")
+        || frame.contains("vcpu_loop::executor::executor_worker")
+}
+
 /// Classify a user stack (frames ordered from leaf to root) into one of the
-/// attribution categories.
+/// attribution categories: the leaf-most frame that a rule names wins, and
+/// the executor root is only a fallback.
 pub(crate) fn classify_stack(frames: &[&str]) -> CpuCategory {
-    // Walk leaf-to-root and take the first matched category.
     for frame in frames {
         if let Some(category) = classify_frame(frame) {
-            // When a thread is idle waiting in the scheduler's run queue, its leaf frame
-            // is `wait_until_internal` or `psynch_cvwait` (LockWait). If an outer caller
-            // on the stack is idle parking in the run queue, attribute to ExecutorScheduling
-            // rather than lock contention.
+            // A condvar/mutex wait is attributed to the waiter that owns it
+            // when that waiter is a named park: an idle executor in the run
+            // queue is scheduling, a sibling parked for a page-table pause is
+            // lifecycle. Everything else stays lock wait.
             if category == CpuCategory::LockWait {
-                let is_park = frames.iter().any(|f| {
+                if frames.iter().any(|f| {
                     f.contains("idle_condvar")
                         || f.contains("park_spare")
                         || f.contains("RunQueue::park_spare")
-                });
-                if is_park {
+                }) {
                     return CpuCategory::ExecutorScheduling;
+                }
+                if frames
+                    .iter()
+                    .any(|f| f.contains("fork_quiesce::PtQuiesce::park"))
+                {
+                    return CpuCategory::Lifecycle(LifecycleClass::ForkQuiescePark);
                 }
             }
             return category;
         }
     }
 
+    if frames.iter().any(|f| is_executor_root_frame(f)) {
+        return CpuCategory::ExecutorScheduling;
+    }
     CpuCategory::Other
 }
 
@@ -614,11 +792,13 @@ pub(crate) struct HvpatchCarrierCpuAttributionSummary {
     pub(crate) fault_service_samples: u64,
     pub(crate) el1_mailbox_samples: u64,
     pub(crate) executor_scheduling_samples: u64,
+    pub(crate) lifecycle_samples: u64,
     pub(crate) lock_wait_samples: u64,
     pub(crate) instrumentation_samples: u64,
     pub(crate) other_samples: u64,
     pub(crate) syscall_classes: BTreeMap<String, u64>,
     pub(crate) fault_classes: BTreeMap<String, u64>,
+    pub(crate) lifecycle_classes: BTreeMap<String, u64>,
     pub(crate) usdt_metrics: BTreeMap<String, u64>,
     #[serde(skip)]
     pub(crate) raw: String,
@@ -651,12 +831,14 @@ impl HvpatchCarrierCpuAttributionSummary {
         let mut fault_service_samples = 0_u64;
         let mut el1_mailbox_samples = 0_u64;
         let mut executor_scheduling_samples = 0_u64;
+        let mut lifecycle_samples = 0_u64;
         let mut lock_wait_samples = 0_u64;
         let mut instrumentation_samples = 0_u64;
         let mut other_samples = 0_u64;
 
         let mut syscall_classes = BTreeMap::new();
         let mut fault_classes = BTreeMap::new();
+        let mut lifecycle_classes = BTreeMap::new();
         let mut usdt_metrics = BTreeMap::new();
 
         for line in raw.lines() {
@@ -832,6 +1014,14 @@ impl HvpatchCarrierCpuAttributionSummary {
                         .checked_add(count)
                         .ok_or_else(|| anyhow!("executor scheduling overflow"))?;
                 }
+                CpuCategory::Lifecycle(class) => {
+                    lifecycle_samples = lifecycle_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("lifecycle overflow"))?;
+                    *lifecycle_classes
+                        .entry(class.as_str().to_owned())
+                        .or_insert(0_u64) += count;
+                }
                 CpuCategory::LockWait => {
                     lock_wait_samples = lock_wait_samples
                         .checked_add(count)
@@ -877,11 +1067,13 @@ impl HvpatchCarrierCpuAttributionSummary {
             fault_service_samples,
             el1_mailbox_samples,
             executor_scheduling_samples,
+            lifecycle_samples,
             lock_wait_samples,
             instrumentation_samples,
             other_samples,
             syscall_classes,
             fault_classes,
+            lifecycle_classes,
             usdt_metrics,
             raw,
         })
@@ -909,6 +1101,10 @@ impl HvpatchCarrierCpuAttributionSummary {
 
     pub(crate) fn executor_scheduling_share(&self) -> f64 {
         share(self.executor_scheduling_samples, self.sample_population)
+    }
+
+    pub(crate) fn lifecycle_share(&self) -> f64 {
+        share(self.lifecycle_samples, self.sample_population)
     }
 
     pub(crate) fn lock_wait_share(&self) -> f64 {
@@ -975,6 +1171,19 @@ impl HvpatchCarrierCpuAttributionSummary {
             self.executor_scheduling_samples,
             self.executor_scheduling_share() * 100.0
         ));
+        out.push_str(&format!(
+            "  lifecycle:           {:>8} ({:>5.1}%)\n",
+            self.lifecycle_samples,
+            self.lifecycle_share() * 100.0
+        ));
+        for (class, count) in &self.lifecycle_classes {
+            out.push_str(&format!(
+                "    {:<18} {:>8} ({:>5.1}%)\n",
+                class,
+                count,
+                share(*count, self.sample_population) * 100.0
+            ));
+        }
         out.push_str(&format!(
             "  lock_wait:           {:>8} ({:>5.1}%)\n",
             self.lock_wait_samples,
@@ -1473,6 +1682,242 @@ mod tests {
         );
     }
 
+    /// The executor root every executor-thread stack ends in.
+    const EXECUTOR_ROOT: [&str; 6] = [
+        "carrick_runtime::vcpu_loop::executor::run_executor_loop+0xeb4 (in carrick)",
+        "carrick_runtime::vcpu_loop::executor::executor_worker+0x1728 (in carrick)",
+        "std::sys::backtrace::__rust_begin_short_backtrace+0x38 (in carrick)",
+        "core::ops::function::FnOnce::call_once{{vtable.shim}}+0xa4 (in carrick)",
+        "<std::sys::thread::unix::Thread>::new::thread_start+0x198 (in carrick)",
+        "0x18a8ffd00",
+    ];
+
+    /// The quantum poll path between a job's work and the executor root.
+    const QUANTUM_POLL: [&str; 5] = [
+        "carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob<E>::poll_with_engine+0x3b08 (in carrick)",
+        "<carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob<E> as carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopPoll>::poll+0xb4 (in carrick)",
+        "carrick_runtime::vcpu_loop::binding::HvpatchLoopJob<E>::poll_production+0x88 (in carrick)",
+        "<carrick_runtime::vcpu_loop::binding::HvpatchLoopJob<E> as carrick_runtime::vcpu_loop::continuation::quantum::PersistentQuantumJob>::poll_quantum_with_engine+0xcc (in carrick)",
+        "<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutor as carrick_runtime::vcpu_loop::executor::backend::PersistentExecutor>::run_until_boundary+0x158 (in carrick)",
+    ];
+
+    fn executor_stack<'a>(leaf: &[&'a str], via_quantum: bool) -> Vec<&'a str> {
+        let mut frames = leaf.to_vec();
+        if via_quantum {
+            frames.extend(QUANTUM_POLL);
+        }
+        frames.extend(EXECUTOR_ROOT);
+        frames
+    }
+
+    /// Real stacks from the `el1ab-202610010107` lane-off captures (node, go,
+    /// cpython) that the old classifier filed as `executor_scheduling` only
+    /// because `run_executor_loop`/`executor_worker`/`executor::`/`::schedule`
+    /// match root frames every executor (and the CLI's tokio) thread has.
+    /// See docs/perf-results/2026-10-01-el1-real-workload-ab/scheduling-attribution.md.
+    #[test]
+    fn executor_root_frames_do_not_capture_fault_or_lifecycle_work() {
+        let settle = executor_stack(
+            &[
+                "carrick_runtime::vcpu_loop::signal::settle_guest_frame_grants+0x10c (in carrick)",
+                "carrick_runtime::vcpu_loop::signal::resolve_mutating_fault+0xb8 (in carrick)",
+                "carrick_runtime::vcpu_loop::ThreadRuntimeState<E>::with_mm_mutation_authority+0x1fc (in carrick)",
+            ],
+            true,
+        );
+        let pause_release = executor_stack(
+            &[
+                "0x18a8be538",
+                "carrick_thread::fork_quiesce::PtQuiesce::end+0xc0 (in carrick)",
+                "core::ptr::drop_in_place<carrick_kernel::dispatch::mm_quiesce::ExactMmStage1Lease>+0x24 (in carrick)",
+                "alloc::rc::Rc<T,A>::drop_slow+0x18 (in carrick)",
+                "core::ptr::drop_in_place<carrick_kernel::dispatch::mm_quiesce::PtPauseGuard>+0x4c (in carrick)",
+                "carrick_runtime::vcpu_loop::ThreadRuntimeState<E>::with_mm_mutation_authority+0x260 (in carrick)",
+            ],
+            true,
+        );
+        let drain = executor_stack(
+            &[
+                "0x18a8be50c",
+                "carrick_hal::threaded::GuestLeaveWake::wait_past+0x80 (in carrick)",
+                "carrick_kernel::dispatch::mm_quiesce::drain_exact_mm+0x328 (in carrick)",
+                "carrick_kernel::dispatch::mm_quiesce::acquire_mm_stage1_authority+0x110 (in carrick)",
+                "carrick_kernel::dispatch::mm_mutation::from_executor+0x88 (in carrick)",
+                "carrick_runtime::vcpu_loop::ThreadRuntimeState<E>::with_mm_mutation_authority+0xe0 (in carrick)",
+            ],
+            true,
+        );
+        for stack in [&settle, &pause_release, &drain] {
+            assert_eq!(
+                classify_stack(stack),
+                CpuCategory::FaultService(FaultClass::MmMutationSettle),
+                "{stack:#?}"
+            );
+        }
+
+        let quiesce_park = executor_stack(
+            &[
+                "0x18a8be50c",
+                "carrick_thread::fork_quiesce::PtQuiesce::park+0xd4 (in carrick)",
+                "carrick_runtime::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation+0x4c (in carrick)",
+            ],
+            true,
+        );
+        assert_eq!(
+            classify_stack(&quiesce_park),
+            CpuCategory::Lifecycle(LifecycleClass::ForkQuiescePark)
+        );
+
+        let fork_prepare = executor_stack(
+            &[
+                "carrick_vmm_hvf::trap::frame_inventory::CowArmedRanges::arm+0x108 (in carrick)",
+                "carrick_vmm_hvf::trap::process_plan::<impl carrick_vmm_hvf::trap::HvfTaskState>::build_process_plan+0x408c (in carrick)",
+                "carrick_vmm_hvf::trap::persistent_executor::<impl carrick_vmm_hvf::trap::HvfVmState>::build_process_spec+0x21c (in carrick)",
+                "<carrick_aarch64::engine::Aarch64EngineCore<V> as carrick_hal::threaded::ThreadedEngine>::build_process_spec+0xeec (in carrick)",
+                "<carrick_runtime::vcpu_loop::lifecycle::ProductionHvpatchProcessBackendOps as carrick_runtime::vcpu_loop::lifecycle::HvpatchProcessBackendOps<E,E>>::prepare+0xd0 (in carrick)",
+            ],
+            true,
+        );
+        assert_eq!(
+            classify_stack(&fork_prepare),
+            CpuCategory::Lifecycle(LifecycleClass::ForkClone)
+        );
+
+        let retire_root = [
+            "carrick_runtime::vcpu_loop::executor::backend::HvpatchTaskEngineBindingState::retire_detached_address_space_with+0x1f8 (in carrick)",
+            "<carrick_runtime::vcpu_loop::continuation::quantum::HvpatchTaskBinding as carrick_runtime::vcpu_loop::executor::binding::PersistentTaskBinding>::retire_detached_address_space+0xac (in carrick)",
+        ];
+        let alias_remove = executor_stack(
+            &[
+                "carrick_vmm_hvf::trap::memory_protection::AliasClassIndex::remove+0x394 (in carrick)",
+                "carrick_vmm_hvf::trap::memory_protection::AliasRegistry::index_remove+0xf8 (in carrick)",
+                "carrick_vmm_hvf::trap::memory_protection::AliasRegistry::retire_scope+0x2e8 (in carrick)",
+                "carrick_vmm_hvf::trap::retire_process_aliases+0xdc (in carrick)",
+                "carrick_vmm_hvf::trap::frame_inventory::<impl carrick_vmm_hvf::trap::HvfVmState>::retire_task_state_process_mappings_inner+0x16e4 (in carrick)",
+                "carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine_with_root_proof+0xe8 (in carrick)",
+                retire_root[0],
+                retire_root[1],
+            ],
+            false,
+        );
+        let stage2_retire = executor_stack(
+            &[
+                "0x260ae2934",
+                "0x260ad81f8",
+                "core::ops::function::FnMut::call_mut+0x28 (in carrick)",
+                "carrick_vmm_hvf::trap::carrier_custody::CarrierVmCustody::retire_stage2_record_using+0x244 (in carrick)",
+                "carrick_vmm_hvf::trap::global_frame::retire_global_frame_host_owner_inner_in_using+0x528 (in carrick)",
+                "carrick_vmm_hvf::trap::frame_inventory::<impl carrick_vmm_hvf::trap::HvfVmState>::retire_stage2_candidate_if_unreferenced+0x150 (in carrick)",
+                "carrick_vmm_hvf::trap::frame_inventory::<impl carrick_vmm_hvf::trap::HvfVmState>::retire_task_state_process_mappings_inner+0x1164 (in carrick)",
+                "carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine_with_root_proof+0xe8 (in carrick)",
+                retire_root[0],
+                retire_root[1],
+            ],
+            false,
+        );
+        let receipt = executor_stack(
+            &[
+                "carrick_hal::kernel::FrameInventoryRetirementReceipt::authorizes+0x18 (in carrick)",
+                "carrick_vmm_hvf::trap::authenticate_pending_retirement+0x5c (in carrick)",
+                "carrick_vmm_hvf::trap::HvpatchTaskRegistration::apply_inventory_retirement+0x3e4 (in carrick)",
+                "carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState::apply_inventory_retirement+0xac (in carrick)",
+                "carrick_runtime::vcpu_loop::executor::backend::HvpatchTaskEngineBindingState::retire_detached_address_space_with+0x3ec (in carrick)",
+                retire_root[1],
+            ],
+            false,
+        );
+        for stack in [&alias_remove, &stage2_retire, &receipt] {
+            assert_eq!(
+                classify_stack(stack),
+                CpuCategory::Lifecycle(LifecycleClass::Teardown),
+                "{stack:#?}"
+            );
+        }
+
+        // The CLI main thread compiling the image-reference regex: matched
+        // only by tokio's `runtime::scheduler` (`::schedule`) before the fix.
+        let startup = [
+            "regex_automata::nfa::thompson::compiler::Compiler::c+0x10e0 (in carrick)",
+            "regex_automata::nfa::thompson::compiler::Compiler::c_bounded+0x1b4 (in carrick)",
+            "regex_automata::meta::regex::Builder::build+0x5f4 (in carrick)",
+            "regex::builders::Builder::build_one_string+0x1d4 (in carrick)",
+            "std::sync::once::Once::call_once_force::{{closure}}+0x50 (in carrick)",
+            "<oci_spec::distribution::reference::Reference as core::convert::TryFrom<&str>>::try_from+0xc40 (in carrick)",
+            "carrick_spec::ImageReference::parse+0x1c (in carrick)",
+            "carrick_engine::Engine::resolve::{{closure}}+0x358 (in carrick)",
+            "tokio::runtime::scheduler::current_thread::Context::enter+0xdc (in carrick)",
+            "tokio::runtime::scheduler::current_thread::CoreGuard::block_on+0x100 (in carrick)",
+            "tokio::runtime::runtime::Runtime::block_on+0xec (in carrick)",
+            "carrick_engine::block_on_oci+0x84 (in carrick)",
+            "carrick::commands::run_cli+0x2eb4 (in carrick)",
+            "carrick::main+0x2e4 (in carrick)",
+        ];
+        assert_eq!(
+            classify_stack(&startup),
+            CpuCategory::Lifecycle(LifecycleClass::Startup)
+        );
+    }
+
+    /// Per-quantum work that IS scheduling must stay there, whether it is
+    /// named leafward or only reachable through the executor root.
+    #[test]
+    fn executor_scheduling_keeps_per_quantum_work() {
+        let stacks = [
+            // Inlined `nudge_reactor` `write` in `prepare_registration`.
+            executor_stack(&["0x18a8be838"], false),
+            executor_stack(
+                &[
+                    "0x18a8c3760",
+                    "carrick_kernel::kernel::wait_service::CarrierWaitService::recheck_registration+0x3ac (in carrick)",
+                    "carrick_kernel::kernel::wait_service::CarrierWaitService::enroll+0x1c34 (in carrick)",
+                ],
+                false,
+            ),
+            executor_stack(
+                &[
+                    "carrick_runtime::vcpu_loop::executor::pool::ReceiptLog::record+0x13c (in carrick)",
+                ],
+                false,
+            ),
+            executor_stack(
+                &[
+                    "carrick_kernel::kernel::run_state::claim_record+0x40 (in carrick)",
+                    "carrick_kernel::kernel::run_state::publish_task_thread+0x20 (in carrick)",
+                    "carrick_runtime::vcpu_loop::ThreadRuntimeState<E>::publish_thread_run_state+0x30 (in carrick)",
+                ],
+                true,
+            ),
+            executor_stack(
+                &[
+                    "applevisor::vcpu::Vcpu::get_reg+0x20 (in carrick)",
+                    "carrick_vmm_hvf::trap::HvfInner::snapshot_vcpu_from+0x80 (in carrick)",
+                    "<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu as carrick_hal::Aarch64Vcpu>::snapshot+0x10 (in carrick)",
+                    "carrick_aarch64::engine::Aarch64EngineCore<V>::overlay_task_state_on_live_executor+0x200 (in carrick)",
+                    "<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutor as carrick_runtime::vcpu_loop::executor::backend::PersistentExecutor>::load+0x40 (in carrick)",
+                ],
+                false,
+            ),
+            executor_stack(
+                &[
+                    "0x18a8be50c",
+                    "parking_lot::condvar::Condvar::wait_until_internal+0x1f0 (in carrick)",
+                    "carrick_kernel::kernel::scheduler::RunQueue::park_spare+0x90 (in carrick)",
+                    "carrick_kernel::kernel::scheduler::Scheduler::try_take+0x100 (in carrick)",
+                ],
+                false,
+            ),
+            // `poll_with_engine` self time under the executor root.
+            executor_stack(&[], true),
+        ];
+        for stack in &stacks {
+            assert_eq!(
+                classify_stack(stack),
+                CpuCategory::ExecutorScheduling,
+                "{stack:#?}"
+            );
+        }
+    }
+
     #[test]
     fn parse_real_python_trace_if_present() {
         let trace_path = [
@@ -1553,5 +1998,54 @@ mod tests {
         let rendered = render_profile_script(&template).expect("render");
         assert!(rendered.contains(&program_sha256()));
         assert!(!rendered.contains(PROGRAM_SHA256_PLACEHOLDER));
+    }
+
+    fn mach(addr: u64, name: &str, stab: bool, external: bool) -> MachSymbol<'_> {
+        MachSymbol {
+            addr,
+            name,
+            stab,
+            external,
+        }
+    }
+
+    /// Real shape of the release carrier's nlist table: a function with a
+    /// debug map is preceded at its own address by an empty-named `N_BNSYM`
+    /// stab and a named `N_FUN` stab, and an `N_ENSYM`/`N_SO` stab can sit at
+    /// an address with no symbol. Before the fix the first entry won the
+    /// dedup, so `settle_guest_frame_grants+0x10c` resolved to `+0x10c`.
+    #[test]
+    fn symbol_table_prefers_named_symbols_over_debug_map_stabs() {
+        let symbols = select_mach_symbols(vec![
+            mach(0x1000, "", true, false),
+            mach(0x1000, "_settle_guest_frame_grants", true, false),
+            mach(0x1000, "_settle_guest_frame_grants", false, false),
+            mach(0x2000, "_local_alias", false, false),
+            mach(0x2000, "_run_executor_loop", false, true),
+            mach(0x2800, "", true, false),
+            mach(0x3000, "_tail", false, false),
+        ]);
+        let table = SymbolTable {
+            symbols,
+            text_vmaddr: 0,
+        };
+        assert_eq!(
+            table.resolve(0, 0x110c).as_deref(),
+            Some("settle_guest_frame_grants+0x10c (in carrick)")
+        );
+        assert_eq!(
+            table.resolve(0, 0x2a18).as_deref(),
+            Some("run_executor_loop+0xa18 (in carrick)"),
+            "an address-only stab must not end the preceding function"
+        );
+        assert_eq!(
+            table.resolve(0, 0x2004).as_deref(),
+            Some("run_executor_loop+0x4 (in carrick)"),
+            "the external name wins over a local alias at the same address"
+        );
+        assert_eq!(
+            table.resolve(0, 0x3001).as_deref(),
+            Some("tail+0x1 (in carrick)")
+        );
     }
 }

@@ -228,6 +228,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 capture_status,
             )?;
             println!("HVPCARRIERATTR_VALID samples={}", summary.sample_population);
+            eprintln!("{}", summary.render_human());
         }
         Commands::InspectElf { path } => {
             let metadata = inspect_elf(&path)
