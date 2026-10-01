@@ -1105,7 +1105,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 545,
+      "line": 576,
       "categories": [
         "description_guard"
       ],
@@ -1116,7 +1116,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 1000,
+      "line": 1031,
       "categories": [
         "description_guard"
       ],
@@ -1127,7 +1127,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 1446,
+      "line": 1477,
       "categories": [
         "description_guard"
       ],
@@ -1138,7 +1138,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 1814,
+      "line": 1845,
       "categories": [
         "description_guard"
       ],
@@ -1149,7 +1149,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 1983,
+      "line": 2014,
       "categories": [
         "description_guard"
       ],
@@ -1160,7 +1160,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 2187,
+      "line": 2218,
       "categories": [
         "description_guard"
       ],
@@ -1171,7 +1171,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 2280,
+      "line": 2311,
       "categories": [
         "description_guard"
       ],
@@ -1182,7 +1182,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 2345,
+      "line": 2376,
       "categories": [
         "description_guard"
       ],
@@ -1193,7 +1193,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 2442,
+      "line": 2473,
       "categories": [
         "description_guard"
       ],
@@ -1204,7 +1204,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 2858,
+      "line": 2913,
       "categories": [
         "description_guard"
       ],
@@ -1215,7 +1215,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 3391,
+      "line": 3462,
       "categories": [
         "description_guard"
       ],
@@ -1226,7 +1226,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 3452,
+      "line": 3523,
       "categories": [
         "description_guard"
       ],
@@ -1237,7 +1237,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 3660,
+      "line": 3731,
       "categories": [
         "description_guard"
       ],
@@ -2901,7 +2901,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 627,
+      "line": 632,
       "categories": [
         "description_guard"
       ],
@@ -2912,7 +2912,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 777,
+      "line": 782,
       "categories": [
         "description_guard"
       ],
@@ -2923,7 +2923,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 967,
+      "line": 972,
       "categories": [
         "description_guard"
       ],
@@ -2934,7 +2934,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1163,
+      "line": 1168,
       "categories": [
         "description_guard"
       ],
@@ -2945,7 +2945,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1344,
+      "line": 1349,
       "categories": [
         "description_guard"
       ],
@@ -2956,7 +2956,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1591,
+      "line": 1596,
       "categories": [
         "description_guard"
       ],
@@ -2967,7 +2967,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "line": 1843,
+      "line": 1848,
       "categories": [
         "description_guard"
       ],
