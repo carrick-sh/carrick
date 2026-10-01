@@ -729,6 +729,63 @@ fn frame_grant_sparse_mincore_tracks_only_faulting_pages() {
     );
 }
 
+// EL1 executes a first-touch grant after the host planned it. A sibling
+// thread's adjacent mmap can merge into the armed extent in between, so the
+// settlement-time plan is wider than the published one; the published span
+// is still armed and must settle. A span that lost its arming must not.
+#[test]
+fn published_frame_grant_survives_an_adjacent_arming_merge() {
+    let dispatcher = SyscallDispatcher::new();
+    let base = LINUX_MMAP_BASE;
+    let page = dispatcher.linux_page_size();
+    let prot = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    const WINDOW: u64 = 2 * 1024 * 1024;
+    dispatcher.record_dynamic_mapping(base, 4 * page, prot, ProcMapSharing::Private, String::new());
+    dispatcher.track_resident_fault_range(base, 4 * page, prot);
+    let published = dispatcher
+        .with_resident_frame_grant_plan_for_test(base + 3 * page, WINDOW, |plan| {
+            (plan.start(), plan.len(), plan.prot())
+        })
+        .unwrap();
+    assert_eq!(published, (base, 4 * page, prot.bits()));
+
+    // The adjacent mapping arrives before settlement and merges.
+    dispatcher.record_dynamic_mapping(
+        base + 4 * page,
+        4 * page,
+        prot,
+        ProcMapSharing::Private,
+        String::new(),
+    );
+    dispatcher.track_resident_fault_range(base + 4 * page, 4 * page, prot);
+    let memory = LinearMemory::new(base, vec![0; 8 * page as usize]);
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base + 3 * page, WINDOW, |plan| {
+            assert_eq!(
+                (plan.start(), plan.len()),
+                (base, 8 * page),
+                "the settlement-time plan grew past the published span"
+            );
+            assert!(plan.covers_published(published));
+            dispatcher.commit_resident_frame_grant(plan);
+        })
+        .unwrap();
+    assert_eq!(
+        dispatcher.mincore_residency_vector(&memory, base, 8, page),
+        Some(vec![0, 0, 0, 1, 0, 0, 0, 0]),
+        "only the faulting page commits; the merged pages stay armed"
+    );
+
+    // A published span that lost its arming or protection does not settle.
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base, WINDOW, |plan| {
+            assert!(!plan.covers_published((base, 4 * page, LinuxProtFlags::READ.bits())));
+            assert!(!plan.covers_published((base, 9 * page, prot.bits())));
+            assert!(!plan.covers_published((base + page, 4 * page, prot.bits())));
+        })
+        .unwrap();
+}
+
 #[test]
 fn reconciled_el1_commit_joins_host_residency_and_disarms_first_touch() {
     let dispatcher = SyscallDispatcher::new();

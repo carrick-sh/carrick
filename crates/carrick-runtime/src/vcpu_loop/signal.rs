@@ -890,13 +890,25 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
             &mut EngineGrantBackend(&mut *engine),
             |pending, _resident| {
                 let permit = mutation.host_alias_permit();
-                let plan = dispatcher
-                    .resident_frame_grant_plan(&permit, pending.fault_va, pending.requested_len)
-                    .filter(|plan| (plan.start(), plan.len(), plan.prot()) == pending.plan)
+                let plan = dispatcher.resident_frame_grant_plan(
+                    &permit,
+                    pending.fault_va,
+                    pending.requested_len,
+                );
+                let current = plan
+                    .as_ref()
+                    .map(|plan| (plan.start(), plan.len(), plan.prot()));
+                // A sibling's adjacent mapping may have merged into the
+                // armed extent while EL1 held the transaction: the published
+                // span is still armed and settles; a span that lost its
+                // arming or protection fails stopped.
+                let plan = plan
+                    .filter(|plan| plan.covers_published(pending.plan))
                     .ok_or_else(|| {
                         TrapError::Hypervisor(format!(
-                            "EL1 published grant {:?} but its first-touch plan changed",
-                            pending.txn.id
+                            "EL1 published grant {:?} but its first-touch span lost its arming: \
+                             fault 0x{:x}, published {:x?}, now {:x?}",
+                            pending.txn.id, pending.fault_va, pending.plan, current
                         ))
                     })?;
                 dispatcher.commit_resident_frame_grant(plan);

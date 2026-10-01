@@ -746,6 +746,22 @@ impl ResidentFrameGrantPlan<'_> {
     pub fn prot(&self) -> u64 {
         self.prot
     }
+
+    /// Whether a grant published earlier for `(start, len, prot)` is still
+    /// wholly first-touch armed with the same protection. The arming may
+    /// have grown since (an adjacent mapping merged into the extent while
+    /// EL1 held the transaction); the published span stays valid and only
+    /// its faulting page commits. A shrunk or reprotected span does not.
+    pub fn covers_published(&self, (start, len, prot): (u64, u64, u64)) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        prot == self.prot
+            && len != 0
+            && self.start <= start
+            && end <= self.start.saturating_add(self.len)
+            && (start..end).contains(&self.fault_page)
+    }
 }
 
 impl ResidentFaultPlan<'_> {
