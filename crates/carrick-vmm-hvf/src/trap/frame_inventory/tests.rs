@@ -7709,23 +7709,46 @@ fn an_unmap_retirement_racing_a_sibling_unmap_carries_the_conditional_retire() {
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (unmapping, key, generation, frame) =
         exit_task_holding_owned_lease(16, 0x40_0000, 81, 82, &kernel, &frames);
-    let retirement = {
-        let mut inventory = unmapping.frame_inventory.lock();
-        let retirement = HvfVmState::inventory_lease_retirement_shape(
-            &inventory,
-            &std::collections::BTreeSet::from([AuthenticatedLease::new(key, generation)]),
-            &|_| Ok(Some(2)),
+    let retirement = HvfVmState::inventory_lease_retirement_shape(
+        &unmapping.frame_inventory.lock(),
+        &std::collections::BTreeSet::from([AuthenticatedLease::new(key, generation)]),
+        &|_| Ok(Some(2)),
+    )
+    .unwrap();
+    assert!(retirement.frames.is_empty(), "a sibling's unmap is pending");
+    assert_eq!(retirement.event_count(), 2);
+    let mut reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+        carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x71; 32]),
+        carrick_hal::FrameInventoryBatch::prepare(
+            carrick_hal::KernelTransactionId::from_kernel_allocation(id(0x7102)),
+            carrick_hal::FrameEventCapacity::for_event_count(retirement.event_count()).unwrap(),
         )
-        .unwrap();
-        assert!(retirement.frames.is_empty(), "a sibling's unmap is pending");
-        assert_eq!(
-            retirement.conditional_frames,
-            std::collections::BTreeSet::from([frame])
-        );
-        assert_eq!(retirement.event_count(), 2);
-        HvfVmState::commit_inventory_lease_retirement(&mut inventory, &retirement).unwrap();
-        retirement
-    };
+        .unwrap(),
+        Vec::new(),
+        Vec::new(),
+    );
+    HvfVmState::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
+    let mut carried = false;
+    HvfVmState::apply_inventory_lease_retirement(
+        &unmapping.frame_inventory.ledger,
+        &retirement,
+        reservation,
+        |commit| {
+            carried = commit.batch().events().iter().any(|event| {
+                matches!(
+                    *event,
+                    carrick_hal::FrameInventoryEvent::RetireFrameIfLastUnmap { frame: retiring, .. }
+                        if retiring == frame
+                )
+            });
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        carried,
+        "the last backend holder carries the conditional retire"
+    );
     assert_eq!(retirement.declined.len(), 1);
     let settle = |declined: Vec<DeclinedLeaseRemainder>| {
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
@@ -7765,4 +7788,246 @@ fn a_shared_file_frame_never_carries_a_conditional_retire() {
     assert!(!carries_conditional_retire(2, 1, Some(2), true));
     assert!(!carries_conditional_retire(1, 1, Some(1), true));
     assert!(!carries_conditional_retire(1, 1, None, true));
+}
+
+/// The Kernel frame-inventory rules the retirement race depends on, run
+/// against real backend commits: exact mapping liveness, VM-wide counts,
+/// `RetireFrame` only beside the last unmap, and `RetireFrameIfLastUnmap`
+/// deciding at apply time (retire now, or mark for the last unmap).
+#[derive(Default)]
+struct ModelKernel {
+    state: parking_lot::Mutex<ModelKernelState>,
+    next_transaction: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct ModelKernelState {
+    counts: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
+    mappings: std::collections::BTreeMap<carrick_hal::MappingId, carrick_hal::FrameId>,
+    marked: std::collections::BTreeSet<carrick_hal::FrameId>,
+}
+
+impl ModelKernel {
+    fn map(&self, mapping: carrick_hal::MappingId, frame: carrick_hal::FrameId) {
+        let mut state = self.state.lock();
+        state.mappings.insert(mapping, frame);
+        *state.counts.entry(frame).or_default() += 1;
+    }
+
+    fn count(&self, frame: carrick_hal::FrameId) -> Option<usize> {
+        self.state.lock().counts.get(&frame).copied()
+    }
+}
+
+impl carrick_hal::FrameCowAuthority for ModelKernel {
+    fn quiesce(
+        &self,
+    ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Ok(Box::new(()))
+    }
+
+    fn reserve(
+        &self,
+        _frame_candidates: usize,
+        _mapping_candidates: usize,
+        event_count: usize,
+    ) -> Result<carrick_hal::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let raw = 0x9000
+            + self
+                .next_transaction
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(
+            carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x90; 32]),
+                carrick_hal::FrameInventoryBatch::prepare(
+                    carrick_hal::KernelTransactionId::from_kernel_allocation(id(raw)),
+                    carrick_hal::FrameEventCapacity::for_event_count(event_count)?,
+                )?,
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn apply(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        {
+            let mut state = self.state.lock();
+            let mut unmapped = std::collections::BTreeSet::new();
+            for event in commit.batch().events() {
+                match *event {
+                    carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
+                        let frame = state
+                            .mappings
+                            .remove(&mapping)
+                            .ok_or_else(|| std::io::Error::other("unmap of a nonlive mapping"))?;
+                        let count = state.counts.get_mut(&frame).unwrap();
+                        *count -= 1;
+                        unmapped.insert(frame);
+                        if *count == 0 && state.marked.remove(&frame) {
+                            state.counts.remove(&frame);
+                        }
+                    }
+                    carrick_hal::FrameInventoryEvent::RetireFrame { frame, .. } => {
+                        if state.counts.get(&frame) != Some(&0) || !unmapped.contains(&frame) {
+                            return Err(Box::new(std::io::Error::other(
+                                "RetireFrame not beside the frame's last unmap",
+                            )));
+                        }
+                        state.counts.remove(&frame);
+                    }
+                    carrick_hal::FrameInventoryEvent::RetireFrameIfLastUnmap { frame, .. } => {
+                        match state.counts.get(&frame).copied() {
+                            None => {}
+                            Some(0) => {
+                                assert!(unmapped.contains(&frame));
+                                state.counts.remove(&frame);
+                            }
+                            Some(_) => {
+                                state.marked.insert(frame);
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(Box::new(std::io::Error::other(format!(
+                            "unexpected event {other:?}"
+                        ))));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mapping_is_live(
+        &self,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        _gpa: carrick_guest_mem::Gpa,
+        _length: carrick_hal::FrameLength,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.state.lock().mappings.get(&mapping) == Some(&frame))
+    }
+
+    fn frame_mapping_count(
+        &self,
+        frame: carrick_hal::FrameId,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.count(frame))
+    }
+}
+
+/// The unmap path's gap. T4b reconciliation retires an EL1-unmapped range
+/// through the alias lease retirement, which used to apply its Kernel unmap
+/// and only afterwards drop its backend reference. A fork sibling whose exit
+/// decided inside that gap saw that stale reference, concluded another
+/// holder would retire the frame, and carried nothing; the unmapping side
+/// had decided from its plan, where the sibling still held the frame, and
+/// carried nothing either. The frame and its grant leaked (signed discard
+/// witness, 1 of 20 after the conditional retire).
+///
+/// The sibling's decision is interleaved deterministically: the unmap's
+/// Kernel publication runs it right after the events take effect, unless
+/// the frame registry is held there (then it runs after the commit, which
+/// is the only order a single authority allows).
+#[test]
+fn a_sibling_exit_cannot_decide_between_an_unmap_apply_and_its_backend_decrement() {
+    let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+    let observer = El1FrameGrantObserver::new(legacy_test_carrier_vm_custody());
+    let before = observer.snapshot();
+    let counts = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (mut unmapping, key, generation, frame) =
+        exit_task_holding_owned_lease(17, 0x40_0000, 91, 92, &counts, &frames);
+    let sibling = fork_sibling_of(&unmapping, 18, 93, &counts);
+    let kernel = std::sync::Arc::new(ModelKernel::default());
+    kernel.map(
+        carrick_hal::MappingId::from_kernel_allocation(id(92)),
+        frame,
+    );
+    kernel.map(
+        carrick_hal::MappingId::from_kernel_allocation(id(93)),
+        frame,
+    );
+    unmapping.cow_authority = Some(kernel.clone());
+    let sibling = std::cell::RefCell::new(sibling);
+    sibling.borrow_mut().cow_authority = Some(kernel.clone());
+
+    // The sibling's exit decision, run inside the unmap's gap when it can.
+    let decided_in_gap = std::cell::Cell::new(false);
+    let decide =
+        || HvfVmState::retire_task_state_process_mappings(&mut sibling.borrow_mut()).unwrap();
+
+    // The unmap: plan while the sibling still holds the frame, then apply.
+    let retirement = {
+        let inventory = unmapping.frame_inventory.lock();
+        HvfVmState::inventory_lease_retirement_shape(
+            &inventory,
+            &std::collections::BTreeSet::from([AuthenticatedLease::new(key, generation)]),
+            &|frame| Ok(kernel.count(frame)),
+        )
+        .unwrap()
+    };
+    let mut reservation =
+        carrick_hal::FrameCowAuthority::reserve(kernel.as_ref(), 0, 0, retirement.event_count())
+            .unwrap();
+    HvfVmState::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
+    HvfVmState::apply_inventory_lease_retirement(
+        &unmapping.frame_inventory.ledger,
+        &retirement,
+        reservation,
+        |commit| {
+            carrick_hal::FrameCowAuthority::apply(kernel.as_ref(), commit)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+            // The gap: the Kernel unmap is applied, the backend reference
+            // not yet dropped. The sibling decides here if it can.
+            if frames.try_lock().is_some() {
+                decide();
+                decided_in_gap.set(true);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    if !decided_in_gap.get() {
+        decide();
+    }
+    let settle = |declined: Vec<DeclinedLeaseRemainder>| {
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+            0,
+            0,
+        );
+        HvfVmState::settle_declined_lease_remainders(
+            legacy_test_carrier_vm_custody(),
+            &frames,
+            kernel.as_ref(),
+            declined,
+            &registry,
+        )
+        .unwrap()
+    };
+    settle(retirement.declined.clone());
+
+    // The sibling's exit is applied last.
+    let commit = HvfVmState::take_task_state_retirement_inventory(&mut sibling.borrow_mut())
+        .expect("sibling retirement commit");
+    carrick_hal::FrameCowAuthority::apply(kernel.as_ref(), commit).unwrap();
+    HvfVmState::settle_task_state_declined_lease_remainders(&sibling.borrow()).unwrap();
+
+    assert_eq!(
+        kernel.count(frame),
+        None,
+        "the last unmap retires the frame (sibling decided in the gap: {})",
+        decided_in_gap.get()
+    );
+    assert_eq!(global_frame_host_owner_generation(key.0, key.1), 0);
+    assert_eq!(
+        observer.snapshot().returns_completed - before.returns_completed,
+        1
+    );
 }
