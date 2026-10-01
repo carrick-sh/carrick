@@ -1378,6 +1378,8 @@ impl NetCrossSubsystem for SyscallDispatcher {
 
 /// Subsystem view for filesystem operations.
 pub struct FsView<'a> {
+    pub(in crate::dispatch) resolve_observations:
+        std::cell::RefCell<Vec<Vec<carrick_vfs::fs_resolve_cache::CoherenceStamp>>>,
     pub(in crate::dispatch) fs: &'a fs::FsState,
     #[allow(dead_code)]
     pub(in crate::dispatch) file_authority:
@@ -2306,6 +2308,7 @@ impl SyscallDispatcher {
     #[inline]
     pub fn fs_view(&self) -> FsView<'_> {
         FsView {
+            resolve_observations: std::cell::RefCell::default(),
             fs: &self.fs,
             file_authority: &self.file_authority,
             io: &self.io,

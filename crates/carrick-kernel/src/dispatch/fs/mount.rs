@@ -3,16 +3,29 @@
 use super::*;
 
 impl SyscallDispatcher {
+    /// Join bind sources through the registry owned by this carrier.
+    pub fn set_bind_cache_cohorts(
+        &mut self,
+        cohorts: std::sync::Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts>,
+    ) {
+        self.fs.bind_cache_cohorts = cohorts;
+        let cohorts = std::sync::Arc::clone(&self.fs.bind_cache_cohorts);
+        self.fs.vfs_mounts_mut().set_bind_cache_cohorts(&cohorts);
+        self.fs.resolve_cache.clear();
+    }
     pub fn register_mount(
         &mut self,
         point: impl Into<std::path::PathBuf>,
         mut vfs: Box<dyn carrick_vfs::Vfs>,
     ) {
-        vfs.set_cache_coherence(std::sync::Arc::clone(
-            &self.fs.rootfs_vfs.dentry_cache.coherence,
-        ));
+        if let Some(source) = vfs.bind_source()
+            && let Ok(coherence) = self.fs.bind_cache_cohorts.admit(source)
+        {
+            vfs.set_cache_coherence(coherence);
+        }
         crate::el1_inotify::invalidate_name_cache_all();
         self.fs.vfs_mounts_mut().mount(point, vfs);
+        self.fs.resolve_cache.clear();
     }
 }
 

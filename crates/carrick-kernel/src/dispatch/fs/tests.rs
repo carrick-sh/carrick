@@ -5090,7 +5090,9 @@ fn independent_bind_cohorts_observe_shared_host_namespace() {
     std::fs::write(host.path().join("old/file"), b"original").unwrap();
     let mut a = SyscallDispatcher::new();
     let mut b = SyscallDispatcher::new();
+    let bind_cohorts = std::sync::Arc::default();
     for dispatcher in [&mut a, &mut b] {
+        dispatcher.set_bind_cache_cohorts(std::sync::Arc::clone(&bind_cohorts));
         dispatcher.register_mount(
             "/bind",
             Box::new(carrick_vfs::BindVfs::new("/bind", host.path(), false)),
@@ -5121,6 +5123,22 @@ fn independent_bind_cohorts_observe_shared_host_namespace() {
         .unlink("/bind/new/file")
         .unwrap();
     assert!(lookup("/bind/new/file").is_err());
+    assert!(matches!(
+        a.open_at_path_string(
+            &a.exact_signal_context_for_test(),
+            None,
+            OpenAtArgs {
+                dirfd: LINUX_AT_FDCWD,
+                path: "/bind/new/file",
+                flags: LINUX_O_WRONLY | LINUX_O_CREAT,
+                mode: 0o644
+            },
+            &CompatReporter::default(),
+        )
+        .unwrap(),
+        DispatchOutcome::Returned { .. }
+    ));
+    assert_eq!(lookup("/bind/new/file").unwrap().size, 0);
     std::fs::write(host.path().join("new/file"), b"replacement").unwrap();
     assert_eq!(lookup("/bind/new/file").unwrap().size, 11);
 }
@@ -5134,14 +5152,35 @@ fn independent_bind_cohorts_observe_replaced_intermediate_symlink() {
     std::fs::write(host.path().join("new/file"), b"replacement").unwrap();
     std::os::unix::fs::symlink("old", host.path().join("link")).unwrap();
     std::os::unix::fs::symlink("new", host.path().join("next")).unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("same-source");
+    std::os::unix::fs::symlink(host.path(), &alias).unwrap();
     let mut a = SyscallDispatcher::new();
     let mut b = SyscallDispatcher::new();
-    for dispatcher in [&mut a, &mut b] {
+    let bind_cohorts = std::sync::Arc::default();
+    for (dispatcher, source) in [(&mut a, host.path()), (&mut b, alias.as_path())] {
+        dispatcher.set_bind_cache_cohorts(std::sync::Arc::clone(&bind_cohorts));
         dispatcher.register_mount(
             "/bind",
-            Box::new(carrick_vfs::BindVfs::new("/bind", host.path(), false)),
+            Box::new(carrick_vfs::BindVfs::new("/bind", source, false)),
         );
     }
+    let unrelated = tempfile::tempdir().unwrap();
+    std::fs::write(unrelated.path().join("stable"), b"stable").unwrap();
+    b.register_mount(
+        "/other",
+        Box::new(carrick_vfs::BindVfs::new("/other", unrelated.path(), false)),
+    );
+    b.fs_view()
+        .resolve_at_path(LINUX_AT_FDCWD, "/other/stable")
+        .unwrap();
+    let root = &b.fs.rootfs_vfs.dentry_cache.coherence;
+    let root_before = [
+        root.current_generation(),
+        root.current_dir_generation(),
+        root.current_marker_generation(),
+        root.current_meta_generation(),
+    ];
     let resolve = || {
         b.fs_view()
             .resolve_at_path(LINUX_AT_FDCWD, "/bind/link/file")
@@ -5155,6 +5194,21 @@ fn independent_bind_cohorts_observe_replaced_intermediate_symlink() {
         .rename("/bind/next", "/bind/link")
         .unwrap();
     assert_eq!(resolve(), "/bind/new/file");
+    assert_eq!(
+        [
+            root.current_generation(),
+            root.current_dir_generation(),
+            root.current_marker_generation(),
+            root.current_meta_generation()
+        ],
+        root_before
+    );
+    assert!(
+        b.fs.resolve_cache
+            .get("/other/stable", root.current_generation())
+            .is_some(),
+        "unrelated bind cache entry must remain valid"
+    );
 }
 
 #[test]
@@ -10477,6 +10531,7 @@ impl FsViewFixture {
 
     fn view(&self) -> FsView<'_> {
         FsView {
+            resolve_observations: std::cell::RefCell::default(),
             fs: &self.fs,
             file_authority: &self.file_authority,
             io: &self.io,

@@ -436,6 +436,7 @@ fn prepare_host_backend(
     spec: &RunSpec,
     plan: &ExecutionPlan,
     container: &Arc<carrick_kernel::kernel::Container>,
+    bind_cache_cohorts: Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts>,
 ) -> Result<SyscallDispatcher, RuntimeError> {
     let exec_overlay = container.launch().exec_overlay.as_deref();
     let managed_scratch = match exec_overlay {
@@ -549,6 +550,7 @@ fn prepare_host_backend(
         &spec.network.extra_hosts,
         &guest_hostname,
     );
+    dispatcher.set_bind_cache_cohorts(bind_cache_cohorts);
     install_spec_mounts(&mut dispatcher, spec);
     let _ = dispatcher.set_fs_backend(Box::new(host));
     Ok(dispatcher)
@@ -559,6 +561,7 @@ fn prepare_memory_backend(
     spec: &RunSpec,
     plan: &ExecutionPlan,
     container: &Arc<carrick_kernel::kernel::Container>,
+    bind_cache_cohorts: Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts>,
 ) -> Result<(SyscallDispatcher, carrick_vfs::rootfs::RootFs), RuntimeError> {
     let rootfs = carrick_vfs::rootfs::RootFs::from_layer_paths(&layer_paths(spec))
         .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {e}")))?;
@@ -584,6 +587,7 @@ fn prepare_memory_backend(
         .map_err(|e| {
             RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {e}"))
         })?;
+    dispatcher.set_bind_cache_cohorts(bind_cache_cohorts);
     install_spec_mounts(&mut dispatcher, spec);
     Ok((dispatcher, rootfs))
 }
@@ -733,12 +737,13 @@ fn prepare_with_lease(
 
     let (mut dispatcher, root) = match spec.mounts.fs_backend {
         FsBackendKind::Host => (
-            prepare_host_backend(spec, &plan, &container)?,
+            prepare_host_backend(spec, &plan, &container, carrier.bind_cache_cohorts())?,
             RootBacking::Host,
         ),
         #[cfg(feature = "fs-memory")]
         FsBackendKind::Memory => {
-            let (dispatcher, rootfs) = prepare_memory_backend(spec, &plan, &container)?;
+            let (dispatcher, rootfs) =
+                prepare_memory_backend(spec, &plan, &container, carrier.bind_cache_cohorts())?;
             (dispatcher, RootBacking::Memory { rootfs })
         }
     };

@@ -4,7 +4,52 @@
 //! `impl SyscallDispatcher` move.
 use super::*;
 use crate::linux_abi::LinuxErrno;
+use carrick_vfs::fs_resolve_cache::CoherenceStamp;
 use std::path::Path;
+
+fn merge_observations(target: &mut Vec<CoherenceStamp>, observations: &[CoherenceStamp]) {
+    for observation in observations {
+        if !target.iter().any(|old| old.same_authority(observation)) {
+            target.push(observation.clone());
+        }
+    }
+}
+
+struct ResolveObservationGuard<'a> {
+    stack: &'a std::cell::RefCell<Vec<Vec<CoherenceStamp>>>,
+    active: bool,
+}
+
+impl<'a> ResolveObservationGuard<'a> {
+    fn new(stack: &'a std::cell::RefCell<Vec<Vec<CoherenceStamp>>>) -> Self {
+        stack.borrow_mut().push(Vec::new());
+        Self {
+            stack,
+            active: true,
+        }
+    }
+    fn finish(mut self) -> Vec<CoherenceStamp> {
+        self.active = false;
+        let mut stack = self.stack.borrow_mut();
+        let observations = stack.pop().unwrap_or_default();
+        if let Some(parent) = stack.last_mut() {
+            merge_observations(parent, &observations);
+        }
+        observations
+    }
+}
+
+impl Drop for ResolveObservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut stack = self.stack.borrow_mut();
+            let observations = stack.pop().unwrap_or_default();
+            if let Some(parent) = stack.last_mut() {
+                merge_observations(parent, &observations);
+            }
+        }
+    }
+}
 
 /// Recursion budget shared by `canonicalize_following` and the symlink-aware
 /// `..` walk it calls.
@@ -75,6 +120,13 @@ impl SyscallDispatcher {
 }
 
 impl<'a> FsView<'a> {
+    fn observe_bind(&self, vfs: &dyn carrick_vfs::Vfs) {
+        if let Some(coherence) = vfs.cache_coherence()
+            && let Some(observations) = self.resolve_observations.borrow_mut().last_mut()
+        {
+            merge_observations(observations, &[CoherenceStamp::observe(coherence)]);
+        }
+    }
     /// Layered "is this a directory?" probe used by mkdirat / openat
     /// (O_CREAT) parent-existence checks. The synthetic /proc and
     /// /sys roots count as directories so that
@@ -84,10 +136,11 @@ impl<'a> FsView<'a> {
         if path == "/" || path.is_empty() {
             return true;
         }
-        if let Some(m) = self.fs.vfs_mounts.resolve(path)
-            && let Ok(md) = m.vfs.lookup(&m.full_path)
-        {
-            return md.kind == carrick_vfs::EntryKind::Directory;
+        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+            self.observe_bind(m.vfs);
+            if let Ok(md) = m.vfs.lookup(&m.full_path) {
+                return md.kind == carrick_vfs::EntryKind::Directory;
+            }
         }
         match self.fs.rootfs_vfs.overlay.lookup(path) {
             Some(OverlayEntry::Dir) => return true,
@@ -114,10 +167,11 @@ impl<'a> FsView<'a> {
         // they appeared in readdir and could be opened (which broke e.g.
         // `ttyname(3)` → `tty(1)`, and `ls -l /dev`). A mount miss falls back to
         // the rootfs so image-provided entries still resolve.
-        if let Some(m) = self.fs.vfs_mounts.resolve(path)
-            && let Ok(md) = m.vfs.lookup(&m.full_path)
-        {
-            return Ok(vfs_md_to_rootfs_md(path, &md));
+        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+            self.observe_bind(m.vfs);
+            if let Ok(md) = m.vfs.lookup(&m.full_path) {
+                return Ok(vfs_md_to_rootfs_md(path, &md));
+            }
         }
         self.fs
             .rootfs_vfs
@@ -133,10 +187,11 @@ impl<'a> FsView<'a> {
             return Some(target);
         }
         use carrick_vfs::Vfs as _;
-        if let Some(m) = self.fs.vfs_mounts.resolve(path)
-            && let Ok(target) = m.vfs.readlink(&m.full_path)
-        {
-            return Some(target.to_string_lossy().into_owned());
+        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+            self.observe_bind(m.vfs);
+            if let Ok(target) = m.vfs.readlink(&m.full_path) {
+                return Some(target.to_string_lossy().into_owned());
+            }
         }
         self.fs
             .rootfs_vfs
@@ -162,10 +217,11 @@ impl<'a> FsView<'a> {
     /// File.) Mounts answer for their subtree; otherwise the overlay-aware
     /// `lookup_nofollow` does.
     pub(crate) fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, LinuxErrno> {
-        if let Some(m) = self.fs.vfs_mounts.resolve(path)
-            && let Ok(md) = m.vfs.lookup_nofollow(&m.full_path)
-        {
-            return Ok(vfs_md_to_rootfs_md(path, &md));
+        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+            self.observe_bind(m.vfs);
+            if let Ok(md) = m.vfs.lookup_nofollow(&m.full_path) {
+                return Ok(vfs_md_to_rootfs_md(path, &md));
+            }
         }
         self.fs
             .rootfs_vfs
@@ -441,9 +497,18 @@ impl<'a> FsView<'a> {
                 // Still enforce DAC search permission per call — it depends on
                 // live creds, not the path structure (a no-op for root, the hot
                 // case). The resolution itself is what the cache elides.
-                self.check_search_access(&hit)?;
-                return Ok(hit);
+                if let Some(parent) = self.resolve_observations.borrow_mut().last_mut() {
+                    merge_observations(parent, &hit.dependencies);
+                }
+                self.check_search_access(&hit.path)?;
+                return Ok(hit.path);
             }
+        }
+        let observations = ResolveObservationGuard::new(&self.resolve_observations);
+        if let Some(abs) = self.absolute_input_path(dirfd, path)
+            && let Some(m) = self.fs.vfs_mounts.resolve(&abs)
+        {
+            self.observe_bind(m.vfs);
         }
         let resolved = match self.resolve_at_path_inner(dirfd, path) {
             Ok(resolved) => resolved,
@@ -464,10 +529,14 @@ impl<'a> FsView<'a> {
             }
         };
         self.check_search_access(&resolved)?;
+        let dependencies = observations.finish();
         if let Some(key) = lookup_key {
-            self.fs
-                .resolve_cache
-                .put(key.into_owned(), resolved.clone(), gen_at_entry);
+            self.fs.resolve_cache.put(
+                key.into_owned(),
+                resolved.clone(),
+                gen_at_entry,
+                dependencies,
+            );
         }
         Ok(resolved)
     }

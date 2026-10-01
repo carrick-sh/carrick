@@ -74,6 +74,11 @@ impl BindVfs {
         }
     }
 
+    fn publish_namespace(&self) {
+        self.coherence.bump_generation();
+        self.coherence.bump_dir_generation();
+    }
+
     /// `true` iff `guest_path` names the mount POINT itself (the directory the
     /// mount is attached at), not something underneath it. A trailing slash is
     /// tolerated so `rmdir("/workspace/")` is recognised too.
@@ -377,6 +382,14 @@ fn real_stat_from_host(
 }
 
 impl Vfs for BindVfs {
+    fn bind_source(&self) -> Option<&Path> {
+        Some(&self.host_path)
+    }
+    fn cache_coherence(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>> {
+        Some(&self.coherence)
+    }
     fn set_cache_coherence(
         &mut self,
         coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
@@ -553,6 +566,9 @@ impl Vfs for BindVfs {
         if host_fd < 0 {
             return Err(host_open_errno());
         }
+        if flags.create && !existed_before_create {
+            self.publish_namespace();
+        }
         // The macOS open(2) applied the HOST process umask to the create mode,
         // so the on-disk bits can be narrower than the guest asked for. When we
         // just created the file, force the exact guest-requested mode via fchmod
@@ -620,6 +636,7 @@ impl Vfs for BindVfs {
         }
         let host = self.to_host(path)?;
         std::fs::create_dir(&host).map_err(map_io_error)?;
+        self.publish_namespace();
         // Set mode since std::fs::create_dir doesn't take mode
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode));
@@ -660,7 +677,9 @@ impl Vfs for BindVfs {
         if let Some(sidecar) = link_owner_sidecar_path(&host) {
             let _ = std::fs::remove_file(&sidecar);
         }
-        std::fs::remove_file(&host).map_err(map_io_error)
+        std::fs::remove_file(&host).map_err(map_io_error)?;
+        self.publish_namespace();
+        Ok(())
     }
 
     fn rmdir(&self, path: &str) -> Result<(), VfsError> {
@@ -675,7 +694,9 @@ impl Vfs for BindVfs {
             return Ok(());
         }
         let host = self.to_host(path)?;
-        std::fs::remove_dir(&host).map_err(map_io_error)
+        std::fs::remove_dir(&host).map_err(map_io_error)?;
+        self.publish_namespace();
+        Ok(())
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
@@ -691,6 +712,7 @@ impl Vfs for BindVfs {
         let host_from = self.to_host(from)?;
         let host_to = self.to_host(to)?;
         std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;
+        self.publish_namespace();
         // Carry a symlink's owner sidecar across the rename (keyed by name, so it
         // must move with the link). Best-effort: only `lchown`ed symlinks have
         // one; a stale sidecar at the destination name is overwritten/removed.
@@ -714,7 +736,9 @@ impl Vfs for BindVfs {
             return Err(LINUX_EROFS);
         }
         let host_link = self.to_host(link)?;
-        std::os::unix::fs::symlink(target, &host_link).map_err(map_io_error)
+        std::os::unix::fs::symlink(target, &host_link).map_err(map_io_error)?;
+        self.publish_namespace();
+        Ok(())
     }
 
     fn link(&self, from: &str, to: &str) -> Result<(), VfsError> {
@@ -723,7 +747,9 @@ impl Vfs for BindVfs {
         }
         let host_from = self.to_host(from)?;
         let host_to = self.to_host(to)?;
-        std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)
+        std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)?;
+        self.publish_namespace();
+        Ok(())
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), VfsError> {
@@ -754,6 +780,7 @@ impl Vfs for BindVfs {
             .truncate(true)
             .open(&host)
             .map_err(map_io_error)?;
+        self.publish_namespace();
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
             .map_err(map_io_error)?;
