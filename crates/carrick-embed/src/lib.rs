@@ -150,7 +150,7 @@ pub use carrick_runtime::compat::CompatReport;
 /// carrier afterwards. Its `snapshots_by_mm()` attributes physical grants and
 /// delayed returns to each granting MM. Require `complete` and matching `scope`
 /// before comparing snapshots; returned leases and released host storage differ.
-pub use carrick_runtime::{El1FrameGrantStats, el1_frame_grant_stats};
+pub use carrick_runtime::{El1FrameGrantStats, el1_frame_grant_stats, el1_frame_grant_unreturned};
 /// Carrier-scoped host COW accounting: completed host COW transactions credited
 /// by every MM the carrier admitted (fork children, exec replacements), kept
 /// after those MMs retire. Difference two readings with `checked_delta` (it

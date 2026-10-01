@@ -4151,3 +4151,53 @@ pub(crate) fn mapped_region_matches_retired_inventory_extent(
         && mapped_region_physical_host_addr(mapping)
             .is_some_and(|host| host as usize == retired.owner.host_addr)
 }
+
+/// See [`super::el1_frame_grant_unreturned`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn unreturned_el1_grant_census(custody: &CarrierVmCustody) -> Vec<String> {
+    let describe = |key: (u64, u64),
+                    owner: &std::sync::Arc<GlobalFrameHostOwner>,
+                    state: String| {
+        let receipt = owner.mapping.el1_grant.lock();
+        let receipt = receipt.as_ref().filter(|receipt| !receipt.returned)?;
+        let record = custody
+            .stage2_record_snapshot(owner.record_identity.record_id)
+            .map(|record| {
+                format!(
+                    "pins={} mapped={} retirement_requested={}",
+                    record.pin_count, record.mapped, record.retirement_requested
+                )
+            })
+            .unwrap_or_else(|| "record=gone".to_owned());
+        Some(format!(
+            "ipa={:#x} len={:#x} grant={:#x}+{:#x} mm={:?} state={state} {record} owner_refs={}",
+            key.0,
+            key.1,
+            receipt.base,
+            receipt.length,
+            receipt.mm,
+            std::sync::Arc::strong_count(owner)
+        ))
+    };
+    let mut census: Vec<String> = custody
+        .global_frame_host_owners
+        .lock()
+        .iter()
+        .filter_map(|(key, entry)| {
+            let state = match entry {
+                GlobalFrameOwnerEntry::Live(_) => "live".to_owned(),
+                GlobalFrameOwnerEntry::RetirementPending {
+                    error, in_flight, ..
+                } => format!("pending(error={error:?},in_flight={in_flight})"),
+            };
+            describe(*key, entry.owner(), state)
+        })
+        .collect();
+    census.push(format!(
+        "detached_owners={} directory_retries={} detached_retries={}",
+        custody.pending_global_frame_owners.lock().len(),
+        custody.pending_global_frame_directory_retries.lock().len(),
+        custody.pending_global_frame_detached_retries.lock().len()
+    ));
+    census
+}
