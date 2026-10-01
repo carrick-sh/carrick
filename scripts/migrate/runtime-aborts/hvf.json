@@ -2248,6 +2248,28 @@
       "domain": "hvpatch::cow"
     },
     {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfTaskState::reuse_sole_owner_cow_in_place",
+      "ordinal_in_function": 1,
+      "fingerprint": "9bacf7e1bb1bdce2ec13928b25130bfcb1c96a6ef86efdfe87471e93174b3be1",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed while rolling back an unsuccessful in-place sole-owner COW write grant, leaving hardware translations inconsistent with the restored page-table journal.",
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfTaskState::reuse_sole_owner_cow_in_place",
+      "ordinal_in_function": 2,
+      "fingerprint": "03659c121e334ffb580d17dd86191e5969ea6a7a640a7fd67fb1cb8c8760b1e0",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed after committing an in-place sole-owner COW write grant, leaving stale read-only translations after the page-table authority made the leaves writable.",
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
+    },
+    {
       "file": "crates/carrick-vmm-hvf/src/trap/guest_alias.rs",
       "function": "GuestAliasContext<'_>::publish_host_alias",
       "ordinal_in_function": 1,
