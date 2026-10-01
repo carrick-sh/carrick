@@ -5951,6 +5951,59 @@ mod tests {
             .expect("a table beyond the copied prefix allocates");
     }
 
+    /// A manager built from the occupied prefix alone (the exec plan's
+    /// payload, with an explicit capacity) must be indistinguishable from the
+    /// one built over the full zero-padded image: same walks, same
+    /// allocations (spare cursor), same reclaim, same final bytes, including
+    /// after the owned storage grows past the prefix.
+    #[test]
+    fn prefix_built_manager_matches_the_full_image_manager() {
+        let full = hvpatch_manager().into_bytes().unwrap();
+        let capacity = full.len();
+        let mut reference =
+            PageTableManager::new(full.clone(), LINUX_PAGE_TABLES_BASE, test_layout());
+        let prefix = hvpatch_manager().into_occupied_bytes().unwrap();
+        assert!(prefix.len() < capacity / 4);
+        let mut built = PageTableManager::from_image_prefix(
+            &prefix,
+            capacity,
+            LINUX_PAGE_TABLES_BASE,
+            test_layout(),
+        );
+        assert_eq!(built.copied_bytes(), reference.copied_bytes());
+        assert_eq!(built.pool_stats(), reference.pool_stats());
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let base = LINUX_MMAP_BASE + 0x40_0000_0000;
+        for step in 0..48u64 {
+            let va = base + step * TWO_MIB;
+            let a = reference.set_rw(va + 0x1000, 0x1000, false, None);
+            let b = built.set_rw(va + 0x1000, 0x1000, false, None);
+            assert_eq!(a.is_ok(), b.is_ok(), "step {step}");
+            assert_eq!(
+                built.debug_walk(va + 0x1000),
+                reference.debug_walk(va + 0x1000)
+            );
+            assert_eq!(built.pool_stats(), reference.pool_stats(), "step {step}");
+            assert_eq!(
+                built.copied_bytes(),
+                reference.copied_bytes(),
+                "step {step}"
+            );
+            if step % 3 == 2 {
+                let prev = base + (step - 1) * TWO_MIB;
+                let a = reference.unmap_aliased(prev + 0x1000, 0x1000, None);
+                let b = built.unmap_aliased(prev + 0x1000, 0x1000, None);
+                assert_eq!(a.is_ok(), b.is_ok(), "unmap step {step}");
+                assert_eq!(built.pool_stats(), reference.pool_stats(), "step {step}");
+            }
+        }
+        assert!(
+            built.copied_bytes() as usize > prefix.len(),
+            "storage must have grown past the prefix"
+        );
+        assert_eq!(built.into_bytes().unwrap(), reference.into_bytes().unwrap());
+    }
+
     #[derive(Debug)]
     struct NonAllocTestArenaSource {
         id: TableArenaSourceId,
