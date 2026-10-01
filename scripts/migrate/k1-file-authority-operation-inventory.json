@@ -21285,7 +21285,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3150,
+      "line": 3153,
       "categories": [
         "mapping"
       ],
@@ -21294,7 +21294,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3158,
+      "line": 3161,
       "categories": [
         "mapping"
       ],
@@ -21303,7 +21303,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3174,
+      "line": 3177,
       "categories": [
         "mapping"
       ],
@@ -21312,7 +21312,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3187,
+      "line": 3190,
       "categories": [
         "mapping"
       ],
@@ -21402,7 +21402,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
-      "line": 659,
+      "line": 676,
       "categories": [
         "mapping"
       ],
@@ -21411,7 +21411,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
-      "line": 667,
+      "line": 684,
       "categories": [
         "mapping"
       ],
@@ -21420,7 +21420,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
-      "line": 683,
+      "line": 700,
       "categories": [
         "mapping"
       ],
