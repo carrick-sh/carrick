@@ -5714,6 +5714,26 @@ mod real {
         /// `vcpu-kick` by id: a kick whose id never shows a cancel did not stop a
         /// running vCPU.
         fn vcpu__canceled(_: u64, _: u64, _: u32, _: i32) {}
+        /// Immediately before one `hv_vcpu_run` call in the HVF run loop. `vcpu`
+        /// is the exact HVF id. Pair with `vcpu-run-exit` on the same host
+        /// thread (`self->`) to time guest execution: every enter is followed
+        /// by exactly one exit unless `hv_vcpu_run` itself fails.
+        fn vcpu__run__enter(_: u64) {}
+        /// One `hv_vcpu_run` return, fired at the single site that also bumps
+        /// the carrier's exhaustive exit counters. `vcpu` is the HVF id,
+        /// `class` the `carrick_el1_abi::HostExitClass` ordinal (0 canceled,
+        /// 1 idle, 2 kick, 3 syscall, 4 metadata, 5 maintenance, 6 fault,
+        /// 7 other), `syndrome` the raw ESR HVF reported (authoritative only
+        /// for EXCEPTION exits). Every return fires, including the ones the
+        /// loop resumes internally, so per-class counts close to the total.
+        fn vcpu__run__exit(_: u64, _: u32, _: u64) {}
+        /// The `hvc #2` exit just reported by `vcpu-run-exit` as class 3
+        /// (syscall) was NOT an EL0 `svc`: the EL1 vector forwarded another
+        /// EL0 synchronous exception. `esr` is the latched ESR_EL1 (its EC
+        /// says abort, sys64, ...). Fires at the site that bumps
+        /// `vcpu_hvc_not_svc_total()`, so a trace can move these exits out of
+        /// the syscall class with the same authority as the counters.
+        fn vcpu__hvc__not__svc(_: u64) {}
         /// The engine absorbed a surfaced kick inside Carrick's EL1 vector/image
         /// or the EL0 clock stub and re-entered the guest with a pending IRQ
         /// armed (`where`: 1 vector, 2 EL1 image, 3 clock stub). The kick is only
@@ -7786,6 +7806,18 @@ mod real {
         carrick_usdt::vcpu__canceled!(|| (vcpu, pc, el, resumed));
     }
 
+    pub fn vcpu_run_enter(vcpu: u64) {
+        carrick_usdt::vcpu__run__enter!(|| vcpu);
+    }
+
+    pub fn vcpu_run_exit(vcpu: u64, class: u32, syndrome: u64) {
+        carrick_usdt::vcpu__run__exit!(|| (vcpu, class, syndrome));
+    }
+
+    pub fn vcpu_hvc_not_svc(esr: u64) {
+        carrick_usdt::vcpu__hvc__not__svc!(|| esr);
+    }
+
     pub fn kick_rearm_irq(pc: u64, where_: u32, spsr_el1: u64, elr_el1: u64) {
         carrick_usdt::kick__rearm__irq!(|| (pc, where_, spsr_el1, elr_el1));
     }
@@ -8889,6 +8921,9 @@ mod stub {
     stub!(kick_in_kernel(pc: u64, el: u32));
     stub!(vcpu_kick(vcpu: u64, valid: i32, rc: i32));
     stub!(vcpu_canceled(vcpu: u64, pc: u64, el: u32, resumed: i32));
+    stub!(vcpu_run_enter(vcpu: u64));
+    stub!(vcpu_run_exit(vcpu: u64, class: u32, syndrome: u64));
+    stub!(vcpu_hvc_not_svc(esr: u64));
     stub!(kick_rearm_irq(pc: u64, where_: u32, spsr_el1: u64, elr_el1: u64));
     stub!(vcpu_irq_kick(pc: u64));
     stub!(owed_kick_settle(pc: u64, pstate: u64, el0_state: u64));

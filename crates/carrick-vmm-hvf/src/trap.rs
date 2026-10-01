@@ -7870,6 +7870,7 @@ impl HvfInner {
             }
             // The engine accounts the guest CPU time via `guest_cpu::timed_run`
             // around its `vcpu.run()` call, so do NOT double-account here.
+            crate::probes::vcpu_run_enter(vcpu.id());
             vcpu.run().map_err(hvf_error)?;
             VCPU_RUN_EXITS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let exit = vcpu.get_exit_info();
@@ -7880,6 +7881,10 @@ impl HvfInner {
             );
             VCPU_RUN_EXIT_CLASSES[class as usize]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The exhaustive per-exit record `hvpatch-exit-attribution` reads:
+            // same site and same class as the counters above, so a trace's
+            // class census closes to `vcpu_run_exits_total`.
+            crate::probes::vcpu_run_exit(vcpu.id(), class.ordinal(), exit.exception.syndrome);
             crate::gic::note_vtimer_probe_exit(vcpu.id(), || {
                 exit.reason == ExitReason::CANCELED
                     || (exit.reason == ExitReason::EXCEPTION
@@ -8157,6 +8162,7 @@ impl HvfInner {
                     }
                     HvcExitOutcome::NotSvc { esr } => {
                         VCPU_HVC_NOT_SVC_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::probes::vcpu_hvc_not_svc(esr);
                         let reason = carrick_el1_abi::HvcNotSvcReason::from_esr(esr);
                         VCPU_HVC_NOT_SVC_BY_EC[usize::from(reason.ec)]
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

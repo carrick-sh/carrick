@@ -338,6 +338,7 @@ dependencies = [
  "base64 0.22.1",
  "bollard",
  "camino",
+ "carrick-el1-abi",
  "carrick-engine",
  "carrick-fatal",
  "carrick-host-bsd",
