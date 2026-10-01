@@ -476,3 +476,70 @@ pub(crate) fn run_drain_call(
     // SAFETY: as above; EL1 answered in place before `hvc #1`.
     Ok(unsafe { host_frame.read_volatile() })
 }
+
+/// The production venue for an EL1 frame grant served outside the mailbox
+/// (a host copyout into never-touched memory): the engine's own prepare,
+/// publish, complete and rollback, and the guest lane's transaction applied
+/// on this vCPU now through the shared drain.
+pub struct EngineGrantVenue<'a, E>(pub &'a mut E);
+
+impl<E: ThreadedEngine> carrick_hal::threaded::El1FrameGrantVenue for EngineGrantVenue<'_, E> {
+    fn prepare(
+        &mut self,
+        request: carrick_hal::El1FrameGrantRequest,
+    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+        self.0.prepare_el1_frame_grant(request)
+    }
+
+    fn publish(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantPublication,
+    ) -> Result<carrick_hal::threaded::El1FrameGrantPublished, TrapError> {
+        self.0.publish_el1_frame_grant(grant)
+    }
+
+    fn apply_guest_publication(
+        &mut self,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        let slots = carrick_el1_abi::descriptor_txn_slots_host().ok_or_else(|| {
+            TrapError::Hypervisor("host copyout grant has no descriptor slots".to_owned())
+        })?;
+        match apply_guest_descriptor_txns_now(&mut EngineDrainVenue(&mut *self.0), slots, &[txn]) {
+            Ok(mut receipts) => receipts.pop().ok_or_else(|| {
+                TrapError::Hypervisor("host copyout grant has no verified receipt".to_owned())
+            }),
+            Err(GuestPublishError::NotApplied { error, .. }) => Err(error),
+            // EL1 may have stored part of the grant: its backing can be
+            // neither rolled back nor committed.
+            Err(GuestPublishError::Unsettled(error)) => carrick_fatal::carrick_fatal!(
+                "hvpatch::host_copyout_grant",
+                "host copyout grant publication is unsettled: {error}"
+            ),
+        }
+    }
+
+    fn settle_receipt(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        self.0.settle_el1_descriptor_receipt(txn, receipt)
+    }
+
+    fn complete(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<(), TrapError> {
+        self.0.complete_el1_frame_grant(grant)
+    }
+
+    fn roll_back(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, TrapError> {
+        self.0.roll_back_el1_frame_grant(grant)
+    }
+}

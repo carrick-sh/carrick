@@ -295,6 +295,49 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .map_err(|error| Box::new(std::io::Error::other(error)) as _)
     }
 
+    fn grant_for_host_copyout(
+        &self,
+        address: u64,
+        len: u64,
+        venue: &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("host copyout grant lost its exact runtime"))?;
+        let dispatcher = &runtime.dispatcher;
+        if !dispatcher.first_touch_is_root_owned(address) {
+            return Ok(false);
+        }
+        let coordinator = dispatcher.mm_mutation_coordinator();
+        let mut guard = carrick_kernel::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
+            &self.pt_quiesce,
+            self.mm,
+            coordinator,
+            self.tid,
+            carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+        )
+        .map_err(|error| std::io::Error::other(format!("host copyout grant quiesce: {error:?}")))?;
+        let end = address.saturating_add(len);
+        dispatcher
+            .grant_for_host_copyout(&mut guard, address, len, venue, &mut |mutation, venue| {
+                super::signal::settle_guest_grants_over(dispatcher, venue, mutation, address, end)
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(|error| Box::new(std::io::Error::other(error)) as _)
+    }
+
+    fn host_read_sees_fresh_zero(
+        &self,
+        page: u64,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("host zero read lost its exact runtime"))?;
+        Ok(runtime.dispatcher.host_read_sees_fresh_zero(page))
+    }
+
     fn deferred_anonymous_state(&self) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
         self.deferred_anonymous.clone()
     }
