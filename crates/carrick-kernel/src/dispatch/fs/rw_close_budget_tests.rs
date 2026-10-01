@@ -117,15 +117,20 @@ fn forwarded_read_per_call_budget() {
 
 #[test]
 fn forwarded_write_per_call_budget() {
-    assert_forwarded_write_per_call_budget(false);
+    assert_forwarded_write_per_call_budget(|| {});
 }
 
-#[test]
-fn forwarded_write_after_foreign_namespace_bump_per_call_budget() {
-    assert_forwarded_write_per_call_budget(true);
+mod serial_host {
+    #[test]
+    fn forwarded_write_after_foreign_namespace_bump_per_call_budget() {
+        super::assert_forwarded_write_per_call_budget(|| {
+            // This fixture explicitly mutates process-global generation state.
+            carrick_vfs::fs_resolve_cache::bump_generation();
+        });
+    }
 }
 
-fn assert_forwarded_write_per_call_budget(foreign_namespace_bump: bool) {
+fn assert_forwarded_write_per_call_budget(before_write: impl FnOnce()) {
     let file = tempfile::tempfile().expect("tempfile");
 
     let mut dispatcher = SyscallDispatcher::new();
@@ -140,11 +145,9 @@ fn assert_forwarded_write_per_call_budget(foreign_namespace_bump: bool) {
 
     let buf_addr = MEM_BASE + 0x1000;
     let count = 8192u64;
-    if foreign_namespace_bump {
-        // Another kernel graph can mutate the shared namespace between cache
-        // construction and this first write. No inode has been cached here.
-        carrick_vfs::fs_resolve_cache::bump_generation();
-    }
+    // Inject a mutation between cache construction and this first write.
+    // No inode has been cached here, even when the namespace generation moves.
+    before_write();
 
     let (outcome, snapshot) = budget_meter::measure_no_allocations(|| {
         dispatcher
