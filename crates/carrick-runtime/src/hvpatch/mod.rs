@@ -23,12 +23,10 @@ use carrick_kernel::kernel::CarrierProcess;
 use carrick_kernel::run_result::RunResult;
 use carrick_kernel::run_result::RuntimeError;
 use carrick_mem::elf::SegmentPerms;
-use info_page::{INFO_PAGE_BASE, InfoPage, info_page_bytes};
 use island::passthrough_island_bytes;
 use patcher::{ISLAND_STUB_SIZE, PatchError, PatchSite, patch_svc_zero};
 
 mod asid;
-mod info_page;
 mod island;
 mod mm_resources;
 mod patcher;
@@ -1329,7 +1327,7 @@ fn find_island_base(
     })
 }
 
-fn prepare_image(mut image: AddressSpace, info: InfoPage) -> Result<PreparedImage, PrepareError> {
+fn prepare_image(mut image: AddressSpace) -> Result<PreparedImage, PrepareError> {
     let mut occupied: Vec<(u64, u64)> = Vec::with_capacity(image.regions().len() + 1);
     for region in image.regions() {
         let end = align_up_stage2(region.end).ok_or(PrepareError::NoIsland {
@@ -1338,7 +1336,6 @@ fn prepare_image(mut image: AddressSpace, info: InfoPage) -> Result<PreparedImag
         })?;
         occupied.push((region.start & !(STAGE2_PAGE_SIZE - 1), end));
     }
-    occupied.push((INFO_PAGE_BASE, INFO_PAGE_BASE + STAGE2_PAGE_SIZE));
 
     let executable_regions: Vec<(usize, u64, u64, Vec<u64>)> = image
         .regions()
@@ -1386,12 +1383,6 @@ fn prepare_image(mut image: AddressSpace, info: InfoPage) -> Result<PreparedImag
     for (island_base, island_bytes) in islands {
         image = image.with_region_bytes(island_base, rx, false, island_bytes)?;
     }
-    let info_perms = SegmentPerms {
-        read: true,
-        write: true,
-        execute: false,
-    };
-    image = image.with_region_bytes(INFO_PAGE_BASE, info_perms, false, info_page_bytes(info))?;
 
     Ok(PreparedImage {
         image,
@@ -1407,7 +1398,7 @@ pub(crate) fn prepare_exec_image_for_dispatcher(
     dispatcher: &SyscallDispatcher,
 ) -> Result<AddressSpace, PrepareError> {
     let _ = dispatcher;
-    Ok(prepare_image(image, InfoPage::default())?.image)
+    Ok(prepare_image(image)?.image)
 }
 
 #[cfg(all(
@@ -1463,7 +1454,7 @@ fn finish_hvpatch_image_owned(
     // fire. All dyld queries remain inside the USDT closure, so an untraced
     // launch pays only this disabled-probe call.
     crate::probes::host_image_base();
-    let prepared = prepare_image(image, InfoPage::default()).map_err(|error| {
+    let prepared = prepare_image(image).map_err(|error| {
         RuntimeError::Unsupported(format!("hvpatch image preparation failed: {error}"))
     })?;
     let _patch_summary = (prepared.manifest.len(), prepared.island_bases.len());
@@ -1554,7 +1545,6 @@ mod tests {
     use crate::memory::AddressSpace;
     use carrick_kernel::kernel::MmBackend as _;
     use carrick_mem::elf::SegmentPerms;
-    use info_page::{INFO_PAGE_BASE, InfoPage};
 
     const RX: SegmentPerms = SegmentPerms {
         read: true,
@@ -3789,25 +3779,22 @@ mod tests {
     }
 
     #[test]
-    fn prepares_loaded_text_with_near_island_and_fixed_info_page() {
+    fn prepares_loaded_text_with_a_near_island_and_no_carrick_data_page() {
         let image = AddressSpace::from_segments(
             0x400000,
             [(0x400000, RX, text(&[0xd503_201f, 0xd400_0001]), 0x1000)],
         )
         .unwrap();
 
-        let prepared = prepare_image(image, InfoPage::default()).expect("prepare hvpatch image");
+        let prepared = prepare_image(image).expect("prepare hvpatch image");
 
         assert_eq!(prepared.manifest.len(), 1);
         assert_eq!(prepared.manifest[0].guest_va, 0x400004);
         assert_eq!(prepared.island_bases, vec![0x404000]);
-        assert!(
-            prepared
-                .image
-                .regions()
-                .iter()
-                .any(|r| r.start == INFO_PAGE_BASE)
-        );
+        // `kernel.mm.carrier-window-isolation`: preparation adds only the
+        // island, never a Carrick data page the guest could reach at EL0.
+        let starts: Vec<u64> = prepared.image.regions().iter().map(|r| r.start).collect();
+        assert_eq!(starts, vec![0x400000, 0x404000]);
         let code = prepared
             .image
             .regions()
@@ -3831,7 +3818,7 @@ mod tests {
         )
         .unwrap();
 
-        let prepared = prepare_image(image, InfoPage::default()).expect("prepare two images");
+        let prepared = prepare_image(image).expect("prepare two images");
 
         assert_eq!(prepared.manifest.len(), 2);
         assert_eq!(prepared.island_bases, vec![0x404000, 0x80_0000_4000]);
@@ -3846,7 +3833,7 @@ mod tests {
         )
         .unwrap();
 
-        let prepared = prepare_image(image, InfoPage::default()).expect("prepare hvpatch image");
+        let prepared = prepare_image(image).expect("prepare hvpatch image");
         let code = prepared.image.regions().first().unwrap();
         assert_eq!(
             u32::from_le_bytes(code.bytes()[0..4].try_into().unwrap()),

@@ -58,34 +58,6 @@ pub fn stamp_identity_page_at<M: CurrentMmMemory>(
     stamp_clock_gate(memory, base, 0)?;
     stamp_identity_values(memory, base, id.pid, shim_enabled)?;
     stamp_clock_gate(memory, base, clock_enabled)?;
-    let _ = stamp_info_page(memory, kernel_context);
-    Ok(())
-}
-
-/// Stamp the EL0-accessible info page with the live PID and TID.
-///
-/// Credentials and the parent pid are deliberately NOT published here: Linux
-/// credentials are per-thread and change on `set*id`, and the parent changes on
-/// reparenting, so a per-process EL0-readable page cannot answer them. Those
-/// syscalls trap to the dispatcher (see `hvpatch::island`).
-pub fn stamp_info_page<M: CurrentMmMemory>(
-    memory: &mut M,
-    kernel_context: &crate::kernel::KernelContext,
-) -> Result<(), carrick_guest_mem::MemoryError> {
-    stamp_info_page_at(memory, kernel_context, crate::memory::LINUX_INFO_PAGE_BASE)
-}
-
-pub fn stamp_info_page_at<M: CurrentMmMemory>(
-    memory: &mut M,
-    kernel_context: &crate::kernel::KernelContext,
-    base: u64,
-) -> Result<(), carrick_guest_mem::MemoryError> {
-    let task_id = u32::try_from(kernel_context.task().key().id.raw()).unwrap_or(0);
-    let pid = crate::namespace::pid::ns_self_pid_for(kernel_context, task_id);
-    let _ = memory.write_bytes(base + crate::memory::INFO_PAGE_OFF_PID, &pid.to_le_bytes());
-    if let Some(tid) = crate::namespace::pid::ns_visible_guest_tid(kernel_context) {
-        let _ = memory.write_bytes(base + crate::memory::INFO_PAGE_OFF_TID, &tid.to_le_bytes());
-    }
     Ok(())
 }
 

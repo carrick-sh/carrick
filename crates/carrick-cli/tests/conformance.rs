@@ -2932,11 +2932,12 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `pwritev`) racing a sibling's unmap. `epollstopcont` covers a sibling's
 /// `epoll_wait` interrupted by a handler-free stop and continue.
 /// `nxwritableimage` covers non-executable `.data`, `.bss`,
-/// stack and heap pages in the first image, a fork child and after execve,
-/// bringing the inventory to 557 sources: 528 conformance sources (505
-/// generic, 23 dedicated), 28 performance sources, and one helper. Both libc
-/// lanes gate 1056 rows.
-const PROBE_SOURCE_COUNT: usize = 557;
+/// stack and heap pages in the first image, a fork child and after execve.
+/// `carrierwindowaccess` covers Carrick's fixed windows being unmapped in a
+/// process that never mapped them, bringing the inventory to 558 sources: 529
+/// conformance sources (506 generic, 23 dedicated), 28 performance sources,
+/// and one helper. Both libc lanes gate 1058 rows.
+const PROBE_SOURCE_COUNT: usize = 558;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4709,9 +4710,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 505);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 528);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1056);
+    assert_eq!(generic.len(), 506);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 529);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1058);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

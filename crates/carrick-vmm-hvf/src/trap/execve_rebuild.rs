@@ -681,11 +681,28 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
             )));
         }
     }
-    // The remap validated the heap mapping like any other backed extent,
-    // which the check above relies on. A fresh image has no break, so the
-    // window starts unmapped; its leaves keep the new frames for `brk`.
-    carrick_mem::memory::seal_heap_window(&mut page_tables).map_err(|error| {
-        TrapError::Hypervisor(format!("seal HVPatch exec heap window: {error:?}"))
+    // The remap validated the heap, aperture and overlay mappings like any
+    // other backed extent, which the check above relies on. A fresh image
+    // owns none of them: its leaves keep the new frames, PROT_NONE, for the
+    // owner of each sub-range to re-validate.
+    carrick_mem::memory::seal_fresh_image_windows(&mut page_tables).map_err(|error| {
+        TrapError::Hypervisor(format!("seal HVPatch exec carrier windows: {error:?}"))
+    })?;
+    // Every other VA the new image does not map still translates to the
+    // equal IPA, which backs the carrier's identity-mapped first root (its
+    // image, interpreter, stack) or nothing.
+    let owned: Vec<(u64, u64)> = global
+        .mappings
+        .iter()
+        .map(|mapping| {
+            (
+                mapping.guest_start,
+                mapping.guest_start.saturating_add(mapping.mapped_size),
+            )
+        })
+        .collect();
+    carrick_mem::memory::seal_unowned_user_space(&mut page_tables, &owned).map_err(|error| {
+        TrapError::Hypervisor(format!("seal HVPatch exec unowned user space: {error:?}"))
     })?;
     carrick_aarch64::engine::reserve_hvpatch_process_apertures(&mut page_tables).map_err(
         |error| {

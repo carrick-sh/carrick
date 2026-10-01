@@ -1,0 +1,32 @@
+schema_version = 1
+id = "kernel.mm.carrier-window-isolation"
+title = "A process reaches only what it mapped"
+guest_surfaces = ["syscall:execve", "syscall:fork", "syscall:mmap", "syscall:munmap", "kernel:stage1_image"]
+semantic_authority = ["man 2 mmap", "man 2 execve", "man 2 fork", "conformance-probes/probe-inventory.json:carrierwindowaccess"]
+fixture = "probe:carrierwindowaccess"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+Linux: an access to an address no VMA of the process covers is
+SIGSEGV/SEGV_MAPERR, whatever another process maps there. Carrick's stage-1
+images start from an identity map whose user leaves translate every VA to the
+equal IPA, and several fixed windows are backed carrier-wide at their identity
+IPA: the boot-mapped MAP_SHARED aperture, the private overlay aperture, the
+dynamic alias and Rosetta IPA windows, and the carrier's first root image
+(image, interpreter, stack). A per-process info page also sat at a fixed VA
+with no reader left. Every fresh image therefore seals those windows PROT_NONE
+(their leaves keep their output, so the owner of a sub-range re-validates it
+in place: mmap's protection publication, brk, the overlay repoint reading the
+retained output), the HVPatch exec rebuild seals every user VA its own mappings
+do not cover, and the info page is gone. The VM-free bindings require the boot
+image's windows to be EL0-inaccessible after the region permission pass and
+the exec rebuild to translate nothing it does not own while keeping the sealed
+windows' frames; the signed binding runs the probe in the generic
+conformance-next shard (first image, fork child, after execve); Docker is the
+probe oracle. No structural work meter or runtime ratio is claimed.
+"""
+
+[bindings]
+vm_free = "carrick-mem::memory::loader_tests::fresh_image_carrier_windows_are_not_el0_accessible; carrick-vmm-hvf::trap::frame_inventory::tests::exec_rebuild_maps_nothing_the_image_does_not_own; carrick-runtime::hvpatch::tests::prepares_loaded_text_with_a_near_island_and_no_carrick_data_page"
+embed = "carrick-conformance-next::probes_shard_2::generic_probe_shard_2"
+docker = "probe:carrierwindowaccess"

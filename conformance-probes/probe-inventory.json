@@ -162,6 +162,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "carrierwindowaccess": {
+    "class": "conformance",
+    "contract_ids": [
+      "kernel.mm.carrier-window-isolation"
+    ],
+    "excluded": false,
+    "runner": "generic"
+  },
   "childrusage": {
     "class": "conformance",
     "excluded": false,
