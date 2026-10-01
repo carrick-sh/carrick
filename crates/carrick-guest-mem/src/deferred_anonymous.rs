@@ -38,6 +38,10 @@ pub struct DeferredPrivateFileSnapshot {
 struct State {
     pristine: Vec<Range<u64>>,
     resident: Vec<Range<u64>>,
+    /// Spans a committed materialization backed and no retirement or fresh
+    /// reservation has released since: backing exists there, so no other
+    /// authority may attest them pristine ([`DeferredAnonymousState::adopt_pristine`]).
+    materialized: Vec<Range<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +167,7 @@ impl DeferredAnonymousState {
         let range = extent(start, len)?;
         let mut state = self.state.lock();
         remove(&mut state.resident, &range);
+        remove(&mut state.materialized, &range);
         insert(&mut state.pristine, range);
         Ok(())
     }
@@ -171,16 +176,45 @@ impl DeferredAnonymousState {
     /// reservation root: an untouched, non-resident page of its current
     /// incarnation). Unlike [`Self::reserve_fresh`] this is no new
     /// reservation: logical zero-read residency is kept.
+    /// Materialized spans keep their (absent) provenance: backing exists.
     pub fn adopt_pristine(&self, start: GuestVa, len: usize) -> Result<(), DeferredAnonymousError> {
         let range = extent(start, len)?;
-        insert(&mut self.state.lock().pristine, range);
+        let mut state = self.state.lock();
+        let mut fresh = vec![range.clone()];
+        let first = state.materialized.partition_point(|r| r.end <= range.start);
+        for backed in &state.materialized[first..] {
+            if backed.start >= range.end {
+                break;
+            }
+            remove(&mut fresh, backed);
+        }
+        for span in fresh {
+            insert(&mut state.pristine, span);
+        }
         Ok(())
+    }
+    /// The parts of `[start, start + len)` a committed materialization
+    /// backed and nothing has released since.
+    pub fn materialized_within(&self, start: GuestVa, len: usize) -> Vec<Range<GuestVa>> {
+        let Ok(range) = extent(start, len) else {
+            return Vec::new();
+        };
+        let state = self.state.lock();
+        let first = state.materialized.partition_point(|r| r.end <= range.start);
+        state.materialized[first..]
+            .iter()
+            .take_while(|backed| backed.start < range.end)
+            .map(|backed| {
+                GuestVa(backed.start.max(range.start))..GuestVa(backed.end.min(range.end))
+            })
+            .collect()
     }
     pub fn retire(&self, start: GuestVa, len: usize) -> Result<(), DeferredAnonymousError> {
         let range = extent(start, len)?;
         let mut state = self.state.lock();
         remove(&mut state.pristine, &range);
         remove(&mut state.resident, &range);
+        remove(&mut state.materialized, &range);
         drop(state);
         let mut files = self.files.lock();
         // Views are sorted and disjoint (`reserve_private_file` refuses an
@@ -458,7 +492,9 @@ impl DeferredAnonymousState {
         len: usize,
     ) -> Result<(), DeferredAnonymousError> {
         let range = extent(start, len)?;
-        insert(&mut self.state.lock().pristine, range);
+        let mut state = self.state.lock();
+        remove(&mut state.materialized, &range);
+        insert(&mut state.pristine, range);
         Ok(())
     }
 
@@ -607,12 +643,43 @@ impl DeferredAnonymousTransition<'_> {
     /// Call only after successful publication. Logical zero-read residency remains.
     pub fn commit(mut self) {
         remove(&mut self.state.pristine, &self.range);
+        let range = self.range.clone();
+        insert(&mut self.state.materialized, range);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A span another authority attests fresh is adopted as pristine only
+    /// where no committed materialization still backs it.
+    #[test]
+    fn adopted_pristine_never_covers_live_backing() {
+        let state = DeferredAnonymousState::new();
+        let base = GuestVa(0x10_0000);
+        state.reserve_fresh(base, 4 * PAGE as usize).unwrap();
+        state
+            .begin_pristine_materialization(GuestVa(base.raw() + PAGE), 2 * PAGE as usize)
+            .unwrap()
+            .expect("pristine span")
+            .commit();
+        state.adopt_pristine(base, 4 * PAGE as usize).unwrap();
+        assert!(state.covers_pristine(base, PAGE as usize));
+        assert!(!state.covers_pristine(GuestVa(base.raw() + PAGE), PAGE as usize));
+        assert_eq!(
+            state.materialized_within(base, 4 * PAGE as usize),
+            vec![GuestVa(base.raw() + PAGE)..GuestVa(base.raw() + 3 * PAGE)]
+        );
+        // Retiring the backing releases it; a later attestation adopts it.
+        state
+            .retire(GuestVa(base.raw() + PAGE), PAGE as usize)
+            .unwrap();
+        state.adopt_pristine(base, 4 * PAGE as usize).unwrap();
+        assert!(state.covers_pristine(GuestVa(base.raw() + PAGE), PAGE as usize));
+        assert!(!state.covers_pristine(GuestVa(base.raw() + 2 * PAGE), PAGE as usize));
+        assert!(state.materialized_within(base, PAGE as usize).is_empty());
+    }
     use std::io::Write;
     #[test]
     fn pristine_validation_is_nonmutating_and_rejects_holes_and_overflow() {
