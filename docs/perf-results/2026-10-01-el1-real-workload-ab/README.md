@@ -59,15 +59,16 @@ that? The answer ranks the next EL1 work:
 On `main`, `CARRICK_EL1_DESCRIPTOR_LANE` does not exist, so the two arms are
 control/control. The lane is on by default on `work/s3-t2`. **Measure one
 artifact:** build `work/s3-t2` with this branch's commits on top, so the timed
-binary and the attributed binary are the same file. The commits cherry-pick
-cleanly (`git merge-tree --merge-base main work/s3-t2 work/ab-instrument`
-reports no conflicts as of 2026-10-01):
+binary and the attributed binary are the same file. Cherry-pick only the code
+commits (instrument, runner, node manifest, summary helper). The `chore:` commits on this branch only re-pin `main`'s
+inventories, they conflict on `work/s3-t2`'s, and they do not change the binary.
+As of 2026-10-01 this applies cleanly on `work/s3-t2` (`784815bfd`):
 
 ```sh
 git worktree add .worktrees/wt-el1ab-measure -b work/el1ab-measure work/s3-t2
 cd .worktrees/wt-el1ab-measure
 ln -s /Volumes/CaseSensitive/carrick/conformance-probes/target conformance-probes/target
-git cherry-pick main..work/ab-instrument
+git cherry-pick 702c3931a 44b5d783e b0f4ead64 b96d509e1
 just build                     # signed; no guest may be alive while it relinks
 strings target/release/carrick | grep -c vcpu__run__exit   # must be > 0
 ```
@@ -217,3 +218,9 @@ same configuration, which is what the near-identical rows show.
   reader refuses `saw_enter=0`, `saw_exit=0` and `saw_service=0`, naming the
   probe, as well as zero paired exits and zero forwarded syscalls. Unit tests
   cover each of these.
+- **Final branch binary** (`b96d509e1` Rust tree, SHA-256 `34a4b78e...`,
+  CDHash `212c5ce5...`, after the summary-writer refactor): one
+  `hvpatch-exit-attribution` capture of `go version`, run id
+  `el1ab-val3-final`. It was accepted and its `--summary-jsonl` was written:
+  1416 exits, 883 forwarded, buckets syscall/fault/kick-idle/other =
+  885/87/242/202.
