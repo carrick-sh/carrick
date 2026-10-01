@@ -3201,44 +3201,98 @@ fn delegated_first_touch_stock_stops_at_nodes_resident_pages_and_owed_returns() 
     );
 }
 
+/// The root's node reads so far (`DelegatedRoot::node_reads`).
+fn root_node_reads(dispatcher: &SyscallDispatcher) -> usize {
+    dispatcher
+        .mem()
+        .lock()
+        .delegated_root()
+        .expect("a delegated MM")
+        .node_reads()
+}
+
 /// Unused first-touch stock is what a reconciliation returns: the root's
-/// holes under this MM's live grants, never a node's backing nor another
-/// MM's grant.
+/// holes under the stock-holding grants this MM committed, never a node's
+/// backing. A mapping that adopts a stocked hole takes it out of the stock.
 #[test]
-fn delegated_unused_first_touch_stock_is_the_roots_holes_under_live_grants() {
+fn delegated_unused_first_touch_stock_is_the_roots_holes_under_its_grants() {
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
     let base = LINUX_MMAP_BASE + STOCK_WINDOW;
     let rw = ReservationProtection::READ_WRITE;
     root.guest_mmap(Placement::Fixed(base + 2 * PAGE), 2 * PAGE, rw)
         .unwrap();
-    let table = Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
-    let grant = |mm_key, semantic_base, len| carrick_el1_abi::FrameGrantResidencyIdentity {
-        mm_key,
-        semantic_base,
-        physical_ipa: 0x9000_0000 + semantic_base,
-        len,
-        mapping_id: 17,
-        frame_id: 19,
-        owner_generation: 23,
-        inventory_revision: 29,
-    };
-    table.publish(grant(root.mm.raw(), base, 8 * PAGE)).unwrap();
-    table
-        .publish(grant(root.mm.raw() + 1, base + 8 * PAGE, 4 * PAGE))
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base + 2 * PAGE, STOCK_WINDOW, |plan| {
+            assert!(plan.stock);
+            dispatcher.commit_resident_frame_grant(plan)
+        })
         .unwrap();
-    let stock: Vec<_> = dispatcher
-        .mem_view()
-        .first_touch_stock(&table)
-        .into_iter()
-        .map(|range| (range.start(), range.end()))
-        .collect();
+    let holes = |stock: Vec<ReservationRange>| -> Vec<(u64, u64)> {
+        stock
+            .iter()
+            .map(|range| (range.start(), range.end()))
+            .collect()
+    };
+    let (spans, stock) = dispatcher.mem_view().take_first_touch_stock();
     assert_eq!(
-        stock,
+        holes(stock),
         vec![(base, base + 2 * PAGE), (base + 4 * PAGE, base + 8 * PAGE)]
     );
-    // Once a mapping adopts a stocked hole it is no longer stock.
+    // Not yet returned (the reconciliation's backend step owns that):
+    // put the spans back, then let a mapping adopt one hole.
+    dispatcher.mem_view().restore_first_touch_stock(spans);
     root.guest_mmap(Placement::Fixed(base + 4 * PAGE), 4 * PAGE, rw)
         .unwrap();
-    assert_eq!(dispatcher.mem_view().first_touch_stock(&table).len(), 1);
+    let (_, stock) = dispatcher.mem_view().take_first_touch_stock();
+    assert_eq!(holes(stock), vec![(base, base + 2 * PAGE)]);
+    // Taken means gone: the next reconciliation has nothing to return.
+    assert!(dispatcher.mem_view().take_first_touch_stock().1.is_empty());
+}
+
+/// Contract `kernel.el1.anonymous-reservations`: returning first-touch
+/// stock costs work proportional to the stock-holding grants, not to the
+/// MM's mappings or the carrier's grant table. An MM without stock reads
+/// no root node at all; one stock span reads only the nodes inside it.
+#[test]
+fn delegated_first_touch_stock_return_work_is_proportional_to_stock() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let rw = ReservationProtection::READ_WRITE;
+    // Many mappings, none of them stock.
+    for index in 0..256 {
+        let address = LINUX_MMAP_BASE + 64 * STOCK_WINDOW + index * 2 * PAGE;
+        root.guest_mmap(Placement::Fixed(address), PAGE, rw)
+            .unwrap();
+    }
+    let before = root_node_reads(&dispatcher);
+    for _ in 0..100 {
+        assert!(dispatcher.mem_view().take_first_touch_stock().1.is_empty());
+    }
+    assert_eq!(
+        root_node_reads(&dispatcher),
+        before,
+        "no stock, no root read"
+    );
+
+    // One stock-holding grant: one span, reading only its own nodes.
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(Placement::Fixed(base + 2 * PAGE), PAGE, rw)
+        .unwrap();
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base + 2 * PAGE, STOCK_WINDOW, |plan| {
+            dispatcher.commit_resident_frame_grant(plan)
+        })
+        .unwrap();
+    let before = root_node_reads(&dispatcher);
+    let (_, stock) = dispatcher.mem_view().take_first_touch_stock();
+    assert_eq!(stock.len(), 2);
+    let reads = root_node_reads(&dispatcher) - before;
+    // A few logarithmic descents of the 257-node tree, never a walk of it.
+    let descent = (u64::BITS - 257u64.leading_zeros()) as usize;
+    assert!(
+        reads <= 4 * descent,
+        "one span's holes cost {reads} node reads; budget {}",
+        4 * descent
+    );
 }
