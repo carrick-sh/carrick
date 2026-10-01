@@ -337,6 +337,13 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// delivery.
     last_fault_esr: u64,
 
+    /// `SP_EL1` of EL1 code this vCPU stopped in mid-operation: set when a
+    /// stage-1 COW fault EL1 took is surfaced (re-entered at its faulting
+    /// instruction by `ResumeEl1`), cleared when the vCPU next runs. A
+    /// host-driven EL1 call meanwhile runs below it, never over the
+    /// suspended operation's frames.
+    suspended_el1_sp: Option<u64>,
+
     // ── trap-surface discriminator (the one aarch64-specific scalar) ──
     /// EC of the most recent exit: did we leave EL0 via `svc` (EC=0x15) or the
     /// EL1 vector's `hvc` (EC=0x16)? `complete_syscall` consults it to know
@@ -461,6 +468,7 @@ struct EngineStage1Services<'a, V: Aarch64Vmm> {
     slot: Option<usize>,
     process_asid: Option<u16>,
     carrier_root: Option<carrick_mem::memory::CarrierMaintenanceRoot>,
+    suspended_el1_sp: Option<u64>,
 }
 impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Services<'_, V> {
     fn slot(&self) -> Option<usize> {
@@ -475,7 +483,7 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
         &mut self,
         frame: carrick_el1_abi::TrapFrame,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
-        crate::descriptor_drain::run_drain_call(frame, |entry, frame_va| {
+        crate::descriptor_drain::run_drain_call(frame, self.suspended_el1_sp, |entry, frame_va| {
             run_el1_service_call_on::<V>(self.vcpu, entry, frame_va)
         })
     }
@@ -558,6 +566,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             stale_stage1_retry: (0, 0),
             last_fork_image_allocations: 0,
             last_fault_esr: 0,
+            suspended_el1_sp: None,
             last_exit_class: 0,
             is_forked_child: false,
             process_asid,
@@ -794,6 +803,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_syscall_nr,
             last_syscall_orig_x0,
             last_fault_esr,
+            suspended_el1_sp: None,
             last_exit_class,
             is_forked_child,
             process_asid,
@@ -1120,6 +1130,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             stale_stage1_retry: (0, 0),
             last_fork_image_allocations: 0,
             last_fault_esr: 0,
+            suspended_el1_sp: None,
             last_exit_class: 0,
             is_forked_child: false,
             process_asid: None,
@@ -1242,6 +1253,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             stale_stage1_retry: (0, 0),
             last_fork_image_allocations: 0,
             last_fault_esr: 0,
+            suspended_el1_sp: None,
             last_exit_class: 0,
             is_forked_child: false,
             process_asid: None,
@@ -2068,6 +2080,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             slot,
             process_asid: self.process_asid,
             carrier_root,
+            suspended_el1_sp: self.suspended_el1_sp,
         };
         self.vm
             .repoint_guest_alias(va, target_ipa, len, content, &mut services)
@@ -2093,6 +2106,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             slot,
             process_asid,
             carrier_root,
+            suspended_el1_sp: self.suspended_el1_sp,
         };
         vm.ensure_frame_cow_write(va, len, intent, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
@@ -2136,6 +2150,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             slot,
             process_asid: self.process_asid,
             carrier_root,
+            suspended_el1_sp: self.suspended_el1_sp,
         };
         vm.ensure_sparse_mmap_backing(va, len, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch sparse mmap backing: {error}")))
@@ -2415,6 +2430,7 @@ impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
             .vcpu
             .mailbox_slot()
             .ok_or_else(|| "caller vCPU has no EL1 slot".to_owned())?;
+        let suspended = self.suspended_el1_sp;
         let vcpu = std::cell::RefCell::new(&mut self.vcpu);
         crate::descriptor_drain::run_foreign_drain_call(
             slot,
@@ -2423,6 +2439,7 @@ impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
             admission,
             || vcpu.borrow().get_sys_reg(SysReg::Ttbr0),
             |value| vcpu.borrow_mut().set_sys_reg(SysReg::Ttbr0, value),
+            suspended,
             |entry, frame_va| run_el1_service_call_on::<V>(&mut vcpu.borrow_mut(), entry, frame_va),
         )
         .map_err(|error| error.to_string())
@@ -2927,6 +2944,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             slot,
             process_asid: self.process_asid,
             carrier_root,
+            suspended_el1_sp: self.suspended_el1_sp,
         };
         vm.materialize_private_file_backing(va, len, host_fd, offset, source, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
@@ -3021,6 +3039,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 slot,
                 process_asid: self.process_asid,
                 carrier_root,
+                suspended_el1_sp: self.suspended_el1_sp,
             };
             return self
                 .vm
@@ -3318,6 +3337,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // A kick absorbed inside Carrick's EL1 code is owed to the next EL0
         // boundary and settled by whichever exit surfaces first (see `OwedKick`).
         let mut owed_kick = crate::owed_kick::OwedKick::default();
+        // Whatever EL1 operation a COW fault suspended resumes with this run.
+        self.suspended_el1_sp = None;
         loop {
             // Account the guest's CPU time (wall time inside the backend's guest
             // run) into this thread's guest_cpu slot so getrusage(RUSAGE_SELF) /
@@ -3391,6 +3412,12 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                 }
                 Aarch64Exit::Stage1CowFault { syndrome, far } => {
                     self.last_fault_esr = syndrome;
+                    self.suspended_el1_sp =
+                        Some(self.vcpu.get_reg(Reg::SpEl1).map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "read SP_EL1 of EL1 stopped by a COW fault: {error}"
+                            ))
+                        })?);
                     owed_kick.settle(&mut self.vcpu)?;
                     return Err(TrapError::Stage1CowFault {
                         syndrome,
@@ -3747,6 +3774,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             slot,
             process_asid: self.process_asid,
             carrier_root,
+            suspended_el1_sp: self.suspended_el1_sp,
         };
         let refusal =
             match self
@@ -4139,6 +4167,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         run_el1_service_call_on::<V>(&mut self.vcpu, entry_pc, frame_va)
     }
 
+    fn suspended_el1_stack_pointer(&mut self) -> Result<Option<u64>, TrapError> {
+        Ok(self.suspended_el1_sp)
+    }
+
     fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
         self.page_tables.live_descriptor_owner()
     }
@@ -4210,6 +4242,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             slot,
             process_asid,
             carrier_root,
+            suspended_el1_sp: self.suspended_el1_sp,
         };
         vm.refresh_fork_process_state(&mut flush)?;
         drop(flush);
@@ -4258,6 +4291,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             slot,
             process_asid,
             carrier_root,
+            suspended_el1_sp: self.suspended_el1_sp,
         };
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
         let resolution = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;

@@ -140,7 +140,8 @@ impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
         &mut self,
         frame: carrick_el1_abi::TrapFrame,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
-        run_drain_call(frame, |entry, frame_va| {
+        let suspended = self.0.suspended_el1_stack_pointer()?;
+        run_drain_call(frame, suspended, |entry, frame_va| {
             self.0.run_el1_service_call(entry, frame_va)
         })
     }
@@ -278,6 +279,7 @@ pub(crate) fn run_foreign_drain_call(
     admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
     mut get_ttbr0: impl FnMut() -> Result<u64, TrapError>,
     mut set_ttbr0: impl FnMut(u64) -> Result<(), TrapError>,
+    suspended_sp: Option<u64>,
     run: impl FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<u64, TrapError> {
     let own = get_ttbr0()?;
@@ -285,7 +287,7 @@ pub(crate) fn run_foreign_drain_call(
         .arm()
         .map_err(|error| TrapError::Hypervisor(format!("admit borrowed target ASID: {error}")))?;
     set_ttbr0(ttbr0)?;
-    let answered = run_drain_call(drain_frame(slot, mm_key, ttbr0), run);
+    let answered = run_drain_call(drain_frame(slot, mm_key, ttbr0), suspended_sp, run);
     if let Err(error) = set_ttbr0(own) {
         carrick_fatal::carrick_fatal!(
             "aarch64::descriptor_drain",
@@ -296,8 +298,12 @@ pub(crate) fn run_foreign_drain_call(
 }
 
 /// Run the shared descriptor service using an already borrowed driving vCPU.
+/// `suspended_sp` is the vCPU's EL1 stack pointer when the call interrupts
+/// EL1 mid-operation (a stage-1 COW fault EL1 took): the frame and the
+/// call's stack go below it, never over the suspended operation's frames.
 pub(crate) fn run_drain_call(
     frame: carrick_el1_abi::TrapFrame,
+    suspended_sp: Option<u64>,
     mut run: impl FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
     let unavailable = |what: &str| TrapError::Hypervisor(format!("guest drain call: {what}"));
@@ -305,8 +311,9 @@ pub(crate) fn run_drain_call(
     if region == 0 {
         return Err(unavailable("no EL1 region"));
     }
-    let offset = carrick_el1_abi::descriptor_drain_frame_offset(frame.slot as usize)
-        .ok_or_else(|| unavailable("slot out of range"))?;
+    let offset =
+        carrick_el1_abi::descriptor_drain_frame_offset_below(frame.slot as usize, suspended_sp)
+            .ok_or_else(|| unavailable("no room below the vCPU's EL1 stack"))?;
     // SAFETY: the EL1 region owner keeps the region alive while it is
     // installed; the header is its first 32 bytes.
     let header = carrick_el1_abi::ImageHeader::read_from_prefix(unsafe {
@@ -318,7 +325,8 @@ pub(crate) fn run_drain_call(
     .ok_or_else(|| unavailable("no EL1 image header"))?;
     let host_frame = (region + offset as usize) as *mut carrick_el1_abi::TrapFrame;
     // SAFETY: the offset lies in this vCPU slot's own EL1 stack, below the
-    // vector's trap frame, 16-aligned; this host thread owns the vCPU.
+    // vector's trap frame and any suspended EL1 stack, 16-aligned; this host
+    // thread owns the vCPU.
     unsafe { host_frame.write_volatile(frame) };
     run(
         carrick_el1_abi::EL1_REGION_BASE + header.entry_offset,

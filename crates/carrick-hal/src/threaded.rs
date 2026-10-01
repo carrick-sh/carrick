@@ -3011,6 +3011,15 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         ))
     }
 
+    /// This vCPU's EL1 stack pointer when it stopped at EL1 mid-operation
+    /// (a stage-1 COW fault EL1 took), `None` at an EL0 boundary. A
+    /// host-driven EL1 call places its frame and stack below it.
+    fn suspended_el1_stack_pointer(&mut self) -> Result<Option<u64>, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend exposes no EL1 stack state".to_owned(),
+        ))
+    }
+
     /// Authenticate EL1's receipt for a transaction this engine returned and
     /// return its unused table grants. Required before residency commit,
     /// inventory repoint or old-owner retirement.
