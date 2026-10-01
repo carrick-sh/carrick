@@ -531,12 +531,22 @@ impl GuestGrantLedger {
             return false;
         };
         let mut entry = entry.lock();
-        if entry.is_some() || !slots.submit(slot, &pending.txn) {
+        if entry.is_some() {
+            return false;
+        }
+        // Count the entry BEFORE EL1 can see the submission: EL1 finds work
+        // only through the slots' summary, which `slots.submit` publishes,
+        // and a boundary woken by EL1's receipt then reads a nonzero count.
+        // Counting after (as this did) let `settle_ready`'s empty-ledger skip
+        // miss a receipt published in between.
+        self.occupied
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !slots.submit(slot, &pending.txn) {
+            self.occupied
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             return false;
         }
         *entry = Some(pending);
-        self.occupied
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         true
     }
 
@@ -565,7 +575,7 @@ impl GuestGrantLedger {
     ) -> usize {
         let mut released = 0;
         for (slot, entry) in self.pending.iter().enumerate() {
-            let mut entry = entry.lock();
+            let mut entry = lock_ledger_slot(entry);
             let Some(pending) = *entry else {
                 continue;
             };
@@ -593,10 +603,16 @@ impl GuestGrantLedger {
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
         ) -> Result<GuestGrantSettlement, Err>,
     ) -> Result<usize, Err> {
+        // One load when nothing is pending anywhere. `submit` counts an entry
+        // before EL1 can see its submission, so a receipt implies a nonzero
+        // count here (see `submit`).
+        if !self.is_occupied() {
+            return Ok(0);
+        }
         let mut settled = 0;
         for (slot, entry) in self.pending.iter().enumerate() {
             let taken = {
-                let mut entry = entry.lock();
+                let mut entry = lock_ledger_slot(entry);
                 match *entry {
                     Some(pending) if pending.txn.id.mm_key.get() == mm_key => {
                         let receipt = slots.take_receipt(slot, pending.txn.id);
@@ -615,6 +631,26 @@ impl GuestGrantLedger {
         }
         Ok(settled)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Ledger slot locks this thread has taken: the settle boundary's
+    /// structural work budget.
+    static LEDGER_SLOT_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn ledger_slot_locks_on_this_thread() -> usize {
+    LEDGER_SLOT_LOCKS.with(std::cell::Cell::get)
+}
+
+fn lock_ledger_slot(
+    entry: &parking_lot::Mutex<Option<PendingGuestGrant>>,
+) -> parking_lot::MutexGuard<'_, Option<PendingGuestGrant>> {
+    #[cfg(test)]
+    LEDGER_SLOT_LOCKS.with(|locks| locks.set(locks.get() + 1));
+    entry.lock()
 }
 
 /// Carrier-wide ledger for the shared EL1 descriptor transaction slots.
@@ -2736,6 +2772,111 @@ mod guest_descriptor_lane_tests {
             "a receipt settles exactly once"
         );
         assert!(ledger.submit(&slots, 4, pending), "the slot is free again");
+    }
+
+    /// Work budget: a mutating-fault boundary with nothing pending costs one
+    /// load, not a lock per vCPU slot. Before the skip every boundary locked
+    /// all `EL1_STACK_SLOTS` entries, lane off included.
+    #[test]
+    fn an_empty_ledger_settles_without_locking_a_slot() {
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let before = ledger_slot_locks_on_this_thread();
+        let settled = ledger
+            .settle_ready(&slots, MM, |_, _| -> Result<_, TrapError> {
+                unreachable!("nothing is pending")
+            })
+            .unwrap();
+        assert_eq!(settled, 0);
+        assert_eq!(ledger_slot_locks_on_this_thread() - before, 0);
+    }
+
+    /// A submission is visible to EL1 (through the slots' summary, as the EL1
+    /// fault path finds work) only after the ledger counts it, so a boundary
+    /// woken by EL1's receipt can never read an empty ledger and skip it.
+    /// Three threads: the host submits, "EL1" applies as soon as it sees the
+    /// submission and wakes the settler, and the settler must settle exactly
+    /// that receipt on its first try.
+    #[test]
+    fn a_receipt_published_concurrently_with_submission_is_never_skipped() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const ROUNDS: usize = 2_000;
+        const SLOT: usize = 4;
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let fault = VA + 2 * 4096;
+        let pending = PendingGuestGrant {
+            txn: authority
+                .prepare_guest_descriptor_txn(nz(MM), grant_op(fault))
+                .unwrap(),
+            fault_va: fault,
+            requested_len: 0x20_0000,
+            plan: (VA, 4 * 4096, 3),
+            residency: residency(),
+        };
+        let visible_while_empty = AtomicUsize::new(0);
+        let done = AtomicBool::new(false);
+        let (published_tx, published_rx) = mpsc::channel::<()>();
+        let (settled_tx, settled_rx) = mpsc::channel::<usize>();
+        let wait = Duration::from_secs(10);
+        let (slots, ledger, resolver) = (&*slots, &ledger, &*resolver);
+        let (visible_while_empty, done) = (&visible_while_empty, &done);
+
+        std::thread::scope(|scope| {
+            // EL1: discover work exactly as `carrick-el1`'s fault path does.
+            scope.spawn(move || {
+                let mut applied = 0;
+                while applied < ROUNDS && !done.load(Ordering::Acquire) {
+                    if slots.submitted_for(MM).next().is_none() {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    if !ledger.is_occupied() {
+                        visible_while_empty.fetch_add(1, Ordering::Relaxed);
+                    }
+                    el1_apply(resolver, slots, SLOT).expect("EL1 claims the submission");
+                    applied += 1;
+                    published_tx.send(()).unwrap();
+                }
+            });
+            // Settler: one settle per published receipt, never a retry.
+            scope.spawn(move || {
+                for _ in 0..ROUNDS {
+                    if published_rx.recv_timeout(wait).is_err() {
+                        done.store(true, Ordering::Release);
+                        return;
+                    }
+                    let settled = ledger
+                        .settle_ready(slots, MM, |_, _| -> Result<_, TrapError> {
+                            Ok(GuestGrantSettlement::Committed(PageSpan::new(fault, 4096)))
+                        })
+                        .unwrap();
+                    settled_tx.send(settled).unwrap();
+                }
+            });
+            // Host: submit the next grant once the last one settled.
+            let mut total = 0;
+            for round in 0..ROUNDS {
+                assert!(ledger.submit(slots, SLOT, pending), "round {round}");
+                let settled = settled_rx
+                    .recv_timeout(wait)
+                    .unwrap_or_else(|_| panic!("round {round}: no settlement"));
+                assert_eq!(settled, 1, "round {round}: the receipt was skipped");
+                total += settled;
+            }
+            done.store(true, Ordering::Release);
+            assert_eq!(total, ROUNDS);
+        });
+        assert_eq!(
+            visible_while_empty.load(Ordering::Relaxed),
+            0,
+            "EL1 saw a submission the ledger did not count"
+        );
+        assert!(!ledger.is_occupied());
     }
 
     #[test]
