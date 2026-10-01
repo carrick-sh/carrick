@@ -3543,6 +3543,128 @@ fn idle_256_indefinite_waits_use_one_blocking_poll_without_probe_storm() {
     drop(owned);
 }
 
+fn host_fd_wait(
+    context: &KernelContext,
+    generation: ExecutionGeneration,
+    read_fd: RawFd,
+) -> BlockedContinuation {
+    let authority = install_test_fd_authority(context, 0);
+    BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::raw(vec![(read_fd, libc::POLLIN)]).with_slot_authorities(vec![authority]),
+            timeout: None,
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        capture(context, generation),
+    )
+    .expect("host fd continuation")
+}
+
+fn fds_host_polls_on_this_thread() -> usize {
+    super::readiness::FDS_HOST_POLLS.with(std::cell::Cell::get)
+}
+
+/// Work budget for one blocked host-fd wait, from prepare to its wake: one
+/// reactor nudge (enroll's) and no host `poll` on the enrolling thread. It
+/// used to be three nudges -- `prepare_registration`'s, which no reactor
+/// work set could observe, `enroll`'s, and the reactor nudging itself when it
+/// published the readiness it had just polled -- plus an enroll-time `poll`
+/// the reactor repeats right after. Node's `schdiag-ev-4` capture paid 2.00
+/// nudges, 0.62 polls and ~1.8 reactor cycles per blocked wait.
+#[test]
+fn a_blocked_host_fd_wait_costs_one_nudge_and_no_enroll_poll() {
+    let (kernel, context) = bootstrap(15_911);
+    let generation = publish(&context, 0x911);
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let service = CarrierWaitService::new(scheduler);
+    let fds = pipe_pair();
+    let continuation = host_fd_wait(&context, generation, fds[0]);
+
+    let nudges = service.reactor_nudges();
+    let polls = fds_host_polls_on_this_thread();
+    let mut registration = service.prepare_registration(&continuation);
+    service.enroll(&mut registration).expect("enroll");
+    assert_eq!(
+        fds_host_polls_on_this_thread() - polls,
+        0,
+        "enroll sampled the host fd the reactor polls next"
+    );
+    assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+    assert_eq!(
+        await_event_timeout(&service, registration.wake_token(), Duration::from_secs(5))
+            .expect("bounded wait")
+            .expect("fd event"),
+        ContinuationEvent::Ready
+    );
+    assert_eq!(
+        service.reactor_nudges() - nudges,
+        1,
+        "one blocked wait, prepare to wake, writes exactly one reactor nudge"
+    );
+    drop(registration);
+    drop(continuation);
+    close_pair(fds);
+}
+
+/// Lost-wakeup stress for the enroll path without its host `poll`: readiness
+/// lands before prepare, between prepare and enroll, during enroll, or after
+/// it, and every wait still wakes within a bound. Readiness that predates
+/// enrollment is now found only by the reactor's level-triggered poll after
+/// enroll's nudge.
+#[test]
+fn host_fd_readiness_racing_enrollment_is_never_lost() {
+    let (kernel, context) = bootstrap(15_912);
+    let generation = publish(&context, 0x912);
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let service = CarrierWaitService::new(scheduler);
+    for round in 0..400u32 {
+        let fds = pipe_pair();
+        let continuation = host_fd_wait(&context, generation, fds[0]);
+        let write_fd = fds[1];
+        let write =
+            move || assert_eq!(unsafe { libc::write(write_fd, b"x".as_ptr().cast(), 1) }, 1);
+        let token = match round % 4 {
+            0 => {
+                write();
+                let mut registration = service.prepare_registration(&continuation);
+                service.enroll(&mut registration).expect("enroll");
+                registration
+            }
+            1 => {
+                let mut registration = service.prepare_registration(&continuation);
+                write();
+                service.enroll(&mut registration).expect("enroll");
+                registration
+            }
+            _ => {
+                // Race the producer against prepare+enroll.
+                let spins = (round * 37) % 2_000;
+                let producer = thread::spawn(move || {
+                    for _ in 0..spins {
+                        std::hint::spin_loop();
+                    }
+                    write();
+                });
+                let mut registration = service.prepare_registration(&continuation);
+                service.enroll(&mut registration).expect("enroll");
+                producer.join().expect("producer");
+                registration
+            }
+        };
+        assert_eq!(
+            await_event_timeout(&service, token.wake_token(), Duration::from_secs(5))
+                .unwrap_or_else(|| panic!("round {round}: readiness was lost"))
+                .expect("fd event"),
+            ContinuationEvent::Ready,
+            "round {round}"
+        );
+        drop(token);
+        drop(continuation);
+        close_pair(fds);
+    }
+}
+
 fn fill_pipe(write_fd: i32) -> Vec<u8> {
     let mut total = Vec::new();
     let chunk = [0x5au8; 1024];

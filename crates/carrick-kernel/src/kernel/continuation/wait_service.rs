@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use carrick_fatal::carrick_fatal;
 use parking_lot::{Condvar, Mutex};
 
+use super::readiness::HostFdSample;
 use super::{
     BlockedContinuation, CancellationCause, ContinuationEvent, ContinuationId,
     ContinuationRegistration, ContinuationResumeError, ContinuationWakeToken, ReadinessProbe,
@@ -423,6 +424,13 @@ impl std::fmt::Debug for ReactorTestHooks {
     }
 }
 
+thread_local! {
+    /// On a reactor thread, the address of the service it reacts for; zero
+    /// elsewhere. Keyed by service so a reactor never skips another
+    /// service's nudge.
+    static REACTOR_OF: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug)]
 pub struct CarrierWaitServiceInner {
     scheduler: Arc<Scheduler>,
@@ -433,6 +441,9 @@ pub struct CarrierWaitServiceInner {
     control_read: OwnedFd,
     control_write: OwnedFd,
     reactor_poll_calls: AtomicU64,
+    /// Control-pipe bytes written to wake the reactor. Each is one host
+    /// `write` on the waker's thread plus, typically, one reactor cycle.
+    reactor_nudges: AtomicU64,
     /// Registrations the reactor has TOUCHED to build its poll sets, summed
     /// over every cycle. The number a cycle adds is the reactor's per-wake
     /// cost: it used to be the whole registration map, and this counter is how
@@ -461,6 +472,7 @@ impl CarrierWaitServiceInner {
         }
     }
     pub(super) fn nudge_reactor(&self) {
+        self.reactor_nudges.fetch_add(1, Ordering::Relaxed);
         let byte = [1u8; 1];
         let _ = unsafe {
             libc::write(
@@ -649,7 +661,14 @@ impl CarrierWaitServiceInner {
             (true, task_waker)
         };
         let _ = self.scheduler.wake_exact(token.exact_target());
-        self.nudge_reactor();
+        // The nudge tells the reactor to rebuild its work set without this
+        // registration. The reactor itself never needs one: every cycle
+        // rebuilds the set under the state lock after it has processed its
+        // events, so a byte it writes to its own pipe only buys a spurious
+        // extra cycle.
+        if REACTOR_OF.with(std::cell::Cell::get) != std::ptr::from_ref(self).addr() {
+            self.nudge_reactor();
+        }
         if let Some(waker) = task_waker {
             waker.wake();
         }
@@ -741,6 +760,7 @@ impl CarrierWaitServiceInner {
     }
 
     fn run_reactor(weak: Weak<Self>) {
+        REACTOR_OF.with(|of| of.set(weak.as_ptr().addr()));
         enum FdSource {
             Ready(ContinuationWakeToken),
             BlockingWrite(
@@ -1058,6 +1078,7 @@ impl CarrierWaitService {
             control_read,
             control_write,
             reactor_poll_calls: AtomicU64::new(0),
+            reactor_nudges: AtomicU64::new(0),
             reactor_cycle_visits: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
             fail_next_enroll: AtomicBool::new(false),
@@ -1137,7 +1158,9 @@ impl CarrierWaitService {
             state.last_prepared = Some(token);
         }
         drop(state);
-        self.inner.nudge_reactor();
+        // No nudge: a `Prepared` row is in none of the reactor's work sets
+        // (`ReactorWorkSet::sync` admits only `Enrolled` rows), so the reactor
+        // has nothing new to see until `enroll`, which nudges once.
         ContinuationRegistration {
             token,
             service: Arc::downgrade(&self.inner),
@@ -1176,7 +1199,13 @@ impl CarrierWaitService {
         // that case subscription is correctly installed at the new generation
         // but has no later edge to report. Sample once after every subscription
         // is live so pre-capture signals/readiness cannot strand the task.
-        let _ = self.recheck_registration(registration)?;
+        //
+        // Host descriptors are the one source this sample need not read: the
+        // row is `Enrolled` (so in the reactor's poll set) before the nudge
+        // below, and the reactor's level-triggered `poll` after that nudge
+        // observes any readiness the host fd already has. Sampling it here too
+        // was a second host `poll` per blocked wait.
+        let _ = self.recheck_registration_scoped(registration, HostFdSample::ReactorPolls)?;
         self.inner.nudge_reactor();
         self.inner.add_metric(
             carrick_observability::work_meter::WorkMetric::ContinuationEnrollments,
@@ -1576,14 +1605,23 @@ impl CarrierWaitService {
         Ok(())
     }
 
-    /// Durable post-enrollment sample. [`Self::enroll`] calls this after every
-    /// producer subscription is installed; explicit callers may repeat it
-    /// before a destructive backend save. The shared reactor repeats the same
-    /// readiness probes afterward, closing both sides of the registration
-    /// window.
+    /// Durable post-enrollment sample. [`Self::enroll`] takes it after every
+    /// producer subscription is installed (leaving host descriptors to the
+    /// reactor's next poll); explicit callers may repeat it, host descriptors
+    /// included, before a destructive backend save. The shared reactor
+    /// repeats the same readiness probes afterward, closing both sides of the
+    /// registration window.
     pub fn recheck_registration(
         &self,
         registration: &ContinuationRegistration,
+    ) -> Result<Option<ContinuationEvent>, WaitServiceError> {
+        self.recheck_registration_scoped(registration, HostFdSample::Sample)
+    }
+
+    fn recheck_registration_scoped(
+        &self,
+        registration: &ContinuationRegistration,
+        host_fds: HostFdSample,
     ) -> Result<Option<ContinuationEvent>, WaitServiceError> {
         let (probe, signal_readiness, gate) = {
             let state = self.inner.state.lock();
@@ -1628,7 +1666,7 @@ impl CarrierWaitService {
         }
 
         let mut probe = probe;
-        let event = signal_readiness.event().or_else(|| probe.poll());
+        let event = signal_readiness.event().or_else(|| probe.poll(host_fds));
         drop(claim);
         if let Some(event) = event {
             let receipt = self.inner.publish_event(registration.token, event.clone());
@@ -1711,6 +1749,11 @@ impl CarrierWaitService {
     #[cfg(test)]
     pub(crate) fn reactor_poll_calls(&self) -> u64 {
         self.inner.reactor_poll_calls.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reactor_nudges(&self) -> u64 {
+        self.inner.reactor_nudges.load(Ordering::Acquire)
     }
 
     #[cfg(test)]

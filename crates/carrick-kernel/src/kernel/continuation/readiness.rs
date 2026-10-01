@@ -340,6 +340,23 @@ impl ContinuationWakeToken {
     }
 }
 
+/// Whether a readiness sample reads an fd wait's host descriptors itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostFdSample {
+    /// `poll(…, 0)` the host descriptors now.
+    Sample,
+    /// The row is enrolled in the reactor's poll set and a reactor cycle is
+    /// guaranteed after this sample; the reactor's level-triggered `poll`
+    /// reads them.
+    ReactorPolls,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Host `poll` calls an fd-wait readiness sample made on this thread.
+    pub(crate) static FDS_HOST_POLLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug)]
 pub enum ReadinessProbe {
     /// A thread parked in the in-guest zone: ready once the host owns its
@@ -814,7 +831,10 @@ impl ReadinessProbe {
         }
     }
 
-    pub(crate) fn poll(&mut self) -> Option<ContinuationEvent> {
+    /// Sample every readiness source now. `HostFdSample::ReactorPolls`
+    /// leaves an fd wait's host descriptors to the reactor's next cycle;
+    /// every other source (deadlines, timerfd plans) is still sampled.
+    pub(crate) fn poll(&mut self, host_fds: HostFdSample) -> Option<ContinuationEvent> {
         let deadline_event = |deadline: Option<Instant>| {
             deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
@@ -869,9 +889,11 @@ impl ReadinessProbe {
                 }) {
                     return Some(ContinuationEvent::Ready);
                 }
-                if registrations.is_empty() {
+                if registrations.is_empty() || host_fds == HostFdSample::ReactorPolls {
                     return None;
                 }
+                #[cfg(test)]
+                FDS_HOST_POLLS.with(|polls| polls.set(polls.get() + 1));
                 let mut pollfds = registrations
                     .iter()
                     .map(|registration| libc::pollfd {
