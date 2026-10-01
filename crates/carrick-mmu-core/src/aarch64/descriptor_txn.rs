@@ -1680,11 +1680,21 @@ impl TableMaintenance for CallerInvalidatesAsid {
     fn invalidate_range(&self, _va: u64, _len: u64) {}
 }
 
-/// The EL1-reachable primary table arena as an aligned array of atomics.
+/// One window of descriptor words: an aligned, writable, hardware-visible
+/// array of atomics whose first word is at `physical_base`.
+#[derive(Clone, Copy, Debug)]
+pub struct TableWindow {
+    pub words: *mut AtomicU64,
+    pub physical_base: u64,
+    pub byte_len: usize,
+}
+
+/// The EL1-reachable stage-1 tables as aligned arrays of atomics: the MM's
+/// primary arena and, optionally, a second window over every other arena
+/// (EL1's view of the carrier's table pool).
 pub struct PrimaryTableWords<'m, M: TableMaintenance + ?Sized> {
-    words: *mut AtomicU64,
-    physical_base: u64,
-    byte_len: usize,
+    primary: TableWindow,
+    extra: Option<TableWindow>,
     maintenance: &'m M,
 }
 
@@ -1701,35 +1711,62 @@ impl<'m, M: TableMaintenance + ?Sized> PrimaryTableWords<'m, M> {
         byte_len: usize,
         maintenance: &'m M,
     ) -> Result<Self, DescriptorRefusal> {
-        if words.is_null()
-            || !(words as usize).is_multiple_of(core::mem::align_of::<AtomicU64>())
-            || !physical_base.is_multiple_of(PT_PAGE)
-        {
-            return Err(DescriptorRefusal::BadRange);
-        }
-        Ok(Self {
+        let primary = TableWindow {
             words,
             physical_base,
             byte_len,
+        };
+        Self::check(primary)?;
+        Ok(Self {
+            primary,
+            extra: None,
             maintenance,
         })
     }
 
-    fn word(&self, pa: u64) -> Result<&AtomicU64, DescriptorRefusal> {
-        let offset = pa
-            .checked_sub(self.physical_base)
-            .and_then(|offset| usize::try_from(offset).ok())
-            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
+    /// Also reach the tables of `window` (every extension arena).
+    ///
+    /// # Safety
+    ///
+    /// The same contract as [`Self::new`] holds for `window`.
+    pub unsafe fn with_window(mut self, window: TableWindow) -> Result<Self, DescriptorRefusal> {
+        Self::check(window)?;
+        self.extra = Some(window);
+        Ok(self)
+    }
+
+    fn check(window: TableWindow) -> Result<(), DescriptorRefusal> {
+        if window.words.is_null()
+            || !(window.words as usize).is_multiple_of(core::mem::align_of::<AtomicU64>())
+            || !window.physical_base.is_multiple_of(PT_PAGE)
+        {
+            return Err(DescriptorRefusal::BadRange);
+        }
+        Ok(())
+    }
+
+    fn word_in(window: &TableWindow, pa: u64) -> Option<&AtomicU64> {
+        let offset = usize::try_from(pa.checked_sub(window.physical_base)?).ok()?;
         if !offset.is_multiple_of(core::mem::size_of::<u64>())
             || offset
                 .checked_add(core::mem::size_of::<u64>())
-                .is_none_or(|end| end > self.byte_len)
+                .is_none_or(|end| end > window.byte_len)
         {
-            return Err(DescriptorRefusal::TableOutsidePrimary);
+            return None;
         }
-        // SAFETY: `new`'s contract covers `byte_len`; the checked, aligned
-        // offset stays inside it.
-        Ok(unsafe { &*self.words.add(offset / core::mem::size_of::<u64>()) })
+        // SAFETY: `new`/`with_window`'s contract covers `byte_len`; the
+        // checked, aligned offset stays inside it.
+        Some(unsafe { &*window.words.add(offset / core::mem::size_of::<u64>()) })
+    }
+
+    fn word(&self, pa: u64) -> Result<&AtomicU64, DescriptorRefusal> {
+        Self::word_in(&self.primary, pa)
+            .or_else(|| {
+                self.extra
+                    .as_ref()
+                    .and_then(|window| Self::word_in(window, pa))
+            })
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)
     }
 }
 
@@ -4558,7 +4595,7 @@ mod tests {
                         ptr,
                         ROOT,
                         byte_len,
-                        ROOT,
+                        None,
                         VA,
                         IPA,
                         LeafAccess::Write,
@@ -4573,7 +4610,7 @@ mod tests {
                         ptr,
                         ROOT,
                         byte_len,
-                        ROOT,
+                        None,
                         GuestPermissionEdit {
                             va: VA,
                             len: 2 * PT_PAGE,
@@ -4591,7 +4628,7 @@ mod tests {
                         ptr,
                         ROOT,
                         byte_len,
-                        ROOT,
+                        None,
                         VA,
                         2 * PT_PAGE,
                     )

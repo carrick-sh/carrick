@@ -125,10 +125,11 @@ impl PreparedPageResolver for HardwarePreparedResolver {
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
         let outcome = unsafe {
             carrick_mmu_core::aarch64::commit_existing_el1_prepared_page(
-                carrick_el1_abi::stage1_table_view().0,
-                carrick_el1_abi::stage1_table_view().1,
-                carrick_el1_abi::stage1_table_view().2,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
+                    as *mut core::sync::atomic::AtomicU64,
                 ttbr0 & TTBR_BADDR_MASK,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+                Some(carrick_el1_abi::stage1_table_pool_window()),
                 va,
                 expected_ipa,
                 access,
@@ -148,15 +149,16 @@ impl CowResolver for HardwareCowResolver {
     fn resolve_cow(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> bool {
         use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
         let maintenance = El1TableMaintenance { ttbr0 };
-        // SAFETY: the table view maps every stage-1 table arena at its own
-        // address and the caller holds the MM's exact editor.
+        // SAFETY: the alias maps this MM's primary arena, the pool window
+        // every other arena, and the caller holds the MM's exact editor.
         let Ok(words) = (unsafe {
             PrimaryTableWords::new(
-                carrick_el1_abi::stage1_table_view().0,
-                carrick_el1_abi::stage1_table_view().1,
-                carrick_el1_abi::stage1_table_view().2,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut AtomicU64,
+                ttbr0 & TTBR_BADDR_MASK,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
                 &maintenance,
             )
+            .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
         }) else {
             return false;
         };
@@ -259,11 +261,12 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
         let maintenance = El1TableMaintenance { ttbr0 };
         let words = unsafe {
             PrimaryTableWords::new(
-                carrick_el1_abi::stage1_table_view().0,
-                carrick_el1_abi::stage1_table_view().1,
-                carrick_el1_abi::stage1_table_view().2,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut AtomicU64,
+                ttbr0 & TTBR_BADDR_MASK,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
                 &maintenance,
             )
+            .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
         }
         .ok()?;
         let mut journal = InlineJournal::new();

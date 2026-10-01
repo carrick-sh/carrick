@@ -125,16 +125,18 @@ pub const AARCH64_STAGE1_TABLE_POOL_BASE: u64 = 0x9A_0000_0000;
 /// Bytes of [`AARCH64_STAGE1_TABLE_POOL_BASE`]'s pool (2048 arenas).
 pub const AARCH64_STAGE1_TABLE_POOL_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
-/// EL1's view of every stage-1 table: the pool's descriptor words, the
-/// physical address of the first word, and the view's length in bytes.
-/// Only meaningful on the guest (EL1), where the pool is mapped.
+/// EL1's window over every stage-1 table arena of the pool (each MM's
+/// extension arenas, and its primary arena when that is a pool slot). The
+/// MM's primary arena is also reachable through
+/// [`AARCH64_STAGE1_TABLES_ALIAS_BASE`]. Only meaningful on the guest (EL1),
+/// where the pool is mapped.
 #[must_use]
-pub const fn stage1_table_view() -> (*mut core::sync::atomic::AtomicU64, u64, usize) {
-    (
-        AARCH64_STAGE1_TABLE_POOL_BASE as *mut core::sync::atomic::AtomicU64,
-        AARCH64_STAGE1_TABLE_POOL_BASE,
-        AARCH64_STAGE1_TABLE_POOL_SIZE as usize,
-    )
+pub const fn stage1_table_pool_window() -> carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
+    carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
+        words: AARCH64_STAGE1_TABLE_POOL_BASE as *mut core::sync::atomic::AtomicU64,
+        physical_base: AARCH64_STAGE1_TABLE_POOL_BASE,
+        byte_len: AARCH64_STAGE1_TABLE_POOL_SIZE as usize,
+    }
 }
 
 /// Canonical accessible user address used when adopting a live AArch64 table
