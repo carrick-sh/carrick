@@ -162,6 +162,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "childrusage": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "childsubreaper": {
     "class": "conformance",
     "excluded": false,

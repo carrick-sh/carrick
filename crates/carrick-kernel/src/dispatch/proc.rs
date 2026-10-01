@@ -3275,7 +3275,13 @@ impl<'a> ProcView<'a> {
                             memory.write_bytes(wstatus_addr.0, &exit.status().to_ne_bytes())?;
                         }
                         if rusage_addr.0 != 0 {
-                            let rusage = LinuxRusage::zeroed();
+                            let usage = exit.rusage();
+                            let rusage = super::time::rusage_from(
+                                u64::try_from(usage.user_time.as_micros()).unwrap_or(u64::MAX),
+                                u64::try_from(usage.system_time.as_micros()).unwrap_or(u64::MAX),
+                                0,
+                                0,
+                            );
                             memory.write_bytes(rusage_addr.0, rusage.abi_bytes())?;
                         }
                         return Ok(DispatchOutcome::Returned {
@@ -5069,6 +5075,131 @@ mod kernel_process_dispatch_tests {
                 lease,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn wait4_preserves_subtree_usage_and_charges_children_once() {
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_180);
+        let kernel = root.kernel();
+        let child = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+                "rusage child".into(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(61_181))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let grandchild = kernel
+            .reserve_fork(
+                &child,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+                "rusage grandchild".into(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(61_182))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        child.thread().charge_user_ns(30_000_000);
+        child.thread().charge_system_ns(2_000_000);
+        grandchild.thread().charge_user_ns(20_000_000);
+        grandchild.thread().charge_system_ns(3_000_000);
+        let child_id = child.task().key().id;
+        let grandchild_id = grandchild.task().key().id;
+        kernel
+            .exit_task(
+                grandchild_id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        kernel
+            .wait_child(
+                child_id,
+                Some(grandchild_id),
+                crate::kernel::WaitMode::Consume,
+            )
+            .unwrap();
+        assert_eq!(child.task().children_cpu_us(), (20_000, 3_000));
+        kernel
+            .exit_task(
+                child_id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(root.task().children_cpu_us(), (0, 0));
+        kernel
+            .wait_child(
+                root.task().key().id,
+                Some(child_id),
+                crate::kernel::WaitMode::Observe,
+            )
+            .unwrap();
+        assert_eq!(root.task().children_cpu_us(), (0, 0));
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAIT4,
+                [child_id.raw() as u64, 0, 0, 0x1000, 0, 0]
+            ),
+            DispatchOutcome::Returned {
+                value: i64::from(child_id.raw())
+            }
+        );
+        let user_usec =
+            i64::from_ne_bytes(memory.read_bytes(0x1008, 8).unwrap().try_into().unwrap());
+        assert_eq!(
+            user_usec, 50_000,
+            "wait4 must retain child plus reaped grandchild CPU"
+        );
+        let system_usec =
+            i64::from_ne_bytes(memory.read_bytes(0x1018, 8).unwrap().try_into().unwrap());
+        assert_eq!(system_usec, 5_000);
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                165,
+                [LINUX_RUSAGE_CHILDREN as u64, 0x1000, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            i64::from_ne_bytes(memory.read_bytes(0x1008, 8).unwrap().try_into().unwrap()),
+            50_000
+        );
+        assert_eq!(
+            i64::from_ne_bytes(memory.read_bytes(0x1018, 8).unwrap().try_into().unwrap()),
+            5_000
+        );
+        assert_eq!(root.task().children_cpu_us(), (50_000, 5_000));
+        assert!(matches!(
+            kernel
+                .wait_child(
+                    root.task().key().id,
+                    Some(child_id),
+                    crate::kernel::WaitMode::Consume
+                )
+                .unwrap(),
+            crate::kernel::WaitOutcome::NoChild
+        ));
+        assert_eq!(root.task().children_cpu_us(), (50_000, 5_000));
     }
 
     fn siginfo_i32(memory: &LinearMemory, offset: u64) -> i32 {
