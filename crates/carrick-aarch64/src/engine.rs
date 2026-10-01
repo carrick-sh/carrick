@@ -2674,6 +2674,27 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         true
     }
 
+    /// The bytes of `[address + offset, ..)` up to the page end when that
+    /// page reads as fresh zero to the host: its live leaf names no output
+    /// and the exact-MM authority answers that it is an untouched, readable
+    /// page of a delegated reservation. A host read needs no frame for it.
+    fn fresh_zero_chunk(&self, address: u64, offset: usize, total_len: usize) -> Option<usize> {
+        let va = address.checked_add(u64::try_from(offset).ok()?)?;
+        let page_left = (0x1000 - (va & 0xfff)) as usize;
+        let len = total_len.checked_sub(offset)?.min(page_left);
+        let (_, walk) = self.diagnostic_fault_page_tables(va)?;
+        if !carrick_mmu_core::aarch64::terminal_descriptor_is_absent(
+            carrick_mmu_core::aarch64::terminal_descriptor(walk),
+        ) {
+            return None;
+        }
+        self.vm
+            .frame_cow_authority()?
+            .host_read_sees_fresh_zero(va & !0xfff)
+            .ok()?
+            .then_some(len)
+    }
+
     /// Host copyout does not take the EL0 translation fault that normally
     /// validates a prepared EL1-private leaf. Publish each touched page through
     /// the exact-MM resident-fault authority before resolving its backing.
@@ -2689,6 +2710,34 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let end = address
             .checked_add(length as u64)
             .ok_or(MemoryError::OutOfBounds { address, length })?;
+        // A never-touched page of a delegated reservation has no frame yet:
+        // back each contiguous absent run with ONE call into the exact-MM
+        // grant service (the grants an EL0 first touch of it would get),
+        // before the prepared-page commit below publishes what it prepared.
+        if let Some(authority) = self.vm.frame_cow_authority() {
+            serve_absent_copyout_runs(
+                self,
+                address,
+                end,
+                |engine, page| {
+                    engine
+                        .diagnostic_fault_page_tables(page)
+                        .map(|(_, walk)| carrick_mmu_core::aarch64::terminal_descriptor(walk))
+                        .is_some_and(carrick_mmu_core::aarch64::terminal_descriptor_is_absent)
+                },
+                |engine, start, len| {
+                    authority
+                        .grant_for_host_copyout(
+                            start,
+                            len,
+                            &mut crate::descriptor_drain::EngineGrantVenue(&mut *engine),
+                        )
+                        .map_err(|error| {
+                            MemoryError::HostMap(format!("host copyout grant: {error}"))
+                        })
+                },
+            )?;
+        }
         let mut page = address & !4095;
         while page < end {
             let descriptor = |engine: &Self| {
@@ -2788,6 +2837,36 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             })?;
         Ok((va, ipa, len))
     }
+}
+
+/// Serve the absent pages of a host copyout of `[address, end)`: one
+/// `grant` call per maximal contiguous run of pages `is_absent` names,
+/// never one per page, and never a second call for a run already asked.
+fn serve_absent_copyout_runs<C: ?Sized, E>(
+    ctx: &mut C,
+    address: u64,
+    end: u64,
+    is_absent: impl Fn(&C, u64) -> bool,
+    mut grant: impl FnMut(&mut C, u64, u64) -> Result<bool, E>,
+) -> Result<(), E> {
+    const PAGE: u64 = 4096;
+    let mut page = address & !(PAGE - 1);
+    while page < end {
+        if !is_absent(ctx, page) {
+            page = page.saturating_add(PAGE);
+            continue;
+        }
+        let mut run_end = page.saturating_add(PAGE);
+        while run_end < end && is_absent(ctx, run_end) {
+            run_end = run_end.saturating_add(PAGE);
+        }
+        // Whatever the service backed (all of the run, or none of it), the
+        // run has had its one call; a page it declined stays absent and the
+        // copy path answers it.
+        grant(ctx, page, run_end - page)?;
+        page = run_end;
+    }
+    Ok(())
 }
 
 /// Name a non-MaintenanceDone exit for the EL1-maintenance error path (the
@@ -2946,7 +3025,16 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut out = vec![0u8; length];
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
+            let (va, ipa, chunk_len) = match self.syscall_buffer_chunk(address, copied, length) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    // `out` is already zero.
+                    copied += self
+                        .fresh_zero_chunk(address, copied, length)
+                        .ok_or(error)?;
+                    continue;
+                }
+            };
             let bytes = match self.vm.translated_read(va, ipa.raw(), chunk_len) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -2989,7 +3077,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
+            let (va, ipa, chunk_len) = match self.syscall_buffer_chunk(address, copied, length) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let zero = self
+                        .fresh_zero_chunk(address, copied, length)
+                        .ok_or(error)?;
+                    dst[copied..copied + zero].fill(0);
+                    copied += zero;
+                    continue;
+                }
+            };
             if let Err(error) =
                 self.vm
                     .translated_read_into(va, ipa.raw(), &mut dst[copied..copied + chunk_len])
@@ -5664,6 +5762,54 @@ unsafe impl<V: Aarch64Vmm> Send for Aarch64EngineCore<V> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Budget: a host copyout calls the grant service once per maximal
+    /// contiguous absent run, whatever the run's length, and never for a
+    /// present page. Adversarial rows: alternating pages, a run touching the
+    /// copyout's end, an unaligned copyout start, and a service that
+    /// declines (the run is still asked once).
+    #[test]
+    fn host_copyout_asks_the_grant_service_once_per_absent_run() {
+        const PAGE: u64 = 4096;
+        struct Pages {
+            absent: std::collections::BTreeSet<u64>,
+            calls: Vec<(u64, u64)>,
+            decline: bool,
+        }
+        let rows: &[(&[u64], u64, u64, &[(u64, u64)])] = &[
+            (&[], 0, 8, &[]),
+            (&[0, 1, 2, 3, 4, 5, 6, 7], 0, 8, &[(0, 8)]),
+            (&[0, 2, 4, 6], 0, 8, &[(0, 1), (2, 1), (4, 1), (6, 1)]),
+            (&[3, 4, 5, 6, 7, 8, 9], 0, 8, &[(3, 5)]),
+            (&[1, 2, 5], 1, 6, &[(1, 2), (5, 1)]),
+        ];
+        for decline in [false, true] {
+            for &(absent, first, last, expected) in rows {
+                let mut pages = Pages {
+                    absent: absent.iter().map(|page| page * PAGE).collect(),
+                    calls: Vec::new(),
+                    decline,
+                };
+                serve_absent_copyout_runs(
+                    &mut pages,
+                    first * PAGE + 17,
+                    last * PAGE,
+                    |pages, page| pages.absent.contains(&page),
+                    |pages, start, len| {
+                        pages.calls.push((start / PAGE, len / PAGE));
+                        if !pages.decline {
+                            for page in (start..start + len).step_by(PAGE as usize) {
+                                pages.absent.remove(&page);
+                            }
+                        }
+                        Ok::<bool, ()>(!pages.decline)
+                    },
+                )
+                .unwrap();
+                assert_eq!(pages.calls, expected, "absent={absent:?} decline={decline}");
+            }
+        }
+    }
 
     fn continuation() -> carrick_hal::threaded::Aarch64SyscallContinuationV1 {
         carrick_hal::threaded::Aarch64SyscallContinuationV1 {
