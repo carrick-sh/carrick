@@ -751,8 +751,10 @@ impl Twin {
 }
 
 /// Every fault-planning answer for `pages`: the trap classifier, the
-/// first-touch plan and the bulk frame-grant plan.
-type FaultAnswer = (bool, Option<u64>, Option<(u64, u64, u64)>);
+/// first-touch plan and whether a bulk frame grant covers the page, at
+/// which protection. The grant's extent is not compared: a root's grant
+/// also stocks its holes (`delegated_first_touch_stock_*`).
+type FaultAnswer = (bool, Option<u64>, Option<u64>);
 
 fn fault_answers(dispatcher: &SyscallDispatcher, pages: &[u64]) -> Vec<FaultAnswer> {
     pages
@@ -762,7 +764,8 @@ fn fault_answers(dispatcher: &SyscallDispatcher, pages: &[u64]) -> Vec<FaultAnsw
                 dispatcher.fault_requires_mm_mutation(page),
                 dispatcher.with_resident_fault_plan_for_test(page, |plan| plan.prot()),
                 dispatcher.with_resident_frame_grant_plan_for_test(page, 4 * PAGE, |plan| {
-                    (plan.start(), plan.len(), plan.prot())
+                    assert!(plan.start() <= page && page < plan.start() + plan.len());
+                    plan.prot()
                 }),
             )
         })
@@ -3074,6 +3077,8 @@ fn delegated_frame_grant_span_carries_pristine_provenance() {
     let grant_is_pristine = |dispatcher: &SyscallDispatcher, page: u64| {
         let (start, len) = dispatcher
             .with_resident_frame_grant_plan_for_test(page, 4 * PAGE, |plan| {
+                // What the runtime does right before preparing the backing.
+                dispatcher.adopt_frame_grant_provenance(&plan);
                 (plan.start(), plan.len())
             })
             .expect("an untouched anonymous page has a bulk grant plan");
@@ -3131,4 +3136,109 @@ fn delegated_fork_twin_keeps_pristine_provenance_of_untouched_root_pages() {
         "the twin's untouched root pages are fresh zero"
     );
     assert!(!pristine(base, PAGE), "a touched page is never pristine");
+}
+
+const STOCK_WINDOW: u64 = 16 * PAGE;
+
+fn stock_span(dispatcher: &SyscallDispatcher, page: u64) -> Option<(u64, u64, bool)> {
+    dispatcher.with_resident_frame_grant_plan_for_test(page, STOCK_WINDOW, |plan| {
+        (plan.start(), plan.len(), plan.root_owned())
+    })
+}
+
+/// Contract `kernel.el1.anonymous-reservations` (first-touch stock): a
+/// root-owned first touch grants its whole aligned window, holes included,
+/// so later guest-venue mmaps there find backing already prepared. A hole
+/// is never itself a fault target.
+#[test]
+fn delegated_first_touch_stock_covers_the_roots_holes_in_the_window() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base + 2 * PAGE),
+        PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    // The faulting node and the holes of its half window: never a whole
+    // block of stock.
+    assert_eq!(
+        stock_span(&dispatcher, base + 2 * PAGE),
+        Some((base, STOCK_WINDOW / 2, true))
+    );
+    assert_eq!(stock_span(&dispatcher, base + 5 * PAGE), None);
+}
+
+/// First-touch stock never covers another node (other protection), a
+/// resident page, or an owed return the host has not reconciled.
+#[test]
+fn delegated_first_touch_stock_stops_at_nodes_resident_pages_and_owed_returns() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    let rw = ReservationProtection::READ_WRITE;
+    // An owed return at page 1, the faulting node at pages 4-5 (page 4
+    // touched), a read-only node at page 8.
+    root.guest_mmap(Placement::Fixed(base + PAGE), PAGE, rw)
+        .unwrap();
+    root.guest_munmap_resident(base + PAGE, PAGE);
+    root.guest_mmap(Placement::Fixed(base + 4 * PAGE), 2 * PAGE, rw)
+        .unwrap();
+    root.guest_mmap(Placement::Fixed(base + 8 * PAGE), PAGE, READ)
+        .unwrap();
+    dispatcher.with_resident_fault_plan_for_test(base + 4 * PAGE, |plan| {
+        dispatcher.commit_resident_fault(plan)
+    });
+    assert_eq!(
+        stock_span(&dispatcher, base + 5 * PAGE),
+        Some((base + 5 * PAGE, 3 * PAGE, true))
+    );
+    assert_eq!(
+        stock_span(&dispatcher, base + 4 * PAGE),
+        None,
+        "a resident page is never granted again"
+    );
+}
+
+/// Unused first-touch stock is what a reconciliation returns: the root's
+/// holes under this MM's live grants, never a node's backing nor another
+/// MM's grant.
+#[test]
+fn delegated_unused_first_touch_stock_is_the_roots_holes_under_live_grants() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    let rw = ReservationProtection::READ_WRITE;
+    root.guest_mmap(Placement::Fixed(base + 2 * PAGE), 2 * PAGE, rw)
+        .unwrap();
+    let table = Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
+    let grant = |mm_key, semantic_base, len| carrick_el1_abi::FrameGrantResidencyIdentity {
+        mm_key,
+        semantic_base,
+        physical_ipa: 0x9000_0000 + semantic_base,
+        len,
+        mapping_id: 17,
+        frame_id: 19,
+        owner_generation: 23,
+        inventory_revision: 29,
+    };
+    table.publish(grant(root.mm.raw(), base, 8 * PAGE)).unwrap();
+    table
+        .publish(grant(root.mm.raw() + 1, base + 8 * PAGE, 4 * PAGE))
+        .unwrap();
+    let stock: Vec<_> = dispatcher
+        .mem_view()
+        .first_touch_stock(&table)
+        .into_iter()
+        .map(|range| (range.start(), range.end()))
+        .collect();
+    assert_eq!(
+        stock,
+        vec![(base, base + 2 * PAGE), (base + 4 * PAGE, base + 8 * PAGE)]
+    );
+    // Once a mapping adopts a stocked hole it is no longer stock.
+    root.guest_mmap(Placement::Fixed(base + 4 * PAGE), 4 * PAGE, rw)
+        .unwrap();
+    assert_eq!(dispatcher.mem_view().first_touch_stock(&table).len(), 1);
 }
