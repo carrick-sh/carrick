@@ -548,6 +548,7 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::offset_of!(IpcOperation, orig_x0) as u64,
     core::mem::offset_of!(IpcOperation, handback) as u64,
     core::mem::offset_of!(IpcOperation, result) as u64,
+    core::mem::offset_of!(IpcOperation, deadline) as u64,
     IPC_HANDBACK_NR,
     core::mem::size_of::<RawOfdPin>() as u64,
     core::mem::size_of::<RawTableId>() as u64,
@@ -615,6 +616,12 @@ pub enum IpcOpKind {
     PipeWrite = 2,
     EventFdRead = 3,
     EventFdWrite = 4,
+    /// A blocking `epoll_pwait` parked on a zone epoll's `Readable` lane
+    /// (`object` is the epoll, `pin` its description). It owns no progress:
+    /// a resumed wait harvests afresh, a host continuation re-runs the
+    /// original call, and a signal interrupts it with EINTR whatever the
+    /// handler's `SA_RESTART` (epoll_wait(2) is never restarted).
+    EpollWait = 5,
 }
 
 /// Exact task key of the operation's owner (venue-defined, generation-bearing).
@@ -663,6 +670,27 @@ pub struct IpcOperation {
     pub handback: IpcHandback,
     /// The completed result for [`IpcHandback::Sigpipe`].
     pub result: i64,
+    /// An [`IpcOpKind::EpollWait`]'s absolute deadline on the guest's
+    /// virtual counter (`CNTVCT_EL0`), kept across wakes so a re-parked wait
+    /// sleeps only its remaining time. Unused by other kinds.
+    pub deadline: IpcCounterDeadline,
+}
+
+/// An absolute deadline on the guest virtual counter (`CNTVCT_EL0`), or
+/// [`IpcCounterDeadline::NONE`] for an untimed wait.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IpcCounterDeadline(u64);
+
+impl IpcCounterDeadline {
+    pub const NONE: Self = Self(0);
+    /// The deadline at counter value `cntvct` (never the untimed value).
+    pub const fn at(cntvct: u64) -> Self {
+        Self(if cntvct == 0 { 1 } else { cntvct })
+    }
+    pub const fn get(self) -> Option<u64> {
+        if self.0 == 0 { None } else { Some(self.0) }
+    }
 }
 
 /// Private call number of an EL1 handback frame (`x0` = the packed raw
@@ -726,6 +754,7 @@ impl IpcOperation {
         nr: 0,
         handback: IpcHandback::None,
         result: 0,
+        deadline: IpcCounterDeadline::NONE,
     };
 }
 

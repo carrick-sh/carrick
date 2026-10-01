@@ -1,4 +1,4 @@
-2318e7bea0b9831a
+d146a28f485a1ab6
 zero_rc=0
 zero_prompt=true
 finite_rc=0
@@ -6,6 +6,12 @@ finite_waited=true
 finite_bounded=true
 empty_set_rc=0
 empty_set_waited=true
+finite_woken_rc=1
+finite_woken_errno=0
+finite_woken_data=42
+finite_woken_early=true
+finite_woken_posted=true
+finite_woken_drained=true
 infinite_rc=1
 infinite_errno=0
 infinite_data=42

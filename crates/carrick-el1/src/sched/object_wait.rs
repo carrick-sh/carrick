@@ -50,9 +50,32 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             .snapshot())
     }
 
+    /// Whether a park of the running thread may carry a deadline: only the
+    /// thread the host loaded on this slot parks into its home record, the
+    /// one record whose timer the host takes over when it settles the slot
+    /// ([`carrick_sched_core::ZoneTables::unhome`]).
+    pub fn may_time_park(&self) -> bool {
+        let s = self.zone.slot(self.slot);
+        match s.current() {
+            None => true,
+            Some(current) => s.host_record() == Some(current),
+        }
+    }
+
+    /// Whether the switched-in record's last object park ended at its
+    /// deadline (read after taking its operation token).
+    pub fn object_wait_expired(&self) -> bool {
+        self.zone
+            .slot(self.slot)
+            .current()
+            .is_some_and(|record| self.zone.record(record).object_wait_expired())
+    }
+
     /// Save and park a pending operation without switching while any caller
     /// lock might still be live. On Changed the caller rechecks the object;
     /// no bytes may be replayed, and the returned token remains its property.
+    /// `deadline` (`CNTVCT`) bounds the park on this slot's timer; only a
+    /// park [`Self::may_time_park`] allows may carry one (else `Occupied`).
     pub fn park_object(
         &mut self,
         frame: &TrapFrame,
@@ -60,8 +83,12 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         snapshot: ObjectWaitSnapshot,
         resume: OperationResumePc,
         operation: OperationToken,
+        deadline: Option<u64>,
     ) -> Result<ObjectParked<'a>, (ObjectWaitError, OperationToken)> {
         let zone = self.zone;
+        if deadline.is_some() && !self.may_time_park() {
+            return Err((ObjectWaitError::Occupied, operation));
+        }
         let guard = match zone.object_wait(key, &BoundedSpin(EL1_ZONE_LOCK_SPINS)) {
             Ok(guard) => guard,
             Err(error) => return Err((error, operation)),
@@ -77,12 +104,19 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         let ctx = unsafe { zone.record(record).ctx_mut() };
         self.cpu.save(frame, ctx);
         ctx.pc = resume.0;
-        if let Err(error) = guard.park(snapshot, record, operation) {
+        // The park's sequence (the one `park_until` publishes).
+        let seq = zone.next_seq(record);
+        if let Err(error) = guard.park_until(snapshot, record, operation, deadline.unwrap_or(0)) {
             drop(guard);
             if fresh {
                 zone.discard_unpublished(self.slot, record);
             }
             return Err(error);
+        }
+        if deadline.is_some() {
+            // A notification that claimed it already leaves a stale timer,
+            // which `timer_deadline` drops.
+            zone.arm_timer(self.slot, record, seq);
         }
         drop(guard);
         zone.clear_current(self.slot);

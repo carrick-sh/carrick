@@ -714,6 +714,8 @@ pub(super) enum IpcHandbackRoute {
     /// The call is complete with this outcome (SIGPIPE already marked).
     Complete(DispatchOutcome),
     /// The call took no effect: dispatch the original call on the host path.
+    /// A timed epoll wait's timeout argument (`x3`) was already rewritten
+    /// to what is left of its deadline ([`restart_with_remaining`]).
     Restart,
     /// The call must keep waiting: park the thread with its owned operation.
     Park(IpcPark),
@@ -797,7 +799,34 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
             .map_err(|error| ipc_error("IPC owner", error))?,
     )
     .map_err(|error| ipc_error("handback completion", error))?;
+    restart_with_remaining(engine, Some(request), &outcome)?;
     ipc_route(&kernel.dispatcher, context, tid, outcome, snapshots)
+}
+
+/// A timed epoll wait re-runs with what is left of its deadline: rewrite
+/// its timeout argument (`x3`) in the vCPU and, for a call the host is about
+/// to dispatch, in `request`, so the re-run never waits the full original
+/// timeout again.
+fn restart_with_remaining<E: ThreadedEngine>(
+    engine: &mut E,
+    request: Option<&mut SyscallRequest>,
+    outcome: &host_ipc::IpcHostOutcome,
+) -> Result<(), RuntimeError> {
+    let host_ipc::IpcHostOutcome::Restart {
+        timeout_ms: Some(timeout_ms),
+        ..
+    } = *outcome
+    else {
+        return Ok(());
+    };
+    let x3 = timeout_ms as u32 as u64;
+    engine
+        .set_reg(carrick_hal::Reg::X(3), x3)
+        .map_err(|error| ipc_error("restore x3", error))?;
+    if let Some(request) = request {
+        request.args.0[3] = x3;
+    }
+    Ok(())
 }
 
 fn ipc_route(
@@ -957,6 +986,8 @@ where
                 .map_err(|error| ipc_error("IPC owner", error))?,
         )
         .map_err(|error| ipc_error("continuation", error))?;
+        // Re-entered at the SVC, the re-run reads its timeout from x3.
+        restart_with_remaining(engine, None, &outcome)?;
         let context = self
             .kernel
             .dispatcher
@@ -1011,6 +1042,19 @@ where
         }
     }
 
+    /// Whether this job's task is stopped by job control (a default-action
+    /// stop signal took effect and no SIGCONT followed yet).
+    fn job_control_stopped(&self) -> bool {
+        self.kernel
+            .dispatcher
+            .capture_kernel_context(self.state.linux_tid)
+            .is_ok_and(|context| {
+                context
+                    .kernel()
+                    .task_is_job_control_stopped(context.task().key().id)
+            })
+    }
+
     /// A zone record holding an IPC operation was loaded from its record
     /// (the thread is at its SVC with the original registers): decide the
     /// operation by how the wait ended. `Some(exit)`: it parked again.
@@ -1040,19 +1084,41 @@ where
             ]),
         );
         let cause = match handback {
-            Some(Handback::Signal) => {
-                // SA_RESTART of the handler about to run (signal(7)).
-                let restart = reserved.is_some_and(|signal| {
+            Some(Handback::Signal) => Some(match reserved {
+                // What the signal will do decides the interruption: a handler
+                // (its SA_RESTART), a default stop (man 7 signal: some calls
+                // fail with EINTR after SIGCONT, others continue), or nothing.
+                Some(signal) => {
                     let action = signal.action();
-                    action.sa_handler != carrick_abi::LINUX_SIG_DFL
-                        && action.sa_handler != carrick_abi::LINUX_SIG_IGN
-                        && action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0
-                });
-                Some(host_ipc::IpcCause::Signal { restart })
-            }
-            Some(Handback::Control | Handback::Timeout | Handback::Cancelled) => {
-                Some(host_ipc::IpcCause::Control)
-            }
+                    match carrick_kernel::kernel::evaluate_signal_delivery_action(
+                        signal.signum(),
+                        action,
+                    ) {
+                        carrick_kernel::kernel::SignalDeliveryAction::Handler { .. } => {
+                            host_ipc::IpcCause::Signal {
+                                restart: action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0,
+                            }
+                        }
+                        carrick_kernel::kernel::SignalDeliveryAction::Stop => {
+                            host_ipc::IpcCause::Stop
+                        }
+                        carrick_kernel::kernel::SignalDeliveryAction::Ignore => {
+                            host_ipc::IpcCause::Control
+                        }
+                        carrick_kernel::kernel::SignalDeliveryAction::Terminate => {
+                            host_ipc::IpcCause::Signal { restart: false }
+                        }
+                    }
+                }
+                None => host_ipc::IpcCause::Signal { restart: false },
+            }),
+            // The deadline of a timed park (an epoll wait) the host kept
+            // after it settled the slot.
+            Some(Handback::Timeout) => Some(host_ipc::IpcCause::Timeout),
+            // A control quantum for a job-control stop is a stop; the rest
+            // (exec/exit drain, quiesce) never interrupt a call.
+            Some(Handback::Control) if self.job_control_stopped() => Some(host_ipc::IpcCause::Stop),
+            Some(Handback::Control | Handback::Cancelled) => Some(host_ipc::IpcCause::Control),
             Some(Handback::Woken | Handback::Resumed) => None,
             Some(Handback::Service) | None => {
                 return Err(RuntimeError::Configuration(format!(
@@ -1071,6 +1137,7 @@ where
                         .map_err(|error| ipc_error("IPC owner", error))?,
                 )
                 .map_err(|error| ipc_error("interrupt", error))?;
+                restart_with_remaining(engine, None, &outcome)?;
                 let context = self
                     .kernel
                     .dispatcher

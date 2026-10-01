@@ -42,6 +42,42 @@ pub trait IpcHostServices {
     /// object's guest waiters on the advanced lanes, and its host
     /// subscribers when the publication owed them (`host_owed`).
     fn wake(&self, wake: IpcWake);
+    /// The guest virtual counter now (an epoll wait's deadline is on it).
+    fn counter(&self) -> CounterClock {
+        CounterClock::host()
+    }
+}
+
+/// A reading of the guest virtual counter (`CNTVCT_EL0`) with its tick
+/// scale. On the host the counter is the host's monotonic tick (no offset),
+/// the same reading EL1 takes deadlines on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CounterClock {
+    /// Counter value now.
+    pub now: u64,
+    /// Nanoseconds per tick, as `numer / denom`.
+    pub numer: u64,
+    pub denom: u64,
+}
+
+impl CounterClock {
+    pub fn host() -> Self {
+        let scale = carrick_host::clock::tick_scale()
+            .unwrap_or(carrick_host::clock::TickScale { numer: 1, denom: 1 });
+        Self {
+            now: carrick_host::clock::monotonic_ticks(),
+            numer: u64::from(scale.numer),
+            denom: u64::from(scale.denom.max(1)),
+        }
+    }
+
+    /// Whole milliseconds left until `deadline`, rounded up so a re-run
+    /// never ends before it; 0 once it has passed.
+    pub fn remaining_ms(self, deadline: u64) -> i32 {
+        let ticks = deadline.saturating_sub(self.now);
+        let ns = u128::from(ticks) * u128::from(self.numer) / u128::from(self.denom.max(1));
+        i32::try_from(ns.div_ceil(1_000_000)).unwrap_or(i32::MAX)
+    }
 }
 
 /// The production completion owner and scheduler's host placement for object
@@ -199,8 +235,16 @@ pub fn lane_snapshots(
 pub enum IpcCause {
     /// A signal whose handler will run; `restart` is its `SA_RESTART`.
     Signal { restart: bool },
-    /// A control action (job-control stop, exec/exit drain).
+    /// A job-control stop (a default-action stop signal), after which the
+    /// thread continues on `SIGCONT` with no handler run.
+    Stop,
+    /// A control action that never returns to the guest (exec, exit or
+    /// group-exit drain) or one Linux does not count as an interruption (a
+    /// quiesce, an ignored signal).
     Control,
+    /// The park's deadline passed while the host kept it (only an
+    /// [`IpcOpKind::EpollWait`] parks with one).
+    Timeout,
 }
 
 /// What the host does with the thread after completing its operation.
@@ -209,8 +253,15 @@ pub enum IpcHostOutcome {
     /// Return `result` after the SVC; `sigpipe` requests SIGPIPE too.
     Complete { result: i64, sigpipe: bool },
     /// No effect was taken: resume at the SVC with the original `x0` and
-    /// syscall number (the call runs again).
-    Restart { x0: u64, nr: u32 },
+    /// syscall number (the call runs again). `timeout_ms`: a timed epoll
+    /// wait re-runs with what is left of its deadline as its timeout
+    /// argument (`x3`), never the full original timeout; 0 once it passed
+    /// (one more harvest, then 0 events).
+    Restart {
+        x0: u64,
+        nr: u32,
+        timeout_ms: Option<i32>,
+    },
     /// Still waiting on `lane`: park the thread with `token` (resumption at
     /// the SVC; EL1 or the host takes the token before any fd lookup).
     Blocked {
@@ -232,8 +283,40 @@ pub fn take_handback(
     Ok((token, op))
 }
 
-/// The outcome of stopping `op` for `cause` (pure policy).
-pub fn interrupted(op: &IpcOperation, cause: IpcCause) -> IpcHostOutcome {
+/// Re-run a parked epoll wait with what is left of its wait.
+fn epoll_rerun(op: &IpcOperation, clock: CounterClock) -> IpcHostOutcome {
+    IpcHostOutcome::Restart {
+        x0: op.orig_x0,
+        nr: op.nr,
+        timeout_ms: op
+            .deadline
+            .get()
+            .map(|deadline| clock.remaining_ms(deadline)),
+    }
+}
+
+/// The outcome of stopping `op` for `cause` at counter reading `clock`
+/// (pure policy).
+pub fn interrupted(op: &IpcOperation, cause: IpcCause, clock: CounterClock) -> IpcHostOutcome {
+    if op.kind == IpcOpKind::EpollWait {
+        // epoll_wait(2) is never restarted after a handler, SA_RESTART or
+        // not, and a stop followed by SIGCONT interrupts it too, with no
+        // handler (man 7 signal, the Linux-specific list). Other control
+        // actions re-run it with what is left of its deadline (no event was
+        // taken).
+        return match cause {
+            IpcCause::Signal { .. } | IpcCause::Stop => IpcHostOutcome::Complete {
+                result: LINUX_EINTR.guest_retval(),
+                sigpipe: false,
+            },
+            IpcCause::Control => epoll_rerun(op, clock),
+            // The timeout elapsed with nothing reported.
+            IpcCause::Timeout => IpcHostOutcome::Complete {
+                result: 0,
+                sigpipe: false,
+            },
+        };
+    }
     let written = op.progress.written;
     if written > 0 {
         return IpcHostOutcome::Complete {
@@ -246,9 +329,16 @@ pub fn interrupted(op: &IpcOperation, cause: IpcCause) -> IpcHostOutcome {
             result: LINUX_EINTR.guest_retval(),
             sigpipe: false,
         },
-        IpcCause::Signal { restart: true } | IpcCause::Control => IpcHostOutcome::Restart {
+        // A read/write never parks with a deadline: a timeout claim is a
+        // control action for it. A stop is not in man 7 signal's list for
+        // read/write: after SIGCONT the call continues (here: re-runs).
+        IpcCause::Signal { restart: true }
+        | IpcCause::Stop
+        | IpcCause::Control
+        | IpcCause::Timeout => IpcHostOutcome::Restart {
             x0: op.orig_x0,
             nr: op.nr,
+            timeout_ms: None,
         },
     }
 }
@@ -287,7 +377,7 @@ pub fn interrupt(
     wake: &impl IpcHostServices,
 ) -> Result<IpcHostOutcome, IpcError> {
     let op = finish(region, token, wake)?;
-    Ok(interrupted(&op, cause))
+    Ok(interrupted(&op, cause, wake.counter()))
 }
 
 /// Most bytes one host step can move (the largest pipe capacity).
@@ -388,6 +478,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
             return Ok(IpcHostOutcome::Restart {
                 x0: op.orig_x0,
                 nr: op.nr,
+                timeout_ms: None,
             });
         }
         IpcHandback::Continue => {}
@@ -399,6 +490,14 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     }
     if let Some(cause) = signal {
         return interrupt(region, token, cause, wake);
+    }
+    if op.kind == IpcOpKind::EpollWait {
+        // A parked zone epoll wait owns no progress: the host runs the
+        // original call (its harvest covers both halves) with what is left
+        // of its deadline, so a wake that found nothing never extends it.
+        let clock = wake.counter();
+        let op = finish(region, token, wake)?;
+        return Ok(epoll_rerun(&op, clock));
     }
     let object = IpcObjectHandle::from_raw(op.object);
     let nonblock = {

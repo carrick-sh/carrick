@@ -2458,10 +2458,20 @@ pub enum IpcLeave {
     SigpipeHandback,
     /// A description replaced by a host-backed one since the snapshot.
     Restart,
+    /// `epoll_pwait` with a signal mask: the host swaps the mask.
+    EpollSigmask,
+    /// `epoll_pwait` on a set with host-half items: the host harvests both.
+    EpollHostItems,
+    /// `epoll_pwait` with a finite timeout and nothing ready: the host waits
+    /// with its deadline.
+    EpollTimedWait,
+    /// The harvested events could not be copied out: the items are
+    /// restored and the host resolves the fault.
+    EpollCopyOut,
 }
 
 impl IpcLeave {
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 23;
 }
 
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.

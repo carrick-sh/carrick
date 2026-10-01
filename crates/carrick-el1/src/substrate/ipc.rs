@@ -198,7 +198,8 @@ pub fn transfer<U: UserCopy>(
                 Err(e) => blocked_or(e)?,
             }
         }
-        IpcOpKind::None => return Err(IpcError::Corrupt),
+        // An epoll wait moves no bytes: it is never transferred.
+        IpcOpKind::None | IpcOpKind::EpollWait => return Err(IpcError::Corrupt),
     };
     Ok((status, wake))
 }
