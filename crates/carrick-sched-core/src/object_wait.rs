@@ -718,7 +718,12 @@ mod host_tests {
 
     #[test]
     fn el1_ipc_wait_host_wake_races_signal_control_once() {
-        for kind in [Handback::Signal, Handback::Control, Handback::Cancelled] {
+        for kind in [
+            Handback::Signal,
+            Handback::Control,
+            Handback::Cancelled,
+            Handback::GroupStop,
+        ] {
             let zone = fixture(true);
             let records: Vec<_> = (1..=64).map(|tid| park(&zone, 1, tid)).collect();
             let barrier = Barrier::new(2);
@@ -969,6 +974,41 @@ mod host_tests {
         assert_eq!(notify(&zone, 1).0.queued, 1);
         assert_eq!(zone.take_foreign_timer(SLOT), None);
         assert!(zone.timer_free(SLOT));
+    }
+
+    #[test]
+    fn group_stop_survives_deferred_handback_but_preserves_completed_results() {
+        for completed in [false, true] {
+            let zone = fixture(true);
+            let record = park(&zone, 1, 1);
+            notify(&zone, 1);
+            assert_eq!(zone.switch_in(SLOT), Some(record));
+            let exact = zone.record_ref(record);
+            assert_eq!(
+                zone.claim_for_host(exact, None, Handback::GroupStop, &SpinForever),
+                HostClaim::El1Held { slot: SLOT }
+            );
+            // A later ordinary control nudge cannot erase the stop cause.
+            zone.claim_for_host(exact, None, Handback::Control, &SpinForever);
+            if completed {
+                // SAFETY: this slot owns the operation as its EL1 adapter.
+                unsafe {
+                    assert!(zone.record(record).take_object_operation().is_some());
+                }
+            }
+            assert_eq!(
+                zone.handback_current(SLOT, record),
+                crate::CurrentHandback::HandedBack
+            );
+            assert_eq!(
+                zone.record(record).handback(),
+                Some(if completed {
+                    Handback::Resumed
+                } else {
+                    Handback::GroupStop
+                })
+            );
+        }
     }
 
     #[test]

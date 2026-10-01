@@ -352,6 +352,9 @@ pub enum Handback {
     /// thread but never runs it at EL0: switching to it makes the vCPU leave
     /// for its executor, which loads the thread and serves it there.
     Service = 7,
+    /// The kernel published a group stop while this operation was blocked.
+    /// This is an owned handback reason, not a second job-control state.
+    GroupStop = 8,
 }
 
 impl Handback {
@@ -364,6 +367,7 @@ impl Handback {
             5 => Some(Self::Control),
             6 => Some(Self::Cancelled),
             7 => Some(Self::Service),
+            8 => Some(Self::GroupStop),
             _ => None,
         }
     }
@@ -482,8 +486,44 @@ impl IncarnationRequest {
     }
 }
 
+/// A host request carries its reason in the same incarnation-tagged word.
+/// Group-stop intent survives control nudges and delayed EL1 handback; a
+/// completed operation has no token and therefore ignores this request.
+#[repr(transparent)]
+struct HostRequest(AtomicU64);
+impl HostRequest {
+    fn publish(&self, incarnation: u64, kind: Handback) {
+        self.0
+            .fetch_max((incarnation << 4) | kind as u64, Ordering::SeqCst);
+    }
+    fn kind(&self, incarnation: u64) -> Option<Handback> {
+        let word = self.0.load(Ordering::SeqCst);
+        if incarnation != 0 && word >> 4 == incarnation {
+            Handback::from_raw((word & 15) as u32)
+        } else {
+            None
+        }
+    }
+    fn is_for(&self, incarnation: u64) -> bool {
+        self.kind(incarnation).is_some()
+    }
+    fn take(&self, incarnation: u64) -> Option<Handback> {
+        let word = self.0.load(Ordering::SeqCst);
+        if incarnation == 0 || word >> 4 != incarnation {
+            return None;
+        }
+        self.0
+            .compare_exchange(word, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .and_then(|word| Handback::from_raw((word & 15) as u32))
+    }
+    fn clear(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+}
+
 /// Incarnation-tagged host request encoding; included in the shared ABI hash.
-pub const HOST_REQUEST_PROTOCOL: u64 = 1;
+pub const HOST_REQUEST_PROTOCOL: u64 = 2;
 
 /// One parked thread. See the crate docs for the ownership protocol.
 #[repr(C, align(64))]
@@ -519,7 +559,7 @@ pub struct ZoneRecord {
     /// while EL1 held its record: the slot's executor hands it back at its
     /// next exit ([`ZoneTables::take_host_wanted`]) instead of leaving it
     /// queued.
-    host_wanted: IncarnationRequest,
+    host_wanted: HostRequest,
     /// CNTVCT deadline of the current park (0: untimed).
     deadline: AtomicU64,
     affinity: AtomicU64,
@@ -574,7 +614,14 @@ impl ZoneRecord {
     }
 
     pub fn handback(&self) -> Option<Handback> {
-        Handback::from_raw(self.handback.load(Ordering::Acquire))
+        if self.has_object_operation()
+            && !self.is_cancelled()
+            && self.host_wanted.kind(self.incarnation()) == Some(Handback::GroupStop)
+        {
+            Some(Handback::GroupStop)
+        } else {
+            Handback::from_raw(self.handback.load(Ordering::Acquire))
+        }
     }
 
     /// Whether resuming it needs its executor ([`Handback::Service`]), or
@@ -589,6 +636,7 @@ impl ZoneRecord {
                         self.handback(),
                         Some(
                             Handback::Signal
+                                | Handback::GroupStop
                                 | Handback::Control
                                 | Handback::Cancelled
                                 | Handback::Timeout
@@ -619,7 +667,7 @@ impl ZoneRecord {
     fn advance_incarnation(&self) -> bool {
         self.incarnation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_add(1)
+                value.checked_add(1).filter(|next| *next <= u64::MAX >> 4)
             })
             .is_ok()
     }
@@ -881,7 +929,7 @@ pub struct ZoneCounters {
     /// Threads the host woke.
     pub host_wakes: AtomicU64,
     /// Host claims of parked records, by [`Handback`] (index = raw value).
-    pub host_claims: [AtomicU64; 8],
+    pub host_claims: [AtomicU64; 9],
     /// Handbacks at an executor exit: records run in-guest (`Resumed`).
     pub reconcile_resumed: AtomicU64,
     /// Handbacks at an executor exit: woken records that had not run yet.
@@ -1125,11 +1173,19 @@ impl HostTransfer<'_> {
 
     fn publish(self) -> Option<RecordRef> {
         let rec = self.zone.record(self.record.id);
-        rec.host_wanted.clear();
         // Requests can only advance to host-requested and then cancelled;
         // each failed CAS therefore consumes one of those finite transitions.
         loop {
             let claim = rec.claim();
+            // Consume exactly the request observed here. A later request
+            // changes Transferring or stays visible on the host-owned record;
+            // it cannot be erased by a separate read followed by clear.
+            if rec.host_wanted.take(self.record.incarnation) == Some(Handback::GroupStop)
+                && rec.has_object_operation()
+            {
+                rec.handback
+                    .store(Handback::GroupStop as u32, Ordering::Release);
+            }
             match claim {
                 Claim::Transferring {
                     seq,
@@ -1599,7 +1655,6 @@ impl ZoneTables {
                     self.begin_host_transfer(identity, Claim::Queued { slot, seq })
             {
                 self.remove_locked(&guard, record);
-                rec.host_wanted.clear();
                 if rec.is_cancelled() {
                     rec.handback
                         .store(Handback::Cancelled as u32, Ordering::Release);
@@ -3503,6 +3558,9 @@ impl ZoneTables {
         wait: &impl LockWait,
     ) -> HostClaim {
         let rec = self.record(r.id);
+        if kind == Handback::GroupStop {
+            rec.host_wanted.publish(r.incarnation, kind);
+        }
         if kind == Handback::Cancelled {
             // Publish intent before observing ownership: a handback that
             // wins immediately after El1Held must already see cancellation.
@@ -3591,7 +3649,7 @@ impl ZoneTables {
                     };
                 }
                 Claim::OnCpu { slot, seq } | Claim::OnCpuRequested { slot, seq } => {
-                    rec.host_wanted.publish(r.incarnation);
+                    rec.host_wanted.publish(r.incarnation, kind);
                     if !rec.cas(claim, Claim::OnCpuRequested { slot, seq }) {
                         continue;
                     }

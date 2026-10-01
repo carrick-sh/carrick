@@ -15,6 +15,11 @@ futexes, poll/select and sleeps preserve their continuation. Socket eligibility
 requires the admitted SO_RCVTIMEO/SO_SNDTIMEO deadline, never an incidental
 reactor timer. Existing task-wake subscriptions provide notification; this
 adds no polling, redispatch while parked, or host-process authority.
+An actual group stop also claims exact thread-group EL1 zone records through
+an incarnation-tagged GroupStop handback request. The request is an owned
+wait disposition, not another stopped flag or stop epoch: TaskJobControl
+remains the authority. Its reason survives deferred handback and SIGCONT;
+a retired operation token preserves a result already completed in EL1.
 The two-thread VM-free binding exercises the real carrier wait service.
 Signed output is checked against predicted Linux output; the integration
 director owns Docker refresh and broader promotion. No timing acceptance or
@@ -22,6 +27,6 @@ structural meter completeness is claimed here.
 """
 
 [bindings]
-vm_free = "carrick-kernel::kernel::continuation::tests::group_stop_interrupts_epoll_sibling_but_preserves_pipe_wait"
+vm_free = "carrick-kernel::el1_zone::tests::serial_host_group_stop_claims_zone_wait_before_continue"
 embed = "probe:epollstopcont"
 docker = "probe:epollstopcont"
