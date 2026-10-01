@@ -6605,3 +6605,100 @@ fn blocking_eventfd_read_wakes_on_producer_write_after_enroll() {
 fn blocking_eventfd_read_wakes_on_producer_write_before_enroll() {
     blocking_eventfd_read_wakes_with(true);
 }
+
+#[test]
+fn group_stop_interrupts_epoll_sibling_but_preserves_pipe_wait() {
+    let (kernel, root) = bootstrap(153_799);
+    let plan = crate::kernel::ClonePlan::from_flags(
+        LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+    )
+    .expect("thread plan");
+    let sibling = kernel
+        .clone_thread(&root, plan, ThreadId::synthetic_for_tests(153_800), None)
+        .expect("sibling");
+    let generation = publish(&sibling, 0x799);
+    let make_wait = |nr| {
+        BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: Some(Duration::from_secs(5)),
+                sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
+            },
+            ContinuationCapture::new(&sibling, generation, request(nr), RestartClass::Never)
+                .expect("capture"),
+        )
+        .expect("wait")
+    };
+    let mut epoll = make_wait(carrick_abi::syscall::nr::EPOLL_PWAIT.raw());
+    let pipe = make_wait(carrick_abi::syscall::nr::READ.raw());
+    let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
+    let mut registration = service.prepare_registration(&epoll);
+    service
+        .enroll(&mut registration)
+        .expect("enroll sibling epoll");
+    let token = registration.wake_token();
+    epoll
+        .attach_registration(registration)
+        .expect("attach epoll");
+    let epoll_probe = SignalReadinessProbe::from_continuation(&epoll);
+    let pipe_probe = SignalReadinessProbe::from_continuation(&pipe);
+    let stop = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).unwrap();
+    let cont = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).unwrap();
+    assert!(kernel.stop_task_for_job_control(root.task().key().id, stop, None));
+    assert!(root.task().is_job_control_stopped());
+    assert!(kernel.post_signal_to_task(root.task().key().id, cont, None));
+    assert!(!root.task().is_job_control_stopped());
+    assert!(pipe_probe.event().is_none(), "pipe read must remain parked");
+    let event = epoll_probe
+        .event()
+        .expect("stop+continue must interrupt sibling epoll");
+    assert_eq!(
+        await_event_timeout(&service, token, Duration::from_secs(1)),
+        Some(Ok(event.clone()))
+    );
+    let result = epoll.resume(event, &sibling).expect("epoll resume");
+    assert_eq!(
+        result.completion,
+        ContinuationCompletion::Errno(LINUX_EINTR)
+    );
+    assert_eq!(result.restart(), RestartDecision::NoRestart);
+    assert_eq!(
+        pipe.resume(ContinuationEvent::Ready, &sibling)
+            .unwrap()
+            .completion,
+        ContinuationCompletion::Redispatch
+    );
+}
+
+#[test]
+fn group_stop_socket_policy_requires_an_admitted_socket_timeout() {
+    let (_kernel, context) = bootstrap(153_801);
+    let generation = publish(&context, 0x801);
+    for nr in [
+        carrick_abi::syscall::nr::RECVFROM,
+        carrick_abi::syscall::nr::SENDTO,
+    ] {
+        for timeout in [None, Some(Duration::from_secs(5))] {
+            let continuation = BlockedContinuation::from_dispatch_outcome(
+                DispatchOutcome::WaitOnFds {
+                    fds: WaitFds::empty(),
+                    timeout,
+                    sig_mask: WaitSigMask::NONE,
+                    completion: FdWaitCompletion::Fd {
+                        on_timeout: LINUX_EAGAIN.guest_retval(),
+                    },
+                },
+                ContinuationCapture::new(
+                    &context,
+                    generation,
+                    request(nr.raw()),
+                    RestartClass::Never,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(continuation.interrupts_on_group_stop(), timeout.is_some());
+        }
+    }
+}

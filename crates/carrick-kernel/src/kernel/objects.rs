@@ -38,13 +38,13 @@ pub use self::signal::{
     SignalWaitReservation, TaskPendingSignals, ThreadSignalState, evaluate_signal_delivery_action,
     is_default_ignore_signal, is_default_stop_signal,
 };
-pub use self::task::JobControlStopInvalidationGeneration;
 pub(in crate::kernel) use self::task::PreparedThreadSet;
 pub use self::task::{
     DumpableMode, ProcessKeyrings, RlimitSet, Task, TaskIdentity, TaskLifecycle,
     TaskParticipantError, TaskRef, TaskWakeEnrollment, TaskWakeSubscription, TaskWaker,
     ThreadResources,
 };
+pub use self::task::{JobControlStopInvalidationGeneration, JobControlWaitStopEpoch};
 pub(crate) use self::task::{PtraceMemoryAccessWitness, PtraceTextAccess, TaskJobControlEvent};
 pub use self::task::{
     PtraceSettlePrecheck, PtraceStopGeneration, PtraceStopRefusal, PtraceStopSettlement,
