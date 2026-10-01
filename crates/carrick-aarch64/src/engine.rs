@@ -54,8 +54,11 @@ pub fn asid_maintenance_bytes() -> Vec<u8> {
     carrick_mem::memory::el1_asid_maintenance_bytes()
 }
 
-/// Remove Carrick's HVPatch root/global-frame aperture from an AArch64
-/// stage-1 image before it is published for an HvPatch process.
+/// Close Carrick's HVPatch root/global-frame aperture to the guest in an
+/// AArch64 stage-1 image before it is published for an HvPatch process: the
+/// global-frame arena is unmapped, and the stage-1 table pool (every MM's
+/// root slot and extension arenas) is mapped EL1-only at its own address,
+/// which is EL1's view of every table it edits on the guest-owned lane.
 ///
 /// The operation is deterministic for an exec layout, so the HVF backend can
 /// bake it into its stage-1 layout. Initial root bring-up still applies it
@@ -63,12 +66,22 @@ pub fn asid_maintenance_bytes() -> Vec<u8> {
 pub fn reserve_hvpatch_process_apertures(
     manager: &mut PageTableManager,
 ) -> Result<PageTableApplyOutcome, PageTableError> {
-    manager.set_prot_none(
-        carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
-        (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
-            + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE) as usize,
+    let mut outcome = manager.set_prot_none(
+        carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+        carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE as usize,
         None,
-    )
+    )?;
+    let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+    if manager.map_kernel_data_aliased(
+        pool,
+        pool,
+        carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE,
+        None,
+    )? {
+        outcome.changed = true;
+        outcome.flush_required = true;
+    }
+    Ok(outcome)
 }
 
 /// Build the guest-owned lane's frame-grant publication: a Prepare
@@ -5957,7 +5970,7 @@ mod tests {
     }
 
     #[test]
-    fn hvpatch_process_aperture_reservation_removes_both_identity_ranges() {
+    fn hvpatch_process_aperture_reservation_closes_both_ranges_to_the_guest() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
         let mut manager = PageTableManager::new(
             bytes,
@@ -5984,10 +5997,22 @@ mod tests {
             manager.translate(carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE),
             None
         );
-        assert_eq!(
-            manager.translate(carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE),
-            None
-        );
+        // The table pool stays at its own address, EL1-only and never
+        // executable: EL1's view of every table arena.
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        for va in [
+            pool,
+            pool + carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE - 0x1000,
+        ] {
+            assert_eq!(manager.translate(va), Some(va));
+            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(va));
+            assert_eq!(leaf & (0b11 << 6), 0, "EL0 has no access: {leaf:#x}");
+            assert_eq!(
+                leaf & (0b11 << 53),
+                0b11 << 53,
+                "never executable: {leaf:#x}"
+            );
+        }
     }
 
     #[test]

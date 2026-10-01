@@ -872,7 +872,7 @@ impl DescriptorTxn {
         reclaimed.len() <= self.op.reclaim_budget()
             && reclaimed.iter().enumerate().all(|(index, &pa)| {
                 pa & !PA_MASK_4KIB == 0
-                    && super::primary_spare_table(self.root.raw(), pa)
+                    && super::spare_table(self.root.raw(), pa)
                     && !reclaimed[..index].contains(&pa)
                     && !unused.contains(&pa)
             })
@@ -1849,7 +1849,7 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
         let (first, last) = ((lo - table_base) / span, (hi - 1 - table_base) / span);
         let mut reclaimable = self.reclaim_budget != 0
             && super::sub_table_level_reclaimable(level)
-            && super::primary_spare_table(self.root, table_pa);
+            && super::spare_table(self.root, table_pa);
         for index in first..=last {
             let pa = table_pa + index * 8;
             let descriptor = self.words.load(pa)?;
@@ -2540,8 +2540,8 @@ where
             || words.load(grant).is_err()
             || words.load(grant + PT_PAGE - 8).is_err()
             // A reclaiming op may drop a grant it split into, and reports it
-            // freed: every grant must then be a primary spare table page.
-            || (op.reclaim_budget() != 0 && !super::primary_spare_table(root, grant))
+            // freed: every grant must then be a spare table page.
+            || (op.reclaim_budget() != 0 && !super::spare_table(root, grant))
         {
             return DescriptorOutcome::Refused(DescriptorRefusal::BadTableGrant);
         }
@@ -4558,6 +4558,7 @@ mod tests {
                         ptr,
                         ROOT,
                         byte_len,
+                        ROOT,
                         VA,
                         IPA,
                         LeafAccess::Write,
@@ -4572,6 +4573,7 @@ mod tests {
                         ptr,
                         ROOT,
                         byte_len,
+                        ROOT,
                         GuestPermissionEdit {
                             va: VA,
                             len: 2 * PT_PAGE,
@@ -4589,6 +4591,7 @@ mod tests {
                         ptr,
                         ROOT,
                         byte_len,
+                        ROOT,
                         VA,
                         2 * PT_PAGE,
                     )
@@ -4853,8 +4856,9 @@ mod tests {
                 // The root and boot tables are never freed.
                 &[ROOT][..],
                 &[page(1)],
-                // Outside the arena below the root, and unaligned.
-                &[ROOT - PT_PAGE],
+                // Unaligned. (A page outside the root's arena may be an
+                // extension-arena table; the host bounds it by what each of
+                // its arenas issued when it settles the receipt.)
                 &[page(10) + 8],
                 // A duplicate would free one page twice.
                 &[page(10), page(10)],

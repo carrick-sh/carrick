@@ -337,6 +337,8 @@ pub(crate) struct MmAccessState {
     pub(crate) live_resolver: parking_lot::RwLock<
         Option<std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>>,
     >,
+    /// Installed on every stage-1 authority bound to this state's backing.
+    pub(crate) arena_publisher: parking_lot::RwLock<Option<std::sync::Arc<MmArenaPublisher>>>,
     pub(crate) page_tables: parking_lot::RwLock<carrick_aarch64::Stage1Authority>,
     pub(crate) protections: std::sync::Arc<MemoryProtections>,
     pub(crate) frame_inventory: HvpatchFrameInventoryState,
@@ -365,6 +367,36 @@ pub(crate) struct MmAccessState {
     #[cfg(test)]
     pub(crate) test_descriptor_slots:
         parking_lot::Mutex<Option<&'static carrick_el1_abi::DescriptorTxnSlots>>,
+}
+
+/// Publishes the stage-1 extension arenas a guest descriptor transaction of
+/// this MM grows into (stage-2 backing and structural owner, from the
+/// carrier's root-slot pool), exactly as a host edit that grew one does.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct MmArenaPublisher {
+    state: std::sync::Weak<MmAccessState>,
+    custody: std::sync::Arc<CarrierVmCustody>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher {
+    fn publish_extension_arenas(
+        &self,
+        manager: &carrick_mmu_core::aarch64::PageTableManager,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| "the MM retired".to_owned())?;
+        state
+            .publish_stage1_extension_arenas(
+                &self.custody,
+                manager,
+                applevisor::memory::MemPerms::ReadWrite,
+            )
+            .map(|_rows| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -652,6 +684,10 @@ impl MmAccessState {
             host_cow_stats,
             backing.binding,
         );
+        *state.arena_publisher.write() = Some(std::sync::Arc::new(MmArenaPublisher {
+            state: std::sync::Arc::downgrade(&state),
+            custody: std::sync::Arc::clone(&backing.custody),
+        }));
         let resolver = MmAccessLiveResolver::new(&state, backing.custody);
         state.set_live_resolver(resolver);
         state
@@ -700,6 +736,7 @@ impl MmAccessState {
             copy_owner_pins: std::sync::atomic::AtomicU64::new(0),
             identity: parking_lot::RwLock::new(None),
             live_resolver: parking_lot::RwLock::new(None),
+            arena_publisher: parking_lot::RwLock::new(None),
             page_tables: parking_lot::RwLock::new(page_tables),
             protections,
             frame_inventory: HvpatchFrameInventoryState::new(frame_inventory),
@@ -824,6 +861,9 @@ impl MmAccessState {
         authority: &carrick_aarch64::Stage1Authority,
         resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
     ) -> bool {
+        if let Some(publisher) = self.arena_publisher.read().clone() {
+            authority.set_arena_publisher(publisher);
+        }
         match self.backing_binding {
             LiveBackingBinding::Immediate => unsafe { authority.bind_live_backing(resolver) },
             // The placeholder authority a state is born with holds no manager:
