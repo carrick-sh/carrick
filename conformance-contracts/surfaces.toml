@@ -589,7 +589,7 @@ contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.e
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_sched.rs"
-contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.anonymous-reservations", "kernel.el1.fork-cow", "kernel.el1.ipc-two-process", "kernel.el1.delegated-root-fork", "kernel.el1.thread-lifecycle"]
+contracts = ["kernel.el1.epoll-zone", "kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.anonymous-reservations", "kernel.el1.fork-cow", "kernel.el1.ipc-two-process", "kernel.el1.delegated-root-fork", "kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/sigframe.rs"

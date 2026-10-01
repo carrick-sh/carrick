@@ -430,6 +430,41 @@
     "excluded": false,
     "runner": "generic"
   },
+  "epollzoneclose": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollzoneeintr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollzonemixed": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollzonepingpong": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollzonesigmask": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollzonetimeout": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollzonetrigger": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "etchostnamefile": {
     "class": "conformance",
     "excluded": false,

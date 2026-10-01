@@ -1,0 +1,15 @@
+570f7d7324993737
+idle_n=0
+eventfd_only_n=1
+eventfd_only_tag=1
+pipe_only_n=1
+pipe_only_tag=2
+socket_only_n=1
+socket_only_tag=4
+all_n=3
+all_tag_sum=7
+drained_n=0
+socket_wakes_blocked_n=1
+socket_wakes_blocked_tag=4
+eventfd_wakes_blocked_n=1
+eventfd_wakes_blocked_tag=1

@@ -1,0 +1,58 @@
+schema_version = 1
+id = "kernel.el1.epoll-zone"
+title = "An epoll set of in-zone objects is waited on and woken in the guest: an eventfd round trip through it needs no host exit"
+guest_surfaces = [
+  "syscall:epoll_create1",
+  "syscall:epoll_ctl",
+  "syscall:epoll_wait",
+  "syscall:epoll_pwait",
+  "syscall:eventfd2",
+  "syscall:pipe2",
+  "syscall:read",
+  "syscall:write",
+  "syscall:close",
+  "syscall:dup",
+  "syscall:fork",
+  "signal:asynchronous-delivery",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 7 epoll: level-triggered members are reported while ready; edge-triggered members once per new arrival; EPOLLONESHOT disarms after one report until EPOLL_CTL_MOD; an item is removed only when the last descriptor of its open description closes",
+  "man 2 epoll_wait / epoll_pwait: timeout 0 returns at once, -1 blocks until an event or a signal, a finite timeout returns 0 when it expires; EINTR when a signal handler interrupts the wait; the sigmask of epoll_pwait replaces the thread mask for exactly the call; EINVAL for maxevents <= 0 or a non-epoll fd, EBADF for a bad epfd, EFAULT for an unwritable events buffer",
+  "man 2 epoll_ctl: EEXIST, ENOENT, EBADF, EINVAL (self add)",
+  "man 7 signal: epoll_wait and epoll_pwait are never restarted after a handler, SA_RESTART or not",
+  "man 7 pipe / man 2 eventfd: readiness of the member objects",
+]
+fixture = "probe:epollzonepingpong|epollzonetrigger|epollzonetimeout|epollzoneeintr|epollzoneclose|epollzonemixed|epollzonesigmask; embed:el1-sched epoll-pingpong 1000|3000|6000"
+scale_points = [1000, 3000, 6000]
+rationale = """
+libuv's MessagePort wake (node worker threads) is an eventfd watched by a
+per-loop epoll whose set holds only that eventfd and a pipe read end: both
+are carrick-owned IPC-pool objects. Before this contract EL1 served the
+eventfd write and read but had no epoll service, so every epoll_pwait
+was forwarded, and the epoll registration subscribed the host to each
+member object, so every served write or read still returned through the
+host to deliver the wake it owed (node-core worker-message-port: 29k-43k
+forwarded epoll_pwait and 66k-73k EL1 boundaries per run,
+docs/perf-results/2026-10-01-el1-real-workload-ab/node-epoll-wait.md).
+Linux needs no such work: a waiter on an epoll of in-memory objects
+sleeps and is woken by the writer's wake callback. Carrick must do the
+same in the zone: an eventfd round trip between two threads through such
+an epoll costs no host exit in steady state.
+"""
+
+[bindings]
+embed = "carrick-embed::el1_sched::el1_epoll_eventfd_pingpong_stays_in_guest"
+docker = "probe:epollzonepingpong|epollzonetrigger|epollzonetimeout|epollzoneeintr|epollzoneclose|epollzonemixed|epollzonesigmask"
+
+[bindings.unresolved]
+vm_free = "The in-zone epoll record and its harvest are pure carrick-el1-abi code; their unit tests are added with the record (stage 1)."
+embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts host exits and forwarded epoll_pwait per round trip < 0.01 over the difference of two run lengths outside the contract evaluator."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "hvf_syscall_exits"
+base = 1024
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "Each scale unit is one round trip. An eventfd round trip through an all-in-zone epoll is served, parked and woken in the guest, so host syscall exits do not grow with the round-trip count: only a fixed base for process start, thread start, epoll and eventfd creation and epoll_ctl (all host-served) and teardown. The signed test measures the per-round-trip slope as the difference of two run lengths and requires it below 0.01."

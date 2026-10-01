@@ -1,0 +1,13 @@
+a92bf946eb7d85d7
+eventfd_threads_rounds_ok=true
+eventfd_threads_peer_ok=true
+eventfd_threads_drained=true
+pipe_threads_rounds_ok=true
+pipe_threads_peer_ok=true
+pipe_threads_drained=true
+eventfd_processes_rounds_ok=true
+eventfd_processes_peer_ok=true
+eventfd_processes_drained=true
+pipe_processes_rounds_ok=true
+pipe_processes_peer_ok=true
+pipe_processes_drained=true
