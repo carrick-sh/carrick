@@ -187,6 +187,220 @@ impl SyscallDispatcher {
     }
 }
 
+/// One planned EL1 frame grant, as both the EL1 mailbox and a host copyout
+/// serve it: the request the backend prepares and the residency identity
+/// published once the grant is live.
+impl SyscallDispatcher {
+    /// The backend request for `plan`, faulted at `fault_va` with `access`.
+    pub fn el1_frame_grant_request(
+        plan: &ResidentFrameGrantPlan<'_>,
+        mm_key: u64,
+        request_generation: u64,
+        fault_va: u64,
+        access: u64,
+    ) -> carrick_hal::El1FrameGrantRequest {
+        carrick_hal::El1FrameGrantRequest {
+            mm_key,
+            request_generation,
+            fault_va,
+            access,
+            semantic_base: plan.start(),
+            len: plan.len(),
+            permissions: plan.prot(),
+        }
+    }
+
+    /// Commit a published, live grant: residency for its faulting page and
+    /// the grant's residency record. Called only once stage-1, stage-2 and
+    /// inventory are live (host lane) or EL1's receipt verified (guest lane).
+    pub fn commit_published_frame_grant(
+        &self,
+        plan: ResidentFrameGrantPlan<'_>,
+        residency: carrick_el1_abi::FrameGrantResidencyIdentity,
+    ) {
+        self.commit_resident_frame_grant(plan);
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            let _ = table.publish(residency);
+        }
+    }
+
+    /// Serve the EL1 frame grant a host copyout into never-touched memory
+    /// needs, exactly as an EL0 first touch of the run would be served:
+    /// plan it from the root, publish its provenance, prepare and publish
+    /// its backing through `venue`, then commit. A guest-lane publication is
+    /// applied on the driving vCPU now and committed only after its verified
+    /// receipt. `Ok(false)`: no root-owned writable grant applies here.
+    ///
+    /// `len` is the copyout's run of absent pages from `address`. The run is
+    /// served as its aligned power-of-two pieces (the windows a root plan is
+    /// drawn in), so the grants back exactly the run: never a page outside
+    /// it, never a resident page, and at most two pieces per size class.
+    ///
+    /// `settle_pending` runs under the same mutation authority before the
+    /// plan: an EL0 first touch's guest-lane grant that is published but
+    /// not yet committed still reads as fresh root memory, so it must be
+    /// settled (or withdrawn and rolled back) first, or the copyout would
+    /// grant a second frame for the same page.
+    pub fn grant_for_host_copyout(
+        &self,
+        authority: &mut FrameCowExactMmGuard,
+        address: u64,
+        len: u64,
+        venue: &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
+        settle_pending: &mut dyn FnMut(
+            &super::super::mm_mutation::MmMutationGuard<'_>,
+            &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
+        ) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let mutation = super::super::mm_mutation::from_frame_cow(authority);
+        if self.mem_view().mm_authority().mm_id != mutation.mm_id() {
+            return Err("host copyout grant authority names another MM".to_owned());
+        }
+        settle_pending(&mutation, venue)?;
+        let page_size = self.linux_page_size();
+        let mm_key = mutation.mm_id().raw();
+        let permit = mutation.host_alias_permit();
+        let end = address
+            .checked_add(len.max(1))
+            .and_then(|end| end.checked_next_multiple_of(page_size))
+            .ok_or_else(|| "host copyout grant run overflows".to_owned())?;
+        let mut cursor = page_floor(address, page_size);
+        let mut granted = false;
+        while cursor < end {
+            let piece = copyout_grant_piece(cursor, end - cursor, page_size);
+            match self.grant_copyout_piece(&permit, mm_key, cursor, piece, venue)? {
+                Some(next) => {
+                    granted = true;
+                    cursor = next.max(cursor + page_size);
+                }
+                None => break,
+            }
+        }
+        Ok(granted)
+    }
+
+    /// One aligned piece of a copyout run: plan it from the root within
+    /// `[cursor, cursor + piece)`, prepare and publish its backing, and
+    /// commit. `Some(end)`: granted through `end`. `None`: no root-owned
+    /// writable grant applies at `cursor` (or EL1 cleanly refused it).
+    fn grant_copyout_piece(
+        &self,
+        permit: &super::super::mm_mutation::HostAliasPermit<'_>,
+        mm_key: u64,
+        cursor: u64,
+        piece: u64,
+        venue: &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
+    ) -> Result<Option<u64>, String> {
+        use carrick_hal::threaded::{
+            El1FrameGrantPublication, El1FrameGrantPublished, El1FrameGrantRollback,
+        };
+        let Some(plan) = self.resident_frame_grant_plan(permit, cursor, piece) else {
+            return Ok(None);
+        };
+        if !plan.root_owned() || plan.prot() & carrick_abi::LINUX_PROT_WRITE == 0 {
+            return Ok(None);
+        }
+        let plan_end = plan.start().saturating_add(plan.len());
+        self.adopt_frame_grant_provenance(&plan);
+        let request = Self::el1_frame_grant_request(&plan, mm_key, 0, cursor, 2);
+        let Some(ready) = venue
+            .prepare(request)
+            .map_err(|error| format!("prepare host copyout grant: {error}"))?
+        else {
+            return Ok(None);
+        };
+        let rollback = El1FrameGrantRollback {
+            mm_key,
+            semantic_base: request.semantic_base,
+            len: request.len,
+            ready,
+        };
+        let published = venue
+            .publish(El1FrameGrantPublication {
+                mm_key,
+                semantic_base: request.semantic_base,
+                len: request.len,
+                fault_va: plan.fault_page(),
+                permissions: request.permissions,
+                ready,
+            })
+            .map_err(|error| format!("publish host copyout grant: {error}"))?;
+        match published {
+            El1FrameGrantPublished::OnHost => {}
+            El1FrameGrantPublished::Submit(txn) => {
+                // EL1 refused or rolled back cleanly: nothing names the
+                // prepared backing, so it is undone and no grant applies.
+                if venue.apply_guest_publication(txn).is_err() {
+                    venue
+                        .roll_back(rollback)
+                        .map_err(|undo| format!("roll back host copyout grant: {undo}"))?;
+                    return Ok(None);
+                }
+                venue
+                    .complete(rollback)
+                    .map_err(|error| format!("complete host copyout grant: {error}"))?;
+            }
+            El1FrameGrantPublished::Unsupported | El1FrameGrantPublished::Refused(_) => {
+                venue
+                    .roll_back(rollback)
+                    .map_err(|error| format!("roll back host copyout grant: {error}"))?;
+                return Ok(None);
+            }
+        }
+        self.commit_published_frame_grant(
+            plan,
+            carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key,
+                semantic_base: request.semantic_base,
+                physical_ipa: ready.physical_ipa,
+                len: request.len,
+                mapping_id: ready.mapping_id,
+                frame_id: ready.frame_id,
+                owner_generation: ready.owner_generation,
+                inventory_revision: ready.inventory_revision,
+            },
+        );
+        Ok(Some(plan_end))
+    }
+
+    /// Whether `page`'s first touch belongs to the delegated reservation
+    /// root. A cheap filter before a copyout takes mutation authority; the
+    /// grant re-asks under it.
+    pub fn first_touch_is_root_owned(&self, page: u64) -> bool {
+        let page = page_floor(page, self.linux_page_size());
+        matches!(
+            self.mem().lock().first_touch_owner(page),
+            FirstTouchOwner::Root(..)
+        )
+    }
+
+    /// Whether a host read of `page` sees fresh zero: a readable page of a
+    /// root-owned live mapping that no one has touched, whose backing does
+    /// not exist yet. The caller has established that the page's live leaf
+    /// names no output at all.
+    pub fn host_read_sees_fresh_zero(&self, page: u64) -> bool {
+        let page = page_floor(page, self.linux_page_size());
+        let mem_authority = self.mem();
+        let mem = mem_authority.lock();
+        match mem.first_touch_owner(page) {
+            FirstTouchOwner::Root(mapping, incarnation) => mem
+                .root_armed_prot(&mapping, incarnation, page)
+                .is_some_and(|prot| prot.contains(LinuxProtFlags::READ)),
+            FirstTouchOwner::Host | FirstTouchOwner::Unmapped => false,
+        }
+    }
+}
+
+/// The largest power-of-two piece at `cursor` that `cursor` is aligned to
+/// and that fits in `remaining` (at least one page).
+fn copyout_grant_piece(cursor: u64, remaining: u64, page_size: u64) -> u64 {
+    let fits = 1_u64 << (u64::BITS - 1 - remaining.max(1).leading_zeros());
+    let aligned = 1_u64
+        .checked_shl(cursor.trailing_zeros())
+        .unwrap_or(u64::MAX);
+    fits.min(aligned).max(page_size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

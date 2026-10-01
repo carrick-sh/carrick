@@ -2454,6 +2454,34 @@ pub trait FrameCowAuthority: Send + Sync {
         )))
     }
 
+    /// Back the never-touched pages `[address, address + len)` of one
+    /// contiguous run before a host copyout writes them: the same EL1 frame
+    /// grant an EL0 first touch of the run would be served by, planned,
+    /// prepared, published and committed by this exact-MM authority through
+    /// `venue`. Afterwards the run's pages hold prepared leaves (the first
+    /// one resident), which the ordinary prepared-page copyout commit
+    /// publishes. `Ok(false)`: no grant applies (not root-owned, already
+    /// backed, or refused), and the caller keeps its existing answer.
+    fn grant_for_host_copyout(
+        &self,
+        _address: u64,
+        _len: u64,
+        _venue: &mut dyn El1FrameGrantVenue,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+
+    /// Whether a host read of `page`, whose live leaf has no output at all,
+    /// sees fresh zero: it is an untouched, readable page of a live mapping
+    /// whose backing does not exist yet (Linux maps the zero page there). A
+    /// host read needs no backing to answer it.
+    fn host_read_sees_fresh_zero(
+        &self,
+        _page: u64,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+
     /// Commit an armed page before the host writes guest memory without an
     /// EL0 first-touch exit. `protect` publishes the live stage-1 leaf; the
     /// authority publishes residency only after that edit succeeds.
@@ -2740,6 +2768,39 @@ pub struct El1FrameGrantRollback {
     pub semantic_base: u64,
     pub len: u64,
     pub ready: El1FrameGrantReady,
+}
+
+/// The engine side of serving one EL1 frame grant outside the EL1 mailbox
+/// (a host copyout into never-touched memory): the same prepare and publish
+/// an EL0 first touch's grant uses, plus applying the guest lane's
+/// transaction on the driving vCPU now, since no EL1 fault is waiting for it.
+pub trait El1FrameGrantVenue {
+    fn prepare(
+        &mut self,
+        request: El1FrameGrantRequest,
+    ) -> Result<Option<El1FrameGrantReady>, TrapError>;
+    fn publish(
+        &mut self,
+        grant: El1FrameGrantPublication,
+    ) -> Result<El1FrameGrantPublished, TrapError>;
+    /// Guest-owned lane: apply `txn` on this vCPU and return its verified
+    /// receipt. `Err` means EL1 provably left no store of `txn` live (a clean
+    /// refusal or rollback), so the caller may roll the grant back; an
+    /// outcome that leaves live state unknown never returns.
+    fn apply_guest_publication(
+        &mut self,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
+    /// Authenticate EL1's receipt for a transaction this engine returned
+    /// earlier (a pending EL0 first-touch grant the copyout must settle
+    /// before it plans).
+    fn settle_receipt(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
+    fn complete(&mut self, grant: El1FrameGrantRollback) -> Result<(), TrapError>;
+    fn roll_back(&mut self, grant: El1FrameGrantRollback) -> Result<bool, TrapError>;
 }
 
 /// How an engine exposed a prepared EL1 frame grant.

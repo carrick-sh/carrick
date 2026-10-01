@@ -211,6 +211,7 @@ if [ "$pkg" = "carrick-embed" ]; then
     scripts/build-embed-interceptor-probe.sh
     scripts/build-embed-zone-readers.sh
     scripts/build-embed-icache-reuse.sh
+    scripts/build-embed-copyout.sh
     scripts/build-embed-el1-sched.sh
 fi
 
