@@ -501,8 +501,15 @@ impl MemState {
     }
 
     /// The root-derived counterpart of [`FirstTouchArming::grant_for_page`]:
-    /// the contiguous non-resident run of same-protection root-owned pages
-    /// around `page`, clipped to one `max_len`-aligned window.
+    /// the contiguous run around `page`, clipped to one `max_len`-aligned
+    /// window, of non-resident same-protection root-owned pages AND of the
+    /// root's holes inside the mmap arena. The holes are first-touch stock:
+    /// backing prepared ahead of any mapping, which EL1 hands to a later
+    /// guest-venue `mmap` there and commits on first touch only where the
+    /// root then holds a node (see `carrick_el1::fault`). The run never
+    /// covers a resident page, another node (heap, host-owned, other
+    /// protection), an owed return the host has not reconciled, or backing
+    /// an earlier grant of this MM already prepared.
     fn root_grant_for_page(
         &self,
         mapping: &Mapping,
@@ -514,45 +521,118 @@ impl MemState {
             return None;
         }
         let prot = self.root_armed_prot(mapping, incarnation, page)?;
+        let root = self.delegated_root()?;
         let window_start = page - page % max_len;
         let window_end = window_start.checked_add(max_len)?;
-        let pieces = self.root_first_touch_pieces(window_start, window_end);
-        // Grow the run through adjacent same-protection pieces, both ways.
-        let index = pieces.iter().position(|piece| {
-            piece.range.start().raw() <= page && page < piece.range.end().raw()
-        })?;
-        let (mut start, mut end) = (
-            pieces[index].range.start().raw(),
-            pieces[index].range.end().raw(),
-        );
-        let mut stops = vec![pieces[index]];
-        for piece in pieces[..index].iter().rev() {
-            if piece.protection != mapping.protection || piece.range.end().raw() != start {
-                break;
-            }
-            start = piece.range.start().raw();
-            stops.push(*piece);
-        }
-        for piece in &pieces[index + 1..] {
-            if piece.protection != mapping.protection || piece.range.start().raw() != end {
-                break;
-            }
-            end = piece.range.end().raw();
-            stops.push(*piece);
-        }
-        // Committed pages split the run, exactly as a commit disarms them:
-        // each piece answers under its own incarnation.
-        for piece in stops {
-            for (resident_start, resident_end) in self.resident.within(
-                piece.range.start().raw(),
-                piece.range.end().raw(),
-                piece.owner(),
-            ) {
-                if resident_end <= page {
-                    start = start.max(resident_end);
-                } else if resident_start > page {
-                    end = end.min(resident_start);
+        let window = ReservationRange::new(window_start, window_end)?;
+        // Stock stays inside the arena and inside the half window holding
+        // `page`: a stock grant never claims a whole block, which only a
+        // mapping that fills it may (EL1 cannot retire part of a block).
+        let half = (max_len / 2).max(crate::linux_abi::LINUX_PAGE_SIZE);
+        let arena_start = (page - page % half).max(self.layout.mmap_base);
+        let arena_end = (page - page % half)
+            .saturating_add(half)
+            .min(self.layout.mmap_base.saturating_add(self.layout.mmap_size));
+        let mut eligible: Vec<(u64, u64)> = Vec::new();
+        let mut owed: Vec<(u64, u64)> = Vec::new();
+        root.with_root(|model| {
+            let mut cursor = window_start;
+            let hole = |eligible: &mut Vec<(u64, u64)>, start: u64, end: u64| {
+                let (start, end) = (start.max(arena_start), end.min(arena_end));
+                if start < end {
+                    eligible.push((start, end));
                 }
+            };
+            model.observe_nodes(window, &mut |node, node_incarnation| {
+                let (start, end) = (
+                    node.range.start().max(window_start),
+                    node.range.end().min(window_end),
+                );
+                if start > cursor {
+                    hole(&mut eligible, cursor, start);
+                }
+                cursor = cursor.max(end);
+                if !node.anonymous
+                    || node.protection != mapping.protection
+                    || super::anonymous::in_heap(node.range.start(), node.range.end(), self.layout)
+                {
+                    return;
+                }
+                // Committed pages split the run, exactly as a commit
+                // disarms them: each piece answers under its own
+                // incarnation.
+                let mut piece_start = start;
+                for (resident_start, resident_end) in
+                    self.resident
+                        .within(start, end, ResidencyOwner::Root(node_incarnation))
+                {
+                    if resident_start > piece_start {
+                        eligible.push((piece_start, resident_start));
+                    }
+                    piece_start = piece_start.max(resident_end);
+                }
+                if piece_start < end {
+                    eligible.push((piece_start, end));
+                }
+            })?;
+            if cursor < window_end {
+                hole(&mut eligible, cursor, window_end);
+            }
+            model.observe_deferred_returns(&mut |entry| {
+                owed.push((entry.range.start(), entry.range.end()));
+            });
+            Ok(())
+        })
+        .unwrap_or_else(|refusal| broken_root("a first-touch grant plan", refusal));
+        // Holes the host itself still records resident are not stock, and
+        // no span this MM's committed backing still occupies is fresh.
+        let mut blocked = owed;
+        if let Ok(len) = usize::try_from(max_len) {
+            blocked.extend(
+                self.deferred_anonymous
+                    .materialized_within(GuestVa(window_start), len)
+                    .into_iter()
+                    .map(|span| (span.start.raw(), span.end.raw())),
+            );
+        }
+        blocked.extend(
+            self.resident
+                .within(window_start, window_end, ResidencyOwner::Host),
+        );
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            table.live_spans_overlapping(root.mm().raw(), window_start, max_len, |start, end| {
+                blocked.push((start, end));
+            });
+        }
+        // The maximal contiguous eligible run containing `page`.
+        eligible.sort_unstable();
+        let index = eligible
+            .iter()
+            .position(|&(start, end)| start <= page && page < end)?;
+        let (mut start, mut end) = eligible[index];
+        for &(piece_start, piece_end) in eligible[..index].iter().rev() {
+            if piece_end != start {
+                break;
+            }
+            start = piece_start;
+        }
+        for &(piece_start, piece_end) in &eligible[index + 1..] {
+            if piece_start != end {
+                break;
+            }
+            end = piece_end;
+        }
+        for (blocked_start, blocked_end) in blocked {
+            if blocked_end <= start || blocked_start >= end {
+                continue;
+            }
+            if blocked_start <= page && page < blocked_end {
+                return None;
+            }
+            if blocked_end <= page {
+                start = start.max(blocked_end);
+            } else {
+                end = end.min(blocked_start);
             }
         }
         let range = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))?;
@@ -723,6 +803,9 @@ pub struct ResidentFrameGrantPlan<'permit> {
     pub(crate) start: u64,
     pub(crate) len: u64,
     pub(crate) prot: u64,
+    /// Planned from a delegated root: its span may include first-touch
+    /// stock over root holes, and its provenance is the root's.
+    pub(crate) root_owned: bool,
     pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
@@ -759,6 +842,10 @@ impl ResidentFrameGrantPlan<'_> {
             return false;
         };
         prot == self.prot && (start..end).contains(&self.fault_page)
+    }
+
+    pub fn root_owned(&self) -> bool {
+        self.root_owned
     }
 }
 
@@ -1057,18 +1144,8 @@ impl<'a> MemView<'a> {
         if start >= end {
             return None;
         }
-        if root_owned {
-            // The root's run is untouched, non-resident memory of its live
-            // incarnations: fresh zero. A guest-venue mmap placed it without
-            // crossing to the host, so the host's pristine provenance, which
-            // the grant's backing publication requires, never learned of it.
-            // Publish it from the root's answer under this MM's permit.
-            let len = usize::try_from(end - start).ok()?;
-            mem.deferred_anonymous
-                .adopt_pristine(GuestVa(start), len)
-                .ok()?;
-        }
         Some(ResidentFrameGrantPlan {
+            root_owned,
             fault_page: page,
             start,
             len: end - start,
@@ -1137,6 +1214,15 @@ impl<'a> MemView<'a> {
                 "caller lacks host alias dispatch exclusion during commit_resident_frame_grant"
             );
         }
+        if plan.root_owned {
+            // First-touch stock may now back root holes. A host-venue
+            // placement there must scrub it like any reused address
+            // (`next_delegated_address`), never map over live leaves.
+            let mem_authority = self.mem();
+            let mut mem = mem_authority.lock();
+            let end = plan.start.saturating_add(plan.len);
+            mem.mmap_writable_high = mem.mmap_writable_high.max(end);
+        }
         // Physical preparation can be bulk; only the faulting Linux page
         // has become accessible. Keep every speculative page armed, so a
         // later touch publishes its retained output and records residency.
@@ -1145,6 +1231,25 @@ impl<'a> MemView<'a> {
             prot: plan.prot,
             exclusion: plan.exclusion,
         });
+    }
+
+    /// Before a root-owned plan's backing is prepared: its span is fresh
+    /// zero by the root's answer (untouched pages of live incarnations and
+    /// root holes no live grant or owed return covers). A guest-venue mmap
+    /// never reserved that provenance with the host; publish it now, under
+    /// the same permit, for exactly the span about to be granted.
+    pub(crate) fn adopt_frame_grant_provenance(&self, plan: &ResidentFrameGrantPlan<'_>) {
+        if !plan.root_owned || !self.owns_host_alias_dispatch(&plan.exclusion) {
+            return;
+        }
+        let Ok(len) = usize::try_from(plan.len) else {
+            return;
+        };
+        let _ = self
+            .mem()
+            .lock()
+            .deferred_anonymous
+            .adopt_pristine(GuestVa(plan.start), len);
     }
 
     pub(in crate::dispatch::mem) fn populate_resident_range(
