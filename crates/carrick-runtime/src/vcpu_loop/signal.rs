@@ -1139,6 +1139,9 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     );
                     return Ok(true);
                 }
+                // A root-owned span's provenance is the root's: publish it
+                // for exactly this span before its backing is prepared.
+                dispatcher.adopt_frame_grant_provenance(&plan);
                 let service = carrick_hal::El1FrameGrantRequest {
                     mm_key: request.mm_key,
                     request_generation: request.request_generation,
