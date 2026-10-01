@@ -3675,6 +3675,14 @@
     },
     {
       "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/dispatch/budget_meter.rs",
+      "symbol": "FIRST_ALLOCATION_TRACE",
+      "fingerprint": "959c34f4115f5cf019cf58e9f27815030aa393f49fd1fd5b47cdfb8133a27e9e",
+      "classification": "test_only",
+      "rationale": "macOS cfg(test)-only fixed per-thread stack buffer for the first allocation inside a zero-allocation budget window. Captured without Rust heap storage and symbolized only after a failed measurement; reset on completion or panic. No guest or carrier authority."
+    },
+    {
+      "kind": "thread_local",
       "file": "crates/carrick-kernel/src/dispatch/mem/vma.rs",
       "symbol": "VMA_SHIFT_COUNT",
       "fingerprint": "6e1d019fa1282e92d6e8b36565bc4aadacdb1cc52c9bafe216cb5a426d3cba58",
