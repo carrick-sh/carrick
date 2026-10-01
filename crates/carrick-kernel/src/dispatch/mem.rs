@@ -2515,6 +2515,11 @@ impl SyscallDispatcher {
     }
 
     #[inline]
+    pub fn adopt_frame_grant_provenance(&self, plan: &ResidentFrameGrantPlan<'_>) {
+        self.mem_view().adopt_frame_grant_provenance(plan);
+    }
+
+    #[inline]
     pub fn commit_resident_frame_grant(&self, plan: ResidentFrameGrantPlan<'_>) {
         self.mem_view().commit_resident_frame_grant(plan);
     }

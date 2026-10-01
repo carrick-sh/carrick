@@ -67,6 +67,37 @@ pub(crate) fn settle_final_root(mut model: Reservations<'_>) -> Result<usize, Re
 }
 
 impl MemView<'_> {
+    /// The root holes of this MM that its live first-touch grants back:
+    /// unused stock (`fault::root_grant_for_page`). Spans of `table`'s live
+    /// grants for this MM, minus every node the root holds now.
+    pub(in crate::dispatch) fn first_touch_stock(
+        &self,
+        table: &carrick_el1_abi::FrameGrantResidencyTable,
+    ) -> Vec<ReservationRange> {
+        let Some(root) = self.mem().lock().delegated_root().cloned() else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        table.live_spans_overlapping(root.mm().raw(), 0, u64::MAX, |start, end| {
+            spans.push((start, end));
+        });
+        let mut stock = Vec::new();
+        for (start, end) in spans {
+            let Some(span) = ReservationRange::new(start, end) else {
+                continue;
+            };
+            let holes = root
+                .with_root(|model| super::super::fault::root_holes(model, span))
+                .unwrap_or_default();
+            stock.extend(
+                holes
+                    .into_iter()
+                    .filter_map(|(start, end)| ReservationRange::new(start, end)),
+            );
+        }
+        stock
+    }
+
     /// Whether this MM's root owes the host any deferred return: the cheap
     /// check a host boundary makes before taking the MM's mutation
     /// authority for [`Self::reconcile_el1_deferred_returns`]. `false` for a
@@ -96,12 +127,17 @@ impl MemView<'_> {
         let (owed, through) = root
             .with_root(|model| Ok(owed_returns(model)))
             .map_err(El1ReturnError::Authority)?;
-        let Some(through) = through else {
+        // Unused first-touch stock returns with the owed extents: a host
+        // mapping step must never place over backing EL1 holds for no node.
+        let stock = carrick_el1_abi::frame_grant_residency_host()
+            .map(|table| self.first_touch_stock(table))
+            .unwrap_or_default();
+        if through.is_none() && stock.is_empty() {
             return Ok(0);
-        };
+        }
         {
             let mut dispatch = self.begin_conditional_vma_dispatch(permit);
-            for range in &owed {
+            for range in owed.iter().chain(&stock) {
                 let len = usize::try_from(range.len())
                     .map_err(|_| El1ReturnError::Authority(Refusal::Invalid))?;
                 memory.unmap_range(range.start(), len).map_err(|error| {
@@ -115,8 +151,12 @@ impl MemView<'_> {
             }
             self.mark_vma_dispatch(&mut dispatch);
         }
-        root.with_root(|model| model.acknowledge_deferred_returns(through))
-            .map_err(El1ReturnError::Authority)
+        match through {
+            Some(through) => root
+                .with_root(|model| model.acknowledge_deferred_returns(through))
+                .map_err(El1ReturnError::Authority),
+            None => Ok(0),
+        }
     }
 }
 
