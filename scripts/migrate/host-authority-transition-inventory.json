@@ -16046,5 +16046,59 @@
       "line_end": 1437,
       "line_start": 1437
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "configured external bind root pinned by carrier-owned BindCacheCohorts"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-vfs/src/fs_resolve_cache.rs:283 in `BindCacheCohorts::admit`, `std::fs::OpenOptions::new` prepares or opens only the configured external bind root. The carrier-owned registry reads its inode identity and holds the root descriptor while observers retain the source cohort, preventing identity reuse. This is a declared host filesystem crossing; coherence words remain anonymous MAP_SHARED, with no process registry or reexec transport.",
+    "review_id": "HA-000692",
+    "source": {
+      "byte_end": 12970,
+      "byte_start": 12945,
+      "column": 27,
+      "column_end": 52,
+      "column_start": 27,
+      "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
+      "line": 283,
+      "line_end": 283,
+      "line_start": 283
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "configured external bind root pinned by carrier-owned BindCacheCohorts"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::open",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-vfs/src/fs_resolve_cache.rs:289 in `BindCacheCohorts::admit`, `std::fs::OpenOptions::open` prepares or opens only the configured external bind root. The carrier-owned registry reads its inode identity and holds the root descriptor while observers retain the source cohort, preventing identity reuse. This is a declared host filesystem crossing; coherence words remain anonymous MAP_SHARED, with no process registry or reexec transport.",
+    "review_id": "HA-000693",
+    "source": {
+      "byte_end": 13196,
+      "byte_start": 13192,
+      "column": 28,
+      "column_end": 32,
+      "column_start": 28,
+      "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
+      "line": 289,
+      "line_end": 289,
+      "line_start": 289
+    }
   }
 ]
