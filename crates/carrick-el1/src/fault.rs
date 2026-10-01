@@ -97,6 +97,42 @@ pub struct NoopPreparedResolver;
 pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
     pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
     pub resolver: &'a mut P,
+    /// The shared reservation roots. A delegated MM's prepared backing may
+    /// include first-touch stock over root holes: it is committed only where
+    /// the root holds a node that permits the access.
+    pub roots: Option<&'a crate::memory::reservations::SharedReservations>,
+}
+
+/// Whether a delegated MM's root lets this prepared page be committed:
+/// `None` when the MM has no admitted root (its host arming decided), else
+/// whether a node covers `page` and, for plain anonymous memory, permits
+/// `access`. A busy root answers `Some(false)`: the host decides.
+fn root_admits_commit(
+    roots: Option<&crate::memory::reservations::SharedReservations>,
+    spaces: &AddressSpaces,
+    mm_key: u64,
+    page: u64,
+    access: LeafAccess,
+) -> Option<bool> {
+    let roots = roots?;
+    let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+    let index = spaces.find(mm_key)?.index();
+    if !roots.admitted(index, mm) {
+        return None;
+    }
+    let Ok(mut model) = roots.lock(index, mm) else {
+        return Some(false);
+    };
+    let bits = match access {
+        LeafAccess::Read => 1,
+        LeafAccess::Write => 2,
+        LeafAccess::Execute => 4,
+    };
+    Some(model.mapping(page).is_some_and(|mapping| {
+        !mapping.anonymous
+            || carrick_el1_abi::ReservationProtection::from_bits(bits)
+                .is_some_and(|access| mapping.protection.permits(access))
+    }))
 }
 
 impl PreparedPageResolver for NoopPreparedResolver {
@@ -680,6 +716,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             Some(PreparedFaultPath {
                 residency: carrick_el1_abi::frame_grant_residency_guest(),
                 resolver: &mut HardwarePreparedResolver,
+                roots: Some(crate::memory::reservations::shared_guest()),
             }),
             &mut HardwareCowResolver,
         )
@@ -845,6 +882,19 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         .as_ref()
         .and_then(|path| path.residency.lookup(mm_key, frame.far))
     {
+        // First-touch stock over a root hole is backing, not a mapping: the
+        // host answers a touch the root does not map (SIGSEGV), and asks
+        // for no grant.
+        if root_admits_commit(
+            prepared.as_ref().and_then(|path| path.roots),
+            spaces,
+            mm_key,
+            frame.far & !4095,
+            prepared_access,
+        ) == Some(false)
+        {
+            return Action::Forward;
+        }
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
         };
@@ -968,6 +1018,7 @@ mod tests {
                 Some(PreparedFaultPath {
                     residency: &table,
                     resolver: &mut prepared,
+                    roots: None,
                 }),
                 &mut NoopCowResolver,
             ),
@@ -976,6 +1027,136 @@ mod tests {
         assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_1000)]);
         assert_eq!(table.committed_words(slot, identity).unwrap()[0], 0b10);
         assert!(!mailbox.has_guest_work());
+    }
+
+    /// A zeroed shared reservation table with `mm`'s root admitted in its
+    /// address-space slot, holding `nodes` (`(address, len, prot bits)`).
+    fn admitted_root(
+        spaces: &AddressSpaces,
+        mm: u64,
+        nodes: &[(u64, u64, u64)],
+    ) -> std::boxed::Box<crate::memory::reservations::SharedReservations> {
+        use crate::memory::reservations::{Decision, Layout, Placement, SharedReservations};
+        use carrick_el1_abi::{
+            ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationProtection,
+            ReservationRange,
+        };
+        let ptr =
+            unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::new::<SharedReservations>()) };
+        assert!(!ptr.is_null());
+        let table: std::boxed::Box<SharedReservations> =
+            unsafe { std::boxed::Box::from_raw(ptr.cast()) };
+        let index = spaces.find(mm).unwrap().index();
+        let raw = ReservationMm::new(mm).unwrap();
+        table
+            .publish(
+                index,
+                raw,
+                Layout {
+                    heap: ReservationRange::new(0x1000, 0x10_0000).unwrap(),
+                    arena: ReservationRange::new(0x4000_0000, 0x8000_0000).unwrap(),
+                    brk: 0x1000,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+        let mut model = table.lock(index, raw).unwrap();
+        model.finish_import().unwrap();
+        for &(address, len, prot) in nodes {
+            let Ok(Decision::Work(request)) = model.mmap(
+                Placement::Fixed(address),
+                len,
+                ReservationProtection::from_bits(prot).unwrap(),
+            ) else {
+                panic!("a fresh mapping is a transaction");
+            };
+            let completion = unsafe {
+                ReservationCompletion::after_descriptor_and_backing_commit(
+                    request,
+                    ReservationBackingReceipt {
+                        receipt: request.sequence.raw(),
+                        granted_bytes: 0,
+                        returned_bytes: 0,
+                    },
+                )
+            }
+            .unwrap();
+            model.complete(completion).unwrap();
+        }
+        drop(model);
+        table
+    }
+
+    /// Contract `kernel.el1.anonymous-reservations` (first-touch stock): a
+    /// delegated MM's prepared backing commits only where its root holds a
+    /// node that permits the access. Stock over a hole, or under a node the
+    /// access is denied by, forwards without a grant request: the host
+    /// delivers the signal.
+    #[test]
+    fn first_touch_stock_commits_only_under_a_permitting_root_node() {
+        let mm = 79;
+        let base = 0x4000_0000;
+        let spaces = published_space(mm, 0x8800_0000);
+        let roots = admitted_root(
+            &spaces,
+            mm,
+            &[(base + 0x1000, 0x1000, 3), (base + 0x2000, 0x1000, 1)],
+        );
+        let residency = std::boxed::Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
+        residency
+            .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: mm,
+                semantic_base: base,
+                physical_ipa: 0x9000_0000,
+                len: 4 * 4096,
+                mapping_id: 11,
+                frame_id: 12,
+                owner_generation: 13,
+                inventory_revision: 14,
+            })
+            .unwrap();
+        let task = CurrentTask::new();
+        task.zone_mm.store(mm, Ordering::Release);
+        let tasks = [task];
+        let read_translation_fault = |address| TrapFrame {
+            esr: (0x24 << 26) | 0x07,
+            far: address,
+            ..TrapFrame::default()
+        };
+        for (mut frame, served) in [
+            (write_translation_fault(0, base), false),
+            (write_translation_fault(0, base + 0x3000), false),
+            (write_translation_fault(0, base + 0x2000), false),
+            (write_translation_fault(0, base + 0x1000), true),
+            (read_translation_fault(base + 0x2000), true),
+        ] {
+            let mailbox = FrameGrantMailbox::new();
+            let mut prepared = RecordingPreparedResolver::default();
+            let action = dispatch_fault_with_prepared(
+                &mut frame,
+                &Counters::default(),
+                &tasks,
+                &spaces,
+                GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath {
+                    residency: &residency,
+                    resolver: &mut prepared,
+                    roots: Some(&roots),
+                }),
+                &mut NoopCowResolver,
+            );
+            let far = frame.far;
+            assert_eq!(action == Action::Served, served, "fault at {far:#x}");
+            assert_eq!(
+                prepared.calls.len(),
+                usize::from(served),
+                "fault at {far:#x}"
+            );
+            assert!(!mailbox.has_guest_work(), "no grant request at {far:#x}");
+        }
     }
 
     #[test]
@@ -1011,6 +1192,7 @@ mod tests {
                 Some(PreparedFaultPath {
                     residency: &table,
                     resolver: &mut RecordingPreparedResolver::default(),
+                    roots: None,
                 }),
                 &mut NoopCowResolver,
             ),
@@ -1288,6 +1470,7 @@ mod tests {
                     Some(PreparedFaultPath {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
+                        roots: None,
                     }),
                     &mut NoopCowResolver,
                 ),
@@ -1324,6 +1507,7 @@ mod tests {
                     Some(PreparedFaultPath {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
+                        roots: None,
                     }),
                     &mut NoopCowResolver,
                 ),
@@ -1348,6 +1532,7 @@ mod tests {
                     Some(PreparedFaultPath {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
+                        roots: None,
                     }),
                     &mut NoopCowResolver,
                 ),

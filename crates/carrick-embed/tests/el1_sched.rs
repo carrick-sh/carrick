@@ -2430,13 +2430,20 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
         );
         assert!(reused > 0, "repeated mapping never reused a returned IPA");
         assert_eq!(
-            served_munmap,
-            ROUNDS + 1,
-            "EL1 must retire every target munmap plus the fixed eligible runtime cleanup"
+            served_munmap + forwarded_munmap,
+            ROUNDS + 2,
+            "every target munmap and both fixed runtime cleanups are counted once"
         );
-        assert_eq!(
-            forwarded_munmap, 1,
-            "only the fixed untagged runtime cleanup may forward"
+        assert!(
+            served_munmap > ROUNDS,
+            "EL1 must retire every target munmap plus the fixed eligible runtime cleanup \
+             (served {served_munmap})"
+        );
+        // The second runtime cleanup mixes backed pages with untouched ones:
+        // a delegated root retires its backed run in EL1, host setup forwards.
+        assert!(
+            forwarded_munmap <= 1,
+            "only the fixed mixed runtime cleanup may forward (forwarded {forwarded_munmap})"
         );
         runs.push((pages, measured.exits));
     }

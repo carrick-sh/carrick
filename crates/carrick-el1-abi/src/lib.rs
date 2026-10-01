@@ -1851,6 +1851,34 @@ impl FrameGrantResidencyTable {
     /// Host: revoke every intersecting grant before backing retirement or
     /// replacement. Revoking a partially covered grant merely sends its other
     /// pages through the existing host fault path.
+    /// Host: visit `[base, end)` of every live grant of `mm_key` that
+    /// overlaps `[start, start + len)`: backing already prepared for this
+    /// exact MM, which no second grant may cover. One pass over the table.
+    pub fn live_spans_overlapping(
+        &self,
+        mm_key: u64,
+        start: u64,
+        len: u64,
+        mut visit: impl FnMut(u64, u64),
+    ) {
+        let end = start.saturating_add(len);
+        for record in &self.slots {
+            let state = record.state.load(Ordering::Acquire);
+            if state & GRANT_STATE_MASK != GRANT_LIVE {
+                continue;
+            }
+            let identity = record.identity();
+            let grant_end = identity.semantic_base.saturating_add(identity.len);
+            if identity.mm_key == mm_key
+                && identity.semantic_base < end
+                && start < grant_end
+                && record.state.load(Ordering::Acquire) == state
+            {
+                visit(identity.semantic_base, grant_end);
+            }
+        }
+    }
+
     pub fn retire_overlapping(&self, mm_key: u64, start: u64, len: u64) {
         let end = start.saturating_add(len);
         for (slot, record) in self.slots.iter().enumerate() {
@@ -4485,6 +4513,46 @@ mod tests {
         assert!(table.retire(fresh_slot, second));
         table.publish(second).unwrap();
         assert!(!table.record_commit(stale_page));
+    }
+
+    #[test]
+    fn grant_residency_reports_only_live_spans_of_the_exact_mm() {
+        extern crate std;
+        use std::{boxed::Box, vec, vec::Vec};
+        let table = Box::new(FrameGrantResidencyTable::new());
+        let grant = |mm_key, semantic_base, owner_generation| FrameGrantResidencyIdentity {
+            mm_key,
+            semantic_base,
+            physical_ipa: 0x9000_0000 + semantic_base,
+            len: 4 * 4096,
+            mapping_id: 17,
+            frame_id: 19,
+            owner_generation,
+            inventory_revision: 29,
+        };
+        let spans = |table: &FrameGrantResidencyTable, mm_key, start, len| {
+            let mut seen = Vec::new();
+            table.live_spans_overlapping(mm_key, start, len, |base, end| seen.push((base, end)));
+            seen.sort_unstable();
+            seen
+        };
+        let near = grant(41, 0x4000_0000, 23);
+        let far = grant(41, 0x4020_0000, 24);
+        let other_mm = grant(42, 0x4000_0000, 25);
+        let near_slot = table.publish(near).unwrap();
+        table.publish(far).unwrap();
+        table.publish(other_mm).unwrap();
+        assert_eq!(
+            spans(&table, 41, 0x4000_2000, 0x20_0000),
+            vec![(0x4000_0000, 0x4000_4000), (0x4020_0000, 0x4020_4000)]
+        );
+        assert_eq!(spans(&table, 41, 0x4000_4000, 0x1000), vec![]);
+        assert!(table.retire(near_slot, near));
+        assert_eq!(spans(&table, 41, 0x4000_0000, 0x1000), vec![]);
+        assert_eq!(
+            spans(&table, 42, 0x4000_0000, 0x1000),
+            vec![(0x4000_0000, 0x4000_4000)]
+        );
     }
 
     #[test]
