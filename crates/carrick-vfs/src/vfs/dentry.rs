@@ -288,18 +288,10 @@ impl DentryCache {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(32 * 1024 * 1024);
 
-        Self::with_coherence(is_shared, capacity_bytes, eviction_enabled, coherence)
+        Self::new_with_capacity(is_shared, capacity_bytes, eviction_enabled, coherence)
     }
 
     pub fn new_with_capacity(
-        is_shared: bool,
-        capacity_bytes: usize,
-        eviction_enabled: bool,
-    ) -> Self {
-        Self::with_coherence(is_shared, capacity_bytes, eviction_enabled, Arc::default())
-    }
-
-    pub fn with_coherence(
         is_shared: bool,
         capacity_bytes: usize,
         eviction_enabled: bool,
@@ -3298,7 +3290,12 @@ mod tests {
         fs::create_dir(tmp.path().join("old")).unwrap();
         fs::write(tmp.path().join("old/file"), b"data").unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new_with_capacity(false, 64 * 1024, true);
+        let cache = DentryCache::new_with_capacity(
+            false,
+            64 * 1024,
+            true,
+            Arc::clone(backend.cache_coherence()),
+        );
         cache.stat("/old/file", true, &backend, None).unwrap();
         fs::rename(tmp.path().join("old"), tmp.path().join("new")).unwrap();
         backend.coherence.simulate_sibling_path_bump();
@@ -3664,7 +3661,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
         // Capacity of 64 KiB
-        let cache = DentryCache::new_with_capacity(false, 64 * 1024, true);
+        let cache = DentryCache::new_with_capacity(
+            false,
+            64 * 1024,
+            true,
+            Arc::clone(backend.cache_coherence()),
+        );
 
         // 1. Create a parent directory with 2 leaf subdirectories
         fs::create_dir_all(tmp.path().join("parent").join("leaf1")).unwrap();
@@ -3764,7 +3766,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
         // 64 KiB capacity so eviction triggers quickly
-        let cache = DentryCache::new_with_capacity(false, 64 * 1024, true);
+        let cache = DentryCache::new_with_capacity(
+            false,
+            64 * 1024,
+            true,
+            Arc::clone(backend.cache_coherence()),
+        );
 
         // 1. Create a pinned directory with an entry
         let pinned_dir = tmp.path().join("pinned_dir");
@@ -4055,7 +4062,13 @@ mod tests {
         use std::thread;
 
         let tmp = tempdir().unwrap();
-        let cache = Arc::new(DentryCache::new_with_capacity(false, 64 * 1024, true));
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = Arc::new(DentryCache::new_with_capacity(
+            false,
+            64 * 1024,
+            true,
+            Arc::clone(backend.cache_coherence()),
+        ));
         let stop = Arc::new(AtomicBool::new(false));
 
         let target_dir = tmp.path().join("target");
@@ -4067,7 +4080,7 @@ mod tests {
         let tmp_path = tmp.path().to_path_buf();
         let churn_handle = thread::spawn(move || {
             let mut idx = 0;
-            let b = HostFsBackend::from_path(&tmp_path).unwrap();
+            let b = HostFsBackend::attach(&tmp_path, Arc::clone(&cache_clone1.coherence)).unwrap();
             while !stop_clone1.load(Ordering::Relaxed) {
                 let dir_name = format!("churn_race_{}", idx % 50);
                 let p = tmp_path.join(&dir_name);
@@ -4081,7 +4094,7 @@ mod tests {
         });
 
         // Thread 2: creates files in target_dir and looks them up concurrently with eviction
-        let b2 = HostFsBackend::from_path(tmp.path()).unwrap();
+        let b2 = HostFsBackend::attach(tmp.path(), Arc::clone(&cache.coherence)).unwrap();
         for i in 0..150 {
             let file_name = format!("file_{i}.txt");
             let file_p = target_dir.join(&file_name);
