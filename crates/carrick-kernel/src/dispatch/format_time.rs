@@ -311,13 +311,12 @@ pub(crate) fn linux_clock_duration(
     clock_id: u64,
 ) -> Option<Duration> {
     match clock_id {
-        LINUX_CLOCK_REALTIME
-        | LINUX_CLOCK_REALTIME_COARSE
-        | LINUX_CLOCK_REALTIME_ALARM
-        | LINUX_CLOCK_TAI => Some(clock.realtime_now()),
-        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW | LINUX_CLOCK_MONOTONIC_COARSE => {
-            Some(clock.monotonic_now())
+        LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM | LINUX_CLOCK_TAI => {
+            Some(clock.realtime_now())
         }
+        LINUX_CLOCK_REALTIME_COARSE => Some(linux_coarse_duration(clock.realtime_now())),
+        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW => Some(clock.monotonic_now()),
+        LINUX_CLOCK_MONOTONIC_COARSE => Some(linux_coarse_duration(clock.monotonic_now())),
         // BOOTTIME includes suspend time; on macOS that is CLOCK_MONOTONIC.
         LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Some(clock.boottime_now()),
         LINUX_CLOCK_PROCESS_CPUTIME_ID => Some(Duration::from_nanos(time::task_process_cpu_ns())),
@@ -328,6 +327,29 @@ pub(crate) fn linux_clock_duration(
             DynamicCpuClock::PerProcess => Some(Duration::from_nanos(time::task_process_cpu_ns())),
         },
     }
+}
+
+/// A COARSE clock reading: its base clock truncated down to a multiple of the
+/// COARSE resolution `clock_getres` reports ([`linux_clock_getres_nsec`]).
+///
+/// clock_gettime(2) defines the COARSE clocks as faster, less precise
+/// versions of their base clocks; Linux advances them once per tick.
+/// Truncation (never rounding up) keeps a COARSE read at or behind a fine read
+/// of its base clock taken after it, keeps MONOTONIC_COARSE monotonic, and
+/// lands every value on the reported resolution. The arm64 vDSO applies the
+/// identical rule to the identical base value (`tools/vdso_fns.s`), so vDSO
+/// and syscall COARSE reads interleave without going backwards. The
+/// resolution divides one second, so truncating the sub-second part is
+/// truncating the whole value.
+// Truncating the sub-second part equals truncating the whole value only when
+// the COARSE resolution divides one second.
+const _: () = assert!(1_000_000_000 % LINUX_CLOCK_RESOLUTION_NSEC == 0);
+
+pub(crate) fn linux_coarse_duration(fine: Duration) -> Duration {
+    let resolution = linux_clock_getres_nsec(LINUX_CLOCK_MONOTONIC_COARSE).unsigned_abs();
+    let subsec = u64::from(fine.subsec_nanos());
+    let truncated = subsec - subsec % resolution.max(1);
+    Duration::new(fine.as_secs(), u32::try_from(truncated).unwrap_or(0))
 }
 
 pub(super) fn linux_clock_nanosleep_now(
@@ -374,7 +396,10 @@ pub(super) fn linux_clock_getres_nsec(clock_id: u64) -> i64 {
         | LINUX_CLOCK_PROCESS_CPUTIME_ID
         | LINUX_CLOCK_THREAD_CPUTIME_ID => LINUX_CLOCK_RESOLUTION_NSEC,
         // COARSE clocks report TICK_NSEC (CONFIG_HZ-dependent, NOT
-        // host-portable). Same 1ms stand-in; not probe-asserted.
+        // host-portable). Same 1ms stand-in, which is also the grid COARSE
+        // readings are truncated to (`linux_coarse_duration`, and the vDSO's
+        // `CLOCK_COARSE_RES_NS`). The absolute value is not probe-asserted;
+        // `clockcoarsevdso` asserts the vDSO and the syscall agree on it.
         LINUX_CLOCK_REALTIME_COARSE | LINUX_CLOCK_MONOTONIC_COARSE => LINUX_CLOCK_RESOLUTION_NSEC,
         _ => LINUX_CLOCK_RESOLUTION_NSEC,
     }
@@ -984,4 +1009,76 @@ pub(super) fn resolve_utimensat_timespec(
 pub(super) fn now_realtime_timespec(clock: &crate::kernel::container::ClockDomain) -> (i64, i64) {
     let now = clock.realtime_now();
     (now.as_secs() as i64, i64::from(now.subsec_nanos()))
+}
+
+#[cfg(test)]
+mod coarse_clock_tests {
+    use super::*;
+    use crate::kernel::container::ClockDomain;
+
+    /// Contract `kernel.time.coarse-clock-vdso` (VM-free, syscall side): the
+    /// arm64 vDSO serves these ids and reports `VDSO_CLOCK_RESOLUTION_NS` for
+    /// them, so `clock_getres` must report the same value or the two paths
+    /// disagree about one clock.
+    #[test]
+    fn syscall_getres_matches_the_vdso_for_every_vdso_served_clock() {
+        for id in [
+            LINUX_CLOCK_REALTIME,
+            LINUX_CLOCK_MONOTONIC,
+            LINUX_CLOCK_MONOTONIC_RAW,
+            LINUX_CLOCK_REALTIME_COARSE,
+            LINUX_CLOCK_MONOTONIC_COARSE,
+            LINUX_CLOCK_BOOTTIME,
+        ] {
+            assert_eq!(
+                linux_clock_getres_nsec(id),
+                carrick_mem::vdso::VDSO_CLOCK_RESOLUTION_NS,
+                "clock {id}"
+            );
+        }
+    }
+
+    /// The syscall's COARSE rule is the vDSO's: truncate the base clock to
+    /// the reported resolution, never round up.
+    #[test]
+    fn coarse_duration_truncates_to_the_reported_resolution() {
+        let res = linux_clock_getres_nsec(LINUX_CLOCK_MONOTONIC_COARSE) as u128;
+        let mut previous = Duration::ZERO;
+        for ns in [
+            0u64,
+            1,
+            999_999,
+            1_000_000,
+            1_000_001,
+            999_999_999,
+            1_000_000_000,
+            5_123_456_789,
+            1_700_000_000_999_999_999,
+        ] {
+            let fine = Duration::from_nanos(ns);
+            let coarse = linux_coarse_duration(fine);
+            assert_eq!(coarse.as_nanos(), fine.as_nanos() - fine.as_nanos() % res);
+            assert!(coarse <= fine && fine - coarse < Duration::from_nanos(res as u64));
+            assert!(coarse >= previous);
+            previous = coarse;
+        }
+    }
+
+    /// Through a system clock domain, a COARSE syscall read is never ahead of
+    /// a fine read of its base clock taken after it.
+    #[test]
+    fn coarse_syscall_reads_never_lead_their_base_clock() {
+        let clock = ClockDomain::system();
+        for (coarse, fine) in [
+            (LINUX_CLOCK_MONOTONIC_COARSE, LINUX_CLOCK_MONOTONIC),
+            (LINUX_CLOCK_REALTIME_COARSE, LINUX_CLOCK_REALTIME),
+        ] {
+            for _ in 0..1_000 {
+                let c = linux_clock_duration(&clock, coarse).unwrap();
+                let f = linux_clock_duration(&clock, fine).unwrap();
+                assert!(c <= f, "clock {coarse}: {c:?} > {fine} {f:?}");
+                assert_eq!(c.subsec_nanos() % 1_000_000, 0);
+            }
+        }
+    }
 }

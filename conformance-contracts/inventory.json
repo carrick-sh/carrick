@@ -1620,6 +1620,7 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.mm.native-syscall-buffers",
+        "kernel.time.coarse-clock-vdso",
         "kernel.time.realtime-calibration"
       ],
       "claims": [],
@@ -1634,7 +1635,9 @@
       "support": "bring_up",
       "handler": "time",
       "authority": "hybrid",
-      "contracts": [],
+      "contracts": [
+        "kernel.time.coarse-clock-vdso"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"

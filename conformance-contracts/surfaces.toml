@@ -94,7 +94,19 @@ contracts = ["kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/vdso.rs"
-contracts = ["kernel.time.realtime-calibration"]
+contracts = ["kernel.time.realtime-calibration", "kernel.time.coarse-clock-vdso"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/tools/vdso_fns.s"
+contracts = ["kernel.time.coarse-clock-vdso"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/coarse_clock_vdso.rs"
+contracts = ["kernel.time.coarse-clock-vdso"]
+
+[[surfaces]]
+path = "fixtures/linux-aarch64-hello/src/coarse_clock_vdso.rs"
+contracts = ["kernel.time.coarse-clock-vdso"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/realtime_calibration.rs"
@@ -622,3 +634,7 @@ contracts = ["kernel.el1.deferred-handback-identity", "kernel.el1.guest-schedule
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation/wait_service.rs"
 contracts = ["kernel.el1.deferred-handback-identity", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/format_time.rs"
+contracts = ["kernel.time.coarse-clock-vdso"]
