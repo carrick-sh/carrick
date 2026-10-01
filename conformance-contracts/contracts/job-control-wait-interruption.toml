@@ -1,0 +1,27 @@
+schema_version = 1
+id = "kernel.signal.job-control-wait-interruption"
+title = "Group-stop interruption is scoped to Linux's eligible blocking interfaces"
+guest_surfaces = ["syscall:epoll_pwait", "syscall:rt_sigtimedwait", "syscall:semop", "syscall:semtimedop", "syscall:recvfrom", "syscall:sendto"]
+semantic_authority = ["man 7 signal: Interruption of system calls and library functions by stop signals"]
+fixture = "probe:epollstopcont"
+scale_points = [2]
+structural_budgets = []
+rationale = """
+A thread group's actual stop transition advances one durable task-owned epoch.
+A parked continuation compares its admitted epoch, so another thread consuming
+the stop signal or a stop+continue pair before resumption cannot erase it.
+Eligible waits fail with EINTR without consuming a handler signal. Pipe I/O,
+futexes, poll/select and sleeps preserve their continuation. Socket eligibility
+requires the admitted SO_RCVTIMEO/SO_SNDTIMEO deadline, never an incidental
+reactor timer. Existing task-wake subscriptions provide notification; this
+adds no polling, redispatch while parked, or host-process authority.
+The two-thread VM-free binding exercises the real carrier wait service.
+Signed output is checked against predicted Linux output; the integration
+director owns Docker refresh and broader promotion. No timing acceptance or
+structural meter completeness is claimed here.
+"""
+
+[bindings]
+vm_free = "carrick-kernel::kernel::continuation::tests::group_stop_interrupts_epoll_sibling_but_preserves_pipe_wait"
+embed = "probe:epollstopcont"
+docker = "probe:epollstopcont"

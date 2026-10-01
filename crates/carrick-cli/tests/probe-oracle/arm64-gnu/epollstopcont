@@ -1,0 +1,7 @@
+1610ad6b6ae0356e
+epoll_rc=-1
+epoll_errno=4
+epoll_returned_before_timeout=true
+pipe_rc=1
+pipe_errno=0
+pipe_returned_before_timeout=true
