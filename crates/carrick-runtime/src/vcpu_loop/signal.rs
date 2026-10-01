@@ -42,10 +42,12 @@ pub(crate) fn partial_write_interrupt_outcome(
     }
 }
 
-// ===================================================================
+// ============================================================}
+
 // EL0 synchronous-fault translation (moved from runtime/fault.rs; the
 // classifier fns are pure and the delivery fn is generic over the engine).
-// ===================================================================
+// ============================================================}
+
 
 /// Map an EL0 synchronous-fault `ESR_EL1` to the Linux `(signum, si_code)` the
 /// kernel would deliver, or `None` for a class we don't translate (kept fatal).
@@ -733,6 +735,45 @@ impl GuestGrantLedger {
         }
         Ok(settled)
     }
+
+    /// Withdraw every still-unclaimed `mm_key` entry whose plan span meets
+    /// `[start, end)`, handing each to `withdrawn` (which rolls its backing
+    /// back). Settle ready receipts first: an overlapping entry EL1 has
+    /// claimed but not answered is an error.
+    pub(super) fn withdraw_unclaimed_over(
+        &self,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+        mm_key: u64,
+        start: u64,
+        end: u64,
+        mut withdrawn: impl FnMut(PendingGuestGrant) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        for (slot, entry) in self.pending.iter().enumerate() {
+            let taken = {
+                let mut entry = entry.lock();
+                let Some(pending) = *entry else {
+                    continue;
+                };
+                let (plan_start, plan_len, _) = pending.plan;
+                if pending.txn.id.mm_key.get() != mm_key
+                    || plan_start >= end
+                    || plan_start.saturating_add(plan_len) <= start
+                {
+                    continue;
+                }
+                if !slots.withdraw(slot, pending.txn.id) {
+                    return Err(TrapError::Hypervisor(format!(
+                        "guest grant {:?} over a host copyout is claimed but unanswered",
+                        pending.txn.id
+                    )));
+                }
+                self.release(&mut entry);
+                pending
+            };
+            withdrawn(taken)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -921,10 +962,7 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
                             pending.txn.id, pending.fault_va, pending.plan, current
                         ))
                     })?;
-                dispatcher.commit_resident_frame_grant(plan);
-                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
-                    let _ = table.publish(pending.residency);
-                }
+                dispatcher.commit_published_frame_grant(plan, pending.residency);
                 Ok(())
             },
         )
@@ -954,6 +992,80 @@ pub(super) fn settle_guest_work_before_host_copy<E: ThreadedEngine>(
     }
     settle_guest_cow_of(mm_executor.mm_id());
     Ok(())
+}
+
+/// The settlement backend for a grant served through an
+/// [`carrick_hal::threaded::El1FrameGrantVenue`] (a host copyout).
+struct VenueGrantBackend<'a>(&'a mut dyn carrick_hal::threaded::El1FrameGrantVenue);
+
+impl GuestGrantBackend for VenueGrantBackend<'_> {
+    fn verify(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
+    {
+        self.0.settle_receipt(txn, receipt)
+    }
+
+    fn complete(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<(), TrapError> {
+        self.0.complete(grant)
+    }
+
+    fn roll_back(
+        &mut self,
+        grant: carrick_hal::threaded::El1FrameGrantRollback,
+    ) -> Result<bool, TrapError> {
+        self.0.roll_back(grant)
+    }
+}
+
+/// Before a host copyout plans a grant over `[start, end)`: settle every
+/// guest grant of this MM whose receipt EL1 has published, and withdraw and
+/// roll back any still-unclaimed one whose span meets the copyout. Such a
+/// grant is published but not committed, so the root still reads its pages
+/// as fresh; planning over it would back the same page twice. The faulting
+/// thread of a withdrawn grant simply faults again and finds the copyout's
+/// frame. A grant EL1 has claimed but not answered cannot be settled here
+/// and is an error: the caller holds the MM, so none should exist.
+pub(super) fn settle_guest_grants_over(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    venue: &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
+    mutation: &carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
+    start: u64,
+    end: u64,
+) -> Result<(), TrapError> {
+    let Some(slots) = carrick_el1_abi::descriptor_txn_slots_host() else {
+        return Ok(());
+    };
+    let mm_key = mutation.host_alias_permit().mm().raw();
+    GUEST_GRANT_LEDGER.settle_ready(slots, mm_key, |pending, receipt| {
+        settle_guest_frame_grant(
+            pending,
+            &receipt,
+            &mut VenueGrantBackend(&mut *venue),
+            |pending, _resident| {
+                let permit = mutation.host_alias_permit();
+                let plan = dispatcher
+                    .resident_frame_grant_plan(&permit, pending.fault_va, pending.requested_len)
+                    .filter(|plan| (plan.start(), plan.len(), plan.prot()) == pending.plan)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "EL1 published grant {:?} but its first-touch plan changed",
+                            pending.txn.id
+                        ))
+                    })?;
+                dispatcher.commit_published_frame_grant(plan, pending.residency);
+                Ok(())
+            },
+        )
+    })?;
+    GUEST_GRANT_LEDGER.withdraw_unclaimed_over(slots, mm_key, start, end, |pending| {
+        venue.roll_back(pending.rollback()).map(|_| ())
+    })
 }
 
 /// Whether a forwarded-syscall boundary must settle guest grants before it
@@ -1133,15 +1245,13 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 // A root-owned span's provenance is the root's: publish it
                 // for exactly this span before its backing is prepared.
                 dispatcher.adopt_frame_grant_provenance(&plan);
-                let service = carrick_hal::El1FrameGrantRequest {
-                    mm_key: request.mm_key,
-                    request_generation: request.request_generation,
-                    fault_va: request.fault_va,
-                    access: request.access,
-                    semantic_base: plan.start(),
-                    len: plan.len(),
-                    permissions: prot,
-                };
+                let service = carrick_kernel::dispatch::SyscallDispatcher::el1_frame_grant_request(
+                    &plan,
+                    request.mm_key,
+                    request.request_generation,
+                    request.fault_va,
+                    request.access,
+                );
                 let Some(ready) = engine.prepare_el1_frame_grant(service)? else {
                     ring::rec_el1_frame_grant_decision(
                         ring_tid,
@@ -1236,13 +1346,10 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             // Committed by `settle_guest_frame_grants`.
                             return;
                         }
-                        dispatcher.commit_resident_frame_grant(plan);
                         // A full journal is safe: prepared leaves still use
-                        // the existing host first-touch path. Publish only
+                        // the existing host first-touch path. Published only
                         // after stage-1, stage-2 and inventory are live.
-                        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
-                            let _ = table.publish(residency_identity);
-                        }
+                        dispatcher.commit_published_frame_grant(plan, residency_identity);
                     },
                 )?;
                 if !completed {
@@ -3407,6 +3514,48 @@ mod guest_descriptor_lane_tests {
             Some(Some(IPA)),
             "the predecessor's retired lease is still named by its leaves"
         );
+    }
+
+    /// A host copyout over a span an EL0 first touch's guest grant still
+    /// holds unclaimed withdraws exactly that grant (its backing is rolled
+    /// back; the faulting thread retries onto the copyout's frame) and frees
+    /// its slot. A grant elsewhere in the MM, or in another MM, stays.
+    #[test]
+    fn a_host_copyout_withdraws_only_the_unclaimed_grants_it_overlaps() {
+        let (authority, _resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let ledger = GuestGrantLedger::new();
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        let pending = replacement_pending(txn, VA);
+        assert!(ledger.submit(&slots, 3, pending));
+
+        let mut withdrawn = Vec::new();
+        ledger
+            .withdraw_unclaimed_over(&slots, MM, VA + 4 * 4096, VA + 8 * 4096, |pending| {
+                withdrawn.push(pending.rollback());
+                Ok(())
+            })
+            .unwrap();
+        ledger
+            .withdraw_unclaimed_over(&slots, MM + 1, VA, VA + 4096, |pending| {
+                withdrawn.push(pending.rollback());
+                Ok(())
+            })
+            .unwrap();
+        assert!(withdrawn.is_empty(), "no overlap, no withdrawal");
+        assert!(ledger.is_occupied());
+
+        ledger
+            .withdraw_unclaimed_over(&slots, MM, VA + 4096, VA + 2 * 4096, |pending| {
+                withdrawn.push(pending.rollback());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(withdrawn, vec![pending.rollback()]);
+        assert!(!ledger.is_occupied());
+        assert!(slots.submit(3, &txn), "the withdrawn slot is free again");
     }
 
     /// A grant that replaces a private predecessor is published by EL1 over
