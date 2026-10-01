@@ -1,0 +1,38 @@
+# Real-workload rows for scripts/perf/el1_workload_ab.py that the generated
+# scripts/conformance/suites.toml does not carry. Same schema as suites.toml,
+# so the conformance harness parses this file too (`--manifest`), and
+# `el1_workload_ab.py plan --check-harness` proves the runner launches each
+# row exactly as the harness would.
+#
+# node-core-worker-message-port: Node's own tools/test.py over the
+# `parallel/test-worker-message-port*` shard (26 tests; one node process per
+# test, worker threads, MessagePort IPC). The image's other Node suites
+# (app-smoke, v8-smoke, npm-smoke) finish in under a second and measure
+# little beyond startup. Shard chosen 2026-10-01: all 26 pass under Carrick
+# (~10 s on a shared host).
+
+[[suite]]
+name = "node-core-worker-message-port"
+ecosystem = "node"
+image = "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0"
+cmd = ["--runner", "docker", "--suite", "node-core", "--line", "24", "--timeout", "240", "--filter", "parallel/test-worker-message-port*"]
+verdict = "tap"
+tier = "full"
+weight = "heavy"
+timeout_s = 300
+carrick_flags = ["--fs", "host"]
+
+[[suite.env]]
+key = "NODEJS_CONFORMANCE_IN_IMAGE"
+val = "1"
+
+[[suite.env_carrick]]
+key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER"
+val = "carrick"
+
+[[suite.env_docker]]
+key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER"
+val = "docker"
+
+[suite.entrypoint]
+both = "/usr/local/bin/nodejs-conformance"

@@ -59,7 +59,7 @@ SCHEMA_DOCKER = "carrick.el1-workload-ab.docker.v1"
 SCHEMA_REPORT = "carrick.el1-workload-ab.report.v1"
 LANE_ENV = "CARRICK_EL1_DESCRIPTOR_LANE"
 DEFAULT_ARMS = (f"lane-off:{LANE_ENV}=0", "lane-on")
-DEFAULT_WORKLOADS = ("go-build", "cpython-threading", "node-app-smoke")
+DEFAULT_WORKLOADS = ("go-build", "cpython-threading", "node-core-worker-message-port")
 GO_BUILD = "go-build"
 # `--max-traps usize::MAX`, exactly as carrick_argv spells it.
 MAX_TRAPS = str((1 << 64) - 1)
@@ -70,6 +70,10 @@ ATTRIBUTION_PROFILES = (
 HYPERVISOR_ENTITLEMENT = "com.apple.security.hypervisor"
 METRICS = ("cpu_s", "elapsed_ms", "workload_ms")
 REPO = pathlib.Path(__file__).resolve().parents[2]
+DEFAULT_MANIFESTS = (
+    REPO / "scripts/conformance/suites.toml",
+    REPO / "scripts/perf/manifests/el1-real-workloads-v1.toml",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,6 +91,7 @@ class Workload:
     image: str
     timeout_s: int
     suite: dict[str, object] | None
+    manifest: pathlib.Path | None = None
 
     @property
     def has_window(self) -> bool:
@@ -121,9 +126,15 @@ def parse_arms(specs: Sequence[str]) -> tuple[Arm, Arm]:
     return arms  # type: ignore[return-value]
 
 
-def load_suites(manifest: pathlib.Path) -> dict[str, dict[str, object]]:
-    data = tomllib.loads(manifest.read_text())
-    return {suite["name"]: suite for suite in data.get("suite", [])}
+def load_suites(*manifests: pathlib.Path) -> dict[str, dict[str, object]]:
+    """Suites by name, each tagged with the manifest that declares it."""
+    suites: dict[str, dict[str, object]] = {}
+    for manifest in manifests:
+        for suite in tomllib.loads(manifest.read_text()).get("suite", []):
+            if suite["name"] in suites:
+                raise ValueError(f"suite {suite['name']!r} is declared twice")
+            suites[suite["name"]] = {**suite, "_manifest": str(manifest)}
+    return suites
 
 
 def resolve_workload(name: str, suites: dict[str, dict[str, object]]) -> Workload:
@@ -137,7 +148,13 @@ def resolve_workload(name: str, suites: dict[str, dict[str, object]]) -> Workloa
     suite = suites.get(name)
     if suite is None:
         raise ValueError(f"unknown workload {name!r}: not go-build and not a suite in suites.toml")
-    return Workload(name, str(suite["image"]), int(suite["timeout_s"]), suite)
+    return Workload(
+        name,
+        str(suite["image"]),
+        int(suite["timeout_s"]),
+        suite,
+        pathlib.Path(str(suite["_manifest"])),
+    )
 
 
 def _effective_cmd(suite: dict[str, object]) -> list[str]:
@@ -203,12 +220,15 @@ def docker_argv(workload: Workload, run_id: str) -> list[str]:
     return argv
 
 
-def harness_dry_run_lines(suite_name: str, binary: pathlib.Path) -> tuple[str, str]:
+def harness_dry_run_lines(
+    suite_name: str, binary: pathlib.Path, manifest: pathlib.Path
+) -> tuple[str, str]:
     """The conformance harness's own planned argv for one suite."""
     result = subprocess.run(
         [
             "cargo", "run", "-q", "-p", "carrick-conformance", "--",
-            "--dry-run", "--suite", suite_name, "--carrick-bin", str(binary),
+            "--dry-run", "--manifest", str(manifest), "--tier", "full",
+            "--suite", suite_name, "--carrick-bin", str(binary),
         ],
         cwd=REPO, capture_output=True, text=True, check=False, timeout=1800,
     )
@@ -224,7 +244,8 @@ def harness_dry_run_lines(suite_name: str, binary: pathlib.Path) -> tuple[str, s
 def check_against_harness(workload: Workload, binary: pathlib.Path) -> None:
     if workload.suite is None:
         return
-    want_carrick, want_docker = harness_dry_run_lines(workload.name, binary)
+    assert workload.manifest is not None
+    want_carrick, want_docker = harness_dry_run_lines(workload.name, binary, workload.manifest)
     marker = "RUNID"
     for want, have in (
         (want_carrick, " ".join(carrick_argv(workload, binary, marker))),
@@ -442,7 +463,7 @@ def campaign_header(args: argparse.Namespace, schema: str) -> dict[str, object]:
 
 def run_carrick_phase(args: argparse.Namespace) -> dict[str, object]:
     arms = parse_arms(args.arm)
-    suites = load_suites(args.manifest)
+    suites = load_suites(*args.manifest)
     workloads = [resolve_workload(name, suites) for name in args.workload]
     binary = args.binary.resolve()
     identity = binary_identity(binary)
@@ -522,7 +543,7 @@ def attribution_bound(timeout_s: int) -> int:
 
 def run_attribution_phase(args: argparse.Namespace) -> dict[str, object]:
     arms = parse_arms(args.arm)
-    suites = load_suites(args.manifest)
+    suites = load_suites(*args.manifest)
     workloads = [resolve_workload(name, suites) for name in args.workload]
     binary = args.binary.resolve()
     identity = binary_identity(binary)
@@ -565,7 +586,7 @@ def run_attribution_phase(args: argparse.Namespace) -> dict[str, object]:
 
 
 def run_docker_phase(args: argparse.Namespace) -> dict[str, object]:
-    suites = load_suites(args.manifest)
+    suites = load_suites(*args.manifest)
     workloads = [resolve_workload(name, suites) for name in args.workload]
     alive = [
         row for row in native_go_build.foreign_workload_census()
@@ -677,7 +698,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     for name in ("plan", "carrick", "attribution", "docker"):
         p = sub.add_parser(name)
         p.add_argument("--workload", action="append", help=f"repeatable; default {', '.join(DEFAULT_WORKLOADS)}")
-        p.add_argument("--manifest", type=pathlib.Path, default=REPO / "scripts/conformance/suites.toml")
+        p.add_argument("--manifest", type=pathlib.Path, action="append",
+                       help="suite manifests (repeatable); default suites.toml + manifests/el1-real-workloads-v1.toml")
         p.add_argument("--campaign", default=f"el1ab-{os.getpid()}", help="run-id prefix (unique per campaign)")
         p.add_argument("--output", type=pathlib.Path, default=REPO / f"target/perf/el1-workload-ab/{name}.json")
         p.add_argument("--timeout-s", type=int, default=0, help="override each workload's own budget")
@@ -706,6 +728,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.command != "report":
         args.workload = args.workload or list(DEFAULT_WORKLOADS)
+        args.manifest = args.manifest or list(DEFAULT_MANIFESTS)
         if hasattr(args, "arm"):
             args.arm = args.arm or list(DEFAULT_ARMS)
         if hasattr(args, "profile"):
@@ -725,7 +748,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "plan":
         arms = parse_arms(args.arm)
-        suites = load_suites(args.manifest)
+        suites = load_suites(*args.manifest)
         binary = args.binary.resolve()
         for name in args.workload:
             workload = resolve_workload(name, suites)
