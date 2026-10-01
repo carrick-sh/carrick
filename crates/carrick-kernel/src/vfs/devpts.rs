@@ -95,24 +95,24 @@ impl PtyTable {
 
     /// Drop an entry (master closed). Does not close the host fd — the
     /// dispatcher owns fd closing; this only updates the directory view.
-    pub fn free(&mut self, n: u32) {
+    pub fn free(&mut self, n: u32, registry: &crate::kernel::tty::TtyRegistry) {
         self.entries.remove(&n);
         if self.controlling_index == Some(n) {
             self.controlling_index = None;
         }
-        crate::kernel::tty::detach(crate::kernel::tty::TtyKey::Pty(n));
+        crate::kernel::tty::detach(registry, crate::kernel::tty::TtyKey::Pty(n));
     }
 
     /// Remove entry `n` only if `pid` opened it. A forked child that closes
     /// its inherited master must NOT remove the parent's entry (the per-process
     /// table is a fork copy); only the owning process's close frees it.
-    pub fn free_if_owner(&mut self, n: u32, pid: u32) {
+    pub fn free_if_owner(&mut self, n: u32, pid: u32, registry: &crate::kernel::tty::TtyRegistry) {
         if self.entries.get(&n).map(|e| e.owner_pid) == Some(pid) {
             self.entries.remove(&n);
             if self.controlling_index == Some(n) {
                 self.controlling_index = None;
             }
-            crate::kernel::tty::detach(crate::kernel::tty::TtyKey::Pty(n));
+            crate::kernel::tty::detach(registry, crate::kernel::tty::TtyKey::Pty(n));
         }
     }
 }
@@ -367,7 +367,7 @@ mod tests {
         assert!(t.is_locked(0));
         t.set_locked(0, false);
         assert!(!t.is_locked(0));
-        t.free(0);
+        t.free(0, &crate::kernel::tty::TtyRegistry::default());
         assert_eq!(t.slave_name(0), None);
         assert_eq!(t.live_indices(), vec![1]);
         assert_eq!(t.insert("/dev/ttys002".into(), 1234), 2);
@@ -377,9 +377,9 @@ mod tests {
     fn free_if_owner_only_frees_for_owning_pid() {
         let mut t = PtyTable::new();
         let n = t.insert("/dev/ttysX".into(), 100);
-        t.free_if_owner(n, 999); // non-owner: no-op
+        t.free_if_owner(n, 999, &crate::kernel::tty::TtyRegistry::default()); // non-owner: no-op
         assert!(t.slave_name(n).is_some());
-        t.free_if_owner(n, 100); // owner: frees
+        t.free_if_owner(n, 100, &crate::kernel::tty::TtyRegistry::default()); // owner: frees
         assert!(t.slave_name(n).is_none());
     }
 
@@ -388,7 +388,7 @@ mod tests {
         let mut t = PtyTable::new();
         let n = t.insert("/dev/ttys-parent".into(), 100);
 
-        t.free_if_owner(n, 200);
+        t.free_if_owner(n, 200, &crate::kernel::tty::TtyRegistry::default());
 
         assert_eq!(t.live_indices(), vec![n]);
         assert_eq!(t.slave_name(n).as_deref(), Some("/dev/ttys-parent"));
@@ -398,9 +398,9 @@ mod tests {
     fn freed_parent_pty_index_is_not_resurrected_by_child_open() {
         let mut t = PtyTable::new();
         let parent = t.insert("/dev/ttys-parent".into(), 100);
-        t.free_if_owner(parent, 100);
+        t.free_if_owner(parent, 100, &crate::kernel::tty::TtyRegistry::default());
 
-        t.free_if_owner(parent, 200);
+        t.free_if_owner(parent, 200, &crate::kernel::tty::TtyRegistry::default());
         let child = t.insert("/dev/ttys-child".into(), 200);
 
         assert_ne!(child, parent);

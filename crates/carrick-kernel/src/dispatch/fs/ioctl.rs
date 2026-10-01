@@ -453,14 +453,18 @@ impl<'a> FsView<'a> {
             if role.is_master {
                 return false;
             }
-            if crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index))
-                == Some(session)
+            if crate::kernel::tty::session(
+                cx_kernel.container().tty_registry(),
+                crate::kernel::tty::TtyKey::Pty(role.index),
+            ) == Some(session)
             {
                 return true;
             }
             if controlling_index == Some(role.index)
-                && (crate::kernel::tty::session(crate::kernel::tty::TtyKey::Launch)
-                    == Some(session)
+                && (crate::kernel::tty::session(
+                    cx_kernel.container().tty_registry(),
+                    crate::kernel::tty::TtyKey::Launch,
+                ) == Some(session)
                     || cx_kernel.kernel().tty_session(cx_kernel) == Ok(session))
             {
                 return true;
@@ -471,7 +475,10 @@ impl<'a> FsView<'a> {
             && !self.fd_table_contains(fd)
             && controlling_index.is_some()
         {
-            crate::kernel::tty::session(crate::kernel::tty::TtyKey::Launch) == Some(session)
+            crate::kernel::tty::session(
+                cx_kernel.container().tty_registry(),
+                crate::kernel::tty::TtyKey::Launch,
+            ) == Some(session)
                 || cx_kernel.kernel().tty_session(cx_kernel) == Ok(session)
         } else {
             false
@@ -956,7 +963,7 @@ impl<'a> FsView<'a> {
                             return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
                         }
                         let session = cx.kernel.task().session();
-                        let group_res = crate::kernel::tty::foreground_process_group(
+                        let group_res = crate::kernel::tty::foreground_process_group(cx.kernel.container().tty_registry(),
                             crate::kernel::tty::TtyKey::Pty(role.index),
                             session,
                         )
@@ -996,7 +1003,7 @@ impl<'a> FsView<'a> {
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         };
                         let session = cx.kernel.task().session();
-                        let res = crate::kernel::tty::set_foreground_process_group(
+                        let res = crate::kernel::tty::set_foreground_process_group(cx.kernel.container().tty_registry(),
                             crate::kernel::tty::TtyKey::Pty(role.index),
                             session,
                             group,
@@ -1029,15 +1036,15 @@ impl<'a> FsView<'a> {
                         }
                         // A session leader that already has a controlling
                         // terminal cannot take a second one (Linux: EPERM).
-                        if crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index))
+                        if crate::kernel::tty::session(cx.kernel.container().tty_registry(), crate::kernel::tty::TtyKey::Pty(role.index))
                             != Some(session)
-                            && crate::kernel::tty::session_owns_tty(session)
+                            && crate::kernel::tty::session_owns_tty(cx.kernel.container().tty_registry(), session)
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
                         let force = arg != 0;
                         let group = cx.kernel.task().process_group();
-                        match crate::kernel::tty::attach_pty(
+                        match crate::kernel::tty::attach_pty(cx.kernel.container().tty_registry(),
                             role.index,
                             cx.kernel.kernel(),
                             cx.kernel.container().id(),
@@ -1057,7 +1064,7 @@ impl<'a> FsView<'a> {
                         }
                     }
                     LINUX_TIOCGSID => {
-                        let session_res = crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index))
+                        let session_res = crate::kernel::tty::session(cx.kernel.container().tty_registry(), crate::kernel::tty::TtyKey::Pty(role.index))
                             .ok_or(LINUX_ENOTTY)
                             .or_else(|_| {
                                 if this.pty_is_controlling(role.index) {
@@ -1085,7 +1092,7 @@ impl<'a> FsView<'a> {
                         // (oracle `ptyflagmatrix`: `ctty_tiocnotty_errno=25`).
                         let session = cx.kernel.task().session();
                         let key = crate::kernel::tty::TtyKey::Pty(role.index);
-                        if crate::kernel::tty::session(key) != Some(session) {
+                        if crate::kernel::tty::session(cx.kernel.container().tty_registry(), key) != Some(session) {
                             return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
                         }
                         // A session LEADER giving up its terminal hangs up the
@@ -1094,11 +1101,11 @@ impl<'a> FsView<'a> {
                         // own reference, which this per-session model has no
                         // separate state for.
                         if session.raw() == cx.kernel.task().key().id.raw() {
-                            crate::kernel::tty::route_foreground_signal_to_tty(
+                            crate::kernel::tty::route_foreground_signal_to_tty(cx.kernel.container().tty_registry(),
                                 key,
                                 crate::linux_abi::LINUX_SIGHUP,
                             );
-                            crate::kernel::tty::route_foreground_signal_to_tty(
+                            crate::kernel::tty::route_foreground_signal_to_tty(cx.kernel.container().tty_registry(),
                                 key,
                                 crate::linux_abi::LINUX_SIGCONT,
                             );
@@ -1106,7 +1113,7 @@ impl<'a> FsView<'a> {
                                 crate::vfs::devpts::set_controlling_index(this.pty_table(), None);
                                 let _ = cx.kernel.kernel().tty_detach(cx.kernel);
                             }
-                            crate::kernel::tty::detach_if_session(key, session);
+                            crate::kernel::tty::detach_if_session(cx.kernel.container().tty_registry(), key, session);
                         }
                         DispatchOutcome::Returned { value: 0 }
                     }
@@ -1127,9 +1134,9 @@ impl<'a> FsView<'a> {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
                         let session = cx.kernel.task().session();
-                        match crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index)) {
+                        match crate::kernel::tty::session(cx.kernel.container().tty_registry(), crate::kernel::tty::TtyKey::Pty(role.index)) {
                             Some(s) if s == session => {
-                                crate::kernel::tty::route_foreground_signal_to_tty(
+                                crate::kernel::tty::route_foreground_signal_to_tty(cx.kernel.container().tty_registry(),
                                     crate::kernel::tty::TtyKey::Pty(role.index),
                                     signum,
                                 );
@@ -1139,7 +1146,7 @@ impl<'a> FsView<'a> {
                                 if this.pty_is_controlling(role.index)
                                     && cx.kernel.kernel().tty_session(cx.kernel).is_ok_and(|s| s == session)
                                 {
-                                    crate::kernel::tty::route_foreground_signal_to_tty(
+                                    crate::kernel::tty::route_foreground_signal_to_tty(cx.kernel.container().tty_registry(),
                                         crate::kernel::tty::TtyKey::Launch,
                                         signum,
                                     );
@@ -1520,7 +1527,7 @@ impl<'a> FsView<'a> {
                         if cx.kernel.kernel().tty_session(cx.kernel).is_err() {
                             return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
                         }
-                        crate::kernel::tty::route_foreground_signal_to_tty(
+                        crate::kernel::tty::route_foreground_signal_to_tty(cx.kernel.container().tty_registry(),
                             crate::kernel::tty::TtyKey::Launch,
                             signum,
                         );

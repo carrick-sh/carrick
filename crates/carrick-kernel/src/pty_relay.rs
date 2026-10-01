@@ -255,23 +255,33 @@ impl PtyRelay {
     /// Production entry: allocate a pty, put `real_in` in raw mode, install
     /// SIGWINCH propagation, and start the relay between (real_in, real_out)
     /// and the master.
-    pub fn start(real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
+    pub fn start(
+        registry: std::sync::Arc<crate::kernel::tty::TtyRegistry>,
+        real_in: RawFd,
+        real_out: RawFd,
+    ) -> io::Result<Self> {
         let pair = PtyPair::allocate()?;
-        Self::start_with_pair(pair, real_in, real_out)
+        Self::start_with_pair(registry, pair, real_in, real_out)
     }
 
     /// Production entry over a pty the caller already allocated: the
     /// carrier-local interactive session allocates the pair, starts this relay,
     /// then `dup2`s the slave over the carrier's fds 0-2 before any guest
     /// traffic flows.
-    pub fn start_with_pair(pair: PtyPair, real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
-        Self::start_with_pair_and_winsize(pair, real_in, real_out, -1)
+    pub fn start_with_pair(
+        registry: std::sync::Arc<crate::kernel::tty::TtyRegistry>,
+        pair: PtyPair,
+        real_in: RawFd,
+        real_out: RawFd,
+    ) -> io::Result<Self> {
+        Self::start_with_pair_and_winsize(registry, pair, real_in, real_out, -1)
     }
 
     /// Same as [`Self::start_with_pair`], but also watches `winsize_r` for
     /// `libc::winsize` messages from a helper that stayed in the original
     /// terminal session.
     pub fn start_with_pair_and_winsize(
+        registry: std::sync::Arc<crate::kernel::tty::TtyRegistry>,
         pair: PtyPair,
         real_in: RawFd,
         real_out: RawFd,
@@ -359,15 +369,16 @@ impl PtyRelay {
         // `?` here drops `guard` on Err → full rollback (disarm global, restore
         // disposition, close both winch fds). The relay thread never spawned on
         // that path, so relay_loop never closed winch_r — no double-close.
-        let mut relay = match Self::start_inner(pair, real_in, real_out, winch_r, winsize_r) {
-            Ok(relay) => relay,
-            Err(error) => {
-                if raw_active {
-                    crate::host_tty::restore_stdin_termios();
+        let mut relay =
+            match Self::start_inner(registry, pair, real_in, real_out, winch_r, winsize_r) {
+                Ok(relay) => relay,
+                Err(error) => {
+                    if raw_active {
+                        crate::host_tty::restore_stdin_termios();
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         relay.raw_active = raw_active;
         relay.winch_r = winch_r;
         relay.winch_w = winch_w;
@@ -381,8 +392,13 @@ impl PtyRelay {
     /// Test entry: same as `start` but skips `make_raw` and does NOT install
     /// the process-global SIGWINCH handler (tests must not disturb signal state).
     #[cfg(test)]
-    pub fn start_for_test(real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
-        let mut relay = Self::start_inner(PtyPair::allocate()?, real_in, real_out, -1, -1)?;
+    pub fn start_for_test(
+        registry: std::sync::Arc<crate::kernel::tty::TtyRegistry>,
+        real_in: RawFd,
+        real_out: RawFd,
+    ) -> io::Result<Self> {
+        let mut relay =
+            Self::start_inner(registry, PtyPair::allocate()?, real_in, real_out, -1, -1)?;
         relay.raw_active = false;
         Ok(relay)
     }
@@ -391,6 +407,7 @@ impl PtyRelay {
     /// the thread; pass `-1` for the test path (poll ignores fds with events=0,
     /// and we special-case -1 in relay_loop to skip adding it to the poll set).
     fn start_inner(
+        registry: std::sync::Arc<crate::kernel::tty::TtyRegistry>,
         pair: PtyPair,
         real_in: RawFd,
         real_out: RawFd,
@@ -415,8 +432,11 @@ impl PtyRelay {
             .name("pty-relay".into())
             .spawn(move || {
                 relay_loop(
-                    real_in,
-                    real_out,
+                    registry,
+                    RelayTerminal {
+                        input: real_in,
+                        output: real_out,
+                    },
                     master,
                     winsize_target,
                     shutdown_r,
@@ -563,15 +583,24 @@ fn drain_pending_master(master: RawFd, real_out: RawFd) {
 /// every poll wakeup (timeout or signal) and propagating on change — the
 /// SIGWINCH self-pipe is only a low-latency nudge (its handler is unreliable
 /// under HVF).
+struct RelayTerminal {
+    input: RawFd,
+    output: RawFd,
+}
+
 fn relay_loop(
-    real_in: RawFd,
-    real_out: RawFd,
+    registry: std::sync::Arc<crate::kernel::tty::TtyRegistry>,
+    terminal: RelayTerminal,
     master: RawFd,
     winsize_target: RawFd,
     shutdown_r: RawFd,
     winch_r: RawFd,
     winsize_r: RawFd,
 ) {
+    let RelayTerminal {
+        input: real_in,
+        output: real_out,
+    } = terminal;
     // Ensure SIGWINCH is deliverable on THIS thread so the handler can wake the
     // relay. carrick's process signal mask (set up by HVF/runtime init) may
     // block it on threads spawned later; unblock it explicitly here.
@@ -627,7 +656,7 @@ fn relay_loop(
         },
     ];
     let mut buf = [0u8; 4096];
-    let mut line_discipline = RelayLineDiscipline::default();
+    let mut line_discipline = RelayLineDiscipline::new(std::sync::Arc::clone(&registry));
     let mut pending_echo = VecDeque::new();
     // Track the last window size we propagated. SIGWINCH delivery is unreliable
     // in carrick's HVF context (the handler often never fires — HVF masks
@@ -694,7 +723,10 @@ fn relay_loop(
                 while let Some(ws) = read_winsize_message(winsize_r) {
                     apply_winsize(winsize_target, &ws);
                     last_ws = Some(ws);
-                    crate::kernel::tty::route_foreground_signal(crate::linux_abi::LINUX_SIGWINCH);
+                    crate::kernel::tty::route_foreground_signal(
+                        &registry,
+                        crate::linux_abi::LINUX_SIGWINCH,
+                    );
                 }
             }
         }
@@ -710,7 +742,10 @@ fn relay_loop(
             if changed {
                 apply_winsize(winsize_target, &cur);
                 last_ws = Some(cur);
-                crate::kernel::tty::route_foreground_signal(crate::linux_abi::LINUX_SIGWINCH);
+                crate::kernel::tty::route_foreground_signal(
+                    &registry,
+                    crate::linux_abi::LINUX_SIGWINCH,
+                );
             }
         }
         // real_in readable → copy to master.
@@ -811,12 +846,19 @@ fn forward_input_bytes(
     true
 }
 
-#[derive(Default)]
 struct RelayLineDiscipline {
+    registry: std::sync::Arc<crate::kernel::tty::TtyRegistry>,
     inner: crate::kernel::tty::LineDiscipline,
 }
 
 impl RelayLineDiscipline {
+    fn new(registry: std::sync::Arc<crate::kernel::tty::TtyRegistry>) -> Self {
+        Self {
+            registry,
+            inner: crate::kernel::tty::LineDiscipline::default(),
+        }
+    }
+
     fn route_control_input(
         &mut self,
         bytes: &[u8],
@@ -824,6 +866,7 @@ impl RelayLineDiscipline {
         pending_echo: &mut VecDeque<u8>,
     ) -> Vec<u8> {
         self.inner.route_control_input(
+            &self.registry,
             bytes,
             slave_fd,
             crate::kernel::tty::TtyKey::Launch,
@@ -836,7 +879,10 @@ impl RelayLineDiscipline {
 
 #[cfg(test)]
 fn route_control_input(bytes: &[u8], slave_fd: RawFd) -> Vec<u8> {
-    RelayLineDiscipline::default().route_control_input(bytes, slave_fd, &mut VecDeque::new())
+    RelayLineDiscipline::new(std::sync::Arc::new(
+        crate::kernel::tty::TtyRegistry::default(),
+    ))
+    .route_control_input(bytes, slave_fd, &mut VecDeque::new())
 }
 
 fn signal_control_echo(termios: &libc::termios, byte: u8) -> Vec<u8> {
@@ -1016,7 +1062,9 @@ mod tests {
             0
         );
 
-        let mut line_discipline = RelayLineDiscipline::default();
+        let mut line_discipline = RelayLineDiscipline::new(std::sync::Arc::new(
+            crate::kernel::tty::TtyRegistry::default(),
+        ));
         let mut pending_echo = VecDeque::new();
         assert_eq!(
             line_discipline.route_control_input(&[22], pty.slave_fd, &mut pending_echo),
@@ -1082,7 +1130,9 @@ mod tests {
                 unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
                 0
             );
-            let mut line_discipline = RelayLineDiscipline::default();
+            let mut line_discipline = RelayLineDiscipline::new(std::sync::Arc::new(
+                crate::kernel::tty::TtyRegistry::default(),
+            ));
             let mut pending_echo = VecDeque::new();
             assert!(forward_input_bytes(
                 b"before\x03after\n",
@@ -1122,9 +1172,11 @@ mod tests {
 
         let mut pending_echo = VecDeque::new();
         assert!(
-            RelayLineDiscipline::default()
-                .route_control_input(&[3], pty.slave_fd, &mut pending_echo)
-                .is_empty()
+            RelayLineDiscipline::new(std::sync::Arc::new(
+                crate::kernel::tty::TtyRegistry::default()
+            ))
+            .route_control_input(&[3], pty.slave_fd, &mut pending_echo)
+            .is_empty()
         );
         assert_eq!(pending_echo.into_iter().collect::<Vec<_>>(), b"^C");
         unsafe {
@@ -1159,9 +1211,11 @@ mod tests {
 
         let mut pending_echo = VecDeque::new();
         assert!(
-            RelayLineDiscipline::default()
-                .route_control_input(&[3], pty.slave_fd, &mut pending_echo)
-                .is_empty()
+            RelayLineDiscipline::new(std::sync::Arc::new(
+                crate::kernel::tty::TtyRegistry::default()
+            ))
+            .route_control_input(&[3], pty.slave_fd, &mut pending_echo)
+            .is_empty()
         );
         assert_eq!(pending_echo.into_iter().collect::<Vec<_>>(), b"^C");
         unsafe {
@@ -1186,7 +1240,12 @@ mod tests {
     #[test]
     fn stop_with_no_pending_master_output_returns() {
         let (real_app, real_term) = socketpair();
-        let relay = PtyRelay::start_for_test(real_term, real_term).expect("start relay");
+        let relay = PtyRelay::start_for_test(
+            std::sync::Arc::new(crate::kernel::tty::TtyRegistry::default()),
+            real_term,
+            real_term,
+        )
+        .expect("start relay");
         relay.stop();
         // SAFETY: the peer is not owned by the relay.
         unsafe { libc::close(real_app) };
@@ -1233,7 +1292,12 @@ mod tests {
         let real_app_dup = unsafe { libc::dup(real_app) };
         assert!(real_app_dup >= 0, "dup(real_app) failed");
 
-        let relay = PtyRelay::start_for_test(real_term, real_term).expect("start_for_test");
+        let relay = PtyRelay::start_for_test(
+            std::sync::Arc::new(crate::kernel::tty::TtyRegistry::default()),
+            real_term,
+            real_term,
+        )
+        .expect("start_for_test");
         let slave = relay.slave_fd();
 
         // Disable echo on the slave's line discipline so the pty does not echo
@@ -1364,7 +1428,12 @@ mod tests {
             );
         }
 
-        let relay = PtyRelay::start_for_test(null_fd, real_term).expect("start_for_test");
+        let relay = PtyRelay::start_for_test(
+            std::sync::Arc::new(crate::kernel::tty::TtyRegistry::default()),
+            null_fd,
+            real_term,
+        )
+        .expect("start_for_test");
         let slave = relay.slave_fd();
 
         // Write from guest side to verify relay still forwards output to real_out

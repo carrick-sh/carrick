@@ -2994,7 +2994,7 @@ impl<'a> FsView<'a> {
                             }
                             let (bytes_to_write, consumed_count) = if let Some(PtyRole { index, is_master: true }) = pty {
                                 let orig_len = bytes.len();
-                                let forwarded = crate::kernel::tty::process_master_write(
+                                let forwarded = crate::kernel::tty::process_master_write(cx.kernel.container().tty_registry(),
                                     crate::kernel::tty::TtyKey::Pty(*index),
                                     host_fd.raw(),
                                     bytes,
@@ -3741,7 +3741,7 @@ impl<'a> FsView<'a> {
                                 }
                                 let (bytes_to_write, consumed_count) = if let Some(PtyRole { index, is_master: true }) = pty {
                                     let orig_len = bytes.len();
-                                    let forwarded = crate::kernel::tty::process_master_write(
+                                    let forwarded = crate::kernel::tty::process_master_write(cx.kernel.container().tty_registry(),
                                         crate::kernel::tty::TtyKey::Pty(*index),
                                         host_fd.raw(),
                                         &bytes,

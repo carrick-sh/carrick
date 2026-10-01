@@ -21,6 +21,12 @@ use crate::linux_abi::{
 };
 use crate::vfs::PtyRole;
 
+struct SpliceOutputTarget {
+    fd: i32,
+    offset_address: u64,
+    nonblocking: bool,
+}
+
 /// Host passthrough for tee(2). On Linux the guest pipes are real host kernel
 /// pipes, so the host tee(2) gives exact zero-consume semantics; on hosts
 /// without tee(2) (macOS/BSD) `SyscallDispatcher::userspace_tee` emulates it.
@@ -388,13 +394,17 @@ impl<'a> FsView<'a> {
     /// count loses nothing.
     fn splice_write_out<M: CurrentMmMemory>(
         &self,
-        out_fd: i32,
-        off_out_addr: u64,
+        registry: &crate::kernel::tty::TtyRegistry,
+        target: SpliceOutputTarget,
         bytes: &[u8],
         memory: &mut M,
         tid: crate::thread::ThreadId,
-        nonblocking: bool,
     ) -> DispatchOutcome {
+        let SpliceOutputTarget {
+            fd: out_fd,
+            offset_address: off_out_addr,
+            nonblocking,
+        } = target;
         if off_out_addr == 0 {
             if let Some(open_file) = self.open_file(out_fd) {
                 if let Some(open) = open_file.description.inspect()
@@ -417,7 +427,7 @@ impl<'a> FsView<'a> {
                     };
                 }
             }
-            return match self.write_output_fd_partial(out_fd, bytes, tid) {
+            return match self.write_output_fd_partial(registry, out_fd, bytes, tid) {
                 // The destination could not take a single byte. A blocking
                 // `splice(2)` waits for room; the partial write path reports
                 // that as `EAGAIN` because it asked non-blocking, so restore
@@ -639,11 +649,12 @@ impl<'a> FsView<'a> {
 
     pub(in crate::dispatch::fs) fn write_output_fd(
         &self,
+        registry: &crate::kernel::tty::TtyRegistry,
         fd: i32,
         bytes: &[u8],
         tid: crate::thread::ThreadId,
     ) -> DispatchOutcome {
-        self.write_output_fd_inner(fd, bytes, tid, false)
+        self.write_output_fd_inner(registry, fd, bytes, tid, false)
     }
 
     /// `splice(2)` flavour of [`Self::write_output_fd`]: the destination is
@@ -658,15 +669,17 @@ impl<'a> FsView<'a> {
     /// it cannot drain the pipe until the splice it is blocked in returns.
     fn write_output_fd_partial(
         &self,
+        registry: &crate::kernel::tty::TtyRegistry,
         fd: i32,
         bytes: &[u8],
         tid: crate::thread::ThreadId,
     ) -> DispatchOutcome {
-        self.write_output_fd_inner(fd, bytes, tid, true)
+        self.write_output_fd_inner(registry, fd, bytes, tid, true)
     }
 
     fn write_output_fd_inner(
         &self,
+        registry: &crate::kernel::tty::TtyRegistry,
         fd: i32,
         bytes: &[u8],
         tid: crate::thread::ThreadId,
@@ -763,6 +776,7 @@ impl<'a> FsView<'a> {
                             {
                                 let orig_len = bytes.len();
                                 let forwarded = crate::kernel::tty::process_master_write(
+                                    registry,
                                     crate::kernel::tty::TtyKey::Pty(*index),
                                     host_fd.raw(),
                                     bytes,
@@ -1167,7 +1181,7 @@ impl<'a> FsView<'a> {
                         )));
                     }
                 };
-                let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid, out_nonblocking);
+                let outcome = this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &bytes, cx.memory, tid);
                 let DispatchOutcome::Returned { value } = outcome else {
                     drop(bytes);
                     return Ok(complete_wait(outcome));
@@ -1215,7 +1229,7 @@ impl<'a> FsView<'a> {
                 if buf.is_empty() {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid, out_nonblocking);
+                let outcome = this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
                 let DispatchOutcome::Returned { value } = outcome else {
                     this.restore_splice_pipe_bytes(in_fd.0, &buf);
                     return Ok(complete_wait(outcome));
@@ -1355,7 +1369,7 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 buf.truncate(n as usize);
-                let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid, out_nonblocking);
+                let outcome = this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
                 let DispatchOutcome::Returned { value } = outcome else {
                     // EAGAIN / WaitOnFds / Errno on the destination — propagate
                     // WITHOUT consuming any socket bytes (the peek left them).
@@ -1474,14 +1488,7 @@ impl<'a> FsView<'a> {
                         Ok((0, _)) => return Ok(DispatchOutcome::Returned { value: 0 }),
                         Ok((n, _)) => {
                             buf.truncate(n);
-                            let outcome = this.splice_write_out(
-                                out_fd.0,
-                                off_out_address,
-                                &buf,
-                                cx.memory,
-                                tid,
-                                out_nonblocking,
-                            );
+                            let outcome = this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
                             let DispatchOutcome::Returned { value } = outcome else {
                                 return Ok(complete_wait(outcome));
                             };
@@ -1553,7 +1560,7 @@ impl<'a> FsView<'a> {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
 
-                    let outcome = this.write_output_fd_partial(out_fd.0, &bytes, tid);
+                    let outcome = this.write_output_fd_partial(cx.kernel.container().tty_registry(), out_fd.0, &bytes, tid);
                     let DispatchOutcome::Returned { value } = outcome else {
                         return Ok(complete_wait(outcome));
                     };
@@ -1581,7 +1588,7 @@ impl<'a> FsView<'a> {
             };
             let mut offset = this.sendfile_offset(in_fd.0, off_in_address, memory)??;
             let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
-            let outcome = match this.write_output_fd_partial(out_fd.0, &bytes, tid) {
+            let outcome = match this.write_output_fd_partial(cx.kernel.container().tty_registry(), out_fd.0, &bytes, tid) {
                 // Nothing moved: the destination pipe is full. SPLICE_F_NONBLOCK
                 // reports EAGAIN; a blocking splice(2) must wait for room. Waiting
                 // is safe in exactly this case — a full pipe can only be drained by
@@ -1591,7 +1598,7 @@ impl<'a> FsView<'a> {
                     if splice_flags.contains(LinuxSpliceFlags::NONBLOCK) {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
-                    this.write_output_fd(out_fd.0, &bytes, tid)
+                    this.write_output_fd(cx.kernel.container().tty_registry(), out_fd.0, &bytes, tid)
                 }
                 other => other,
             };
@@ -1732,7 +1739,7 @@ impl<'a> FsView<'a> {
                         };
                     }
                     let bytes = &bytes[..room.map_or(bytes.len(), |room| bytes.len().min(room))];
-                    Ok(this.splice_write_out(fd.0, 0, bytes, memory, tid, nonblocking))
+                    Ok(this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: fd.0, offset_address: 0, nonblocking }, bytes, memory, tid))
                 }
                 VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(
                     memory,

@@ -2259,9 +2259,11 @@ impl SyscallDispatcher {
         }
         if let Some(index) = pty_master_index {
             crate::dispatch::pty_registry::unregister_master(index);
-            self.pty_table()
-                .lock()
-                .free_if_owner(index, std::process::id());
+            self.pty_table().lock().free_if_owner(
+                index,
+                std::process::id(),
+                self.container().tty_registry(),
+            );
         }
         // A FIFO write-end close drops a beacon writer — wake epoll/poll so FIFO
         // read-ends re-check the (kernel-decided) EOF (see dispatch::fifo_beacon).

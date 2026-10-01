@@ -30,9 +30,12 @@ impl std::fmt::Debug for InteractiveSession {
 }
 
 impl InteractiveSession {
-    pub fn start(dispatcher: &mut SyscallDispatcher) -> io::Result<Self> {
+    pub fn start(
+        dispatcher: &mut SyscallDispatcher,
+        registry: std::sync::Arc<carrick_kernel::kernel::tty::TtyRegistry>,
+    ) -> io::Result<Self> {
         let admission = InteractiveSessionAdmission::acquire()?;
-        carrick_kernel::kernel::tty::prepare();
+        carrick_kernel::kernel::tty::prepare(&registry);
         let mut setup = SessionSetupGuard {
             admission: Some(admission),
             saved_stdio: [-1; 3],
@@ -48,7 +51,7 @@ impl InteractiveSession {
         let relay_out = dup_fd(setup.saved_stdio[1])?;
         setup.owned_fds.push(relay_out);
         let pair = PtyPair::allocate()?;
-        let relay = PtyRelay::start_with_pair(pair, relay_in, relay_out)?;
+        let relay = PtyRelay::start_with_pair(registry, pair, relay_in, relay_out)?;
         setup.owned_fds.clear();
         setup.relay = Some(relay);
         let (slave_fd, slave_name) = match setup.relay.as_ref() {

@@ -59,17 +59,21 @@ impl Kernel {
             });
         drop(ttys);
         drop(state);
-        crate::kernel::tty::acknowledge_ready(self, container);
+        crate::kernel::tty::acknowledge_ready(caller.container().tty_registry(), self, container);
     }
 
     /// Acknowledge the launch tty after the carrier relay route is installed.
     /// Initialization owns session/group references before guest execution; a
     /// completed root need not remain in the task registry for publication.
     /// A retired container or a non-interactive launch has nothing to publish.
-    pub fn acknowledge_launch_controlling_tty(&self, container: ContainerId) {
+    pub fn acknowledge_launch_controlling_tty(
+        &self,
+        registry: &crate::kernel::tty::TtyRegistry,
+        container: ContainerId,
+    ) {
         let initialized = self.controlling_ttys.lock().contains_key(&container);
         if initialized {
-            crate::kernel::tty::acknowledge_ready(self, container);
+            crate::kernel::tty::acknowledge_ready(registry, self, container);
         }
     }
 
@@ -104,7 +108,12 @@ impl Kernel {
         match ttys.get(&container) {
             Some(current) if current.session.id() == session => Ok(()),
             Some(_) if !force || !caller.resources().credentials().is_privileged() => {
-                if crate::kernel::tty::session_controlling_tty(session).is_some() {
+                if crate::kernel::tty::session_controlling_tty(
+                    caller.container().tty_registry(),
+                    session,
+                )
+                .is_some()
+                {
                     Ok(())
                 } else {
                     Err(TtyControlError::Permission)
@@ -128,7 +137,10 @@ impl Kernel {
         caller: &KernelContext,
     ) -> Result<ProcessGroupId, TtyControlError> {
         let session = caller.task().session();
-        if let Some(fg) = crate::kernel::tty::session_foreground_process_group(session) {
+        if let Some(fg) = crate::kernel::tty::session_foreground_process_group(
+            caller.container().tty_registry(),
+            session,
+        ) {
             return Ok(fg);
         }
         let ttys = self.controlling_ttys.lock();
@@ -143,7 +155,9 @@ impl Kernel {
 
     pub(crate) fn tty_session(&self, caller: &KernelContext) -> Result<SessionId, TtyControlError> {
         let session = caller.task().session();
-        if crate::kernel::tty::session_controlling_tty(session).is_some() {
+        if crate::kernel::tty::session_controlling_tty(caller.container().tty_registry(), session)
+            .is_some()
+        {
             return Ok(session);
         }
         let ttys = self.controlling_ttys.lock();
@@ -174,9 +188,16 @@ impl Kernel {
         drop(state);
 
         let mut updated = false;
-        if let Some(tty_key) = crate::kernel::tty::session_controlling_tty(session) {
-            if crate::kernel::tty::set_foreground_process_group(tty_key, session, foreground)
-                .is_ok()
+        if let Some(tty_key) =
+            crate::kernel::tty::session_controlling_tty(caller.container().tty_registry(), session)
+        {
+            if crate::kernel::tty::set_foreground_process_group(
+                caller.container().tty_registry(),
+                tty_key,
+                session,
+                foreground,
+            )
+            .is_ok()
             {
                 updated = true;
             }
@@ -199,8 +220,14 @@ impl Kernel {
     pub(crate) fn tty_detach(&self, caller: &KernelContext) -> Result<(), TtyControlError> {
         let container = caller.container().id();
         let session = caller.task().session();
-        if let Some(tty_key) = crate::kernel::tty::session_controlling_tty(session) {
-            crate::kernel::tty::detach_if_session(tty_key, session);
+        if let Some(tty_key) =
+            crate::kernel::tty::session_controlling_tty(caller.container().tty_registry(), session)
+        {
+            crate::kernel::tty::detach_if_session(
+                caller.container().tty_registry(),
+                tty_key,
+                session,
+            );
         }
         let mut ttys = self.controlling_ttys.lock();
         if let Some(current) = ttys.get(&container) {
@@ -787,15 +814,18 @@ mod tests {
     #[test]
     fn relay_signal_waits_for_controlling_foreground_group_then_flushes() {
         let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
-        crate::kernel::tty::prepare();
-        crate::kernel::tty::route_foreground_signal(carrick_abi::LINUX_SIGQUIT);
-        crate::kernel::tty::install(&kernel);
+        crate::kernel::tty::prepare(root.container().tty_registry());
+        crate::kernel::tty::route_foreground_signal(
+            root.container().tty_registry(),
+            carrick_abi::LINUX_SIGQUIT,
+        );
+        crate::kernel::tty::install(root.container().tty_registry(), &kernel);
         for signum in [
             carrick_abi::LINUX_SIGINT,
             carrick_abi::LINUX_SIGTSTP,
             carrick_abi::LINUX_SIGWINCH,
         ] {
-            crate::kernel::tty::route_foreground_signal(signum);
+            crate::kernel::tty::route_foreground_signal(root.container().tty_registry(), signum);
         }
         assert!(
             !root
@@ -822,6 +852,88 @@ mod tests {
     }
 
     #[test]
+    fn two_carriers_in_one_process_keep_independent_launch_routes() {
+        let (alpha_kernel, alpha) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        let (beta_kernel, beta) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        crate::kernel::tty::prepare(alpha.container().tty_registry());
+        crate::kernel::tty::install(alpha.container().tty_registry(), &alpha_kernel);
+        crate::kernel::tty::route_foreground_signal(
+            alpha.container().tty_registry(),
+            carrick_abi::LINUX_SIGINT,
+        );
+        crate::kernel::tty::prepare(beta.container().tty_registry());
+        crate::kernel::tty::install(beta.container().tty_registry(), &beta_kernel);
+        crate::kernel::tty::route_foreground_signal(
+            beta.container().tty_registry(),
+            carrick_abi::LINUX_SIGWINCH,
+        );
+        alpha_kernel.initialize_launch_controlling_tty(&alpha);
+        beta_kernel.initialize_launch_controlling_tty(&beta);
+        assert!(
+            alpha
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGINT),
+            "another carrier must not discard alpha's queued SIGINT"
+        );
+        assert!(
+            !alpha
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGWINCH)
+        );
+        assert!(
+            beta.shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGWINCH)
+        );
+        assert!(
+            !beta
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGINT)
+        );
+    }
+
+    #[test]
+    fn independent_relay_fixtures_do_not_replace_each_others_launch_route() {
+        let queued = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let queued = Arc::clone(&queued);
+                workers.push(scope.spawn(move || {
+                    let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+                    crate::kernel::tty::prepare(root.container().tty_registry());
+                    crate::kernel::tty::install(root.container().tty_registry(), &kernel);
+                    crate::kernel::tty::route_foreground_signal(
+                        root.container().tty_registry(),
+                        carrick_abi::LINUX_SIGINT,
+                    );
+                    // Both independent carrier fixtures have installed their route
+                    // before either acknowledges it. No scheduling luck is needed.
+                    queued.wait();
+                    kernel.initialize_launch_controlling_tty(&root);
+                    root.shared()
+                        .pending_signals()
+                        .present()
+                        .contains(carrick_abi::LINUX_SIGINT)
+                }));
+            }
+            for worker in workers {
+                assert!(
+                    worker.join().expect("relay fixture thread"),
+                    "each independent fixture must flush its own queued SIGINT",
+                );
+            }
+        });
+    }
+
+    #[test]
     fn two_containers_keep_independent_tty_state_and_relay_routes_exactly() {
         use crate::kernel::{Container, LaunchContext, RunId};
 
@@ -841,13 +953,20 @@ mod tests {
             .commit()
             .expect("publish beta root");
 
-        crate::kernel::tty::prepare();
-        crate::kernel::tty::install(&kernel);
+        crate::kernel::tty::prepare(alpha.container().tty_registry());
+        crate::kernel::tty::install(alpha.container().tty_registry(), &kernel);
         kernel.initialize_launch_controlling_tty(&alpha);
-        crate::kernel::tty::route_foreground_signal(carrick_abi::LINUX_SIGINT);
+        crate::kernel::tty::route_foreground_signal(
+            alpha.container().tty_registry(),
+            carrick_abi::LINUX_SIGINT,
+        );
 
+        crate::kernel::tty::install(beta.container().tty_registry(), &kernel);
         kernel.initialize_launch_controlling_tty(&beta);
-        crate::kernel::tty::route_foreground_signal(carrick_abi::LINUX_SIGWINCH);
+        crate::kernel::tty::route_foreground_signal(
+            beta.container().tty_registry(),
+            carrick_abi::LINUX_SIGWINCH,
+        );
 
         assert_eq!(
             kernel.tty_foreground_process_group(&alpha),

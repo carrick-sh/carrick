@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::io::RawFd;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use carrick_abi::LinuxErrno;
 use parking_lot::Mutex;
@@ -21,7 +21,7 @@ impl From<u32> for TtyKey {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct TtyState {
     kernel: Option<Weak<Kernel>>,
     container: Option<ContainerId>,
@@ -32,13 +32,13 @@ struct TtyState {
     literal_next: bool,
 }
 
-#[derive(Default)]
-struct TtyRegistry {
+#[derive(Default, Debug)]
+struct TtyRegistryState {
     launch: TtyState,
     ptys: BTreeMap<u32, TtyState>,
 }
 
-impl TtyRegistry {
+impl TtyRegistryState {
     fn get_state_mut(&mut self, key: TtyKey) -> &mut TtyState {
         match key {
             TtyKey::Launch => &mut self.launch,
@@ -47,28 +47,34 @@ impl TtyRegistry {
     }
 }
 
-fn slot() -> &'static Mutex<TtyRegistry> {
-    static SLOT: OnceLock<Mutex<TtyRegistry>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(TtyRegistry::default()))
+/// Terminal routes owned by one container's launch state. Relay threads and
+/// kernel callers share this exact authority; no host-process lookup selects it.
+#[derive(Default, Debug)]
+pub struct TtyRegistry {
+    state: Mutex<TtyRegistryState>,
 }
 
 /// Begin a new interactive carrier session before the relay thread can observe
 /// input. This removes any route or pending signals left by a prior run.
-pub fn prepare() {
-    let mut reg = slot().lock();
+pub fn prepare(registry: &TtyRegistry) {
+    let mut reg = registry.state.lock();
     reg.launch = TtyState::default();
 }
 
-pub fn install(kernel: &Arc<Kernel>) {
-    let mut reg = slot().lock();
+pub fn install(registry: &TtyRegistry, kernel: &Arc<Kernel>) {
+    let mut reg = registry.state.lock();
     reg.launch.kernel = Some(Arc::downgrade(kernel));
     reg.launch.container = None;
     reg.launch.acknowledged = false;
 }
 
-pub(super) fn acknowledge_ready(expected_kernel: &Kernel, container: ContainerId) {
+pub(super) fn acknowledge_ready(
+    registry: &TtyRegistry,
+    expected_kernel: &Kernel,
+    container: ContainerId,
+) {
     let (kernel, pending) = {
-        let mut reg = slot().lock();
+        let mut reg = registry.state.lock();
         let Some(kernel) = reg.launch.kernel.as_ref().and_then(Weak::upgrade) else {
             return;
         };
@@ -91,6 +97,7 @@ pub(super) fn acknowledge_ready(expected_kernel: &Kernel, container: ContainerId
 }
 
 pub(crate) fn attach_pty(
+    registry: &TtyRegistry,
     index: u32,
     kernel: &Arc<Kernel>,
     container: ContainerId,
@@ -98,7 +105,7 @@ pub(crate) fn attach_pty(
     foreground: ProcessGroupId,
     force: bool,
 ) -> Result<(), LinuxErrno> {
-    let mut reg = slot().lock();
+    let mut reg = registry.state.lock();
     let state = reg.ptys.entry(index).or_default();
     if let Some(existing) = state.session {
         if existing != session && !force {
@@ -114,11 +121,12 @@ pub(crate) fn attach_pty(
 }
 
 pub(crate) fn set_foreground_process_group(
+    registry: &TtyRegistry,
     tty: TtyKey,
     session: SessionId,
     foreground: ProcessGroupId,
 ) -> Result<(), LinuxErrno> {
-    let mut reg = slot().lock();
+    let mut reg = registry.state.lock();
     match tty {
         TtyKey::Launch => {
             reg.launch.foreground = Some(foreground);
@@ -136,10 +144,11 @@ pub(crate) fn set_foreground_process_group(
 }
 
 pub(crate) fn foreground_process_group(
+    registry: &TtyRegistry,
     tty: TtyKey,
     session: SessionId,
 ) -> Result<ProcessGroupId, LinuxErrno> {
-    let reg = slot().lock();
+    let reg = registry.state.lock();
     match tty {
         TtyKey::Launch => reg.launch.foreground.ok_or(carrick_abi::LINUX_ENOTTY),
         TtyKey::Pty(index) => {
@@ -152,8 +161,11 @@ pub(crate) fn foreground_process_group(
     }
 }
 
-pub(crate) fn session_controlling_tty(session: SessionId) -> Option<TtyKey> {
-    let reg = slot().lock();
+pub(crate) fn session_controlling_tty(
+    registry: &TtyRegistry,
+    session: SessionId,
+) -> Option<TtyKey> {
+    let reg = registry.state.lock();
     if reg.launch.session == Some(session) {
         return Some(TtyKey::Launch);
     }
@@ -165,8 +177,11 @@ pub(crate) fn session_controlling_tty(session: SessionId) -> Option<TtyKey> {
     None
 }
 
-pub(crate) fn session_foreground_process_group(session: SessionId) -> Option<ProcessGroupId> {
-    let reg = slot().lock();
+pub(crate) fn session_foreground_process_group(
+    registry: &TtyRegistry,
+    session: SessionId,
+) -> Option<ProcessGroupId> {
+    let reg = registry.state.lock();
     if reg.launch.session == Some(session) {
         return reg.launch.foreground;
     }
@@ -181,21 +196,21 @@ pub(crate) fn session_foreground_process_group(session: SessionId) -> Option<Pro
 /// Whether `session` already has a controlling terminal (the launch tty or
 /// any guest pty). Linux refuses `TIOCSCTTY` with EPERM for a session leader
 /// that already has one.
-pub(crate) fn session_owns_tty(session: SessionId) -> bool {
-    let reg = slot().lock();
+pub(crate) fn session_owns_tty(registry: &TtyRegistry, session: SessionId) -> bool {
+    let reg = registry.state.lock();
     reg.launch.session == Some(session) || reg.ptys.values().any(|s| s.session == Some(session))
 }
 
-pub(crate) fn session(tty: TtyKey) -> Option<SessionId> {
-    let reg = slot().lock();
+pub(crate) fn session(registry: &TtyRegistry, tty: TtyKey) -> Option<SessionId> {
+    let reg = registry.state.lock();
     match tty {
         TtyKey::Launch => reg.launch.session,
         TtyKey::Pty(index) => reg.ptys.get(&index).and_then(|s| s.session),
     }
 }
 
-pub(crate) fn detach(tty: TtyKey) {
-    let mut reg = slot().lock();
+pub(crate) fn detach(registry: &TtyRegistry, tty: TtyKey) {
+    let mut reg = registry.state.lock();
     match tty {
         TtyKey::Launch => {
             reg.launch.session = None;
@@ -207,8 +222,8 @@ pub(crate) fn detach(tty: TtyKey) {
     }
 }
 
-pub(crate) fn detach_if_session(tty: TtyKey, session: SessionId) {
-    let mut reg = slot().lock();
+pub(crate) fn detach_if_session(registry: &TtyRegistry, tty: TtyKey, session: SessionId) {
+    let mut reg = registry.state.lock();
     match tty {
         TtyKey::Launch => {
             if reg.launch.session == Some(session) {
@@ -227,16 +242,20 @@ pub(crate) fn detach_if_session(tty: TtyKey, session: SessionId) {
     }
 }
 
-pub(crate) fn route_foreground_signal(signum: i32) {
-    route_foreground_signal_to_tty(TtyKey::Launch, signum);
+pub(crate) fn route_foreground_signal(registry: &TtyRegistry, signum: i32) {
+    route_foreground_signal_to_tty(registry, TtyKey::Launch, signum);
 }
 
-pub(crate) fn route_foreground_signal_to_tty(tty: TtyKey, signum: i32) -> usize {
+pub(crate) fn route_foreground_signal_to_tty(
+    registry: &TtyRegistry,
+    tty: TtyKey,
+    signum: i32,
+) -> usize {
     let Ok(signal) = LinuxSignal::for_signal_number(signum) else {
         return 0;
     };
     let route = {
-        let mut reg = slot().lock();
+        let mut reg = registry.state.lock();
         match tty {
             TtyKey::Launch => {
                 if !reg.launch.acknowledged {
@@ -293,6 +312,7 @@ pub struct LineDiscipline {
 impl LineDiscipline {
     pub(crate) fn route_control_input(
         &mut self,
+        registry: &TtyRegistry,
         bytes: &[u8],
         tty_fd: RawFd,
         tty: TtyKey,
@@ -337,7 +357,7 @@ impl LineDiscipline {
                     }
                 }
                 on_signal(*signal, *byte, &termios);
-                route_foreground_signal_to_tty(tty, *signal);
+                route_foreground_signal_to_tty(registry, tty, *signal);
             } else {
                 forwarded.push(*byte);
             }
@@ -346,17 +366,23 @@ impl LineDiscipline {
     }
 }
 
-pub(crate) fn process_master_write(tty: TtyKey, host_fd: RawFd, bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn process_master_write(
+    registry: &TtyRegistry,
+    tty: TtyKey,
+    host_fd: RawFd,
+    bytes: &[u8],
+) -> Vec<u8> {
     let mut ld = {
-        let mut reg = slot().lock();
+        let mut reg = registry.state.lock();
         let state = reg.get_state_mut(tty);
         LineDiscipline {
             literal_next: state.literal_next,
         }
     };
-    let forwarded = ld.route_control_input(bytes, host_fd, tty, |_signum, _byte, _termios| {});
+    let forwarded =
+        ld.route_control_input(registry, bytes, host_fd, tty, |_signum, _byte, _termios| {});
     {
-        let mut reg = slot().lock();
+        let mut reg = registry.state.lock();
         let state = reg.get_state_mut(tty);
         state.literal_next = ld.literal_next;
     }
@@ -381,8 +407,168 @@ mod tests {
     }
 
     #[test]
+    fn relay_launch_registry_preserves_input_queued_before_kernel_boot() {
+        let container = Arc::new(crate::kernel::Container::new(
+            crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new("early-relay")),
+        ));
+        let registry = Arc::clone(container.tty_registry());
+        prepare(&registry);
+        route_foreground_signal(&registry, carrick_abi::LINUX_SIGINT);
+        let bootstrap = RootBootstrap::for_reference_model(
+            570,
+            ThreadId::synthetic_for_tests(570),
+            "late-kernel".to_owned(),
+        )
+        .expect("root bootstrap")
+        .with_container(container);
+        let (kernel, root) = Kernel::bootstrap_root(bootstrap).expect("kernel boot");
+        install(&registry, &kernel);
+        assert!(
+            !root
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGINT)
+        );
+        kernel.initialize_launch_controlling_tty(&root);
+        assert!(
+            root.shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGINT)
+        );
+    }
+
+    #[test]
+    fn relay_thread_queues_before_acknowledgement_and_delivers_after_it() {
+        let (kernel, root) = bootstrap(550);
+        let registry = Arc::clone(root.container().tty_registry());
+        prepare(&registry);
+        install(&registry, &kernel);
+
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let bound = std::time::Duration::from_secs(5);
+        std::thread::scope(|scope| {
+            let relay = scope.spawn(move || {
+                // This thread belongs to the same simulated carrier as the
+                // acknowledgement thread, so it uses the same registry.
+                route_foreground_signal(&registry, carrick_abi::LINUX_SIGINT);
+                queued_tx.send(()).expect("queued notification");
+                ready_rx
+                    .recv_timeout(bound)
+                    .expect("foreground acknowledgement");
+                route_foreground_signal(&registry, carrick_abi::LINUX_SIGWINCH);
+            });
+            queued_rx.recv_timeout(bound).expect("relay queued signal");
+            assert!(
+                !root
+                    .shared()
+                    .pending_signals()
+                    .present()
+                    .contains(carrick_abi::LINUX_SIGINT)
+            );
+            kernel.initialize_launch_controlling_tty(&root);
+            assert!(
+                root.shared()
+                    .pending_signals()
+                    .present()
+                    .contains(carrick_abi::LINUX_SIGINT)
+            );
+            ready_tx.send(()).expect("ready notification");
+            relay.join().expect("relay thread");
+            assert!(
+                root.shared()
+                    .pending_signals()
+                    .present()
+                    .contains(carrick_abi::LINUX_SIGWINCH)
+            );
+        });
+    }
+
+    #[test]
+    fn two_carriers_keep_overlapping_pty_indices_and_sessions_independent() {
+        let (alpha_kernel, alpha) = bootstrap(560);
+        let (beta_kernel, beta) = bootstrap(560);
+        let alpha_registry = Arc::clone(alpha.container().tty_registry());
+        let beta_registry = Arc::clone(beta.container().tty_registry());
+        for (registry, kernel, root) in [
+            (&alpha_registry, &alpha_kernel, &alpha),
+            (&beta_registry, &beta_kernel, &beta),
+        ] {
+            attach_pty(
+                registry,
+                0,
+                kernel,
+                root.container().id(),
+                root.task().session(),
+                root.task().process_group(),
+                false,
+            )
+            .expect("attach own pty");
+        }
+        assert_eq!(
+            route_foreground_signal_to_tty(
+                &alpha_registry,
+                TtyKey::Pty(0),
+                carrick_abi::LINUX_SIGINT
+            ),
+            1
+        );
+        assert_eq!(
+            route_foreground_signal_to_tty(
+                &beta_registry,
+                TtyKey::Pty(0),
+                carrick_abi::LINUX_SIGWINCH
+            ),
+            1
+        );
+        assert!(
+            alpha
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGINT)
+        );
+        assert!(
+            !alpha
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGWINCH)
+        );
+        assert!(
+            beta.shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGWINCH)
+        );
+        assert!(
+            !beta
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGINT)
+        );
+        detach(&alpha_registry, TtyKey::Pty(0));
+        assert_eq!(
+            session_controlling_tty(&alpha_registry, alpha.task().session()),
+            None
+        );
+        assert_eq!(
+            session_controlling_tty(&beta_registry, beta.task().session()),
+            Some(TtyKey::Pty(0))
+        );
+        assert_eq!(
+            foreground_process_group(&beta_registry, TtyKey::Pty(0), beta.task().session()),
+            Ok(beta.task().process_group())
+        );
+    }
+
+    #[test]
     fn pty_master_vintr_delivers_sigint_to_foreground_pgrp_and_not_others() {
         let (kernel, root) = bootstrap(500);
+        let registry = Arc::clone(root.container().tty_registry());
         let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
         let child = kernel
             .fork_task(
@@ -399,8 +585,9 @@ mod tests {
             .expect("child process group");
 
         let pty_pair = crate::pty_relay::PtyPair::allocate().expect("pty pair");
-        detach(TtyKey::Pty(5001));
+        detach(&registry, TtyKey::Pty(5001));
         attach_pty(
+            &registry,
             5001,
             &kernel,
             root.container().id(),
@@ -410,7 +597,8 @@ mod tests {
         )
         .expect("attach pty");
 
-        let forwarded = process_master_write(TtyKey::Pty(5001), pty_pair.master_fd, b"\x03");
+        let forwarded =
+            process_master_write(&registry, TtyKey::Pty(5001), pty_pair.master_fd, b"\x03");
         assert!(
             forwarded.is_empty(),
             "VINTR must be consumed by line discipline"
@@ -433,7 +621,7 @@ mod tests {
             "other process group must not receive SIGINT"
         );
 
-        detach(TtyKey::Pty(5001));
+        detach(&registry, TtyKey::Pty(5001));
         unsafe {
             libc::close(pty_pair.master_fd);
             libc::close(pty_pair.slave_fd);
@@ -443,9 +631,11 @@ mod tests {
     #[test]
     fn pty_master_write_without_isig_passes_through() {
         let (kernel, root) = bootstrap(510);
+        let registry = Arc::clone(root.container().tty_registry());
         let pty_pair = crate::pty_relay::PtyPair::allocate().expect("pty pair");
-        detach(TtyKey::Pty(5002));
+        detach(&registry, TtyKey::Pty(5002));
         attach_pty(
+            &registry,
             5002,
             &kernel,
             root.container().id(),
@@ -466,7 +656,8 @@ mod tests {
             0
         );
 
-        let forwarded = process_master_write(TtyKey::Pty(5002), pty_pair.master_fd, b"\x03");
+        let forwarded =
+            process_master_write(&registry, TtyKey::Pty(5002), pty_pair.master_fd, b"\x03");
         assert_eq!(forwarded, b"\x03", "without ISIG byte must pass through");
         assert!(
             !root
@@ -477,7 +668,7 @@ mod tests {
             "no signal should be generated when ISIG is disabled"
         );
 
-        detach(TtyKey::Pty(5002));
+        detach(&registry, TtyKey::Pty(5002));
         unsafe {
             libc::close(pty_pair.master_fd);
             libc::close(pty_pair.slave_fd);
@@ -487,9 +678,11 @@ mod tests {
     #[test]
     fn pty_master_write_without_foreground_pgrp_drops_byte_and_no_signal() {
         let (_kernel, root) = bootstrap(520);
+        let registry = Arc::clone(root.container().tty_registry());
         let pty_pair = crate::pty_relay::PtyPair::allocate().expect("pty pair");
-        detach(TtyKey::Pty(5003));
-        let forwarded = process_master_write(TtyKey::Pty(5003), pty_pair.master_fd, b"\x03");
+        detach(&registry, TtyKey::Pty(5003));
+        let forwarded =
+            process_master_write(&registry, TtyKey::Pty(5003), pty_pair.master_fd, b"\x03");
         assert!(
             forwarded.is_empty(),
             "without foreground group byte must be dropped"
@@ -503,7 +696,7 @@ mod tests {
             "no signal should be delivered without foreground group"
         );
 
-        detach(TtyKey::Pty(5003));
+        detach(&registry, TtyKey::Pty(5003));
         unsafe {
             libc::close(pty_pair.master_fd);
             libc::close(pty_pair.slave_fd);
@@ -513,9 +706,11 @@ mod tests {
     #[test]
     fn pty_master_write_vlnext_quotes_signal_byte() {
         let (kernel, root) = bootstrap(530);
+        let registry = Arc::clone(root.container().tty_registry());
         let pty_pair = crate::pty_relay::PtyPair::allocate().expect("pty pair");
-        detach(TtyKey::Pty(5004));
+        detach(&registry, TtyKey::Pty(5004));
         attach_pty(
+            &registry,
             5004,
             &kernel,
             root.container().id(),
@@ -525,7 +720,12 @@ mod tests {
         )
         .expect("attach pty");
 
-        let forwarded = process_master_write(TtyKey::Pty(5004), pty_pair.master_fd, &[0x16, 0x03]);
+        let forwarded = process_master_write(
+            &registry,
+            TtyKey::Pty(5004),
+            pty_pair.master_fd,
+            &[0x16, 0x03],
+        );
         assert_eq!(forwarded, vec![0x16, 0x03], "VLNEXT must quote VINTR");
         assert!(
             !root
@@ -536,7 +736,7 @@ mod tests {
             "quoted VINTR must not generate signal"
         );
 
-        detach(TtyKey::Pty(5004));
+        detach(&registry, TtyKey::Pty(5004));
         unsafe {
             libc::close(pty_pair.master_fd);
             libc::close(pty_pair.slave_fd);
@@ -546,9 +746,11 @@ mod tests {
     #[test]
     fn pty_master_write_noflsh_preserves_preceding_input() {
         let (kernel, root) = bootstrap(540);
+        let registry = Arc::clone(root.container().tty_registry());
         let pty_pair = crate::pty_relay::PtyPair::allocate().expect("pty pair");
-        detach(TtyKey::Pty(5005));
+        detach(&registry, TtyKey::Pty(5005));
         attach_pty(
+            &registry,
             5005,
             &kernel,
             root.container().id(),
@@ -559,7 +761,7 @@ mod tests {
         .expect("attach pty");
 
         let forwarded_flush =
-            process_master_write(TtyKey::Pty(5005), pty_pair.master_fd, b"abc\x03");
+            process_master_write(&registry, TtyKey::Pty(5005), pty_pair.master_fd, b"abc\x03");
         assert!(
             forwarded_flush.is_empty(),
             "without NOFLSH preceding data is flushed"
@@ -577,13 +779,13 @@ mod tests {
         );
 
         let forwarded_noflsh =
-            process_master_write(TtyKey::Pty(5005), pty_pair.master_fd, b"abc\x03");
+            process_master_write(&registry, TtyKey::Pty(5005), pty_pair.master_fd, b"abc\x03");
         assert_eq!(
             forwarded_noflsh, b"abc",
             "with NOFLSH preceding data is preserved"
         );
 
-        detach(TtyKey::Pty(5005));
+        detach(&registry, TtyKey::Pty(5005));
         unsafe {
             libc::close(pty_pair.master_fd);
             libc::close(pty_pair.slave_fd);

@@ -765,11 +765,14 @@ fn prepare_with_lease(
     }
     dispatcher.set_stdio_sink(sink);
     let interactive_session = if spec.process.tty {
-        Some(InteractiveSession::start(&mut dispatcher).map_err(|e| {
-            RuntimeError::FsBackend(anyhow::anyhow!(
-                "failed to create carrier-local interactive PTY: {e}"
-            ))
-        })?)
+        Some(
+            InteractiveSession::start(&mut dispatcher, Arc::clone(container.tty_registry()))
+                .map_err(|e| {
+                    RuntimeError::FsBackend(anyhow::anyhow!(
+                        "failed to create carrier-local interactive PTY: {e}"
+                    ))
+                })?,
+        )
     } else {
         None
     };

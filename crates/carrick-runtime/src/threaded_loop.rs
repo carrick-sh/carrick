@@ -615,8 +615,9 @@ fn publish_root_tty(
     dispatcher: &SyscallDispatcher,
     kernel: &std::sync::Arc<carrick_kernel::kernel::Kernel>,
 ) {
-    carrick_kernel::kernel::tty::install(kernel);
-    kernel.acknowledge_launch_controlling_tty(dispatcher.container().id());
+    let container = dispatcher.container();
+    carrick_kernel::kernel::tty::install(container.tty_registry(), kernel);
+    kernel.acknowledge_launch_controlling_tty(container.tty_registry(), container.id());
 }
 
 #[cfg(test)]
