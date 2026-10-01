@@ -1333,9 +1333,27 @@ mod overlay_dispatch_tests {
         let mut h = Harness::new();
         let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
         let out = h.reserve(16);
-        let kqueue_fd = match h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]) {
-            DispatchOutcome::WaitOnFds { fds, .. } => fds.first().expect("epoll mutation source").0,
-            other => panic!("expected shared epoll source, got {other:?}"),
+        let blocked = h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]);
+        assert!(
+            matches!(blocked, DispatchOutcome::WaitOnFds { .. }),
+            "expected a blocked epoll wait, got {blocked:?}"
+        );
+        // The wait service enrolls a blocked waiter on the epoll fd's
+        // description wait queue (contract kernel.el1.epoll-zone): that
+        // enrollment subscribes the zone record, so a zone item made ready
+        // later wakes it through the record's publisher.
+        let epoll = h
+            .dispatcher
+            .open_file(epfd)
+            .expect("epoll fd")
+            .description;
+        let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let enrollment = {
+            let woke = Arc::clone(&woke);
+            epoll
+                .wait_queue()
+                .expect("epoll wait queue")
+                .enroll_callback(move |_| woke.store(true, std::sync::atomic::Ordering::SeqCst))
         };
         let ready = returned(h.call(19, [1, 0, 0, 0, 0, 0])) as i32;
         let event_addr = h.reserve(16);
@@ -1357,16 +1375,99 @@ mod overlay_dispatch_tests {
             )),
             0
         );
-        let mut pollfd = libc::pollfd {
-            fd: kqueue_fd,
-            events: libc::POLLIN,
-            revents: 0,
+        assert!(
+            woke.load(std::sync::atomic::Ordering::SeqCst),
+            "adding a ready zone item must wake an enrolled waiter"
+        );
+        // The post-enrollment probe's answer: the epoll fd is readable.
+        assert_eq!(
+            h.dispatcher.poll_ready_events(epfd, LINUX_POLLIN) & LINUX_POLLIN,
+            LINUX_POLLIN
+        );
+        drop(enrollment);
+        drop(blocked);
+    }
+
+    /// poll(2) on an epoll fd whose zone item (a pipe read end) became
+    /// readable reports POLLIN without consuming the event (probe
+    /// `pollevent`, libuv's embedded loop).
+    #[test]
+    fn poll_on_an_epoll_fd_sees_a_ready_zone_item() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
+        let pair = h.reserve(8);
+        assert_eq!(returned(h.call(59, [pair, 0, 0, 0, 0, 0])), 0);
+        let fds = h.memory.read_bytes(pair, 8).expect("pipe fds");
+        let rd = i32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let wr = i32::from_le_bytes(fds[4..8].try_into().unwrap());
+        let event = h.reserve(16);
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+        h.memory.write_bytes(event, &bytes).expect("event");
+        assert_eq!(
+            returned(h.call(21, [epfd as u64, LINUX_EPOLL_CTL_ADD, rd as u64, event, 0, 0])),
+            0
+        );
+        let byte = h.reserve(8);
+        h.memory.write_bytes(byte, b"e").expect("byte");
+        assert_eq!(returned(h.call(64, [wr as u64, byte, 1, 0, 0, 0])), 1);
+        assert_eq!(
+            h.dispatcher.poll_ready_events(epfd, LINUX_POLLIN) & LINUX_POLLIN,
+            LINUX_POLLIN
+        );
+        let out = h.reserve(16);
+        assert_eq!(returned(h.call(22, [epfd as u64, out, 1, 0, 0, 0])), 1);
+    }
+
+    /// Contract kernel.el1.epoll-zone, candid divergence: a set with zone
+    /// and host items reports the zone half first, then the host half,
+    /// under one `maxevents` budget (no single ready order across halves).
+    #[test]
+    fn mixed_epoll_set_alternates_halves_so_neither_starves() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
+        let efd = returned(h.call(19, [1, 0, 0, 0, 0, 0])) as i32;
+        let pair = h.reserve(8);
+        assert_eq!(returned(h.call(199, [1, 1, 0, pair, 0, 0])), 0);
+        let fds = h.memory.read_bytes(pair, 8).expect("socketpair fds");
+        let sock = i32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let peer = i32::from_le_bytes(fds[4..8].try_into().unwrap());
+        let byte = h.reserve(8);
+        h.memory.write_bytes(byte, b"x").expect("byte");
+        assert_eq!(returned(h.call(64, [peer as u64, byte, 1, 0, 0, 0])), 1);
+        let event = h.reserve(16);
+        // The host item first, so its registration cannot explain the order.
+        for (fd, data) in [(sock, 0x50c_u64), (efd, 0xef_u64)] {
+            let mut bytes = [0u8; 16];
+            bytes[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+            bytes[8..16].copy_from_slice(&data.to_le_bytes());
+            h.memory.write_bytes(event, &bytes).expect("event");
+            assert_eq!(
+                returned(h.call(21, [epfd as u64, LINUX_EPOLL_CTL_ADD, fd as u64, event, 0, 0])),
+                0
+            );
+        }
+        let out = h.reserve(32);
+        let data = |h: &Harness, n: usize| -> Vec<u64> {
+            (0..n)
+                .map(|i| {
+                    let raw = h.memory.read_bytes(out + 16 * i as u64 + 8, 8).unwrap();
+                    u64::from_le_bytes(raw.try_into().unwrap())
+                })
+                .collect()
         };
-        // SAFETY: `kqueue_fd` is the live epoll instance source and `pollfd`
-        // names one initialized record. The zero timeout only performs the
-        // durable post-registration recheck used by the carrier reactor.
-        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
-        assert_ne!(pollfd.revents & libc::POLLIN, 0);
+        assert_eq!(returned(h.call(22, [epfd as u64, out, 2, 0, 0, 0])), 2);
+        assert_eq!(data(&h, 2), vec![0xef, 0x50c], "the zone half's turn first");
+        assert_eq!(returned(h.call(22, [epfd as u64, out, 2, 0, 0, 0])), 2);
+        assert_eq!(data(&h, 2), vec![0x50c, 0xef], "then the host half's");
+        // Both stay ready (level-triggered) with room for one report per
+        // call: the turns alternate, so neither half starves the other.
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(returned(h.call(22, [epfd as u64, out, 1, 0, 0, 0])), 1);
+            seen.extend(data(&h, 1));
+        }
+        assert_eq!(seen, vec![0xef, 0x50c, 0xef, 0x50c]);
     }
 
     #[test]
@@ -1400,7 +1501,10 @@ mod overlay_dispatch_tests {
             other => panic!("expected blocked epoll, got {other:?}"),
         };
         assert_eq!(fds.logical_authorities_for_test().len(), 1);
-        assert_eq!(fds.watched_authorities_for_test().len(), 1);
+        // An eventfd member is a zone item (contract kernel.el1.epoll-zone):
+        // its record, not a watched host slot, carries its readiness and its
+        // removal at the last close.
+        assert_eq!(fds.watched_authorities_for_test().len(), 0);
 
         assert_eq!(returned(h.call(57, [watched as u64, 0, 0, 0, 0, 0])), 0);
         let successor = returned(h.call(19, [1, 0, 0, 0, 0, 0])) as i32;
@@ -5381,15 +5485,9 @@ mod hvpatch_in_process_fork_tests {
             DispatchOutcome::Returned { value: 0 }
         );
 
-        let target_description = parent
-            .open_file(read_fd)
-            .expect("parent target fd")
-            .description;
         let epoll_description = parent.open_file(epfd).expect("parent epoll fd").description;
-        let (_, _, _, _, owners, _, _) = target_description
-            .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
-            .expect("target reverse epoll snapshot");
-        assert_eq!(owners, vec![(epoll_description.id(), read_fd)]);
+        // A pipe read end is a zone item: the epoll's record holds it.
+        assert!(epoll_holds_item_fd(&epoll_description, read_fd));
 
         let (child, _) = fork_dispatcher(
             &parent,
@@ -5411,19 +5509,20 @@ mod hvpatch_in_process_fork_tests {
             DispatchOutcome::Returned { value: 0 }
         );
 
-        let (_, _, _, _, owners, _, _) = target_description
-            .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
-            .expect("detached target snapshot");
-        assert!(owners.is_empty());
-        let epoll = parent.open_file(epfd).expect("parent epoll fd");
-        let epoll = epoll.description.inspect().expect("epoll open description");
-        let OpenDescription::Epoll { interest, .. } = &*epoll else {
+        assert!(
+            !epoll_holds_item_fd(&epoll_description, read_fd),
+            "final target close did not detach the epoll item in another table"
+        );
+    }
+
+    /// Whether the epoll description holds an item for fd number `fd` in
+    /// either half (contract kernel.el1.epoll-zone).
+    fn epoll_holds_item_fd(epoll: &Arc<crate::kernel::FileDescription>, fd: i32) -> bool {
+        let epoll = epoll.inspect().expect("epoll open description");
+        let OpenDescription::Epoll { interest, zone, .. } = &*epoll else {
             panic!("epoll fd changed description kind");
         };
-        assert!(
-            !interest.contains_key(&read_fd),
-            "final target close did not detach the epoll owner in another table"
-        );
+        interest.contains_key(&fd) || zone.as_ref().is_some_and(|zone| zone.has_item_fd(fd))
     }
 
     #[test]
@@ -5531,16 +5630,11 @@ mod hvpatch_in_process_fork_tests {
             DispatchOutcome::Returned { value: 0 }
         );
 
-        let epoll = parent.open_file(epfd).expect("parent epoll fd");
-        let epoll = epoll.description.inspect().expect("epoll open description");
-        let OpenDescription::Epoll { interest, .. } = &*epoll else {
-            panic!("epoll fd changed description kind");
-        };
+        let epoll_description = parent.open_file(epfd).expect("parent epoll fd").description;
         assert!(
-            interest.contains_key(&read_fd),
+            epoll_holds_item_fd(&epoll_description, read_fd),
             "child dup3 detached the parent's inherited epoll registration"
         );
-        drop(epoll);
 
         // Drain the child-close wake before making the pipe readable.  The
         // parent's inherited registration must still arm the host
@@ -5552,31 +5646,34 @@ mod hvpatch_in_process_fork_tests {
             call!(&parent, 22, [epfd as u64, ready_addr, 1, 0, 0, 0]),
             DispatchOutcome::Returned { value: 0 }
         );
+        // A parent waiter blocks and the wait service enrolls it on the
+        // epoll fd's description wait queue (contract kernel.el1.epoll-zone:
+        // the zone record's wake source), before the pipe becomes readable.
+        let blocked = call!(&parent, 22, [epfd as u64, ready_addr, 1, u64::MAX, 0, 0]);
+        assert!(matches!(blocked, DispatchOutcome::WaitOnFds { .. }));
+        let epoll = parent.open_file(epfd).expect("parent epoll fd").description;
+        let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let enrollment = {
+            let woke = Arc::clone(&woke);
+            epoll
+                .wait_queue()
+                .expect("epoll wait queue")
+                .enroll_callback(move |_| woke.store(true, std::sync::atomic::Ordering::SeqCst))
+        };
         let byte_addr = MEM_BASE + 0x1e0;
         memory.write_bytes(byte_addr, b"x").unwrap();
         assert_eq!(
             call!(&parent, 64, [write_fd as u64, byte_addr, 1, 0, 0, 0],),
             DispatchOutcome::Returned { value: 1 }
         );
-        let epoll = parent.open_file(epfd).expect("parent epoll fd");
-        let poll_fd = {
-            let epoll = epoll.description.inspect().expect("open description");
-            let OpenDescription::Epoll { kqueue, .. } = &*epoll else {
-                panic!("epoll fd changed description kind");
-            };
-            kqueue.poll_fd()
-        };
-        let mut pollfd = libc::pollfd {
-            fd: poll_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(
-            unsafe { libc::poll(&mut pollfd, 1, 100) },
-            1,
-            "child non-final close deleted the parent's host epoll registration"
+        assert!(
+            woke.load(std::sync::atomic::Ordering::SeqCst),
+            "child non-final close deleted the parent's inherited epoll item"
         );
-        assert_ne!(pollfd.revents & libc::POLLIN, 0);
+        let ready = call!(&parent, 22, [epfd as u64, ready_addr, 1, 0, 0, 0]);
+        assert_eq!(ready, DispatchOutcome::Returned { value: 1 });
+        drop(enrollment);
+        drop(blocked);
     }
 }
 

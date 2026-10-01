@@ -246,7 +246,7 @@ fn op_kind(
         IpcBacking::Pipe { object, .. } => Some((IpcOpKind::PipeWrite, object)),
         IpcBacking::EventFd { object } if reading => Some((IpcOpKind::EventFdRead, object)),
         IpcBacking::EventFd { object } => Some((IpcOpKind::EventFdWrite, object)),
-        IpcBacking::Host(_) => None,
+        IpcBacking::Host(_) | IpcBacking::Epoll { .. } => None,
     }
 }
 
@@ -389,6 +389,9 @@ fn release_pin<C: ThreadCpu, U: UserWord>(
             sched.finish_object_wake(e);
         }
     }
+    for e in notify_epolls(sched, &wake).into_iter().flatten() {
+        sched.finish_object_wake(e);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -461,6 +464,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             sched.task.mark_pending_host_work();
         }
         let effects = notify(sched, object, wake);
+        let epoll_effects = notify_epolls(sched, &published);
         // A call that would block parks in the zone even with host work
         // pending (a kick, an owed host wake, possibly a signal for this
         // thread): `park` then leaves for the host at once, which settles the
@@ -473,7 +477,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             _ => None,
         };
         drop(guard);
-        for e in effects.into_iter().flatten() {
+        for e in effects.into_iter().chain(epoll_effects).flatten() {
             sched.finish_object_wake(e);
         }
         let written = op.progress.written;
@@ -547,6 +551,24 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
         frame.x[0] = result as u64;
         return IpcServed::Returned { switched: false };
     }
+}
+
+/// Notify the waiters of every zone epoll a member's change queued items
+/// on (their `Readable` lane), under the member's lock like the member's
+/// own lanes (lock order: object state, then a queue).
+fn notify_epolls<C: ThreadCpu, U: UserWord>(
+    sched: &Sched<'_, C, U>,
+    wake: &carrick_el1_abi::ipc::IpcWake,
+) -> [Option<WakeEffects>; carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS] {
+    let mut out = [None; carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS];
+    for (slot, epoll) in out.iter_mut().zip(wake.epolls.iter()) {
+        let lanes = WakeSet {
+            readers: true,
+            writers: false,
+        };
+        *slot = notify(sched, epoll, lanes)[0];
+    }
+    out
 }
 
 /// Notify both lanes' waiters the step owes, under the object lock.

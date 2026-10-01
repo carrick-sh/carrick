@@ -237,12 +237,20 @@ fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
             end: End::Writer,
         },
         IpcBacking::EventFd { object },
+        IpcBacking::Epoll { object },
         IpcBacking::Host(HostResourceToken::new(HostResourceToken::MAX).unwrap()),
         IpcBacking::Host(HostResourceToken::new(1).unwrap()),
     ] {
         assert_eq!(IpcBacking::decode(backing.encode()), Some(backing));
     }
-    for bad in [0, 4 << 61, 7 << 61, (3 << 61) | (1 << 60), 1 << 61] {
+    for bad in [
+        0,
+        5 << 61,
+        7 << 61,
+        (3 << 61) | (1 << 60),
+        (4 << 61) | (1 << 60),
+        1 << 61,
+    ] {
         assert_eq!(IpcBacking::decode(BackingToken(bad)), None, "{bad:#x}");
     }
     assert_eq!(HostResourceToken::new(0), None);

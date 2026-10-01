@@ -77,6 +77,12 @@
 //! `pipe::Error::Storage` before any effect; EL1 then forwards the call and
 //! the host provides the ring ([`IpcObjectGuard::provide_pipe_storage`]).
 //!
+//! Zone epoll objects ([`epoll`]) add one rule: a member (pipe or eventfd)
+//! lock is taken before an epoll lock (`EPOLL_CTL_ADD`/`MOD`/`DEL`, a final
+//! release detaching items), never the reverse; a member publication takes
+//! no epoll lock at all (it pushes on the epoll's lock-free ready stack);
+//! and a harvest holds the epoll lock or one member lock, never both.
+//!
 //! Guest page size for pipe accounting is [`IPC_PIPE_PAGE_SIZE`] (Linux
 //! aarch64 4 KiB pages, `carrick_abi::LINUX_PAGE_SIZE`).
 
@@ -122,9 +128,9 @@ pub const IPC_STOCK_RING_BYTES: u64 = (pipe::DEFAULT_PIPE_PAGES * IPC_PIPE_PAGE_
 pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
-/// Region magic: "CRKIPC" + ABI version 4 (elastic object and description
-/// stores, three-level host wake index).
-pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x04");
+/// Region magic: "CRKIPC" + ABI version 5 (elastic object and description
+/// stores, three-level host wake index, zone epoll records).
+pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x05");
 const IPC_READY: u64 = 1;
 /// Leaf words of the owed-host-wake index: one bit per object.
 const HOST_WAKE_LEAF_WORDS: usize = IPC_MAX_OBJECTS / 64;
@@ -266,20 +272,32 @@ impl HostResourceToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcBacking {
     Host(HostResourceToken),
-    Pipe { object: IpcObjectHandle, end: End },
-    EventFd { object: IpcObjectHandle },
+    Pipe {
+        object: IpcObjectHandle,
+        end: End,
+    },
+    EventFd {
+        object: IpcObjectHandle,
+    },
+    /// An epoll instance whose interest list lives in the shared record
+    /// ([`epoll`]).
+    Epoll {
+        object: IpcObjectHandle,
+    },
 }
 
 const TAG_SHIFT: u32 = 61;
 const TAG_HOST: u64 = 1;
 const TAG_PIPE: u64 = 2;
 const TAG_EVENTFD: u64 = 3;
+const TAG_EPOLL: u64 = 4;
 const END_WRITER: u64 = 1 << 60;
 const INDEX_SHIFT: u32 = 32;
 const INDEX_BITS: u64 = (1 << 28) - 1;
 
 impl IpcBacking {
-    /// Bits 63..61 tag (1 host, 2 pipe, 3 eventfd); host: bits 60..0 token;
+    /// Bits 63..61 tag (1 host, 2 pipe, 3 eventfd, 4 epoll); host: bits
+    /// 60..0 token;
     /// object: bit 60 pipe writer end, bits 59..32 index, 31..0 generation.
     pub const fn encode(self) -> BackingToken {
         BackingToken(match self {
@@ -292,6 +310,7 @@ impl IpcBacking {
                 (TAG_PIPE << TAG_SHIFT) | end | object_bits(object)
             }
             Self::EventFd { object } => (TAG_EVENTFD << TAG_SHIFT) | object_bits(object),
+            Self::Epoll { object } => (TAG_EPOLL << TAG_SHIFT) | object_bits(object),
         })
     }
     /// `None` for any token this ABI never encodes (fails closed).
@@ -315,6 +334,7 @@ impl IpcBacking {
                 },
             }),
             TAG_EVENTFD if raw & END_WRITER == 0 => Some(Self::EventFd { object }),
+            TAG_EPOLL if raw & END_WRITER == 0 => Some(Self::Epoll { object }),
             _ => None,
         }
     }
@@ -331,10 +351,12 @@ const _: () = assert!(IPC_MAX_OBJECTS as u64 <= INDEX_BITS);
 pub enum IpcObjectKind {
     Pipe,
     EventFd,
+    Epoll,
 }
 const KIND_FREE: u32 = 0;
 const KIND_PIPE: u32 = 1;
 const KIND_EVENTFD: u32 = 2;
+const KIND_EPOLL: u32 = 3;
 
 /// A pipe's pool storage: `ring_bytes` of ring (guest-page multiple) followed
 /// by `pages` [`Page`] metadata entries, starting at pool `offset`
@@ -360,12 +382,13 @@ impl IpcPipeStorage {
     }
 }
 
-/// The object's state; which half is meaningful follows `kind`.
+/// The object's state; which part is meaningful follows `kind`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct IpcObjectState {
     pub pipe: PipeRecord,
     pub eventfd: EventFd,
+    pub epoll: epoll::EpollState,
 }
 
 /// One pipe or eventfd, shared by host and EL1. Every field is written only
@@ -391,7 +414,12 @@ pub struct IpcObjectRecord {
     storage_offset: AtomicU64,
     storage_ring_bytes: AtomicU64,
     storage_pages: AtomicU64,
-    _reserved: u64,
+    /// Kind-dependent epoll link ([`epoll`]): for a pipe or eventfd, the
+    /// first zone epoll item watching it (item number, 0 none; written
+    /// under this object's lock); for an epoll, its lock-free ready stack
+    /// (pushed by member publishers holding only the member's lock,
+    /// drained whole under this epoll's lock).
+    epoll_link: AtomicU64,
     state: UnsafeCell<IpcObjectState>,
 }
 // SAFETY: `state` is accessed only through an `IpcObjectGuard`, which holds
@@ -440,6 +468,10 @@ pub struct IpcDirectory {
     /// visiting only pending words, never live objects.
     host_wake_summary: AtomicU64,
     host_wake_mid: [AtomicU64; HOST_WAKE_MID_WORDS],
+    /// Free zone epoll items ([`epoll`]), a tagged lock-free stack over
+    /// the item array at [`IPC_EPOLL_ITEMS_OFFSET`].
+    free_epoll_items: AtomicU64,
+    _reserved_epoll: [u64; 7],
 }
 
 const fn page_round(n: usize) -> usize {
@@ -453,11 +485,16 @@ pub const IPC_OFDS_OFFSET: usize =
 /// Offset of the owed-host-wake index's leaf words.
 pub const IPC_WAKE_LEAVES_OFFSET: usize =
     page_round(IPC_OFDS_OFFSET + IPC_MAX_OFDS * core::mem::size_of::<OfdRecord>());
+/// Offset of the zone epoll item array ([`epoll::IpcEpollItem`]).
+pub const IPC_EPOLL_ITEMS_OFFSET: usize =
+    page_round(IPC_WAKE_LEAVES_OFFSET + HOST_WAKE_LEAF_WORDS * core::mem::size_of::<AtomicU64>());
 /// Length of the directory mapping: fixed head plus every store's
 /// reservation, a multiple of 16 KiB (the host's stage-2 granule).
-pub const IPC_DIRECTORY_BYTES: usize = (IPC_WAKE_LEAVES_OFFSET
-    + HOST_WAKE_LEAF_WORDS * core::mem::size_of::<AtomicU64>())
+pub const IPC_DIRECTORY_BYTES: usize = (IPC_EPOLL_ITEMS_OFFSET
+    + epoll::IPC_EPOLL_ITEMS * core::mem::size_of::<epoll::IpcEpollItem>())
 .next_multiple_of(0x4000);
+const _: () =
+    assert!(IPC_EPOLL_ITEMS_OFFSET.is_multiple_of(core::mem::align_of::<epoll::IpcEpollItem>()));
 const _: () = assert!(IPC_OBJECTS_OFFSET.is_multiple_of(core::mem::align_of::<IpcObjectRecord>()));
 // The elastic stores' reservations follow the head, in order, without overlap.
 const _: () = assert!(IPC_OBJECTS_OFFSET >= core::mem::size_of::<IpcDirectory>());
@@ -531,6 +568,15 @@ const LAYOUT_FACTS: &[u64] = &[
     IPC_STOCK_RING_BYTES,
     core::mem::size_of::<RingStockSlot>() as u64,
     core::mem::offset_of!(IpcDirectory, ring_stock) as u64,
+    core::mem::offset_of!(IpcObjectRecord, epoll_link) as u64,
+    core::mem::size_of::<epoll::EpollState>() as u64,
+    core::mem::offset_of!(IpcObjectState, epoll) as u64,
+    core::mem::offset_of!(IpcDirectory, free_epoll_items) as u64,
+    IPC_EPOLL_ITEMS_OFFSET as u64,
+    epoll::IPC_EPOLL_ITEMS as u64,
+    core::mem::size_of::<epoll::IpcEpollItem>() as u64,
+    TAG_EPOLL,
+    KIND_EPOLL as u64,
 ];
 
 /// FNV-1a over `LAYOUT_FACTS` and the fd core's layout facts. Written into
@@ -887,6 +933,10 @@ impl<'a> IpcRegion<'a> {
         for i in (0..IPC_OPERATIONS).rev() {
             push(&d.free_operations, i, &d.operations[i].next_free);
         }
+        for i in (0..epoll::IPC_EPOLL_ITEMS).rev() {
+            let item = region.epoll_item_at(i).ok_or(IpcError::Corrupt)?;
+            push(&d.free_epoll_items, i, &item.next_free);
+        }
         d.header.magic.store(IPC_MAGIC, Ordering::Relaxed);
         d.header
             .layout_hash
@@ -1170,6 +1220,7 @@ impl<'a> IpcRegion<'a> {
             match kind {
                 KIND_PIPE => "pipe",
                 KIND_EVENTFD => "eventfd",
+                KIND_EPOLL => "epoll",
                 KIND_FREE => "free",
                 _ => "?",
             },
@@ -1221,6 +1272,13 @@ impl<'a> IpcRegion<'a> {
             Some(IpcObjectKind::EventFd) => match guard.eventfd() {
                 Ok(e) => writeln!(out, " counter={} mode={:?}", e.value(), e.mode()),
                 Err(e) => writeln!(out, " eventfd={e:?}"),
+            },
+            Some(IpcObjectKind::Epoll) => match guard.epoll_census() {
+                Some((zone, host, dead, ready)) => writeln!(
+                    out,
+                    " zone_items={zone} host_items={host} dead={dead} ready_head={ready}"
+                ),
+                None => writeln!(out, " epoll=?"),
             },
             None => writeln!(out),
         }
@@ -1402,6 +1460,18 @@ impl<'a> IpcRegion<'a> {
             IpcBacking::Host(token) => Ok(IpcReleased::Host(token)),
             IpcBacking::Pipe { object, end } => {
                 let mut guard = self.lock(object, wait)?;
+                let other = match end {
+                    End::Reader => End::Writer,
+                    End::Writer => End::Reader,
+                };
+                let last = {
+                    let pipe = guard.pipe()?;
+                    pipe.references(end) == 1 && pipe.references(other) == 0
+                };
+                if last {
+                    // Before any effect: a refused detach changes nothing.
+                    guard.detach_all_member_items(wait)?;
+                }
                 let mut pipe = guard.pipe()?;
                 let step = pipe.release(end);
                 step.result.map_err(IpcError::Object)?;
@@ -1415,9 +1485,14 @@ impl<'a> IpcRegion<'a> {
             IpcBacking::EventFd { object } => {
                 let mut guard = self.lock(object, wait)?;
                 guard.eventfd()?;
+                guard.detach_all_member_items(wait)?;
                 let wake = guard.publish(WakeSet::default());
                 guard.free();
                 Ok(IpcReleased::Object { wake, freed: true })
+            }
+            IpcBacking::Epoll { object } => {
+                self.epoll_destroy(object, wait)?;
+                Ok(IpcReleased::Epoll)
             }
         }
     }
@@ -1487,6 +1562,25 @@ impl<'a> IpcRegion<'a> {
             }
         }
         visited
+    }
+
+    /// Set object `index`'s bits in the owed-wake index: leaf bit, then
+    /// middle bit, then summary bit, so a boundary that sees the summary
+    /// finds the object. O(1): three words, whatever the live population.
+    /// Needs no object lock (an epoll publication indexes the epoll while
+    /// holding only its member's lock).
+    fn index_host_wake(&self, index: u32) {
+        let index = index as usize;
+        let leaf = index / 64;
+        let Some(leaf_word) = self.wake_leaf(leaf) else {
+            return;
+        };
+        leaf_word.fetch_or(1u64 << (index % 64), Ordering::Release);
+        let mid = leaf / 64;
+        self.dir.host_wake_mid[mid].fetch_or(1u64 << (leaf % 64), Ordering::Release);
+        self.dir
+            .host_wake_summary
+            .fetch_or(1u64 << mid, Ordering::Release);
     }
 
     /// Owed host wakes a boundary found with no live delivery target (see
@@ -1656,6 +1750,9 @@ pub struct IpcWake {
     pub writers: bool,
     pub seqs: IpcSeqs,
     pub host_owed: bool,
+    /// Zone epolls this change queued items on: their `Readable` waiters
+    /// are notified like the object's own.
+    pub epolls: epoll::EpollWakes,
 }
 
 /// Result of releasing a description's backing.
@@ -1665,6 +1762,9 @@ pub enum IpcReleased {
     Host(HostResourceToken),
     /// An object endpoint was released; `freed` if the object is gone.
     Object { wake: IpcWake, freed: bool },
+    /// An epoll instance was destroyed with its zone items (it has no
+    /// waiters: each one holds a pin on it).
+    Epoll,
 }
 
 /// A held object lock. Dropping it releases the lock.
@@ -1687,6 +1787,7 @@ impl<'a> IpcObjectGuard<'a> {
         match self.record.kind.load(Ordering::Relaxed) {
             KIND_PIPE => Some(IpcObjectKind::Pipe),
             KIND_EVENTFD => Some(IpcObjectKind::EventFd),
+            KIND_EPOLL => Some(IpcObjectKind::Epoll),
             _ => None,
         }
     }
@@ -1878,10 +1979,22 @@ impl<'a> IpcObjectGuard<'a> {
             r.write_seq.fetch_add(1, Ordering::Release);
         }
         let changed = wake.readers || wake.writers;
-        let host_owed = changed && r.host_subscribers.load(Ordering::Relaxed) != 0;
+        let mut host_owed = changed && r.host_subscribers.load(Ordering::Relaxed) != 0;
         if host_owed {
             r.host_wake_owed.store(1, Ordering::Release);
             self.index_host_wake();
+        }
+        // Zone epoll items watching this member: queued on their epolls
+        // under this lock alone (see `epoll`). An epoll owes the host a
+        // wake only when it has a host-side waiter.
+        let mut epolls = epoll::EpollWakes::EMPTY;
+        if changed
+            && r.epoll_link.load(Ordering::Relaxed) != 0
+            && self.kind() != Some(IpcObjectKind::Epoll)
+        {
+            let (queued, epoll_host_owed) = self.publish_to_epolls(wake);
+            epolls = queued;
+            host_owed |= epoll_host_owed;
         }
         IpcWake {
             object: self.handle,
@@ -1889,24 +2002,14 @@ impl<'a> IpcObjectGuard<'a> {
             writers: wake.writers,
             seqs: self.seqs(),
             host_owed,
+            epolls,
         }
     }
     /// Set this object's bits in the owed-wake index: leaf bit, then middle
     /// bit, then summary bit, so a boundary that sees the summary finds the
     /// object. O(1): three words, whatever the live population.
     fn index_host_wake(&self) {
-        let index = self.handle.index as usize;
-        let leaf = index / 64;
-        let Some(leaf_word) = self.region.wake_leaf(leaf) else {
-            return;
-        };
-        leaf_word.fetch_or(1u64 << (index % 64), Ordering::Release);
-        let mid = leaf / 64;
-        self.region.dir.host_wake_mid[mid].fetch_or(1u64 << (leaf % 64), Ordering::Release);
-        self.region
-            .dir
-            .host_wake_summary
-            .fetch_or(1u64 << mid, Ordering::Release);
+        self.region.index_host_wake(self.handle.index);
     }
 
     /// Host, under this lock: consume the owed host wake, for delivery to a
@@ -1953,6 +2056,8 @@ impl<'a> IpcObjectGuard<'a> {
         }
     }
 }
+
+pub mod epoll;
 
 #[cfg(test)]
 mod tests;

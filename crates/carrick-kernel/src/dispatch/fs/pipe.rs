@@ -420,9 +420,7 @@ impl PipeInner {
         delivery.collect(wake);
         drop(guard);
         delivery.deliver();
-        if wake.host_owed {
-            self.owner.service_host_wake(self.object);
-        }
+        self.owner.service_wake(&wake);
         step.result.map_err(object_error)
     }
     /// Give the pipe its ring (at its first write). ENOMEM only when the
@@ -476,6 +474,24 @@ impl PipeInner {
             .as_ref()
             .ok_or(carrick_el1_abi::ipc::fd::Error::StalePin)?
             .install(table, fd, false)
+    }
+
+    /// One end of this pipe as a zone epoll member (its object, side and
+    /// OFD identity), while that end's description is live.
+    pub(crate) fn zone_member(
+        &self,
+        end: core_pipe::End,
+    ) -> Option<crate::dispatch::net::epoll_zone::ZoneMember> {
+        let file_key = self.endpoint_status_flags(end)?.ofd_key()?;
+        Some(crate::dispatch::net::epoll_zone::ZoneMember {
+            owner: Arc::clone(&self.owner),
+            object: self.object,
+            kind: match end {
+                core_pipe::End::Reader => carrick_el1_abi::ipc::epoll::EpollMember::PipeReader,
+                core_pipe::End::Writer => carrick_el1_abi::ipc::epoll::EpollMember::PipeWriter,
+            },
+            file_key,
+        })
     }
 
     pub(crate) fn endpoint_status_flags(
@@ -834,12 +850,8 @@ pub(crate) fn transfer_in_memory_pipes(
     drop(dst);
     delivery.deliver();
     if copied > 0 {
-        if dest_wake.host_owed {
-            dest.owner.service_host_wake(dest.object);
-        }
-        if source_wake.host_owed {
-            source.owner.service_host_wake(source.object);
-        }
+        dest.owner.service_wake(&dest_wake);
+        source.owner.service_wake(&source_wake);
         return InMemoryTeeOutcome::Transferred(copied);
     }
     match result {

@@ -287,6 +287,7 @@ fn epoll() -> WaitQueueFixture {
             crate::dispatch::new_epoll_wake_registry(),
         )),
         wait_queue: Arc::clone(&wait_queue),
+        zone: None,
     });
     let producer_description = Arc::clone(&description);
     WaitQueueFixture {

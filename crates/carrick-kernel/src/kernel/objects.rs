@@ -279,6 +279,12 @@ pub trait FileDescriptionBacking: Any + Send + Sync {
         None
     }
 
+    /// Items an epoll backing holds in its zone record (members that are
+    /// IPC objects, outside `epoll_targets`). Zero for every other kind.
+    fn epoll_zone_items(&self) -> usize {
+        0
+    }
+
     #[allow(dead_code)]
     fn is_closed(&self) -> bool {
         false
@@ -1329,6 +1335,14 @@ impl FileDescription {
             FileDescriptionKind::Concrete(backing) => backing.0.is_epoll(),
             FileDescriptionKind::Regular => false,
             FileDescriptionKind::Epoll(_) => true,
+        }
+    }
+
+    /// See [`FileDescriptionBacking::epoll_zone_items`].
+    pub(crate) fn epoll_zone_items(&self) -> usize {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.epoll_zone_items(),
+            _ => 0,
         }
     }
 

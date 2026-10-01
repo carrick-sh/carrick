@@ -33,6 +33,146 @@ const EPOLL_REBIND_REASON_CLOSE_DETACH: u32 = 2;
 const EPOLL_REBIND_REASON_WAIT_SAMPLE: u32 = 3;
 const EPOLL_REBIND_REASON_CTL_DEL: u32 = 4;
 
+/// A new epoll description: its kqueue (host-half readiness and the user
+/// wake), its wait queue (parent epolls and poll waiters), and, with an IPC
+/// authority, its zone record (contract `kernel.el1.epoll-zone`). The wait
+/// queue subscribes the zone record while anyone is enrolled on it, so a
+/// zone member's change reaches a host-side watcher, and only then.
+fn new_epoll_description(
+    wake_registry: crate::dispatch::EpollWakeRegistry,
+    owner: Option<Arc<crate::el1_ipc::HostIpc>>,
+) -> Result<OpenDescription, carrick_abi::LinuxErrno> {
+    // The readiness backend is an EventMultiplexer: kqueue-backed on macOS,
+    // epoll-backed on Linux. The user-wake channel `register_user(0)` is the
+    // in-memory wake: `wake_parked` triggers it when an in-memory member's
+    // readiness changes or an interest is re-armed, so a thread blocked on
+    // this instance's poll_fd re-checks.
+    let mut mux =
+        crate::event_mux::make_event_multiplexer().map_err(|_| crate::linux_abi::LINUX_EMFILE)?;
+    let _ = mux.register_user(0);
+    let kqueue = Arc::new(crate::dispatch::EpollKqueue::new(mux, wake_registry));
+    let object = owner.and_then(|owner| owner.create_epoll().ok().map(|object| (owner, object)));
+    let wait_queue = Arc::new(match &object {
+        Some((owner, object)) => crate::kernel::WaitQueue::with_subscription(
+            super::epoll_zone::ZoneEpoll::queue_subscription(Arc::clone(owner), *object),
+        ),
+        None => crate::kernel::WaitQueue::new(),
+    });
+    let zone = object.and_then(|(owner, object)| {
+        super::epoll_zone::ZoneEpoll::create(
+            &owner,
+            object,
+            Arc::downgrade(&kqueue),
+            Arc::downgrade(&wait_queue),
+        )
+    });
+    Ok(OpenDescription::Epoll {
+        interest: HashMap::new(),
+        synthetic_interest_count: 0,
+        base: OpenDescriptionBase::new(0),
+        pending_ready: VecDeque::new(),
+        kqueue,
+        wait_queue,
+        zone,
+    })
+}
+
+/// The zone half of one `epoll_pwait`: its reports (arrival order), the
+/// items taken (restored if the reports cannot be delivered), and the
+/// waiter's host subscription, held while the wait blocks.
+#[derive(Default)]
+struct ZoneTake {
+    events: Vec<LinuxEpollEvent>,
+    taken: Vec<carrick_el1_abi::ipc::epoll::EpollItemRef>,
+    zone: Option<Arc<super::epoll_zone::ZoneEpoll>>,
+    /// This call's turn of a mixed set puts the host half first: the host
+    /// half gets the whole budget and the zone reports fill what it leaves
+    /// (the rest are queued again). Mixed-set calls alternate turns, so a
+    /// half that is always ready cannot starve the other.
+    host_first: bool,
+    /// The call's `maxevents`.
+    budget: usize,
+}
+
+/// The blocked wait of an epoll with a zone record. The epoll fd itself is
+/// the registration: its description wait queue (which subscribes the zone
+/// record while anyone is enrolled) is a wake source beside the instance
+/// kqueue, and the wait service probes the description's readiness after it
+/// enrolls, so a zone member's change between this call's harvest and the
+/// enrollment is not lost (probe after enroll). Watched slots force a
+/// re-dispatch when a host-half item's slot is replaced, as before.
+fn zone_epoll_wait_fds(
+    files: &crate::kernel::FileTable,
+    epfd: i32,
+    kq_fd: i32,
+    host_events: carrick_abi::LinuxPollEvents,
+    watched_fds: &[i32],
+) -> Result<WaitFds, carrick_abi::LinuxErrno> {
+    use crate::dispatch::wait_source::{
+        HostProxyCoverage, HostWaitTarget, WaitInterest, WaitRegistration, WaitSource, WatchedSlot,
+    };
+    let number = crate::kernel::FileSlotNumber::for_open_fd(epfd).map_err(|_| LINUX_EBADF)?;
+    let slot = files
+        .capture_slot_or_stdio_authority(number)
+        .ok_or(LINUX_EBADF)?;
+    let interest = WaitInterest::new(carrick_abi::LinuxPollEvents::IN).ok_or(LINUX_EINVAL)?;
+    let source = WaitSource::Dual {
+        host: HostWaitTarget::new(HostFd(kq_fd), host_events),
+        interest,
+        coverage: HostProxyCoverage::HostPeersOnly,
+    };
+    let watched = watched_fds
+        .iter()
+        .filter_map(|fd| crate::kernel::FileSlotNumber::for_open_fd(*fd).ok())
+        .filter_map(|number| files.capture_slot_or_stdio_authority(number))
+        .map(WatchedSlot::new)
+        .collect();
+    WaitFds::from_registrations(
+        vec![WaitRegistration::new(
+            Fd(epfd),
+            slot,
+            carrick_abi::LinuxPollEvents::IN,
+            source,
+        )],
+        watched,
+    )
+}
+
+/// Write the zone reports, then the host reports, as one `epoll_wait`
+/// result. An unwritable buffer reports nothing (`EFAULT`) and queues the
+/// zone items again, as Linux re-queues items whose copy failed.
+fn deliver_epoll_reports<M: CurrentMmMemory>(
+    memory: &mut M,
+    events_address: u64,
+    guest_abi: LinuxGuestAbi,
+    take: &ZoneTake,
+    host: Vec<LinuxEpollEvent>,
+) -> Result<DispatchOutcome, DispatchError> {
+    let (all, unsent) = if take.host_first {
+        // The host half's turn: zone reports fill what it left.
+        let room = take
+            .budget
+            .saturating_sub(host.len())
+            .min(take.events.len());
+        let mut all = host;
+        all.extend_from_slice(&take.events[..room]);
+        (all, &take.taken[room..])
+    } else {
+        let mut all = take.events.clone();
+        all.extend(host);
+        (all, &take.taken[take.taken.len()..])
+    };
+    let outcome = write_epoll_events(memory, events_address, &all, guest_abi)?;
+    if let Some(zone) = &take.zone {
+        if matches!(outcome, DispatchOutcome::Errno { .. }) {
+            zone.restore(&take.taken);
+        } else {
+            zone.restore(unsent);
+        }
+    }
+    Ok(outcome)
+}
+
 fn remove_epoll_interest(
     interest: &mut HashMap<i32, EpollInterest>,
     synthetic_interest_count: &mut usize,
@@ -279,6 +419,11 @@ impl<'a> NetView<'a> {
         let Some(children) = current_desc.epoll_targets() else {
             return false;
         };
+        // Zone items are leaves one level down, like the host half's
+        // non-epoll targets.
+        if depth + 1 >= 5 && current_desc.epoll_zone_items() > 0 {
+            return true;
+        }
         children
             .into_iter()
             .any(|child| self.epoll_path_reaches_desc(&child, target_id, depth + 1, seen))
@@ -915,6 +1060,7 @@ impl<'a> NetView<'a> {
                 synthetic_interest_count,
                 pending_ready,
                 kqueue,
+                zone,
                 ..
             } = &mut *guard
             else {
@@ -927,6 +1073,9 @@ impl<'a> NetView<'a> {
                 continue;
             }
             let _ = remove_epoll_interest(interest, synthetic_interest_count, registration_fd);
+            if let Some(zone) = zone {
+                zone.set_host_items(interest.len());
+            }
             clear_pending_epoll_ready(pending_ready, registration_fd);
             if let Some(host_fd) = detached_host_fd {
                 kqueue.with_mux(|mux| {
@@ -1030,6 +1179,7 @@ impl<'a> NetView<'a> {
                 synthetic_interest_count,
                 pending_ready,
                 kqueue,
+                zone,
                 ..
             } = &mut *guard
             {
@@ -1055,6 +1205,9 @@ impl<'a> NetView<'a> {
                             registered_fd,
                         );
                         clear_pending_epoll_ready(pending_ready, registered_fd);
+                    }
+                    if let Some(zone) = zone {
+                        zone.set_host_items(interest.len());
                     }
                 }
                 if let Some(host_fd) = detached_host_fd {
@@ -1117,12 +1270,64 @@ impl<'a> NetView<'a> {
         }
     }
 
-    // core stays byte-for-byte identical (one pre-existing unused destructure).
-    #[allow(unused_variables)]
+    /// `epoll_wait`/`epoll_pwait` on the host. The zone half (contract
+    /// `kernel.el1.epoll-zone`) is harvested through the shared record's
+    /// routine. On a set with both halves, calls alternate which half
+    /// reports first and the other fills what is left of the `maxevents`
+    /// budget (the zone's unsent reports are queued again), so neither half
+    /// starves the other. Candid divergence from Linux: such a set has no
+    /// single ready order across its halves; within each half the order is
+    /// Linux's.
     fn epoll_pwait_wait_core<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
         args: EpollPwaitWaitArgs,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let zone = args
+            .open_file
+            .description
+            .inspect_kind(|open| match open {
+                OpenDescription::Epoll { zone, .. } => zone.clone(),
+                _ => None,
+            })
+            .flatten();
+        let Some(zone) = zone else {
+            return self.epoll_pwait_host_core(memory, args, ZoneTake::default());
+        };
+        let harvested = zone.harvest(args.max_events);
+        // Mixed sets alternate which half reports first (see `ZoneTake`).
+        let host_first = harvested.host_items != 0 && zone.take_host_turn();
+        let take = ZoneTake {
+            events: harvested.events,
+            taken: harvested.taken,
+            zone: Some(zone),
+            host_first,
+            budget: args.max_events,
+        };
+        // The zone filled the budget on its turn, or there is no host half
+        // to add to it.
+        if (!host_first && take.events.len() >= args.max_events)
+            || (harvested.host_items == 0 && !take.events.is_empty())
+        {
+            crate::probes::epoll_result(args.epfd, take.events.len() as i32, 0, args.timeout_ms, 0);
+            return deliver_epoll_reports(
+                memory,
+                args.events_address,
+                args.guest_abi,
+                &take,
+                Vec::new(),
+            );
+        }
+        self.epoll_pwait_host_core(memory, args, take)
+    }
+
+    // core stays byte-for-byte identical (one pre-existing unused destructure).
+    #[allow(unused_variables)]
+    fn epoll_pwait_host_core<M: CurrentMmMemory>(
+        &self,
+        memory: &mut M,
+        args: EpollPwaitWaitArgs,
+        take: ZoneTake,
     ) -> Result<DispatchOutcome, DispatchError> {
         let EpollPwaitWaitArgs {
             open_file,
@@ -1133,6 +1338,13 @@ impl<'a> NetView<'a> {
             timeout_ms,
             sig_mask,
         } = args;
+        // The host half fills what the zone half left of the budget, or the
+        // whole budget on its turn.
+        let max_events = if take.host_first {
+            max_events
+        } else {
+            max_events - take.events.len()
+        };
         let this = self;
         // Snapshot any already-queued ready events first. `ready` is
         // reassigned on the multiplexer path below (it collects the
@@ -1152,8 +1364,14 @@ impl<'a> NetView<'a> {
             for (fd, event) in &pending_ready {
                 crate::event_ring::rec(crate::event_ring::EPREADY, epfd, *fd, event.events as i32);
             }
-            crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
-            return write_epoll_events(memory, events_address, &ready, guest_abi);
+            crate::probes::epoll_result(
+                epfd,
+                (take.events.len() + ready.len()) as i32,
+                0,
+                timeout_ms,
+                0,
+            );
+            return deliver_epoll_reports(memory, events_address, guest_abi, &take, ready);
         }
 
         // Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The
@@ -1967,7 +2185,7 @@ impl<'a> NetView<'a> {
                 ready.len() as i32,
                 timeout_ms,
             );
-            if ready.is_empty() && timeout_ms != 0 {
+            if ready.is_empty() && take.events.is_empty() && timeout_ms != 0 {
                 let timeout = if timeout_ms < 0 {
                     None
                 } else {
@@ -1982,11 +2200,22 @@ impl<'a> NetView<'a> {
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
                     crate::event_ring::rec(crate::event_ring::EPWFD, kq_fd, 0, timeout_ms);
                     let files = self.captured_file_table();
-                    let fds = match WaitFds::raw_one(kq_fd, 0).with_redispatch_and_watched_slots(
-                        &files,
-                        [epfd],
-                        watched_guest_fds.iter().copied(),
-                    ) {
+                    let built = if take.zone.is_some() {
+                        zone_epoll_wait_fds(
+                            &files,
+                            epfd,
+                            kq_fd,
+                            carrick_abi::LinuxPollEvents::empty(),
+                            &watched_guest_fds,
+                        )
+                    } else {
+                        WaitFds::raw_one(kq_fd, 0).with_redispatch_and_watched_slots(
+                            &files,
+                            [epfd],
+                            watched_guest_fds.iter().copied(),
+                        )
+                    };
+                    let fds = match built {
                         Ok(fds) => fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
@@ -2011,12 +2240,22 @@ impl<'a> NetView<'a> {
                         timeout_ms,
                     );
                     let files = self.captured_file_table();
-                    let fds = match WaitFds::raw_one(kq_fd, libc::POLLIN)
-                        .with_redispatch_and_watched_slots(
+                    let built = if take.zone.is_some() {
+                        zone_epoll_wait_fds(
+                            &files,
+                            epfd,
+                            kq_fd,
+                            carrick_abi::LinuxPollEvents::IN,
+                            &watched_guest_fds,
+                        )
+                    } else {
+                        WaitFds::raw_one(kq_fd, libc::POLLIN).with_redispatch_and_watched_slots(
                             &files,
                             [epfd],
                             watched_guest_fds.iter().copied(),
-                        ) {
+                        )
+                    };
+                    let fds = match built {
                         Ok(fds) => fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
@@ -2040,12 +2279,22 @@ impl<'a> NetView<'a> {
                 // kevent() here it does not consume pending epoll events before the
                 // re-dispatched epoll_pwait can copy them out.
                 let files = self.captured_file_table();
-                let fds = match WaitFds::raw_one(kq_fd, libc::POLLIN)
-                    .with_redispatch_and_watched_slots(
+                let built = if take.zone.is_some() {
+                    zone_epoll_wait_fds(
+                        &files,
+                        epfd,
+                        kq_fd,
+                        carrick_abi::LinuxPollEvents::IN,
+                        &watched_guest_fds,
+                    )
+                } else {
+                    WaitFds::raw_one(kq_fd, libc::POLLIN).with_redispatch_and_watched_slots(
                         &files,
                         [epfd],
                         watched_guest_fds.iter().copied(),
-                    ) {
+                    )
+                };
+                let fds = match built {
                     Ok(fds) => fds,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
@@ -2057,8 +2306,14 @@ impl<'a> NetView<'a> {
                 });
             }
 
-            crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
-            write_epoll_events(memory, events_address, &ready, guest_abi)
+            crate::probes::epoll_result(
+                epfd,
+                (take.events.len() + ready.len()) as i32,
+                0,
+                timeout_ms,
+                0,
+            );
+            deliver_epoll_reports(memory, events_address, guest_abi, &take, ready)
         }
     }
 }
@@ -3411,30 +3666,12 @@ impl<'a> NetView<'a> {
             if flags & !LINUX_EPOLL_CLOEXEC != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            // The readiness backend is an EventMultiplexer: kqueue-backed on
-            // macOS, epoll-backed on Linux. The user-wake channel `register_user(0)`
-            // is the in-memory wake: `notify_inmem_epoll`/`wake_parked` trigger it
-            // when an eventfd/pipe/timerfd readiness changes or an interest is
-            // re-armed, so a thread blocked on this instance's poll_fd re-checks.
-            let epoll_kqueue = {
-                let mut mux = match crate::event_mux::make_event_multiplexer() {
-                    Ok(m) => m,
-                    // The backing kqueue/epoll fd couldn't be allocated (fd table full).
-                    Err(_) => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE)),
-                };
-                let _ = mux.register_user(0);
-                crate::dispatch::EpollKqueue::new(
-                    mux,
-                    Arc::clone(this.captured_file_table().epoll_wake_registry()),
-                )
-            };
-            let description = OpenDescription::Epoll {
-                interest: HashMap::new(),
-                synthetic_interest_count: 0,
-                base: OpenDescriptionBase::new(0),
-                pending_ready: VecDeque::new(),
-                kqueue: Arc::new(epoll_kqueue),
-                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+            let description = match new_epoll_description(
+                Arc::clone(this.captured_file_table().epoll_wake_registry()),
+                cx.kernel.kernel().ipc().ok(),
+            ) {
+                Ok(description) => description,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
 
@@ -3448,24 +3685,12 @@ impl<'a> NetView<'a> {
             if (size as i32) <= 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let epoll_kqueue = {
-                let mut mux = match crate::event_mux::make_event_multiplexer() {
-                    Ok(m) => m,
-                    Err(_) => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE)),
-                };
-                let _ = mux.register_user(0);
-                crate::dispatch::EpollKqueue::new(
-                    mux,
-                    Arc::clone(this.captured_file_table().epoll_wake_registry()),
-                )
-            };
-            let description = OpenDescription::Epoll {
-                interest: HashMap::new(),
-                synthetic_interest_count: 0,
-                base: OpenDescriptionBase::new(0),
-                pending_ready: VecDeque::new(),
-                kqueue: Arc::new(epoll_kqueue),
-                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+            let description = match new_epoll_description(
+                Arc::clone(this.captured_file_table().epoll_wake_registry()),
+                cx.kernel.kernel().ipc().ok(),
+            ) {
+                Ok(description) => description,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             Ok(this.install_fd(description, linux_fd_flags_from_open_flags(0)))
 
@@ -3508,6 +3733,68 @@ impl<'a> NetView<'a> {
             // taking the epoll write lock (it locks the *target* fd's description).
             let host_fd = this.host_fd_for_poll(fd);
             let target_description = Some(Arc::clone(&target_file.description));
+
+            // Zone half (contract kernel.el1.epoll-zone): an item whose member
+            // is an IPC object lives in the epoll's shared record, keyed on
+            // (fd, open file); every other item in `interest` below. An
+            // item's home is chosen here, at ADD, and never changes.
+            let zone = epoll_description
+                .inspect_kind(|open| match open {
+                    OpenDescription::Epoll { zone, .. } => zone.clone(),
+                    _ => None,
+                })
+                .flatten();
+            let member = target_file
+                .description
+                .inspect_kind(OpenDescription::zone_epoll_member)
+                .flatten();
+            if let (Some(zone), Some(member)) = (&zone, &member)
+                && zone.belongs_to(&member.owner)
+            {
+                use super::epoll_zone::ZoneCtl;
+                let zone_result = match operation {
+                    LINUX_EPOLL_CTL_ADD => {
+                        let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
+                        // The exact (fd, file) already lives in the host half
+                        // (a placement refusal earlier): one item per pair.
+                        let in_host_half = epoll_description
+                            .inspect_kind(|open| match open {
+                                OpenDescription::Epoll { interest, .. } => {
+                                    interest.get(&fd).is_some_and(|slot| {
+                                        epoll_slot_names_current_file(
+                                            slot,
+                                            &target_file.description,
+                                        )
+                                    })
+                                }
+                                _ => false,
+                            })
+                            .unwrap_or(false);
+                        if in_host_half {
+                            ZoneCtl::Exists
+                        } else {
+                            zone.add(member, fd, event.events, event.data)
+                        }
+                    }
+                    LINUX_EPOLL_CTL_MOD => {
+                        let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
+                        zone.modify(fd, member.file_key, event.events, event.data)
+                    }
+                    LINUX_EPOLL_CTL_DEL => zone.delete(fd, member.file_key),
+                    _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                };
+                match zone_result {
+                    ZoneCtl::Done => {
+                        crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    ZoneCtl::Exists => return Ok(DispatchOutcome::errno(LINUX_EEXIST)),
+                    ZoneCtl::Invalid => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    // Not a zone item (MOD/DEL), or placed in the host half
+                    // (ADD): the host interest map below decides.
+                    ZoneCtl::NotFound | ZoneCtl::HostHalf(_) => {}
+                }
+            }
 
             // Record this epoll instance for the consumption-based EPOLLET
             // re-arm ([`Self::epoll_rearm_after_io`]) BEFORE taking the
@@ -3659,6 +3946,9 @@ impl<'a> NetView<'a> {
                     if is_synthetic {
                         *synthetic_interest_count += 1;
                     }
+                    if let Some(zone) = &zone {
+                        zone.set_host_items(interest.len());
+                    }
                     if is_synthetic || interest.len() == 1 {
                         kqueue.wake_parked();
                         drop(open);
@@ -3745,6 +4035,9 @@ impl<'a> NetView<'a> {
                     else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                     };
+                    if let Some(zone) = &zone {
+                        zone.set_host_items(interest.len());
+                    }
                     let removed_reg_gen = removed.reg_gen;
                     if let Some(target) = &removed.target {
                         target.unregister_epoll_owner(&epoll_description, fd);
