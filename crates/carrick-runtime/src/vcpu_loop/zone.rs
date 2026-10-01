@@ -1072,6 +1072,13 @@ where
         let region = host_ipc::host_region().ok_or_else(|| {
             RuntimeError::Configuration("IPC resume without a published window".to_owned())
         })?;
+        // The resumed operation copies into the guest buffer without
+        // passing syscall entry again; EL1 work this MM published while it
+        // was parked is settled first, as at syscall entry.
+        let mm_executor = self.state.guest_execution.as_mut().ok_or_else(|| {
+            RuntimeError::Configuration("IPC resume without MM executor participation".to_owned())
+        })?;
+        signal::settle_guest_work_before_host_copy(&self.kernel.dispatcher, engine, mm_executor)?;
         let mut op = region
             .operation(&token)
             .map_err(|error| ipc_error("resume", error))?;
