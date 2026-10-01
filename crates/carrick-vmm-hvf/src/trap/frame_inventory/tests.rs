@@ -7074,3 +7074,207 @@ fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
         winning_ipa,
     ));
 }
+
+/// One mm's inventory holding a single 16 KiB private compound, the frame
+/// registry it shares with any fork relative, and the Kernel's VM-wide
+/// mapping count for that frame.
+fn sole_compound_inventory(
+    backend_references: usize,
+    backing: InventoryBackingIdentity,
+    length: u64,
+) -> (HvpatchFrameInventory, (u64, u64), carrick_hal::FrameId) {
+    let frame = carrick_hal::FrameId::from_kernel_allocation(id(301));
+    let key = (0xa0a0_0000_0000, length);
+    let mut inventory = HvpatchFrameInventory::default();
+    inventory.extents.insert(
+        key,
+        InventoryExtent {
+            frame,
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(302)),
+            backing,
+            stage2_base: key.0,
+            stage2_length: key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
+        },
+    );
+    {
+        let mut frames = inventory.frames.lock();
+        frames.references.insert(frame, backend_references);
+        frames
+            .extent_references
+            .insert((frame, key.0, key.1), backend_references);
+        frames.stage2_references.insert(key, backend_references);
+    }
+    (inventory, key, frame)
+}
+
+fn route_for(
+    inventory: &HvpatchFrameInventory,
+    compound: u64,
+    kernel_count: usize,
+) -> CowWriteRoute {
+    HvfVmState::cow_inventory_split_shape(inventory, compound, false, |_| Ok(Some(kernel_count)))
+        .expect("plan the COW")
+        .write_route(
+            carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+            false,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+            false,
+            false,
+        )
+}
+
+/// Linux reuses a written page whose only mapper is the writer; a fork child
+/// that exited (or exec'd) before its parent's write leaves exactly that.
+/// cpython-threading took 17.7k COW copies per run and 63% of them were of
+/// a frame the writer solely owned (cow-and-teardown.md).
+#[test]
+fn a_write_after_the_fork_child_is_fully_gone_reuses_the_frame() {
+    let (mut inventory, key, frame) =
+        sole_compound_inventory(2, InventoryBackingIdentity::Private(301), 0x4000);
+    // Fork: the child shares the frame in the backend and the Kernel.
+    assert_eq!(route_for(&inventory, key.0, 2), CowWriteRoute::Copy);
+    // The child's exit decides: its backend reference is gone, its Kernel
+    // unmap is not applied yet. The frame is still shared; copy.
+    *inventory.frames.lock().references.get_mut(&frame).unwrap() = 1;
+    assert_eq!(
+        route_for(&inventory, key.0, 2),
+        CowWriteRoute::Copy,
+        "a decided-but-unapplied sibling unmap still shares the frame"
+    );
+    // The child's Kernel unmap is applied: the writer is the sole owner.
+    assert_eq!(
+        route_for(&inventory, key.0, 1),
+        CowWriteRoute::ReuseSoleOwner
+    );
+    inventory.extents.clear();
+}
+
+/// The other apply order: the Kernel has already applied the sibling's unmap
+/// but its backend decrement is still pending (the unmap/alias path applies
+/// before it decrements). The backend population still names the sibling,
+/// so the write copies until the decrement lands.
+#[test]
+fn a_write_while_a_sibling_backend_reference_is_pending_copies() {
+    let (inventory, key, frame) =
+        sole_compound_inventory(2, InventoryBackingIdentity::Private(301), 0x4000);
+    assert_eq!(route_for(&inventory, key.0, 1), CowWriteRoute::Copy);
+    *inventory.frames.lock().references.get_mut(&frame).unwrap() = 1;
+    assert_eq!(
+        route_for(&inventory, key.0, 1),
+        CowWriteRoute::ReuseSoleOwner
+    );
+}
+
+/// Reuse is only for a guest-visible user write of a whole private 16 KiB
+/// compound that the write would otherwise retire, on the host descriptor
+/// lane: every other shape keeps the copy.
+#[test]
+fn reuse_is_limited_to_a_whole_private_guest_visible_compound() {
+    use carrick_aarch64::vmm::FrameCowWriteIntent;
+    let (inventory, key, _) =
+        sole_compound_inventory(1, InventoryBackingIdentity::Private(301), 0x4000);
+    let shape =
+        HvfVmState::cow_inventory_split_shape(&inventory, key.0, false, |_| Ok(Some(1))).unwrap();
+    let compound = CowArmedRanges::COMPOUND_SIZE as usize;
+    assert_eq!(
+        shape.write_route(
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            compound,
+            false,
+            false
+        ),
+        CowWriteRoute::ReuseSoleOwner
+    );
+    for (intent, kernel_only, span, retain, guest_lane) in [
+        (
+            FrameCowWriteIntent::BackingMaintenance,
+            false,
+            compound,
+            false,
+            false,
+        ),
+        (
+            FrameCowWriteIntent::GuestVisible,
+            true,
+            compound,
+            false,
+            false,
+        ),
+        (
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            0x1000,
+            false,
+            false,
+        ),
+        (
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            compound,
+            true,
+            false,
+        ),
+        (
+            FrameCowWriteIntent::GuestVisible,
+            false,
+            compound,
+            false,
+            true,
+        ),
+    ] {
+        assert_eq!(
+            shape.write_route(intent, kernel_only, span, retain, guest_lane),
+            CowWriteRoute::Copy,
+            "{intent:?} kernel_only={kernel_only} span={span:#x} retain={retain} guest_lane={guest_lane}"
+        );
+    }
+    // A private file view keeps file-backed COW semantics.
+    let (file_view, key, _) =
+        sole_compound_inventory(1, InventoryBackingIdentity::PrivateFileView(301), 0x4000);
+    assert_eq!(route_for(&file_view, key.0, 1), CowWriteRoute::Copy);
+    // A frame wider than the compound that only this mm maps is reused too:
+    // granting write to one compound of it needs no split.
+    let (wide, key, frame) =
+        sole_compound_inventory(1, InventoryBackingIdentity::Private(301), 0x10000);
+    assert_eq!(route_for(&wide, key.0, 1), CowWriteRoute::ReuseSoleOwner);
+    // ...but not while another mm maps it.
+    *wide.frames.lock().references.get_mut(&frame).unwrap() = 2;
+    assert_eq!(route_for(&wide, key.0 + 0x4000, 2), CowWriteRoute::Copy);
+}
+
+/// A frame an earlier COW split into fragments is mapped by several extents
+/// of the same mm. It is still solely owned when every backend reference and
+/// every Kernel mapping is one of those extents; one more holder anywhere
+/// makes it shared.
+#[test]
+fn a_frame_split_across_one_mms_extents_is_still_solely_owned() {
+    let frame = carrick_hal::FrameId::from_kernel_allocation(id(311));
+    let base = 0xa0b0_0000_0000_u64;
+    let mut inventory = HvpatchFrameInventory::default();
+    for (index, mapping) in [(0_u64, 312_u64), (1, 313), (3, 314)] {
+        let key = (base + index * 0x4000, 0x4000);
+        inventory.extents.insert(
+            key,
+            InventoryExtent {
+                frame,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(id(mapping)),
+                backing: InventoryBackingIdentity::Private(311),
+                stage2_base: base,
+                stage2_length: 0x10000,
+                stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
+            },
+        );
+    }
+    inventory.frames.lock().references.insert(frame, 3);
+    assert_eq!(
+        route_for(&inventory, base + 0x4000, 3),
+        CowWriteRoute::ReuseSoleOwner
+    );
+    // A fork child's pending Kernel unmap of one fragment still shares it.
+    assert_eq!(route_for(&inventory, base + 0x4000, 4), CowWriteRoute::Copy);
+    // So does a live child's backend reference.
+    inventory.frames.lock().references.insert(frame, 4);
+    assert_eq!(route_for(&inventory, base + 0x4000, 4), CowWriteRoute::Copy);
+}

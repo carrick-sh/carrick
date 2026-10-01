@@ -2307,6 +2307,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         old,
         fragments,
         retirement,
+        sole_owner,
     } = split_shape;
     if page_tables_authority.live_descriptor_owner()
         == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
@@ -2328,6 +2329,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                     old,
                     fragments,
                     retirement,
+                    sole_owner,
                 },
             },
         );
@@ -2823,6 +2825,7 @@ fn perform_foreign_guest_cow(
                 old,
                 fragments,
                 retirement,
+                sole_owner: _,
             },
     } = cow;
     let tables = lease.state.page_tables_authority();
