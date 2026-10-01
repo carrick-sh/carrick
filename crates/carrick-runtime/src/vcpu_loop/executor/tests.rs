@@ -7093,7 +7093,7 @@ fn preemption_driver_duplicate_attachment_fails_with_typed_error() {
         config(1),
         Arc::clone(&scheduler),
         Arc::clone(&factory),
-        factory,
+        Arc::clone(&factory),
         ExecutorBoundaryAudit::production(),
     )
     .expect_err("pool start on already-attached scheduler should fail");
@@ -7101,6 +7101,14 @@ fn preemption_driver_duplicate_attachment_fails_with_typed_error() {
     assert_eq!(
         pool_err.driver_error(),
         Some(&PreemptionDriverError::AlreadyAttached)
+    );
+    // The refusal comes before any worker exists. A worker created first
+    // could already be parked in the run queue, where the startup rollback's
+    // `Stop` command cannot reach it, and the rollback join would hang.
+    assert_eq!(
+        factory.create_calls.load(Ordering::SeqCst),
+        0,
+        "a refused preemption-driver attachment must not create any executor"
     );
 
     driver.shutdown();
