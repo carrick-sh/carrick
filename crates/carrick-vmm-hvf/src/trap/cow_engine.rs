@@ -3672,10 +3672,60 @@ impl HvfTaskState {
                     CowRepointAccess::User { writable_pages }
                 };
                 let tables = self.page_tables_authority();
+                let mm_key = std::num::NonZeroU64::new(identity.mm)
+                    .ok_or_else(|| TrapError::Hypervisor("zero COW MM".to_owned()))?;
+                // The host record says the span shares its frame, but a page
+                // the host published from a prepared leaf (a copyout or
+                // signal frame into untouched memory) became a plain
+                // resident private leaf without EL1's COW arm. Re-arm the
+                // span in EL1 first, so the repoint below copies exactly as
+                // the record requires.
+                let unarmed_resident = tables
+                    .with_manager(|manager| {
+                        (0..(span.len as u64 / PAGE_SIZE)).any(|index| {
+                            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                                manager.debug_walk(span.va + index * PAGE_SIZE),
+                            );
+                            carrick_mmu_core::aarch64::el1_private_leaf_state(leaf)
+                                == carrick_mmu_core::aarch64::El1PrivateLeafState::Resident
+                                && !carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(leaf)
+                        })
+                    })
+                    .unwrap_or(false);
+                if unarmed_resident && !span.kernel_only {
+                    let arm = tables
+                        .with_manager(|manager| {
+                            manager.fork_arm_op(
+                                span.va,
+                                span.len as u64,
+                                false,
+                                span.executable,
+                                false,
+                            )
+                        })
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor("guest COW re-arm lost its tables".to_owned())
+                        })?;
+                    let arm_txn =
+                        tables
+                            .prepare_guest_descriptor_txn(mm_key, arm)
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "prepare guest COW re-arm: {error:?}"
+                                ))
+                            })?;
+                    flush_stage1.publish(&arm_txn).map_err(|error| {
+                        error.into_clean_refusal().unwrap_or_else(|error| {
+                            carrick_fatal!(
+                                "hvpatch::cow",
+                                "guest COW re-arm lacks a verified completion: {error}"
+                            )
+                        })
+                    })?;
+                }
                 let txn = tables
                     .prepare_guest_descriptor_txn(
-                        std::num::NonZeroU64::new(identity.mm)
-                            .ok_or_else(|| TrapError::Hypervisor("zero COW MM".to_owned()))?,
+                        mm_key,
                         carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
                             access,
                             va: span.va,
