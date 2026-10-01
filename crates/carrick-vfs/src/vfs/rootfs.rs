@@ -2488,6 +2488,24 @@ impl Vfs for RootFsVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_retains_backing_cohort_and_replacement_detaches_old_backing() {
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        let first = HostFsBackend::from_path(first_root.path()).unwrap();
+        let first_cohort = Arc::clone(first.cache_coherence());
+        let second = HostFsBackend::from_path(second_root.path()).unwrap();
+        let second_cohort = Arc::clone(second.cache_coherence());
+        let mut vfs = RootFsVfs::new();
+        vfs.set_overlay(Box::new(first));
+        assert!(Arc::ptr_eq(&vfs.dentry_cache.coherence, &first_cohort));
+        let old = vfs.set_overlay(Box::new(second));
+        assert!(Arc::ptr_eq(&vfs.dentry_cache.coherence, &second_cohort));
+        let before = second_cohort.current_generation();
+        old.make_dir("/old-only").unwrap();
+        assert_eq!(second_cohort.current_generation(), before);
+    }
     #[cfg(target_os = "macos")]
     use crate::fs_backend::HostFsBackend;
     use crate::fs_backend::{BackendError, HostFdOpen, OverlayEntryKind};
