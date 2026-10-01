@@ -1534,10 +1534,22 @@ struct PinnedStage1Arenas {
     structural:
         std::collections::BTreeMap<u64, (std::sync::Arc<StructuralBackingOwner>, CarrierStage2Pin)>,
     relocated_primary: Option<(u64, GlobalFrameOwnerPin)>,
+    /// The instruction-cache authority for executable leaves this edit
+    /// publishes.
+    custody: std::sync::Arc<CarrierVmCustody>,
 }
 unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for PinnedStage1Arenas {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         <&Self as carrick_mmu_core::aarch64::HostArenaResolver>::host_ptr_for_base(&self, base)
+    }
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        <&Self as carrick_mmu_core::aarch64::HostArenaResolver>::publish_user_executable(
+            &self, output, len,
+        )
     }
     fn record_populated_prefix(&self, base: u64, prefix: usize) {
         <&Self as carrick_mmu_core::aarch64::HostArenaResolver>::record_populated_prefix(
@@ -1561,6 +1573,15 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for &PinnedStage1Arenas
         if let Some((owner, _)) = self.structural.get(&base) {
             owner.record_populated_prefix(prefix);
         }
+    }
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        self.custody
+            .publish_user_executable(output, len, |_, _| None, |_, _| None)
+            .map(|_| ())
     }
 }
 impl MmAccessState {
@@ -1659,6 +1680,7 @@ impl MmAccessState {
         Ok(PinnedStage1Arenas {
             structural,
             relocated_primary,
+            custody: std::sync::Arc::clone(custody),
         })
     }
 }

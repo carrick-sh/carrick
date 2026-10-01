@@ -272,6 +272,23 @@ impl GuestVmBackend for KvmAarch64Vmm {
 }
 
 impl Aarch64Vmm for KvmAarch64Vmm {
+    /// KVM keeps no per-frame cleanliness: every executable publication
+    /// invalidates its frame.
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        let size = usize::try_from(len)
+            .map_err(|_| carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
+        let host = self.ram.host_ptr(output, size).ok_or(
+            carrick_mmu_core::aarch64::PageTableError::UnresolvedArena(output),
+        )?;
+        // SAFETY: `host_ptr` proved the range is a live guest RAM window.
+        unsafe { crate::kvm::invalidate_icache_host_range(host, size) };
+        Ok(())
+    }
+
     type AnonymousDiscard = ();
     type Vcpu = KvmVcpu;
     type KickHandle = KvmKickHandle;

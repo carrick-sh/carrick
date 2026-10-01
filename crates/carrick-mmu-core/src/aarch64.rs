@@ -543,6 +543,7 @@ unsafe fn live_primary_descriptor(
     Ok(unsafe { words.add(offset / core::mem::size_of::<u64>()) })
 }
 
+#[cfg(test)]
 unsafe fn existing_l3_descriptor(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
@@ -655,6 +656,7 @@ unsafe fn existing_terminal_descriptor(
 /// `words` must be an aligned, writable, hardware-visible array of atomic
 /// descriptor words covering `byte_len`. `physical_base` must name that same
 /// primary page-table arena in every live table descriptor reachable here.
+#[cfg(test)]
 pub unsafe fn publish_existing_invalid_private_pages(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
@@ -1674,11 +1676,52 @@ pub unsafe trait HostArenaResolver {
     /// occupant wrote during its lifetime are guaranteed to be zero-filled before
     /// the slot is handed to the next occupant.
     fn record_populated_prefix(&self, _base: u64, _prefix: usize) {}
+
+    /// Called by [`PageTableManager::sync_to_host`] immediately BEFORE it
+    /// stores a descriptor that makes `[output, output + len)` executable at
+    /// EL0 where the word it replaces did not (invalid, kernel-only, UXN, or a
+    /// different output). This is the single host-lane point every
+    /// user-executable leaf crosses on its way to hardware, so it is where
+    /// the frame's instruction cache is made coherent with its contents, as
+    /// arm64 Linux does in `set_pte_at` (`__sync_icache_dcache`): the frame
+    /// may have held other code in an earlier life, and a guest that writes
+    /// instructions into a fresh executable page owes no cache maintenance
+    /// of its own. Required, with no default, so no resolver can skip it.
+    /// An error aborts the publication before the descriptor is stored.
+    fn publish_user_executable(&self, output: u64, len: u64) -> Result<(), PageTableError>;
+}
+
+/// The output page a terminal descriptor makes executable at EL0, if any: a
+/// valid, EL0-accessible (AP[1]) L3 page (`0b11` in a non-table word) with
+/// UXN clear. Blocks are deliberately not announced: the only EL0-executable
+/// blocks are the boot image's static identity aperture, which every MM image
+/// carries unchanged and the EL0 entry trampoline's `ic ialluis` makes
+/// coherent; frames a process can recycle are always published page by page.
+pub fn user_executable_output(descriptor: u64) -> Option<(u64, u64)> {
+    (descriptor & VALID != 0
+        && descriptor & TYPE_BITS == TYPE_TABLE_OR_PAGE
+        && descriptor & AP_EL0_ACCESS != 0
+        && descriptor & UXN == 0)
+        .then_some((descriptor & PA_MASK_4KIB, PT_PAGE))
+}
+
+/// Whether storing `new` over the live word `old` newly makes an output range
+/// executable at EL0, and which: an unchanged executable output (a permission
+/// or attribute change on the same frame) publishes nothing new.
+pub fn newly_user_executable(old: u64, new: u64) -> Option<(u64, u64)> {
+    let published = user_executable_output(new)?;
+    (user_executable_output(old) != Some(published)).then_some(published)
 }
 
 unsafe impl HostArenaResolver for (u64, *mut u8) {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         (self.0 == base).then_some(self.1)
+    }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
     }
 }
 
@@ -1690,11 +1733,23 @@ unsafe impl HostArenaResolver for (u64, *const u8) {
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         (self.0 == base).then_some(self.1)
     }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
+    }
 }
 
 unsafe impl<const N: usize> HostArenaResolver for [(u64, *mut u8); N] {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
     }
 }
 
@@ -1702,11 +1757,23 @@ unsafe impl<const N: usize> HostArenaResolver for &[(u64, *mut u8); N] {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
+    }
 }
 
 unsafe impl HostArenaResolver for &[(u64, *mut u8)] {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
     }
 }
 
@@ -1718,6 +1785,12 @@ unsafe impl<const N: usize> HostArenaResolver for [(u64, *const u8); N] {
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
+    }
 }
 
 unsafe impl<const N: usize> HostArenaResolver for &[(u64, *const u8); N] {
@@ -1728,6 +1801,12 @@ unsafe impl<const N: usize> HostArenaResolver for &[(u64, *const u8); N] {
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
+    }
 }
 
 unsafe impl HostArenaResolver for &[(u64, *const u8)] {
@@ -1737,6 +1816,12 @@ unsafe impl HostArenaResolver for &[(u64, *const u8)] {
 
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
     }
 }
 
@@ -1754,6 +1839,12 @@ where
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         (self.0)(base)
     }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
+    }
 }
 
 unsafe impl<F> HostArenaResolver for &ConstFnResolver<F>
@@ -1766,6 +1857,12 @@ where
 
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         (self.0)(base)
+    }
+
+    /// A page-table-only resolver knows no guest frame to make coherent:
+    /// refusing keeps executable publication on a frame-aware resolver.
+    fn publish_user_executable(&self, output: u64, _len: u64) -> Result<(), PageTableError> {
+        Err(PageTableError::UnresolvedArena(output))
     }
 }
 
@@ -1797,6 +1894,10 @@ unsafe impl HostArenaResolver for Arc<dyn HostArenaResolver + Send + Sync> {
     fn record_populated_prefix(&self, base: u64, prefix: usize) {
         (**self).record_populated_prefix(base, prefix);
     }
+
+    fn publish_user_executable(&self, output: u64, len: u64) -> Result<(), PageTableError> {
+        (**self).publish_user_executable(output, len)
+    }
 }
 
 unsafe impl HostArenaResolver for &Arc<dyn HostArenaResolver + Send + Sync> {
@@ -1818,6 +1919,10 @@ unsafe impl HostArenaResolver for &Arc<dyn HostArenaResolver + Send + Sync> {
 
     fn record_populated_prefix(&self, base: u64, prefix: usize) {
         (***self).record_populated_prefix(base, prefix);
+    }
+
+    fn publish_user_executable(&self, output: u64, len: u64) -> Result<(), PageTableError> {
+        (***self).publish_user_executable(output, len)
     }
 }
 
@@ -3638,6 +3743,12 @@ impl PageTableManager {
             let host = hosts[loc.arena].ok_or(PageTableError::UnresolvedArena(arena.base))?;
             unsafe {
                 let slot = host.add(loc.offset) as *mut AtomicU64;
+                if !is_ptr
+                    && let Some((output, len)) =
+                        newly_user_executable((*slot).load(Ordering::SeqCst), v)
+                {
+                    resolver.publish_user_executable(output, len)?;
+                }
                 (*slot).store(v, Ordering::SeqCst);
             }
             Ok(())
@@ -4150,6 +4261,24 @@ impl PageTableManager {
             match arena.storage {
                 TableArenaStorage::Owned(ref bytes) => {
                     let copy_len = prefix_len.min(bytes.len());
+                    // The whole image reaches hardware here, so every word
+                    // that newly makes an output EL0-executable crosses the
+                    // same instruction-cache authority as `sync_to_host`.
+                    // Table words never carry AP[1], so they are never
+                    // mistaken for an executable page.
+                    for offset in (0..copy_len / 8).map(|word| word * 8) {
+                        let mut new = [0u8; 8];
+                        new.copy_from_slice(&bytes[offset..offset + 8]);
+                        let new = u64::from_le_bytes(new);
+                        if user_executable_output(new).is_none() {
+                            continue;
+                        }
+                        let old =
+                            unsafe { core::ptr::read_volatile(host.add(offset).cast::<u64>()) };
+                        if let Some((output, len)) = newly_user_executable(old, new) {
+                            resolver.publish_user_executable(output, len)?;
+                        }
+                    }
                     unsafe {
                         core::ptr::copy_nonoverlapping(bytes.as_ptr(), host, copy_len);
                     }
@@ -6135,6 +6264,22 @@ impl PageTableManager {
 mod tests {
     #![allow(clippy::panic)]
     use super::*;
+
+    /// Page-table arenas for a VM-free test whose images carry executable
+    /// leaves: a raw `(base, host)` set refuses executable publication in
+    /// production, so a test that publishes them says so explicitly.
+    struct TestArenas<'a>(&'a [(u64, *mut u8)]);
+
+    unsafe impl HostArenaResolver for TestArenas<'_> {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            self.0.iter().find_map(|&(b, p)| (b == base).then_some(p))
+        }
+
+        fn publish_user_executable(&self, _output: u64, _len: u64) -> Result<(), PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
+        }
+    }
     use alloc::boxed::Box;
     use alloc::vec;
     use carrick_mem::memory::{
@@ -6159,6 +6304,14 @@ mod tests {
                 assert!(len <= self.words.len() * 8);
                 (self.calls.fetch_add(1, Ordering::SeqCst) == 0)
                     .then_some(self.words.as_ptr().cast_mut().cast())
+            }
+            fn publish_user_executable(
+                &self,
+                _output: u64,
+                _len: u64,
+            ) -> Result<(), PageTableError> {
+                // VM-free test backing: no instruction cache to maintain.
+                Ok(())
             }
         }
         #[test]
@@ -6195,6 +6348,14 @@ mod tests {
                 assert!(len <= self.words.len() * 8);
                 (self.calls.fetch_add(1, Ordering::SeqCst) < self.allowed.load(Ordering::SeqCst))
                     .then_some(self.words.as_ptr().cast_mut().cast())
+            }
+            fn publish_user_executable(
+                &self,
+                _output: u64,
+                _len: u64,
+            ) -> Result<(), PageTableError> {
+                // VM-free test backing: no instruction cache to maintain.
+                Ok(())
             }
         }
         #[test]
@@ -7209,6 +7370,217 @@ mod tests {
         mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize, None)
             .expect("reserve sparse arena");
         mgr
+    }
+
+    /// Live host backing for one manager plus a log of every executable
+    /// publication its stores announced, with the live leaf word observed at
+    /// the moment of each announcement.
+    struct ExecLog {
+        base: u64,
+        host: Vec<u8>,
+        va: u64,
+        calls: std::cell::RefCell<Vec<(u64, u64, u64)>>,
+        refuse: bool,
+    }
+
+    unsafe impl HostArenaResolver for &ExecLog {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            (base == self.base).then_some(self.host.as_ptr().cast_mut())
+        }
+
+        fn publish_user_executable(&self, output: u64, len: u64) -> Result<(), PageTableError> {
+            // The live leaf at `va` as the hardware would see it right now.
+            let walk = unsafe {
+                walk_descriptors_host(self.host.as_ptr(), self.host.len(), self.base, self.va)
+            };
+            self.calls.borrow_mut().push((output, len, walk[3]));
+            if self.refuse {
+                return Err(PageTableError::UnresolvedArena(output));
+            }
+            Ok(())
+        }
+    }
+
+    fn exec_log(mgr: &PageTableManager, va: u64) -> ExecLog {
+        let mut log = ExecLog {
+            base: mgr.base(),
+            host: vec![0; LINUX_PAGE_TABLES_SIZE as usize],
+            va,
+            calls: std::cell::RefCell::new(Vec::new()),
+            refuse: false,
+        };
+        let host = log.host.as_mut_ptr();
+        unsafe { mgr.restore_quiesced_snapshot_to_host(TestArenas(&[(mgr.base(), host)])) }
+            .expect("seed live backing");
+        log
+    }
+
+    /// Work budget of the instruction-cache funnel: a data-only publication
+    /// announces nothing; making a page EL0-executable announces exactly its
+    /// output once, BEFORE the live store; a permission change that keeps
+    /// the executable output announces nothing; adding EXEC to a resident
+    /// data page (mprotect) and moving the leaf to a new frame each announce
+    /// once.
+    #[test]
+    fn executable_publication_is_announced_once_before_the_store() {
+        let mut mgr = hvpatch_manager();
+        let va = LINUX_MMAP_BASE + 0x40_0000;
+        let log = exec_log(&mgr, va);
+        let sync = |mgr: &mut PageTableManager| unsafe { mgr.sync_to_host(&log) }.expect("sync");
+
+        mgr.set_rw(va, 0x1000, false, None).unwrap();
+        sync(&mut mgr);
+        assert!(log.calls.borrow().is_empty(), "data-only page announced");
+
+        mgr.set_rw(va, 0x1000, true, None).unwrap();
+        sync(&mut mgr);
+        let output = mgr.translate(va).unwrap();
+        {
+            let calls = log.calls.borrow();
+            assert_eq!(calls.len(), 1, "{calls:x?}");
+            assert_eq!((calls[0].0, calls[0].1), (output, 0x1000));
+            assert_ne!(
+                calls[0].2 & UXN,
+                0,
+                "announced after the executable leaf was already live"
+            );
+        }
+
+        mgr.set_readonly(va, 0x1000, true, None).unwrap();
+        sync(&mut mgr);
+        mgr.set_rw(va, 0x1000, true, None).unwrap();
+        sync(&mut mgr);
+        assert_eq!(
+            log.calls.borrow().len(),
+            1,
+            "same executable output re-announced"
+        );
+
+        mgr.set_readonly(va, 0x1000, false, None).unwrap();
+        sync(&mut mgr);
+        mgr.set_rw(va, 0x1000, true, None).unwrap();
+        sync(&mut mgr);
+        assert_eq!(log.calls.borrow().len(), 2, "mprotect adding EXEC");
+
+        mgr.repoint_preserving_attributes(va, output + 0x10_0000, 0x1000, None)
+            .unwrap();
+        sync(&mut mgr);
+        let calls = log.calls.borrow();
+        assert_eq!(calls.len(), 3, "a new frame under an executable leaf");
+        assert_eq!(calls[2].0, output + 0x10_0000);
+    }
+
+    /// Blocks are never announced: the static identity aperture that every
+    /// image carries would otherwise cost an invalidation of up to 1 GiB per
+    /// fork or exec. Only an L3 page is an executable publication.
+    #[test]
+    fn executable_blocks_are_not_announced_pages_are() {
+        const BLOCK: u64 = (1 << 10) | (0b01 << 6) | 0b01;
+        assert_eq!(user_executable_output(0x4000_0000 | BLOCK), None);
+        assert_eq!(user_executable_output(0x4020_0000 | BLOCK), None);
+        assert_eq!(
+            user_executable_output(0x4020_1000 | BLOCK | 0b10),
+            Some((0x4020_1000, 0x1000))
+        );
+        assert_eq!(
+            user_executable_output(0x4020_1000 | BLOCK | 0b10 | UXN),
+            None
+        );
+        assert_eq!(
+            user_executable_output((0x4020_1000 | BLOCK | 0b10) & !AP_EL0_ACCESS),
+            None,
+            "a kernel-only page"
+        );
+    }
+
+    /// A refused announcement refuses the publication: the executable leaf
+    /// never reaches the live backing.
+    #[test]
+    fn a_refused_executable_publication_stores_nothing() {
+        let mut mgr = hvpatch_manager();
+        let va = LINUX_MMAP_BASE + 0x40_0000;
+        let mut log = exec_log(&mgr, va);
+        log.refuse = true;
+        mgr.set_rw(va, 0x1000, true, None).unwrap();
+        assert!(unsafe { mgr.sync_to_host(&log) }.is_err());
+        let live =
+            unsafe { walk_descriptors_host(log.host.as_ptr(), log.host.len(), log.base, va) };
+        assert_eq!(
+            live[3] & VALID,
+            0,
+            "refused executable leaf reached hardware"
+        );
+    }
+
+    /// A whole-image publication (fork child, exec, rollback) announces each
+    /// newly executable output once, and none when the live words already
+    /// hold the same image.
+    #[test]
+    fn whole_image_publication_announces_new_executable_outputs_once() {
+        let mut mgr = hvpatch_manager();
+        let va = LINUX_MMAP_BASE + 0x40_0000;
+        let log = exec_log(&mgr, va);
+        let before = log.calls.borrow().len();
+        mgr.set_rw(va, 0x3000, true, None).unwrap();
+        mgr.set_rw(va + 0x3000, 0x1000, false, None).unwrap();
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&log) }.unwrap();
+        assert_eq!(
+            log.calls.borrow().len() - before,
+            3,
+            "three executable pages"
+        );
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&log) }.unwrap();
+        assert_eq!(
+            log.calls.borrow().len() - before,
+            3,
+            "an identical image re-announced"
+        );
+    }
+
+    /// Source audit: every function that stores a descriptor into live host
+    /// backing is one the instruction-cache funnel covers or one that cannot
+    /// newly make a page executable. A new live-store path must be added here
+    /// with its reason, after it calls `publish_user_executable`.
+    #[test]
+    fn every_live_descriptor_store_is_covered_by_the_executable_funnel() {
+        let source = include_str!("aarch64.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        // (function, why it is covered)
+        let allowed = [
+            ("sync_to_host", "announces before each store"),
+            (
+                "restore_quiesced_snapshot_to_host",
+                "announces before the copy",
+            ),
+            ("rollback_undo", "restores words that were already live"),
+            (
+                "arm_existing_el1_fork_pages",
+                "write-protects only; output and UXN kept",
+            ),
+            ("publish_existing_invalid_private_pages", "test-only"),
+        ];
+        let mut function = "";
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub unsafe fn ")
+                .or_else(|| trimmed.strip_prefix("pub fn "))
+                .or_else(|| trimmed.strip_prefix("unsafe fn "))
+                .or_else(|| trimmed.strip_prefix("fn "))
+                .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                .or_else(|| trimmed.strip_prefix("pub(crate) unsafe fn "))
+            {
+                function = rest.split(['(', '<']).next().unwrap_or("");
+            }
+            let stores_live = (trimmed.contains(").store(") && !trimmed.starts_with("//"))
+                || trimmed.contains("copy_nonoverlapping(bytes.as_ptr(), host");
+            if stores_live {
+                assert!(
+                    allowed.iter().any(|(name, _)| *name == function),
+                    "`{function}` stores live descriptors outside the executable funnel: {trimmed}"
+                );
+            }
+        }
     }
 
     fn exhaust_spare_pool(mgr: &mut PageTableManager, keep_out: u64) {
@@ -8657,7 +9029,10 @@ mod tests {
 
         unsafe {
             snapshot
-                .restore_quiesced_snapshot_to_host((snapshot.base(), live.as_mut_ptr()))
+                .restore_quiesced_snapshot_to_host(TestArenas(&[(
+                    snapshot.base(),
+                    live.as_mut_ptr(),
+                )]))
                 .unwrap()
         };
 
@@ -9147,6 +9522,14 @@ mod tests {
                 self.calls.set(self.calls.get() + 1);
                 Some(self.ptr)
             }
+            fn publish_user_executable(
+                &self,
+                _output: u64,
+                _len: u64,
+            ) -> Result<(), PageTableError> {
+                // VM-free test backing: no instruction cache to maintain.
+                Ok(())
+            }
         }
         unsafe {
             mgr.sync_to_host(CountingResolver { calls: &calls, ptr })
@@ -9376,7 +9759,7 @@ mod tests {
             (ext_base.0, host_arena1.as_mut_ptr()),
         ];
         unsafe {
-            mgr.restore_quiesced_snapshot_to_host(&full_resolver[..])
+            mgr.restore_quiesced_snapshot_to_host(TestArenas(&full_resolver[..]))
                 .unwrap();
         };
 
@@ -9614,6 +9997,10 @@ mod tests {
         fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
             self.populated.lock().unwrap().insert(base, prefix_len);
         }
+        fn publish_user_executable(&self, _output: u64, _len: u64) -> Result<(), PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
+        }
     }
 
     unsafe impl HostArenaResolver for &MockLiveResolver {
@@ -9635,6 +10022,10 @@ mod tests {
 
         fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
             (*self).record_populated_prefix(base, prefix_len);
+        }
+        fn publish_user_executable(&self, _output: u64, _len: u64) -> Result<(), PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
         }
     }
 
@@ -10068,7 +10459,7 @@ mod tests {
             (mgr.base(), host_arena0.as_mut_ptr()),
             (ext_base.0, host_arena1.as_mut_ptr()),
         ];
-        assert!(unsafe { mgr.restore_quiesced_snapshot_to_host(&full[..]) }.is_ok());
+        assert!(unsafe { mgr.restore_quiesced_snapshot_to_host(TestArenas(&full[..])) }.is_ok());
     }
 
     #[test]

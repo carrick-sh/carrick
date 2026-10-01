@@ -5691,6 +5691,10 @@ mod real {
         /// 7 mapping permission), and the original error or refusal context.
         /// Emitted before signal-frame callers lower the error to SIGSEGV.
         fn guest__internal__write__fault(_: u64, _: u64, _: u32, _: &str) {}
+        /// One EL0-executable publication through the instruction-cache
+        /// authority: guest-physical output, bytes, and how many
+        /// invalidations it issued (0 when every page was already clean).
+        fn hvpatch__exec__publication(_: u64, _: u64, _: u32) {}
         /// Fires inside rt_sigreturn/restore. `saved_pc` is the PC about to be
         /// restored into ELR_EL1, `sp` the SP_EL0 the frame was read from,
         /// `magic` the frame magic read back. A corrupted `saved_pc` or `magic`
@@ -7797,6 +7801,10 @@ mod real {
         carrick_usdt::guest__internal__write__fault!(|| (address, length, phase, error));
     }
 
+    pub fn hvpatch_exec_publication(output: u64, len: u64, invalidations: u32) {
+        carrick_usdt::hvpatch__exec__publication!(|| (output, len, invalidations));
+    }
+
     pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
         carrick_usdt::signal__restore!(|| (saved_pc, sp, magic));
     }
@@ -8928,6 +8936,7 @@ mod stub {
     stub!(fork_post(pid: i32, pc: u64, elr: u64));
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(guest_internal_write_fault(address: u64, length: u64, phase: u32, error: &str));
+    stub!(hvpatch_exec_publication(output: u64, len: u64, invalidations: u32));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
     stub!(kick_in_kernel(pc: u64, el: u32));
     stub!(vcpu_kick(vcpu: u64, valid: i32, rc: i32));

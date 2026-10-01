@@ -1082,6 +1082,11 @@ pub(crate) struct GlobalFrameSharedMapping {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GlobalFrameSharedMapping {
+    /// The host address of this backing's first byte.
+    pub(crate) fn host_base(&self) -> *mut u8 {
+        self.backing.as_ptr()
+    }
+
     pub(crate) fn begin_content_write(
         self: &std::sync::Arc<Self>,
         offset: usize,

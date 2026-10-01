@@ -1550,6 +1550,24 @@ impl HvfVmState {
             published.alias.physical_ipa,
             published.alias.physical_size as u64,
         );
+        // EL1 publishes a grant's leaves itself (guest lane), and commits
+        // its prepared pages on first touch on either lane, without this
+        // host ever storing the executable descriptor. A leaf can become
+        // EL0-executable at EL1 only when the grant carries PROT_EXEC
+        // (`SW_EL1_MAY_EXEC`; EL1 refuses widening), so a grant that may
+        // execute makes its fresh frame coherent here, through the same
+        // authority as every host-stored executable leaf.
+        if request.permissions & carrick_abi::LINUX_PROT_EXEC != 0 {
+            self.publish_user_executable(physical_grant.0, physical_grant.1)
+                .unwrap_or_else(|error| {
+                    carrick_fatal!(
+                        "hvpatch::el1_frame_grant",
+                        "executable EL1 frame grant could not make its frame coherent: ipa=0x{:x} len=0x{:x} error={error:?}",
+                        physical_grant.0,
+                        physical_grant.1,
+                    );
+                });
+        }
         self.mappings.insert(published.region);
         transition.commit();
         mark_el1_frame_grant_in(self.custody(), physical_grant.0, physical_grant.1, request.mm_key, published.ready.owner_generation).unwrap_or_else(
@@ -7129,6 +7147,32 @@ impl HvfTaskState {
         None
     }
 
+    /// The instruction-cache authority for one EL0-executable publication of
+    /// `[output, output + len)` through this MM's tables (see
+    /// `HostArenaResolver::publish_user_executable`), falling back to this
+    /// MM's mapping rows for an output no carrier backing owns.
+    pub(crate) fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        let structural = self.mm_access.structural_owners.read();
+        self.custody()
+            .publish_user_executable(
+                output,
+                len,
+                |ipa, size| {
+                    let (&(base, extent), owner) =
+                        structural.range(..=(ipa, usize::MAX)).next_back()?;
+                    let offset = usize::try_from(ipa.checked_sub(base)?).ok()?;
+                    (offset.checked_add(size)? <= extent)
+                        .then(|| unsafe { owner.ptr().add(offset) })
+                },
+                |ipa, size| self.host_ptr_for_ipa(ipa, size),
+            )
+            .map(|_| ())
+    }
+
     pub(crate) fn host_ptr_for_ipa(&self, ipa: u64, len: usize) -> Option<*mut u8> {
         let mapping = HvfVmState::mapping_for_ipa_range(&self.mappings, ipa, len.max(1))?;
         let offset = usize::try_from(ipa.saturating_sub(mapping.ipa)).ok()?;
@@ -7978,3 +8022,13 @@ pub(crate) struct FrameCowTrigger {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Invalidate the instruction cache for `[host, host + len)` (IC IVAU over
+/// the host mapping of guest frames; the cache is physically tagged, so
+/// this reaches every vCPU's view of those physical pages).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn invalidate_instruction_cache(host: *mut u8, len: u64) {
+    // SAFETY: `host` maps `len` bytes of live guest backing pinned by the
+    // caller's page-table edit authority.
+    unsafe { carrick_aarch64::icache::invalidate_host_range(host, len as usize) };
+}

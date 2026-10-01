@@ -30,6 +30,7 @@ pub mod engine;
 pub mod esr;
 #[cfg(test)]
 mod guest_alias_writer_tests;
+pub mod icache;
 pub mod mailbox;
 pub mod owed_kick;
 pub mod stage1_authority;

@@ -1985,6 +1985,14 @@ fn hvpatch_discard_admits(persistent: bool, va: u64, len: usize) -> bool {
 }
 
 impl Aarch64Vmm for HvfAarch64Vmm {
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        self.state.publish_user_executable(output, len)
+    }
+
     type AnonymousDiscard = HvfAnonymousDiscard;
 
     fn frame_cow_authority(&self) -> Option<Arc<dyn carrick_hal::FrameCowAuthority>> {

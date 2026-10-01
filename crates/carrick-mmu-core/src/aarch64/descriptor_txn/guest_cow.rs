@@ -24,8 +24,8 @@
 
 use super::{
     AP_MASK, AP_RW, DescriptorRefusal, LeafAccess, LiveDescriptorWords, PA_MASK_4KIB, PT_PAGE,
-    SW_EL1_MAY_WRITE, SW_EL1_PRIVATE, SubstrateGpa, TYPE_BITS, TYPE_TABLE_OR_PAGE, VALID, el1_cow,
-    terminal_descriptor_permits_el0,
+    SW_EL1_MAY_WRITE, SW_EL1_PRIVATE, SubstrateGpa, TYPE_BITS, TYPE_TABLE_OR_PAGE, UXN, VALID,
+    el1_cow, terminal_descriptor_permits_el0,
 };
 
 /// Bytes of the host COW compound a run stays inside.
@@ -77,6 +77,11 @@ pub enum GuestCowNotArmed {
     /// COW-armed and private, but Linux never granted write (a real
     /// protection fault).
     NoWriteIntent,
+    /// An EL0-executable page. Its copy lands on a fresh frame whose
+    /// instruction cache must be made coherent before the leaf executes,
+    /// which is the host's single executable-publication authority
+    /// (`HostArenaResolver::publish_user_executable`), not EL1's.
+    Executable,
 }
 
 /// The L3 leaf mapping `va`, or `None` when a level above is not a table
@@ -142,6 +147,9 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     if !is_guest_cow_write_leaf(3, leaf) {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed));
     }
+    if leaf & UXN == 0 {
+        return Err(GuestCowClass::NotArmed(GuestCowNotArmed::Executable));
+    }
     let output = leaf & PA_MASK_4KIB;
     let compound = output & !(GUEST_COW_COMPOUND - 1);
     let lane = (output - compound) / PT_PAGE;
@@ -161,7 +169,9 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
         Ok(l3_leaf(words, root, va)
             .map_err(GuestCowClass::Unreachable)?
             .is_some_and(|neighbour| {
-                armed_page(neighbour) && neighbour & PA_MASK_4KIB == compound + index * PT_PAGE
+                armed_page(neighbour)
+                    && neighbour & UXN != 0
+                    && neighbour & PA_MASK_4KIB == compound + index * PT_PAGE
             }))
     };
     let mut first = lane;
@@ -233,8 +243,33 @@ mod tests {
     const PRIVATE: u64 = 1 << 56;
     const MAY_WRITE: u64 = 1 << 57;
 
+    const NX: u64 = 1 << 54;
+
+    /// An armed private DATA page (UXN set, as every non-exec leaf is).
     fn armed(ipa: u64, may_write: bool) -> u64 {
-        ipa | 3 | AF | AP_RO_EL0 | NG | COW | PRIVATE | if may_write { MAY_WRITE } else { 0 }
+        ipa | 3 | AF | AP_RO_EL0 | NG | NX | COW | PRIVATE | if may_write { MAY_WRITE } else { 0 }
+    }
+
+    /// An EL0-executable armed page is the host's: its copy's fresh frame
+    /// needs instruction-cache maintenance before it executes. A data page
+    /// beside one is moved alone, never with the executable neighbour.
+    #[test]
+    fn an_executable_armed_page_is_forwarded_and_never_joins_a_run() {
+        let words = Words::new();
+        words.leaf_at(VA, armed(OLD, true) & !NX);
+        assert_eq!(
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::Executable))
+        );
+        words.leaf_at(VA + PT_PAGE, armed(OLD + PT_PAGE, true));
+        assert_eq!(
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + PT_PAGE),
+            Ok(GuestCowRun {
+                va: VA + PT_PAGE,
+                len: PT_PAGE,
+                old_ipa: SubstrateGpa(OLD + PT_PAGE),
+            })
+        );
     }
 
     #[test]

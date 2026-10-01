@@ -11,7 +11,7 @@ use std::{
     ops::{Deref, RangeInclusive},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -131,6 +131,21 @@ pub(crate) struct CodeContent {
     writers: AtomicUsize,
     observed: AtomicBool,
     registry: OnceLock<Arc<Registry>>,
+    /// One bit per 4 KiB page: the instruction cache may still hold lines of
+    /// this physical page from before its current contents (Linux's
+    /// `!PG_dcache_clean`). Every page starts dirty, because this backing is
+    /// a new incarnation of host memory whose physical pages may have held
+    /// any code, and a host write admission dirties what it writes. Only the
+    /// first publication of the page as EL0-executable consults and clears
+    /// it ([`Self::take_icache_dirty`]); data-only pages are never cleaned.
+    icache_dirty: Box<[AtomicU64]>,
+}
+
+/// Bits `[first, last]` of the 64-bit word `index` (page numbers).
+fn page_word_mask(index: usize, first: usize, last: usize) -> u64 {
+    let low = first.max(index * 64) - index * 64;
+    let high = last.min(index * 64 + 63) - index * 64;
+    (u64::MAX >> (63 - high)) & (u64::MAX << low)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -143,12 +158,47 @@ pub(crate) enum ContentError {
 
 impl CodeContent {
     pub(crate) fn new(len: usize) -> Self {
+        let pages = len.div_ceil(1 << PAGE_SHIFT);
         Self {
             len,
             writers: AtomicUsize::new(0),
             observed: AtomicBool::new(false),
             registry: OnceLock::new(),
+            icache_dirty: (0..pages.div_ceil(64))
+                .map(|_| AtomicU64::new(u64::MAX))
+                .collect(),
         }
+    }
+
+    /// Record that `[offset, offset + len)` may no longer match the
+    /// instruction cache (a host write admission).
+    pub(crate) fn mark_icache_dirty(&self, offset: usize, len: usize) {
+        let Ok(range) = self.pages(offset, len) else {
+            return;
+        };
+        let (first, last) = (*range.start(), *range.end());
+        for index in first / 64..=last / 64 {
+            self.icache_dirty[index].fetch_or(page_word_mask(index, first, last), Ordering::SeqCst);
+        }
+    }
+
+    /// Claim the pages of `[offset, offset + len)` whose instruction cache
+    /// must be invalidated before they first execute: clears their dirty
+    /// bits and returns whether any was set. The caller invalidates the
+    /// whole range when it returns true (one invalidation per publication,
+    /// whatever the dirty count). Out-of-range is answered dirty, so a
+    /// caller can never skip maintenance on an unproven range.
+    pub(crate) fn take_icache_dirty(&self, offset: usize, len: usize) -> bool {
+        let Ok(range) = self.pages(offset, len) else {
+            return true;
+        };
+        let (first, last) = (*range.start(), *range.end());
+        let mut dirty = false;
+        for index in first / 64..=last / 64 {
+            let mask = page_word_mask(index, first, last);
+            dirty |= self.icache_dirty[index].fetch_and(!mask, Ordering::SeqCst) & mask != 0;
+        }
+        dirty
     }
 
     fn pages(&self, offset: usize, len: usize) -> Result<RangeInclusive<usize>, ContentError> {
@@ -291,6 +341,8 @@ pub(crate) struct ContentWrite<O: Deref<Target = CodeContent>> {
 impl<O: Deref<Target = CodeContent>> ContentWrite<O> {
     pub(crate) fn new(content: O, offset: usize, len: usize) -> Result<Self, ContentError> {
         let range = content.pages(offset, len)?;
+        // A host write changes bytes the instruction cache may hold.
+        content.mark_icache_dirty(offset, len);
         content
             .writers
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
@@ -336,6 +388,38 @@ impl<O: Deref<Target = CodeContent>> Drop for ContentWrite<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new backing incarnation is dirty everywhere (its physical pages may
+    /// have held any code); each page is claimed exactly once.
+    #[test]
+    fn fresh_backing_pages_are_claimed_dirty_exactly_once() {
+        let content = CodeContent::new(130 * 4096);
+        assert!(content.take_icache_dirty(4096, 4096));
+        assert!(
+            !content.take_icache_dirty(4096, 4096),
+            "a clean page re-claimed"
+        );
+        // A range spanning a clean page and dirty ones is still dirty once.
+        assert!(content.take_icache_dirty(0, 3 * 4096));
+        assert!(!content.take_icache_dirty(0, 3 * 4096));
+        // Across a bitmap word boundary.
+        assert!(content.take_icache_dirty(63 * 4096, 2 * 4096));
+        assert!(!content.take_icache_dirty(64 * 4096, 4096));
+        assert!(content.take_icache_dirty(129 * 4096, 4096));
+        // Out of range is answered dirty, never skipped.
+        assert!(content.take_icache_dirty(130 * 4096, 4096));
+    }
+
+    /// A host write admission dirties exactly the pages it writes.
+    #[test]
+    fn a_host_write_dirties_only_its_pages() {
+        let content = CodeContent::new(4 * 4096);
+        assert!(content.take_icache_dirty(0, 4 * 4096));
+        drop(content.begin_write(4096 + 100, 4096).unwrap());
+        assert!(!content.take_icache_dirty(0, 4096));
+        assert!(content.take_icache_dirty(4096, 2 * 4096));
+        assert!(!content.take_icache_dirty(3 * 4096, 4096));
+    }
 
     #[test]
     fn overlapping_writes_prevent_observation_until_both_finish() {

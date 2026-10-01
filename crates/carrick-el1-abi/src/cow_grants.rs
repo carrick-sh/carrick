@@ -80,10 +80,13 @@ pub enum CowDecline {
     /// The copy or the repoint refused (stale leaf, window absent, split
     /// needed); the grant went back to the pool untouched semantically.
     Refused = 7,
+    /// An EL0-executable page: its fresh frame's instruction cache is the
+    /// host's to make coherent, so the host resolves the COW.
+    Executable = 8,
 }
 
 /// Number of [`CowDecline`] reasons.
-pub const COW_DECLINE_REASONS: usize = 8;
+pub const COW_DECLINE_REASONS: usize = 9;
 
 /// One ready grant as EL1 claimed it, or as the host published it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -776,6 +779,6 @@ mod tests {
         pool.note_declined(CowDecline::PoolEmpty);
         pool.note_declined(CowDecline::PoolEmpty);
         pool.note_declined(CowDecline::NotCowArmed);
-        assert_eq!(pool.declined(), [0, 1, 0, 0, 0, 2, 0, 0]);
+        assert_eq!(pool.declined(), [0, 1, 0, 0, 0, 2, 0, 0, 0]);
     }
 }

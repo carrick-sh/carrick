@@ -763,8 +763,17 @@ fn install_mm_sparse(
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables.rebase(root, None).expect("rebase foreign test root");
+    // A private data mapping, as Linux makes one: not executable (an
+    // executable armed page is the host's to COW, never EL1's).
     tables
-        .map_aliased(TEST_VA, data_ipa, data_len as u64, false, None)
+        .map_private_aliased_with_permissions(
+            TEST_VA,
+            data_ipa,
+            data_len as u64,
+            false,
+            false,
+            None,
+        )
         .expect("map foreign test leaf");
 
     // The manager retains only populated bytes; the host owner must still
@@ -3110,7 +3119,10 @@ fn foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity() {
                         .unwrap();
                     unsafe {
                         editor
-                            .sync_to_host((editor.base(), table_owner.as_ptr()))
+                            .sync_to_host(super::TestPageTableArena(
+                                editor.base(),
+                                table_owner.as_ptr(),
+                            ))
                             .unwrap()
                     };
                     Ok::<(), TrapError>(())
@@ -3255,7 +3267,10 @@ fn foreign_cow_prepare_write_rejects_out_of_span_alias() {
                         .expect("map stage-1 alias outside compound span");
                     unsafe {
                         editor
-                            .sync_to_host((editor.base(), table_owner.as_ptr()))
+                            .sync_to_host(super::TestPageTableArena(
+                                editor.base(),
+                                table_owner.as_ptr(),
+                            ))
                             .unwrap()
                     };
                     Ok::<(), TrapError>(())
@@ -5749,7 +5764,10 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         .host_addr;
     unsafe {
         child_page_tables
-            .sync_to_host((child_page_tables.base(), child_page_table_host))
+            .sync_to_host(super::TestPageTableArena(
+                child_page_tables.base(),
+                child_page_table_host,
+            ))
             .unwrap();
     }
     let child_inventory = prepared

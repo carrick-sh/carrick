@@ -511,6 +511,123 @@ pub(crate) struct CarrierVmCustody {
         parking_lot::Mutex<std::collections::HashMap<u64, std::sync::Weak<MmAccessState>>>,
 }
 
+/// Who owns an executable output's bytes, for the instruction-cache
+/// authority.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum ExecutableBacking {
+    /// A backing incarnation with per-page cleanliness: `(mapping, base, len)`.
+    Tracked(
+        std::sync::Arc<super::global_frame::GlobalFrameSharedMapping>,
+        u64,
+        u64,
+    ),
+    /// A stage-2 extent without it: `(host base, base, len)`.
+    Untracked(*mut u8, u64, u64),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierVmCustody {
+    /// The backing that owns physical `ipa`: a global frame or a structural
+    /// backing (tracked: its `CodeContent` carries per-page instruction-cache
+    /// state), else any other carrier stage-2 extent (untracked).
+    fn backing_for_ipa(&self, ipa: u64) -> Option<ExecutableBacking> {
+        {
+            let owners = self.global_frame_host_owners.lock();
+            if let Some((&(base, len), entry)) = owners.range(..=(ipa, u64::MAX)).next_back()
+                && ipa < base.saturating_add(len)
+            {
+                return Some(ExecutableBacking::Tracked(
+                    std::sync::Arc::clone(&entry.owner().mapping),
+                    base,
+                    len,
+                ));
+            }
+        }
+        let (base, len, record) = {
+            let records = self.carrier_stage2_records.lock();
+            let (&(base, len), identity) = records.range(..=(ipa, u64::MAX)).next_back()?;
+            (ipa < base.saturating_add(len)).then_some((base, len, identity.record_id))?
+        };
+        if let Some(entry) = self.structural_backings.lock().get(&record) {
+            return Some(ExecutableBacking::Tracked(
+                std::sync::Arc::clone(&entry.mapping),
+                base,
+                len,
+            ));
+        }
+        // A stage-2 extent with no content owner (boot identity, fixed
+        // apertures): its host address is known, its cleanliness is not.
+        let host = self.stage2_record_snapshot(record)?.host_addr;
+        Some(ExecutableBacking::Untracked(host as *mut u8, base, len))
+    }
+
+    /// The instruction-cache authority behind every EL0-executable
+    /// publication (`HostArenaResolver::publish_user_executable`): for each
+    /// backing page of `[output, output + len)`, the first publication after
+    /// its incarnation or a host write invalidates it by host address; a
+    /// clean page costs nothing. A carrier stage-2 extent with no content
+    /// owner is invalidated every time; an output with no stage-2 record is
+    /// resolved through `structural` then `rows` (the caller's MM-local
+    /// lookups) and invalidated every time, and one nothing resolves has no
+    /// backing to fetch from, so it needs none. Returns the number of
+    /// invalidations issued (the work budget tests read it).
+    pub(crate) fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+        structural: impl Fn(u64, usize) -> Option<*mut u8>,
+        rows: impl Fn(u64, usize) -> Option<*mut u8>,
+    ) -> Result<usize, carrick_mmu_core::aarch64::PageTableError> {
+        use carrick_mmu_core::aarch64::PageTableError;
+        let end = output.checked_add(len).ok_or(PageTableError::BadAddress)?;
+        let mut cursor = output;
+        let mut invalidations = 0;
+        while cursor < end {
+            let (host, chunk, dirty) = match self.backing_for_ipa(cursor) {
+                Some(ExecutableBacking::Untracked(host, base, extent)) => {
+                    let chunk = end.min(base.saturating_add(extent)) - cursor;
+                    let offset =
+                        usize::try_from(cursor - base).map_err(|_| PageTableError::BadAddress)?;
+                    (unsafe { host.add(offset) }, chunk, true)
+                }
+                Some(ExecutableBacking::Tracked(mapping, base, extent)) => {
+                    let chunk = end.min(base.saturating_add(extent)) - cursor;
+                    let offset =
+                        usize::try_from(cursor - base).map_err(|_| PageTableError::BadAddress)?;
+                    let size = usize::try_from(chunk).map_err(|_| PageTableError::BadAddress)?;
+                    let dirty = mapping.code_content.take_icache_dirty(offset, size);
+                    (unsafe { mapping.host_base().add(offset) }, chunk, dirty)
+                }
+                None => {
+                    let chunk = (end - cursor).min(4096 - (cursor & 0xfff));
+                    let size = usize::try_from(chunk).map_err(|_| PageTableError::BadAddress)?;
+                    match structural(cursor, size).or_else(|| rows(cursor, size)) {
+                        Some(host) => (host, chunk, true),
+                        // No stage-2 record and no mapping row: no memory
+                        // backs this output, so no fetch can hit it and no
+                        // line of it can be cached.
+                        None => {
+                            cursor += chunk;
+                            continue;
+                        }
+                    }
+                }
+            };
+            if dirty {
+                super::cow_engine::invalidate_instruction_cache(host, chunk);
+                invalidations += 1;
+            }
+            cursor += chunk;
+        }
+        carrick_observability::probes::hvpatch_exec_publication(
+            output,
+            len,
+            u32::try_from(invalidations).unwrap_or(u32::MAX),
+        );
+        Ok(invalidations)
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Debug, Default)]
 pub(crate) enum CarrierFramePoolState {
@@ -1605,6 +1722,77 @@ mod carrier_vm_custody_tests {
         CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, create_vm_with_custody_using,
         destroy_vm_with_custody_using,
     };
+
+    /// Work budget of the instruction-cache authority: an executable
+    /// publication over a fresh frame invalidates once, re-publication of the
+    /// clean frame costs nothing, a host write makes it cost one again, an
+    /// output no backing owns is invalidated every time through the caller's
+    /// fallback, and an output nothing backs needs no maintenance.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn executable_publication_invalidates_a_frame_once_per_incarnation() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = CarrierVmCustody::new();
+        let ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x51_0000;
+        let len = 0x8000_u64;
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("test frame backing");
+        let generation = super::super::global_frame::next_global_frame_owner_generation();
+        let owner = std::sync::Arc::new(super::super::global_frame::GlobalFrameHostOwner::new(
+            super::super::global_frame::GlobalFrameStage2Lease::fixed(ipa, len),
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            generation,
+            ipa,
+            len,
+        ));
+        custody.global_frame_host_owners.lock().insert(
+            (ipa, len),
+            super::super::global_frame::GlobalFrameOwnerEntry::Live(std::sync::Arc::clone(&owner)),
+        );
+        let none = |_: u64, _: usize| -> Option<*mut u8> { None };
+        let publish = |output, size| custody.publish_user_executable(output, size, none, none);
+
+        assert_eq!(publish(ipa + 0x1000, 0x1000), Ok(1), "fresh frame");
+        assert_eq!(
+            publish(ipa + 0x1000, 0x1000),
+            Ok(0),
+            "clean frame re-published"
+        );
+        assert_eq!(
+            publish(ipa + 0x2000, 0x1000),
+            Ok(1),
+            "its neighbour is its own page"
+        );
+        drop(
+            owner
+                .mapping
+                .begin_content_write(0x1000, 16)
+                .expect("host write"),
+        );
+        assert_eq!(publish(ipa + 0x1000, 0x1000), Ok(1), "host-written page");
+        assert_eq!(publish(ipa + 0x1000, 0x1000), Ok(0));
+
+        let mut unowned_backing = vec![0u8; 0x1000];
+        let host = unowned_backing.as_mut_ptr();
+        let rows = |_: u64, _: usize| Some(host);
+        let unowned = ipa + 0x10_0000;
+        for _ in 0..2 {
+            assert_eq!(
+                custody.publish_user_executable(unowned, 0x1000, none, rows),
+                Ok(1),
+                "an unowned output is invalidated every time"
+            );
+        }
+        assert_eq!(
+            custody.publish_user_executable(unowned, 0x1000, none, none),
+            Ok(0),
+            "no stage-2 record and no row: nothing backs it, nothing to fetch"
+        );
+    }
 
     #[allow(clippy::expect_used)]
     fn live_custody() -> (std::sync::Arc<CarrierVmCustody>, CarrierVmGeneration) {

@@ -1587,6 +1587,14 @@ unsafe impl<'a> carrick_mmu_core::aarch64::HostArenaResolver for HvfPageTableRes
     fn record_populated_prefix(&self, base: u64, prefix: usize) {
         self.task.record_stage1_populated_prefix(base, prefix);
     }
+
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        self.task.publish_user_executable(output, len)
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

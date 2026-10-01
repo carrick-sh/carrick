@@ -2646,6 +2646,14 @@ mod guest_descriptor_lane_tests {
         fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
             (base == LINUX_PAGE_TABLES_BASE).then(|| self.buf.lock().as_ptr())
         }
+        fn publish_user_executable(
+            &self,
+            _output: u64,
+            _len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
+        }
     }
 
     const MM: u64 = 41;

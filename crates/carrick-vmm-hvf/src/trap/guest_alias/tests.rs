@@ -34,6 +34,14 @@ unsafe impl HostArenaResolver for LiveWords {
         (offset.checked_add(len)? <= SIZE)
             .then(|| unsafe { self.0.as_ptr().cast::<u8>().cast_mut().add(offset) })
     }
+    fn publish_user_executable(
+        &self,
+        _output: u64,
+        _len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        // VM-free test backing: no instruction cache to maintain.
+        Ok(())
+    }
 }
 
 impl LiveWords {
