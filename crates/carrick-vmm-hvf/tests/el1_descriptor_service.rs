@@ -22,6 +22,14 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for RootBacking {
     fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
         (base == self.ipa && len <= self.len).then_some(self.host as *mut u8)
     }
+    fn publish_user_executable(
+        &self,
+        _output: u64,
+        _len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        // VM-free test backing: no instruction cache to maintain.
+        Ok(())
+    }
 }
 
 #[test]

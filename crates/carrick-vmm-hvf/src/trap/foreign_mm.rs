@@ -421,6 +421,29 @@ impl MmAccessLiveResolver {
     }
 }
 
+/// One raw `(base, host)` page-table arena for test fixtures whose edits
+/// publish executable leaves: production refuses those on page-table-only
+/// resolvers (`HostArenaResolver::publish_user_executable`).
+#[cfg(any(test, feature = "foreign-cow-test-support"))]
+#[derive(Clone, Copy)]
+pub(crate) struct TestPageTableArena(pub(crate) u64, pub(crate) *mut u8);
+
+#[cfg(any(test, feature = "foreign-cow-test-support"))]
+unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for TestPageTableArena {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        (base == self.0).then_some(self.1)
+    }
+
+    fn publish_user_executable(
+        &self,
+        _output: u64,
+        _len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        // Fixture backing: no instruction cache to maintain.
+        Ok(())
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolver {
     fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
@@ -604,6 +627,30 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolve
             // delay reuse, so track every live extension's written high-water.
             owner.record_populated_prefix(prefix_end);
         }
+    }
+
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        let state = self.mm_access.upgrade();
+        let structural = state.as_ref().map(|state| state.structural_owners.read());
+        self.custody
+            .publish_user_executable(
+                output,
+                len,
+                |ipa, size| {
+                    let structural = structural.as_ref()?;
+                    let (&(base, extent), owner) =
+                        structural.range(..=(ipa, usize::MAX)).next_back()?;
+                    let offset = usize::try_from(ipa.checked_sub(base)?).ok()?;
+                    (offset.checked_add(size)? <= extent)
+                        .then(|| unsafe { owner.ptr().add(offset) })
+                },
+                |_, _| None,
+            )
+            .map(|_| ())
     }
 }
 
@@ -2436,6 +2483,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         backing: &'a RetainedForeignMmBacking,
         root_ipa: u64,
         root_host: *mut u8,
+        custody: &'a CarrierVmCustody,
     }
 
     unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for ForeignMmPageTableResolver<'_> {
@@ -2466,9 +2514,29 @@ pub(crate) fn perform_foreign_cow_transaction(
         fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
             self.host_ptr_for_base(base).map(|p| p.cast_const())
         }
+
+        fn publish_user_executable(
+            &self,
+            output: u64,
+            len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            self.custody
+                .publish_user_executable(
+                    output,
+                    len,
+                    |ipa, size| {
+                        let extent = self.backing.extent_for(ipa, size).ok()?;
+                        let offset = usize::try_from(ipa.checked_sub(extent.key.0)?).ok()?;
+                        Some(unsafe { extent.owner.ptr().add(offset) })
+                    },
+                    |_, _| None,
+                )
+                .map(|_| ())
+        }
     }
 
     let resolve_page_table_host = ForeignMmPageTableResolver {
+        custody: &lease.custody,
         backing: &lease_guard.backing,
         root_ipa: requested.binding.stage1_root.raw(),
         root_host: page_table_host_ptr,
@@ -4576,7 +4644,7 @@ pub mod foreign_cow_test_support {
                 self.state.page_tables_authority().edit(
                     || Err("fixture page tables absent".to_owned()),
                     |editor| {
-                        unsafe { editor.sync_to_host((root.0, owner.ptr())) }
+                        unsafe { editor.sync_to_host(TestPageTableArena(root.0, owner.ptr())) }
                             .map_err(|e| format!("publish fixture leaf: {e:?}"))
                     },
                 )?;

@@ -592,6 +592,18 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for &PooledRootSlotHand
             PooledRootSlotHandle::record_populated_prefix(self, prefix);
         }
     }
+
+    /// A root slot alone knows no guest frame: executable publication needs
+    /// a frame-aware resolver.
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        _len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        Err(carrick_mmu_core::aarch64::PageTableError::UnresolvedArena(
+            output,
+        ))
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -792,9 +804,11 @@ mod tests {
         assert_eq!(table_a, s0_ipa + (48 * 1024) as u64);
 
         // Occupant A writes descriptors across this new table and syncs to host.
+        // The filler keeps UXN (bit 54) set: as a descriptor it is a data
+        // page, so publishing it needs no instruction-cache authority.
         for i in 0..512u64 {
             mgr_a
-                .write_desc_for_test(table_a + i * 8, 0xdead_beef_dead_beef)
+                .write_desc_for_test(table_a + i * 8, 0xdeed_beef_dead_beef)
                 .expect("write desc");
         }
         unsafe { mgr_a.sync_to_host(&s0).expect("sync_to_host for A") };

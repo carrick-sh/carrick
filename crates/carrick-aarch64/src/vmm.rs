@@ -540,6 +540,18 @@ pub enum FrameCowWriteIntent {
 pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type Vcpu: Aarch64Vcpu;
 
+    /// The instruction-cache authority for an EL0-executable publication of
+    /// guest physical `[output, output + len)`: make the frame's instruction
+    /// cache coherent with its contents before the descriptor is stored
+    /// (`HostArenaResolver::publish_user_executable`). A backend that tracks
+    /// which frames are already clean may skip those; one that cannot must
+    /// invalidate. An error refuses the publication.
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError>;
+
     /// Prepared exact-MM backing retirement; dropping it makes no changes.
     type AnonymousDiscard;
 

@@ -88,6 +88,7 @@ where
                 GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent) => {
                     CowDecline::NoWriteIntent
                 }
+                GuestCowClass::NotArmed(GuestCowNotArmed::Executable) => CowDecline::Executable,
                 _ => CowDecline::Unreachable,
             };
             pool.note_declined(reason);

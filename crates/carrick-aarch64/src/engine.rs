@@ -299,6 +299,14 @@ unsafe impl<V: Aarch64Vmm> carrick_mmu_core::aarch64::HostArenaResolver
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.host_ptr_for_base(base).map(|p| p.cast_const())
     }
+
+    fn publish_user_executable(
+        &self,
+        output: u64,
+        len: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+        self.vm.publish_user_executable(output, len)
+    }
 }
 
 /// The generic aarch64 trap engine. Owns the VM, the (one) vCPU, the

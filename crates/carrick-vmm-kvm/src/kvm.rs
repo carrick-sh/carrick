@@ -1856,3 +1856,29 @@ mod fp_reg_id_tests {
         let _ = vreg_id(32);
     }
 }
+
+/// Invalidate the instruction cache for `[host, host + len)`, the host
+/// mapping of guest RAM: IC IVAU per cache line (Linux user space may run it,
+/// SCTLR_EL1.UCI, and read CTR_EL0), bracketed by DSB/ISB. The cache is
+/// physically tagged for this purpose, so this drops the guest's lines too.
+///
+/// # Safety
+/// `[host, host + len)` must be mapped in the calling process.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn invalidate_icache_host_range(host: *mut u8, len: usize) {
+    let ctr: u64;
+    // SAFETY: CTR_EL0 is readable at EL0 on Linux.
+    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    let line = 4usize << (ctr & 0xf);
+    let end = (host as usize).saturating_add(len);
+    let mut address = (host as usize) & !(line - 1);
+    // SAFETY: the caller guarantees the range is mapped.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        while address < end {
+            core::arch::asm!("ic ivau, {}", in(reg) address, options(nostack, preserves_flags));
+            address += line;
+        }
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}

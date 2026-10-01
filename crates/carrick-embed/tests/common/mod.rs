@@ -97,6 +97,29 @@ pub fn zone_readers_vfs() -> InMemoryFileVfs {
     vfs
 }
 
+/// The static icache-reuse fixture (`fixtures/embed-icache-reuse`), mounted
+/// executable at `/opt/carrick/icache-reuse`.
+pub fn icache_reuse_vfs() -> InMemoryFileVfs {
+    let fixture = repo_root().join("target/embed-fixtures/icache-reuse-aarch64");
+    let bytes = std::fs::read(&fixture).unwrap_or_else(|error| {
+        panic!(
+            "read {}: {error}; scripts/test-signed.sh must build the fixture first",
+            fixture.display()
+        )
+    });
+    let vfs = InMemoryFileVfs::new();
+    vfs.add_file_with_metadata(
+        "/opt/carrick/icache-reuse",
+        bytes,
+        0o755,
+        NsUid::ROOT,
+        NsGid::ROOT,
+        0,
+    )
+    .expect("install executable icache-reuse fixture");
+    vfs
+}
+
 /// Unwrap a container run, turning `EmbedError::Entitlement` into a loud,
 /// actionable FAILURE. Never a skip: an unsigned test executable is a broken
 /// gate, not an absent one.

@@ -1668,6 +1668,23 @@ impl<'a> Stage1Editor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Raw `(base, host)` arenas for a VM-free test whose edits publish
+    /// executable leaves (production refuses those on page-table-only
+    /// resolvers).
+    #[derive(Clone, Copy)]
+    struct TestArenas<const N: usize>([(u64, *mut u8); N]);
+
+    unsafe impl<const N: usize> HostArenaResolver for TestArenas<N> {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            self.0.iter().find_map(|&(b, p)| (b == base).then_some(p))
+        }
+
+        fn publish_user_executable(&self, _output: u64, _len: u64) -> Result<(), PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
+        }
+    }
     use carrick_guest_mem::Gpa;
     use carrick_mem::memory::{
         AARCH64_LINUX_PAGE_TABLE_LAYOUT, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
@@ -2190,7 +2207,7 @@ mod tests {
         let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let p0 = host_arena0.as_mut_ptr();
         let p1 = host_arena1.as_mut_ptr();
-        let resolver = [(LINUX_PAGE_TABLES_BASE, p0), (ext_base.0, p1)];
+        let resolver = TestArenas([(LINUX_PAGE_TABLES_BASE, p0), (ext_base.0, p1)]);
 
         authority
             .edit(
@@ -2420,7 +2437,7 @@ mod tests {
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let p0 = host_arena0.as_mut_ptr();
-        let resolver = (LINUX_PAGE_TABLES_BASE, p0);
+        let resolver = TestArenas([(LINUX_PAGE_TABLES_BASE, p0)]);
 
         let va = 0x40_0000;
         authority
@@ -2519,6 +2536,14 @@ mod tests {
                 None
             }
         }
+        fn publish_user_executable(
+            &self,
+            _output: u64,
+            _len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
+        }
     }
 
     unsafe impl HostArenaResolver for &BufferResolver {
@@ -2527,6 +2552,14 @@ mod tests {
         }
         fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
             (*self).host_const_ptr_for_base(base)
+        }
+        fn publish_user_executable(
+            &self,
+            _output: u64,
+            _len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
         }
     }
 
@@ -2722,6 +2755,14 @@ mod tests {
         fn host_const_ptr_for_base(&self, _base: u64) -> Option<*const u8> {
             None
         }
+        fn publish_user_executable(
+            &self,
+            _output: u64,
+            _len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
+        }
     }
 
     #[test]
@@ -2762,7 +2803,7 @@ mod tests {
             authority.restore_image_and_host(
                 &mut snapshot,
                 0,
-                (LINUX_PAGE_TABLES_BASE, host.as_mut_ptr()),
+                TestArenas([(LINUX_PAGE_TABLES_BASE, host.as_mut_ptr())]),
             )
         }
         .expect("retry retained snapshot with available backing");
@@ -2875,6 +2916,14 @@ mod tests {
         fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
             self.host_ptr_for_range(base, 0)
         }
+        fn publish_user_executable(
+            &self,
+            _output: u64,
+            _len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
+        }
     }
 
     unsafe impl HostArenaResolver for &MultiBufferResolver {
@@ -2883,6 +2932,14 @@ mod tests {
         }
         fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
             (*self).host_ptr_for_base(base)
+        }
+        fn publish_user_executable(
+            &self,
+            _output: u64,
+            _len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            // VM-free test backing: no instruction cache to maintain.
+            Ok(())
         }
     }
 

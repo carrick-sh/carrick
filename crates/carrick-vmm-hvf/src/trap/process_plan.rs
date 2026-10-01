@@ -1553,6 +1553,7 @@ impl HvfTaskState {
         #[derive(Copy, Clone)]
         struct PlanResolver<'a> {
             mappings: &'a [ProcessMappingDesc],
+            custody: &'a CarrierVmCustody,
         }
         unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for PlanResolver<'_> {
             fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
@@ -1573,9 +1574,32 @@ impl HvfTaskState {
             fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
                 self.host_ptr_for_base(base).map(|p| p.cast_const())
             }
+
+            fn publish_user_executable(
+                &self,
+                output: u64,
+                len: u64,
+            ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+                self.custody
+                    .publish_user_executable(
+                        output,
+                        len,
+                        |_, _| None,
+                        |ipa, size| {
+                            let mapping = self.mappings.iter().find(|m| {
+                                ipa >= m.physical_ipa
+                                    && ipa - m.physical_ipa + size as u64 <= m.physical_size as u64
+                            })?;
+                            let offset = usize::try_from(ipa - mapping.physical_ipa).ok()?;
+                            Some(unsafe { mapping.physical_host_addr.add(offset) })
+                        },
+                    )
+                    .map(|_| ())
+            }
         }
         let page_table_resolver = PlanResolver {
             mappings: &mappings,
+            custody: &carrier_foreign_mm_transport.custody,
         };
         unsafe { page_tables.restore_quiesced_snapshot_to_host(page_table_resolver) }.map_err(
             |e| {
