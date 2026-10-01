@@ -430,6 +430,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "epollstopcont": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic",
+    "contract_ids": [
+      "kernel.signal.job-control-wait-interruption"
+    ]
+  },
   "epollzoneclose": {
     "class": "conformance",
     "excluded": false,
