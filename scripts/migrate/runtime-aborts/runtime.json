@@ -2729,7 +2729,7 @@
       "file": "crates/carrick-kernel/src/el1_zone.rs",
       "function": "ObjectWakeDelivery::collect",
       "ordinal_in_function": 1,
-      "fingerprint": "ee796585f46aeccbac8719bf8a68e740fcfce3532aad2e69626eb3201d03a70d",
+      "fingerprint": "872024937a1d04178f60457ae0d1869923ddb6da8a7b9afa2eff2bbd72161af9",
       "verdict": "carrier_fault",
       "failure_domain": "ipc::wake",
       "rationale": "Shared object wake claims must be unique and fit the fixed record population; duplicate delivery or an invalid ownership transition is a scheduler invariant failure. Re-reviewed 2026-09-29: unchanged abort; EL1 migration edits to the enclosing function (and, for shifted ordinals, newly inserted guest-publication aborts ahead of it) moved the fingerprint.",
@@ -2740,7 +2740,7 @@
       "file": "crates/carrick-kernel/src/el1_zone.rs",
       "function": "ObjectWakeDelivery::collect",
       "ordinal_in_function": 2,
-      "fingerprint": "ee796585f46aeccbac8719bf8a68e740fcfce3532aad2e69626eb3201d03a70d",
+      "fingerprint": "872024937a1d04178f60457ae0d1869923ddb6da8a7b9afa2eff2bbd72161af9",
       "verdict": "carrier_fault",
       "failure_domain": "ipc::wake",
       "rationale": "Shared object wake claims must be unique and fit the fixed record population; duplicate delivery or an invalid ownership transition is a scheduler invariant failure. Re-reviewed 2026-09-29: unchanged abort; EL1 migration edits to the enclosing function (and, for shifted ordinals, newly inserted guest-publication aborts ahead of it) moved the fingerprint.",
@@ -2988,6 +2988,28 @@
       "rationale": "A host row (other than carrick's hidden backing rows) overlapping a delegated root's anonymous row means two owners describe the same memory: admission trims the host rows the root takes, and every later host edit of root-owned memory either proposes to the root or demotes first. Rendering either answer (or trimming one away, as S1b did) would publish a /proc or core view no authority holds, so the invariant break is a carrier fault. (Added 2026-09-30, S1c: /proc and core maps merge the root projection with the host rows once.)",
       "sink": "fatal",
       "domain": "dispatch::anonymous"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "function": "ZoneEpoll::ctl",
+      "ordinal_in_function": 1,
+      "fingerprint": "24d2a90deec3493b63ebc407eb9029cdb6a52c9c662e3cee8df19ca20805da41",
+      "verdict": "carrier_fault",
+      "failure_domain": "epoll::zone",
+      "rationale": "The zone epoll record and its members belong to this description's IPC owner; a ctl refused for anything but a retired member (Stale, mapped to ENOENT) means the shared record lost an item it owns or its lock word is corrupt, with no Linux errno.",
+      "sink": "fatal",
+      "domain": "epoll::zone"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "function": "ZoneEpoll::harvest",
+      "ordinal_in_function": 1,
+      "fingerprint": "1106ef603b3e41a1038171b042101e3bebd98d1f5febe953bad90985b79a2237",
+      "verdict": "carrier_fault",
+      "failure_domain": "epoll::zone",
+      "rationale": "The host harvests the record its live description keeps alive with an unbounded host lock wait; a refusal means the record was destroyed under a live description or its item lists are corrupt, so no ready list can be reported.",
+      "sink": "fatal",
+      "domain": "epoll::zone"
     }
   ]
 }
