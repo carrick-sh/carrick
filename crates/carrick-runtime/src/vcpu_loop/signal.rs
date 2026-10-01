@@ -160,6 +160,9 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     // This is the single synchronous-signal admission point, including a
     // ptrace-resumed fault. Classify before ptrace, disposition and injection
     // so none of those exits can bypass the file BUS range.
+    // The frame lands on the guest (or alternate) stack, which EL1 may have
+    // just copied for COW.
+    settle_guest_cow_of(context.shared().mm().id());
     let incoming = fault.signum;
     let bus = incoming == crate::linux_abi::LINUX_SIGSEGV
         && dispatcher.mmap_fault_is_sigbus(fault.si_addr);
