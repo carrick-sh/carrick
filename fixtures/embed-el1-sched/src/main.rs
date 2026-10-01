@@ -88,6 +88,11 @@
 //!   `kick-first-read <rounds>` (EL1 stage S3): two-process delegated-root
 //!   witnesses, described in `delegated_root.rs`.
 //!
+//! - `cross-vcpu-stale <rounds>`: a worker pinned to guest CPU 1 keeps a page
+//!   hot while the main thread (CPU 0) `mprotect`s it read-only and later
+//!   `munmap`s it; the worker's next write and read must each fault exactly
+//!   once, and the read must see a fresh zero page (no stale translation).
+//!
 //! - `fault-entry`: triggers a stage-1 permission fault on a PROT_READ mapping,
 //!   catches SIGSEGV with SA_SIGINFO, verifies si_addr, mprotects PROT_READ|PROT_WRITE,
 //!   retries store, and verifies store success and register preservation.
@@ -95,7 +100,7 @@
 //! Every wait in the checks is bounded, so a lost wake or a lost signal is a
 //! failed line, never a hung test.
 
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod delegated_root;
@@ -2046,6 +2051,204 @@ extern "C" fn on_permission_segv(
     }
 }
 
+// ---------------------------------------------------------------------------
+// cross-vcpu-stale: stale stage-1 translations across two vCPUs
+
+static STALE_PAGE: AtomicUsize = AtomicUsize::new(0);
+static STALE_PHASE: AtomicU32 = AtomicU32::new(0); // 1: write probe, 2: read probe
+static STALE_WRITE_FAULTS: AtomicU64 = AtomicU64::new(0);
+static STALE_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+static STALE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static STALE_CMD: AtomicU32 = AtomicU32::new(0);
+static STALE_ACK: AtomicU32 = AtomicU32::new(0);
+static STALE_READ_VALUE: AtomicU64 = AtomicU64::new(0);
+
+/// SIGSEGV on the worker: an expected fault restores access to the probed
+/// page (RW for the write probe, a fresh zero page for the read probe) so the
+/// faulting access retries and completes.
+extern "C" fn on_stale_segv(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    if sig != libc::SIGSEGV || info.is_null() {
+        unsafe { libc::_exit(61) };
+    }
+    let page = STALE_PAGE.load(Ordering::SeqCst);
+    let fault = unsafe { (*info).si_addr() as usize };
+    let phase = STALE_PHASE.swap(0, Ordering::SeqCst);
+    if page == 0 || fault & !0xfff != page {
+        STALE_ERRORS.fetch_add(1, Ordering::SeqCst);
+        unsafe { libc::_exit(62) };
+    }
+    match phase {
+        1 => {
+            STALE_WRITE_FAULTS.fetch_add(1, Ordering::SeqCst);
+            if unsafe {
+                libc::mprotect(
+                    page as *mut libc::c_void,
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            } != 0
+            {
+                unsafe { libc::_exit(63) };
+            }
+        }
+        2 => {
+            STALE_READ_FAULTS.fetch_add(1, Ordering::SeqCst);
+            let mapped = unsafe {
+                libc::mmap(
+                    page as *mut libc::c_void,
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            if mapped as usize != page {
+                unsafe { libc::_exit(64) };
+            }
+        }
+        _ => {
+            STALE_ERRORS.fetch_add(1, Ordering::SeqCst);
+            unsafe { libc::_exit(65) };
+        }
+    }
+}
+
+/// Post `cmd` to the worker and wait (bounded) for it to acknowledge.
+fn stale_command(cmd: u32) -> bool {
+    let ack = STALE_ACK.load(Ordering::SeqCst);
+    STALE_CMD.store(cmd, Ordering::SeqCst);
+    let _ = futex_wake(&STALE_CMD, 1);
+    wait_until_changed(&STALE_ACK, ack, Duration::from_secs(10))
+}
+
+/// `cross-vcpu-stale <rounds>`: the main thread (guest CPU 0) changes a page a
+/// worker (guest CPU 1) keeps hot in its TLB, and the worker's next access must
+/// observe the change. Each round: the worker writes the page repeatedly; the
+/// main thread `mprotect`s it read-only and the worker's next write must fault
+/// once; the worker warms the RW page again; the main thread `munmap`s it and
+/// the worker's next read must fault once and then read a fresh zero page,
+/// never the value it wrote. A stale translation the editor failed to
+/// invalidate shows up as a missing fault or a stale read.
+fn cross_vcpu_stale(rounds: usize) -> i32 {
+    if rounds == 0 || rounds > 10_000 {
+        println!("cross-vcpu-stale invalid rounds={rounds}");
+        return 1;
+    }
+    unsafe { libc::alarm(90) };
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = on_stale_segv as *const () as usize;
+    action.sa_flags = libc::SA_SIGINFO;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    if unsafe { libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut()) } != 0 {
+        println!("cross-vcpu-stale sigaction failed");
+        return 1;
+    }
+    if pin(0) != 0 {
+        println!("cross-vcpu-stale pin main failed");
+        return 1;
+    }
+    let page = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if page == libc::MAP_FAILED {
+        println!("cross-vcpu-stale mmap failed");
+        return 1;
+    }
+    STALE_PAGE.store(page as usize, Ordering::SeqCst);
+    // Worker commands: 1 warm (write the page 64 times), 2 write probe,
+    // 3 read probe, 4 stop. Each acknowledges by bumping STALE_ACK.
+    let worker = std::thread::spawn(|| {
+        if pin(1) != 0 {
+            STALE_ERRORS.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut seen = 0u32;
+        loop {
+            while STALE_CMD.load(Ordering::SeqCst) == seen {
+                let _ = futex_wait_timeout(&STALE_CMD, seen, Duration::from_millis(50));
+            }
+            let cmd = STALE_CMD.load(Ordering::SeqCst);
+            seen = cmd;
+            let ptr = STALE_PAGE.load(Ordering::SeqCst) as *mut u64;
+            match cmd >> 8 {
+                1 => {
+                    for i in 0..64u64 {
+                        unsafe { std::ptr::write_volatile(ptr, 0x5A5A_0000 + i) };
+                    }
+                }
+                2 => {
+                    STALE_PHASE.store(1, Ordering::SeqCst);
+                    unsafe { std::ptr::write_volatile(ptr, 0xC0DE) };
+                    if STALE_PHASE.swap(0, Ordering::SeqCst) != 0 {
+                        // The write went through a stale writable translation.
+                        STALE_ERRORS.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                3 => {
+                    STALE_PHASE.store(2, Ordering::SeqCst);
+                    let value = unsafe { std::ptr::read_volatile(ptr) };
+                    STALE_READ_VALUE.store(value, Ordering::SeqCst);
+                    if STALE_PHASE.swap(0, Ordering::SeqCst) != 0 {
+                        // The read went through a stale translation of the unmapped page.
+                        STALE_ERRORS.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                _ => {
+                    STALE_ACK.fetch_add(1, Ordering::SeqCst);
+                    let _ = futex_wake(&STALE_ACK, 1);
+                    return;
+                }
+            }
+            STALE_ACK.fetch_add(1, Ordering::SeqCst);
+            let _ = futex_wake(&STALE_ACK, 1);
+        }
+    });
+    let mut seq = 0u32;
+    let mut next = |op: u32| {
+        seq = seq.wrapping_add(1) & 0xff;
+        (op << 8) | seq
+    };
+    let mut timeouts = 0u64;
+    let mut stale_reads = 0u64;
+    for _ in 0..rounds {
+        let ptr = STALE_PAGE.load(Ordering::SeqCst) as *mut libc::c_void;
+        timeouts += u64::from(!stale_command(next(1)));
+        if unsafe { libc::mprotect(ptr, 4096, libc::PROT_READ) } != 0 {
+            STALE_ERRORS.fetch_add(1, Ordering::SeqCst);
+        }
+        timeouts += u64::from(!stale_command(next(2)));
+        timeouts += u64::from(!stale_command(next(1)));
+        if unsafe { libc::munmap(ptr, 4096) } != 0 {
+            STALE_ERRORS.fetch_add(1, Ordering::SeqCst);
+        }
+        timeouts += u64::from(!stale_command(next(3)));
+        if STALE_READ_VALUE.load(Ordering::SeqCst) != 0 {
+            stale_reads += 1;
+        }
+    }
+    timeouts += u64::from(!stale_command(next(4)));
+    let _ = worker.join();
+    let write_faults = STALE_WRITE_FAULTS.load(Ordering::SeqCst);
+    let read_faults = STALE_READ_FAULTS.load(Ordering::SeqCst);
+    let errors = STALE_ERRORS.load(Ordering::SeqCst);
+    let ok = write_faults == rounds as u64
+        && read_faults == rounds as u64
+        && errors == 0
+        && stale_reads == 0
+        && timeouts == 0;
+    println!(
+        "cross-vcpu-stale rounds={rounds} write_faults={write_faults} read_faults={read_faults} stale_reads={stale_reads} errors={errors} timeouts={timeouts} ok={ok}"
+    );
+    i32::from(!ok)
+}
+
 fn permission_transitions(pages: usize, rounds: usize) -> i32 {
     let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size_raw <= 0 {
@@ -3182,6 +3385,9 @@ fn main() {
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
         ),
+        "cross-vcpu-stale" => {
+            cross_vcpu_stale(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200))
+        }
         "permission-transitions" => permission_transitions(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),

@@ -4076,17 +4076,36 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
         let size = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
         self.pt_edit_and_flush_after_adopting(grant.semantic_base, size, |editor| {
+            // TLB maintenance only if the publication overwrote a descriptor
+            // the walker could have cached: a VALID leaf, a valid block it
+            // split, or a valid table pointer a reclaim sweep cleared. A first
+            // touch normally turns invalid (PROT_NONE / prepared) leaves valid,
+            // which AArch64 never caches, so it needs none. The undo journal
+            // records exactly whether any word it first wrote was valid. A
+            // journal some caller already holds open is not ours to read or
+            // close: keep the unconditional invalidation then.
+            let owns_journal = !editor.manager.undo_is_open();
+            if owns_journal {
+                editor.manager.begin_undo()?;
+            }
             let source = editor.arena_source.as_deref_mut();
-            editor
+            let published = editor
                 .manager
                 .publish_private_pages(publication, grant.fault_va, source)
                 .map_err(|error| match error {
                     carrick_mmu_core::aarch64::GuestLeafPublicationError::Manager(error) => error,
                     _ => PageTableError::BadAddress,
-                })?;
+                });
+            let flush_required = !owns_journal || editor.manager.undo_replaced_valid_descriptor();
+            if owns_journal {
+                // The funnel's own failure handling owns rollback; this
+                // journal only measured the edit.
+                editor.manager.commit_undo();
+            }
+            published?;
             Ok(PageTableApplyOutcome {
                 changed: true,
-                flush_required: true,
+                flush_required,
             })
         })
         .map_err(|error| memory_error_to_trap_error(error, "publish EL1 frame grant on host"))?;
