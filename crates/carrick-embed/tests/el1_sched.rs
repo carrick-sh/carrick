@@ -3733,8 +3733,10 @@ fn el1_anonymous_discard_and_exit_return_frames() {
         );
         assert!(grants > 0, "workload published no EL1 frame grants");
         assert_eq!(
-            returns, grants,
-            "every exact EL1 grant across discard and exit must return"
+            returns,
+            grants,
+            "every exact EL1 grant across discard and exit must return; outstanding: {:#?}",
+            carrick_embed::el1_frame_grant_unreturned()
         );
         assert_eq!(
             bytes_returned, bytes_granted,
