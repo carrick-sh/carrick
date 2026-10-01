@@ -1392,22 +1392,7 @@ where
         mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
-        if signal::guest_grants_awaiting_settlement() {
-            // Residency EL1 already published is settled before the syscall
-            // reads it (mincore, madvise, copyout into a granted page).
-            let mutation = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor)
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "settle guest grants before syscall: {error:?}"
-                    ))
-                })?;
-            signal::settle_guest_frame_grants(&kernel.dispatcher, engine, &mutation)
-                .map_err(RuntimeError::Trap)?;
-        }
-        // EL1 may already have repointed spans for COW; the host's mapping
-        // view catches up before the syscall validates or copies a buffer
-        // (it translates through the live leaves).
-        signal::settle_guest_cow_of(mm_executor.mm_id());
+        signal::settle_guest_work_before_host_copy(&kernel.dispatcher, engine, mm_executor)?;
         if !crate::el1_census::enabled() {
             return self.service_threaded_syscall_for_executor_inner(
                 kernel,

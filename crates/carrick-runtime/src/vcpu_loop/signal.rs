@@ -922,6 +922,30 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
     Ok(())
 }
 
+/// Settle what EL1 already published for this MM before the host
+/// validates or copies a guest buffer: first-touch grants (residency that
+/// mincore, madvise and copyout read) and COW repoints (the host's mapping
+/// view translates through the live leaves). Every host boundary that
+/// services a guest buffer runs this first: syscall entry, and the
+/// resumption of an IPC operation that parked mid-call.
+pub(super) fn settle_guest_work_before_host_copy<E: ThreadedEngine>(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    engine: &mut E,
+    mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
+) -> Result<(), RuntimeError> {
+    if guest_grants_awaiting_settlement() {
+        let mutation =
+            carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor).map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "settle guest grants before a host copy: {error:?}"
+                ))
+            })?;
+        settle_guest_frame_grants(dispatcher, engine, &mutation).map_err(RuntimeError::Trap)?;
+    }
+    settle_guest_cow_of(mm_executor.mm_id());
+    Ok(())
+}
+
 /// Whether a forwarded-syscall boundary must settle guest grants before it
 /// services the syscall, so `mincore` and every other reader of residency
 /// sees what EL1 already published. Cheap when nothing is pending.
@@ -3971,6 +3995,13 @@ mod guest_descriptor_lane_tests {
             .find("ops.commit_parent(memory)")
             .expect("fork commit");
         assert!(armed < copyout && copyout < commit);
+        let helper = include_str!("signal.rs")
+            .split("fn settle_guest_work_before_host_copy<")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("settlement helper");
+        assert!(helper.contains("settle_guest_frame_grants("));
+        assert!(helper.contains("settle_guest_cow_of("));
         let module = include_str!("mod.rs");
         let service = module
             .split("fn service_threaded_syscall_for_executor(")
@@ -3978,14 +4009,25 @@ mod guest_descriptor_lane_tests {
             .and_then(|tail| tail.split("\n    fn ").next())
             .expect("syscall service");
         let settle = service
-            .find("settle_guest_frame_grants(")
+            .find("settle_guest_work_before_host_copy(")
             .expect("settlement at syscall entry");
-        let cow = service
-            .find("settle_guest_cow_of(")
-            .expect("guest COW settlement at syscall entry");
         let dispatch = service
             .find("service_threaded_syscall_for_executor_inner(")
             .expect("dispatch");
-        assert!(settle < dispatch && cow < dispatch);
+        assert!(settle < dispatch);
+        // A parked IPC operation resumes and copies into the guest buffer
+        // without passing syscall entry again.
+        let zone = include_str!("zone.rs");
+        let resume = zone
+            .split("fn resume_ipc_operation(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("IPC resume");
+        let settle = resume
+            .find("settle_guest_work_before_host_copy(")
+            .expect("settlement before an IPC resumption copies");
+        let interrupt = resume.find("host_ipc::interrupt(").expect("interrupt");
+        let continue_ = resume.find("self.ipc_continue(").expect("continue");
+        assert!(settle < interrupt && settle < continue_);
     }
 }
