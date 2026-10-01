@@ -3171,6 +3171,11 @@ fn el1_fork_cow_resolves_in_guest() {
             "el1-sched fork-cow forks={FORKS} pages={pages} exits={} {host_line}",
             measured.exits
         );
+        println!(
+            "el1-sched fork-cow pages={pages} exit_classes={} forwarded_syscalls={:?}",
+            exit_breakdown(&measured),
+            measured.forwarded_syscalls,
+        );
         let report = validate_el1_memory_cow_report(&transcript, FORKS, pages)
             .unwrap_or_else(|error| panic!("invalid fork-cow report: {error}\n{transcript}"));
 
