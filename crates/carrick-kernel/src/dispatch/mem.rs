@@ -247,7 +247,6 @@ impl MemAuthority {
         // The child is a different MM in host setup: a delegated parent's
         // root rows and break become its values, never its root.
         let mut forked = state.fork_materialized();
-        forked.deferred_anonymous = std::sync::Arc::new(state.deferred_anonymous.fork_private());
         let projection = Self::derive_fork_projection(&forked)?;
 
         for (start, len) in projection.omitted_ranges {
@@ -300,8 +299,7 @@ impl MemAuthority {
     pub(super) fn fork_private(&self) -> std::sync::Arc<Self> {
         let state = self.state.lock();
         let revision = self.vma_revision();
-        let mut forked = state.fork_materialized();
-        forked.deferred_anonymous = std::sync::Arc::new(state.deferred_anonymous.fork_private());
+        let forked = state.fork_materialized();
         std::sync::Arc::new(Self::with_revision(forked, revision))
     }
 
