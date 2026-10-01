@@ -382,6 +382,10 @@ fn ipc_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
         (L::FaultFirst, "fault_first"),
         (L::SigpipeHandback, "sigpipe_handback"),
         (L::Restart, "restart"),
+        (L::EpollSigmask, "epoll_sigmask"),
+        (L::EpollHostItems, "epoll_host_items"),
+        (L::EpollTimedWait, "epoll_timed_wait"),
+        (L::EpollCopyOut, "epoll_copy_out"),
     ]
     .into_iter()
     .filter_map(|(reason, name)| {

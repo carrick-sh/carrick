@@ -290,6 +290,9 @@ where
     // - a pipe or eventfd read/write that completes right now. Forwarding
     //   it only moves a transfer EL1 can finish to the host (one served
     //   read lost per fork in el1_ipc_two_processes_blocking).
+    // - an epoll_pwait on a zone epoll, for the same reason: Linux reports
+    //   ready events even with a signal pending, and a wait that would block
+    //   parks and leaves as below.
     // A call that completes leaves with the pending work (`ServedWithWork`),
     // so the host delivers a signal after the call returns, as Linux does
     // for one pending at entry; a call that would block parks in the zone
@@ -302,7 +305,8 @@ where
             .and_then(|slot| zone.tables.slot(slot).current())
             .is_some_and(|record| zone.tables.record(record).has_object_operation())
     });
-    let ipc_transfer = matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE) && ipc.is_some();
+    let ipc_transfer =
+        matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE | ipc::SYS_EPOLL_PWAIT) && ipc.is_some();
     if host_work && !resumes_operation && !ipc_transfer {
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
@@ -389,9 +393,10 @@ where
         }
     }
 
-    // Pipe and eventfd read/write on the shared IPC objects, served (and
-    // blocked) in EL1; host-backed descriptions fall through unchanged.
-    if matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE)
+    // Pipe and eventfd read/write on the shared IPC objects, and
+    // epoll_pwait on a zone epoll, served (and blocked) in EL1; host-backed
+    // descriptions fall through unchanged.
+    if matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE | ipc::SYS_EPOLL_PWAIT)
         && let (Some(venue), Some(zone), Some(task), Some(zslot)) =
             (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
     {

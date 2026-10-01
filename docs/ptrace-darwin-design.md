@@ -542,6 +542,9 @@ single-step, and continue a simple single-threaded Go/C guest; `TestGdb*`/
 - `PTRACE_O_TRACECLONE/FORK/VFORK/EXEC/EXITKILL` + `PTRACE_EVENT_*`.
 - Full group-stop for multithreaded tracees (PtQuiesce-based).
 - `PTRACE_SYSCALL` (syscall-entry/exit stops via the existing syscall trap).
+  Needs a per-task EL1 venue gate first: EL1 serves `read`/`write` on
+  pipes/eventfds, `epoll_pwait` on zone epolls and futex waits without a host
+  exit, so a syscall-traced task must have those calls forwarded to the host.
 - General signal-delivery-stop interception (R-8), `GET/SETSIGINFO`.
 - HW breakpoint/watchpoint regsets (`NT_ARM_HW_BREAK`/`WATCH` → DBG* regs).
 - Optional Mach `mach_vm_read` PEEK fast-path (R-9), only if profiling warrants.

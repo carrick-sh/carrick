@@ -2625,7 +2625,13 @@ impl ZoneTables {
         let rec = self.record(record);
         let entry_id = rec.first_entry.load(Ordering::Acquire);
         if entry_id == NIL {
-            return Ok(false);
+            // A timed object park (an epoll wait): its queue, not a bucket.
+            let expired = self.expire_object_park(slot, record, seq)?;
+            s.timer_record.store(NIL, Ordering::Release);
+            if expired {
+                self.counters.el1_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(expired);
         }
         let bucket = self.entry(entry_id).bucket.load(Ordering::Relaxed) as usize;
         let Some(guard) = self.lock(bucket, &BoundedSpin(EL1_SLOT_LOCK_SPINS)) else {

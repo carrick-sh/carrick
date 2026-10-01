@@ -1331,6 +1331,7 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
             snapshot,
             a_pc,
             OperationToken::new(101, 4).unwrap(),
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -1364,6 +1365,7 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
             snapshot,
             OperationResumePc::new(b_ctx.pc).unwrap(),
             OperationToken::new(202, 5).unwrap(),
+            None,
         )
         .unwrap();
     assert_eq!(

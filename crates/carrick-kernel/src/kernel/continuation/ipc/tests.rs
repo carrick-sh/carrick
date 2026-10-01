@@ -291,6 +291,7 @@ fn el1_ipc_zero_progress_interruption_restarts_or_returns_eintr() {
             IpcHostOutcome::Restart {
                 x0: r.0 as u64,
                 nr: 63,
+                timeout_ms: None,
             },
         ),
         (
@@ -305,6 +306,17 @@ fn el1_ipc_zero_progress_interruption_restarts_or_returns_eintr() {
             IpcHostOutcome::Restart {
                 x0: r.0 as u64,
                 nr: 63,
+                timeout_ms: None,
+            },
+        ),
+        // read(2) is not among the calls a stop interrupts (man 7 signal):
+        // after SIGCONT it continues.
+        (
+            IpcCause::Stop,
+            IpcHostOutcome::Restart {
+                x0: r.0 as u64,
+                nr: 63,
+                timeout_ms: None,
             },
         ),
     ] {
@@ -316,6 +328,163 @@ fn el1_ipc_zero_progress_interruption_restarts_or_returns_eintr() {
     // Every pin was released: only the descriptor's own reference remains.
     let (pin, _) = w.region.fd(HostIpcWait).pin(w.table, r).unwrap();
     assert_eq!(w.region.fd(HostIpcWait).holds(&pin), Ok((1, 1)));
+    let _ = w.region.fd(HostIpcWait).unpin(pin);
+}
+
+/// A parked zone epoll wait owns no progress: a signal ends it with EINTR
+/// even under SA_RESTART (epoll_wait(2) is never restarted), so does a stop
+/// followed by SIGCONT with no handler (man 7 signal), a host-kept
+/// deadline returns 0 events, a control stop and a host continuation re-run
+/// the original call, and each drops its pin.
+#[test]
+fn el1_epoll_wait_interruption_is_eintr_and_continuation_restarts() {
+    let w = world();
+    let (r, _wfd, _) = w.pipe();
+    let eintr = IpcHostOutcome::Complete {
+        result: LINUX_EINTR.guest_retval(),
+        sigpipe: false,
+    };
+    let restart = IpcHostOutcome::Restart {
+        x0: r.0 as u64,
+        nr: 22,
+        timeout_ms: None,
+    };
+    let timed_out = IpcHostOutcome::Complete {
+        result: 0,
+        sigpipe: false,
+    };
+    for (cause, expected) in [
+        (IpcCause::Signal { restart: true }, &eintr),
+        (IpcCause::Signal { restart: false }, &eintr),
+        // A stop then SIGCONT, no handler: EINTR (man 7 signal).
+        (IpcCause::Stop, &eintr),
+        (IpcCause::Control, &restart),
+        (IpcCause::Timeout, &timed_out),
+    ] {
+        let token = w.operation(r, IpcOpKind::EpollWait, 0, 22);
+        let wakes = Wakes::default();
+        assert_eq!(
+            &interrupt(w.region, token, cause, &wakes).unwrap(),
+            expected
+        );
+    }
+    let token = w.operation(r, IpcOpKind::EpollWait, 0, 22);
+    w.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let wakes = Wakes::default();
+    let mut mem = memory(&[0; 16]);
+    let outcome = complete_handback(w.region, token, MM, &mut mem, None, &wakes).unwrap();
+    assert_eq!(outcome, restart);
+    let (pin, _) = w.region.fd(HostIpcWait).pin(w.table, r).unwrap();
+    assert_eq!(w.region.fd(HostIpcWait).holds(&pin), Ok((1, 1)));
+    let _ = w.region.fd(HostIpcWait).unpin(pin);
+}
+
+/// Host services reading a model counter (1 tick = 1 ns) instead of the
+/// host's clock.
+struct Clocked {
+    wakes: Wakes,
+    now: u64,
+}
+impl IpcHostServices for Clocked {
+    fn validate_region(&self, region: &IpcRegion<'_>) -> Result<(), IpcError> {
+        self.wakes.validate_region(region)
+    }
+    fn release_host(&self, token: carrick_el1_abi::ipc::HostResourceToken) -> Result<(), IpcError> {
+        self.wakes.release_host(token)
+    }
+    fn wake(&self, wake: carrick_el1_abi::ipc::IpcWake) {
+        self.wakes.wake(wake);
+    }
+    fn counter(&self) -> CounterClock {
+        CounterClock {
+            now: self.now,
+            numer: 1,
+            denom: 1,
+        }
+    }
+}
+
+/// A timed epoll wait the host wakes and re-runs never waits longer than
+/// its timeout: the re-run gets what is left of the deadline (rounded up to
+/// a whole millisecond), so the woken-but-empty wait plus the re-run's full
+/// wait end within the timeout plus that rounding, and a wake after the
+/// deadline re-runs with 0 (one harvest, then 0 events). Measured on a model
+/// monotonic counter, not wall time.
+#[test]
+fn el1_epoll_timed_wait_host_rerun_waits_only_what_is_left() {
+    const MS: u64 = 1_000_000;
+    let start = 1_000 * MS;
+    let timeout_ms = 100u64;
+    let deadline = start + timeout_ms * MS;
+    let w = world();
+    let (r, _wfd, _) = w.pipe();
+    let timed = |w: &World| {
+        let token = w.operation(r, IpcOpKind::EpollWait, 0, 22);
+        let mut op = w.region.operation(&token).unwrap();
+        op.deadline = carrick_el1_abi::ipc::IpcCounterDeadline::at(deadline);
+        op.handback = IpcHandback::Continue;
+        w.region.update_operation(&token, op).unwrap();
+        token
+    };
+    for woken_at in [
+        start + 60 * MS,
+        start + 60 * MS + MS / 2,
+        start + 99 * MS + 1,
+    ] {
+        let services = Clocked {
+            wakes: Wakes::default(),
+            now: woken_at,
+        };
+        let mut mem = memory(&[0; 16]);
+        let outcome =
+            complete_handback(w.region, timed(&w), MM, &mut mem, None, &services).unwrap();
+        let IpcHostOutcome::Restart {
+            timeout_ms: Some(left),
+            ..
+        } = outcome
+        else {
+            panic!("a timed wait re-runs with its remaining time: {outcome:?}");
+        };
+        // The re-run waits `left` from the wake when nothing arrives.
+        let expires = woken_at + u64::try_from(left).unwrap() * MS;
+        assert!(expires >= deadline, "never before the timeout");
+        assert!(
+            expires - start <= timeout_ms * MS + MS,
+            "total {} ns exceeds the timeout plus rounding",
+            expires - start
+        );
+    }
+    for (cause, at) in [
+        (None, deadline + 5 * MS),
+        (Some(IpcCause::Control), start + 30 * MS),
+    ] {
+        let services = Clocked {
+            wakes: Wakes::default(),
+            now: at,
+        };
+        let outcome = match cause {
+            None => {
+                let mut mem = memory(&[0; 16]);
+                complete_handback(w.region, timed(&w), MM, &mut mem, None, &services).unwrap()
+            }
+            Some(cause) => interrupt(w.region, timed(&w), cause, &services).unwrap(),
+        };
+        let expected = if at > deadline { 0 } else { 70 };
+        assert_eq!(
+            outcome,
+            IpcHostOutcome::Restart {
+                x0: r.0 as u64,
+                nr: 22,
+                timeout_ms: Some(expected),
+            }
+        );
+    }
+    let (pin, _) = w.region.fd(HostIpcWait).pin(w.table, r).unwrap();
+    assert_eq!(
+        w.region.fd(HostIpcWait).holds(&pin),
+        Ok((1, 1)),
+        "every pin dropped"
+    );
     let _ = w.region.fd(HostIpcWait).unpin(pin);
 }
 
@@ -486,7 +655,8 @@ fn el1_ipc_exit_cancellation_releases_the_last_pin_and_wakes_the_peer() {
         interrupt(w.region, token, IpcCause::Control, &wakes).unwrap(),
         IpcHostOutcome::Restart {
             x0: r.0 as u64,
-            nr: 63
+            nr: 63,
+            timeout_ms: None,
         }
     );
     // Final release: the writer lane learns the reader is gone (EPIPE).

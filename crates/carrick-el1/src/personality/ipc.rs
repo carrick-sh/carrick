@@ -72,6 +72,9 @@ mod linux {
 }
 pub use linux::{SYS_READ, SYS_WRITE};
 
+mod epoll;
+pub use epoll::SYS_EPOLL_PWAIT;
+
 /// Where the venue finds a task's descriptor table in the shared authority.
 /// Returns a table only when it is the task's complete descriptor namespace
 /// (a missing descriptor is then EBADF, not a host descriptor).
@@ -177,7 +180,8 @@ impl LockWait for Finish {
     }
 }
 
-/// Serve read(2)/write(2) on a pipe or eventfd in EL1.
+/// Serve read(2)/write(2) on a pipe or eventfd, and epoll_pwait(2) on a
+/// zone epoll, in EL1.
 pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
     sched: &mut Sched<'_, C, U>,
     frame: &mut TrapFrame,
@@ -185,7 +189,7 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
     user: &mut M,
 ) -> IpcServed {
     let nr = frame.x[8] as usize;
-    if nr != SYS_READ && nr != SYS_WRITE {
+    if nr != SYS_READ && nr != SYS_WRITE && nr != SYS_EPOLL_PWAIT {
         return IpcServed::Forward;
     }
     let (token, op, resumed) = match sched.take_object_operation() {
@@ -202,8 +206,12 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 let served = handback(frame, token, op, IpcHandback::Continue, 0, venue);
                 return leave(sched, IpcLeave::ForeignOperation, served);
             }
+            if op.kind == IpcOpKind::EpollWait {
+                return epoll::resume(sched, frame, venue, user, token, op);
+            }
             (token, op, true)
         }
+        Ok(None) if nr == SYS_EPOLL_PWAIT => return epoll::serve(sched, frame, venue, user),
         Ok(None) => match admit(sched, frame, venue, user) {
             Admission::Admitted(token, op) => (token, op, false),
             Admission::Immediate(result) => {
@@ -504,7 +512,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         IpcLeave::ParkRefused,
                     );
                 };
-                match park(sched, frame, region, token, op, object, lane, snap) {
+                match park(sched, frame, region, token, op, object, lane, snap, None) {
                     Parked::Done(served) => return served,
                     Parked::Retry(t) => {
                         token = t;
@@ -646,6 +654,7 @@ fn park<C: ThreadCpu, U: UserWord>(
     object: IpcObjectHandle,
     lane: WaitFor,
     snap: ObjectWaitSnapshot,
+    deadline: Option<u64>,
 ) -> Parked {
     let (Some(key), Some(resume)) = (
         wait_key(object, lane),
@@ -660,7 +669,7 @@ fn park<C: ThreadCpu, U: UserWord>(
         Ok(t) => t,
         Err(token) => return Parked::Refused(token),
     };
-    match sched.park_object(frame, key, snap, resume, sched_token) {
+    match sched.park_object(frame, key, snap, resume, sched_token, deadline) {
         Ok(parked) => {
             let served = if sched.task.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
@@ -1236,6 +1245,222 @@ mod tests {
                 .host_service_placements
                 .load(Ordering::Relaxed)
             + w.zone.counters.el1_service_exits.load(Ordering::Relaxed)
+    }
+
+    // ---- epoll_pwait on a zone epoll (kernel.el1.epoll-zone) ----
+
+    const EPOLL_IN: u32 = carrick_el1_abi::ipc::epoll::events::IN;
+
+    /// epoll_create1 + EPOLL_CTL_ADD of eventfd `member` (EPOLLIN, `data`),
+    /// as the host venue performs them: the epoll's fd and object.
+    fn zone_epoll(w: &World, t: TableId, member: i32, data: u64) -> (i32, IpcObjectHandle) {
+        let object = w.region.create_epoll(&HostWait).unwrap();
+        let fd = w
+            .host()
+            .open(
+                t,
+                Fd(0),
+                Description::new(
+                    IpcBacking::Epoll { object }.encode(),
+                    AccessMode::ReadWrite,
+                    StatusFlags::default(),
+                ),
+                false,
+            )
+            .unwrap()
+            .0;
+        let desc = w.host().get(t, Fd(member)).unwrap();
+        let Some(IpcBacking::EventFd { object: eventfd }) = IpcBacking::decode(desc.backing) else {
+            panic!("eventfd");
+        };
+        w.region
+            .epoll_add(
+                object,
+                eventfd,
+                carrick_el1_abi::ipc::epoll::EpollMember::EventFd,
+                member,
+                0x51,
+                EPOLL_IN,
+                data,
+                &HostWait,
+            )
+            .unwrap();
+        (fd, object)
+    }
+
+    fn epoll_pwait(ep: i32, buf: u64, maxevents: u64, timeout: i32, svc: u64) -> TrapFrame {
+        let mut frame = syscall(SYS_EPOLL_PWAIT, ep, buf, maxevents, svc);
+        frame.x[3] = timeout as u32 as u64;
+        frame
+    }
+
+    fn leaves(w: &World, why: IpcLeave) -> u64 {
+        w.counters.ipc_leaves[why as usize].load(Ordering::Relaxed)
+    }
+
+    /// Ready zone items are reported in the guest; every case EL1 does not
+    /// serve forwards unchanged before any effect, and an undelivered
+    /// report is reported again.
+    #[test]
+    fn el1_epoll_zone_wait_reports_in_guest_and_forwards_the_rest() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let e = w.eventfd(t, 0, EventMode::Counter, NONBLOCK);
+        let (ep, object) = zone_epoll(&w, t, e, 0xfeed);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        let mut f = epoll_pwait(ep, va, 8, 0, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 0), "nothing ready");
+        w.mem.write(MM, va + 0x100, &1u64.to_ne_bytes());
+        let mut f = syscall(SYS_WRITE, e, va + 0x100, 8, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8));
+        // Forwarded unchanged: a signal mask, no maxevents, host items, a
+        // buffer that cannot take the report.
+        let mut f = epoll_pwait(ep, va, 8, -1, A_SVC);
+        f.x[4] = 0x30000;
+        let regs = f.x;
+        assert_eq!(w.call(&mut f), IpcServed::Forward);
+        assert_eq!(f.x, regs);
+        let mut f = epoll_pwait(ep, va, 0, -1, A_SVC);
+        assert_eq!(w.call(&mut f), IpcServed::Forward);
+        w.region.epoll_set_host_items(object, 1, &HostWait).unwrap();
+        let mut f = epoll_pwait(ep, va, 8, -1, A_SVC);
+        assert_eq!(w.call(&mut f), IpcServed::Forward);
+        w.region.epoll_set_host_items(object, 0, &HostWait).unwrap();
+        let mut f = epoll_pwait(ep, 0x9_0000, 8, -1, A_SVC);
+        assert_eq!(w.call(&mut f), IpcServed::Forward);
+        assert_eq!(
+            [
+                leaves(&w, IpcLeave::EpollSigmask),
+                leaves(&w, IpcLeave::EpollHostItems),
+                leaves(&w, IpcLeave::EpollCopyOut),
+            ],
+            [1, 1, 1]
+        );
+        // The level-triggered item is still reported, by the guest.
+        let mut f = epoll_pwait(ep, va, 8, -1, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 1));
+        let event = w.mem.read(MM, va, 16);
+        assert_eq!(event[..4], EPOLL_IN.to_ne_bytes());
+        assert_eq!(event[8..], 0xfeedu64.to_ne_bytes());
+        // Drained: a zero timeout returns 0 in the guest (finite timeouts
+        // are `el1_epoll_zone_finite_timeout_*`).
+        let mut f = syscall(SYS_READ, e, va + 0x100, 8, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8));
+        let mut f = epoll_pwait(ep, va, 8, 0, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 0));
+        // A bad descriptor is EBADF in the guest.
+        let mut f = epoll_pwait(99, va, 8, -1, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, linux::EBADF));
+        // Every pin was dropped: only the descriptor's own reference.
+        assert_eq!(w.host().refcount(t, Fd(ep)), Ok(1));
+    }
+
+    /// The ping-pong half: A blocks in epoll_pwait, B's eventfd write wakes
+    /// it, and A re-enters and reports the event, all without the host.
+    #[test]
+    fn el1_epoll_zone_blocking_wait_parks_and_wakes_in_guest() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 0, EventMode::Counter, NONBLOCK);
+        let (ep, _) = zone_epoll(&w, a, e, 7);
+        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.write(OTHER_MM, va, &1u64.to_ne_bytes());
+        let b_write = syscall(SYS_WRITE, e, va, 8, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let mut f = epoll_pwait(ep, va, 4, -1, A_SVC);
+        let a_regs = f.x;
+        assert_eq!(w.call(&mut f), SWITCHED, "A parks, B runs");
+        assert_eq!(f.elr, B_SVC);
+        f = b_write;
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8), "B writes");
+        // B blocks on an empty pipe: the vCPU goes back to A.
+        let mut g = syscall(SYS_READ, r2, va, 16, B_SVC);
+        assert_eq!(w.call(&mut g), SWITCHED);
+        assert_eq!(g.x, a_regs, "A's original arguments");
+        reenter(&mut g, A_SVC);
+        assert_eq!((w.call(&mut g), g.x[0]), (RETURNED, 1));
+        assert_eq!(w.mem.read(MM, va + 8, 8), 7u64.to_ne_bytes());
+        assert_eq!(host_calls(&w), 0, "no host exit");
+        assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), 2);
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(!w.zone.record(current).has_object_operation());
+        assert_eq!(
+            w.host().refcount(a, Fd(ep)),
+            Ok(2),
+            "A's and the forked B's descriptors; the wait's pin dropped"
+        );
+    }
+
+    /// A finite timeout with nothing ready parks in the guest; the slot's
+    /// timer ends it at the deadline, and the re-entered call harvests once
+    /// more and returns 0, never before the timeout, without the host.
+    #[test]
+    fn el1_epoll_zone_finite_timeout_expires_in_guest() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let e = w.eventfd(t, 0, EventMode::Counter, NONBLOCK);
+        let (ep, _) = zone_epoll(&w, t, e, 9);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        let start = w.cpu.now;
+        let timeout_ticks = 5 * w.cpu.freq / 1000;
+        let mut f = epoll_pwait(ep, va, 8, 5, A_SVC);
+        let a_regs = f.x;
+        assert_eq!(
+            w.call(&mut f),
+            SWITCHED,
+            "parked; its timer switches it back in"
+        );
+        assert!(w.cpu.now >= start + timeout_ticks, "not before the timeout");
+        assert_eq!(f.x, a_regs, "re-enters with its original arguments");
+        reenter(&mut f, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 0));
+        assert_eq!(w.zone.counters.el1_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(host_calls(&w), 0, "no host exit");
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(!w.zone.record(current).has_object_operation());
+        assert_eq!(
+            w.host().refcount(t, Fd(ep)),
+            Ok(1),
+            "the wait's pin dropped"
+        );
+        assert_eq!(leaves(&w, IpcLeave::EpollTimedWait), 0);
+    }
+
+    /// A finite-timeout wait woken before its deadline reports the event in
+    /// the guest; the stale timer never fires a second claim.
+    #[test]
+    fn el1_epoll_zone_finite_timeout_woken_before_its_deadline() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 0, EventMode::Counter, NONBLOCK);
+        let (ep, _) = zone_epoll(&w, a, e, 7);
+        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.write(OTHER_MM, va, &1u64.to_ne_bytes());
+        let b_write = syscall(SYS_WRITE, e, va, 8, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let start = w.cpu.now;
+        let mut f = epoll_pwait(ep, va, 4, 5_000, A_SVC);
+        let a_regs = f.x;
+        assert_eq!(w.call(&mut f), SWITCHED, "A parks, B runs");
+        f = b_write;
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8), "B writes");
+        let mut g = syscall(SYS_READ, r2, va, 16, B_SVC);
+        assert_eq!(w.call(&mut g), SWITCHED);
+        assert_eq!(g.x, a_regs);
+        reenter(&mut g, A_SVC);
+        assert_eq!((w.call(&mut g), g.x[0]), (RETURNED, 1));
+        assert!(w.cpu.now < start + 5 * w.cpu.freq, "woken, not timed out");
+        assert_eq!(w.zone.counters.el1_timeouts.load(Ordering::Relaxed), 0);
+        assert_eq!(w.zone.timer_deadline(SLOT), None, "no timer left armed");
+        assert_eq!(host_calls(&w), 0);
     }
 
     #[test]

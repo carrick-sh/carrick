@@ -127,6 +127,10 @@ pub(super) struct ObjectRecord {
     queue: AtomicU32,
     prev: AtomicU32,
     next: AtomicU32,
+    /// 1: the park's deadline ended it ([`ZoneTables::expire_timer`]), not
+    /// a readiness notification. Cleared by every park; read by the adapter
+    /// after it takes the operation token.
+    expired: AtomicU32,
     generation: AtomicU64,
     operation: AtomicU64,
     operation_generation: AtomicU64,
@@ -223,6 +227,22 @@ impl ObjectWaitGuard<'_> {
         record: RecordId,
         operation: OperationToken,
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        self.park_until(snapshot, record, operation, 0)
+    }
+
+    /// [`Self::park`] bounded by `deadline` (a `CNTVCT` value; 0: untimed).
+    /// A timed park is ended by whichever comes first: a notification, or
+    /// the timer of the record's home slot ([`ZoneTables::arm_timer`], armed
+    /// by the parker after this returns), which queues the record with its
+    /// operation and [`ZoneRecord::object_wait_expired`] set. Both claim the
+    /// record under this queue's lock, so exactly one wins.
+    pub fn park_until(
+        &self,
+        snapshot: ObjectWaitSnapshot,
+        record: RecordId,
+        operation: OperationToken,
+        deadline: u64,
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
         if snapshot.key != self.key {
             return Err((ObjectWaitError::Stale, operation));
         }
@@ -260,7 +280,8 @@ impl ObjectWaitGuard<'_> {
             self.queue().head.store(record.raw(), Ordering::Relaxed);
         }
         self.queue().tail.store(record.raw(), Ordering::Relaxed);
-        self.zone.set_deadline(record, 0);
+        rec.object.expired.store(0, Ordering::Relaxed);
+        self.zone.set_deadline(record, deadline);
         self.zone.publish_park(record, self.zone.next_seq(record));
         Ok(())
     }
@@ -369,6 +390,13 @@ impl ZoneRecord {
         self.object.operation.load(Ordering::Acquire) != 0
     }
 
+    /// Whether this record's last object park ended at its deadline rather
+    /// than by a notification. Meaningful to the owner of the record's
+    /// context once the record was claimed off its park.
+    pub fn object_wait_expired(&self) -> bool {
+        self.object.expired.load(Ordering::Acquire) != 0
+    }
+
     /// Transfer a pending operation to its adapter exactly once.
     ///
     /// # Safety
@@ -465,6 +493,44 @@ impl ZoneTables {
             return Err(ObjectWaitError::Stale);
         }
         Ok(guard)
+    }
+
+    /// EL1 timer: end the timed object park of `record` (parked under `seq`
+    /// on `slot`, its home). Claimed under the record's queue lock, then the
+    /// slot's (the lock order), exactly like a notification: the record is
+    /// queued on `slot` with its operation, marked expired, and resumes at
+    /// its saved entry (registers untouched). `Ok(false)`: a notification or
+    /// a host claim won it first. `Err(())`: the queue lock stayed busy.
+    pub(super) fn expire_object_park(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        seq: u32,
+    ) -> Result<bool, ()> {
+        let rec = self.record(record);
+        let index = rec.object.queue.load(Ordering::Acquire);
+        let Some(key) = ObjectWaitKey::new(index, rec.object.generation.load(Ordering::Relaxed))
+        else {
+            return Ok(false);
+        };
+        let guard = match self.object_wait(key, &BoundedSpin(EL1_SLOT_LOCK_SPINS)) {
+            Ok(guard) => guard,
+            Err(ObjectWaitError::Busy) => return Err(()),
+            Err(_) => return Ok(false),
+        };
+        let Some(slot_guard) = self.slot_lock(slot, &SpinForever) else {
+            return Err(());
+        };
+        if rec.object.queue.load(Ordering::Acquire) != index
+            || !rec.cas(Claim::Parked { seq }, Claim::Queued { slot, seq })
+        {
+            return Ok(false);
+        }
+        rec.object.expired.store(1, Ordering::Release);
+        guard.unlink(record);
+        self.mark_woken(rec, 0);
+        self.push_locked(&slot_guard, record, None);
+        Ok(true)
     }
 
     /// The claim owner removes at most one object registration, by direct
@@ -682,6 +748,115 @@ mod host_tests {
             });
             assert_eq!(notify(&zone, 1).0.visited, 0);
             assert_eq!(zone.slot(SLOT).queued(), 0);
+        }
+    }
+
+    /// A timed park of the slot's home record (an epoll wait with a finite
+    /// timeout): parked with `deadline` and armed on the slot's timer.
+    fn park_home_until(zone: &ZoneTables, index: u32, deadline: u64) -> RecordId {
+        let record = zone
+            .current_or_new(
+                SLOT,
+                ThreadIdentity {
+                    tid: 77,
+                    serial: 77,
+                    mm: MM,
+                    file_table: 99,
+                    generation: 1,
+                    affinity: 0,
+                },
+            )
+            .unwrap();
+        let seq = zone.next_seq(record);
+        let guard = zone.object_wait(key(index), &SpinForever).unwrap();
+        guard
+            .park_until(
+                guard.snapshot(),
+                record,
+                OperationToken::new(77, 1).unwrap(),
+                deadline,
+            )
+            .unwrap();
+        zone.arm_timer(SLOT, record, seq);
+        drop(guard);
+        zone.clear_current(SLOT);
+        record
+    }
+
+    /// The deadline alone ends the park: the record is queued on its home
+    /// slot with its operation, marked expired, its registers untouched, and
+    /// the queue no longer holds it.
+    #[test]
+    fn el1_epoll_timed_object_park_expires_at_its_deadline() {
+        let zone = fixture(true);
+        let record = park_home_until(&zone, 1, 1_000);
+        assert_eq!(zone.timer_deadline(SLOT), Some(1_000));
+        assert_eq!(zone.expire_timer(SLOT, 999, 0), Ok(false), "not yet");
+        assert_eq!(zone.expire_timer(SLOT, 1_000, 0), Ok(true));
+        let rec = zone.record(record);
+        assert!(matches!(rec.claim(), Claim::Queued { slot, .. } if slot == SLOT));
+        assert!(rec.object_wait_expired());
+        assert!(rec.has_object_operation());
+        assert_eq!(rec.handback(), Some(Handback::Resumed));
+        assert_eq!(notify(&zone, 1).0.visited, 0, "unlinked from its queue");
+        assert_eq!(zone.timer_deadline(SLOT), None);
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert_eq!(
+            switched.result, None,
+            "the SVC re-enters with its registers"
+        );
+        // SAFETY: the test owns the switched-in context.
+        assert_eq!(unsafe { rec.take_object_operation() }.unwrap().index(), 77);
+    }
+
+    /// A notification before the deadline wins: the expiry finds nothing to
+    /// claim, and the record is not marked expired.
+    #[test]
+    fn el1_epoll_timed_object_park_woken_before_its_deadline() {
+        let zone = fixture(true);
+        let record = park_home_until(&zone, 1, 1_000);
+        assert_eq!(notify(&zone, 1).0.queued, 1);
+        assert_eq!(zone.expire_timer(SLOT, 5_000, 0), Ok(false));
+        assert_eq!(
+            zone.timer_deadline(SLOT),
+            None,
+            "the stale timer is dropped"
+        );
+        let rec = zone.record(record);
+        assert!(!rec.object_wait_expired());
+        assert!(rec.has_object_operation());
+        assert_eq!(zone.slot(SLOT).queued(), 1, "queued exactly once");
+    }
+
+    /// A notification racing the deadline: exactly one claims the record,
+    /// it is queued exactly once, and `expired` says which one did.
+    #[test]
+    fn el1_epoll_timed_object_park_wake_racing_its_deadline_claims_once() {
+        for _ in 0..256 {
+            let zone = fixture(true);
+            let record = park_home_until(&zone, 1, 1_000);
+            let barrier = Barrier::new(2);
+            let (woken, expired) = std::thread::scope(|scope| {
+                let waker = scope.spawn(|| {
+                    barrier.wait();
+                    notify(&zone, 1).0.queued
+                });
+                barrier.wait();
+                let expired = loop {
+                    match zone.expire_timer(SLOT, 1_000, 0) {
+                        Ok(expired) => break expired,
+                        Err(()) => core::hint::spin_loop(),
+                    }
+                };
+                (waker.join().unwrap(), expired)
+            });
+            assert_eq!(u32::from(expired) + woken, 1, "exactly one claim");
+            let rec = zone.record(record);
+            assert_eq!(rec.object_wait_expired(), expired);
+            assert!(rec.has_object_operation());
+            assert_eq!(zone.slot(SLOT).queued(), 1);
+            assert_eq!(notify(&zone, 1).0.visited, 0);
         }
     }
 
