@@ -920,6 +920,11 @@
     "excluded": false,
     "runner": "conformance_native_host_gateway"
   },
+  "hostreadunmap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "hugepage": {
     "class": "conformance",
     "excluded": false,

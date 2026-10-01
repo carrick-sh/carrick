@@ -2928,10 +2928,11 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// execve. `childrusage` covers wait4/RUSAGE_CHILDREN CPU usage of reaped
 /// children. The seven `epollzone*` probes (`close`, `eintr`, `mixed`,
 /// `pingpong`, `sigmask`, `timeout`, `trigger`) cover the in-zone epoll
-/// served in EL1, bringing the inventory to 554 sources: 525 conformance
-/// sources (502 generic, 23 dedicated), 28 performance sources, and one
-/// helper. Both libc lanes gate 1050 rows.
-const PROBE_SOURCE_COUNT: usize = 554;
+/// served in EL1. `hostreadunmap` covers host-call guest sources (`write`,
+/// `pwritev`) racing a sibling's unmap, bringing the inventory to 555
+/// sources: 526 conformance sources (503 generic, 23 dedicated), 28
+/// performance sources, and one helper. Both libc lanes gate 1052 rows.
+const PROBE_SOURCE_COUNT: usize = 555;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4704,9 +4705,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 502);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 525);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1050);
+    assert_eq!(generic.len(), 503);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 526);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1052);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
