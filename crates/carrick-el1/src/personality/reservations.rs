@@ -476,8 +476,20 @@ impl SharedReservations {
         }
     }
 
+    /// EL1's acquisition: one attempt. A held root answers `Busy` and the
+    /// syscall or fault goes to the host, which serves it on its own venue.
     pub fn lock(&self, index: usize, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-        self.lock_using(index, mm, None, cfg!(target_os = "none"))
+        self.lock_waiting(index, mm, &carrick_sched_core::BoundedSpin(0))
+    }
+
+    /// [`Self::lock`] with `wait` deciding whether to retry a held root.
+    pub fn lock_waiting(
+        &self,
+        index: usize,
+        mm: ReservationMm,
+        wait: &dyn carrick_sched_core::LockWait,
+    ) -> Result<Reservations<'_>, Refusal> {
+        self.lock_using(index, mm, None, cfg!(target_os = "none"), wait)
     }
 
     fn lock_using<'a>(
@@ -486,14 +498,27 @@ impl SharedReservations {
         mm: ReservationMm,
         banks: Option<&'a dyn storage::NodeBanks>,
         identity: bool,
+        wait: &dyn carrick_sched_core::LockWait,
     ) -> Result<Reservations<'a>, Refusal> {
         if self.layout_hash.load(Ordering::Acquire) != LAYOUT_HASH {
             return Err(Refusal::Stale);
         }
         let root = self.roots.get(index).ok_or(Refusal::Invalid)?;
-        root.locked
+        // The root lock's holders: EL1 on some vCPU (a critical section that
+        // never blocks and is resumed to completion) or one host thread (the
+        // host serializes its own venues per MM first). EL1 gives up at once;
+        // the host waits the holder out.
+        let mut attempt = 0u32;
+        while root
+            .locked
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| Refusal::Busy)?;
+            .is_err()
+        {
+            if !wait.wait(attempt) {
+                return Err(Refusal::Busy);
+            }
+            attempt = attempt.saturating_add(1);
+        }
         if root.key.load(Ordering::Acquire) != mm.raw() {
             root.locked.store(0, Ordering::Release);
             return Err(Refusal::Stale);
