@@ -67,27 +67,30 @@ pub(crate) fn settle_final_root(mut model: Reservations<'_>) -> Result<usize, Re
 }
 
 impl MemView<'_> {
-    /// The root holes of this MM that its live first-touch grants back:
-    /// unused stock (`fault::root_grant_for_page`). Spans of `table`'s live
-    /// grants for this MM, minus every node the root holds now.
-    pub(in crate::dispatch) fn first_touch_stock(
+    /// Take this MM's unused first-touch stock: the root holes still under
+    /// the stock-holding grants recorded at their commit. Work is
+    /// proportional to those spans: an MM that holds none pays one check.
+    /// The spans leave the list; [`Self::restore_first_touch_stock`] puts
+    /// them back when their return fails.
+    pub(in crate::dispatch) fn take_first_touch_stock(
         &self,
-        table: &carrick_el1_abi::FrameGrantResidencyTable,
-    ) -> Vec<ReservationRange> {
-        let Some(root) = self.mem().lock().delegated_root().cloned() else {
-            return Vec::new();
-        };
-        let mut spans = Vec::new();
-        table.live_spans_overlapping(root.mm().raw(), 0, u64::MAX, |start, end| {
-            spans.push((start, end));
-        });
-        let mut stock = Vec::new();
-        for (start, end) in spans {
-            let Some(span) = ReservationRange::new(start, end) else {
-                continue;
+    ) -> (Vec<ReservationRange>, Vec<ReservationRange>) {
+        let (root, spans) = {
+            let authority = self.mem();
+            let mut mem = authority.lock();
+            if mem.first_touch_stock.is_empty() {
+                return (Vec::new(), Vec::new());
+            }
+            let Some(root) = mem.delegated_root().cloned() else {
+                mem.first_touch_stock.clear();
+                return (Vec::new(), Vec::new());
             };
+            (root, std::mem::take(&mut mem.first_touch_stock))
+        };
+        let mut stock = Vec::new();
+        for span in &spans {
             let holes = root
-                .with_root(|model| super::super::fault::root_holes(model, span))
+                .with_root(|model| super::super::fault::root_holes(model, *span))
                 .unwrap_or_default();
             stock.extend(
                 holes
@@ -95,7 +98,11 @@ impl MemView<'_> {
                     .filter_map(|(start, end)| ReservationRange::new(start, end)),
             );
         }
-        stock
+        (spans, stock)
+    }
+
+    pub(in crate::dispatch) fn restore_first_touch_stock(&self, spans: Vec<ReservationRange>) {
+        self.mem().lock().first_touch_stock.extend(spans);
     }
 
     /// Whether this MM's root owes the host any deferred return: the cheap
@@ -129,9 +136,7 @@ impl MemView<'_> {
             .map_err(El1ReturnError::Authority)?;
         // Unused first-touch stock returns with the owed extents: a host
         // mapping step must never place over backing EL1 holds for no node.
-        let stock = carrick_el1_abi::frame_grant_residency_host()
-            .map(|table| self.first_touch_stock(table))
-            .unwrap_or_default();
+        let (stock_spans, stock) = self.take_first_touch_stock();
         if through.is_none() && stock.is_empty() {
             return Ok(0);
         }
@@ -140,12 +145,14 @@ impl MemView<'_> {
             for range in owed.iter().chain(&stock) {
                 let len = usize::try_from(range.len())
                     .map_err(|_| El1ReturnError::Authority(Refusal::Invalid))?;
-                memory.unmap_range(range.start(), len).map_err(|error| {
-                    El1ReturnError::Backend {
+                if let Err(error) = memory.unmap_range(range.start(), len) {
+                    // Nothing is acknowledged; the stock is retried too.
+                    self.restore_first_touch_stock(stock_spans);
+                    return Err(El1ReturnError::Backend {
                         range: *range,
                         error,
-                    }
-                })?;
+                    });
+                }
                 memory.set_unmapped(range.start(), len, true);
                 self.remove_mapping_metadata(range.start(), range.len());
             }

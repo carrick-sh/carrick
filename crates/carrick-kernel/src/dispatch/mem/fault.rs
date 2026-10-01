@@ -806,6 +806,8 @@ pub struct ResidentFrameGrantPlan<'permit> {
     /// Planned from a delegated root: its span may include first-touch
     /// stock over root holes, and its provenance is the root's.
     pub(crate) root_owned: bool,
+    /// The span covers root holes: its grant holds first-touch stock.
+    pub(crate) stock: bool,
     pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
@@ -1144,8 +1146,16 @@ impl<'a> MemView<'a> {
         if start >= end {
             return None;
         }
+        let stock = root_owned
+            && mem.delegated_root().is_some_and(|root| {
+                ReservationRange::new(start, end).is_some_and(|span| {
+                    root.with_root(|model| root_holes(model, span))
+                        .is_ok_and(|holes| !holes.is_empty())
+                })
+            });
         Some(ResidentFrameGrantPlan {
             root_owned,
+            stock,
             fault_page: page,
             start,
             len: end - start,
@@ -1214,14 +1224,13 @@ impl<'a> MemView<'a> {
                 "caller lacks host alias dispatch exclusion during commit_resident_frame_grant"
             );
         }
-        if plan.root_owned {
-            // First-touch stock may now back root holes. A host-venue
-            // placement there must scrub it like any reused address
-            // (`next_delegated_address`), never map over live leaves.
-            let mem_authority = self.mem();
-            let mut mem = mem_authority.lock();
-            let end = plan.start.saturating_add(plan.len);
-            mem.mmap_writable_high = mem.mmap_writable_high.max(end);
+        if plan.stock
+            && let Some(span) =
+                ReservationRange::new(plan.start, plan.start.saturating_add(plan.len))
+        {
+            // Returned at the next reconciliation unless a mapping adopts
+            // it first (`returns::first_touch_stock`).
+            self.mem().lock().first_touch_stock.push(span);
         }
         // Physical preparation can be bulk; only the faulting Linux page
         // has become accessible. Keep every speculative page armed, so a
