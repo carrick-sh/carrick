@@ -3284,6 +3284,21 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn independent_backing_namespace_mutation_keeps_other_cache_generation() {
+        use crate::fs_backend::FsBackend;
+
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        let backend_a = HostFsBackend::from_path(a.path()).unwrap();
+        let backend_b = HostFsBackend::from_path(b.path()).unwrap();
+        let cache_b = DentryCache::new(false);
+        cache_b.stat("/", true, &backend_b, None).unwrap();
+        let before = cache_b.combined_generation();
+        backend_a.make_dir("/only-a").unwrap();
+        assert_eq!(cache_b.combined_generation(), before);
+    }
+
+    #[test]
     fn test_dentry_cache_positive_and_negative() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
