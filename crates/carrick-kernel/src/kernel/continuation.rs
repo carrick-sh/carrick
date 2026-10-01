@@ -2072,7 +2072,20 @@ impl BlockedContinuation {
         let family = self.family();
         let restart_class = self.authority().restart_class();
         let producer_completion = self.state().producer_completion.lock().take();
-        let outcome = if self.interrupted_by_group_stop(context.task()) {
+        // Terminal publication owns any side effects already performed by
+        // the producer. A stop wake cannot turn that result into a failure.
+        // Readiness alone owns no result: eligible waits must be interrupted
+        // before redispatch can transfer bytes or harvest epoll events.
+        let completed = matches!(
+            producer_completion,
+            Some(DispatchOutcome::Returned { .. } | DispatchOutcome::Errno { .. })
+        );
+        let event = if completed {
+            ContinuationEvent::Ready
+        } else {
+            event
+        };
+        let outcome = if !completed && self.interrupted_by_group_stop(context.task()) {
             ContinuationCompletion::Errno(LINUX_EINTR)
         } else {
             match event {

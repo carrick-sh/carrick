@@ -703,9 +703,9 @@ pub mod sysv;
 pub use sysv::BlockingSemop;
 pub use sysv::BlockingSemopStep;
 pub use sysv::SysvWaitState;
-#[cfg(test)]
-pub(crate) use sysv::blocking_semop_for_continuation_test;
 pub(crate) use sysv::{SemopChangeEnrollment, SemopChangeSubscription};
+#[cfg(test)]
+pub(crate) use sysv::{blocking_semop_for_continuation_test, complete_semop_for_continuation_test};
 #[macro_use]
 mod time;
 pub use time::{
