@@ -555,6 +555,15 @@ pub(super) fn guest_cow_awaiting_settlement(mm: carrick_kernel::kernel::MmId) ->
     carrick_el1_abi::cow_grant_pool_host().is_some_and(|pool| pool.has_completions_for(mm.raw()))
 }
 
+/// Settle `mm`'s guest COW completions before the host reads or writes its
+/// memory (a syscall buffer, a signal frame): excluding the MM's EL1 editor
+/// settles them, and nothing else of the MM is paused.
+pub(super) fn settle_guest_cow_of(mm: carrick_kernel::kernel::MmId) {
+    if guest_cow_awaiting_settlement(mm) {
+        drop(carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(mm));
+    }
+}
+
 /// Host-retained copy of one submitted guest-lane frame grant: the exact
 /// transaction (never re-read from shared memory) and what the host commits
 /// once EL1's receipt verifies.
@@ -1581,6 +1590,9 @@ where
         interrupted_pc,
         continuation_restart,
     } = restart;
+    // The frame is written to the guest stack, which EL1 may have just
+    // copied for COW.
+    settle_guest_cow_of(context.shared().mm().id());
     // Drain the cross-process explicit-signal ring into pending state, so the
     // normal delivery below runs each with the sender's identity.
     if reserved.is_none() {
@@ -3954,7 +3966,7 @@ mod guest_descriptor_lane_tests {
             .find("settle_guest_frame_grants(")
             .expect("settlement at syscall entry");
         let cow = service
-            .find("guest_cow_awaiting_settlement(")
+            .find("settle_guest_cow_of(")
             .expect("guest COW settlement at syscall entry");
         let dispatch = service
             .find("service_threaded_syscall_for_executor_inner(")
