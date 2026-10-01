@@ -102,8 +102,8 @@ pub use ids::{
 pub use mm_occupancy::{
     AddressSpacePublication, ExecutionSlot, HostExecutionSlot, MmOccupancy, MmOccupancyError,
     ReservationLimits, SlotVacancyEnrollment, SlotVacancySubscription,
-    execution_slot_for_current_thread, note_foreign_cow, publish_address_space_with_layout,
-    publish_idle_root, subscribe_slot_vacancy,
+    execution_slot_for_current_thread, is_address_space_published, note_foreign_cow,
+    publish_address_space_with_layout, publish_idle_root, subscribe_slot_vacancy,
 };
 pub use netns::{NetNs, UtsNs};
 pub use objects::{

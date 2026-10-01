@@ -1431,6 +1431,22 @@ where
                     "failed to commit parent HVPatch fork transaction: parent_pid={parent_pid}, error={error}"
                 );
             });
+            // The copied child's address space is published, and its
+            // reservation root admitted from the parent's committed root,
+            // under this fork's own MM transaction, before the child can run.
+            if let PreparedHvpatchProcessMm::Copied(prepared) = &prepared_mm {
+                let commit = parent_mutation
+                    .fork_commit(&topology, &child_dispatcher)
+                    .unwrap_or_else(|refusal| {
+                        carrick_fatal!(
+                            "hvpatch::fork_commit",
+                            "fork commit authority refused over the prepared child MM: parent_pid={parent_pid}, child_pid={child_pid}, refusal={refusal:?}"
+                        )
+                    });
+                prepared.publish_address_space(|child_ttbr0| {
+                    commit.publish_and_admit_child(&kernel.dispatcher, child_ttbr0)
+                });
+            }
         }
         drop(topology);
         drop(parent_mutation);

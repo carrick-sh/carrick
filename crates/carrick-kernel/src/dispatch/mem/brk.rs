@@ -53,7 +53,7 @@ impl<'a> MemView<'a> {
                 }
                 AnonymousAuthority::Delegated(_) => {
                     let Some(root) = mem.delegated_root().cloned() else {
-                        return Err(DispatchError::ReservationAuthority(Refusal::Stale));
+                        return Err(super::anonymous::root_refusal(Refusal::Stale));
                     };
                     this.plan_delegated_brk(&mem, root, requested)?
                 }
@@ -195,11 +195,11 @@ impl<'a> MemView<'a> {
                 return Ok(Err(BreakAnswer {
                     value: root
                         .with_root(|model| Ok(model.brk_current()))
-                        .map_err(DispatchError::ReservationAuthority)?,
+                        .map_err(super::anonymous::root_refusal)?,
                     changed: false,
                 }));
             }
-            Err(refusal) => return Err(DispatchError::ReservationAuthority(refusal)),
+            Err(refusal) => return Err(super::anonymous::root_refusal(refusal)),
         };
         let request = match decision {
             Decision::Complete(value) => {
@@ -217,8 +217,8 @@ impl<'a> MemView<'a> {
             ReservationOperation::Protect | ReservationOperation::Move => {
                 // Not a break proposal: leave the root as it was.
                 root.with_root(|model| model.refuse(request))
-                    .map_err(DispatchError::ReservationAuthority)?;
-                return Err(DispatchError::ReservationAuthority(Refusal::Invalid));
+                    .map_err(super::anonymous::root_refusal)?;
+                return Err(super::anonymous::root_refusal(Refusal::Invalid));
             }
         };
         Ok(Ok(BreakMove {
@@ -241,7 +241,7 @@ impl<'a> MemView<'a> {
         // The limits and, when finite, the charges of everything the root
         // does not hold: the guest venue decides against both.
         self.with_charged_root(&mem, &root, |_| Ok(()))
-            .map_err(DispatchError::ReservationAuthority)
+            .map_err(super::anonymous::root_refusal)
     }
 
     /// No backend work happened: withdraw a delegated proposal and answer
@@ -253,7 +253,7 @@ impl<'a> MemView<'a> {
     ) -> Result<DispatchOutcome, DispatchError> {
         if let Some((root, request)) = pending {
             root.with_root(|model| model.refuse(request))
-                .map_err(DispatchError::ReservationAuthority)?;
+                .map_err(super::anonymous::root_refusal)?;
         }
         Ok(DispatchOutcome::returned_u64(mem.program_break())?)
     }

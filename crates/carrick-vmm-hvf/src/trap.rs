@@ -437,6 +437,66 @@ pub use carrick_hal::aarch64::{
 use carrick_hal::trap::{HostAliasBacking, HostAliasSharing};
 pub use carrick_hal::trap::{RawSyscall, SyscallTrap, TrapError};
 
+/// An exit as the run loop classifies it before deciding how to answer it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunExitKind {
+    /// `hv_vcpus_exit`: a kick or a cancel, landing at any instruction.
+    Canceled,
+    /// A stage-2 abort. `alias_replayable`: a registered alias backs the
+    /// faulting high-VA address and is re-mapped into the VM in place.
+    Stage2Abort { alias_replayable: bool },
+    /// An exception the vCPU raised on purpose: an `hvc` from the EL1
+    /// vectors (syscall, kick, idle, metadata grant, the current-EL
+    /// synchronous slot) or another trapped instruction.
+    Explicit,
+}
+
+/// How the run loop answers an exit taken at EL1 inside the EL1 image,
+/// where an EL1 critical section may hold a lock (a reservation root, a
+/// zone bucket, a delegated object) that a host thread is waiting on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum El1ImageExit {
+    /// Not at EL1 inside the image: the ordinary decode applies.
+    NotInImage,
+    /// Re-enter the same vCPU at once (after the in-place alias replay):
+    /// the critical section runs to completion with no runtime step in
+    /// between, so no runtime lock can stand in its way.
+    Resume,
+    /// Terminate the carrier (`carrick_fatal!`): never surfaced to the
+    /// runtime, never delivered to the guest.
+    Fatal,
+    /// The ordinary decode applies: EL1 raised it on purpose, and does so
+    /// only outside its critical sections, with one exception the runtime
+    /// checks itself: an EL1 user copy's copy-on-write write fault
+    /// (`Stage1CowFault`), which never runs under a reservation root guard
+    /// and is refused loudly if it ever does.
+    Explicit,
+}
+
+/// The run loop's one decision for exits at EL1 inside the EL1 image: an
+/// asynchronous interruption resumes, and a stage-2 abort resumes only
+/// after its in-place replay and is fatal otherwise. No such exit reaches
+/// the runtime while a critical section is live, so a host thread waiting
+/// on an EL1-held lock waits only for EL1 instructions to retire.
+pub(crate) fn el1_image_exit(kind: RunExitKind, pstate: u64, pc: u64) -> El1ImageExit {
+    let in_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+        ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE)
+        .contains(&pc);
+    if ExecLevel::from_pstate(pstate).is_guest() || !in_image {
+        return El1ImageExit::NotInImage;
+    }
+    match kind {
+        RunExitKind::Canceled
+        | RunExitKind::Stage2Abort {
+            alias_replayable: true,
+        } => El1ImageExit::Resume,
+        RunExitKind::Stage2Abort {
+            alias_replayable: false,
+        } => El1ImageExit::Fatal,
+        RunExitKind::Explicit => El1ImageExit::Explicit,
+    }
+}
+
 pub const HVF_PAGE_SIZE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
 // Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
 // chunks. Syscall memory copies must reselect the backing at this boundary.
@@ -7888,16 +7948,12 @@ impl HvfInner {
     /// EL1 kernel image are resumed on the same vCPU until leaving EL1. Vector
     /// trampoline kicks are handled separately in the engine.
     pub(crate) fn should_resume_mid_el1(is_canceled: bool, pstate: u64, pc: u64) -> bool {
-        if !is_canceled {
-            return false;
-        }
-        let is_el1 = !ExecLevel::from_pstate(pstate).is_guest();
-        if !is_el1 {
-            return false;
-        }
-        (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-            ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE)
-            .contains(&pc)
+        let kind = if is_canceled {
+            RunExitKind::Canceled
+        } else {
+            RunExitKind::Explicit
+        };
+        el1_image_exit(kind, pstate, pc) == El1ImageExit::Resume
     }
 
     /// Run the passed `vcpu` to its next exit, decoding HVF's native trap surface
@@ -7915,6 +7971,12 @@ impl HvfInner {
         custody: &CarrierVmCustody,
         vm_generation: Option<CarrierVmGeneration>,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
+        // The slot runs (odd sequence) for exactly this call: a host thread
+        // waiting on a lock EL1 holds on this slot reads it to tell a holder
+        // still being resumed from one that left with the lock.
+        let _slot_run = carrick_el1_abi::SlotRun::enter(
+            mailbox.leased_slot().map(|slot| usize::from(slot.raw())),
+        );
         let mut kick_armed = false;
         let exit = Self::run_to_exit_inner(vcpu, mailbox, custody, vm_generation, &mut kick_armed);
         // A kick re-armed for an EL1 critical section is owed only until the
@@ -8135,12 +8197,15 @@ impl HvfInner {
             // An unresolvable stage-2 abort taken from EL1 inside the kernel image
             // must terminate cleanly with carrick_fatal!, never be delivered to the
             // guest as an EL0 signal (which would leave EL1 locks unreleased).
-            let in_el1_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-                ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE)
-                .contains(&pc);
-            if !ExecLevel::from_pstate(cpsr).is_guest()
-                && in_el1_image
-                && is_aarch64_abort_exception(exception.syndrome)
+            // A replayable alias abort was replayed in place above.
+            if is_aarch64_abort_exception(exception.syndrome)
+                && el1_image_exit(
+                    RunExitKind::Stage2Abort {
+                        alias_replayable: false,
+                    },
+                    cpsr,
+                    pc,
+                ) == El1ImageExit::Fatal
             {
                 carrick_fatal!(
                     "trap::run_to_exit",
@@ -8624,6 +8689,143 @@ mod el1_resume_tests {
             el1_pstate,
             el1_past_img
         ));
+    }
+
+    /// Every exit at EL1 inside the EL1 image is resumed, fatal, or one EL1
+    /// raised on purpose; outside the image the ordinary decode applies.
+    #[test]
+    fn el1_image_exits_never_surface_an_interrupted_critical_section() {
+        use super::{El1ImageExit, RunExitKind, el1_image_exit};
+        let el1 = 0b0100;
+        let el0 = 0b0000;
+        let mid = carrick_mem::memory::LINUX_EL1_KERNEL_BASE + 0x4000;
+        let past = carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE;
+        let replayable = RunExitKind::Stage2Abort {
+            alias_replayable: true,
+        };
+        let unresolvable = RunExitKind::Stage2Abort {
+            alias_replayable: false,
+        };
+        assert_eq!(
+            el1_image_exit(RunExitKind::Canceled, el1, mid),
+            El1ImageExit::Resume
+        );
+        assert_eq!(el1_image_exit(replayable, el1, mid), El1ImageExit::Resume);
+        assert_eq!(el1_image_exit(unresolvable, el1, mid), El1ImageExit::Fatal);
+        assert_eq!(
+            el1_image_exit(RunExitKind::Explicit, el1, mid),
+            El1ImageExit::Explicit
+        );
+        for kind in [
+            RunExitKind::Canceled,
+            replayable,
+            unresolvable,
+            RunExitKind::Explicit,
+        ] {
+            assert_eq!(
+                el1_image_exit(kind, el0, 0x40_0000),
+                El1ImageExit::NotInImage
+            );
+            assert_eq!(el1_image_exit(kind, el1, past), El1ImageExit::NotInImage);
+        }
+    }
+
+    /// A host venue waits on a reservation root guest EL1 holds, itself
+    /// holding a lock the runtime would need (the MM's `MemState`, modelled
+    /// by `mem`). The EL1 holder is interrupted mid critical section by a
+    /// kick and by a stage-2-fault-shaped exit; each is answered by the run
+    /// loop's one decision, which re-enters EL1 without a runtime step, so
+    /// the section completes and the waiter gets the root. A decision that
+    /// surfaced either exit would leave the holder waiting for the runtime
+    /// and the runtime for `mem`.
+    #[test]
+    fn a_host_waiter_gets_a_root_whose_el1_holder_takes_a_stage2_exit_mid_section() {
+        use super::{El1ImageExit, RunExitKind, el1_image_exit};
+        use carrick_el1::memory::reservations::{Layout, SharedReservations};
+        use carrick_el1_abi::{ReservationMm, ReservationRange};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A host waiter that waits on the holder's progress, as the
+        /// kernel's `RootHostWait` does: the holder slot must be running.
+        struct Waiter;
+        impl carrick_el1::memory::reservations::RootWait for Waiter {
+            fn wait(
+                &self,
+                _attempt: u32,
+                holder: carrick_el1::memory::reservations::RootHolder,
+            ) -> bool {
+                assert_eq!(
+                    holder,
+                    carrick_el1::memory::reservations::RootHolder::El1Slot(3)
+                );
+                assert_eq!(
+                    carrick_el1_abi::slot_run_sequence(3) % 2,
+                    1,
+                    "the holder's vCPU is being resumed, not abandoned"
+                );
+                std::thread::yield_now();
+                true
+            }
+        }
+
+        let table: &'static SharedReservations = unsafe {
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<SharedReservations>());
+            assert!(!ptr.is_null());
+            &*ptr.cast::<SharedReservations>()
+        };
+        let mm = ReservationMm::new(7).unwrap();
+        let heap = 0x1000_0000;
+        table
+            .publish(
+                0,
+                mm,
+                Layout {
+                    heap: ReservationRange::new(heap, heap + 0x10_0000).unwrap(),
+                    arena: ReservationRange::new(0x2000_0000, 0x3000_0000).unwrap(),
+                    brk: heap,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+        let mem = std::sync::Mutex::new(());
+        let waiting = AtomicBool::new(false);
+        let el1 = 0b0100;
+        let pc = carrick_mem::memory::LINUX_EL1_KERNEL_BASE + 0x4000;
+        std::thread::scope(|scope| {
+            // Slot 3's vCPU is in the run loop for the whole section.
+            let running = carrick_el1_abi::SlotRun::enter(Some(3));
+            let guard = table.lock_el1(0, mm, 3).unwrap();
+            let waiter = scope.spawn(|| {
+                let _mem = mem.lock().unwrap();
+                waiting.store(true, Ordering::Release);
+                table.lock_waiting(0, mm, &Waiter).is_ok()
+            });
+            while !waiting.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // The holder's vCPU exits twice mid section; the loop answers.
+            for kind in [
+                RunExitKind::Canceled,
+                RunExitKind::Stage2Abort {
+                    alias_replayable: true,
+                },
+            ] {
+                assert_eq!(
+                    el1_image_exit(kind, el1, pc),
+                    El1ImageExit::Resume,
+                    "{kind:?} mid section must re-enter EL1"
+                );
+                assert_eq!(table.el1_slot_holding(3), Some(0), "still mid section");
+            }
+            // Re-entered: the section completes and releases.
+            drop(guard);
+            assert!(waiter.join().unwrap(), "the host waiter gets the root");
+            drop(running);
+        });
+        assert!(mem.try_lock().is_ok());
     }
 
     #[test]
