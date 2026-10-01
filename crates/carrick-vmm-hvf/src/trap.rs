@@ -2811,6 +2811,12 @@ fn authenticate_pending_retirement(
     pending: &[PendingForkFrameReceipt],
     receipt: &carrick_hal::FrameInventoryRetirementReceipt,
 ) -> PendingRetirementAudit {
+    // O((n + p) log n): `authorizes` is a binary search over the receipt's
+    // sorted set, and pending receipts are matched against sorted expected
+    // mapping ids. Both were linear scans per element (O(n^2) and O(p*n)).
+    let mut expected_mappings: Vec<carrick_hal::MappingId> =
+        expected.iter().map(|&(mapping, _)| mapping).collect();
+    expected_mappings.sort_unstable();
     PendingRetirementAudit {
         mm_empty_at_revision: receipt.mm_empty_at_revision(),
         expected_non_empty: !expected.is_empty(),
@@ -2833,9 +2839,9 @@ fn authenticate_pending_retirement(
         pending_authorized: pending
             .iter()
             .filter(|pending| {
-                expected
-                    .iter()
-                    .any(|(mapping, _)| *mapping == pending.child_mapping)
+                expected_mappings
+                    .binary_search(&pending.child_mapping)
+                    .is_ok()
             })
             .all(|pending| receipt.authorizes(pending.child_mapping, pending.frame)),
     }

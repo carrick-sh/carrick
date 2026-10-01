@@ -1212,8 +1212,7 @@ impl AliasRegistry {
     }
 
     pub(crate) fn index_remove(&mut self, seq: u64, alias: AliasBacking) {
-        self.va_classes.remove(alias.start, seq, alias);
-        self.ipa_classes.remove(alias.ipa, seq, alias);
+        self.index_remove_carrier_wide(seq, alias);
         let scope = alias.ownership_scope;
         if let Some(index) = self.va_classes_by_scope.get_mut(&scope) {
             index.remove(alias.start, seq, alias);
@@ -1225,14 +1224,6 @@ impl AliasRegistry {
             index.remove(alias.physical_ipa, seq, alias);
             if index.is_empty() {
                 self.physical_classes_by_scope.remove(&scope);
-            }
-        }
-        if let Some(rows) = self.by_physical_start.get_mut(&alias.physical_ipa) {
-            if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
-                rows.remove(at);
-            }
-            if rows.is_empty() {
-                self.by_physical_start.remove(&alias.physical_ipa);
             }
         }
         let physical_key = (alias.ownership_scope, alias.physical_ipa);
@@ -1257,6 +1248,22 @@ impl AliasRegistry {
             if counts.is_empty() {
                 self.physical_size_counts_by_scope
                     .remove(&alias.ownership_scope);
+            }
+        }
+    }
+
+    /// Remove one row from the indexes shared by every scope. A row's own
+    /// scope indexes are removed by [`Self::index_remove`], or dropped whole
+    /// when the scope retires ([`Self::retire_scope`]).
+    fn index_remove_carrier_wide(&mut self, seq: u64, alias: AliasBacking) {
+        self.va_classes.remove(alias.start, seq, alias);
+        self.ipa_classes.remove(alias.ipa, seq, alias);
+        if let Some(rows) = self.by_physical_start.get_mut(&alias.physical_ipa) {
+            if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
+                rows.remove(at);
+            }
+            if rows.is_empty() {
+                self.by_physical_start.remove(&alias.physical_ipa);
             }
         }
     }
@@ -1850,8 +1857,26 @@ impl AliasRegistry {
         self.bump_scope_revision(scope);
         self.rows = self.rows.saturating_sub(bucket.rows.len());
         note_alias_state_rows_scanned(bucket.rows.len());
+        // The scope's own indexes go whole; only the carrier-wide ones need a
+        // per-row removal. Per-row removal from all of them cost four class
+        // index edits and two bucket scans per row (26% of a cpython process
+        // teardown, cow-and-teardown.md).
+        self.va_classes_by_scope.remove(&scope);
+        self.physical_classes_by_scope.remove(&scope);
+        let scope_physical: Vec<_> = self
+            .by_scope_physical_start
+            .range((scope, 0)..=(scope, u64::MAX))
+            .map(|(&key, _)| key)
+            .collect();
+        for key in scope_physical {
+            self.by_scope_physical_start.remove(&key);
+        }
         for &(seq, alias) in &bucket.rows {
-            self.index_remove(seq, alias);
+            if alias.ownership_scope == scope {
+                self.index_remove_carrier_wide(seq, alias);
+            } else {
+                self.index_remove(seq, alias);
+            }
         }
         let aliases = bucket.rows.into_iter().map(|(_, alias)| alias).collect();
         RetiredRows::new(aliases)

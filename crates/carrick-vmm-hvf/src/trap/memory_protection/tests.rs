@@ -550,6 +550,64 @@ mod alias_registry_tests {
         );
     }
 
+    /// Retiring a scope drops its own indexes whole and edits only the
+    /// carrier-wide ones per row, leaving exactly what rebuilding every index
+    /// from the surviving buckets would give. Adversarial shape: many scopes
+    /// whose rows share starts and physical extents (fork siblings mapping the
+    /// same frames), so carrier-wide buckets hold rows of every scope.
+    #[test]
+    fn retiring_a_scope_leaves_the_indexes_a_rebuild_would() {
+        let scope = |index: u64| AliasOwnershipScope::MmRootSlot {
+            base: 0x9000_0000 + index * 0x20_0000,
+            size: 0x20_0000,
+        };
+        let row = |owner: u64, page: u64, wide: bool| AliasBacking {
+            start: 0x4000_0000 + page * 0x4000,
+            ipa: crate::memory::LINUX_ALIAS_IPA_BASE + page * 0x4000,
+            host_addr: 0x1000_0000 + (page as usize) * 0x4000,
+            size: if wide { 0x8000 } else { HVF_PAGE_SIZE as usize },
+            physical_ipa: crate::memory::LINUX_ALIAS_IPA_BASE + (page / 4) * 0x10000,
+            physical_host_addr: 0x1000_0000 + (page as usize / 4) * 0x10000,
+            physical_size: 0x10000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: scope(owner),
+            inventory_backing: InventoryBackingIdentity::Private(owner),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        let mut registry = AliasRegistry::default();
+        for owner in 0..12 {
+            for page in 0..64 {
+                registry.push(row(owner, page, page % 3 == 0));
+            }
+        }
+        let retired = registry.retire_scope(scope(5));
+        assert_eq!(retired.len(), 64);
+        assert_eq!(registry.rows, 11 * 64);
+        let mut rebuilt = registry.clone();
+        rebuilt.reindex();
+        assert_eq!(registry.va_classes, rebuilt.va_classes);
+        assert_eq!(registry.ipa_classes, rebuilt.ipa_classes);
+        assert_eq!(registry.va_classes_by_scope, rebuilt.va_classes_by_scope);
+        assert_eq!(
+            registry.physical_classes_by_scope,
+            rebuilt.physical_classes_by_scope
+        );
+        assert_eq!(registry.by_physical_start, rebuilt.by_physical_start);
+        assert_eq!(
+            registry.by_scope_physical_start,
+            rebuilt.by_scope_physical_start
+        );
+        assert_eq!(
+            registry.physical_size_counts_by_scope,
+            rebuilt.physical_size_counts_by_scope
+        );
+        assert!(!registry.va_classes_by_scope.contains_key(&scope(5)));
+    }
+
     #[test]
     fn address_space_replacement_drops_only_its_private_alias_scope() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();

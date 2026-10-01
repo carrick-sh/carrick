@@ -359,12 +359,12 @@ impl FrameInventoryAuthority {
             .ok_or(FrameInventoryError::UnreservedTransaction(transaction))?;
         let mut mappings = Vec::new();
         for event in commit.batch().events() {
-            if let FrameInventoryEvent::PrepareMapping { mapping, frame, .. } = *event
-                && !mappings.contains(&(mapping, frame))
-            {
+            if let FrameInventoryEvent::PrepareMapping { mapping, frame, .. } = *event {
                 mappings.push((mapping, frame));
             }
         }
+        mappings.sort_unstable();
+        mappings.dedup();
         let mm_id = mm;
         let (outcome, revision, _) = self.apply_inner(mm_id, commit, None, grant)?;
         let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
@@ -458,6 +458,8 @@ impl FrameInventoryAuthority {
             .get(&transaction)
             .map(|reservation| reservation.provenance)
             .ok_or(FrameInventoryError::UnreservedTransaction(transaction))?;
+        // One entry per unmapped (mapping, frame): sort and dedup instead of
+        // a `contains` per event, which made a process retirement O(n^2).
         let mut mappings = Vec::new();
         for event in commit.batch().events() {
             if let FrameInventoryEvent::UnmapMapping { mapping, .. } = *event {
@@ -466,11 +468,11 @@ impl FrameInventoryAuthority {
                     .get(&mapping)
                     .map(|entry| entry.frame)
                     .ok_or(FrameInventoryError::NonliveMapping(mapping))?;
-                if !mappings.contains(&(mapping, frame)) {
-                    mappings.push((mapping, frame));
-                }
+                mappings.push((mapping, frame));
             }
         }
+        mappings.sort_unstable();
+        mappings.dedup();
         drop(state);
         let mm_id = mm;
         let (outcome, revision, mm_empty_at_revision) =
