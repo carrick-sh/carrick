@@ -191,6 +191,9 @@ struct Measured {
     lifecycle_declines: [u64; carrick_el1_abi::LifecycleDecline::COUNT],
     /// Pipe/eventfd calls EL1 left for the host, by `IpcLeave` index.
     ipc_leaves: [u64; carrick_el1_abi::IpcLeave::COUNT],
+    /// Delegated-MM anonymous calls EL1 left for the host, by
+    /// `AnonymousLeave` index.
+    anonymous_leaves: [u64; carrick_el1_abi::AnonymousLeave::COUNT],
     host_work_publications: [u64; carrick_el1_abi::HostWorkPublishReason::COUNT],
     cpu_ns: u64,
     wall: Duration,
@@ -222,6 +225,12 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     let ipc_leaves_before = read_el1_counters()
         .map_or([0; carrick_el1_abi::IpcLeave::COUNT], |c| {
             std::array::from_fn(|i| c.ipc_leaves[i].load(std::sync::atomic::Ordering::Relaxed))
+        });
+    let anonymous_leaves_before =
+        read_el1_counters().map_or([0; carrick_el1_abi::AnonymousLeave::COUNT], |c| {
+            std::array::from_fn(|i| {
+                c.anonymous_leaves[i].load(std::sync::atomic::Ordering::Relaxed)
+            })
         });
     let zone_before = ZoneCounts::read();
     let cpu_before = carrier_cpu_ns();
@@ -292,6 +301,14 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
                 .saturating_sub(ipc_leaves_before[i])
         })
     });
+    let anonymous_leaves =
+        read_el1_counters().map_or([0; carrick_el1_abi::AnonymousLeave::COUNT], |c| {
+            std::array::from_fn(|i| {
+                c.anonymous_leaves[i]
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(anonymous_leaves_before[i])
+            })
+        });
     let host_work_after = carrick_el1_abi::host_work_publication_counts();
     let host_work_publications = std::array::from_fn(|i| host_work_after[i] - host_work_before[i]);
     let zone = ZoneCounts::read().since(zone_before);
@@ -306,6 +323,7 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         forwarded_syscalls,
         lifecycle_declines,
         ipc_leaves,
+        anonymous_leaves,
         host_work_publications,
         cpu_ns,
         wall,
@@ -376,6 +394,33 @@ fn host_work_breakdown(measured: &Measured) -> String {
 }
 
 /// Nonzero `IpcLeave` counts, as `(reason, count)`.
+/// Each named reason EL1 left a delegated-MM anonymous call for the host,
+/// nonzero ones only: the cause list a red `el1_` anonymous witness reports.
+fn anonymous_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
+    use carrick_el1_abi::AnonymousLeave as L;
+    [
+        ("pending_host_work", L::PendingHostWork),
+        ("root_busy", L::RootBusy),
+        ("root_unavailable", L::RootUnavailable),
+        ("root_declined", L::RootDeclined),
+        ("no_grant", L::NoGrant),
+        ("editor_busy", L::EditorBusy),
+        ("backing_host_owned_leaf", L::BackingHostOwnedLeaf),
+        ("backing_block", L::BackingBlock),
+        ("backing_multi_run", L::BackingMultiRun),
+        ("backing_malformed", L::BackingMalformed),
+        ("backing_retired", L::BackingRetired),
+        ("edit_refused", L::EditRefused),
+        ("journal_full", L::JournalFull),
+    ]
+    .into_iter()
+    .filter_map(|(name, reason)| {
+        let count = measured.anonymous_leaves[reason as usize];
+        (count != 0).then_some((name, count))
+    })
+    .collect()
+}
+
 fn ipc_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
     use carrick_el1_abi::IpcLeave as L;
     [
@@ -3374,8 +3419,9 @@ fn el1_anonymous_reservations_stay_in_guest() {
 
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched anonymous-reservations count={count} exits={} served_mmap={served_mmap} forwarded_mmap={forwarded_mmap} served_brk={served_brk} forwarded_brk={forwarded_brk} {}",
+            "el1-sched anonymous-reservations count={count} exits={} served_mmap={served_mmap} forwarded_mmap={forwarded_mmap} served_brk={served_brk} forwarded_brk={forwarded_brk} anonymous_leaves={:?} {}",
             measured.exits,
+            anonymous_leaves_breakdown(&measured),
             stdout.trim()
         );
 
@@ -3387,7 +3433,8 @@ fn el1_anonymous_reservations_stay_in_guest() {
         );
         assert!(
             served_mmap >= count as u64,
-            "EL1 must serve every anonymous mmap: expected >= {count} served, got {served_mmap}"
+            "EL1 must serve every anonymous mmap: expected >= {count} served, got {served_mmap}; leaves {:?}",
+            anonymous_leaves_breakdown(&measured)
         );
         assert!(
             served_brk >= 2,
@@ -3471,8 +3518,9 @@ fn el1_delegated_root_concurrent_vma_ops() {
             forwarded[i] = after[i][1].saturating_sub(before[i][1]);
         }
         println!(
-            "el1-sched delegated-root-vma rounds={rounds} exits={} served[mmap,munmap,mprotect]={served:?} forwarded[mmap,munmap,mprotect]={forwarded:?} {}",
+            "el1-sched delegated-root-vma rounds={rounds} exits={} served[mmap,munmap,mprotect]={served:?} forwarded[mmap,munmap,mprotect]={forwarded:?} anonymous_leaves={:?} {}",
             measured.exits,
+            anonymous_leaves_breakdown(&measured),
             stdout.trim()
         );
         assert!(measured.result.success(), "{}", describe(&measured));
@@ -3493,10 +3541,11 @@ fn el1_delegated_root_concurrent_vma_ops() {
             let expected = 2 * PER_ROUND[i] * rounds;
             assert!(
                 served[i] >= expected,
-                "EL1 must serve every delegated-MM {}: expected >= {expected} served, got {} (forwarded {})",
+                "EL1 must serve every delegated-MM {}: expected >= {expected} served, got {} (forwarded {}); leaves {:?}",
                 DELEGATED_SYSCALLS[i].0,
                 served[i],
-                forwarded[i]
+                forwarded[i],
+                anonymous_leaves_breakdown(&measured)
             );
         }
         runs.push((rounds, forwarded));
@@ -3550,10 +3599,11 @@ fn el1_delegated_root_map_fixed_over_cow_pages() {
         let forwarded = after[1].saturating_sub(before[1]);
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched delegated-root-fixed-cow pages={PAGES} rounds={rounds} exits={} served_mmap[{MMAP}]={served} forwarded_mmap={forwarded} grants={} returns={} {}",
+            "el1-sched delegated-root-fixed-cow pages={PAGES} rounds={rounds} exits={} served_mmap[{MMAP}]={served} forwarded_mmap={forwarded} grants={} returns={} anonymous_leaves={:?} {}",
             measured.exits,
             grants_after.grants_succeeded - grants_before.grants_succeeded,
             grants_after.returns_completed - grants_before.returns_completed,
+            anonymous_leaves_breakdown(&measured),
             stdout.trim()
         );
         assert!(measured.result.success(), "{}", describe(&measured));
@@ -3566,8 +3616,9 @@ fn el1_delegated_root_map_fixed_over_cow_pages() {
         );
         assert!(
             served >= 3 * rounds,
-            "EL1 must serve every MAP_FIXED replacement on a delegated MM: expected >= {} served, got {served} (forwarded {forwarded})",
-            3 * rounds
+            "EL1 must serve every MAP_FIXED replacement on a delegated MM: expected >= {} served, got {served} (forwarded {forwarded}); leaves {:?}",
+            3 * rounds,
+            anonymous_leaves_breakdown(&measured)
         );
         runs.push((rounds, forwarded));
     }
