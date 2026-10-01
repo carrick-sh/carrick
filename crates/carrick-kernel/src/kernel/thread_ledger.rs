@@ -561,6 +561,91 @@ mod tests {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
     }
 
+    #[test]
+    fn lifecycle_identity_precedes_adoption_in_two_processes() {
+        let (kernel, root) = bootstrap(9_600);
+        kernel.registry().thread_ledger().set_pool_depth_for_test(0);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_601),
+                "peer".into(),
+                None,
+            )
+            .unwrap();
+        let first = kernel
+            .reserve_thread_clone(&root, thread_plan(), None)
+            .unwrap();
+        let second = kernel
+            .reserve_thread_clone(&peer, thread_plan(), None)
+            .unwrap();
+        // Adoption may run in the reverse order of births. It must consume
+        // identities already issued at reservation, not mint their serials.
+        let second = second
+            .prepare(ThreadId::synthetic_for_tests(9_603))
+            .unwrap();
+        let first = first.prepare(ThreadId::synthetic_for_tests(9_602)).unwrap();
+        let first_key = first.prepared_execution_identity().1;
+        let second_key = second.prepared_execution_identity().1;
+        assert!(
+            first_key.serial.raw() < second_key.serial.raw(),
+            "identity was assigned at adoption: {first_key:?} {second_key:?}"
+        );
+        let first = first.commit().unwrap().into_context().unwrap();
+        let second = second.commit().unwrap().into_context().unwrap();
+        assert_eq!(first.thread().key(), first_key);
+        assert_eq!(second.thread().key(), second_key);
+        assert_eq!(first.task().key(), root.task().key());
+        assert_eq!(second.task().key(), peer.task().key());
+    }
+
+    #[test]
+    fn lifecycle_clone_seed_is_bound_at_claim_in_two_processes() {
+        let (kernel, root) = bootstrap(9_610);
+        kernel.registry().thread_ledger().set_pool_depth_for_test(0);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_611),
+                "peer".into(),
+                None,
+            )
+            .unwrap();
+        for (index, parent) in [&root, &peer].into_iter().enumerate() {
+            let mask = carrick_abi::SigSet::from_raw(1 << (10 + index));
+            let affinity = carrick_hal::CpuAffinity::from_words(&[1 << index]);
+            parent.thread().store_blocked(mask);
+            parent.thread().set_affinity(affinity);
+            let claim = kernel
+                .reserve_thread_clone(parent, thread_plan(), None)
+                .unwrap();
+            parent.thread().store_blocked(carrick_abi::SigSet::EMPTY);
+            parent
+                .thread()
+                .set_affinity(carrick_hal::CpuAffinity::from_words(&[4]));
+            let child = claim
+                .prepare(ThreadId::synthetic_for_tests(9_612 + index as i32))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_context()
+                .unwrap();
+            assert_eq!(
+                child.thread().blocked_mask(),
+                mask,
+                "clone must inherit the claim-time mask"
+            );
+            assert_eq!(
+                child.thread().affinity(),
+                affinity,
+                "clone must inherit the claim-time affinity"
+            );
+            assert_eq!(parent.thread().blocked_mask(), carrick_abi::SigSet::EMPTY);
+        }
+    }
+
     /// Drop `root` to real uid 1000 under a soft `RLIMIT_NPROC` of `soft`,
     /// with the default (Docker) capability set: no `CAP_SYS_ADMIN`, no
     /// `CAP_SYS_RESOURCE`.
