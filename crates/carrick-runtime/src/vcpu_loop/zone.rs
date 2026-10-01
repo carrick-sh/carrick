@@ -665,7 +665,7 @@ where
             Some(Handback::Signal) => Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
             // The host needed it runnable (an exit or exec drain, or a
             // control action): its wait ends as a spurious wakeup.
-            Some(Handback::Control) => Some(0),
+            Some(Handback::Control | Handback::GroupStop) => Some(0),
             // A service record names a thread the host made runnable; it is
             // loaded from its own residency, never resumed from a zone wait.
             Some(Handback::Cancelled | Handback::Service) | None => {
@@ -1125,6 +1125,7 @@ where
             // The deadline of a timed park (an epoll wait) the host kept
             // after it settled the slot.
             Some(Handback::Timeout) => Some(host_ipc::IpcCause::Timeout),
+            Some(Handback::GroupStop) => Some(host_ipc::IpcCause::Stop),
             // A control quantum for a job-control stop is a stop; the rest
             // (exec/exit drain, quiesce) never interrupt a call.
             Some(Handback::Control) if self.job_control_stopped() => Some(host_ipc::IpcCause::Stop),

@@ -2021,10 +2021,16 @@ fn late_host_requests_neither_target_nor_mask_a_new_incarnation() {
     zone.free_record(record);
     assert_eq!(park(&zone, 2, 0x1000), record);
     let replacement = zone.record_ref(record);
-    admitted.host_wanted.publish(original.incarnation);
+    admitted
+        .host_wanted
+        .publish(original.incarnation, Handback::Control);
     assert!(!zone.record(record).host_wanted());
-    admitted.host_wanted.publish(replacement.incarnation);
-    admitted.host_wanted.publish(original.incarnation);
+    admitted
+        .host_wanted
+        .publish(replacement.incarnation, Handback::Control);
+    admitted
+        .host_wanted
+        .publish(original.incarnation, Handback::Control);
     assert!(
         zone.record(record).host_wanted(),
         "old publisher masked current request"

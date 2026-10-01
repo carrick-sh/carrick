@@ -236,6 +236,13 @@ impl Kernel {
         if !task.stop_for_job_control(signal, action_generation) {
             return false;
         }
+        crate::el1_zone::claim_group_stop(
+            &task
+                .threads()
+                .iter()
+                .map(|thread| thread.key())
+                .collect::<Vec<_>>(),
+        );
         drop(generation);
         let parent = self.current_parent_task(&task);
         task.wake();

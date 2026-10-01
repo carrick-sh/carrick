@@ -342,6 +342,31 @@ pub fn requeue<E>(
     Ok((woken, moved))
 }
 
+/// Route an actual kernel group stop through the existing zone ownership
+/// protocol. Exact thread identities fence this from other tasks, including
+/// tasks sharing an address space. One bounded census per stop; no polling.
+pub(crate) fn claim_group_stop(threads: &[crate::kernel::ThreadKey]) {
+    let Some(zone) = zone_tables() else {
+        return;
+    };
+    let keys: std::collections::BTreeSet<_> = threads.iter().copied().collect();
+    for index in 1..carrick_sched_core::ZONE_RECORDS {
+        let Some(id) = u32::try_from(index)
+            .ok()
+            .and_then(carrick_el1_abi::RecordId::from_raw)
+        else {
+            continue;
+        };
+        let record = zone.record_ref(id);
+        if thread_key_of(record).is_some_and(|key| keys.contains(&key)) {
+            match claim(record, None, Handback::GroupStop) {
+                HostClaim::Claimed | HostClaim::AlreadyHost => publish_handback(record),
+                HostClaim::El1Held { .. } | HostClaim::Deferred | HostClaim::Stale => {}
+            }
+        }
+    }
+}
+
 /// Whether the zone thread `record` is running or runnable in the guest
 /// (`Some(true)`: queued, on a vCPU, or claimed by the host to run) or parked
 /// there (`Some(false)`); `None` if the record is gone.
@@ -810,6 +835,120 @@ mod tests {
             generation: 1,
             affinity: 0,
         }
+    }
+
+    #[test]
+    fn serial_host_group_stop_claims_zone_wait_before_continue() {
+        use crate::kernel::continuation::test_support::bootstrap;
+        use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+        let (kernel, context) = bootstrap(153_900);
+        let plan = crate::kernel::ClonePlan::from_flags(
+            crate::linux_abi::LinuxCloneFlags::THREAD
+                | crate::linux_abi::LinuxCloneFlags::SIGHAND
+                | crate::linux_abi::LinuxCloneFlags::VM,
+        )
+        .unwrap();
+        let sibling = kernel
+            .clone_thread(
+                &context,
+                plan,
+                crate::thread::ThreadId::synthetic_for_tests(153_901),
+                None,
+            )
+            .unwrap();
+        let layout =
+            std::alloc::Layout::from_size_align(carrick_el1_abi::EL1_REGION_SIZE as usize, 64)
+                .unwrap();
+        // SAFETY: an aligned zeroed carrier region is a valid empty ABI image.
+        let region = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!region.is_null());
+        carrick_el1_abi::record_el1_region_host_ptr(region as usize);
+        let zone = carrick_el1_abi::zone_tables().unwrap();
+        let key = context.thread().key();
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: key.tid.raw() as u64,
+                serial: key.serial.raw(),
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let lane = ObjectWaitKey::new(1, 1).unwrap();
+        zone.bind_object_wait(lane, &HostLockWait).unwrap();
+        let queue = zone.object_wait(lane, &HostLockWait).unwrap();
+        queue
+            .park(queue.snapshot(), record, OperationToken::new(1, 1).unwrap())
+            .unwrap();
+        drop(queue);
+        let sibling_key = sibling.thread().key();
+        let sibling_record = zone
+            .alloc_record(ThreadIdentity {
+                tid: sibling_key.tid.raw() as u64,
+                serial: sibling_key.serial.raw(),
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let foreign_record = zone.alloc_record(identity(153_902)).unwrap();
+        for (parked, token) in [(sibling_record, 2), (foreign_record, 3)] {
+            let queue = zone.object_wait(lane, &HostLockWait).unwrap();
+            queue
+                .park(
+                    queue.snapshot(),
+                    parked,
+                    OperationToken::new(token, 1).unwrap(),
+                )
+                .unwrap();
+        }
+        let stop =
+            crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).unwrap();
+        let cont =
+            crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).unwrap();
+        assert!(kernel.stop_task_for_job_control(context.task().key().id, stop, None));
+        assert!(kernel.post_signal_to_task(context.task().key().id, cont, None));
+        let claimed = matches!(zone.record(record).claim(), Claim::Host { .. });
+        let reason = zone.record(record).handback();
+        let sibling_claimed = matches!(zone.record(sibling_record).claim(), Claim::Host { .. });
+        let foreign_parked = matches!(zone.record(foreign_record).claim(), Claim::Parked { .. });
+        // Clear the process-global mapping before any assertion may unwind.
+        carrick_el1_abi::record_el1_region_host_ptr(0);
+        // SAFETY: the original aligned allocation is no longer published.
+        unsafe {
+            std::alloc::dealloc(region, layout);
+        }
+        assert!(
+            claimed,
+            "group stop must take the parked zone operation before SIGCONT"
+        );
+        assert_eq!(reason, Some(Handback::GroupStop));
+        assert!(sibling_claimed, "every sibling joins the group stop");
+        assert!(
+            foreign_parked,
+            "a distinct thread group sharing the MM is untouched"
+        );
+        let op = carrick_el1_abi::ipc::IpcOperation {
+            kind: carrick_el1_abi::ipc::IpcOpKind::EpollWait,
+            ..carrick_el1_abi::ipc::IpcOperation::EMPTY
+        };
+        assert_eq!(
+            crate::kernel::continuation::ipc::interrupted(
+                &op,
+                crate::kernel::continuation::ipc::IpcCause::Stop,
+                crate::kernel::continuation::ipc::CounterClock {
+                    now: 1,
+                    numer: 1,
+                    denom: 1
+                },
+            ),
+            crate::kernel::continuation::ipc::IpcHostOutcome::Complete {
+                result: carrick_abi::LINUX_EINTR.guest_retval(),
+                sigpipe: false,
+            }
+        );
     }
 
     /// Contract kernel.el1.deferred-handback-identity. The slot evacuation
