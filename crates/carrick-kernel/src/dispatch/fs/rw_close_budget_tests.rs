@@ -72,7 +72,7 @@ fn forwarded_read_per_call_budget() {
     let buf_addr = MEM_BASE + 0x1000;
     let count = 16384u64;
 
-    let (outcome, snapshot) = budget_meter::measure(|| {
+    let (outcome, snapshot) = budget_meter::measure_no_allocations(|| {
         dispatcher
             .dispatch(
                 &context,
@@ -132,7 +132,7 @@ fn forwarded_write_per_call_budget() {
     let buf_addr = MEM_BASE + 0x1000;
     let count = 8192u64;
 
-    let (outcome, snapshot) = budget_meter::measure(|| {
+    let (outcome, snapshot) = budget_meter::measure_no_allocations(|| {
         dispatcher
             .dispatch(
                 &context,
@@ -189,7 +189,7 @@ fn forwarded_close_per_call_budget() {
         .install_fd_at_or_above(3, open_file)
         .expect("install fd");
 
-    let (outcome, snapshot) = budget_meter::measure(|| {
+    let (outcome, snapshot) = budget_meter::measure_no_allocations(|| {
         dispatcher
             .dispatch(
                 &context,
