@@ -2075,7 +2075,7 @@ impl BlockedContinuation {
         // Terminal publication owns any side effects already performed by
         // the producer. A stop wake cannot turn that result into a failure.
         // Readiness alone owns no result: eligible waits must be interrupted
-        // before redispatch can transfer bytes or harvest epoll events.
+        // before redispatch can transfer bytes or harvest readiness events.
         let completed = matches!(
             producer_completion,
             Some(DispatchOutcome::Returned { .. } | DispatchOutcome::Errno { .. })
