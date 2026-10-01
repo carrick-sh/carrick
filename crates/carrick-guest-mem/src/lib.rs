@@ -787,6 +787,18 @@ pub trait GuestMemory {
         self.set_unmapped(address, len, false);
     }
 
+    /// Drop the host protection facts for the pages of a live root-owned
+    /// mapping `[address, address + len)` whose permissions the root and
+    /// guest EL1 decide: pages with no terminal yet, or with an EL1-private
+    /// terminal (which carries its own permissions). A guest-venue edit
+    /// never updates the host registry, so a fact left there goes stale the
+    /// moment EL1 edits the page. Pages whose terminal the host owns keep
+    /// their facts (every edit of them reaches the host). The default (no
+    /// page tables) treats every page as root-decided.
+    fn release_root_facts(&mut self, address: u64, len: usize) {
+        self.return_to_root(address, len);
+    }
+
     /// Publish all permission metadata for one live mapping as a single state
     /// transition. Real shared-memory backends override this to keep sibling
     /// vCPUs from observing an accessible gap between separate updates.
