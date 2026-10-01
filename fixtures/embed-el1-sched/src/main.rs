@@ -93,6 +93,9 @@
 //!   `munmap`s it; the worker's next write and read must each fault exactly
 //!   once, and the read must see a fresh zero page (no stale translation).
 //!
+//! - `tlb-edit-budget`, `tlb-stale-threads`, `tlb-fork-stale`,
+//!   `tlb-exec-stale`: TLB-maintenance witnesses, described in `tlb.rs`.
+//!
 //! - `fault-entry`: triggers a stage-1 permission fault on a PROT_READ mapping,
 //!   catches SIGSEGV with SA_SIGINFO, verifies si_addr, mprotects PROT_READ|PROT_WRITE,
 //!   retries store, and verifies store success and register preservation.
@@ -107,6 +110,7 @@ mod delegated_root;
 mod ipc;
 mod sample_buffer;
 mod threads;
+mod tlb;
 use sample_buffer::measured_samples;
 
 const SYS_FUTEX: u64 = 98;
@@ -3388,6 +3392,18 @@ fn main() {
         "cross-vcpu-stale" => {
             cross_vcpu_stale(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200))
         }
+        "tlb-edit-budget" => {
+            tlb::edit_budget(&args[0], args.get(2).and_then(|n| n.parse().ok()).unwrap_or(32))
+        }
+        "tlb-stale-threads" => tlb::stale_threads(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(2),
+        ),
+        "tlb-fork-stale" => {
+            tlb::fork_stale(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(50))
+        }
+        "tlb-exec-stale" => tlb::exec_stale(&args[0]),
+        "tlb-exec-stale-child" => tlb::exec_stale_child(args.get(2).map(String::as_str)),
         "permission-transitions" => permission_transitions(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
