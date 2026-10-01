@@ -235,11 +235,12 @@ impl SharedReservations {
         index: usize,
         mm: ReservationMm,
         nodes: &'a ResolvedReservationNodes<P>,
+        wait: &dyn carrick_sched_core::LockWait,
     ) -> Result<Reservations<'a>, Refusal> {
         if !core::ptr::eq(nodes.table, self) {
             return Err(Refusal::Stale);
         }
-        self.lock_using(index, mm, Some(nodes), false)
+        self.lock_using(index, mm, Some(nodes), false, wait)
     }
 
     #[cfg(test)]
@@ -248,7 +249,7 @@ impl SharedReservations {
         index: usize,
         mm: ReservationMm,
     ) -> Result<Reservations<'_>, Refusal> {
-        self.lock_using(index, mm, None, true)
+        self.lock_using(index, mm, None, true, &carrick_sched_core::BoundedSpin(0))
     }
 
     pub(super) fn node<'a>(&'a self, id: u32, banks: Option<&'a dyn NodeBanks>) -> &'a Node {
@@ -427,7 +428,9 @@ mod tests {
             "unresolved host view must not dereference guest addresses"
         );
         for (index, mm) in [(0, a), (1, b)] {
-            let mut model = table.lock_resolved(index, mm, &host).unwrap();
+            let mut model = table
+                .lock_resolved(index, mm, &host, &carrick_sched_core::BoundedSpin(0))
+                .unwrap();
             let decision = model
                 .mmap(Placement::Anywhere, 8192, ReservationProtection::READ_WRITE)
                 .unwrap();
@@ -453,7 +456,9 @@ mod tests {
         finish(&mut guest, decision);
         let committed_generation = guest.generation();
         drop(guest);
-        let mut first = table.lock_resolved(0, a, &host).unwrap();
+        let mut first = table
+            .lock_resolved(0, a, &host, &carrick_sched_core::BoundedSpin(0))
+            .unwrap();
         assert!(!first.authenticate_fault(old));
         assert_eq!(
             first.mapping(0x100000).unwrap().generation,
@@ -464,7 +469,9 @@ mod tests {
             ReservationProtection::NONE
         );
         drop(first);
-        let mut second = table.lock_resolved(1, b, &host).unwrap();
+        let mut second = table
+            .lock_resolved(1, b, &host, &carrick_sched_core::BoundedSpin(0))
+            .unwrap();
         assert_eq!(
             second.mapping(0x100000).unwrap().protection,
             ReservationProtection::READ_WRITE

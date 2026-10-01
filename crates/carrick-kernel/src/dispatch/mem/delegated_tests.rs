@@ -100,7 +100,9 @@ pub(in crate::dispatch) struct Root {
 struct View(Carrier);
 impl PreparedHostReservations for View {
     fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-        self.0.table.lock(self.0.slot(mm)?, mm)
+        self.0
+            .table
+            .lock_waiting(self.0.slot(mm)?, mm, &crate::el1_zone::HostLockWait)
     }
 }
 struct Provider(Carrier);
@@ -807,6 +809,34 @@ fn delegated_fault_on_a_root_owned_page_is_planned_from_the_root() {
 
     twin.munmap(base, PAGE);
     answers(&twin, "after an munmap of a root-owned page");
+}
+
+/// A guest-venue editor (EL1 on a sibling vCPU of the same MM) holds the
+/// root while the host classifies a fault there. The host waits the holder
+/// out: an EL1 critical section never blocks and its executor resumes it to
+/// completion. Answering `Busy` as a broken root aborted the carrier
+/// (go-build with reservations on: "refused a first-touch observation:
+/// Busy", then every executor's boundary audit saw the abort's mask).
+#[test]
+fn delegated_fault_classifier_waits_out_a_guest_venue_holder() {
+    let mut twin = Twin::new();
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.anonymous(base, 2 * PAGE, RW);
+    let Twin {
+        delegated, root, ..
+    } = &twin;
+    let held = root.lock();
+    let tracked = std::thread::scope(|scope| {
+        let classifier = scope.spawn(|| delegated.fault_requires_mm_mutation(base));
+        // The classifier reaches the held root before it is released.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(held);
+        classifier.join().expect("the classifier finishes")
+    });
+    assert!(
+        tracked,
+        "a root-owned page's first touch is the host's to serve"
+    );
 }
 
 #[test]

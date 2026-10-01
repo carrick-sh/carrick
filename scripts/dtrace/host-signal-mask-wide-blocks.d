@@ -26,6 +26,19 @@
  *     a thread first seen here, so an INHERITED wide mask shows only through
  *     the creating thread's `bsdthread_create` record.
  *
+ *     Finding (2026-10-01, go-build, reservations on): no traced syscall
+ *     widened an executor's mask. Its own boundary read (WIDE-QUERY,
+ *     `current_signal_mask`) saw 0xfffefeff, every catchable signal, on
+ *     two executors at once, right after another thread's `carrick_fatal`
+ *     began `abort()` (its 0xffffffff / 0xffffffdf SETMASKs). So the audit
+ *     failure was the abort's fallout, not a leak: read stderr for
+ *     `carrick fatal` before chasing a mask writer. The fatal there was the
+ *     host fault classifier answering a root held by EL1 with `Busy`.
+ *     ustack() frames in carrick print unsymbolized when the carrier has
+ *     exited; `atos -o target/release/carrick -l <load>` recovers them (the
+ *     load address is the frame of `thread_start` minus its nm offset,
+ *     page-rounded).
+ *
  * (c) Perturbation: low. Mask changes are rare on the carrier (VM and vCPU
  *     creation, tty paths); only wide ones take a ustack().
  *
@@ -35,6 +48,15 @@
  */
 
 inline int WIDE = 16;
+
+self uint32_t mask;
+self uint32_t set;
+self int how;
+self int armed;
+self int wide;
+this uint32_t old;
+this uint32_t seen;
+self uint64_t query;
 
 syscall::__pthread_sigmask:entry,
 syscall::sigprocmask:entry
@@ -85,6 +107,47 @@ syscall::sigprocmask:return
     self->armed = 0;
 }
 
+/*
+ * A query (`set == NULL`) that READS a wide mask: the reader's stack names
+ * the thread that holds it, even when no traced syscall set it (a thread
+ * born with a wide kernel mask, e.g. a workqueue thread).
+ */
+syscall::__pthread_sigmask:entry,
+syscall::sigprocmask:entry
+/(pid == $target || progenyof($target)) && arg1 == 0 && arg2 != 0/
+{
+    self->query = arg2;
+}
+
+syscall::__pthread_sigmask:return,
+syscall::sigprocmask:return
+{
+    this->seen = 0;
+}
+
+syscall::__pthread_sigmask:return,
+syscall::sigprocmask:return
+/self->query && errno == 0/
+{
+    this->seen = *(uint32_t *)copyin(self->query, 4);
+}
+
+syscall::__pthread_sigmask:return,
+syscall::sigprocmask:return
+/self->query/
+{
+    self->query = 0;
+}
+
+/* SIGHUP (bit 0) and SIGTERM (bit 14) both blocked: a wide mask. */
+syscall::__pthread_sigmask:return,
+syscall::sigprocmask:return
+/(this->seen & 0x4001) == 0x4001/
+{
+    printf("WIDE-QUERY pid=%d tid=%d mask=0x%08x\n", pid, tid, this->seen);
+    ustack();
+}
+
 syscall::bsdthread_create:entry
 /(pid == $target || progenyof($target)) && self->wide/
 {
@@ -97,4 +160,10 @@ END
 {
     printa("wide blocks pid=%d tid=%d: %@d\n", @wide);
     printa("threads born under a wide mask, creator pid=%d tid=%d: %@d\n", @born);
+}
+
+proc:::exit
+/pid == $target/
+{
+    exit(0);
 }
