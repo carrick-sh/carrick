@@ -365,13 +365,61 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
 pub enum RangeBacking {
     /// No terminal: nothing was ever backed there (a lazy reservation).
     Empty,
-    /// Every page's terminal is an EL1-private prepared or resident grant.
+    /// Only EL1-private grants and holes, and some page is resident (its
+    /// contents may be anything).
     Private,
+    /// Only EL1-private prepared grants EL1 never committed (such as
+    /// first-touch stock) and holes.
+    Prepared,
     /// Some terminal is a retired lease whose inventory return is owed.
     Retired,
     /// A host-owned terminal, a malformed one, a table outside the primary
-    /// arena, or a mix of backed and unbacked pages.
+    /// arena, or more backed runs than one edit step takes.
     Foreign,
+}
+
+/// Backed runs one classification reports; more is [`RangeBacking::Foreign`].
+pub const MAX_BACKED_RUNS: usize = 8;
+
+/// One range's classification and its maximal backed runs (`[start, end)`
+/// of EL1-private terminals, in address order): the spans an editor step
+/// must cover. Pages between runs have no terminal at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stage1Backing {
+    pub summary: RangeBacking,
+    runs: [(u64, u64); MAX_BACKED_RUNS],
+    count: usize,
+}
+
+impl Stage1Backing {
+    pub const fn of(summary: RangeBacking) -> Self {
+        Self {
+            summary,
+            runs: [(0, 0); MAX_BACKED_RUNS],
+            count: 0,
+        }
+    }
+    /// `summary` over exactly these backed runs; `Foreign` if too many.
+    pub fn with_runs(summary: RangeBacking, runs: &[(u64, u64)]) -> Self {
+        let mut backing = Self::of(summary);
+        for &(start, end) in runs {
+            backing.push(start, end);
+        }
+        backing
+    }
+    fn push(&mut self, start: u64, end: u64) {
+        if self.count > 0 && self.runs[self.count - 1].1 == start {
+            self.runs[self.count - 1].1 = end;
+        } else if self.count == MAX_BACKED_RUNS {
+            self.summary = RangeBacking::Foreign;
+        } else {
+            self.runs[self.count] = (start, end);
+            self.count += 1;
+        }
+    }
+    pub fn runs(&self) -> &[(u64, u64)] {
+        &self.runs[..self.count]
+    }
 }
 
 /// Classify `[va, va + len)` by walking the live graph rooted at `root`.
@@ -383,16 +431,18 @@ pub fn classify_stage1_range(
     root: u64,
     va: u64,
     len: u64,
-) -> RangeBacking {
+) -> Stage1Backing {
     use carrick_mmu_core::aarch64::{El1PrivateLeafState, el1_private_leaf_state, indices};
     const VALID: u64 = 1;
     const TABLE: u64 = 0b11;
     const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
     const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
+    let foreign = Stage1Backing::of(RangeBacking::Foreign);
     let Some(end) = va.checked_add(len) else {
-        return RangeBacking::Foreign;
+        return foreign;
     };
-    let (mut empty, mut private) = (false, false);
+    let mut backing = Stage1Backing::of(RangeBacking::Empty);
+    let (mut private, mut resident) = (false, false);
     let mut cursor = va;
     while cursor < end {
         let index = indices(cursor);
@@ -400,7 +450,7 @@ pub fn classify_stage1_range(
         let mut level = 0;
         let descriptor = loop {
             let Some(descriptor) = read(table + index[level] as u64 * 8) else {
-                return RangeBacking::Foreign;
+                return foreign;
             };
             if level < 3 && descriptor & (VALID | TABLE) == VALID | TABLE {
                 table = descriptor & TABLE_PA;
@@ -409,36 +459,46 @@ pub fn classify_stage1_range(
             }
             break descriptor;
         };
-        if descriptor == 0 {
-            empty = true;
-        } else {
+        let span = SPANS[level];
+        let next = (cursor & !(span - 1)).saturating_add(span);
+        if descriptor != 0 {
             match el1_private_leaf_state(descriptor) {
-                El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident => private = true,
-                El1PrivateLeafState::Retired => return RangeBacking::Retired,
+                El1PrivateLeafState::Prepared => private = true,
+                El1PrivateLeafState::Resident => {
+                    private = true;
+                    resident = true;
+                }
+                El1PrivateLeafState::Retired => {
+                    return Stage1Backing::of(RangeBacking::Retired);
+                }
                 El1PrivateLeafState::Unowned | El1PrivateLeafState::Malformed => {
-                    return RangeBacking::Foreign;
+                    return foreign;
                 }
             }
+            backing.push(cursor, next.min(end));
+            if backing.summary == RangeBacking::Foreign {
+                return foreign;
+            }
         }
-        if empty && private {
-            return RangeBacking::Foreign;
-        }
-        let span = SPANS[level];
-        let Some(next) = (cursor & !(span - 1)).checked_add(span) else {
+        if next <= cursor {
             break;
-        };
+        }
         cursor = next;
     }
-    if private {
-        RangeBacking::Private
-    } else {
-        RangeBacking::Empty
-    }
+    backing.summary = match (private, resident) {
+        (true, true) => RangeBacking::Private,
+        (true, false) => RangeBacking::Prepared,
+        _ => RangeBacking::Empty,
+    };
+    backing
 }
 
 /// Exact-MM read of the live stage-1 graph behind the syscall policy.
 pub trait AnonymousBackingProbe {
-    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> RangeBacking;
+    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing;
+    /// `[start, end)` of the live first-touch grant of exactly `mm_key`
+    /// that prepared `va`, if any: stock this MM may hand to a new mapping.
+    fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)>;
 }
 
 /// Every descriptor step of a delegated anonymous transaction.
@@ -457,7 +517,7 @@ pub struct HardwareAnonymousEditor;
 
 #[cfg(target_os = "none")]
 impl AnonymousBackingProbe for HardwareAnonymousEditor {
-    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> RangeBacking {
+    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing {
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let root = ttbr0 & TTBR_BADDR_MASK;
         let primary = carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
@@ -484,6 +544,14 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
             })
         };
         classify_stage1_range(&read, root, va, len)
+    }
+
+    fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
+        let page = carrick_el1_abi::frame_grant_residency_guest().lookup(mm_key, va)?;
+        Some((
+            page.identity.semantic_base,
+            page.identity.semantic_base + page.identity.len,
+        ))
     }
 }
 
@@ -592,16 +660,50 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     };
     let (va, len) = (request.range.start(), request.range.len());
     let backing = match request.operation {
-        carrick_el1_abi::ReservationOperation::Move => RangeBacking::Foreign,
+        carrick_el1_abi::ReservationOperation::Move => Stage1Backing::of(RangeBacking::Foreign),
         _ => editor.backing(grant.ttbr0, va, len),
     };
+    // One editor call is one all-or-nothing step: a range whose backing is
+    // split into several runs by holes goes to the host.
+    let run = match backing.runs() {
+        [] => None,
+        [(start, end)] => Some((*start, *end - *start)),
+        _ => return refuse(pending, &mut model),
+    };
     use carrick_el1_abi::ReservationOperation::{Prepare, Protect, Retire};
-    let owed_return = match (request.operation, backing) {
-        (_, RangeBacking::Empty) => None,
-        (Protect, RangeBacking::Private) => {
+    // A fresh mapping into a root hole over this MM's first-touch stock
+    // adopts it: zero backing EL1 never exposed, re-permissioned for the
+    // mapping and committed on first touch; any rest of the range has no
+    // terminal and stays lazy. Anything else prepared is a replaced
+    // mapping's backing and is retired as an owed return.
+    let adopts_stock = request.operation == Prepare
+        && backing.summary == RangeBacking::Prepared
+        && run.is_some_and(|(start, run_len)| {
+            editor
+                .stock_span(mm_key, start)
+                .is_some_and(|(base, end)| base <= start && start + run_len <= end)
+        })
+        && {
+            let mut nodes = 0usize;
+            model
+                .observe_range(request.range, &mut |_| nodes += 1)
+                .is_ok()
+                && nodes == 0
+        };
+    let owed_return = match (request.operation, backing.summary, run) {
+        (_, RangeBacking::Foreign | RangeBacking::Retired, _) => {
+            return refuse(pending, &mut model);
+        }
+        (_, RangeBacking::Empty, _) | (_, _, None) => None,
+        // The permission editor is the descriptor step of an mprotect and
+        // of a stock adoption alike (prepared leaves stay invalid).
+        (Protect, RangeBacking::Private | RangeBacking::Prepared, Some((start, run_len)))
+        | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
+            if request.operation == Protect || adopts_stock =>
+        {
             let edit = GuestPermissionEdit {
-                va,
-                len,
+                va: start,
+                len: run_len,
                 readable: request.protection.bits() & PROT_READ != 0,
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
@@ -614,13 +716,18 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
                 Err(_) => return refuse(pending, &mut model),
             }
         }
-        (Retire | Prepare, RangeBacking::Private) => {
+        (
+            Retire | Prepare,
+            RangeBacking::Private | RangeBacking::Prepared,
+            Some((start, run_len)),
+        ) => {
             // The journal slot first: after the descriptor step the commit
-            // must not fail for lack of room.
+            // must not fail for lack of room. The whole range is owed; its
+            // pages without a terminal have nothing to return.
             let Ok(slot) = model.reserve_return(request.range) else {
                 return refuse(pending, &mut model);
             };
-            match editor.retire_and_invalidate(grant.ttbr0, va, len) {
+            match editor.retire_and_invalidate(grant.ttbr0, start, run_len) {
                 Ok(()) => {
                     #[cfg(target_os = "none")]
                     carrick_el1_abi::frame_grant_residency_guest()
@@ -1105,6 +1212,10 @@ mod tests {
         struct Editor {
             backing: RangeBacking,
             protect: Option<GuestPermissionEditError>,
+            /// `(mm, start, end)` of this MM's live first-touch stock.
+            stock: Option<(u64, u64, u64)>,
+            /// Backed runs to report; `None`: the whole queried range.
+            runs: Option<&'static [(u64, u64)]>,
             calls: Vec<Call>,
         }
         impl Editor {
@@ -1112,14 +1223,31 @@ mod tests {
                 Self {
                     backing,
                     protect: None,
+                    stock: None,
+                    runs: None,
                     calls: Vec::new(),
                 }
             }
         }
         impl AnonymousBackingProbe for Editor {
-            fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> RangeBacking {
+            fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing {
                 self.calls.push(Call::Probe(ttbr0, va, len));
-                self.backing
+                match self.runs {
+                    Some(runs) => Stage1Backing::with_runs(self.backing, runs),
+                    None if matches!(
+                        self.backing,
+                        RangeBacking::Private | RangeBacking::Prepared
+                    ) =>
+                    {
+                        Stage1Backing::with_runs(self.backing, &[(va, va + len)])
+                    }
+                    None => Stage1Backing::of(self.backing),
+                }
+            }
+            fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
+                self.stock
+                    .filter(|&(mm, start, end)| mm == mm_key && start <= va && va < end)
+                    .map(|(_, start, end)| (start, end))
             }
         }
         impl AnonymousPermissionEditor for Editor {
@@ -1583,6 +1711,145 @@ mod tests {
             assert!(model.mapping(ARENA + (pages - 1) * 0x2000).is_some());
         }
 
+        /// Contract `kernel.el1.anonymous-reservations` (first-touch stock):
+        /// a fresh mapping into a root hole this MM's stock already backs
+        /// adopts it with the permission editor alone: no retirement, no
+        /// owed return, no host crossing. A replaced mapping's prepared
+        /// backing, or prepared backing that is not this MM's live stock,
+        /// is retired as an owed return.
+        #[test]
+        fn delegated_mmap_into_first_touch_stock_adopts_it() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let task = mm(&spaces, &table, 17, true);
+            let window = (ARENA, ARENA + 0x20_0000);
+            let mut stock = Editor::over(RangeBacking::Prepared);
+            stock.stock = Some((task.key, window.0, window.1));
+            let (route, address) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut stock,
+                SYS_MMAP,
+                [0, 0x2000, PROT_READ, ANON, u64::MAX, 0],
+            );
+            assert_eq!((route, address as u64), (DelegatedAnonymous::Served, ARENA));
+            assert_eq!(
+                stock.calls,
+                vec![
+                    Call::Probe(task.ttbr0, ARENA, 0x2000),
+                    Call::Protect(
+                        task.ttbr0,
+                        GuestPermissionEdit {
+                            va: ARENA,
+                            len: 0x2000,
+                            readable: true,
+                            writable: false,
+                            executable: false,
+                        }
+                    ),
+                ]
+            );
+            assert!(owed_returns(&root(&spaces, &table, &task)).is_empty());
+
+            // MAP_FIXED over that mapping: its prepared backing may hold
+            // bytes the host wrote; it is retired, never adopted.
+            stock.calls.clear();
+            let (route, _) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut stock,
+                SYS_MMAP,
+                mmap_fixed(ARENA, 0x2000),
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            assert!(
+                stock
+                    .calls
+                    .iter()
+                    .any(|call| matches!(call, Call::Retire(..)))
+            );
+            assert_eq!(owed_returns(&root(&spaces, &table, &task)).len(), 1);
+
+            // Prepared leaves that are not this MM's live stock: retired.
+            let mut foreign = Editor::over(RangeBacking::Prepared);
+            foreign.stock = Some((task.key + 1, window.0, window.1));
+            let (route, _) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut foreign,
+                SYS_MMAP,
+                mmap_fixed(ARENA + 0x10_0000, 0x1000),
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            assert!(
+                foreign
+                    .calls
+                    .iter()
+                    .any(|call| matches!(call, Call::Retire(..)))
+            );
+            assert_eq!(owed_returns(&root(&spaces, &table, &task)).len(), 2);
+        }
+
+        /// A fresh mapping that straddles the end of this MM's stock adopts
+        /// the stocked part and leaves the rest lazy, still without a host
+        /// crossing. Backing split into several runs is one step too many:
+        /// the host serves it.
+        #[test]
+        fn delegated_mmap_straddling_first_touch_stock_adopts_the_stocked_part() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let task = mm(&spaces, &table, 17, true);
+            let mut straddle = Editor::over(RangeBacking::Prepared);
+            straddle.stock = Some((task.key, ARENA - 0x1000, ARENA + 0x1000));
+            straddle.runs = Some(&[(ARENA, ARENA + 0x1000)]);
+            let (route, address) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut straddle,
+                SYS_MMAP,
+                [0, 0x3000, RW, ANON, u64::MAX, 0],
+            );
+            assert_eq!((route, address as u64), (DelegatedAnonymous::Served, ARENA));
+            assert_eq!(
+                straddle.calls[1..],
+                [Call::Protect(
+                    task.ttbr0,
+                    GuestPermissionEdit {
+                        va: ARENA,
+                        len: 0x1000,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                    }
+                )]
+            );
+            assert!(owed_returns(&root(&spaces, &table, &task)).is_empty());
+
+            let mut split = Editor::over(RangeBacking::Prepared);
+            split.stock = Some((task.key, ARENA, ARENA + 0x10_0000));
+            split.runs = Some(&[
+                (ARENA + 0x8000, ARENA + 0x9000),
+                (ARENA + 0xa000, ARENA + 0xb000),
+            ]);
+            let (route, _) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut split,
+                SYS_MMAP,
+                mmap_fixed(ARENA + 0x8000, 0x3000),
+            );
+            assert_eq!(route, DelegatedAnonymous::Forward);
+            assert!(root(&spaces, &table, &task).pending().is_none());
+        }
+
         #[test]
         fn stage1_range_classification_follows_the_live_terminals() {
             const VALID: u64 = 1;
@@ -1606,11 +1873,28 @@ mod tests {
                     let offset = pa.checked_sub(root)?;
                     words.get((offset / 8) as usize).copied()
                 };
-                classify_stage1_range(&read, root, va, len)
+                classify_stage1_range(&read, root, va, len).summary
+            };
+            let runs = |words: &Vec<u64>, va: u64, len: u64| {
+                let read = |pa: u64| {
+                    let offset = pa.checked_sub(root)?;
+                    words.get((offset / 8) as usize).copied()
+                };
+                classify_stage1_range(&read, root, va, len).runs().to_vec()
             };
             assert_eq!(classify(&words, va, 0x2000), RangeBacking::Private);
+            assert_eq!(
+                classify(&words, va + 0x1000, 0x1000),
+                RangeBacking::Prepared
+            );
             assert_eq!(classify(&words, va + 0x2000, 0x1000), RangeBacking::Empty);
-            assert_eq!(classify(&words, va, 0x3000), RangeBacking::Foreign);
+            // A hole beside backed pages: the backed run alone is the step.
+            assert_eq!(classify(&words, va, 0x3000), RangeBacking::Private);
+            assert_eq!(runs(&words, va, 0x3000), vec![(va, va + 0x2000)]);
+            assert_eq!(
+                runs(&words, va + 0x1000, 0x2000),
+                vec![(va + 0x1000, va + 0x2000)]
+            );
             assert_eq!(classify(&words, va + 0x3000, 0x1000), RangeBacking::Foreign);
             assert_eq!(classify(&words, va + 0x4000, 0x1000), RangeBacking::Retired);
             // An absent L2 table is one empty span, whatever its length.
