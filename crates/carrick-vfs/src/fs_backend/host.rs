@@ -365,7 +365,7 @@ pub struct HostFsBackend {
     /// scratch root and this is only a cache of a `true` reading.
     fifo_seen: std::sync::atomic::AtomicBool,
     /// The shared root-MARKER generation
-    /// ([`crate::fs_resolve_cache::current_marker_generation`]) at which this
+    /// ([`crate::fs_resolve_cache::FsCacheCoherence::current_marker_generation`]) at which this
     /// process last read the root marker as ABSENT. `stamp_root_marker` bumps
     /// it after every stamp, so "marker generation unchanged since the last
     /// absent reading" proves no FIFO appeared anywhere — the per-open
@@ -425,7 +425,7 @@ pub(crate) struct StatCacheEntry {
     dir_generation: u64,
     /// Guest-metadata generation the xattr-derived fields (`mode_override`,
     /// `real.uid`/`gid`, the socket kind) were read at. While it still equals
-    /// [`crate::fs_resolve_cache::current_meta_generation`], no carrick writer
+    /// [`crate::fs_resolve_cache::FsCacheCoherence::current_meta_generation`], no carrick writer
     /// has touched ANY metadata xattr since the fill, so an inode whose
     /// timestamps moved for other reasons (child churn, an append) is served
     /// with those fields intact and only the volatile ones refreshed.
@@ -2906,7 +2906,7 @@ impl HostFsBackend {
     /// exchange it performed itself.
     ///
     /// The DURABLE invalidation is the shared directory-topology generation
-    /// (`fs_resolve_cache::bump_dir_generation`), which every process observes
+    /// (`fs_resolve_cache::FsCacheCoherence::bump_dir_generation`), which every process observes
     /// and which the caller bumps. This clear is the local half: it stops this
     /// process from serving its own in-flight entries between the mutation and
     /// its next generation read, and it releases the dirfds immediately rather
