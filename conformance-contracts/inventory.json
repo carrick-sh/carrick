@@ -314,7 +314,8 @@
       "handler": "network",
       "authority": "guest",
       "contracts": [
-        "kernel.el1.epoll-zone"
+        "kernel.el1.epoll-zone",
+        "kernel.signal.job-control-wait-interruption"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -1969,7 +1970,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.signal.job-control-wait-interruption"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2702,7 +2705,9 @@
       "support": "bring_up",
       "handler": "process",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.signal.job-control-wait-interruption"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2715,7 +2720,9 @@
       "support": "bring_up",
       "handler": "process",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.signal.job-control-wait-interruption"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2884,7 +2891,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.signal.job-control-wait-interruption"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2898,7 +2907,8 @@
       "handler": "network",
       "authority": "host",
       "contracts": [
-        "kernel.mm.syscall-code-write"
+        "kernel.mm.syscall-code-write",
+        "kernel.signal.job-control-wait-interruption"
       ],
       "claims": [],
       "uncovered_behaviors": [

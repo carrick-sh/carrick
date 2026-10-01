@@ -3010,6 +3010,17 @@
       "rationale": "The host harvests the record its live description keeps alive with an unbounded host lock wait; a refusal means the record was destroyed under a live description or its item lists are corrupt, so no ready list can be reported.",
       "sink": "fatal",
       "domain": "epoll::zone"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/task.rs",
+      "function": "Task::stop_for_job_control",
+      "ordinal_in_function": 1,
+      "fingerprint": "cfc10fd0d403507b4950cbf506f36358c9d46066b3cce8dc9052e3c188db65ba",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::job_control",
+      "rationale": "Exhausting the task-owned group-stop epoch would alias a new stop to a parked continuation epoch and silently lose required EINTR; stop rather than publish ambiguous kernel authority. This is unreachable counter exhaustion, not a guest errno condition.",
+      "sink": "fatal",
+      "domain": "kernel::job_control"
     }
   ]
 }
