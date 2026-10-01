@@ -3,9 +3,9 @@
   "scope": "production Rust sources under crates/carrick-runtime/src, crates/carrick-kernel/src and crates/carrick-vfs/src",
   "counts": {
     "table_guard": 167,
-    "description_guard": 203,
+    "description_guard": 200,
     "description_backing": 24,
-    "epoll": 423,
+    "epoll": 501,
     "stream": 176,
     "mapping": 1472,
     "lifecycle": 32
@@ -14,7 +14,7 @@
     "table_guard": 66,
     "description_guard": 172,
     "description_backing": 9,
-    "epoll": 161,
+    "epoll": 219,
     "stream": 120,
     "mapping": 937,
     "lifecycle": 16
@@ -23,7 +23,7 @@
     "table_guard": 26,
     "description_guard": 38,
     "description_backing": 8,
-    "epoll": 44,
+    "epoll": 49,
     "stream": 21,
     "mapping": 110,
     "lifecycle": 10
@@ -337,7 +337,25 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 327,
+      "line": 164,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// This eventfd as a zone epoll member (its object and its OFD's",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 171,
+      "categories": [
+        "epoll"
+      ],
+      "text": "kind: carrick_el1_abi::ipc::epoll::EpollMember::EventFd,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 336,
       "categories": [
         "epoll"
       ],
@@ -346,7 +364,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 810,
+      "line": 819,
       "categories": [
         "mapping"
       ],
@@ -355,7 +373,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 812,
+      "line": 821,
       "categories": [
         "mapping"
       ],
@@ -364,7 +382,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 813,
+      "line": 822,
       "categories": [
         "mapping"
       ],
@@ -373,7 +391,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1158,
+      "line": 1167,
       "categories": [
         "epoll"
       ],
@@ -382,7 +400,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1221,
+      "line": 1230,
       "categories": [
         "mapping"
       ],
@@ -391,7 +409,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1340,
+      "line": 1349,
       "categories": [
         "mapping"
       ],
@@ -400,7 +418,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1401,
+      "line": 1410,
       "categories": [
         "epoll"
       ],
@@ -409,7 +427,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1416,
+      "line": 1425,
       "categories": [
         "epoll"
       ],
@@ -418,7 +436,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1421,
+      "line": 1430,
       "categories": [
         "epoll"
       ],
@@ -427,7 +445,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1425,
+      "line": 1434,
       "categories": [
         "epoll"
       ],
@@ -436,7 +454,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1427,
+      "line": 1436,
       "categories": [
         "epoll"
       ],
@@ -445,7 +463,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1428,
+      "line": 1437,
       "categories": [
         "epoll"
       ],
@@ -454,7 +472,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1439,
+      "line": 1453,
       "categories": [
         "epoll"
       ],
@@ -463,7 +481,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1578,
+      "line": 1592,
       "categories": [
         "mapping"
       ],
@@ -472,7 +490,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1845,
+      "line": 1859,
       "categories": [
         "description_guard"
       ],
@@ -481,7 +499,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1942,
+      "line": 1956,
       "categories": [
         "description_guard"
       ],
@@ -490,7 +508,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1952,
+      "line": 1966,
       "categories": [
         "description_backing",
         "mapping"
@@ -500,7 +518,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1969,
+      "line": 1983,
       "categories": [
         "description_backing"
       ],
@@ -509,7 +527,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 1995,
+      "line": 2009,
       "categories": [
         "description_backing"
       ],
@@ -518,7 +536,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2004,
+      "line": 2018,
       "categories": [
         "description_backing"
       ],
@@ -527,7 +545,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2024,
+      "line": 2038,
       "categories": [
         "description_backing"
       ],
@@ -536,7 +554,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2033,
+      "line": 2047,
       "categories": [
         "description_backing"
       ],
@@ -545,7 +563,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2076,
+      "line": 2090,
       "categories": [
         "epoll"
       ],
@@ -554,7 +572,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2093,
+      "line": 2107,
       "categories": [
         "epoll"
       ],
@@ -563,7 +581,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2101,
+      "line": 2115,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// This description as a zone epoll member: an eventfd or a pipe end,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 2116,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// with its OFD's identity (the epoll item's file). `None` for every",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 2117,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// other kind, whose epoll items live in the host half.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 2131,
       "categories": [
         "mapping"
       ],
@@ -572,7 +617,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2125,
+      "line": 2155,
       "categories": [
         "epoll"
       ],
@@ -581,7 +626,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2153,
+      "line": 2183,
       "categories": [
         "epoll"
       ],
@@ -590,7 +635,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2192,
+      "line": 2222,
       "categories": [
         "epoll"
       ],
@@ -599,7 +644,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2253,
+      "line": 2283,
       "categories": [
         "epoll"
       ],
@@ -608,7 +653,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2276,
+      "line": 2306,
       "categories": [
         "epoll"
       ],
@@ -617,7 +662,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2378,
+      "line": 2408,
       "categories": [
         "table_guard"
       ],
@@ -626,7 +671,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2382,
+      "line": 2412,
       "categories": [
         "description_guard"
       ],
@@ -635,7 +680,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2391,
+      "line": 2421,
       "categories": [
         "description_backing"
       ],
@@ -644,43 +689,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2496,
-      "categories": [
-        "epoll"
-      ],
-      "text": "OpenDescription::Epoll { .. } | OpenDescription::Closed { was_epoll: true }",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2502,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll { interest, .. } = &*description else {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2531,
-      "categories": [
-        "epoll"
-      ],
-      "text": "OpenDescription::Epoll { .. } => Kind::Epoll,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2583,
-      "categories": [
-        "epoll"
-      ],
-      "text": "OpenDescription::Epoll { interest, .. } => interest",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 2647,
+      "line": 2515,
       "categories": [
         "epoll"
       ],
@@ -689,7 +698,88 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3033,
+      "line": 2529,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll { .. } | OpenDescription::Closed { was_epoll: true }",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 2535,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 2544,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll { interest, .. } = &*description else {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 2573,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll { .. } => Kind::Epoll,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 2625,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll { interest, .. } => interest",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 2689,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 3064,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// `man 7 epoll`: the open file's last descriptor removes its items",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 3065,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// from every epoll interest list (zone half; the host half detaches",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 3078,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 3093,
       "categories": [
         "epoll"
       ],
@@ -698,7 +788,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3205,
+      "line": 3265,
       "categories": [
         "description_backing"
       ],
@@ -707,7 +797,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3235,
+      "line": 3295,
       "categories": [
         "epoll"
       ],
@@ -716,7 +806,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3240,
+      "line": 3300,
       "categories": [
         "mapping"
       ],
@@ -725,7 +815,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3245,
+      "line": 3305,
       "categories": [
         "description_backing"
       ],
@@ -734,7 +824,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3252,
+      "line": 3312,
       "categories": [
         "description_backing"
       ],
@@ -743,7 +833,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3271,
+      "line": 3331,
       "categories": [
         "description_backing"
       ],
@@ -752,7 +842,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3296,
+      "line": 3356,
       "categories": [
         "description_backing"
       ],
@@ -761,7 +851,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3310,
+      "line": 3370,
       "categories": [
         "description_backing"
       ],
@@ -770,7 +860,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3730,
+      "line": 3790,
       "categories": [
         "epoll"
       ],
@@ -779,7 +869,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 4234,
+      "line": 4294,
       "categories": [
         "mapping"
       ],
@@ -788,7 +878,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 4235,
+      "line": 4295,
       "categories": [
         "mapping"
       ],
@@ -797,7 +887,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 4243,
+      "line": 4303,
       "categories": [
         "mapping"
       ],
@@ -806,7 +896,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 4262,
+      "line": 4322,
       "categories": [
         "mapping"
       ],
@@ -815,7 +905,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 4263,
+      "line": 4323,
       "categories": [
         "mapping"
       ],
@@ -1860,7 +1950,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
-      "line": 683,
+      "line": 479,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// One end of this pipe as a zone epoll member (its object, side and",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "line": 490,
+      "categories": [
+        "epoll"
+      ],
+      "text": "core_pipe::End::Reader => carrick_el1_abi::ipc::epoll::EpollMember::PipeReader,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "line": 491,
+      "categories": [
+        "epoll"
+      ],
+      "text": "core_pipe::End::Writer => carrick_el1_abi::ipc::epoll::EpollMember::PipeWriter,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "line": 699,
       "categories": [
         "stream"
       ],
@@ -1869,7 +1986,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
-      "line": 684,
+      "line": 700,
       "categories": [
         "stream"
       ],
@@ -1878,7 +1995,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
-      "line": 978,
+      "line": 990,
       "categories": [
         "table_guard"
       ],
@@ -10719,7 +10836,79 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 190,
+      "line": 36,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// A new epoll description: its kqueue (host-half readiness and the user",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 38,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// authority, its zone record (contract `kernel.el1.epoll-zone`). The wait",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 46,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// epoll-backed on Linux. The user-wake channel `register_user(0)` is the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 73,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Ok(OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 90,
+      "categories": [
+        "epoll"
+      ],
+      "text": "taken: Vec<carrick_el1_abi::ipc::epoll::EpollItemRef>,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 101,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// The blocked wait of an epoll with a zone record. The epoll fd itself is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 192,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Linux keys an epoll item on the (open file, fd number) pair it was added",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 193,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// with (`man 7 epoll`: the item outlives the descriptor and goes away only",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 350,
       "categories": [
         "description_backing",
         "mapping"
@@ -10729,7 +10918,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 195,
+      "line": 355,
       "categories": [
         "description_guard"
       ],
@@ -10738,7 +10927,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 217,
+      "line": 377,
       "categories": [
         "description_guard"
       ],
@@ -10747,7 +10936,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 232,
+      "line": 392,
       "categories": [
         "description_guard"
       ],
@@ -10756,7 +10945,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 302,
+      "line": 427,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// non-epoll targets.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 467,
       "categories": [
         "epoll"
       ],
@@ -10765,7 +10963,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 307,
+      "line": 472,
       "categories": [
         "epoll"
       ],
@@ -10774,7 +10972,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 620,
+      "line": 785,
       "categories": [
         "epoll"
       ],
@@ -10783,7 +10981,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 622,
+      "line": 787,
       "categories": [
         "epoll"
       ],
@@ -10792,7 +10990,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 631,
+      "line": 796,
       "categories": [
         "stream"
       ],
@@ -10801,7 +10999,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 640,
+      "line": 805,
       "categories": [
         "epoll"
       ],
@@ -10810,7 +11008,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 669,
+      "line": 834,
       "categories": [
         "stream"
       ],
@@ -10819,7 +11017,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 703,
+      "line": 868,
       "categories": [
         "stream"
       ],
@@ -10828,7 +11026,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 706,
+      "line": 871,
       "categories": [
         "stream"
       ],
@@ -10837,7 +11035,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 707,
+      "line": 872,
       "categories": [
         "stream"
       ],
@@ -10846,7 +11044,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 716,
+      "line": 881,
       "categories": [
         "epoll"
       ],
@@ -10855,7 +11053,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 721,
+      "line": 886,
       "categories": [
         "table_guard"
       ],
@@ -10864,7 +11062,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 729,
+      "line": 894,
       "categories": [
         "description_guard"
       ],
@@ -10873,70 +11071,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 732,
-      "categories": [
-        "epoll"
-      ],
-      "text": "if let OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 881,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Lazy prune: the fd was closed or recycled as a non-epoll.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 883,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "self.captured_file_table().write_epoll_fds().remove(&epfd);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
       "line": 897,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 955,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let table = files.read_open_files();",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 960,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Only the epoll instances registered on the closing description",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 966,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// scans the table's epoll descriptions; any other number absent",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1012,
       "categories": [
         "epoll"
       ],
@@ -10949,48 +11084,21 @@
       "categories": [
         "epoll"
       ],
-      "text": "// table, while the inherited epoll description (and its",
+      "text": "// Lazy prune: the fd was closed or recycled as a non-epoll.",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1125,
+      "line": 1048,
       "categories": [
-        "description_guard"
+        "table_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
+      "text": "self.captured_file_table().write_epoll_fds().remove(&epfd);",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1128,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1143,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1153,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.inspect() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1156,
+      "line": 1062,
       "categories": [
         "epoll"
       ],
@@ -10999,79 +11107,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1174,
+      "line": 1124,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let table = files.read_open_files();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1129,
       "categories": [
         "epoll"
       ],
-      "text": "// guest_fd -> (accumulated epoll events, epoll_data); read+write filters",
+      "text": "// Only the epoll instances registered on the closing description",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1235,
+      "line": 1135,
       "categories": [
         "epoll"
       ],
-      "text": "// here, then the epoll lock is dropped before the per-fd",
+      "text": "// scans the table's epoll descriptions; any other number absent",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1243,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.inspect() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1246,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Per-guest-fd epoll interest snapshot: (host_fd,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1247,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// events, epoll data, reg_gen, io_gen, last_ready,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1264,
-      "categories": [
-        "epoll"
-      ],
-      "text": "if let OpenDescription::Epoll { interest, .. } = &*open {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1537,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// epoll waiter while the host fd is already readable/writable.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1809,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1810,
+      "line": 1181,
       "categories": [
         "epoll"
       ],
@@ -11080,412 +11143,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1937,
+      "line": 1219,
       "categories": [
-        "description_guard"
+        "epoll"
       ],
-      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
+      "text": "// table, while the inherited epoll description (and its",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 1938,
+      "line": 1278,
       "categories": [
         "epoll"
       ],
-      "text": "if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {",
+      "text": "/// `kernel.el1.epoll-zone`) is harvested through the shared record's",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2023,
+      "line": 1294,
       "categories": [
         "epoll"
       ],
-      "text": "// the epoll kqueue inside the per-thread kqueue, and unlike calling",
+      "text": "OpenDescription::Epoll { zone, .. } => zone.clone(),",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2024,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// kevent() here it does not consume pending epoll events before the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2114,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "Arc::clone(dispatcher.captured_file_table().epoll_wake_registry()),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2143,
-      "categories": [
-        "epoll"
-      ],
-      "text": "Some(\"dns-epoll-wake\".to_string()),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2169,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let epoll = epoll_kqueue_for_wake_test(&dispatcher);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2171,
-      "categories": [
-        "epoll"
-      ],
-      "text": "!poll_fd_readable(epoll.poll_fd()),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2172,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"a fresh epoll instance must be quiet\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2187,
-      "categories": [
-        "epoll"
-      ],
-      "text": "poll_fd_readable(epoll.poll_fd()),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2188,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"DNS gateway reply must wake the epoll instance's poll fd\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2373,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Create empty inner epoll",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2376,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Create outer epoll",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2399,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Authoritative readiness must NOT return POLLIN/EPOLLIN because inner epoll has no deliverable events!",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2403,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"empty inner epoll must not report POLLIN under poll(2)\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2408,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"empty inner epoll must not report EPOLLIN under epoll\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2413,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"outer epoll monitoring empty inner epoll must not report EPOLLIN\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2418,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"outer epoll monitoring empty inner epoll must not report POLLIN\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2432,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Create inner epoll",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2435,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Create outer epoll",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2480,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Get outer epoll's wait_queue",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2488,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Spawn a background waiter that waits for outer epoll wake_queue or kqueue poll_fd",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2556,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Create inner epoll",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2584,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Create outer epoll",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2646,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Outer epoll must report ready because it tracks the underlying Epoll description identity (referenced by alias_inner_fd)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2650,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"outer epoll must track stored description identity, not newly installed netlink at reused fd\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2653,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Now close alias_inner_fd (the last handle to the inner epoll description)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2662,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Outer epoll must now evaluate to not ready because the target description is closed",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2666,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"outer epoll must not report ready after inner epoll description is closed\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 2739,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"outer ET epoll first delivery: {wait_outcome:?}\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3079,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"waiter on 3-level deep epoll must wake on leaf write\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3302,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// macOS, epoll-backed on Linux. The user-wake channel `register_user(0)`",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3309,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// The backing kqueue/epoll fd couldn't be allocated (fd table full).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3315,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "Arc::clone(this.captured_file_table().epoll_wake_registry()),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3318,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let description = OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3333,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// but the kernel still rejects size <= 0 with EINVAL (epoll-ltp /",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3346,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "Arc::clone(this.captured_file_table().epoll_wake_registry()),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3349,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let description = OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3368,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// A bad target fd is EBADF; a target equal to the epoll fd itself is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3369,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// EINVAL (an epoll instance can't monitor itself). (LTP epoll_ctl02.)",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3388,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Same-description alias check (LTP / Linux epoll_ctl EINVAL when target refers to this epoll instance)",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3395,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// taking the epoll write lock (it locks the *target* fd's description).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3399,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Record this epoll instance for the consumption-based EPOLLET",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3403,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// acyclic). A non-epoll epfd inserted on the error path below is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3405,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "this.captured_file_table().write_epoll_fds().insert(epfd);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3407,
+      "line": 1357,
       "categories": [
         "description_guard"
       ],
@@ -11494,7 +11179,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3410,
+      "line": 1360,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1381,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1391,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.inspect() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1394,
       "categories": [
         "epoll"
       ],
@@ -11503,7 +11215,520 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3462,
+      "line": 1412,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// guest_fd -> (accumulated epoll events, epoll_data); read+write filters",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1473,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// here, then the epoll lock is dropped before the per-fd",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1481,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.inspect() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1484,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Per-guest-fd epoll interest snapshot: (host_fd,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1485,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// events, epoll data, reg_gen, io_gen, last_ready,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1502,
+      "categories": [
+        "epoll"
+      ],
+      "text": "if let OpenDescription::Epoll { interest, .. } = &*open {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 1775,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// epoll waiter while the host fd is already readable/writable.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2047,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2048,
+      "categories": [
+        "epoll"
+      ],
+      "text": "if let OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2175,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2176,
+      "categories": [
+        "epoll"
+      ],
+      "text": "if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2282,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// the epoll kqueue inside the per-thread kqueue, and unlike calling",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2283,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// kevent() here it does not consume pending epoll events before the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2389,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "Arc::clone(dispatcher.captured_file_table().epoll_wake_registry()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2418,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Some(\"dns-epoll-wake\".to_string()),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2444,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll = epoll_kqueue_for_wake_test(&dispatcher);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2446,
+      "categories": [
+        "epoll"
+      ],
+      "text": "!poll_fd_readable(epoll.poll_fd()),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2447,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"a fresh epoll instance must be quiet\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2462,
+      "categories": [
+        "epoll"
+      ],
+      "text": "poll_fd_readable(epoll.poll_fd()),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2463,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"DNS gateway reply must wake the epoll instance's poll fd\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2641,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// `man 7 epoll`: an item belongs to the (open file, fd number) it was",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2745,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Create empty inner epoll",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2748,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Create outer epoll",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2771,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Authoritative readiness must NOT return POLLIN/EPOLLIN because inner epoll has no deliverable events!",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2775,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"empty inner epoll must not report POLLIN under poll(2)\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2780,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"empty inner epoll must not report EPOLLIN under epoll\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2785,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"outer epoll monitoring empty inner epoll must not report EPOLLIN\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2790,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"outer epoll monitoring empty inner epoll must not report POLLIN\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2804,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Create inner epoll",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2807,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Create outer epoll",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2852,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Get outer epoll's wait_queue",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2860,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Spawn a background waiter that waits for outer epoll wake_queue or kqueue poll_fd",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2928,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Create inner epoll",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 2956,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Create outer epoll",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3018,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Outer epoll must report ready because it tracks the underlying Epoll description identity (referenced by alias_inner_fd)",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3022,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"outer epoll must track stored description identity, not newly installed netlink at reused fd\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3025,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Now close alias_inner_fd (the last handle to the inner epoll description)",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3034,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Outer epoll must now evaluate to not ready because the target description is closed",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3038,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"outer epoll must not report ready after inner epoll description is closed\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3111,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"outer ET epoll first delivery: {wait_outcome:?}\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3451,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"waiter on 3-level deep epoll must wake on leaf write\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3674,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "Arc::clone(this.captured_file_table().epoll_wake_registry()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3687,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// but the kernel still rejects size <= 0 with EINVAL (epoll-ltp /",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3693,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "Arc::clone(this.captured_file_table().epoll_wake_registry()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3710,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// A bad target fd is EBADF; a target equal to the epoll fd itself is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3711,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// EINVAL (an epoll instance can't monitor itself). (LTP epoll_ctl02.)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3730,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Same-description alias check (LTP / Linux epoll_ctl EINVAL when target refers to this epoll instance)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3737,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// taking the epoll write lock (it locks the *target* fd's description).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3741,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Zone half (contract kernel.el1.epoll-zone): an item whose member",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3742,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// is an IPC object lives in the epoll's shared record, keyed on",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3747,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll { zone, .. } => zone.clone(),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3766,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll { interest, .. } => {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3803,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Record this epoll instance for the consumption-based EPOLLET",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3807,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// acyclic). A non-epoll epfd inserted on the error path below is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3809,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "this.captured_file_table().write_epoll_fds().insert(epfd);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3811,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3814,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
+      "line": 3872,
       "categories": [
         "epoll"
       ],
@@ -11512,7 +11737,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3631,
+      "line": 4056,
       "categories": [
         "epoll"
       ],
@@ -11521,7 +11746,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3633,
+      "line": 4058,
       "categories": [
         "epoll"
       ],
@@ -11530,7 +11755,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3635,
+      "line": 4060,
       "categories": [
         "epoll"
       ],
@@ -11539,7 +11764,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3642,
+      "line": 4067,
       "categories": [
         "epoll"
       ],
@@ -11548,7 +11773,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3767,
+      "line": 4192,
       "categories": [
         "table_guard"
       ],
@@ -11557,7 +11782,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3786,
+      "line": 4211,
       "categories": [
         "epoll"
       ],
@@ -11566,11 +11791,218 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/epoll_ops.rs",
-      "line": 3874,
+      "line": 4299,
       "categories": [
         "table_guard"
       ],
       "text": "let open_file = files.read_open_files().get(&epfd).cloned();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 1,
+      "categories": [
+        "epoll"
+      ],
+      "text": "//! The host venue of a zone epoll record (contract `kernel.el1.epoll-zone`).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 3,
+      "categories": [
+        "epoll"
+      ],
+      "text": "//! An epoll description owns one [`ZoneEpoll`]: the shared record",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 4,
+      "categories": [
+        "epoll"
+      ],
+      "text": "//! ([`carrick_el1_abi::ipc::epoll`]) that is the single authority for its",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 10,
+      "categories": [
+        "epoll"
+      ],
+      "text": "//! Host-side waiters (a host `epoll_pwait`, a parent epoll, poll/select on",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 11,
+      "categories": [
+        "epoll"
+      ],
+      "text": "//! the epoll fd) are the only reason a member's change reaches the host:",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 13,
+      "categories": [
+        "epoll"
+      ],
+      "text": "//! publication owes the host a wake through this epoll, delivered by",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 20,
+      "categories": [
+        "epoll"
+      ],
+      "text": "use carrick_el1_abi::ipc::epoll::{",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 30,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// A zone epoll item's member: an IPC object side and the identity of the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 53,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Why an epoll description has no zone record and keeps every item in",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 76,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Admit a zone record for a new epoll description: the record, or why the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 91,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// The zone record of one epoll description.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 95,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// The record's OFD (backing `IpcBacking::Epoll`) the host holds while",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 96,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// any descriptor names the epoll; its final release destroys the record.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 98,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// The host wake target for this epoll's owed wakes, held alive here.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 122,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Create the record for a new epoll description. `kqueue` and",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 125,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// exhausted; the epoll then keeps every item in the host half.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 132,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let backing = IpcBacking::Epoll { object }.encode();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 164,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// The epoll description's shared flags (its OFD), for file-table",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 165,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// publication: EL1 resolves an epoll fd to this record through it.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 183,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// epoll or poll waiter is enrolled on it.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 217,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"epoll::zone\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 282,
+      "categories": [
+        "epoll"
+      ],
+      "text": "carrick_fatal::carrick_fatal!(\"epoll::zone\", \"zone harvest refused: {error:?}\")",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/epoll_zone.rs",
+      "line": 346,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// closed (`man 7 epoll`).",
       "scope_kind": "production_callsite"
     },
     {
@@ -12305,7 +12737,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 519,
+      "line": 520,
       "categories": [
         "epoll"
       ],
@@ -12314,7 +12746,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 628,
+      "line": 629,
       "categories": [
         "description_guard"
       ],
@@ -12323,7 +12755,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 679,
+      "line": 680,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// A zone epoll's kqueue is not a complete mirror: a zone",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net.rs",
+      "line": 684,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// kernel.el1.epoll-zone).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net.rs",
+      "line": 685,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net.rs",
+      "line": 693,
       "categories": [
         "epoll"
       ],
@@ -12332,7 +12791,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 734,
+      "line": 748,
       "categories": [
         "epoll"
       ],
@@ -12341,7 +12800,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 736,
+      "line": 750,
       "categories": [
         "epoll"
       ],
@@ -12350,7 +12809,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 742,
+      "line": 756,
       "categories": [
         "epoll"
       ],
@@ -12359,7 +12818,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 770,
+      "line": 784,
       "categories": [
         "epoll"
       ],
@@ -12368,7 +12827,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 809,
+      "line": 823,
       "categories": [
         "epoll"
       ],
@@ -12377,7 +12836,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 838,
+      "line": 852,
       "categories": [
         "epoll"
       ],
@@ -12386,7 +12845,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 840,
+      "line": 854,
       "categories": [
         "epoll"
       ],
@@ -12395,7 +12854,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 845,
+      "line": 859,
       "categories": [
         "epoll"
       ],
@@ -12404,7 +12863,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 955,
+      "line": 969,
       "categories": [
         "epoll"
       ],
@@ -12413,7 +12872,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 959,
+      "line": 973,
       "categories": [
         "description_guard"
       ],
@@ -12422,7 +12881,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1080,
+      "line": 1094,
       "categories": [
         "epoll"
       ],
@@ -12431,7 +12890,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1135,
+      "line": 1149,
       "categories": [
         "stream"
       ],
@@ -12440,7 +12899,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1140,
+      "line": 1154,
       "categories": [
         "epoll",
         "stream"
@@ -12450,7 +12909,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1148,
+      "line": 1162,
       "categories": [
         "stream"
       ],
@@ -12459,7 +12918,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1198,
+      "line": 1212,
       "categories": [
         "epoll"
       ],
@@ -12468,7 +12927,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1214,
+      "line": 1229,
       "categories": [
         "epoll"
       ],
@@ -12477,7 +12936,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1216,
+      "line": 1231,
       "categories": [
         "epoll"
       ],
@@ -12486,7 +12945,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1221,
+      "line": 1236,
       "categories": [
         "epoll"
       ],
@@ -12495,7 +12954,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1226,
+      "line": 1241,
       "categories": [
         "epoll"
       ],
@@ -12504,7 +12963,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1234,
+      "line": 1249,
       "categories": [
         "epoll"
       ],
@@ -12513,7 +12972,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1260,
+      "line": 1275,
       "categories": [
         "epoll"
       ],
@@ -12522,7 +12981,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1275,
+      "line": 1290,
       "categories": [
         "epoll"
       ],
@@ -12531,7 +12990,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1291,
+      "line": 1307,
       "categories": [
         "epoll"
       ],
@@ -12540,7 +12999,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1294,
+      "line": 1310,
       "categories": [
         "epoll"
       ],
@@ -12549,7 +13008,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1319,
+      "line": 1335,
       "categories": [
         "epoll"
       ],
@@ -12558,7 +13017,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1329,
+      "line": 1345,
       "categories": [
         "epoll"
       ],
@@ -12567,7 +13026,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1348,
+      "line": 1365,
       "categories": [
         "epoll"
       ],
@@ -12576,7 +13035,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1351,
+      "line": 1368,
       "categories": [
         "epoll"
       ],
@@ -12585,7 +13044,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1431,
+      "line": 1448,
       "categories": [
         "epoll"
       ],
@@ -12594,7 +13053,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1456,
+      "line": 1473,
       "categories": [
         "epoll"
       ],
@@ -12603,7 +13062,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1474,
+      "line": 1492,
       "categories": [
         "epoll"
       ],
@@ -12612,7 +13071,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1475,
+      "line": 1493,
       "categories": [
         "epoll"
       ],
@@ -12621,7 +13080,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1481,
+      "line": 1499,
       "categories": [
         "epoll"
       ],
@@ -12630,7 +13089,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1489,
+      "line": 1507,
       "categories": [
         "epoll"
       ],
@@ -12639,7 +13098,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1496,
+      "line": 1514,
       "categories": [
         "epoll"
       ],
@@ -12648,7 +13107,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1612,
+      "line": 1630,
       "categories": [
         "epoll"
       ],
@@ -12657,7 +13116,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1627,
+      "line": 1646,
       "categories": [
         "epoll"
       ],
@@ -12666,7 +13125,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1659,
+      "line": 1678,
       "categories": [
         "epoll"
       ],
@@ -12675,7 +13134,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1662,
+      "line": 1681,
       "categories": [
         "epoll"
       ],
@@ -12684,7 +13143,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1666,
+      "line": 1685,
       "categories": [
         "epoll"
       ],
@@ -12693,7 +13152,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1716,
+      "line": 1735,
       "categories": [
         "epoll"
       ],
@@ -12702,7 +13161,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1745,
+      "line": 1765,
       "categories": [
         "epoll"
       ],
@@ -12711,7 +13170,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1750,
+      "line": 1770,
       "categories": [
         "epoll"
       ],
@@ -12720,7 +13179,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1752,
+      "line": 1772,
       "categories": [
         "epoll"
       ],
@@ -12729,7 +13188,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1775,
+      "line": 1795,
       "categories": [
         "epoll"
       ],
@@ -12738,7 +13197,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1790,
+      "line": 1811,
       "categories": [
         "epoll"
       ],
@@ -12747,7 +13206,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1835,
+      "line": 1856,
       "categories": [
         "epoll"
       ],
@@ -12756,7 +13215,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1850,
+      "line": 1871,
       "categories": [
         "epoll"
       ],
@@ -12765,7 +13224,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 1974,
+      "line": 1995,
       "categories": [
         "epoll"
       ],
@@ -12774,7 +13233,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net.rs",
-      "line": 3346,
+      "line": 3368,
       "categories": [
         "epoll"
       ],
@@ -13359,34 +13818,97 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1337,
+      "line": 1339,
       "categories": [
         "epoll"
       ],
-      "text": "DispatchOutcome::WaitOnFds { fds, .. } => fds.first().expect(\"epoll mutation source\").0,",
+      "text": "\"expected a blocked epoll wait, got {blocked:?}\"",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1338,
+      "line": 1341,
       "categories": [
         "epoll"
       ],
-      "text": "other => panic!(\"expected shared epoll source, got {other:?}\"),",
+      "text": "// The wait service enrolls a blocked waiter on the epoll fd's",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1365,
+      "line": 1342,
       "categories": [
         "epoll"
       ],
-      "text": "// SAFETY: `kqueue_fd` is the live epoll instance source and `pollfd`",
+      "text": "// description wait queue (contract kernel.el1.epoll-zone): that",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1400,
+      "line": 1345,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll = h",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 1348,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"epoll fd\")",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 1353,
+      "categories": [
+        "epoll"
+      ],
+      "text": "epoll",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 1355,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"epoll wait queue\")",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 1382,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// The post-enrollment probe's answer: the epoll fd is readable.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 1391,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// poll(2) on an epoll fd whose zone item (a pipe read end) became",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 1422,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Contract kernel.el1.epoll-zone, candid divergence: a set with zone",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 1501,
       "categories": [
         "epoll"
       ],
@@ -13395,7 +13917,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1411,
+      "line": 1504,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// An eventfd member is a zone item (contract kernel.el1.epoll-zone):",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 1515,
       "categories": [
         "epoll"
       ],
@@ -13404,7 +13935,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1500,
+      "line": 1604,
       "categories": [
         "stream"
       ],
@@ -13413,7 +13944,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1524,
+      "line": 1628,
       "categories": [
         "stream"
       ],
@@ -13422,7 +13953,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1541,
+      "line": 1645,
       "categories": [
         "stream"
       ],
@@ -13431,7 +13962,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1634,
+      "line": 1738,
       "categories": [
         "mapping"
       ],
@@ -13440,7 +13971,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1714,
+      "line": 1818,
       "categories": [
         "epoll"
       ],
@@ -13449,7 +13980,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1717,
+      "line": 1821,
       "categories": [
         "description_guard"
       ],
@@ -13458,7 +13989,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1785,
+      "line": 1889,
       "categories": [
         "epoll"
       ],
@@ -13467,7 +13998,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1794,
+      "line": 1898,
       "categories": [
         "epoll"
       ],
@@ -13476,7 +14007,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1801,
+      "line": 1905,
       "categories": [
         "epoll"
       ],
@@ -13485,7 +14016,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1832,
+      "line": 1936,
       "categories": [
         "table_guard"
       ],
@@ -13494,7 +14025,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1834,
+      "line": 1938,
       "categories": [
         "epoll"
       ],
@@ -13503,7 +14034,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1839,
+      "line": 1943,
       "categories": [
         "epoll"
       ],
@@ -13512,7 +14043,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1843,
+      "line": 1947,
       "categories": [
         "epoll"
       ],
@@ -13521,7 +14052,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1844,
+      "line": 1948,
       "categories": [
         "epoll"
       ],
@@ -13530,7 +14061,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1845,
+      "line": 1949,
       "categories": [
         "epoll"
       ],
@@ -13539,7 +14070,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 1889,
+      "line": 1993,
       "categories": [
         "epoll"
       ],
@@ -13548,7 +14079,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2357,
+      "line": 2461,
       "categories": [
         "epoll"
       ],
@@ -13557,7 +14088,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2361,
+      "line": 2465,
       "categories": [
         "epoll"
       ],
@@ -13566,7 +14097,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2362,
+      "line": 2466,
       "categories": [
         "epoll"
       ],
@@ -13575,7 +14106,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2363,
+      "line": 2467,
       "categories": [
         "epoll"
       ],
@@ -13584,7 +14115,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2475,
+      "line": 2579,
       "categories": [
         "epoll"
       ],
@@ -13593,7 +14124,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2476,
+      "line": 2580,
       "categories": [
         "description_guard",
         "epoll"
@@ -13603,7 +14134,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2477,
+      "line": 2581,
       "categories": [
         "epoll"
       ],
@@ -13612,7 +14143,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2478,
+      "line": 2582,
       "categories": [
         "epoll"
       ],
@@ -13621,7 +14152,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2485,
+      "line": 2589,
       "categories": [
         "epoll"
       ],
@@ -13630,7 +14161,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2486,
+      "line": 2590,
       "categories": [
         "epoll"
       ],
@@ -13639,7 +14170,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2489,
+      "line": 2593,
       "categories": [
         "epoll"
       ],
@@ -13648,7 +14179,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2490,
+      "line": 2594,
       "categories": [
         "description_guard",
         "epoll"
@@ -13658,7 +14189,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2491,
+      "line": 2595,
       "categories": [
         "epoll"
       ],
@@ -13667,7 +14198,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2492,
+      "line": 2596,
       "categories": [
         "epoll"
       ],
@@ -13676,7 +14207,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2505,
+      "line": 2609,
       "categories": [
         "epoll"
       ],
@@ -13685,7 +14216,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2506,
+      "line": 2610,
       "categories": [
         "epoll"
       ],
@@ -13694,7 +14225,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2513,
+      "line": 2617,
       "categories": [
         "epoll"
       ],
@@ -13703,7 +14234,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2522,
+      "line": 2626,
       "categories": [
         "epoll"
       ],
@@ -13712,7 +14243,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2570,
+      "line": 2674,
       "categories": [
         "epoll"
       ],
@@ -13721,7 +14252,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2579,
+      "line": 2683,
       "categories": [
         "epoll"
       ],
@@ -13730,7 +14261,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2587,
+      "line": 2691,
       "categories": [
         "epoll"
       ],
@@ -13739,7 +14270,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2594,
+      "line": 2698,
       "categories": [
         "epoll"
       ],
@@ -13748,7 +14279,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2595,
+      "line": 2699,
       "categories": [
         "epoll"
       ],
@@ -13757,7 +14288,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2600,
+      "line": 2704,
       "categories": [
         "epoll"
       ],
@@ -13766,7 +14297,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2606,
+      "line": 2710,
       "categories": [
         "epoll"
       ],
@@ -13775,7 +14306,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2627,
+      "line": 2731,
       "categories": [
         "epoll"
       ],
@@ -13784,7 +14315,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2628,
+      "line": 2732,
       "categories": [
         "epoll"
       ],
@@ -13793,7 +14324,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2631,
+      "line": 2735,
       "categories": [
         "epoll"
       ],
@@ -13802,7 +14333,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2662,
+      "line": 2766,
       "categories": [
         "epoll"
       ],
@@ -13811,7 +14342,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2664,
+      "line": 2768,
       "categories": [
         "epoll"
       ],
@@ -13820,97 +14351,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2793,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let epoll_open = h.dispatcher.open_file(epfd as i32).expect(\"epoll fd\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2798,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"epoll open description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2799,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll { interest, .. } = &mut *open else {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2800,
-      "categories": [
-        "epoll"
-      ],
-      "text": "panic!(\"epfd should be an epoll description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2815,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"epoll open description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2816,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll { interest, .. } = &*open else {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2817,
-      "categories": [
-        "epoll"
-      ],
-      "text": "panic!(\"epfd should be an epoll description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2834,
-      "categories": [
-        "epoll"
-      ],
-      "text": ".expect(\"epoll open description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2835,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll { interest, .. } = &*open else {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2836,
-      "categories": [
-        "epoll"
-      ],
-      "text": "panic!(\"epfd should be an epoll description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2898,
+      "line": 2897,
       "categories": [
         "epoll"
       ],
@@ -13932,7 +14373,7 @@
       "categories": [
         "epoll"
       ],
-      "text": "let OpenDescription::Epoll { interest, .. } = &*open else {",
+      "text": "let OpenDescription::Epoll { interest, .. } = &mut *open else {",
       "scope_kind": "test_or_definition"
     },
     {
@@ -13946,61 +14387,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2920,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let epoll_open = h.dispatcher.open_file(epfd as i32).expect(\"epoll fd\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2921,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = epoll_open.description.inspect().expect(\"open description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2922,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll { kqueue, .. } = &*open else {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2923,
-      "categories": [
-        "epoll"
-      ],
-      "text": "panic!(\"epfd should be an epoll description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2929,
-      "categories": [
-        "epoll"
-      ],
-      "text": "assert!(n > 0, \"peer write should wake the epoll instance\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2944,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let epoll_open = h.dispatcher.open_file(epfd as i32).expect(\"epoll fd\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2948,
+      "line": 2919,
       "categories": [
         "epoll"
       ],
@@ -14009,7 +14396,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2949,
+      "line": 2920,
       "categories": [
         "epoll"
       ],
@@ -14018,7 +14405,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 2950,
+      "line": 2921,
       "categories": [
         "epoll"
       ],
@@ -14027,7 +14414,151 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3035,
+      "line": 2938,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"epoll open description\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 2939,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll { interest, .. } = &*open else {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 2940,
+      "categories": [
+        "epoll"
+      ],
+      "text": "panic!(\"epfd should be an epoll description\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3002,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll_open = h.dispatcher.open_file(epfd as i32).expect(\"epoll fd\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3006,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"epoll open description\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3007,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll { interest, .. } = &*open else {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3008,
+      "categories": [
+        "epoll"
+      ],
+      "text": "panic!(\"epfd should be an epoll description\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3024,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll_open = h.dispatcher.open_file(epfd as i32).expect(\"epoll fd\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3025,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = epoll_open.description.inspect().expect(\"open description\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3026,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll { kqueue, .. } = &*open else {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3027,
+      "categories": [
+        "epoll"
+      ],
+      "text": "panic!(\"epfd should be an epoll description\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3033,
+      "categories": [
+        "epoll"
+      ],
+      "text": "assert!(n > 0, \"peer write should wake the epoll instance\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3048,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll_open = h.dispatcher.open_file(epfd as i32).expect(\"epoll fd\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3052,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"epoll open description\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3053,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll { interest, .. } = &*open else {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3054,
+      "categories": [
+        "epoll"
+      ],
+      "text": "panic!(\"epfd should be an epoll description\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 3139,
       "categories": [
         "epoll"
       ],
@@ -14036,7 +14567,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3039,
+      "line": 3143,
       "categories": [
         "epoll"
       ],
@@ -14045,7 +14576,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3045,
+      "line": 3149,
       "categories": [
         "epoll"
       ],
@@ -14054,7 +14585,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3074,
+      "line": 3178,
       "categories": [
         "epoll"
       ],
@@ -14063,7 +14594,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3241,
+      "line": 3345,
       "categories": [
         "epoll"
       ],
@@ -14072,7 +14603,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3242,
+      "line": 3346,
       "categories": [
         "epoll"
       ],
@@ -14081,7 +14612,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3483,
+      "line": 3587,
       "categories": [
         "epoll"
       ],
@@ -14090,7 +14621,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3804,
+      "line": 3908,
       "categories": [
         "mapping"
       ],
@@ -14099,7 +14630,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3836,
+      "line": 3940,
       "categories": [
         "mapping"
       ],
@@ -14108,7 +14639,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 3995,
+      "line": 4099,
       "categories": [
         "mapping"
       ],
@@ -14117,7 +14648,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4087,
+      "line": 4191,
       "categories": [
         "mapping"
       ],
@@ -14126,7 +14657,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4165,
+      "line": 4269,
       "categories": [
         "mapping"
       ],
@@ -14135,7 +14666,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4166,
+      "line": 4270,
       "categories": [
         "mapping"
       ],
@@ -14144,7 +14675,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4170,
+      "line": 4274,
       "categories": [
         "mapping"
       ],
@@ -14153,7 +14684,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4689,
+      "line": 4793,
       "categories": [
         "table_guard"
       ],
@@ -14162,7 +14693,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4694,
+      "line": 4798,
       "categories": [
         "table_guard"
       ],
@@ -14171,7 +14702,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4740,
+      "line": 4844,
       "categories": [
         "table_guard"
       ],
@@ -14180,7 +14711,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4742,
+      "line": 4846,
       "categories": [
         "table_guard"
       ],
@@ -14189,7 +14720,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4963,
+      "line": 5067,
       "categories": [
         "table_guard"
       ],
@@ -14198,7 +14729,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4981,
+      "line": 5085,
       "categories": [
         "table_guard"
       ],
@@ -14207,7 +14738,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 4996,
+      "line": 5100,
       "categories": [
         "table_guard"
       ],
@@ -14216,7 +14747,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5001,
+      "line": 5105,
       "categories": [
         "table_guard"
       ],
@@ -14225,7 +14756,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5044,
+      "line": 5148,
       "categories": [
         "table_guard"
       ],
@@ -14234,7 +14765,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5046,
+      "line": 5150,
       "categories": [
         "table_guard"
       ],
@@ -14243,7 +14774,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5059,
+      "line": 5163,
       "categories": [
         "table_guard"
       ],
@@ -14252,7 +14783,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5075,
+      "line": 5179,
       "categories": [
         "table_guard"
       ],
@@ -14261,7 +14792,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5089,
+      "line": 5193,
       "categories": [
         "table_guard"
       ],
@@ -14270,7 +14801,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5102,
+      "line": 5206,
       "categories": [
         "table_guard"
       ],
@@ -14279,7 +14810,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5119,
+      "line": 5223,
       "categories": [
         "table_guard"
       ],
@@ -14288,7 +14819,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5136,
+      "line": 5240,
       "categories": [
         "table_guard"
       ],
@@ -14297,7 +14828,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5145,
+      "line": 5249,
       "categories": [
         "table_guard"
       ],
@@ -14306,7 +14837,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5193,
+      "line": 5297,
       "categories": [
         "table_guard"
       ],
@@ -14315,7 +14846,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5210,
+      "line": 5314,
       "categories": [
         "table_guard"
       ],
@@ -14324,7 +14855,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5227,
+      "line": 5331,
       "categories": [
         "table_guard"
       ],
@@ -14333,7 +14864,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5236,
+      "line": 5340,
       "categories": [
         "table_guard"
       ],
@@ -14342,7 +14873,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5281,
+      "line": 5385,
       "categories": [
         "epoll"
       ],
@@ -14351,7 +14882,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5305,
+      "line": 5409,
       "categories": [
         "table_guard"
       ],
@@ -14360,7 +14891,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5314,
+      "line": 5418,
       "categories": [
         "epoll"
       ],
@@ -14369,7 +14900,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5323,
+      "line": 5427,
       "categories": [
         "epoll"
       ],
@@ -14378,7 +14909,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5388,
+      "line": 5488,
       "categories": [
         "epoll"
       ],
@@ -14387,90 +14918,70 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5391,
+      "line": 5489,
       "categories": [
         "epoll"
       ],
-      "text": ".expect(\"target reverse epoll snapshot\");",
+      "text": "// A pipe read end is a zone item: the epoll's record holds it.",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5418,
+      "line": 5514,
       "categories": [
         "epoll"
       ],
-      "text": "let epoll = parent.open_file(epfd).expect(\"parent epoll fd\");",
+      "text": "\"final target close did not detach the epoll item in another table\"",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5419,
+      "line": 5518,
       "categories": [
-        "description_guard",
         "epoll"
       ],
-      "text": "let epoll = epoll.description.inspect().expect(\"epoll open description\");",
+      "text": "/// Whether the epoll description holds an item for fd number `fd` in",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5420,
+      "line": 5519,
       "categories": [
         "epoll"
       ],
-      "text": "let OpenDescription::Epoll { interest, .. } = &*epoll else {",
+      "text": "/// either half (contract kernel.el1.epoll-zone).",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5421,
+      "line": 5520,
       "categories": [
         "epoll"
       ],
-      "text": "panic!(\"epoll fd changed description kind\");",
+      "text": "fn epoll_holds_item_fd(epoll: &Arc<crate::kernel::FileDescription>, fd: i32) -> bool {",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5425,
+      "line": 5521,
       "categories": [
         "epoll"
       ],
-      "text": "\"final target close did not detach the epoll owner in another table\"",
+      "text": "let epoll = epoll.inspect().expect(\"epoll open description\");",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5534,
+      "line": 5522,
       "categories": [
         "epoll"
       ],
-      "text": "let epoll = parent.open_file(epfd).expect(\"parent epoll fd\");",
+      "text": "let OpenDescription::Epoll { interest, zone, .. } = &*epoll else {",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5535,
-      "categories": [
-        "description_guard",
-        "epoll"
-      ],
-      "text": "let epoll = epoll.description.inspect().expect(\"epoll open description\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5536,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll { interest, .. } = &*epoll else {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5537,
+      "line": 5523,
       "categories": [
         "epoll"
       ],
@@ -14479,7 +14990,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5541,
+      "line": 5633,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll_description = parent.open_file(epfd).expect(\"parent epoll fd\").description;",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
+      "line": 5636,
       "categories": [
         "epoll"
       ],
@@ -14488,16 +15008,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5543,
-      "categories": [
-        "epoll"
-      ],
-      "text": "drop(epoll);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5548,
+      "line": 5642,
       "categories": [
         "epoll"
       ],
@@ -14506,53 +15017,52 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5561,
+      "line": 5650,
       "categories": [
         "epoll"
       ],
-      "text": "let epoll = parent.open_file(epfd).expect(\"parent epoll fd\");",
+      "text": "// epoll fd's description wait queue (contract kernel.el1.epoll-zone:",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5563,
+      "line": 5654,
       "categories": [
-        "description_guard",
         "epoll"
       ],
-      "text": "let epoll = epoll.description.inspect().expect(\"open description\");",
+      "text": "let epoll = parent.open_file(epfd).expect(\"parent epoll fd\").description;",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5564,
+      "line": 5658,
       "categories": [
         "epoll"
       ],
-      "text": "let OpenDescription::Epoll { kqueue, .. } = &*epoll else {",
+      "text": "epoll",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5565,
+      "line": 5660,
       "categories": [
         "epoll"
       ],
-      "text": "panic!(\"epoll fd changed description kind\");",
+      "text": ".expect(\"epoll wait queue\")",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 5577,
+      "line": 5671,
       "categories": [
         "epoll"
       ],
-      "text": "\"child non-final close deleted the parent's host epoll registration\"",
+      "text": "\"child non-final close deleted the parent's inherited epoll item\"",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 8386,
+      "line": 8483,
       "categories": [
         "description_backing"
       ],
@@ -14561,7 +15071,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 8792,
+      "line": 8889,
       "categories": [
         "mapping"
       ],
@@ -14570,7 +15080,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 8795,
+      "line": 8892,
       "categories": [
         "mapping"
       ],
@@ -14579,7 +15089,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 10004,
+      "line": 10101,
       "categories": [
         "stream"
       ],
@@ -14588,7 +15098,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/tests.rs",
-      "line": 10010,
+      "line": 10107,
       "categories": [
         "stream"
       ],
@@ -14660,7 +15170,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/wait_queue_fixture.rs",
-      "line": 297,
+      "line": 298,
       "categories": [
         "epoll"
       ],
@@ -14669,7 +15179,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/wait_queue_fixture.rs",
-      "line": 300,
+      "line": 301,
       "categories": [
         "epoll"
       ],
@@ -14975,7 +15485,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 379,
+      "line": 290,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// packed), the epoll item key of the open file this view describes.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "line": 392,
       "categories": [
         "mapping"
       ],
@@ -14984,7 +15503,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 380,
+      "line": 393,
       "categories": [
         "mapping"
       ],
@@ -14993,7 +15512,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 442,
+      "line": 455,
       "categories": [
         "mapping"
       ],
@@ -15002,11 +15521,74 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_ipc.rs",
-      "line": 443,
+      "line": 456,
       "categories": [
         "mapping"
       ],
       "text": "bytes: Mapping::new(pool_bytes)?,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "line": 649,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// host subscribers), and each zone epoll's it queued an item on (that",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "line": 650,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// epoll's host-side waiters). Each is consumed only where owed.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "line": 656,
+      "categories": [
+        "epoll"
+      ],
+      "text": "for epoll in wake.epolls.iter() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "line": 657,
+      "categories": [
+        "epoll"
+      ],
+      "text": "self.service_host_wake(epoll);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_ipc.rs",
+      "line": 824,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// A zone epoll record ([`carrick_el1_abi::ipc::epoll`]) with an empty",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "line": 52,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// epoll the change queued an item on.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "line": 63,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".map(|epoll| (epoll, carrick_el1_abi::ipc::pipe::WaitFor::Readable)),",
       "scope_kind": "production_callsite"
     },
     {
@@ -15173,7 +15755,25 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs",
-      "line": 678,
+      "line": 334,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// A parked zone epoll wait owns no progress: a signal ends it with EINTR",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs",
+      "line": 407,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// A timed epoll wait the host wakes and re-runs never waits longer than",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs",
+      "line": 848,
       "categories": [
         "epoll"
       ],
@@ -15182,7 +15782,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
-      "line": 34,
+      "line": 36,
       "categories": [
         "mapping"
       ],
@@ -15191,11 +15791,74 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
-      "line": 143,
+      "line": 45,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// The guest virtual counter now (an epoll wait's deadline is on it).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "line": 127,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// The object's own lanes, then each zone epoll it queued items on.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "line": 136,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".map(|epoll| (epoll, WaitFor::Readable, true)),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "line": 182,
       "categories": [
         "mapping"
       ],
       "text": "/// publish a different kernel's descriptor IDs into the carrier's mapping.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "line": 256,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// syscall number (the call runs again). `timeout_ms`: a timed epoll",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "line": 286,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Re-run a parked epoll wait with what is left of its wait.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "line": 365,
+      "categories": [
+        "epoll"
+      ],
+      "text": "IpcReleased::Object { freed: true, .. } | IpcReleased::Epoll => {}",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "line": 495,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// A parked zone epoll wait owns no progress: the host runs the",
       "scope_kind": "production_callsite"
     },
     {
@@ -18719,7 +19382,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 292,
+      "line": 282,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Items an epoll backing holds in its zone record (members that are",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
+      "line": 298,
       "categories": [
         "epoll"
       ],
@@ -18728,7 +19400,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 398,
+      "line": 404,
       "categories": [
         "epoll"
       ],
@@ -18737,7 +19409,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 401,
+      "line": 407,
       "categories": [
         "epoll"
       ],
@@ -18746,7 +19418,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1283,
+      "line": 1289,
       "categories": [
         "epoll"
       ],
@@ -18755,7 +19427,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1286,
+      "line": 1292,
       "categories": [
         "epoll"
       ],
@@ -18764,7 +19436,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1331,
+      "line": 1337,
       "categories": [
         "epoll"
       ],
@@ -18773,7 +19445,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1339,
+      "line": 1353,
       "categories": [
         "epoll"
       ],
@@ -18782,7 +19454,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1368,
+      "line": 1382,
       "categories": [
         "epoll"
       ],
@@ -18791,7 +19463,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1378,
+      "line": 1392,
       "categories": [
         "epoll"
       ],
@@ -18800,7 +19472,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1407,
+      "line": 1421,
       "categories": [
         "epoll"
       ],
@@ -18809,7 +19481,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1410,
+      "line": 1424,
       "categories": [
         "epoll"
       ],
@@ -18818,7 +19490,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1570,
+      "line": 1584,
       "categories": [
         "mapping"
       ],
@@ -18827,7 +19499,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1602,
+      "line": 1616,
       "categories": [
         "epoll"
       ],
@@ -18836,7 +19508,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1618,
+      "line": 1632,
       "categories": [
         "epoll"
       ],
@@ -18845,7 +19517,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1645,
+      "line": 1659,
       "categories": [
         "epoll"
       ],
@@ -18854,7 +19526,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 1666,
+      "line": 1680,
       "categories": [
         "epoll"
       ],
@@ -18863,7 +19535,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2313,
+      "line": 2327,
       "categories": [
         "table_guard"
       ],
@@ -18872,7 +19544,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2338,
+      "line": 2352,
       "categories": [
         "table_guard"
       ],
@@ -18881,7 +19553,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2346,
+      "line": 2360,
       "categories": [
         "lifecycle"
       ],
@@ -18890,7 +19562,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2352,
+      "line": 2366,
       "categories": [
         "table_guard"
       ],
@@ -18899,7 +19571,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2391,
+      "line": 2405,
       "categories": [
         "table_guard"
       ],
@@ -18908,7 +19580,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2403,
+      "line": 2417,
       "categories": [
         "lifecycle"
       ],
@@ -18917,7 +19589,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2420,
+      "line": 2434,
       "categories": [
         "table_guard"
       ],
@@ -18926,7 +19598,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2458,
+      "line": 2472,
       "categories": [
         "table_guard"
       ],
@@ -18935,7 +19607,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2507,
+      "line": 2521,
       "categories": [
         "table_guard"
       ],
@@ -18944,7 +19616,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2508,
+      "line": 2522,
       "categories": [
         "table_guard"
       ],
@@ -18953,7 +19625,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2510,
+      "line": 2524,
       "categories": [
         "table_guard"
       ],
@@ -18962,7 +19634,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2645,
+      "line": 2659,
       "categories": [
         "table_guard"
       ],
@@ -18971,7 +19643,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2646,
+      "line": 2660,
       "categories": [
         "table_guard"
       ],
@@ -18980,7 +19652,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2661,
+      "line": 2675,
       "categories": [
         "table_guard"
       ],
@@ -18989,7 +19661,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2666,
+      "line": 2680,
       "categories": [
         "table_guard"
       ],
@@ -18998,7 +19670,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2696,
+      "line": 2710,
       "categories": [
         "table_guard"
       ],
@@ -19007,7 +19679,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2697,
+      "line": 2711,
       "categories": [
         "table_guard"
       ],
@@ -19016,7 +19688,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2708,
+      "line": 2722,
       "categories": [
         "table_guard"
       ],
@@ -19025,7 +19697,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2713,
+      "line": 2727,
       "categories": [
         "table_guard"
       ],
@@ -19034,7 +19706,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2739,
+      "line": 2753,
       "categories": [
         "table_guard"
       ],
@@ -19043,7 +19715,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2792,
+      "line": 2806,
       "categories": [
         "table_guard"
       ],
@@ -19052,7 +19724,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2950,
+      "line": 2964,
       "categories": [
         "table_guard"
       ],
@@ -19061,7 +19733,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2956,
+      "line": 2970,
       "categories": [
         "table_guard"
       ],
@@ -19070,7 +19742,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2977,
+      "line": 2991,
       "categories": [
         "table_guard"
       ],
@@ -19079,7 +19751,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2981,
+      "line": 2995,
       "categories": [
         "table_guard"
       ],
@@ -19088,7 +19760,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2985,
+      "line": 2999,
       "categories": [
         "table_guard"
       ],
@@ -19097,7 +19769,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2993,
+      "line": 3007,
       "categories": [
         "table_guard"
       ],
@@ -19106,7 +19778,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 2997,
+      "line": 3011,
       "categories": [
         "table_guard"
       ],
@@ -19115,7 +19787,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3002,
+      "line": 3016,
       "categories": [
         "table_guard"
       ],
@@ -19124,7 +19796,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3010,
+      "line": 3024,
       "categories": [
         "table_guard"
       ],
@@ -19133,7 +19805,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3014,
+      "line": 3028,
       "categories": [
         "table_guard"
       ],
@@ -19142,7 +19814,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3018,
+      "line": 3032,
       "categories": [
         "table_guard"
       ],
@@ -19151,7 +19823,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3022,
+      "line": 3036,
       "categories": [
         "table_guard"
       ],
@@ -19160,7 +19832,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3023,
+      "line": 3037,
       "categories": [
         "table_guard"
       ],
@@ -19169,7 +19841,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3029,
+      "line": 3043,
       "categories": [
         "table_guard"
       ],
@@ -19178,7 +19850,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3433,
+      "line": 3447,
       "categories": [
         "lifecycle"
       ],
@@ -19187,7 +19859,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3640,
+      "line": 3654,
       "categories": [
         "epoll"
       ],
@@ -19196,7 +19868,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3642,
+      "line": 3656,
       "categories": [
         "epoll"
       ],
@@ -19205,7 +19877,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3644,
+      "line": 3658,
       "categories": [
         "epoll"
       ],
@@ -19214,7 +19886,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3702,
+      "line": 3716,
       "categories": [
         "table_guard"
       ],
@@ -19223,7 +19895,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3716,
+      "line": 3730,
       "categories": [
         "table_guard"
       ],
@@ -19232,7 +19904,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3720,
+      "line": 3734,
       "categories": [
         "lifecycle"
       ],
@@ -19241,7 +19913,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3723,
+      "line": 3737,
       "categories": [
         "table_guard"
       ],
@@ -19250,7 +19922,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3727,
+      "line": 3741,
       "categories": [
         "table_guard"
       ],
@@ -19259,7 +19931,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3739,
+      "line": 3753,
       "categories": [
         "table_guard"
       ],
@@ -19268,7 +19940,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3745,
+      "line": 3759,
       "categories": [
         "lifecycle"
       ],
@@ -19277,7 +19949,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3751,
+      "line": 3765,
       "categories": [
         "table_guard"
       ],
@@ -19286,7 +19958,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3781,
+      "line": 3795,
       "categories": [
         "table_guard"
       ],
@@ -19295,7 +19967,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3801,
+      "line": 3815,
       "categories": [
         "lifecycle"
       ],
@@ -19304,7 +19976,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3828,
+      "line": 3842,
       "categories": [
         "lifecycle"
       ],
@@ -19313,7 +19985,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3829,
+      "line": 3843,
       "categories": [
         "lifecycle"
       ],
@@ -19322,7 +19994,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3886,
+      "line": 3900,
       "categories": [
         "epoll"
       ],
@@ -19331,7 +20003,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3887,
+      "line": 3901,
       "categories": [
         "epoll"
       ],
@@ -19340,7 +20012,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3889,
+      "line": 3903,
       "categories": [
         "epoll"
       ],
@@ -19349,7 +20021,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3890,
+      "line": 3904,
       "categories": [
         "epoll"
       ],
@@ -19358,7 +20030,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3897,
+      "line": 3911,
       "categories": [
         "epoll"
       ],
@@ -19367,7 +20039,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3898,
+      "line": 3912,
       "categories": [
         "epoll"
       ],
@@ -19376,7 +20048,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3901,
+      "line": 3915,
       "categories": [
         "epoll"
       ],
@@ -19385,7 +20057,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3904,
+      "line": 3918,
       "categories": [
         "epoll"
       ],
@@ -19394,7 +20066,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3907,
+      "line": 3921,
       "categories": [
         "epoll"
       ],
@@ -19403,7 +20075,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3909,
+      "line": 3923,
       "categories": [
         "epoll"
       ],
@@ -19412,7 +20084,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3921,
+      "line": 3935,
       "categories": [
         "table_guard",
         "epoll"
@@ -19422,7 +20094,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3931,
+      "line": 3945,
       "categories": [
         "epoll"
       ],
@@ -19431,7 +20103,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3938,
+      "line": 3952,
       "categories": [
         "epoll"
       ],
@@ -19440,7 +20112,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 3956,
+      "line": 3970,
       "categories": [
         "lifecycle"
       ],
@@ -19449,7 +20121,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4040,
+      "line": 4054,
       "categories": [
         "table_guard"
       ],
@@ -19458,7 +20130,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4052,
+      "line": 4066,
       "categories": [
         "table_guard"
       ],
@@ -19467,7 +20139,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4237,
+      "line": 4251,
       "categories": [
         "table_guard"
       ],
@@ -19476,7 +20148,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4295,
+      "line": 4309,
       "categories": [
         "table_guard"
       ],
@@ -19485,7 +20157,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4358,
+      "line": 4372,
       "categories": [
         "table_guard"
       ],
@@ -19494,7 +20166,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4399,
+      "line": 4413,
       "categories": [
         "table_guard"
       ],
@@ -19503,7 +20175,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4743,
+      "line": 4757,
       "categories": [
         "lifecycle"
       ],
@@ -19512,7 +20184,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "line": 4744,
+      "line": 4758,
       "categories": [
         "lifecycle"
       ],
@@ -22316,6 +22988,33 @@
         "mapping"
       ],
       "text": "if detail.starts_with(\"HVPatch sparse mmap backing:\") =>",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
+      "line": 720,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// A timed epoll wait's timeout argument (`x3`) was already rewritten",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
+      "line": 809,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// A timed epoll wait re-runs with what is left of its deadline: rewrite",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
+      "line": 1118,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// The deadline of a timed park (an epoll wait) the host kept",
       "scope_kind": "production_callsite"
     },
     {
