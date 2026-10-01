@@ -3293,6 +3293,20 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn capacity_cache_observes_backing_cohort_sibling_rename() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("old")).unwrap();
+        fs::write(tmp.path().join("old/file"), b"data").unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new_with_capacity(false, 64 * 1024, true);
+        cache.stat("/old/file", true, &backend, None).unwrap();
+        fs::rename(tmp.path().join("old"), tmp.path().join("new")).unwrap();
+        backend.coherence.simulate_sibling_path_bump();
+        assert!(cache.stat("/old/file", true, &backend, None).is_err());
+        cache.stat("/new/file", true, &backend, None).unwrap();
+    }
+
+    #[test]
     fn independent_backing_namespace_mutation_keeps_other_cache_generation() {
         use crate::fs_backend::FsBackend;
 
