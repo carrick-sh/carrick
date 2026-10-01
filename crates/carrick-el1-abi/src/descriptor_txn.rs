@@ -244,6 +244,31 @@ pub fn descriptor_drain_frame_offset(slot: usize) -> Option<u64> {
     Some((top - 0x120 - 0x200) & !0xF)
 }
 
+/// Stack the host-driven drain call needs below its frame.
+pub const DRAIN_MIN_CALL_STACK: u64 = 0x1800;
+
+/// Placement of a host-driven drain frame on vCPU `slot` whose EL1 may be
+/// suspended mid-operation with its stack pointer at `suspended_sp` (a VA in
+/// the EL1 region): below that stack, never over it.
+#[must_use]
+pub fn descriptor_drain_frame_offset_below(slot: usize, suspended_sp: Option<u64>) -> Option<u64> {
+    let fixed = descriptor_drain_frame_offset(slot)?;
+    let Some(sp) = suspended_sp else {
+        return Some(fixed);
+    };
+    let base = crate::EL1_STACKS_OFFSET + slot as u64 * crate::EL1_STACK_SIZE;
+    let top = base + crate::EL1_STACK_SIZE;
+    let sp = sp.checked_sub(crate::EL1_REGION_BASE)?;
+    if sp <= base || sp > top {
+        return None;
+    }
+    // A small gap below the suspended SP, then the frame, 16-aligned.
+    let frame = core::mem::size_of::<crate::TrapFrame>() as u64;
+    let below = sp.checked_sub(0x40 + frame)? & !0xF;
+    let placed = fixed.min(below);
+    (placed >= base + DRAIN_MIN_CALL_STACK).then_some(placed)
+}
+
 /// Host view of every descriptor transaction slot, if an EL1 region is
 /// installed.
 pub fn descriptor_txn_slots_host() -> Option<&'static DescriptorTxnSlots> {
@@ -274,6 +299,56 @@ pub fn descriptor_txn_slots_guest() -> &'static DescriptorTxnSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stage-1 COW fault taken at EL1 (a copy_out in an in-zone operation)
+    /// leaves that operation's frames on the slot's EL1 stack while the host
+    /// publishes the COW through a host-driven drain call on the same vCPU.
+    /// The drain frame, and the call's stack below it, must lie below the
+    /// suspended stack pointer: the fixed placement near the stack top wrote
+    /// the drain's frames over the suspended operation's.
+    #[test]
+    fn drain_frame_lies_below_a_suspended_el1_stack() {
+        let frame = core::mem::size_of::<crate::TrapFrame>() as u64;
+        for slot in [0, 1, EL1_STACK_SLOTS as usize - 1] {
+            let base = crate::EL1_STACKS_OFFSET + slot as u64 * crate::EL1_STACK_SIZE;
+            let top = base + crate::EL1_STACK_SIZE;
+            let fixed = descriptor_drain_frame_offset(slot).unwrap();
+            // Not suspended: the fixed placement.
+            assert_eq!(descriptor_drain_frame_offset_below(slot, None), Some(fixed));
+            // Suspended above the fixed frame: the fixed frame already lies below.
+            let shallow = crate::EL1_REGION_BASE + top - 0x120 - 0x40;
+            let placed = descriptor_drain_frame_offset_below(slot, Some(shallow)).unwrap();
+            assert!(placed + frame <= shallow - crate::EL1_REGION_BASE);
+            // Suspended deeper: the frame moves below the suspended SP.
+            for depth in [0x400_u64, 0x900, 0x1800] {
+                let sp = crate::EL1_REGION_BASE + top - depth;
+                let placed = descriptor_drain_frame_offset_below(slot, Some(sp)).unwrap();
+                assert!(
+                    placed + frame <= sp - crate::EL1_REGION_BASE,
+                    "slot {slot} depth 0x{depth:x}: frame 0x{placed:x} overlaps the suspended stack"
+                );
+                assert_eq!(placed % 16, 0);
+                assert!(placed >= base + DRAIN_MIN_CALL_STACK);
+            }
+            // Too deep to leave the call its stack, or not this slot's stack.
+            let exhausted = crate::EL1_REGION_BASE + base + DRAIN_MIN_CALL_STACK;
+            assert_eq!(
+                descriptor_drain_frame_offset_below(slot, Some(exhausted)),
+                None
+            );
+            assert_eq!(
+                descriptor_drain_frame_offset_below(
+                    slot,
+                    Some(crate::EL1_REGION_BASE + top + 0x10)
+                ),
+                None
+            );
+            assert_eq!(
+                descriptor_drain_frame_offset_below(slot, Some(0x1000)),
+                None
+            );
+        }
+    }
 
     #[test]
     fn slots_fit_the_counters_tail_and_start_idle() {
