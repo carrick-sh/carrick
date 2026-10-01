@@ -1008,6 +1008,17 @@
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::prepare_el1_frame_grant",
       "ordinal_in_function": 2,
+      "fingerprint": "6f5c52739cdeaf3262a592fcb1b84c335d44b28016f187dbf8d8994f47fcbba5",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "An executable EL1 frame grant's freshly published frame could not be resolved by the carrier's instruction-cache authority; EL1 could then publish the leaf over stale instruction-cache lines.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfVmState::prepare_el1_frame_grant",
+      "ordinal_in_function": 3,
       "fingerprint": "5bcab621e68692ffb58e95060d95fa86be22d654dd9338b6820bcb71ee4aa37d",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::el1_frame_grant",
