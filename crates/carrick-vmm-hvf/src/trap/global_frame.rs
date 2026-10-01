@@ -4155,30 +4155,24 @@ pub(crate) fn mapped_region_matches_retired_inventory_extent(
 /// See [`super::el1_frame_grant_unreturned`].
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn unreturned_el1_grant_census(custody: &CarrierVmCustody) -> Vec<String> {
-    let describe = |key: (u64, u64),
-                    owner: &std::sync::Arc<GlobalFrameHostOwner>,
-                    state: String| {
-        let receipt = owner.mapping.el1_grant.lock();
-        let receipt = receipt.as_ref().filter(|receipt| !receipt.returned)?;
-        let record = custody
-            .stage2_record_snapshot(owner.record_identity.record_id)
-            .map(|record| {
-                format!(
-                    "pins={} mapped={} retirement_requested={}",
-                    record.pin_count, record.mapped, record.retirement_requested
-                )
-            })
-            .unwrap_or_else(|| "record=gone".to_owned());
-        Some(format!(
-            "ipa={:#x} len={:#x} grant={:#x}+{:#x} mm={:?} state={state} {record} owner_refs={}",
-            key.0,
-            key.1,
-            receipt.base,
-            receipt.length,
-            receipt.mm,
-            std::sync::Arc::strong_count(owner)
-        ))
-    };
+    let describe =
+        |key: (u64, u64), owner: &std::sync::Arc<GlobalFrameHostOwner>, state: String| {
+            let receipt = owner.mapping.el1_grant.lock();
+            let receipt = receipt.as_ref().filter(|receipt| !receipt.returned)?;
+            let record = custody
+                .stage2_record_snapshot(owner.record_identity.record_id)
+                .map(|record| {
+                    format!(
+                        "pins={} mapped={} retirement_requested={}",
+                        record.pin_count, record.mapped, record.retirement_requested
+                    )
+                })
+                .unwrap_or_else(|| "record=gone".to_owned());
+            Some(format!(
+                "ipa={:#x} len={:#x} grant={:#x}+{:#x} mm={:?} state={state} {record}",
+                key.0, key.1, receipt.base, receipt.length, receipt.mm,
+            ))
+        };
     let mut census: Vec<String> = custody
         .global_frame_host_owners
         .lock()
