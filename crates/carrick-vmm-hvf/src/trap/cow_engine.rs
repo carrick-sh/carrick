@@ -8,11 +8,15 @@ use carrick_fatal::carrick_fatal;
 /// Check the engine's completed mapping before publishing alias metadata.
 /// Walk terminal spans, not every page of a coarse block; perform no writes,
 /// splits, allocation or TLB operations. The caller retains MM exclusion.
+/// A repoint is published when every leaf of `[va, va + len)` is a valid EL0
+/// leaf at the expected output carrying exactly the `access` the repoint
+/// published (never an assumed executable leaf).
 fn require_published_repoint(
     authority: &carrick_aarch64::Stage1Authority,
     va: u64,
     ipa: u64,
     len: usize,
+    access: carrick_mmu_core::aarch64::UserLeafAccess,
 ) -> Result<(), TrapError> {
     use carrick_mmu_core::aarch64::{LeafAccess, terminal_descriptor_permits_el0, terminal_entry};
     let refusal =
@@ -28,8 +32,10 @@ fn require_published_repoint(
                 let walk = manager.try_debug_walk(current).map_err(|_| refusal())?;
                 let (level, leaf) = terminal_entry(walk);
                 if level == 0
-                    || !terminal_descriptor_permits_el0(leaf, LeafAccess::Write)
-                    || !terminal_descriptor_permits_el0(leaf, LeafAccess::Execute)
+                    || !terminal_descriptor_permits_el0(leaf, LeafAccess::Read)
+                    || terminal_descriptor_permits_el0(leaf, LeafAccess::Write) != access.writable
+                    || terminal_descriptor_permits_el0(leaf, LeafAccess::Execute)
+                        != access.executable
                 {
                     return Err(refusal());
                 }
@@ -730,9 +736,9 @@ impl HvfVmState {
             }
         }
         let result = if content.is_some() {
-            self.publish_private_repoint(va, target_ipa, len)
+            self.publish_private_repoint(va, target_ipa, len, access)
         } else {
-            self.publish_shared_repoint(va, target_ipa, len)
+            self.publish_shared_repoint(va, target_ipa, len, access)
         };
         if let Err(e) = result {
             carrick_fatal!(
@@ -807,6 +813,7 @@ impl HvfVmState {
         va: u64,
         overlay_ipa: u64,
         len: usize,
+        access: carrick_mmu_core::aarch64::UserLeafAccess,
     ) -> Result<(), TrapError> {
         let overlay_end = overlay_ipa.checked_add(len as u64).ok_or_else(|| {
             TrapError::Hypervisor("private repoint semantic IPA overflow".to_owned())
@@ -888,7 +895,7 @@ impl HvfVmState {
             } else {
                 mapping_owner_generation
             };
-        require_published_repoint(&self.page_tables_authority(), va, overlay_ipa, len)?;
+        require_published_repoint(&self.page_tables_authority(), va, overlay_ipa, len, access)?;
         // The stage-1 repoint has replaced every promise about the previous
         // VA -> IPA output. Retire those promises before publishing the alias,
         // so the protection commit authenticates only the replacement state.
@@ -2674,6 +2681,7 @@ impl HvfTaskState {
         va: u64,
         target_ipa: u64,
         len: usize,
+        access: carrick_mmu_core::aarch64::UserLeafAccess,
     ) -> Result<(), TrapError> {
         let target_end = target_ipa.checked_add(len as u64).ok_or_else(|| {
             TrapError::Hypervisor("shared repoint target IPA overflow".to_owned())
@@ -2839,7 +2847,7 @@ impl HvfTaskState {
 
         // The engine already published and invalidated this mapping. This
         // adapter commits ownership metadata, never a second descriptor edit.
-        require_published_repoint(&self.page_tables_authority(), va, target_ipa, len)?;
+        require_published_repoint(&self.page_tables_authority(), va, target_ipa, len, access)?;
 
         let shared_key_offset = shared_key_offset.saturating_add(semantic_offset);
         let sharing = GuestMappingSharing::GlobalShared;
