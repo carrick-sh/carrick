@@ -548,6 +548,13 @@ pub(super) fn admit_bound_mm<E: ThreadedEngine>(engine: &mut E, bound: &BoundMm)
     )
 }
 
+/// Whether EL1 completed fork-COW copies of `mm` the host has not settled
+/// yet: until it does, the host's mapping view names the old frames of those
+/// spans while their live leaves name EL1's grants.
+pub(super) fn guest_cow_awaiting_settlement(mm: carrick_kernel::kernel::MmId) -> bool {
+    carrick_el1_abi::cow_grant_pool_host().is_some_and(|pool| pool.has_completions_for(mm.raw()))
+}
+
 /// Host-retained copy of one submitted guest-lane frame grant: the exact
 /// transaction (never re-read from shared memory) and what the host commits
 /// once EL1's receipt verifies.
@@ -3946,9 +3953,12 @@ mod guest_descriptor_lane_tests {
         let settle = service
             .find("settle_guest_frame_grants(")
             .expect("settlement at syscall entry");
+        let cow = service
+            .find("guest_cow_awaiting_settlement(")
+            .expect("guest COW settlement at syscall entry");
         let dispatch = service
             .find("service_threaded_syscall_for_executor_inner(")
             .expect("dispatch");
-        assert!(settle < dispatch);
+        assert!(settle < dispatch && cow < dispatch);
     }
 }

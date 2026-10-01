@@ -1404,6 +1404,21 @@ where
             signal::settle_guest_frame_grants(&kernel.dispatcher, engine, &mutation)
                 .map_err(RuntimeError::Trap)?;
         }
+        if signal::guest_cow_awaiting_settlement(mm_executor.mm_id()) {
+            // EL1 already repointed these spans; the host's mapping view
+            // catches up before the syscall validates or copies a buffer
+            // (it translates through the live leaves). The MM's mutation
+            // authority excludes its EL1 editor, which settles them.
+            drop(
+                carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor).map_err(
+                    |error| {
+                        RuntimeError::Configuration(format!(
+                            "settle guest COW before syscall: {error:?}"
+                        ))
+                    },
+                )?,
+            );
+        }
         if !crate::el1_census::enabled() {
             return self.service_threaded_syscall_for_executor_inner(
                 kernel,
