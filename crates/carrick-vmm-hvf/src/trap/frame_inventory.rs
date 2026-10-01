@@ -309,6 +309,22 @@ pub(crate) struct InventoryLeaseRetirement {
     pub(crate) frames: std::collections::BTreeSet<carrick_hal::FrameId>,
     pub(crate) stage2_leases: std::collections::BTreeSet<(u64, u64)>,
     pub(crate) stage2_population_complete: std::collections::BTreeMap<(u64, u64), bool>,
+    /// Frames the batch retires only if its unmap turns out to be the last
+    /// (`RetireFrameIfLastUnmap`).
+    pub(crate) conditional_frames: std::collections::BTreeSet<carrick_hal::FrameId>,
+    /// Owner incarnations left in place, settled after the Kernel apply.
+    pub(crate) declined: Vec<DeclinedLeaseRemainder>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl InventoryLeaseRetirement {
+    /// The Kernel events `stage_inventory_lease_retirement` pushes.
+    pub(crate) fn event_count(&self) -> usize {
+        self.mappings
+            .len()
+            .saturating_add(self.frames.len())
+            .saturating_add(self.conditional_frames.len())
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -375,6 +391,75 @@ pub(crate) struct InventoryFrameRegistry {
     /// The carrier destructor consumes a token and leaves the lease parked; a
     /// later exact retirement may then take that parked lease normally.
     pub(crate) authority_retained_stage2: std::collections::BTreeSet<(u64, u64)>,
+}
+
+/// One exact global-frame owner incarnation a retirement left in place
+/// because some of its frames were not retired when the batch was built.
+///
+/// Retirement decides from the backend population before its Kernel unmap is
+/// applied. Two mms that map one frame (a fork parent and child) can both
+/// decide before either applies; neither can then see that its unmap is the
+/// last. The frame decision moves to the Kernel: the batch carries
+/// `RetireFrameIfLastUnmap`, and the Kernel retires the frame in whichever
+/// batch applies its last unmap. The owner follows the frame: after its own
+/// apply, the retirement that recorded this remainder retires the owner if
+/// the Kernel has retired every frame it names
+/// ([`HvfVmState::settle_declined_lease_remainders`]). It is authenticated by
+/// owner generation, never by address.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeclinedLeaseRemainder {
+    pub(crate) projection: RetiredStage2Projection,
+    /// The frames of this lease the retirement did not retire.
+    pub(crate) frames: std::collections::BTreeSet<carrick_hal::FrameId>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// The remainders `retiring` leaves: every reusable global-frame owner
+/// incarnation it unmaps without retiring its lease.
+fn declined_lease_remainders<'e>(
+    retiring: impl IntoIterator<Item = &'e InventoryExtent>,
+    retired_stage2: &std::collections::BTreeSet<(u64, u64)>,
+    retired_frames: &std::collections::BTreeSet<carrick_hal::FrameId>,
+) -> Vec<DeclinedLeaseRemainder> {
+    let mut remainders = std::collections::BTreeMap::<(u64, u64), DeclinedLeaseRemainder>::new();
+    for extent in retiring {
+        let lease = (extent.stage2_base, extent.stage2_length);
+        if retired_stage2.contains(&lease)
+            || extent.stage2_owner.generation == 0
+            || !is_reusable_global_frame_extent(lease.0, lease.1)
+        {
+            continue;
+        }
+        let remainder = remainders
+            .entry(lease)
+            .or_insert_with(|| DeclinedLeaseRemainder {
+                projection: RetiredStage2Projection::from(*extent),
+                frames: std::collections::BTreeSet::new(),
+            });
+        if !retired_frames.contains(&extent.frame) {
+            remainder.frames.insert(extent.frame);
+        }
+    }
+    remainders.into_values().collect()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Whether a retirement that leaves `frame` unretired must carry
+/// `RetireFrameIfLastUnmap` for it: it removes the last backend reference
+/// (`global == local`), so no backend holder remains to decide later, yet the
+/// Kernel still counts mappings beyond its own. Those can only be unmaps
+/// other retirements decided and have not applied: any new mapping of a
+/// private frame is staged through a backend reference first. A shared-file
+/// frame stays published in the registry's `shared` map for later mappers, so
+/// it never carries one.
+fn carries_conditional_retire(
+    global: usize,
+    local: usize,
+    authoritative: Option<usize>,
+    private: bool,
+) -> bool {
+    private && global == local && authoritative.is_some_and(|count| count > local)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -606,6 +691,9 @@ pub(crate) struct HvpatchFrameInventory {
     /// lets `HvpatchTaskInventoryAuthority::prepare_retirement` still check
     /// exactness instead of reading a ledger the commit construction emptied.
     pub(crate) retirement_expected: Vec<(carrick_hal::MappingId, carrick_hal::FrameId)>,
+    /// The remainders this mm's process retirement left, consumed after its
+    /// Kernel commit is applied.
+    pub(crate) declined_leases: Vec<DeclinedLeaseRemainder>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1635,6 +1723,7 @@ impl HvfVmState {
         }
         let registry = inventory.frames.lock();
         let mut frames = std::collections::BTreeSet::new();
+        let mut conditional_frames = std::collections::BTreeSet::new();
         let mut complete_frames = std::collections::BTreeSet::new();
         for (&frame, &removed) in &removed_frames {
             let live = registry.references.get(&frame).copied().ok_or_else(|| {
@@ -1659,6 +1748,18 @@ impl HvfVmState {
             // aborts the whole carrier.
             if removed == live && authoritative == Some(removed) {
                 frames.insert(frame);
+            } else if carries_conditional_retire(
+                live,
+                removed,
+                authoritative,
+                mappings
+                    .iter()
+                    .filter(|(_, extent)| extent.frame == frame)
+                    .all(|(_, extent)| {
+                        matches!(extent.backing, InventoryBackingIdentity::Private(_))
+                    }),
+            ) {
+                conditional_frames.insert(frame);
             }
         }
         let mut stage2_leases = std::collections::BTreeSet::new();
@@ -1687,11 +1788,18 @@ impl HvfVmState {
                 stage2_leases.insert(lease);
             }
         }
+        let declined = declined_lease_remainders(
+            mappings.iter().map(|(_, extent)| extent),
+            &stage2_leases,
+            &frames,
+        );
         Ok(InventoryLeaseRetirement {
             mappings,
             frames,
             stage2_leases,
             stage2_population_complete,
+            conditional_frames,
+            declined,
         })
     }
 
@@ -1712,6 +1820,15 @@ impl HvfVmState {
         for &frame in &retirement.frames {
             reservation
                 .push(carrick_hal::FrameInventoryEvent::RetireFrame {
+                    transaction,
+                    frame,
+                    generation: Self::inventory_generation(2),
+                })
+                .map_err(Self::reservation_error)?;
+        }
+        for &frame in &retirement.conditional_frames {
+            reservation
+                .push(carrick_hal::FrameInventoryEvent::RetireFrameIfLastUnmap {
                     transaction,
                     frame,
                     generation: Self::inventory_generation(2),
@@ -1774,6 +1891,94 @@ impl HvfVmState {
             reconcile_carrier_stage2_authority_retention(&mut registry, lease, population_complete);
         }
         Ok(())
+    }
+
+    /// Retire the owner of each of `remainders` whose frames the Kernel has
+    /// retired. A retirement runs this with its own remainders after its
+    /// Kernel commit is applied.
+    ///
+    /// The Kernel retires a frame in exactly the batch that applies its last
+    /// unmap (`RetireFrameIfLastUnmap`), and `FrameId`s are never reused, so
+    /// "the Kernel no longer knows the frame" is the applied result. The
+    /// retirement whose batch it was always holds a remainder for that lease
+    /// and finds it here. A sibling that settles later finds the owner gone
+    /// and skips it: the owner is retired under the frame-registry leaf, by
+    /// its exact generation.
+    ///
+    /// A remainder is skipped while any of its frames is still known to the
+    /// Kernel, or while a backend inventory still references the lease or a
+    /// frame: that holder's own retirement carries it from there.
+    pub(crate) fn settle_declined_lease_remainders(
+        custody: &CarrierVmCustody,
+        frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+        authority: &dyn carrick_hal::FrameCowAuthority,
+        remainders: Vec<DeclinedLeaseRemainder>,
+        _registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+    ) -> Result<usize, TrapError> {
+        if remainders.is_empty() {
+            return Ok(0);
+        }
+        let mut registry = frames.lock();
+        let mut retired = Vec::new();
+        for remainder in remainders {
+            let projection = remainder.projection;
+            let lease = (projection.physical_ipa, projection.physical_length);
+            if global_frame_host_owner_identity_in(custody, lease.0, lease.1)
+                != Some((projection.owner.host_addr, projection.owner.generation))
+            {
+                continue;
+            }
+            if registry.stage2_references.contains_key(&lease)
+                || remainder
+                    .frames
+                    .iter()
+                    .any(|frame| registry.references.contains_key(frame))
+            {
+                continue;
+            }
+            let mut retired_by_kernel = true;
+            for &frame in &remainder.frames {
+                let count = authority.frame_mapping_count(frame).map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "query declined-remainder frame {frame:?} mapping count: {error}"
+                    ))
+                })?;
+                retired_by_kernel &= count.is_none();
+            }
+            if !retired_by_kernel {
+                continue;
+            }
+            match retire_global_frame_host_owner_if_generation_in(
+                custody,
+                lease.0,
+                lease.1,
+                projection.owner.generation,
+            ) {
+                GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+                | GlobalFrameRetirementOutcome::TerminalizedByVmDestroy { .. }
+                | GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+                | GlobalFrameRetirementOutcome::RetryPending { .. } => {}
+                outcome => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch declined remainder {lease:?} owner identity drifted: {outcome:?}"
+                    )));
+                }
+            }
+            registry.authority_retained_stage2.remove(&lease);
+            retired.push(projection);
+        }
+        drop(registry);
+        if retired.is_empty() {
+            return Ok(0);
+        }
+        // The declining mms left their alias rows for these exact
+        // incarnations published; they must not outlive the owner.
+        mutate_known_external_alias_state(
+            AliasWriterActor::Unknown,
+            |aliases| retired_projection_mutation_keys(aliases, &retired, &[]),
+            |aliases| remove_rows_for_retired_stage2_projections(aliases, &retired),
+        );
+        Ok(retired.len())
     }
 
     pub(crate) fn stage_cow_inventory_split(
@@ -2279,6 +2484,7 @@ impl HvfVmState {
         }
 
         let mut retired = std::collections::BTreeSet::new();
+        let mut conditional = std::collections::BTreeSet::new();
         let mut complete_frames = std::collections::BTreeSet::new();
         for (&frame, &local) in &local_frame_references {
             let global = frames.references.get(&frame).copied().ok_or_else(|| {
@@ -2300,6 +2506,17 @@ impl HvfVmState {
             // exact agreement before emitting the irreversible frame event.
             if global == local && authoritative == Some(local) {
                 retired.insert(frame);
+            } else if carries_conditional_retire(
+                global,
+                local,
+                authoritative,
+                inventory
+                    .extents
+                    .values()
+                    .filter(|extent| extent.frame == frame)
+                    .all(|extent| matches!(extent.backing, InventoryBackingIdentity::Private(_))),
+            ) {
+                conditional.insert(frame);
             }
         }
         for (&(gpa, length), extent) in &inventory.extents {
@@ -2353,6 +2570,15 @@ impl HvfVmState {
                 })
                 .map_err(Self::reservation_error)?;
         }
+        for &frame in &conditional {
+            reservation
+                .push(carrick_hal::FrameInventoryEvent::RetireFrameIfLastUnmap {
+                    transaction,
+                    frame,
+                    generation: Self::inventory_generation(2),
+                })
+                .map_err(Self::reservation_error)?;
+        }
 
         for (&frame, &local) in &local_frame_references {
             let remaining = frames.references[&frame] - local;
@@ -2388,6 +2614,8 @@ impl HvfVmState {
             reconcile_carrier_stage2_authority_retention(&mut frames, lease, population_complete);
         }
         drop(frames);
+        inventory.declined_leases =
+            declined_lease_remainders(inventory.extents.values(), &retired_stage2, &retired);
         // Record what this mm owned BEFORE dropping it, so the authority can
         // still authenticate the commit against the exact set it retires.
         let mut expected: Vec<_> = inventory
@@ -2702,6 +2930,52 @@ impl HvfVmState {
                     "HVPatch process retirement produced no stage-1 root proof".to_owned(),
                 )
             },
+        )
+    }
+
+    /// [`Self::settle_declined_lease_remainders`] for the remainders a
+    /// task's process retirement left, once the Kernel applied it.
+    pub(crate) fn settle_task_state_declined_lease_remainders(
+        task: &HvfTaskState,
+    ) -> Result<usize, TrapError> {
+        if !task.persistent_vm_lifecycle {
+            return Ok(0);
+        }
+        let (frames, remainders) = {
+            let mut inventory = task.frame_inventory.lock();
+            (
+                std::sync::Arc::clone(&inventory.frames),
+                std::mem::take(&mut inventory.declined_leases),
+            )
+        };
+        if remainders.is_empty() {
+            return Ok(0);
+        }
+        let authority = task.cow_authority.clone().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "HVPatch declined-remainder settlement has no frame inventory authority".to_owned(),
+            )
+        })?;
+        #[cfg(not(test))]
+        let custody = std::sync::Arc::clone(&task.custody);
+        #[cfg(not(test))]
+        let custody = custody.as_ref();
+        #[cfg(test)]
+        let custody = legacy_test_carrier_vm_custody();
+        let (pid, tid) = task
+            .cow_identity
+            .map_or((0, 0), |identity| (identity.linux_pid, identity.linux_tid));
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+            pid,
+            tid,
+        );
+        Self::settle_declined_lease_remainders(
+            custody,
+            &frames,
+            authority.as_ref(),
+            remainders,
+            &registry,
         )
     }
 
