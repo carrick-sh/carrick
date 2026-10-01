@@ -309,21 +309,22 @@ pub(crate) struct InventoryLeaseRetirement {
     pub(crate) frames: std::collections::BTreeSet<carrick_hal::FrameId>,
     pub(crate) stage2_leases: std::collections::BTreeSet<(u64, u64)>,
     pub(crate) stage2_population_complete: std::collections::BTreeMap<(u64, u64), bool>,
-    /// Frames the batch retires only if its unmap turns out to be the last
-    /// (`RetireFrameIfLastUnmap`).
-    pub(crate) conditional_frames: std::collections::BTreeSet<carrick_hal::FrameId>,
     /// Owner incarnations left in place, settled after the Kernel apply.
     pub(crate) declined: Vec<DeclinedLeaseRemainder>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl InventoryLeaseRetirement {
-    /// The Kernel events `stage_inventory_lease_retirement` pushes.
+    /// Room for every Kernel event the retirement can push: an unmap per
+    /// mapping and, per frame, either `RetireFrame` (staged with the plan)
+    /// or `RetireFrameIfLastUnmap` (decided at apply).
     pub(crate) fn event_count(&self) -> usize {
-        self.mappings
-            .len()
-            .saturating_add(self.frames.len())
-            .saturating_add(self.conditional_frames.len())
+        let frames: std::collections::BTreeSet<_> = self
+            .mappings
+            .iter()
+            .map(|(_, extent)| extent.frame)
+            .collect();
+        self.mappings.len().saturating_add(frames.len())
     }
 }
 
@@ -1723,7 +1724,6 @@ impl HvfVmState {
         }
         let registry = inventory.frames.lock();
         let mut frames = std::collections::BTreeSet::new();
-        let mut conditional_frames = std::collections::BTreeSet::new();
         let mut complete_frames = std::collections::BTreeSet::new();
         for (&frame, &removed) in &removed_frames {
             let live = registry.references.get(&frame).copied().ok_or_else(|| {
@@ -1748,18 +1748,6 @@ impl HvfVmState {
             // aborts the whole carrier.
             if removed == live && authoritative == Some(removed) {
                 frames.insert(frame);
-            } else if carries_conditional_retire(
-                live,
-                removed,
-                authoritative,
-                mappings
-                    .iter()
-                    .filter(|(_, extent)| extent.frame == frame)
-                    .all(|(_, extent)| {
-                        matches!(extent.backing, InventoryBackingIdentity::Private(_))
-                    }),
-            ) {
-                conditional_frames.insert(frame);
             }
         }
         let mut stage2_leases = std::collections::BTreeSet::new();
@@ -1798,7 +1786,6 @@ impl HvfVmState {
             frames,
             stage2_leases,
             stage2_population_complete,
-            conditional_frames,
             declined,
         })
     }
@@ -1826,20 +1813,24 @@ impl HvfVmState {
                 })
                 .map_err(Self::reservation_error)?;
         }
-        for &frame in &retirement.conditional_frames {
-            reservation
-                .push(carrick_hal::FrameInventoryEvent::RetireFrameIfLastUnmap {
-                    transaction,
-                    frame,
-                    generation: Self::inventory_generation(2),
-                })
-                .map_err(Self::reservation_error)?;
-        }
         Ok(())
     }
 
+    /// The backend half of [`Self::apply_inventory_lease_retirement`], for
+    /// tests of the ledger arithmetic alone.
+    #[cfg(test)]
     pub(crate) fn commit_inventory_lease_retirement(
         inventory: &mut HvpatchFrameInventory,
+        retirement: &InventoryLeaseRetirement,
+    ) -> Result<(), TrapError> {
+        let frames = std::sync::Arc::clone(&inventory.frames);
+        let mut registry = frames.lock();
+        Self::commit_inventory_lease_retirement_in(inventory, &mut registry, retirement)
+    }
+
+    fn commit_inventory_lease_retirement_in(
+        inventory: &mut HvpatchFrameInventory,
+        registry: &mut InventoryFrameRegistry,
         retirement: &InventoryLeaseRetirement,
     ) -> Result<(), TrapError> {
         let mut removed = Vec::with_capacity(retirement.mappings.len());
@@ -1856,7 +1847,6 @@ impl HvfVmState {
             }
             removed.push((key, actual));
         }
-        let mut registry = inventory.frames.lock();
         for (key, extent) in removed {
             decrement_inventory_reference(&mut registry.references, extent.frame)?;
             decrement_inventory_reference(
@@ -1888,7 +1878,80 @@ impl HvfVmState {
             }
         }
         for (&lease, &population_complete) in &retirement.stage2_population_complete {
-            reconcile_carrier_stage2_authority_retention(&mut registry, lease, population_complete);
+            reconcile_carrier_stage2_authority_retention(registry, lease, population_complete);
+        }
+        Ok(())
+    }
+
+    /// Apply an unmap/alias lease retirement's Kernel commit and drop its
+    /// backend references as one step under the frame registry, deciding
+    /// its conditional frame retirements there.
+    ///
+    /// The plan was made earlier, against a population that may have moved.
+    /// Applying the Kernel unmap and only afterwards dropping the backend
+    /// reference left a gap in which a sibling's retirement saw that stale
+    /// reference, concluded another holder would retire the frame, and
+    /// carried nothing, while this retirement, deciding from its plan, had
+    /// carried nothing either: the frame and its owner leaked. Holding the
+    /// registry from the decision through the decrement makes every other
+    /// retirement decide either before this one (it still sees this
+    /// reference, and this one sees it gone) or after it (it sees both the
+    /// Kernel unmap and the backend reference gone).
+    ///
+    /// `apply` is the Kernel publication; on its failure the backend ledger
+    /// is unchanged. Once it succeeded the backend must follow, so a backend
+    /// ledger refusal then is a carrier fault. `reservation` must have room
+    /// for [`InventoryLeaseRetirement::event_count`] events.
+    pub(crate) fn apply_inventory_lease_retirement<R>(
+        ledger: &parking_lot::Mutex<HvpatchFrameInventory>,
+        retirement: &InventoryLeaseRetirement,
+        mut reservation: carrick_hal::FrameInventoryReservation,
+        apply: impl FnOnce(carrick_hal::FrameInventoryCommit<()>) -> Result<R, TrapError>,
+    ) -> Result<R, TrapError> {
+        let mut inventory = ledger.lock();
+        let frames = std::sync::Arc::clone(&inventory.frames);
+        let mut registry = frames.lock();
+        Self::stage_conditional_lease_retirement(&registry, &mut reservation, retirement)?;
+        let applied = apply(reservation.commit(()))?;
+        if let Err(error) =
+            Self::commit_inventory_lease_retirement_in(&mut inventory, &mut registry, retirement)
+        {
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "commit HVPatch lease retirement backend ledger after its Kernel apply: {error}"
+            );
+        }
+        Ok(applied)
+    }
+
+    /// Push `RetireFrameIfLastUnmap` for each frame this retirement unmaps
+    /// without retiring whose last backend reference it holds now. Called
+    /// under the registry the decrement will run under.
+    fn stage_conditional_lease_retirement(
+        registry: &InventoryFrameRegistry,
+        reservation: &mut carrick_hal::FrameInventoryReservation,
+        retirement: &InventoryLeaseRetirement,
+    ) -> Result<(), TrapError> {
+        let mut removed = std::collections::BTreeMap::<carrick_hal::FrameId, (usize, bool)>::new();
+        for (_, extent) in &retirement.mappings {
+            let entry = removed.entry(extent.frame).or_insert((0, true));
+            entry.0 += 1;
+            entry.1 &= matches!(extent.backing, InventoryBackingIdentity::Private(_));
+        }
+        let transaction = reservation.transaction();
+        for (frame, (removed, private)) in removed {
+            if retirement.frames.contains(&frame) || !private {
+                continue;
+            }
+            if registry.references.get(&frame).copied() == Some(removed) {
+                reservation
+                    .push(carrick_hal::FrameInventoryEvent::RetireFrameIfLastUnmap {
+                        transaction,
+                        frame,
+                        generation: Self::inventory_generation(2),
+                    })
+                    .map_err(Self::reservation_error)?;
+            }
         }
         Ok(())
     }
