@@ -3037,14 +3037,41 @@ impl HvfVmState {
         } else {
             Vec::new()
         };
-        retire_process_aliases(task.mm_root_slot, task.container_root, |alias| {
-            let key = (alias.physical_ipa, alias.physical_size as u64);
-            let retired_exact_owner = superseded_owners.get(&key).is_some_and(|owner| {
-                owner.host_addr == alias.physical_host_addr
-                    && owner.generation == alias.owner_generation
-            });
-            !extents.contains(&(alias.physical_ipa, alias.physical_size)) && !retired_exact_owner
-        });
+        // Exactly the incarnations this exit retired (and the superseded ones
+        // it found already replaced): other MMs' rows naming them are stale.
+        let retired_projections: Vec<RetiredStage2Projection> = extents
+            .iter()
+            .filter_map(|&(ipa, size)| {
+                stage2_owners
+                    .get(&(ipa, size as u64))
+                    .map(|&owner| RetiredStage2Projection {
+                        physical_ipa: ipa,
+                        physical_length: size as u64,
+                        owner,
+                    })
+            })
+            .chain(superseded_owners.iter().map(|(&(ipa, length), &owner)| {
+                RetiredStage2Projection {
+                    physical_ipa: ipa,
+                    physical_length: length,
+                    owner,
+                }
+            }))
+            .collect();
+        retire_process_aliases(
+            task.mm_root_slot,
+            task.container_root,
+            &retired_projections,
+            |alias| {
+                let key = (alias.physical_ipa, alias.physical_size as u64);
+                let retired_exact_owner = superseded_owners.get(&key).is_some_and(|owner| {
+                    owner.host_addr == alias.physical_host_addr
+                        && owner.generation == alias.owner_generation
+                });
+                !extents.contains(&(alias.physical_ipa, alias.physical_size))
+                    && !retired_exact_owner
+            },
+        );
         record_alias_unmap_lifecycle(
             CowDiagnosticLifecycleSite::ProcessRetirement,
             custody,

@@ -1277,19 +1277,23 @@ fn el1_sched_mm_occupancy_two_processes() {
     reset_el1_counters();
     carrick_kernel::mprotect_diag::reset();
     let carrier = carrier_or_fail();
+    let census_before = carrick_runtime::trap::alias_retirement_census();
     let measured = run_fixture(
         &carrier,
         &["mm-occupancy", &FORKS.to_string()],
         Duration::from_secs(240),
     );
+    let census = carrick_runtime::trap::alias_retirement_census();
     let stdout = measured.result.stdout_utf8();
     println!(
-        "el1-sched mm-occupancy exits={} carrier_cpu_ns={} wall_ms={} zone={:?} mprotect_enomem_sites=[{}] {}",
+        "el1-sched mm-occupancy exits={} carrier_cpu_ns={} wall_ms={} zone={:?} mprotect_enomem_sites=[{}] alias_retirement_restarts={} alias_stale_incarnation_co_holders={} {}",
         measured.exits,
         measured.cpu_ns,
         measured.wall.as_millis(),
         measured.zone,
         carrick_kernel::mprotect_diag::report_line(),
+        census.restarts - census_before.restarts,
+        census.stale_incarnation_co_holders - census_before.stale_incarnation_co_holders,
         stdout.trim()
     );
     assert!(measured.result.success(), "{}", describe(&measured));

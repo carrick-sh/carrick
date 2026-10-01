@@ -1927,15 +1927,16 @@ mod alias_registry_tests {
         }
     }
 
-    /// The 2026-09-30 `hvpatch::host_alias` carrier fatal, VM-free. A
-    /// root-container munmap planned `{Y}`: its window also held a row of
-    /// extent X, but a stale row of an older incarnation of X elsewhere in the
-    /// same scope kept X alive. Before the commit, ANOTHER MM's COW retired
-    /// that older projection and -- holding only its own MM guard -- removed
-    /// every scope's rows of it. Unregistering against the old plan then
-    /// retired X too, a lease the plan never reserved. The commit must see the
-    /// change before it mutates, and the restarted plan must be the live one
-    /// and must have read strictly fewer rows.
+    /// The 2026-09-30 `hvpatch::host_alias` carrier fatal's transaction
+    /// shape, VM-free. A munmap planned `{Y}`: its window also held a row of
+    /// extent X, and a co-holder of X elsewhere in the scope kept X alive.
+    /// Before the commit, ANOTHER MM retired that projection and -- holding
+    /// only its own MM guard -- removed every scope's rows of it.
+    /// Unregistering against the old plan then retired X too, a lease the plan
+    /// never reserved. The commit must see the change before it mutates, and
+    /// the restarted plan must be the live one and read strictly fewer rows.
+    /// (The witnesses' co-holder was an OLDER incarnation, which no longer
+    /// co-holds at all: see `stale_incarnation_row_does_not_hold_a_live_lease`.)
     #[test]
     fn retirement_commit_detects_an_out_of_guard_co_holder_removal() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
@@ -1945,10 +1946,10 @@ mod alias_registry_tests {
         let planned_row = make_test_alias(0x1000_4000, 0x4000, y, 0x4000, scope);
         let mut live_row = make_test_alias(0x1000_8000, 0x4000, x, 0x4000, scope);
         live_row.owner_generation = 2125;
-        let mut stale_row = make_test_alias(0x2000_0000, 0x2000, x, 0x4000, scope);
-        stale_row.owner_generation = 1788;
+        let mut co_holder = make_test_alias(0x2000_0000, 0x2000, x, 0x4000, scope);
+        co_holder.owner_generation = 2125;
         let mut registry = AliasRegistry::default();
-        for alias in [planned_row, live_row, stale_row] {
+        for alias in [planned_row, live_row, co_holder] {
             registry.push(alias);
         }
 
@@ -1959,19 +1960,12 @@ mod alias_registry_tests {
         let footprint = alias_unmap_footprint(&registry, &window, None, ContainerRootToken::ROOT);
         assert_eq!(footprint.len(), 3);
 
-        // Another MM retires the OLD incarnation of X.
-        let removed = remove_rows_for_retired_stage2_projections(
-            &mut registry,
-            &[RetiredStage2Projection {
-                physical_ipa: x,
-                physical_length: 0x4000,
-                owner: InventoryStage2OwnerIdentity {
-                    host_addr: stale_row.physical_host_addr,
-                    generation: 1788,
-                },
-            }],
+        // Another MM retires X's projection, removing every scope's rows of
+        // it; drop just the co-holder to model the window row surviving.
+        assert_eq!(
+            registry.remove_exact_values_in_batch(&[co_holder]),
+            vec![co_holder]
         );
-        assert_eq!(removed.removed_aliases, vec![stale_row]);
         let rows_before_commit: Vec<_> = registry.iter().copied().collect();
 
         let outcome = commit_planned_unregister_in(
@@ -2024,6 +2018,113 @@ mod alias_registry_tests {
             AliasUnmapCommit::Retired(live)
         );
         assert_eq!(registry.len(), 0);
+    }
+
+    /// A row naming an OLDER incarnation of a physical extent (a parent's COW
+    /// shadow left behind when a child borrowed the old frame, outliving that
+    /// lease) is not a co-holder of the live incarnation: it must not keep the
+    /// live lease from retiring when its last live row is unmapped. Matching
+    /// by extent alone leaked the live lease until the stale row happened to
+    /// be removed, which is also what let another MM's cleanup change a plan.
+    #[test]
+    fn stale_incarnation_row_does_not_hold_a_live_lease() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT);
+        let x = 0x9000_0000_u64;
+        let mut live_row = make_test_alias(0x1000_8000, 0x4000, x, 0x4000, scope);
+        live_row.owner_generation = 2125;
+        let mut stale_row = make_test_alias(0x2000_0000, 0x2000, x, 0x4000, scope);
+        stale_row.owner_generation = 1788;
+        let mut same_incarnation = make_test_alias(0x3000_0000, 0x1000, x, 0x4000, scope);
+        same_incarnation.owner_generation = 2125;
+        let mut registry = AliasRegistry::default();
+        registry.push(live_row);
+        registry.push(stale_row);
+
+        let (planned, _) = registry.plan_unregister_process_alias(
+            0x1000_8000,
+            0x4000,
+            None,
+            ContainerRootToken::ROOT,
+        );
+        assert_eq!(
+            planned,
+            [(x, 0x4000)].into(),
+            "stale incarnation held the live lease"
+        );
+        let mut live = registry.clone();
+        assert_eq!(
+            unregister_alias_entries(
+                &mut live,
+                0x1000_8000,
+                0x4000,
+                None,
+                ContainerRootToken::ROOT
+            ),
+            planned
+        );
+
+        // The same incarnation elsewhere still co-holds.
+        registry.push(same_incarnation);
+        let (planned, _) = registry.plan_unregister_process_alias(
+            0x1000_8000,
+            0x4000,
+            None,
+            ContainerRootToken::ROOT,
+        );
+        assert!(planned.is_empty(), "a live co-holder must keep the lease");
+    }
+
+    /// Where the stale incarnations came from (the witnesses showed ~10^4
+    /// stale-incarnation co-holder encounters per mm-occupancy run). A parent
+    /// COW-splits a page whose old frame a child still borrows: the parent's
+    /// row for the old frame stays behind as a shadow. When the child -- the
+    /// frame's last user -- EXITS, it retires that incarnation but removed
+    /// only its own scope's rows, so the parent kept a row naming a retired,
+    /// soon recycled IPA. Exit retirement must remove every scope's rows of
+    /// exactly the incarnations it retired, and nothing else.
+    #[test]
+    fn exit_retirement_removes_other_scopes_rows_of_the_retired_incarnation() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let parent = AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT);
+        let child_slot = (0x009a_0020_0000_u64, 0x20_0000_u64);
+        let child = AliasOwnershipScope::MmRootSlot {
+            base: child_slot.0,
+            size: child_slot.1,
+        };
+        let x = 0x9000_0000_u64;
+        let mut child_row = make_test_alias(0x6000_8000, 0x4000, x, 0x4000, child);
+        child_row.owner_generation = 1788;
+        let mut parent_shadow = make_test_alias(0x6000_8000, 0x2000, x, 0x4000, parent);
+        parent_shadow.owner_generation = 1788;
+        // The parent's live successor incarnation of the same IPA, and an
+        // unrelated live row: neither may be touched.
+        let mut parent_successor = make_test_alias(0x7000_0000, 0x4000, x, 0x4000, parent);
+        parent_successor.owner_generation = 2125;
+        let parent_other = make_test_alias(0x6000_c000, 0x4000, 0x9001_0000, 0x4000, parent);
+        let mut registry = AliasRegistry::default();
+        for alias in [child_row, parent_shadow, parent_successor, parent_other] {
+            registry.push(alias);
+        }
+
+        let cleanup = crate::trap::retire_exited_process_rows_in(
+            &mut registry,
+            Some(child_slot),
+            ContainerRootToken::ROOT,
+            &[RetiredStage2Projection {
+                physical_ipa: x,
+                physical_length: 0x4000,
+                owner: InventoryStage2OwnerIdentity {
+                    host_addr: child_row.physical_host_addr,
+                    generation: 1788,
+                },
+            }],
+            |_| true,
+        );
+        let mut left: Vec<_> = registry.iter().copied().collect();
+        left.sort_by_key(|alias| alias.start);
+        assert_eq!(left, vec![parent_other, parent_successor]);
+        assert_eq!(cleanup.removed_aliases, vec![parent_shadow]);
     }
 
     /// A visible-scope change that leaves this window's lease set alone (a

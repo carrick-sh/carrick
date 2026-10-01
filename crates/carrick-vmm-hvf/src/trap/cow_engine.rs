@@ -5889,6 +5889,7 @@ impl HvfVmState {
             else {
                 return Ok(());
             };
+            note_alias_retirement_restart();
             prepared = self.prepare_process_alias_retirement(va, len)?;
             if prepared.read_rows.len() >= read {
                 carrick_fatal!(
