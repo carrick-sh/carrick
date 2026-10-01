@@ -2787,6 +2787,22 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
+      "symbol": "ALIAS_RETIREMENT_RESTARTS",
+      "fingerprint": "d1e3b714d5998ab8bd55832d3979da05f58f0f957fef9df557d1339e220cfce2",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter in crates/carrick-vmm-hvf/src/trap/memory_protection.rs: process-alias retirements restarted because an out-of-guard writer made the plan stale (alias_retirement_census); monotonic, never read for control flow."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
+      "symbol": "ALIAS_STALE_INCARNATION_CO_HOLDERS",
+      "fingerprint": "320c9deba57a12da82c3adef6d0f20a8529384d5bcb6c32d3be20c0d8e3076e6",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter in crates/carrick-vmm-hvf/src/trap/memory_protection.rs: leases that retired beside a surviving row of an older incarnation of their extent (alias_retirement_census); monotonic, never read for control flow."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "EL1_KICK_RESUMED",
       "fingerprint": "7f0d99da30714e3ca6ae4f2d8b07dfeb7a52caabef1631ffc7a9cc00a22a0824",
