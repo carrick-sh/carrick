@@ -31,6 +31,7 @@ pub use foreign_mm::{
     ForeignPtraceTextAuthority, ForeignPtraceTextCowPlan, ForeignReadableRange,
     ForeignStage1Identity,
 };
+pub mod el1_editor_exclusion;
 pub mod stage1_exclusive;
 pub mod stage1_mm;
 

@@ -3614,6 +3614,16 @@ mod guest_descriptor_lane_tests {
         answered: usize,
         /// Host-driven drain calls taken: each is a VM exit and entry.
         calls: usize,
+        /// Break-before-make and ASID invalidations a host-applied
+        /// transaction ran (each a maintenance exit in production).
+        invalidations: std::cell::Cell<usize>,
+    }
+
+    impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for FakeVenue<'_> {
+        fn publish_barrier(&self) {}
+        fn invalidate_range(&self, _va: u64, _len: u64) {
+            self.invalidations.set(self.invalidations.get() + 1);
+        }
     }
 
     impl GuestDrainVenue for FakeVenue<'_> {
@@ -3685,6 +3695,21 @@ mod guest_descriptor_lane_tests {
                     )
                 })
         }
+        fn apply_as_host(
+            &mut self,
+            txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+            slots: &DescriptorTxnSlots,
+        ) -> Option<Result<DescriptorReceipt, TrapError>> {
+            let venue: &FakeVenue<'_> = self;
+            carrick_aarch64::descriptor_drain::apply_as_host_if_excluded(
+                venue.authority,
+                slots,
+                txn,
+                venue,
+                &|| venue.invalidations.set(venue.invalidations.get() + 1),
+                || Ok(()),
+            )
+        }
     }
 
     fn el1_apply_mm(
@@ -3752,6 +3777,225 @@ mod guest_descriptor_lane_tests {
             .unwrap()
     }
 
+    /// Hold `MM`'s EL1 editor exclusion on this thread, as the syscall and
+    /// first-touch mutation guards do.
+    fn excluded<R>(f: impl FnOnce() -> R) -> R {
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let index = spaces
+            .publish_closed(MM, LINUX_PAGE_TABLES_BASE, 0)
+            .unwrap();
+        let result = {
+            let excluded = spaces.raise_and_wait_for_editor(index, || {});
+            let _held =
+                carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
+            f()
+        };
+        spaces.lower(index);
+        result
+    }
+
+    fn venue<'a>(
+        resolver: &'a BufferResolver,
+        slots: &'a DescriptorTxnSlots,
+        authority: &'a Stage1Authority,
+    ) -> FakeVenue<'a> {
+        FakeVenue {
+            resolver,
+            slots,
+            authority,
+            ttbr0: LINUX_PAGE_TABLES_BASE | (7 << 48),
+            block: false,
+            max_in_flight: 0,
+            refuse_from: None,
+            answered: 0,
+            calls: 0,
+            invalidations: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Work budget: a host first touch (a prepared leaf made resident)
+    /// published while this thread holds the MM's EL1 editor exclusion
+    /// costs no drain call and no invalidation (invalid->valid), and the
+    /// live leaf is final before the publication returns, so the guest
+    /// resumes onto it. Without the exclusion the EL1 drain applies it.
+    #[test]
+    fn an_excluded_host_first_touch_takes_no_drain_exit() {
+        for exclusion in [true, false] {
+            let (authority, resolver) = guest_lane();
+            let txn = authority
+                .prepare_guest_descriptor_txn(nz(MM), grant_op(VA + 4096))
+                .unwrap();
+            let slots = Box::new(DescriptorTxnSlots::new());
+            let mut fake = venue(&resolver, &slots, &authority);
+            let publish = |fake: &mut FakeVenue<'_>| {
+                apply_guest_descriptor_txns_now(fake, &slots, &[txn]).unwrap()
+            };
+            let receipts = if exclusion {
+                excluded(|| publish(&mut fake))
+            } else {
+                publish(&mut fake)
+            };
+            assert_eq!(receipts.len(), 1);
+            assert!(writable(&authority, VA + 4096), "final before it returns");
+            assert!(!writable(&authority, VA), "only the resident page");
+            if exclusion {
+                assert_eq!(fake.calls, 0, "no drain call under the exclusion");
+                assert_eq!(fake.invalidations.get(), 0, "invalid->valid needs none");
+                assert_eq!(fake.max_in_flight, 0, "no slot was used");
+            } else {
+                assert_eq!(fake.calls, 1, "the unexcluded path still drains");
+            }
+            assert!(slots.as_slice().iter().all(|slot| slot.state() == 0));
+        }
+    }
+
+    /// A COW repoint is never host-applied, even under the exclusion: EL1
+    /// copies the page as it repoints (its copy aliases), and the bare
+    /// executor would leave the guest on an uncopied frame
+    /// (lifecycleflagmatrix lane on: SIGSEGV at 0 after a fork).
+    #[test]
+    fn a_cow_repoint_is_left_to_the_el1_drain_under_the_exclusion() {
+        use carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess;
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let txn = carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn {
+            id: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxnId {
+                mm_key: nz(MM),
+                generation: nz(1),
+            },
+            root: SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+            op: DescriptorOp::CowRepoint {
+                access: CowRepointAccess::RecordedPrivate,
+                va: VA,
+                len: 4096,
+                old_ipa: SubstrateGpa(IPA),
+                new_ipa: SubstrateGpa(IPA + 0x10_0000),
+                backing: BackingIdentity {
+                    frame_id: nz(5),
+                    mapping_id: nz(6),
+                    owner_generation: nz(7),
+                    inventory_revision: nz(8),
+                },
+            },
+            tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants::NONE,
+        };
+        let fake = venue(&resolver, &slots, &authority);
+        excluded(|| {
+            assert!(
+                carrick_aarch64::descriptor_drain::apply_as_host_if_excluded(
+                    &authority,
+                    &slots,
+                    &txn,
+                    &fake,
+                    &|| {},
+                    || Ok(()),
+                )
+                .is_none()
+            );
+        });
+    }
+
+    /// Order: a submission already in flight for the MM (a frame grant EL1
+    /// has not applied yet) lands before a later host edit. Under the
+    /// exclusion the host applies it first, as EL1's drain would, leaving its
+    /// receipt for its owner; host-applying the later retirement first let
+    /// the grant's prepare land on the retired range (windowcoherence:
+    /// "prepare ... Refused(Occupied)" when it was reused).
+    #[test]
+    fn a_host_edit_behind_an_in_flight_submission_applies_it_first() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let grant = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        assert!(slots.submit(3, &grant));
+        let op = authority
+            .with_manager(|manager| manager.fork_arm_op(VA, 4096, false, false, false))
+            .unwrap();
+        let arm = authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap();
+        let mut fake = venue(&resolver, &slots, &authority);
+        excluded(|| {
+            apply_guest_descriptor_txns_now(&mut fake, &slots, &[arm]).unwrap();
+        });
+        assert_eq!(fake.calls, 0, "the host applied both, no drain call");
+        let receipt = slots
+            .take_receipt(3, grant.id)
+            .expect("the grant's receipt");
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        authority
+            .settle_guest_descriptor_receipt(&grant, &receipt)
+            .unwrap();
+        assert!(!writable(&authority, VA), "the arm landed after the grant");
+    }
+
+    /// TLB: a host-applied transaction invalidates exactly when its receipt
+    /// changed or removed a valid leaf: arming a resident writable page
+    /// (valid -> read-only) invalidates, making a prepared page resident
+    /// (invalid -> valid) does not.
+    #[test]
+    fn a_host_applied_change_of_a_valid_leaf_invalidates_and_a_new_leaf_does_not() {
+        let (authority, resolver) = guest_lane();
+        let slots = Box::new(DescriptorTxnSlots::new());
+        let mut fake = venue(&resolver, &slots, &authority);
+        excluded(|| {
+            let first_touch = authority
+                .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+                .unwrap();
+            apply_guest_descriptor_txns_now(&mut fake, &slots, &[first_touch]).unwrap();
+            assert_eq!(fake.invalidations.get(), 0);
+            assert!(writable(&authority, VA));
+            let op = authority
+                .with_manager(|manager| manager.fork_arm_op(VA, 4096, false, false, false))
+                .unwrap();
+            let arm = authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap();
+            apply_guest_descriptor_txns_now(&mut fake, &slots, &[arm]).unwrap();
+            assert!(!writable(&authority, VA));
+            assert_eq!(fake.invalidations.get(), 1, "valid -> changed invalidates");
+        });
+        assert_eq!(fake.calls, 0);
+    }
+
+    /// The host may store to guest-owned descriptors only through
+    /// `Stage1Authority::execute_guest_descriptor_txn_as_host` and
+    /// `apply_submitted_as_host`, which need the exclusion witness: each of
+    /// the manager's two unsafe host appliers has exactly that one caller,
+    /// and the witness is minted only from a held exclusion of the same MM.
+    #[test]
+    fn host_descriptor_stores_require_the_exclusion_witness() {
+        let callers: usize = [
+            include_str!("../../../carrick-aarch64/src/stage1_authority.rs"),
+            include_str!("../../../carrick-aarch64/src/engine.rs"),
+            include_str!("../../../carrick-aarch64/src/descriptor_drain.rs"),
+            include_str!("../../../carrick-vmm-hvf/src/trap/cow_engine.rs"),
+            include_str!("../../../carrick-vmm-hvf/src/trap/sparse_materialization.rs"),
+        ]
+        .iter()
+        .map(|source| {
+            source
+                .matches("manager.execute_guest_descriptor_txn_as_host(")
+                .count()
+                + source
+                    .matches("manager.apply_submitted_descriptor_txn_as_host(")
+                    .count()
+        })
+        .sum();
+        assert_eq!(callers, 2, "only the two witness-checked authority methods");
+        let (authority, _resolver) = guest_lane();
+        let txn = authority
+            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
+            .unwrap();
+        assert!(carrick_hal::el1_editor_exclusion::with_held_exclusion(
+            MM,
+            |witness| witness.is_none()
+        ));
+        excluded(|| {
+            carrick_hal::el1_editor_exclusion::with_held_exclusion(MM + 1, |witness| {
+                assert!(witness.is_none(), "another MM's exclusion is no witness")
+            });
+        });
+        authority.abandon_guest_descriptor_txn(&txn).unwrap();
+    }
+
     #[test]
     fn prepared_copyout_refusal_preserves_the_leaf_and_releases_the_slot() {
         for failure in ["wrong root", "wrong backing", "blocked", "read only"] {
@@ -3781,6 +4025,7 @@ mod guest_descriptor_lane_tests {
                 refuse_from: None,
                 answered: 0,
                 calls: 0,
+                invalidations: std::cell::Cell::new(0),
             };
             assert!(
                 carrick_aarch64::descriptor_drain::publish_copyout(
@@ -3836,6 +4081,7 @@ mod guest_descriptor_lane_tests {
             refuse_from: None,
             answered: 0,
             calls: 0,
+            invalidations: std::cell::Cell::new(0),
         };
         let receipt = carrick_aarch64::descriptor_drain::publish_copyout(
             &mut venue,
@@ -3878,6 +4124,7 @@ mod guest_descriptor_lane_tests {
             refuse_from: None,
             answered: 0,
             calls: 0,
+            invalidations: std::cell::Cell::new(0),
         };
         let receipts = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap();
         assert_eq!(receipts.len(), 2);
@@ -3912,6 +4159,7 @@ mod guest_descriptor_lane_tests {
             refuse_from: None,
             answered: 0,
             calls: 0,
+            invalidations: std::cell::Cell::new(0),
         };
         assert!(apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).is_err());
         assert!(
@@ -3957,6 +4205,7 @@ mod guest_descriptor_lane_tests {
                 refuse_from: Some(refuse_from),
                 answered: 0,
                 calls: 0,
+                invalidations: std::cell::Cell::new(0),
             };
             let error = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap_err();
             assert_eq!(

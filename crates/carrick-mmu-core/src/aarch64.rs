@@ -1886,6 +1886,80 @@ impl descriptor_txn::LiveDescriptorWords for ArenaTableWords<'_> {
     fn invalidate_range(&self, _va: u64, _len: u64) {}
 }
 
+/// The host's STORING view of a guest-owned image, for the one case the
+/// host may store to it: while it holds the MM's EL1 editor exclusion, so
+/// no EL1 editor can store concurrently. Same multi-arena resolution as
+/// [`ArenaTableWords`]; maintenance is the caller's.
+struct ArenaLiveWords<'a, M: descriptor_txn::TableMaintenance + ?Sized> {
+    arenas: &'a [TableArena],
+    resolver: &'a (dyn HostArenaResolver + Send + Sync),
+    maintenance: &'a M,
+}
+
+impl<M: descriptor_txn::TableMaintenance + ?Sized> ArenaLiveWords<'_, M> {
+    fn word(
+        &self,
+        pa: u64,
+    ) -> Result<&core::sync::atomic::AtomicU64, descriptor_txn::DescriptorRefusal> {
+        use descriptor_txn::DescriptorRefusal;
+        if !pa.is_multiple_of(8) {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        let arena = self
+            .arenas
+            .iter()
+            .find(|arena| pa >= arena.base && pa - arena.base < arena.capacity as u64)
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
+        let host = self
+            .resolver
+            .host_ptr_for_range(arena.base, arena.capacity)
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
+        // SAFETY: the resolver maps the whole arena resident, aligned and
+        // writable; the offset is in bounds and 8-byte aligned.
+        Ok(unsafe {
+            &*host
+                .add((pa - arena.base) as usize)
+                .cast::<core::sync::atomic::AtomicU64>()
+        })
+    }
+}
+
+impl<M: descriptor_txn::TableMaintenance + ?Sized> descriptor_txn::LiveDescriptorWords
+    for ArenaLiveWords<'_, M>
+{
+    fn load(&self, pa: u64) -> Result<u64, descriptor_txn::DescriptorRefusal> {
+        Ok(self.word(pa)?.load(core::sync::atomic::Ordering::Acquire))
+    }
+
+    fn compare_exchange(
+        &self,
+        pa: u64,
+        current: u64,
+        new: u64,
+    ) -> Result<bool, descriptor_txn::DescriptorRefusal> {
+        use core::sync::atomic::Ordering;
+        Ok(self
+            .word(pa)?
+            .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok())
+    }
+
+    fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), descriptor_txn::DescriptorRefusal> {
+        self.word(pa)?
+            .store(value, core::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn publish_barrier(&self) {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.maintenance.publish_barrier();
+    }
+
+    fn invalidate_range(&self, va: u64, len: u64) {
+        self.maintenance.invalidate_range(va, len);
+    }
+}
+
 #[derive(Debug)]
 pub struct TableArena {
     pub base: u64,
@@ -2383,6 +2457,98 @@ impl PageTableManager {
     /// result and later settles its receipt with
     /// [`Self::settle_guest_descriptor_receipt`] (or
     /// [`Self::abandon_guest_descriptor_txn`] if it is withdrawn unclaimed).
+    /// Execute a prepared guest descriptor transaction with the host as the
+    /// MM's editor: the same journaled executor and receipt EL1's drain
+    /// uses ([`descriptor_txn::execute_descriptor_txn`]), on the live words
+    /// of every arena. `maintenance` performs each break-before-make
+    /// invalidation the executor asks for; the caller invalidates the ASID
+    /// when [`descriptor_txn::outcome_requires_invalidation`] says so,
+    /// BEFORE settling the receipt.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds this MM's EL1 editor exclusion for the whole call:
+    /// no EL1 editor can store to these tables concurrently. The one caller
+    /// is `Stage1Authority::execute_guest_descriptor_txn_as_host`, which
+    /// demands the exclusion witness.
+    pub unsafe fn execute_guest_descriptor_txn_as_host<M>(
+        &self,
+        txn: &descriptor_txn::DescriptorTxn,
+        maintenance: &M,
+    ) -> Result<descriptor_txn::DescriptorReceipt, GuestTxnPrepareError>
+    where
+        M: descriptor_txn::TableMaintenance + ?Sized,
+    {
+        if self.live_descriptor_owner != LiveDescriptorOwner::Guest {
+            return Err(GuestTxnPrepareError::NotGuestOwned);
+        }
+        if !self.arenas.first().is_some_and(TableArena::is_live) {
+            return Err(GuestTxnPrepareError::NotLive);
+        }
+        let resolver = self
+            .resolver
+            .as_ref()
+            .ok_or(GuestTxnPrepareError::NotLive)?;
+        let words = ArenaLiveWords {
+            arenas: &self.arenas,
+            resolver: resolver.as_ref(),
+            maintenance,
+        };
+        let mut journal = descriptor_txn::InlineJournal::new();
+        Ok(descriptor_txn::execute_descriptor_txn(
+            &words,
+            SubstrateGpa(self.base()),
+            txn,
+            &mut journal,
+        ))
+    }
+
+    /// Apply the submission waiting in `slot` for `mm_key` with the host as
+    /// the MM's editor, exactly as EL1's drain applies it
+    /// ([`descriptor_txn::apply_submitted_descriptor_txn`]): claim, execute,
+    /// `invalidate_asid` when the outcome requires it, publish the receipt
+    /// for its owner to settle. `Ok(None)`: nothing waiting for `mm_key`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::execute_guest_descriptor_txn_as_host`]: the caller holds
+    /// this MM's EL1 editor exclusion for the whole call.
+    pub unsafe fn apply_submitted_descriptor_txn_as_host<M>(
+        &self,
+        slot: &descriptor_txn::DescriptorTxnSlot,
+        mm_key: u64,
+        maintenance: &M,
+        invalidate_asid: impl FnOnce(),
+    ) -> Result<Option<descriptor_txn::DescriptorReceipt>, GuestTxnPrepareError>
+    where
+        M: descriptor_txn::TableMaintenance + ?Sized,
+    {
+        if self.live_descriptor_owner != LiveDescriptorOwner::Guest {
+            return Err(GuestTxnPrepareError::NotGuestOwned);
+        }
+        if !self.arenas.first().is_some_and(TableArena::is_live) {
+            return Err(GuestTxnPrepareError::NotLive);
+        }
+        let resolver = self
+            .resolver
+            .as_ref()
+            .ok_or(GuestTxnPrepareError::NotLive)?;
+        let words = ArenaLiveWords {
+            arenas: &self.arenas,
+            resolver: resolver.as_ref(),
+            maintenance,
+        };
+        let mut journal = descriptor_txn::InlineJournal::new();
+        Ok(descriptor_txn::apply_submitted_descriptor_txn(
+            slot,
+            mm_key,
+            &words,
+            SubstrateGpa(self.base()),
+            &mut journal,
+            invalidate_asid,
+        ))
+    }
+
     pub fn prepare_guest_descriptor_txn(
         &mut self,
         id: descriptor_txn::DescriptorTxnId,
