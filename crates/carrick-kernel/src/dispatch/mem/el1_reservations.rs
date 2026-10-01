@@ -285,6 +285,49 @@ impl MemView<'_> {
 }
 
 impl MemView<'_> {
+    /// Hand the root everything it now decides in the host protection
+    /// registry: its holes in the heap and the mmap arena (a seeded heap
+    /// `unmapped` mark, a loader's `munmap`) and the root-decided pages of
+    /// its anonymous rows (see `GuestMemory::release_root_facts`). Guest
+    /// EL1 places and edits there without the host, so a host fact left
+    /// behind would refuse host reads and copyouts of EL1's mappings.
+    pub(in crate::dispatch) fn release_root_territory<M: CurrentMmMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+    ) {
+        let (root, layout, rows) = {
+            let authority = self.mm_authority();
+            let mem = authority.lock();
+            let Some(root) = mem.delegated_root().cloned() else {
+                return;
+            };
+            (root, mem.layout, mem.root_anonymous_rows())
+        };
+        let territory = [
+            (layout.heap_base, layout.heap_size),
+            (layout.mmap_base, layout.mmap_size),
+        ];
+        let mut holes = Vec::new();
+        for (base, size) in territory {
+            let Some(range) = base
+                .checked_add(size)
+                .and_then(|end| ReservationRange::new(base, end))
+            else {
+                continue;
+            };
+            holes.extend(
+                root.with_root(|model| super::fault::root_holes(model, range))
+                    .unwrap_or_else(|refusal| broken_root("a territory observation", refusal)),
+            );
+        }
+        for (start, end) in holes {
+            memory.return_to_root(start, (end - start) as usize);
+        }
+        for row in rows {
+            memory.release_root_facts(row.start, (row.end - row.start) as usize);
+        }
+    }
+
     /// Whether this MM is a copied-MM fork twin of `parent`: a delegated
     /// parent's twin names its root; a host-setup parent's child carries no
     /// seed. A delegated MM is nobody's unsealed twin.
@@ -346,13 +389,92 @@ impl SyscallDispatcher {
     /// admitted as a bind, or a fork parent that moved on; `Busy`: a root
     /// proposal is still pending; `MetadataRequired`: node storage must be
     /// provisioned first).
-    pub fn admit_el1_reservations(
+    pub(crate) fn admit_el1_reservations(
         &self,
         permit: &HostAliasPermit<'_>,
         origin: El1AdmissionOrigin<'_, '_>,
     ) -> Result<El1Admission, Refusal> {
         self.mem_view()
             .admit_el1_reservations(permit, origin, el1_reservations_enabled())
+    }
+
+    /// Publish this MM's address space at its first load (the initial
+    /// runner, or the new MM of an exec) for guest EL1 to install, and admit
+    /// its just-published reservation root as the owner of its anonymous
+    /// memory ([`El1AdmissionOrigin::Bind`]) in the same step: an address
+    /// space is never published without its admission being decided.
+    /// `participation` is this MM's loading executor; the admission takes
+    /// its exact-MM mutation authority after the publication.
+    ///
+    /// A fork child is published and admitted by its fork commit instead
+    /// ([`crate::dispatch::mm_mutation::ForkCommit::publish_and_admit_child`]).
+    /// `None`: nothing was published (no EL1 zone, or the table refused).
+    /// Every admission outcome, including a refusal that leaves the MM in
+    /// host setup, fires `hvpatch-el1-root-admission`.
+    pub fn publish_bound_address_space<M: CurrentMmMemory + ?Sized>(
+        &self,
+        participation: &mut crate::dispatch::MmExecutorParticipation,
+        memory: &mut M,
+        ttbr0: u64,
+        ttbr1: u64,
+    ) -> Option<crate::kernel::AddressSpacePublication> {
+        if !participation.authorizes(&self.mm_authority()) {
+            carrick_fatal::carrick_fatal!(
+                "dispatch::el1_reservations",
+                "address space publication by another MM's executor: participation mm={:?}",
+                participation.mm_id()
+            );
+        }
+        let publication = participation.publish_address_space(ttbr0, ttbr1)?;
+        let mm = participation.mm_id();
+        let admission = match crate::dispatch::mm_mutation::from_executor(participation) {
+            Ok(guard) => RootAdmission::of(
+                self.admit_el1_reservations(&guard.host_alias_permit(), El1AdmissionOrigin::Bind),
+            ),
+            Err(_) => RootAdmission::NoAuthority,
+        };
+        admission.trace(
+            mm,
+            carrick_observability::probes::HvpatchEl1RootOrigin::Bind,
+        );
+        if admission == RootAdmission::Decided(El1Admission::Delegated) {
+            self.mem_view().release_root_territory(memory);
+        }
+        Some(publication)
+    }
+}
+
+/// What one published address space's root admission decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootAdmission {
+    Decided(El1Admission),
+    Refused(Refusal),
+    /// No exact-MM mutation authority could be taken; nothing was asked.
+    NoAuthority,
+}
+
+impl RootAdmission {
+    pub(crate) fn of(result: Result<El1Admission, Refusal>) -> Self {
+        result.map_or_else(Self::Refused, Self::Decided)
+    }
+
+    pub(crate) fn trace(
+        self,
+        mm: crate::kernel::MmId,
+        origin: carrick_observability::probes::HvpatchEl1RootOrigin,
+    ) {
+        use carrick_observability::probes::HvpatchEl1RootAdmission as Outcome;
+        let outcome = match self {
+            Self::Decided(El1Admission::Delegated) => Outcome::Delegated,
+            Self::Decided(El1Admission::HostSetup) => Outcome::HostSetup,
+            Self::NoAuthority => Outcome::NoAuthority,
+            Self::Refused(Refusal::Busy) => Outcome::RefusedBusy,
+            Self::Refused(Refusal::Stale) => Outcome::RefusedStale,
+            Self::Refused(Refusal::Invalid) => Outcome::RefusedInvalid,
+            Self::Refused(Refusal::MetadataRequired) => Outcome::RefusedMetadataRequired,
+            Self::Refused(_) => Outcome::RefusedOther,
+        };
+        crate::probes::hvpatch_el1_root_admission(mm.raw(), origin, outcome);
     }
 }
 #[cfg(test)]
@@ -440,8 +562,11 @@ mod tests {
         }
         impl PreparedHostReservations for View {
             fn lock(&self, _mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-                self.table
-                    .lock_waiting(self.index, self.mm, &crate::el1_zone::HostLockWait)
+                self.table.lock_waiting(
+                    self.index,
+                    self.mm,
+                    &crate::dispatch::mem::el1_reservations::RootHostWait::new(),
+                )
             }
         }
         let table: Arc<SharedReservations> = Arc::from(shared());
@@ -724,7 +849,9 @@ pub use projection::{NonAnonymousVmas, ReservationProcMaps};
 #[path = "el1_reservations/provider.rs"]
 mod provider;
 pub(in crate::dispatch) use provider::{DelegatedRoot, ReservationProviderSlot};
-pub use provider::{HostReservationProvider, PreparedHostReservations, PreparedReservationSession};
+pub use provider::{
+    HostReservationProvider, PreparedHostReservations, PreparedReservationSession, RootHostWait,
+};
 
 #[path = "el1_reservations/returns.rs"]
 mod returns;

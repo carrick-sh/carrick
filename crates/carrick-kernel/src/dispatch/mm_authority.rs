@@ -470,8 +470,10 @@ impl MmExecutorParticipation {
 
     /// Publish this MM's address space, whose translation roots are
     /// `ttbr0`/`ttbr1`, for guest EL1 to install on a vCPU itself (EL1
-    /// increment 2): its gate follows this MM's fence.
-    pub fn publish_address_space(
+    /// increment 2): its gate follows this MM's fence. Only
+    /// [`super::SyscallDispatcher::publish_bound_address_space`] calls it,
+    /// so a publication always decides its root's admission.
+    pub(in crate::dispatch) fn publish_address_space(
         &self,
         ttbr0: u64,
         ttbr1: u64,
