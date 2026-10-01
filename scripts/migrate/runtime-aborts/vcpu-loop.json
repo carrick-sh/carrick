@@ -1052,7 +1052,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "publish_zone_slot",
       "ordinal_in_function": 1,
-      "fingerprint": "32c60dd76f9ea0dd4e8eb86a98f0fb81e3ca689933e2975c5c234686b5aed097",
+      "fingerprint": "fc22e3f6f11ac959d37b43f8f9145f132b4c1eb3ec1e3ac2f3a466d5c17e88c9",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::el1_zone",
       "rationale": "An EL1 zone slot still held threads (current, queued or host-owned) when the executor loaded a task on it: the previous residency's exit must have reconciled the slot, so a non-empty slot means a parked thread's only owner would be overwritten; continuing would lose that thread.",
