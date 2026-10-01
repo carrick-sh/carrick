@@ -3011,6 +3011,13 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         ))
     }
 
+    /// Whether this vCPU stopped at EL1 mid-operation (a stage-1 COW fault
+    /// EL1 took, now resolved): its next run must re-enter that operation
+    /// before any host boundary work touches the thread.
+    fn el1_operation_suspended(&self) -> bool {
+        false
+    }
+
     /// This vCPU's EL1 stack pointer when it stopped at EL1 mid-operation
     /// (a stage-1 COW fault EL1 took), `None` at an EL0 boundary. A
     /// host-driven EL1 call places its frame and stack below it.

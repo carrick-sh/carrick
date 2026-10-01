@@ -4171,6 +4171,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(self.suspended_el1_sp)
     }
 
+    fn el1_operation_suspended(&self) -> bool {
+        self.suspended_el1_sp.is_some()
+    }
+
     fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
         self.page_tables.live_descriptor_owner()
     }
