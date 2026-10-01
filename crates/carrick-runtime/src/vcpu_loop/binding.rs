@@ -3603,7 +3603,7 @@ where
                     binding.publish_address_space(|lease_ttbr0| {
                         let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
                         (ttbr0 == lease_ttbr0)
-                            .then(|| participation.publish_address_space(ttbr0, ttbr1))
+                            .then(|| dispatcher.publish_bound_address_space(participation, &mut *engine, ttbr0, ttbr1))
                             .flatten()
                     });
                 }
@@ -4150,6 +4150,21 @@ where
                 elr,
                 spsr,
             }) => {
+                // The one exit EL1 takes from inside its image that reaches
+                // the runtime (`carrick_vmm_hvf` `el1_image_exit`): an EL1
+                // user copy's write to a copy-on-write page. User copies never
+                // run under a reservation root guard; one that did would leave
+                // every host venue waiting on that root (holding the MM's
+                // `MemState`) behind host code this thread is about to run.
+                if let Some(slot) = engine.mailbox_slot()
+                    && let Some(root) = carrick_el1::memory::reservations::shared_host()
+                        .and_then(|roots| roots.el1_slot_holding(slot as u32))
+                {
+                    carrick_fatal!(
+                        "vcpu_loop::el1_cow_fault",
+                        "EL1 took a copy-on-write fault while holding reservation root {root}: slot={slot} far={far:#x} elr={elr:#x}"
+                    );
+                }
                 self.check_own_space_at_el1_fault(engine)?;
                 // The engine's single COW resolver emits the exact TTBR +
                 // descriptor pair immediately before its typed trigger. Do not

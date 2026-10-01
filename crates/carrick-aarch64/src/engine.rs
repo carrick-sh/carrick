@@ -1570,10 +1570,18 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     // the Carrick-owned EL1 COW copy window, is an address no
                     // guest edit may reach, like a bad address.
                     Err(
-                        PageTableError::BadAddress
+                        error @ (PageTableError::BadAddress
                         | PageTableError::GicWindowOutput
-                        | PageTableError::CarrickOwnedWindow,
+                        | PageTableError::CarrickOwnedWindow),
                     ) => {
+                        // The refusal's kind is lost in the lowered error:
+                        // name it for `guest-internal-write-fault` readers.
+                        carrick_observability::probes::guest_internal_write_fault(
+                            0,
+                            0,
+                            8,
+                            &format!("stage-1 edit refused: {error:?}"),
+                        );
                         Err(MemoryError::OutOfBounds {
                             address: 0,
                             length: 0,
@@ -2674,6 +2682,22 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         true
     }
 
+    /// Fire `guest-internal-read-fault` for the page of `va` with its live
+    /// terminal descriptor (the evidence of why a host read refused).
+    fn trace_read_fault(&self, va: u64, length: usize, phase: u32) {
+        let live = self
+            .diagnostic_fault_page_tables(va)
+            .map_or(0, |(_, walk)| {
+                carrick_mmu_core::aarch64::terminal_descriptor(walk)
+            });
+        carrick_observability::probes::guest_internal_read_fault(
+            va & !0xfff,
+            length as u64,
+            phase,
+            live,
+        );
+    }
+
     /// The bytes of `[address + offset, ..)` up to the page end when that
     /// page reads as fresh zero to the host: its live leaf names no output
     /// and the exact-MM authority answers that it is an untouched, readable
@@ -3017,6 +3041,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             length,
             carrick_mmu_core::aarch64::LeafAccess::Read,
         ) {
+            self.trace_read_fault(address, length, 0);
             return Err(MemoryError::OutOfBounds { address, length });
         }
         // PROT_NONE was gated on the guest VA in the default `read_bytes`. Walk
@@ -3029,9 +3054,11 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     // `out` is already zero.
-                    copied += self
-                        .fresh_zero_chunk(address, copied, length)
-                        .ok_or(error)?;
+                    let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
+                        self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
+                        return Err(error);
+                    };
+                    copied += zero;
                     continue;
                 }
             };
@@ -3052,6 +3079,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                         copied += chunk_len;
                         continue;
                     }
+                    self.trace_read_fault(va, length, 2);
                     return Err(error);
                 }
             };
@@ -3073,6 +3101,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             length,
             carrick_mmu_core::aarch64::LeafAccess::Read,
         ) {
+            self.trace_read_fault(address, length, 0);
             return Err(MemoryError::OutOfBounds { address, length });
         }
         let mut copied = 0usize;
@@ -3080,9 +3109,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             let (va, ipa, chunk_len) = match self.syscall_buffer_chunk(address, copied, length) {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    let zero = self
-                        .fresh_zero_chunk(address, copied, length)
-                        .ok_or(error)?;
+                    let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
+                        self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
+                        return Err(error);
+                    };
                     dst[copied..copied + zero].fill(0);
                     copied += zero;
                     continue;
@@ -3103,12 +3133,45 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                     None => false,
                 };
                 if !deferred {
+                    self.trace_read_fault(va, length, 2);
                     return Err(error);
                 }
             }
             copied += chunk_len;
         }
         Ok(())
+    }
+
+    fn release_root_facts(&mut self, address: u64, len: usize) {
+        let Some(end) = address.checked_add(len as u64) else {
+            return;
+        };
+        let root_decided = |engine: &Self, page: u64| {
+            engine
+                .diagnostic_fault_page_tables(page)
+                .map(|(_, walk)| carrick_mmu_core::aarch64::terminal_descriptor(walk))
+                .is_none_or(|leaf| {
+                    carrick_mmu_core::aarch64::terminal_descriptor_is_absent(leaf)
+                        || carrick_mmu_core::aarch64::el1_private_leaf_state(leaf)
+                            != carrick_mmu_core::aarch64::El1PrivateLeafState::Unowned
+                })
+        };
+        let mut page = address & !0xfff;
+        let mut run: Option<u64> = None;
+        while page < end {
+            match (root_decided(self, page), run) {
+                (true, None) => run = Some(page),
+                (false, Some(start)) => {
+                    self.return_to_root(start, (page - start) as usize);
+                    run = None;
+                }
+                _ => {}
+            }
+            page += 0x1000;
+        }
+        if let Some(start) = run {
+            self.return_to_root(start, (end.max(start) - start) as usize);
+        }
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
@@ -3564,7 +3627,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             &armed_cow,
             new_mapping,
         );
-        self.apply_stage1_rules((address, len), &plan)?;
+        if let Err(error) = self.apply_stage1_rules((address, len), &plan) {
+            // Phase 3: the stage-1 protection edit refused; name the first
+            // page's live terminal (the leaf the rule could not take).
+            self.trace_read_fault(address, len, 3);
+            return Err(error);
+        }
         self.vm
             .observe_frame_cow_protection(address, len, prot)
             .map_err(|error| {
@@ -5776,7 +5844,9 @@ mod tests {
             calls: Vec<(u64, u64)>,
             decline: bool,
         }
-        let rows: &[(&[u64], u64, u64, &[(u64, u64)])] = &[
+        /// (absent pages, copyout start page, copyout pages, expected runs)
+        type Row<'a> = (&'a [u64], u64, u64, &'a [(u64, u64)]);
+        let rows: &[Row<'_>] = &[
             (&[], 0, 8, &[]),
             (&[0, 1, 2, 3, 4, 5, 6, 7], 0, 8, &[(0, 8)]),
             (&[0, 2, 4, 6], 0, 8, &[(0, 1), (2, 1), (4, 1), (6, 1)]),

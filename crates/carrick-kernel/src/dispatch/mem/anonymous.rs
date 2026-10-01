@@ -116,6 +116,15 @@ enum HostVenue {
 /// A root refusal where the host already committed backend work, or where
 /// the MM permit and the host queue exclude every contender: the root is the
 /// only owner, so answering from anything else would be a second authority.
+/// A host-venue step the root refused, as the dispatch error the syscall
+/// fails with. Fires `hvpatch-el1-root-host-refusal` first, so a trace's
+/// stack names the refusing step (the error alone does not).
+#[inline(never)]
+pub(in crate::dispatch) fn root_refusal(refusal: Refusal) -> DispatchError {
+    crate::probes::hvpatch_el1_root_host_refusal(refusal as u32);
+    DispatchError::ReservationAuthority(refusal)
+}
+
 pub(super) fn broken_root(context: &str, refusal: Refusal) -> ! {
     carrick_fatal!(
         "dispatch::anonymous",
@@ -1218,9 +1227,9 @@ pub(in crate::dispatch) fn complete_delegated(
             },
         )
     }
-    .ok_or(DispatchError::ReservationAuthority(Refusal::Invalid))?;
+    .ok_or_else(|| root_refusal(Refusal::Invalid))?;
     root.with_root(|model| model.complete(completion))
-        .map_err(DispatchError::ReservationAuthority)
+        .map_err(root_refusal)
 }
 
 /// A root proposal held open across a runtime host-alias install. Commit
@@ -1345,7 +1354,7 @@ impl MemView<'_> {
         match secured {
             Ok(()) => Ok(None),
             Err(Refusal::MetadataRequired) => Ok(Some(LINUX_ENOMEM)),
-            Err(refusal) => Err(DispatchError::ReservationAuthority(refusal)),
+            Err(refusal) => Err(root_refusal(refusal)),
         }
     }
 
@@ -1373,7 +1382,7 @@ impl MemView<'_> {
                 Ok(Ok(request))
             }
             // mmap/munmap/mprotect proposals always carry work.
-            Ok(Decision::Complete(_)) => Err(DispatchError::ReservationAuthority(Refusal::Invalid)),
+            Ok(Decision::Complete(_)) => Err(root_refusal(Refusal::Invalid)),
             Err(
                 refusal @ (Refusal::Limit
                 | Refusal::Collision
@@ -1381,7 +1390,7 @@ impl MemView<'_> {
                 | Refusal::Hole
                 | Refusal::MetadataRequired),
             ) => Ok(Err(refusal)),
-            Err(refusal) => Err(DispatchError::ReservationAuthority(refusal)),
+            Err(refusal) => Err(root_refusal(refusal)),
         }
     }
 
@@ -1437,7 +1446,7 @@ impl MemView<'_> {
                 | Refusal::ForeignMapping
                 | Refusal::MetadataRequired),
             ) => Ok(Err(refusal)),
-            Err(refusal) => Err(DispatchError::ReservationAuthority(refusal)),
+            Err(refusal) => Err(root_refusal(refusal)),
         }
     }
 
@@ -1585,8 +1594,9 @@ impl MemView<'_> {
     /// Settle this syscall's host venue with its outcome: complete a proposal
     /// the syscall succeeded for, refuse any other, and mirror a host-placed
     /// range's host rows whatever happened.
-    fn settle_host_venue(
+    fn settle_host_venue<M: CurrentMmMemory + ?Sized>(
         &self,
+        memory: &mut M,
         outcome: &Result<DispatchOutcome, DispatchError>,
         succeeded: impl FnOnce(&DispatchOutcome, &ReservationRequest) -> bool,
     ) -> Result<(), DispatchError> {
@@ -1607,6 +1617,20 @@ impl MemView<'_> {
                         // incarnations it just created.
                         mem.adopt_completed_residency(request.range.start(), request.range.end());
                     }
+                    drop(mem);
+                    // The committed range is the root's now: the guest venue
+                    // may edit it without the host, so no host protection
+                    // fact may outlive this commit where the root decides.
+                    // A retired range (and a move's source) is a root hole.
+                    if let Some(source) = request.source {
+                        memory.return_to_root(source.start(), source.len() as usize);
+                    }
+                    let (start, len) = (request.range.start(), request.range.len() as usize);
+                    if request.operation == ReservationOperation::Retire {
+                        memory.return_to_root(start, len);
+                    } else {
+                        memory.release_root_facts(start, len);
+                    }
                     return Ok(());
                 }
                 if request.operation == ReservationOperation::Prepare
@@ -1621,10 +1645,10 @@ impl MemView<'_> {
                     if transaction.attach_root_proposal(RootAliasProposal::new(root, request)) {
                         return Ok(());
                     }
-                    return Err(DispatchError::ReservationAuthority(Refusal::Stale));
+                    return Err(root_refusal(Refusal::Stale));
                 }
                 root.with_root(|model| model.refuse(request))
-                    .map_err(DispatchError::ReservationAuthority)?;
+                    .map_err(root_refusal)?;
             }
             HostVenue::Reserved(range) => mem.mirror_host_rows(range.start(), range.end()),
         }
@@ -1674,7 +1698,7 @@ impl MemView<'_> {
         cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let outcome = self.mmap_served(cx);
-        self.settle_host_venue(&outcome, |outcome, request| {
+        self.settle_host_venue(cx.memory, &outcome, |outcome, request| {
             matches!(outcome, DispatchOutcome::Returned { value }
                 if *value as u64 == request.range.start())
         })?;
@@ -1693,7 +1717,7 @@ impl MemView<'_> {
             return Ok(DispatchOutcome::errno(errno));
         }
         let outcome = self.munmap_served(cx);
-        self.settle_host_venue(&outcome, |outcome, _| {
+        self.settle_host_venue(cx.memory, &outcome, |outcome, _| {
             matches!(outcome, DispatchOutcome::Returned { value: 0 })
         })?;
         outcome
@@ -1731,7 +1755,7 @@ impl MemView<'_> {
                 || None,
             );
         }
-        self.settle_host_venue(&outcome, |outcome, _| {
+        self.settle_host_venue(cx.memory, &outcome, |outcome, _| {
             matches!(outcome, DispatchOutcome::Returned { value: 0 })
         })?;
         outcome
@@ -1772,7 +1796,7 @@ impl MemView<'_> {
             self.demote_for_host_edit(new_address.0, new_size);
         }
         let outcome = self.mremap_served(cx);
-        self.settle_host_venue(&outcome, |_, _| false)?;
+        self.settle_host_venue(cx.memory, &outcome, |_, _| false)?;
         outcome
     }
 
@@ -1863,8 +1887,7 @@ impl MemView<'_> {
             (false, false, true) => MoveTarget::MayMove,
             (false, false, false) => MoveTarget::InPlace,
         };
-        let source =
-            reservation_range(old_address, old_end).map_err(DispatchError::ReservationAuthority)?;
+        let source = reservation_range(old_address, old_end).map_err(root_refusal)?;
         let proposed = {
             let authority = self.mem();
             let mut mem = authority.lock();
@@ -1896,7 +1919,7 @@ impl MemView<'_> {
                 Err(Refusal::Invalid) => return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL))),
                 // A fixed destination the root cannot own.
                 Err(Refusal::ForeignMapping | Refusal::Collision) => return Ok(None),
-                Err(refusal) => return Err(DispatchError::ReservationAuthority(refusal)),
+                Err(refusal) => return Err(root_refusal(refusal)),
             }
         };
         let outcome = match proposed.operation {
@@ -1906,7 +1929,7 @@ impl MemView<'_> {
                 let outcome = with_args(cx, [tail.start(), tail.len(), 0, 0, 0, 0], |cx| {
                     self.munmap_served(cx)
                 });
-                self.settle_host_venue(&outcome, |outcome, _| {
+                self.settle_host_venue(cx.memory, &outcome, |outcome, _| {
                     matches!(outcome, DispatchOutcome::Returned { value: 0 })
                 })?;
                 return Ok(Some(match outcome? {
@@ -1921,7 +1944,7 @@ impl MemView<'_> {
             }
             _ => self.mremap_root_move(cx, proposed, source, dontunmap, locked),
         };
-        self.settle_host_venue(&outcome, |outcome, request| {
+        self.settle_host_venue(cx.memory, &outcome, |outcome, request| {
             matches!(outcome, DispatchOutcome::Returned { value }
                 if *value as u64 == request.range.start()
                     || request.operation == ReservationOperation::Prepare && !dontunmap)

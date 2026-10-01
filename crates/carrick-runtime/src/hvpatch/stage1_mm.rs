@@ -980,6 +980,15 @@ impl PreparedStage1Mm {
         self.lease.extension_slots()
     }
 
+    /// Publish the prepared MM's address space for guest EL1 (a fork
+    /// child's, at its fork commit): see [`Stage1MmLease::publish_address_space`].
+    pub(crate) fn publish_address_space(
+        &self,
+        publish: impl FnOnce(u64) -> Option<carrick_kernel::kernel::AddressSpacePublication>,
+    ) {
+        self.lease.publish_address_space(publish);
+    }
+
     pub(crate) fn backend(&self) -> Arc<Stage1MmBackend> {
         self.lease.backend()
     }
