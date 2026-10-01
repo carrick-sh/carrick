@@ -14166,18 +14166,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:550 in `arm_itimer`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_itimer`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:548 in `arm_itimer`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_itimer`; no guest identity selects its host target.",
     "review_id": "HA-000579",
     "source": {
-      "byte_end": 20547,
-      "byte_start": 20522,
+      "byte_end": 20565,
+      "byte_start": 20540,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 550,
-      "line_end": 550,
-      "line_start": 550
+      "line": 548,
+      "line_end": 548,
+      "line_start": 548
     }
   },
   {
@@ -14193,18 +14193,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:614 in `arm_posix`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_posix`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:612 in `arm_posix`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_posix`; no guest identity selects its host target.",
     "review_id": "HA-000580",
     "source": {
-      "byte_end": 23356,
-      "byte_start": 23331,
+      "byte_end": 23374,
+      "byte_start": 23349,
       "column": 21,
       "column_end": 46,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 614,
-      "line_end": 614,
-      "line_start": 614
+      "line": 612,
+      "line_end": 612,
+      "line_start": 612
     }
   },
   {
@@ -15163,18 +15163,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:500 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 190; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:498 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 190; no guest identity selects its host target.",
     "review_id": "HA-000606",
     "source": {
-      "byte_end": 19170,
-      "byte_start": 19152,
+      "byte_end": 19188,
+      "byte_start": 19170,
       "column": 21,
       "column_end": 39,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 500,
-      "line_end": 500,
-      "line_start": 500
+      "line": 498,
+      "line_end": 498,
+      "line_start": 498
     }
   },
   {
@@ -15190,18 +15190,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:505 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 195; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:503 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 195; no guest identity selects its host target.",
     "review_id": "HA-000607",
     "source": {
-      "byte_end": 19290,
-      "byte_start": 19272,
+      "byte_end": 19308,
+      "byte_start": 19290,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 505,
-      "line_end": 505,
-      "line_start": 505
+      "line": 503,
+      "line_end": 503,
+      "line_start": 503
     }
   },
   {
@@ -15217,18 +15217,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:519 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 208; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:517 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 208; no guest identity selects its host target.",
     "review_id": "HA-000608",
     "source": {
-      "byte_end": 19767,
-      "byte_start": 19749,
+      "byte_end": 19785,
+      "byte_start": 19767,
       "column": 13,
       "column_end": 31,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 519,
-      "line_end": 519,
-      "line_start": 519
+      "line": 517,
+      "line_end": 517,
+      "line_start": 517
     }
   },
   {
