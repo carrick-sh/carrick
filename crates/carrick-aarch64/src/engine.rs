@@ -3581,9 +3581,16 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // stage-1 graph before touching backing or publishing the replacement
         // leaf; treating the slot VA as an IPA made post-exec MAP_FIXED fail
         // with ENOMEM despite the frame being live.
+        // The overlay aperture is sealed PROT_NONE in every image (it is never
+        // guest memory through its own VA), so its frame address is the
+        // retained output of the slot's leaf.
         let overlay_ipa = self
             .page_tables
-            .with_manager(|manager| manager.translate(overlay_slot_va))
+            .with_manager(|manager| {
+                manager
+                    .translate(overlay_slot_va)
+                    .or_else(|| manager.translate_retained_output(overlay_slot_va))
+            })
             .flatten()
             .ok_or_else(|| {
                 RepointPrivateError::clean(MemoryError::OutOfBounds {

@@ -3027,6 +3027,7 @@
         "kernel.el1.zone-entry-at-open",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
+        "kernel.mm.carrier-window-isolation",
         "kernel.mm.current-read-reuse",
         "kernel.mm.metadata-refusal",
         "kernel.mm.native-data-activation",
@@ -3138,6 +3139,7 @@
         "kernel.el1.thread-lifecycle",
         "kernel.exec.stage1-image",
         "kernel.mm.address-space-occupancy",
+        "kernel.mm.carrier-window-isolation",
         "kernel.mm.exec-heap-window",
         "kernel.mm.image-page-permissions",
         "kernel.time.realtime-calibration"
@@ -3166,6 +3168,7 @@
         "kernel.fork.mappings",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
+        "kernel.mm.carrier-window-isolation",
         "kernel.mm.image-page-permissions",
         "kernel.mm.metadata-refusal",
         "kernel.mm.pt-pause-drain-acknowledgement",

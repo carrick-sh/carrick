@@ -1020,6 +1020,90 @@ fn exec_plan_table_payload_is_the_occupied_prefix() {
     assert_eq!(table.payload_size, occupied as u64);
 }
 
+/// `kernel.mm.carrier-window-isolation` (VM-free): a process reaches only
+/// what it mapped. An exec image's unowned VAs kept identity leaves onto the
+/// carrier's first root (its interpreter at `LINUX_INTERPRETER_BASE`, its
+/// image, its stack), and its shared-aperture and overlay mappings were
+/// EL0 read/write over their whole windows. The rebuild must leave every VA
+/// it does not own unmapped, and keep the sealed windows' new frames as
+/// retained outputs for their owners to re-validate.
+#[test]
+fn exec_rebuild_maps_nothing_the_image_does_not_own() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let mut plan = root_exec_test_plan();
+    let rw = carrick_mem::elf::SegmentPerms {
+        read: true,
+        write: true,
+        execute: false,
+    };
+    let mut shared = exec_mapping_for_order(carrick_mem::memory::LINUX_SHARED_FILE_BASE, 0x20_0000);
+    shared.perms = rw;
+    shared.shared = true;
+    let mut overlay =
+        exec_mapping_for_order(carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE, 0x20_0000);
+    overlay.perms = rw;
+    plan.mappings.push(shared);
+    plan.mappings.push(overlay);
+    let GlobalExecPlan { plan: rebuilt, .. } = prepare_global_exec_plan(&plan, None).unwrap();
+    let root = rebuilt.stage1_page_tables_base.unwrap();
+    let ipa_of = |va: u64| {
+        rebuilt
+            .mappings
+            .iter()
+            .find(|mapping| mapping.guest_start == va)
+            .unwrap()
+            .ipa_start
+    };
+    let table = rebuilt
+        .mappings
+        .iter()
+        .find(|mapping| mapping.ipa_start == root)
+        .expect("rebuilt table mapping");
+    let tables = carrick_mmu_core::aarch64::PageTableManager::new(
+        table.image.as_ref().clone(),
+        root,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    for va in [
+        carrick_mem::memory::LINUX_NULL_GUARD_END,
+        0x40_0000,
+        carrick_mem::memory::LINUX_INTERPRETER_BASE,
+        carrick_mem::memory::LINUX_INTERPRETER_BASE + 0x20_0000,
+        carrick_mem::elf::LINUX_PIE_DEFAULT_BASE,
+        carrick_mem::memory::LINUX_SHARED_FILE_BASE,
+        carrick_mem::memory::LINUX_SHARED_FILE_BASE + 0x40_0000,
+        carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE,
+        carrick_mem::memory::LINUX_ALIAS_IPA_BASE,
+        carrick_mem::memory::LINUX_ROSETTA_IPA_BASE,
+        0x2c_ffff_0000,
+        carrick_mem::memory::LINUX_STACK_TOP - 0x1000,
+    ] {
+        assert_eq!(
+            tables.translate(va),
+            None,
+            "unowned VA {va:#x} is mapped in a fresh exec image: {:x?}",
+            tables.debug_walk(va)
+        );
+    }
+    for va in [
+        carrick_mem::memory::LINUX_SHARED_FILE_BASE,
+        carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE,
+    ] {
+        assert_eq!(
+            tables.translate_retained_output(va),
+            Some(ipa_of(va)),
+            "sealed window {va:#x} keeps its own new frame for re-validation"
+        );
+    }
+    assert_eq!(tables.translate(0x20_0000), Some(ipa_of(0x20_0000)));
+    assert!(
+        tables
+            .translate(crate::memory::LINUX_PAGE_TABLES_BASE)
+            .is_some(),
+        "Carrick's EL1-only ranges keep their own rule"
+    );
+}
+
 #[test]
 fn root_exec_plan_owns_every_materialized_stage2_extent() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
@@ -1907,7 +1991,12 @@ fn exec_replacement_keeps_every_representative_leaf_asid_scoped() {
                 va,
             ),
         );
-        if name != "mmap" {
+        // The fixture plan owns no user text, stack or shared aperture and
+        // keeps the arena sparse: those leaves are sealed PROT_NONE
+        // (`kernel.mm.carrier-window-isolation`) and still ASID-scoped.
+        if matches!(name, "user text" | "mmap" | "shared aperture" | "stack") {
+            assert_eq!(leaf & 1, 0, "unowned {name} leaf at {va:#x} is mapped");
+        } else {
             assert_ne!(leaf & 0b11, 0, "{name} leaf at {va:#x} is not mapped");
         }
         assert_ne!(

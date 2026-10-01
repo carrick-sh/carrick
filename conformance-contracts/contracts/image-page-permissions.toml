@@ -27,5 +27,5 @@ claimed.
 
 [bindings]
 vm_free = "carrick-mem::memory::loader_tests::fresh_image_data_bss_and_stack_are_not_executable; carrick-mmu-core::aarch64::tests::alias_leaves_carry_exactly_the_named_access"
-embed = "carrick-conformance-next::probes_shard_0::generic_probe_shard_0"
+embed = "carrick-conformance-next::probes_shard_1::generic_probe_shard_1"
 docker = "probe:nxwritableimage"

@@ -301,18 +301,6 @@ const _: () = assert!(
 // stamps the read-only vvar.
 pub const LINUX_IDENTITY_PAGE_BASE: u64 = LINUX_EL1_MAINT_BASE + LINUX_EL1_MAINT_SIZE;
 pub const LINUX_IDENTITY_PAGE_SIZE: u64 = 0x4000;
-pub const LINUX_INFO_PAGE_BASE: u64 = 0x2c_ffff_0000;
-pub const INFO_PAGE_OFF_TPIDR_EL0: u64 = 0x00;
-pub const INFO_PAGE_OFF_PID: u64 = 0x08;
-pub const INFO_PAGE_OFF_TID: u64 = 0x0c;
-pub const INFO_PAGE_OFF_CTR_EL0: u64 = 0x10;
-pub const INFO_PAGE_OFF_DCZID_EL0: u64 = 0x18;
-pub const INFO_PAGE_OFF_RESERVED: u64 = 0x20;
-pub const INFO_PAGE_OFF_UID: u64 = 0x28;
-pub const INFO_PAGE_OFF_GID: u64 = 0x2c;
-pub const INFO_PAGE_OFF_EUID: u64 = 0x30;
-pub const INFO_PAGE_OFF_EGID: u64 = 0x34;
-pub const INFO_PAGE_OFF_PPID: u64 = 0x38;
 pub const LINUX_SYSCALL_MAILBOX_BASE: u64 = LINUX_IDENTITY_PAGE_BASE + LINUX_IDENTITY_PAGE_SIZE;
 pub const LINUX_SYSCALL_MAILBOX_ARENA_SIZE: u64 = 0x1_0000;
 pub const LINUX_SYSCALL_MAILBOX_SLOT_SIZE: u64 =
@@ -839,7 +827,6 @@ pub const LINUX_GIC_REDISTRIBUTOR_MAX: u64 = LINUX_GIC_WINDOW_SIZE - LINUX_GIC_D
 const GIC_WINDOW_NEIGHBOURS: &[(u64, u64)] = &[
     (LINUX_ROSETTA_IPA_BASE, LINUX_ROSETTA_WINDOW_SIZE),
     (LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE),
-    (LINUX_INFO_PAGE_BASE, 0x1_0000),
     (LINUX_KERNEL_REGION_BASE, LINUX_KERNEL_REGION_SIZE),
     (LINUX_EL1_KERNEL_BASE, LINUX_EL1_KERNEL_SIZE),
     (
@@ -902,15 +889,6 @@ const _: () = assert!(
         LINUX_KERNEL_REGION_SIZE,
     ),
     "EL1 kernel region overlaps kernel region (trampoline/vectors/page tables)",
-);
-const _: () = assert!(
-    ranges_do_not_overlap(
-        LINUX_EL1_KERNEL_BASE,
-        LINUX_EL1_KERNEL_SIZE,
-        LINUX_INFO_PAGE_BASE,
-        0x1_0000,
-    ),
-    "EL1 kernel region overlaps info page",
 );
 const _: () = assert!(
     ranges_do_not_overlap(
@@ -3537,12 +3515,10 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
         AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     mgr.set_multi_vcpu(true);
-    if let Err(error) = seal_heap_window(&mut mgr) {
+    if let Err(error) = seal_fresh_image_windows(&mut mgr) {
         carrick_fatal!(
             "mem::stage1_tables",
-            "failed to apply PROT_NONE to heap region at {:#x} (size {:#x}) in initial stage-1 page tables: {error:?}",
-            LINUX_HEAP_BASE,
-            LINUX_HEAP_SIZE
+            "failed to apply PROT_NONE to the carrier windows in initial stage-1 page tables: {error:?}"
         );
     }
     match mgr.into_bytes() {
@@ -3585,9 +3561,9 @@ fn protection_window(start: u64, len: u64) -> Option<(u64, usize)> {
 ///   image's segments, so the region permission alone would leave `.data`
 ///   and `.bss` executable).
 ///
-/// Windows with their own rule are left alone here: the heap window (sealed
-/// by [`seal_heap_window`]), the sparse mmap arena, Carrick's EL1-only
-/// ranges and the high-VA aliases. A failure is returned rather than
+/// Windows with their own rule are left alone here: the windows sealed by
+/// [`seal_fresh_image_windows`] (heap, shared aperture, private overlay),
+/// the sparse mmap arena, Carrick's EL1-only ranges and the high-VA aliases. A failure is returned rather than
 /// skipped: an image whose data would stay executable is not booted.
 pub fn apply_image_protections(
     mgr: &mut carrick_mmu_core::aarch64::PageTableManager,
@@ -3603,7 +3579,7 @@ pub fn apply_image_protections(
         }
     };
     for region in regions {
-        let own_rule = region.start == LINUX_HEAP_BASE
+        let own_rule = overlaps_fresh_image_sealed_window(region.start, region.end)
             || region.start == LINUX_MMAP_BASE
             || region.start >= LINUX_HIGH_VA_THRESHOLD
             || is_carrick_kernel_only_range(region.start, region.end);
@@ -3661,25 +3637,124 @@ pub fn apply_image_page_spans(
     Ok(())
 }
 
-/// Make the whole heap window `[LINUX_HEAP_BASE, +LINUX_HEAP_SIZE)` unmapped
-/// in a fresh image's stage-1 tables.
+/// Guest-virtual windows of the identity image that no fresh image owns.
 ///
-/// A new image has no program break above `heap_base`: Linux maps heap pages
-/// only as `brk` grows, so every access past the break faults. The leaves keep
-/// their output address as PROT_NONE so `brk` growth re-validates them in
-/// place. Every builder of a fresh image (boot, exec rebuild) seals the window
-/// after laying out its mappings; a remap of the heap's backing that is not
-/// followed by this seal hands the image a readable, writable and executable
-/// heap.
-pub fn seal_heap_window(
+/// Each is a fixed Carrick range whose identity output is backed by memory
+/// that belongs to someone other than the image being built, or to nobody
+/// yet:
+///
+/// - the heap window: a new image has no program break, and Linux maps heap
+///   pages only as `brk` grows;
+/// - the `MAP_SHARED` aperture: boot-mapped once for the whole carrier; a
+///   process may touch exactly the sub-ranges its own `mmap` published;
+/// - the private overlay aperture: frames reached only through another VA's
+///   repointed leaf, never through its own identity VA;
+/// - the dynamic alias and Rosetta IPA windows: carrier-wide backing that
+///   is reached through alias leaves, never through its identity VA.
+///
+/// Linux has nothing mapped at any of these addresses in a fresh process.
+pub const FRESH_IMAGE_SEALED_WINDOWS: [(u64, u64); 5] = [
+    (LINUX_HEAP_BASE, LINUX_HEAP_SIZE),
+    (LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE),
+    (LINUX_PRIVATE_OVERLAY_BASE, LINUX_PRIVATE_OVERLAY_SIZE),
+    (LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE),
+    (LINUX_ROSETTA_IPA_BASE, LINUX_ROSETTA_WINDOW_SIZE),
+];
+
+/// Whether `[start, end)` touches a [`FRESH_IMAGE_SEALED_WINDOWS`] window.
+pub fn overlaps_fresh_image_sealed_window(start: u64, end: u64) -> bool {
+    FRESH_IMAGE_SEALED_WINDOWS
+        .iter()
+        .any(|&(base, len)| start < base + len && base < end)
+}
+
+/// Make every [`FRESH_IMAGE_SEALED_WINDOWS`] window unmapped in a fresh
+/// image's stage-1 tables.
+///
+/// The leaves keep their output address as PROT_NONE, so the owner of a
+/// sub-range re-validates it in place: `brk` growth for the heap, the
+/// `mmap` protection publication for a shared-aperture allocation, and the
+/// overlay repoint reads the retained output as its frame's address. Every
+/// builder of a fresh image (boot, exec rebuild) seals the windows after
+/// laying out its mappings; a remap of their backing that is not followed by
+/// this seal hands the image memory it never mapped.
+pub fn seal_fresh_image_windows(
     mgr: &mut carrick_mmu_core::aarch64::PageTableManager,
 ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
-    const HEAP_LEN: usize = {
-        assert!(LINUX_HEAP_SIZE <= usize::MAX as u64);
-        LINUX_HEAP_SIZE as usize
-    };
-    mgr.set_prot_none(LINUX_HEAP_BASE, HEAP_LEN, None)
-        .map(|_| ())
+    for (base, len) in FRESH_IMAGE_SEALED_WINDOWS {
+        let len = usize::try_from(len)
+            .map_err(|_| carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
+        mgr.set_prot_none(base, len, None)?;
+    }
+    Ok(())
+}
+
+/// Make every EL0 address of a rebuilt image that none of its `owned`
+/// mappings covers unmapped.
+///
+/// The exec rebuild starts from identity tables whose user leaves translate
+/// every VA to the equal IPA. In a carrier those IPAs back another image (the
+/// carrier's first root, whose image, interpreter and stack are mapped at
+/// identity) or nothing; Linux has nothing mapped there in the new process.
+/// Carrick's EL1-only ranges and the in-kernel GIC window keep their own
+/// rule. The leaves keep their identity output as PROT_NONE; a later `mmap`
+/// installs its own backing over them.
+pub fn seal_unowned_user_space(
+    mgr: &mut carrick_mmu_core::aarch64::PageTableManager,
+    owned: &[(u64, u64)],
+) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+    let mut keep: Vec<(u64, u64)> = owned
+        .iter()
+        .copied()
+        .chain([
+            (
+                LINUX_KERNEL_REGION_BASE,
+                LINUX_KERNEL_REGION_BASE + LINUX_KERNEL_REGION_SIZE,
+            ),
+            (
+                LINUX_EL1_KERNEL_BASE,
+                LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE,
+            ),
+            (
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
+            ),
+            (
+                carrick_el1_abi::EL1_IPC_BASE,
+                carrick_el1_abi::EL1_IPC_BASE + carrick_el1_abi::EL1_IPC_SIZE,
+            ),
+            (
+                LINUX_GIC_WINDOW_BASE,
+                LINUX_GIC_WINDOW_BASE + LINUX_GIC_WINDOW_SIZE,
+            ),
+            (LINUX_HVPATCH_ROOT_SLOT_BASE, LINUX_HVPATCH_RESERVED_END),
+        ])
+        .filter(|(start, end)| start < end)
+        .collect();
+    keep.sort_unstable();
+    let mut cursor = LINUX_NULL_GUARD_END;
+    let mut seal =
+        |start: u64, end: u64| -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            if end <= start {
+                return Ok(());
+            }
+            let len = usize::try_from(end - start)
+                .map_err(|_| carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
+            mgr.set_prot_none(start, len, None).map(|_| ())
+        };
+    for (start, end) in keep {
+        let start = start & !0xfff;
+        let end = end.div_ceil(0x1000) * 0x1000;
+        if start > cursor {
+            seal(cursor, start.min(LINUX_HIGH_VA_THRESHOLD))?;
+        }
+        cursor = cursor.max(end);
+        if cursor >= LINUX_HIGH_VA_THRESHOLD {
+            return Ok(());
+        }
+    }
+    seal(cursor, LINUX_HIGH_VA_THRESHOLD)
 }
 
 /// Build the per-mm HVPatch stage-1 image.
@@ -6834,6 +6909,45 @@ mod loader_tests {
         );
     }
 
+    /// `kernel.mm.carrier-window-isolation` (VM-free): the identity image's
+    /// carrier-wide windows (the boot-mapped `MAP_SHARED` aperture, the
+    /// private overlay, the dynamic alias and Rosetta IPA windows, the heap)
+    /// are never EL0-accessible in a fresh image, even after the image
+    /// builder gives its regions their permissions; their leaves keep their
+    /// output for the owner of a sub-range to re-validate in place.
+    #[test]
+    fn fresh_image_carrier_windows_are_not_el0_accessible() {
+        use carrick_mmu_core::aarch64::{LeafAccess, terminal_descriptor_permits_el0};
+        let image = AddressSpace::load_elf_bytes(&text_and_data_elf())
+            .unwrap()
+            .with_hvpatch_stage1_page_tables()
+            .unwrap();
+        let pt_region = image
+            .regions()
+            .iter()
+            .find(|r| r.start == LINUX_PAGE_TABLES_BASE)
+            .expect("stage-1 page-table region");
+        let mgr = carrick_mmu_core::aarch64::PageTableManager::new(
+            pt_region.bytes().to_vec(),
+            LINUX_PAGE_TABLES_BASE,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        for (base, len) in FRESH_IMAGE_SEALED_WINDOWS {
+            for va in [base, base + len / 2, base + len - 0x1000] {
+                let leaf = carrick_mmu_core::aarch64::terminal_descriptor(mgr.debug_walk(va));
+                assert!(
+                    !terminal_descriptor_permits_el0(leaf, LeafAccess::Read),
+                    "window VA {va:#x} is EL0-accessible: {leaf:#x}"
+                );
+                assert_eq!(mgr.translate_retained_output(va), Some(va));
+            }
+        }
+        assert!(
+            mgr.translate(0x400000).is_some(),
+            "the image's own text stays mapped"
+        );
+    }
+
     #[test]
     fn linux_auxv_can_omit_sysinfo_ehdr_for_vdso_debug_control() {
         let plan = LoadPlan {
@@ -7218,8 +7332,28 @@ mod stage1_tests {
         // and the entry covering the heap, which is split into an L2 table.
         let kernel_l1_index = (LINUX_KERNEL_REGION_BASE >> 30) as usize;
         let heap_l1_index = (LINUX_HEAP_BASE >> 30) as usize;
+        let rosetta_ipa_l1_index = (LINUX_ROSETTA_IPA_BASE >> 30) as usize;
+        // A carrier window's 1 GiB blocks are sealed PROT_NONE: invalid, with
+        // their identity output retained (`seal_fresh_image_windows`).
+        let sealed_block = |va: u64| {
+            FRESH_IMAGE_SEALED_WINDOWS
+                .iter()
+                .any(|&(base, len)| va >= base && va + (1 << 30) <= base + len)
+        };
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x1000 + index * 8);
+            if index == rosetta_ipa_l1_index {
+                assert!(
+                    valid_table(d),
+                    "L1A[{index}] (Rosetta IPA window split) must be a table"
+                );
+                continue;
+            }
+            if sealed_block((index as u64) << 30) {
+                assert_eq!(d & 1, 0, "L1A[{index}] (sealed window) must be invalid");
+                assert_eq!(d & 0x0000_FFFF_C000_0000, (index as u64) << 30);
+                continue;
+            }
             if index == kernel_l1_index {
                 assert!(
                     valid_table(d),
@@ -7274,6 +7408,10 @@ mod stage1_tests {
         // L1B[0..511] all user 1 GiB blocks.
         for index in 0..512usize {
             let d = read_u64_le(&bytes, 0x2000 + index * 8);
+            if sealed_block(((index as u64) + 512) << 30) {
+                assert_eq!(d & 1, 0, "L1B[{index}] (sealed window) must be invalid");
+                continue;
+            }
             assert!(valid_block(d), "L1B[{}] must be a block", index);
             assert_eq!(ap(d), 0b01);
             assert_eq!(pxn(d), 1);
@@ -7396,7 +7534,6 @@ mod stage1_tests {
         for (name, va) in [
             ("user text", 0x0040_0000),
             ("mmap", LINUX_MMAP_BASE),
-            ("shared aperture", LINUX_SHARED_FILE_BASE),
             ("stack", LINUX_STACK_TOP - 0x4000),
             ("EL1 maintenance", LINUX_EL1_MAINT_BASE),
             ("identity control", LINUX_IDENTITY_PAGE_BASE),
@@ -7603,15 +7740,15 @@ mod stage1_tests {
     fn page_tables_reserve_spare_pool_within_kernel_block() {
         let bytes = stage1_identity_page_tables();
         assert_eq!(bytes.len() as u64, LINUX_PAGE_TABLES_SIZE);
-        // Nine boot tables (0..0x9000: six identity + two Rosetta alias + one heap L2);
-        // the rest is a spare pool of >=7 pages.
-        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0x9000) / 0x1000;
+        // Ten boot tables (0..0xA000: six identity + two Rosetta alias + the heap
+        // L2 + the Rosetta IPA window L2); the rest is a spare pool of >=7 pages.
+        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0xA000) / 0x1000;
         assert!(
             spare_pages >= 7,
             "need a spare-table pool, got {spare_pages}"
         );
         // Spare tail is zero-filled (invalid descriptors).
-        assert!(bytes[0x9000..].iter().all(|&b| b == 0));
+        assert!(bytes[0xA000..].iter().all(|&b| b == 0));
         // Whole table region stays inside the kernel hole's first 2 MiB block,
         // so it remains kernel-only (EL1) after the size bump.
         let region_end_off =
