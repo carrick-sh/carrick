@@ -12,13 +12,66 @@ pub trait HostReservationProvider: Send + Sync {
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal>;
 }
 
+/// How a host thread waits for a held reservation root: spin briefly, then
+/// yield, then park in short naps, for as long as the holder makes progress.
+/// The holder is guest EL1 on some vCPU slot (host venues of one MM queue on
+/// their host serial first): its critical section never blocks, and the run
+/// loop resumes it to completion while the slot's run sequence is odd
+/// ([`carrick_el1_abi::slot_run_sequence`]). There is no attempt or time
+/// limit, which load would turn into a verdict. The only failure is a proven
+/// contradiction: the root still names a slot whose run sequence is even and
+/// unchanged across a whole failed attempt, i.e. a vCPU that executed nothing
+/// while it held the root. That is fatal (the root can never be released),
+/// never a silent park of a thread holding the MM's `MemState`.
+#[derive(Default)]
+pub struct RootHostWait {
+    /// The EL1 slot and its (even) run sequence at the previous attempt.
+    idle_holder: std::cell::Cell<Option<(u32, u64)>>,
+}
+
+impl RootHostWait {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl carrick_el1::memory::reservations::RootWait for RootHostWait {
+    fn wait(&self, attempt: u32, holder: carrick_el1::memory::reservations::RootHolder) -> bool {
+        use carrick_el1::memory::reservations::RootHolder;
+        let idle = match holder {
+            RootHolder::El1Slot(slot) => {
+                let sequence = carrick_el1_abi::slot_run_sequence(slot as usize);
+                sequence.is_multiple_of(2).then_some((slot, sequence))
+            }
+            RootHolder::Host => None,
+        };
+        if let Some((slot, sequence)) = idle
+            && self.idle_holder.get() == Some((slot, sequence))
+        {
+            carrick_fatal::carrick_fatal!(
+                "dispatch::el1_reservations",
+                "reservation root held by EL1 slot {slot} while that slot's vCPU ran nothing (run sequence {sequence}): it left an EL1 critical section holding the root"
+            );
+        }
+        self.idle_holder.set(idle);
+        if attempt < 128 {
+            std::hint::spin_loop();
+        } else if attempt < 1024 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        true
+    }
+}
+
 pub trait PreparedHostReservations {
     /// The returned guard borrows this view, retaining the region and exact
     /// extent pins until the operation finishes. Resolve the exact MM's slot
     /// and use SharedReservations::lock_resolved, never a guest pointer cast.
-    /// The host waits out a held root (`HostLockWait`): its holder is EL1 on
-    /// some vCPU, whose critical section always completes, so `Busy` from
-    /// this lock is never an answer the host venue sees.
+    /// The host waits out a held root with [`RootHostWait`]: its holder is
+    /// EL1 on some vCPU, whose critical section always completes, so `Busy`
+    /// is never this lock's answer to a held root.
     fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal>;
 }
 

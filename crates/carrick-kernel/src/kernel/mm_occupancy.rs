@@ -817,6 +817,11 @@ impl ReservationLimits {
     }
 }
 
+/// Whether `mm` has a published address space in this carrier's zone.
+pub fn is_address_space_published(mm: MmId) -> bool {
+    crate::el1_zone::zone().is_some_and(|zone| zone.spaces.find(mm.raw()).is_some())
+}
+
 /// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, with initial
 /// `brk_current` and `mmap_next` layout anchors for guest EL1 to install and
 /// the publishing process's `limits` for its reservation root.
