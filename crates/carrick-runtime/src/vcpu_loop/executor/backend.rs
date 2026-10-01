@@ -1355,6 +1355,9 @@ fn publish_zone_slot(
         });
         let host_record = zone.slot(zone_slot).host_record();
         let queued = zone.slot(zone_slot).queued();
+        // The reset clears the slot's timer: a timed park another executor's
+        // thread left on it goes to the host first.
+        carrick_kernel::el1_zone::hand_back_foreign_timer(zone_slot);
         if !zone.reset_slot(zone_slot) {
             carrick_fatal!(
                 "vcpu_loop::el1_zone",

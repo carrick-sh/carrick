@@ -777,7 +777,7 @@ mod host_tests {
                 deadline,
             )
             .unwrap();
-        zone.arm_timer(SLOT, record, seq);
+        zone.arm_timer(SLOT, record, seq).unwrap();
         drop(guard);
         zone.clear_current(SLOT);
         record
@@ -858,6 +858,117 @@ mod host_tests {
             assert_eq!(zone.slot(SLOT).queued(), 1);
             assert_eq!(notify(&zone, 1).0.visited, 0);
         }
+    }
+
+    /// A timed object park of `tid` (not the slot's home record) holding
+    /// the slot's timer: a thread EL1 switched in on this vCPU.
+    fn park_foreign_until(zone: &ZoneTables, index: u32, tid: u64, deadline: u64) -> RecordId {
+        let record = allocate(zone, tid);
+        let seq = zone.next_seq(record);
+        zone.arm_timer(SLOT, record, seq).unwrap();
+        let guard = zone.object_wait(key(index), &SpinForever).unwrap();
+        guard
+            .park_until(
+                guard.snapshot(),
+                record,
+                OperationToken::new(tid, 1).unwrap(),
+                deadline,
+            )
+            .unwrap();
+        record
+    }
+
+    /// A slot's timer has exactly one owner, and whichever record owns it
+    /// is handed to the host at every way the slot's executor leaves EL1:
+    /// with its own thread running (a plain exit), with its own thread
+    /// parked untimed (the settle path, before `unhome`), and before the
+    /// `reset_slot` of a load. The home record's own deadline instead goes
+    /// through `unhome`; a woken or stale owner leaves nothing to hand back.
+    #[test]
+    fn el1_epoll_slot_timer_owner_is_handed_back_at_every_exit() {
+        // Plain exit, own thread running: the foreign owner is handed back.
+        let zone = fixture(true);
+        let foreign = park_foreign_until(&zone, 1, 300, 1_000);
+        let owner = zone.timer_owner(SLOT).unwrap();
+        assert_eq!(owner.record, foreign);
+        let taken = zone.take_foreign_timer(SLOT).unwrap();
+        assert_eq!(taken.record, zone.record_ref(foreign));
+        assert_eq!(taken.seq, owner.seq);
+        assert_eq!(zone.timer_owner(SLOT), None, "taken off the timer");
+        assert_eq!(zone.take_foreign_timer(SLOT), None, "exactly once");
+        assert_eq!(
+            zone.claim_for_host(
+                taken.record,
+                Some(taken.seq),
+                Handback::Control,
+                &SpinForever
+            ),
+            HostClaim::Claimed
+        );
+        assert_eq!(notify(&zone, 1).0.visited, 0, "the claim unlinked it");
+
+        // One owner: while it is live, no other park may take the timer;
+        // the home record's timed park is refused (it forwards) too.
+        let zone = fixture(true);
+        let foreign = park_foreign_until(&zone, 1, 301, 1_000);
+        let other = allocate(&zone, 302);
+        assert_eq!(
+            zone.arm_timer(SLOT, other, zone.next_seq(other)),
+            Err(TimerBusy)
+        );
+        assert!(!zone.timer_free(SLOT));
+        assert_eq!(zone.timer_owner(SLOT).unwrap().record, foreign);
+
+        // Settle path: the home record parked untimed, the foreign record
+        // owns the timer. The foreign park is handed back; `unhome` returns
+        // no deadline for the home record.
+        let home = zone
+            .current_or_new(
+                SLOT,
+                ThreadIdentity {
+                    tid: 77,
+                    serial: 77,
+                    mm: MM,
+                    file_table: 99,
+                    generation: 1,
+                    affinity: 0,
+                },
+            )
+            .unwrap();
+        let guard = zone.object_wait(key(2), &SpinForever).unwrap();
+        guard
+            .park(guard.snapshot(), home, OperationToken::new(77, 1).unwrap())
+            .unwrap();
+        drop(guard);
+        zone.clear_current(SLOT);
+        let taken = zone.take_foreign_timer(SLOT).unwrap();
+        assert_eq!(taken.record, zone.record_ref(foreign));
+        assert_eq!(zone.unhome(SLOT, home, 0), None);
+
+        // The home record's own timed park is not foreign: `unhome` keeps it.
+        let zone = fixture(true);
+        let home = park_home_until(&zone, 1, 2_000);
+        assert_eq!(zone.take_foreign_timer(SLOT), None);
+        let seq = zone.timer_owner(SLOT).unwrap().seq;
+        assert_eq!(zone.unhome(SLOT, home, 0), Some((seq, 2_000)));
+
+        // Load path: hand back before the reset clears the timer.
+        let zone = fixture(true);
+        let foreign = park_foreign_until(&zone, 1, 303, 1_000);
+        assert_eq!(
+            zone.take_foreign_timer(SLOT).map(|t| t.record),
+            Some(zone.record_ref(foreign))
+        );
+        assert!(zone.reset_slot(SLOT));
+        assert_eq!(zone.timer_owner(SLOT), None);
+
+        // A woken owner (a notification won it) is not live: nothing to
+        // hand back, and the timer is free again.
+        let zone = fixture(true);
+        let _ = park_foreign_until(&zone, 1, 304, 1_000);
+        assert_eq!(notify(&zone, 1).0.queued, 1);
+        assert_eq!(zone.take_foreign_timer(SLOT), None);
+        assert!(zone.timer_free(SLOT));
     }
 
     #[test]

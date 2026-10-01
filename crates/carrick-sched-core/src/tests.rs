@@ -626,7 +626,7 @@ fn el1_park(zone: &ZoneTables, slot: SlotId, tid: u64, uaddr: u64, deadline: u64
         .unwrap();
     zone.set_deadline(record, deadline);
     if deadline != 0 {
-        zone.arm_timer(slot, record, seq);
+        zone.arm_timer(slot, record, seq).unwrap();
     }
     zone.publish_park(record, seq);
     drop(guard);
@@ -2052,7 +2052,7 @@ fn host_request_wins_against_enrolled_guest_park() {
         zone.enqueue(&guard, record, seq, MM, 0x2000, u32::MAX, 0)
             .unwrap();
         zone.set_deadline(record, 100);
-        zone.arm_timer(SLOT, record, seq);
+        zone.arm_timer(SLOT, record, seq).unwrap();
         assert_eq!(
             zone.claim_for_host(original, None, kind, &HostWait),
             HostClaim::El1Held { slot: SLOT }

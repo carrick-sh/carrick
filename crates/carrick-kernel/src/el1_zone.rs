@@ -181,6 +181,23 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
     outcome
 }
 
+/// The executor of `slot` is leaving EL1: a timed park of another
+/// executor's thread on this slot's timer would go unserved until the vCPU
+/// returns. Claim it for the host (a control handback): its thread re-runs
+/// the call with what is left of its deadline. A wake that won the record
+/// first leaves nothing to claim.
+pub fn hand_back_foreign_timer(slot: SlotId) {
+    let Some(zone) = zone() else {
+        return;
+    };
+    let Some(foreign) = zone.take_foreign_timer(slot) else {
+        return;
+    };
+    if let HostClaim::Claimed = claim(foreign.record, Some(foreign.seq), Handback::Control) {
+        hand_back(&[foreign.record]);
+    }
+}
+
 /// Whether the host owns `record` (a wake, a signal, a timeout or a
 /// handback claimed it), so its thread may run.
 pub fn is_host_owned(record: RecordRef) -> bool {
