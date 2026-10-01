@@ -9,9 +9,8 @@
 //!
 //! - a non-NULL sigmask (the host swaps the mask around its wait);
 //! - host-half items (only the host harvests both halves);
-//! - a finite timeout with nothing ready when the caller is not the
-//!   thread its executor loaded (only that thread's home record has a
-//!   timer the host takes over when it settles the slot);
+//! - a finite timeout with nothing ready while another thread's timed
+//!   park holds the slot's timer (a slot's timer has one owner);
 //! - a buffer the reports cannot be copied to (the harvested items are put
 //!   back first, so the host's harvest reports them again).
 //!
@@ -251,8 +250,8 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             Wait::Forever => None,
             Wait::Until(_) if !sched.may_time_park() => {
-                // No timer EL1 may arm for this thread: the host waits with
-                // the deadline (nothing was taken).
+                // Another timed park owns the slot's timer: the host waits
+                // with the deadline (nothing was taken).
                 release_pin(sched, OfdPin::from_raw(op.pin), region);
                 return leave(sched, IpcLeave::EpollTimedWait, IpcServed::Forward);
             }

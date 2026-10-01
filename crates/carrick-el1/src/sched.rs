@@ -201,9 +201,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let record = zone
             .current_or_new(slot, identity_of(self.task, affinity))
             .ok()?;
-        if deadline.is_some() && zone.slot(slot).host_record() != Some(record) {
-            // Unreachable (checked above); never time a record the host
-            // cannot take over.
+        if deadline.is_some()
+            && (zone.slot(slot).host_record() != Some(record) || !zone.timer_free(slot))
+        {
+            // Never time a record the host cannot take over, nor take the
+            // timer from another live timed park (a slot has one owner).
             if fresh {
                 zone.discard_unpublished(slot, record);
             }
@@ -215,6 +217,15 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.cpu
             .save(frame, unsafe { zone.record(record).ctx_mut() });
         let seq = zone.next_seq(record);
+        // The timer is free (checked above) and only this vCPU arms it; an
+        // owner whose park is never published is dropped as stale.
+        if deadline.is_some() && zone.arm_timer(slot, record, seq).is_err() {
+            drop(guard);
+            if fresh {
+                zone.discard_unpublished(slot, record);
+            }
+            return None;
+        }
         if zone
             .enqueue(&guard, record, seq, mm, uaddr, bitset, 0)
             .is_err()
@@ -226,9 +237,6 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return None;
         }
         zone.set_deadline(record, deadline.unwrap_or(0));
-        if deadline.is_some() {
-            zone.arm_timer(slot, record, seq);
-        }
         if !zone.publish_guest_park(&guard, slot, record, seq) {
             drop(guard);
             if fresh {

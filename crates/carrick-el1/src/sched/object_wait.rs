@@ -50,16 +50,14 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             .snapshot())
     }
 
-    /// Whether a park of the running thread may carry a deadline: only the
-    /// thread the host loaded on this slot parks into its home record, the
-    /// one record whose timer the host takes over when it settles the slot
-    /// ([`carrick_sched_core::ZoneTables::unhome`]).
+    /// Whether a park of the running thread may carry a deadline: the
+    /// slot's timer has no other live owner. The home record's deadline goes
+    /// to the host when its executor settles it (`unhome`); any other
+    /// record's is taken off the timer at every exit of the slot's executor
+    /// (`take_foreign_timer`) and its thread re-runs the call on the host
+    /// with the time left.
     pub fn may_time_park(&self) -> bool {
-        let s = self.zone.slot(self.slot);
-        match s.current() {
-            None => true,
-            Some(current) => s.host_record() == Some(current),
-        }
+        self.zone.timer_free(self.slot)
     }
 
     /// Whether the switched-in record's last object park ended at its
@@ -104,19 +102,23 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         let ctx = unsafe { zone.record(record).ctx_mut() };
         self.cpu.save(frame, ctx);
         ctx.pc = resume.0;
-        // The park's sequence (the one `park_until` publishes).
+        // The park's sequence (the one `park_until` publishes). The timer is
+        // armed first: until the park is published its owner is not live
+        // (a refused park leaves a stale owner `timer_owner` drops).
         let seq = zone.next_seq(record);
+        if deadline.is_some() && zone.arm_timer(self.slot, record, seq).is_err() {
+            drop(guard);
+            if fresh {
+                zone.discard_unpublished(self.slot, record);
+            }
+            return Err((ObjectWaitError::Occupied, operation));
+        }
         if let Err(error) = guard.park_until(snapshot, record, operation, deadline.unwrap_or(0)) {
             drop(guard);
             if fresh {
                 zone.discard_unpublished(self.slot, record);
             }
             return Err(error);
-        }
-        if deadline.is_some() {
-            // A notification that claimed it already leaves a stale timer,
-            // which `timer_deadline` drops.
-            zone.arm_timer(self.slot, record, seq);
         }
         drop(guard);
         zone.clear_current(self.slot);

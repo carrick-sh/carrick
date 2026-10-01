@@ -232,6 +232,9 @@ where
         };
         zone.sweep_cancelled(slot);
         carrick_kernel::el1_zone::hand_back_wanted(slot);
+        // Every exit: nothing serves this slot's timer until the vCPU
+        // returns, so another thread's timed park on it goes to the host.
+        carrick_kernel::el1_zone::hand_back_foreign_timer(slot);
         let s = zone.slot(slot);
         let (mut current, own) = (s.current(), s.host_record());
         let mut requeued = false;

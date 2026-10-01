@@ -691,6 +691,30 @@ pub struct ZoneBucket {
     len: AtomicU32,
 }
 
+/// The one record a slot's virtual timer serves, with the sequence of the
+/// park it bounds. Each slot holds at most one ([`ZoneTables::arm_timer`]
+/// refuses a second live owner).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimerOwner {
+    pub record: RecordId,
+    pub seq: u32,
+}
+
+/// [`ZoneTables::arm_timer`]: another record's timed park holds the timer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimerBusy;
+
+/// A timed park of a record other than the slot's home record, taken off
+/// the slot's timer as its executor left EL1. Nothing serves that deadline
+/// any longer: the host claims the record (a control handback; its thread
+/// re-runs the call with what is left of its deadline).
+#[must_use = "a foreign timed park taken off its slot must be claimed by the host"]
+#[derive(Debug, Eq, PartialEq)]
+pub struct ForeignTimer {
+    pub record: RecordRef,
+    pub seq: u32,
+}
+
 /// Per-vCPU-slot scheduler state. The slot's own vCPU (EL1, while it runs)
 /// and its executor (while the vCPU is stopped) own it in turn; other vCPUs
 /// may only queue a woken thread on it, under `lock`, while it is in the
@@ -2583,12 +2607,53 @@ impl ZoneTables {
         moved
     }
 
-    /// EL1: `record` (a home record of `slot`, parked under `seq`) has a
-    /// deadline this slot's virtual timer serves.
-    pub fn arm_timer(&self, slot: SlotId, record: RecordId, seq: u32) {
+    /// The live owner of `slot`'s timer: the record whose timed park (under
+    /// the recorded sequence) is still in force. A stale owner is dropped.
+    pub fn timer_owner(&self, slot: SlotId) -> Option<TimerOwner> {
+        self.timer_deadline(slot)?;
+        let (record, seq) = self.slot(slot).timer()?;
+        Some(TimerOwner { record, seq })
+    }
+
+    /// EL1: `record`'s park (under `seq`) has a deadline this slot's virtual
+    /// timer serves. A slot's timer has exactly one owner: arming never
+    /// displaces another record's live timed park (`TimerBusy`; the caller
+    /// forwards instead). Arm before publishing the park: until then the
+    /// owner is not live and the next check drops it.
+    pub fn arm_timer(&self, slot: SlotId, record: RecordId, seq: u32) -> Result<(), TimerBusy> {
+        if self
+            .timer_owner(slot)
+            .is_some_and(|owner| owner.record != record)
+        {
+            return Err(TimerBusy);
+        }
         let s = self.slot(slot);
         s.timer_seq.store(seq, Ordering::Release);
         s.timer_record.store(record.raw(), Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether a park on `slot` may take its timer now (no live owner).
+    pub fn timer_free(&self, slot: SlotId) -> bool {
+        self.timer_owner(slot).is_none()
+    }
+
+    /// The executor of `slot` is leaving EL1 (any exit), so nothing serves
+    /// its timer until the vCPU returns: take a live timed park of a record
+    /// that is not the slot's home record off the timer. The host must
+    /// claim it ([`ForeignTimer`]); the home record's deadline goes to the
+    /// host through [`Self::unhome`] when its thread is settled.
+    pub fn take_foreign_timer(&self, slot: SlotId) -> Option<ForeignTimer> {
+        let owner = self.timer_owner(slot)?;
+        let s = self.slot(slot);
+        if s.host_record() == Some(owner.record) {
+            return None;
+        }
+        s.timer_record.store(NIL, Ordering::Release);
+        Some(ForeignTimer {
+            record: self.record_ref(owner.record),
+            seq: owner.seq,
+        })
     }
 
     /// The deadline `slot`'s timer must fire at for its timed park, if the
@@ -2884,6 +2949,7 @@ impl ZoneTables {
             Some((timed, seq)) if timed == record => rec.deadline().map(|deadline| (seq, deadline)),
             _ => None,
         };
+        // A foreign owner was taken off by `take_foreign_timer` at this exit.
         s.timer_record.store(NIL, Ordering::Release);
         s.host_record.store(NIL, Ordering::Release);
         rec.home.store(0, Ordering::Release);

@@ -1431,6 +1431,46 @@ mod tests {
         assert_eq!(leaves(&w, IpcLeave::EpollTimedWait), 0);
     }
 
+    /// A thread EL1 switched in on this vCPU (not its loaded thread) may own
+    /// the slot's timer too: its finite wait parks in the guest and expires
+    /// there, with no host call. (Its deadline goes to the host only if the
+    /// executor leaves EL1 first: `take_foreign_timer`.)
+    #[test]
+    fn el1_epoll_zone_switched_in_thread_times_its_wait_in_guest() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 0, EventMode::Counter, NONBLOCK);
+        let (ep, _) = zone_epoll(&w, a, e, 5);
+        let (r, _wfd, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.map(OTHER_MM, va, PAGE);
+        let b_wait = epoll_pwait(ep, va, 4, 5, B_SVC);
+        w.queue(202, OTHER_MM, &b_wait, B_SVC);
+        // A (the loaded thread) blocks untimed; B runs.
+        let mut f = syscall(SYS_READ, r, va, 16, A_SVC);
+        assert_eq!(w.call(&mut f), SWITCHED, "A parks, B runs");
+        assert_eq!(f.elr, B_SVC);
+        f = b_wait;
+        let start = w.cpu.now;
+        assert_eq!(
+            w.call(&mut f),
+            SWITCHED,
+            "B parks timed; its timer switches it back in"
+        );
+        assert!(
+            w.cpu.now >= start + 5 * w.cpu.freq / 1000,
+            "not before the timeout"
+        );
+        assert_eq!(f.x, b_wait.x);
+        reenter(&mut f, B_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 0));
+        assert_eq!(w.zone.counters.el1_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(leaves(&w, IpcLeave::EpollTimedWait), 0);
+        assert_eq!(host_calls(&w), 0, "no host exit");
+    }
+
     /// A finite-timeout wait woken before its deadline reports the event in
     /// the guest; the stale timer never fires a second claim.
     #[test]
