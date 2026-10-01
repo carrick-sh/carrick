@@ -1341,10 +1341,17 @@ fn publish_zone_slot(
     if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot) {
         drive_zone_slot(zone_slot, driver);
         // What the slot still holds, for the fatal below: the record EL1
-        // left switched in, its claim and identity, and the slot's queue.
+        // left switched in, its claim, identity, pending object operation and
+        // handback, and the slot's queue.
         let held = zone.slot(zone_slot).current().map(|record| {
             let rec = zone.record(record);
-            (record, rec.claim(), rec.identity())
+            (
+                record,
+                rec.claim(),
+                rec.identity(),
+                rec.has_object_operation(),
+                rec.handback(),
+            )
         });
         let host_record = zone.slot(zone_slot).host_record();
         let queued = zone.slot(zone_slot).queued();

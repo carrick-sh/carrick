@@ -619,7 +619,10 @@ mod host_tests {
                     unsafe { rec.take_object_operation() }.unwrap().index(),
                     rec.identity().tid
                 );
-                zone.release_current(SLOT, switched.record);
+                assert_eq!(
+                    zone.release_current(SLOT, switched.record, &SpinForever),
+                    crate::CurrentRelease::Released
+                );
             }
             assert_eq!(notify(&zone, 1).0.visited, 0);
         }

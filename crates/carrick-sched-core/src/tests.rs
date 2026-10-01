@@ -2329,7 +2329,10 @@ mod ipc_wait {
                 let rec = zone.record(switched.record);
                 // SAFETY: this slot owns this OnCpu record.
                 assert!(unsafe { rec.take_object_operation() }.is_some());
-                zone.release_current(SLOT, switched.record);
+                assert_eq!(
+                    zone.release_current(SLOT, switched.record, &HostWait),
+                    CurrentRelease::Released
+                );
             }
             assert_eq!(notify(&zone, affected).0.visited, 0);
         }
@@ -2431,6 +2434,55 @@ mod ipc_wait {
         zone.free_record(record);
         assert_eq!(zone.record(record).claim(), Claim::Free);
     }
+
+    /// The loaded thread parks its pending object operation in EL1 (its
+    /// home record), the object becomes ready and EL1 switches the thread
+    /// back in at its SVC; the vCPU then leaves for the host before that SVC
+    /// re-executes (host work was pending after the switch, so EL1 left with
+    /// `ServedWithWork`; or a kick stopped it at EL0). The host boundary must
+    /// leave nothing switched in on the slot, so the thread can be loaded on
+    /// it again, and must keep the operation, which never resumed: the record
+    /// goes back to the head of the run queue for the host to settle.
+    #[test]
+    fn a_host_boundary_requeues_the_own_record_switched_in_at_its_operation() {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let key = key(5, 1);
+        zone.bind_object_wait(key, &HostWait).unwrap();
+        let record = zone.current_or_new(SLOT, identity(23)).unwrap();
+        {
+            let guard = zone.object_wait(key, &HostWait).unwrap();
+            // SAFETY: the slot's new home record, not yet published.
+            unsafe { zone.record(record).ctx_mut().pc = 0x8000 };
+            guard.park(guard.snapshot(), record, token(23)).unwrap();
+        }
+        zone.clear_current(SLOT);
+        assert_eq!(notify(&zone, key).0.queued, 1);
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert!(switched.home);
+        zone.leave_guest(SLOT, &HostWait);
+        assert_eq!(zone.slot(SLOT).current(), Some(record));
+        assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+        assert_eq!(
+            zone.release_current(SLOT, record, &HostWait),
+            CurrentRelease::Requeued,
+            "an operation EL1 never re-entered must not be retired"
+        );
+        assert_eq!(zone.slot(SLOT).current(), None);
+        assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+        assert_eq!(zone.slot(SLOT).queued(), 1);
+        assert!(matches!(zone.record(record).claim(), Claim::Queued { slot, .. } if slot == SLOT));
+        assert!(zone.record(record).has_object_operation());
+        // SAFETY: the record is untouched since the switch-in restored it.
+        assert_eq!(unsafe { zone.record(record).ctx_mut().pc }, 0x8000);
+        assert!(
+            zone.reset_slot(SLOT),
+            "the slot still held the switched-in record after the host boundary"
+        );
+    }
+
     #[test]
     fn cancelled_current_object_retains_cleanup_authority_through_host_transfer() {
         let zone = zone();
