@@ -434,6 +434,8 @@ pub struct SignalReadinessProbe {
     pub(crate) kernel: Weak<Kernel>,
     pub(crate) host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     pub(crate) task_ref: Weak<Task>,
+    observed_stop_epoch: crate::kernel::objects::JobControlWaitStopEpoch,
+    interrupts_on_group_stop: bool,
     pub(crate) observed_task_wake: u64,
     pub(crate) observed_task_event: u64,
     pub(crate) task: TaskKey,
@@ -468,6 +470,8 @@ impl SignalReadinessProbe {
             kernel: state.authority.kernel.clone(),
             host_signal: Arc::clone(&state.authority.host_signal),
             task_ref: state.authority.task_ref.clone(),
+            observed_stop_epoch: state.authority.task_stop_epoch,
+            interrupts_on_group_stop: continuation.interrupts_on_group_stop(),
             observed_task_wake,
             observed_task_event: state.authority.task_event_generation,
             task: state.authority.task,
@@ -505,6 +509,12 @@ impl SignalReadinessProbe {
         let context = kernel.context(self.task.id, self.thread.tid).ok()?;
         if context.task().key() != self.task || context.thread().key() != self.thread {
             return None;
+        }
+        if self.interrupts_on_group_stop
+            && context.task().wait_stop_epoch() != self.observed_stop_epoch
+            && !context.task().is_job_control_stopped()
+        {
+            return Some(ContinuationEvent::Signal);
         }
         let authority = context.signal_authority();
         let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());

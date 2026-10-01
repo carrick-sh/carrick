@@ -308,8 +308,13 @@ enum DefaultStopGeneration {
 
 use crate::kernel::StopKind;
 
+/// Identity of the most recent real group-stop transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobControlWaitStopEpoch(u64);
+
 #[derive(Debug, Default)]
 struct TaskJobControl {
+    wait_stop_epoch: u64,
     stopped_by: Option<LinuxSignal>,
     pending_stop: Option<(LinuxSignal, StopKind)>,
     stopped_by_ptrace: bool,
@@ -1441,6 +1446,10 @@ impl Task {
         self.process_credentials.store(credentials);
     }
 
+    pub(in crate::kernel) fn wait_stop_epoch(&self) -> JobControlWaitStopEpoch {
+        JobControlWaitStopEpoch(self.job_control.lock().wait_stop_epoch)
+    }
+
     pub fn is_job_control_stopped(&self) -> bool {
         self.job_control.lock().stopped_by.is_some()
     }
@@ -1819,6 +1828,10 @@ impl Task {
             return true;
         }
         state.stopped_by = Some(signal);
+        state.wait_stop_epoch = state
+            .wait_stop_epoch
+            .checked_add(1)
+            .unwrap_or_else(|| carrick_fatal!("kernel::job_control", "group-stop epoch exhausted"));
         state.pending_stop = Some((signal, StopKind::JobControl));
         state.stopped_by_ptrace = false;
         clear_ptrace_transient_state(&mut state);

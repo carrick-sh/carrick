@@ -109,6 +109,7 @@ pub struct ContinuationCapture {
     thread: ThreadKey,
     task: TaskKey,
     task_revision: TaskRevision,
+    task_stop_epoch: crate::kernel::objects::JobControlWaitStopEpoch,
     task_wake_generation: u64,
     task_event_generation: u64,
     mm: MmId,
@@ -148,6 +149,7 @@ impl ContinuationCapture {
             thread: context.thread().key(),
             task: context.task().key(),
             task_revision: context.revision(),
+            task_stop_epoch: context.task().wait_stop_epoch(),
             task_wake_generation: context.task().wake_generation(),
             task_event_generation: context.task().task_event_generation(),
             mm,
@@ -189,6 +191,7 @@ impl ContinuationCapture {
             thread: context.thread().key(),
             task: context.task().key(),
             task_revision: context.revision(),
+            task_stop_epoch: context.task().wait_stop_epoch(),
             task_wake_generation: context.task().wake_generation(),
             task_event_generation: context.task().task_event_generation(),
             mm,
@@ -213,6 +216,7 @@ pub struct ContinuationAuthority {
     pub(crate) thread: ThreadKey,
     pub(crate) task: TaskKey,
     pub(crate) task_revision: TaskRevision,
+    pub(crate) task_stop_epoch: crate::kernel::objects::JobControlWaitStopEpoch,
     pub(crate) task_wake_generation: u64,
     pub(crate) task_event_generation: u64,
     pub(crate) execution: ExecutionGeneration,
@@ -232,6 +236,7 @@ impl ContinuationAuthority {
             thread: capture.thread,
             task: capture.task,
             task_revision: capture.task_revision,
+            task_stop_epoch: capture.task_stop_epoch,
             task_wake_generation: capture.task_wake_generation,
             task_event_generation: capture.task_event_generation,
             execution: capture.execution,
@@ -1668,6 +1673,38 @@ impl BlockedContinuation {
         self.state().signal_masks
     }
 
+    /// Linux signal(7), stop-signal interruption: current Linux preserves
+    /// pipe, futex, poll/select, and sleep waits across a group stop.
+    fn interrupts_on_group_stop(&self) -> bool {
+        use carrick_abi::syscall::nr;
+        let nr = self.authority().syscall.request().number;
+        if matches!(nr, value if value == nr::EPOLL_PWAIT
+            || value == nr::EPOLL_PWAIT2
+            || value == nr::RT_SIGTIMEDWAIT
+            || value == nr::SEMOP
+            || value == nr::SEMTIMEDOP)
+        {
+            return true;
+        }
+        let timed_socket = matches!(nr, value if value == nr::ACCEPT
+            || value == nr::ACCEPT4 || value == nr::CONNECT
+            || value == nr::RECVFROM || value == nr::RECVMSG
+            || value == nr::RECVMMSG || value == nr::SENDTO
+            || value == nr::SENDMSG);
+        // Socket blocking_io carries only SO_RCVTIMEO/SO_SNDTIMEO here.
+        // Reactor deadlines can also come from unrelated timerfd producers;
+        // they are not evidence of a socket timeout.
+        timed_socket
+            && matches!(&self.state().detail, ContinuationDetail::Fds {
+                caller_deadline: Some(_), on_timeout, ..
+            } if *on_timeout == LINUX_EAGAIN.guest_retval())
+    }
+
+    fn interrupted_by_group_stop(&self, task: &Task) -> bool {
+        self.interrupts_on_group_stop()
+            && self.authority().task_stop_epoch != task.wait_stop_epoch()
+    }
+
     pub fn is_waiting_for_signal(&self, signal: crate::kernel::LinuxSignal) -> bool {
         match &self.state().detail {
             ContinuationDetail::Signals { wait_set, .. } => wait_set.contains(signal.raw()),
@@ -2035,67 +2072,171 @@ impl BlockedContinuation {
         let family = self.family();
         let restart_class = self.authority().restart_class();
         let producer_completion = self.state().producer_completion.lock().take();
-        let outcome = match event {
-            ContinuationEvent::Ready => match producer_completion {
-                Some(
-                    outcome @ (DispatchOutcome::Returned { .. } | DispatchOutcome::Errno { .. }),
-                ) if family == ContinuationFamily::BlockingWrite => {
-                    let write = match &self.state().detail {
-                        ContinuationDetail::BlockingWrite(write) => write.lock().clone(),
-                        _ => unreachable!("blocking-write family without write state"),
-                    };
-                    ContinuationCompletion::BlockingWrite {
-                        write,
-                        outcome: match outcome {
-                            DispatchOutcome::Returned { value } => {
-                                BlockingWriteOutcome::Return(value)
-                            }
-                            DispatchOutcome::Errno { errno } => BlockingWriteOutcome::Errno(errno),
-                            _ => unreachable!(),
-                        },
-                    }
-                }
-                Some(DispatchOutcome::Returned { value }) => ContinuationCompletion::Return(value),
-                Some(DispatchOutcome::Errno { errno }) => ContinuationCompletion::Errno(errno),
-                Some(_) => ContinuationCompletion::Redispatch,
-                None => match family {
-                    // How a zone wait ended is the record's handback, which the
-                    // runtime applies; `Return(0)` only names "woken".
-                    ContinuationFamily::ZoneFutexWait => ContinuationCompletion::Return(0),
-                    ContinuationFamily::FutexWait => ContinuationCompletion::Return(0),
-                    ContinuationFamily::FutexWaitv => {
-                        let index = match &self.state().detail {
-                            ContinuationDetail::Futex { index, .. }
-                            | ContinuationDetail::SharedFutex { index, .. } => index.unwrap_or(0),
-                            _ => 0,
-                        };
-                        ContinuationCompletion::Return(index)
-                    }
-                    ContinuationFamily::SharedFutexWait => ContinuationCompletion::Return(0),
-                    ContinuationFamily::SharedFutexWaitv => {
-                        let index = match &self.state().detail {
-                            ContinuationDetail::SharedFutex { index, .. } => index.unwrap_or(0),
-                            _ => 0,
-                        };
-                        ContinuationCompletion::Return(index)
-                    }
-                    ContinuationFamily::BlockingWrite => {
+        let outcome = if self.interrupted_by_group_stop(context.task()) {
+            ContinuationCompletion::Errno(LINUX_EINTR)
+        } else {
+            match event {
+                ContinuationEvent::Ready => match producer_completion {
+                    Some(
+                        outcome
+                        @ (DispatchOutcome::Returned { .. } | DispatchOutcome::Errno { .. }),
+                    ) if family == ContinuationFamily::BlockingWrite => {
                         let write = match &self.state().detail {
                             ContinuationDetail::BlockingWrite(write) => write.lock().clone(),
-                            _ => return Err(ContinuationResumeError::MissingContinuation),
+                            _ => unreachable!("blocking-write family without write state"),
                         };
                         ContinuationCompletion::BlockingWrite {
                             write,
-                            outcome: BlockingWriteOutcome::Resume,
+                            outcome: match outcome {
+                                DispatchOutcome::Returned { value } => {
+                                    BlockingWriteOutcome::Return(value)
+                                }
+                                DispatchOutcome::Errno { errno } => {
+                                    BlockingWriteOutcome::Errno(errno)
+                                }
+                                _ => unreachable!(),
+                            },
                         }
                     }
-                    ContinuationFamily::BlockingOpen => {
-                        let open = match &self.state().detail {
-                            ContinuationDetail::BlockingOpen(open) => open.lock().take(),
-                            _ => None,
+                    Some(DispatchOutcome::Returned { value }) => {
+                        ContinuationCompletion::Return(value)
+                    }
+                    Some(DispatchOutcome::Errno { errno }) => ContinuationCompletion::Errno(errno),
+                    Some(_) => ContinuationCompletion::Redispatch,
+                    None => match family {
+                        // How a zone wait ended is the record's handback, which the
+                        // runtime applies; `Return(0)` only names "woken".
+                        ContinuationFamily::ZoneFutexWait => ContinuationCompletion::Return(0),
+                        ContinuationFamily::FutexWait => ContinuationCompletion::Return(0),
+                        ContinuationFamily::FutexWaitv => {
+                            let index = match &self.state().detail {
+                                ContinuationDetail::Futex { index, .. }
+                                | ContinuationDetail::SharedFutex { index, .. } => {
+                                    index.unwrap_or(0)
+                                }
+                                _ => 0,
+                            };
+                            ContinuationCompletion::Return(index)
                         }
-                        .ok_or(ContinuationResumeError::MissingContinuation)?;
-                        ContinuationCompletion::BlockingOpen(open)
+                        ContinuationFamily::SharedFutexWait => ContinuationCompletion::Return(0),
+                        ContinuationFamily::SharedFutexWaitv => {
+                            let index = match &self.state().detail {
+                                ContinuationDetail::SharedFutex { index, .. } => index.unwrap_or(0),
+                                _ => 0,
+                            };
+                            ContinuationCompletion::Return(index)
+                        }
+                        ContinuationFamily::BlockingWrite => {
+                            let write = match &self.state().detail {
+                                ContinuationDetail::BlockingWrite(write) => write.lock().clone(),
+                                _ => return Err(ContinuationResumeError::MissingContinuation),
+                            };
+                            ContinuationCompletion::BlockingWrite {
+                                write,
+                                outcome: BlockingWriteOutcome::Resume,
+                            }
+                        }
+                        ContinuationFamily::BlockingOpen => {
+                            let open = match &self.state().detail {
+                                ContinuationDetail::BlockingOpen(open) => open.lock().take(),
+                                _ => None,
+                            }
+                            .ok_or(ContinuationResumeError::MissingContinuation)?;
+                            ContinuationCompletion::BlockingOpen(open)
+                        }
+                        ContinuationFamily::TimerFdRead => {
+                            let read = match &self.state().detail {
+                                ContinuationDetail::TimerFdRead(read) => read.lock().take(),
+                                _ => None,
+                            }
+                            .ok_or(ContinuationResumeError::MissingContinuation)?;
+                            ContinuationCompletion::TimerFdRead(read)
+                        }
+                        ContinuationFamily::Semop => {
+                            let semop = match &self.state().detail {
+                                ContinuationDetail::Semop(semop) => semop.lock().take(),
+                                _ => None,
+                            }
+                            .ok_or(ContinuationResumeError::MissingContinuation)?;
+                            ContinuationCompletion::Semop(semop)
+                        }
+                        ContinuationFamily::Mqueue => {
+                            let mqueue = match &self.state().detail {
+                                ContinuationDetail::Mqueue(mqueue) => mqueue.lock().take(),
+                                _ => None,
+                            }
+                            .ok_or(ContinuationResumeError::MissingContinuation)?;
+                            ContinuationCompletion::Mqueue(mqueue)
+                        }
+                        ContinuationFamily::FdWait => {
+                            let wait = match &self.state().detail {
+                                ContinuationDetail::FdWait(wait) => wait.lock().take(),
+                                _ => None,
+                            }
+                            .ok_or(ContinuationResumeError::MissingContinuation)?;
+                            ContinuationCompletion::FdWait {
+                                wait,
+                                sig_mask: signal_masks.temporary.unwrap_or(WaitSigMask::NONE),
+                            }
+                        }
+                        ContinuationFamily::VforkParent => {
+                            match self
+                                .vfork_child()
+                                .and_then(|key| self.authority().namespace_task_id(key))
+                            {
+                                Some(child) => ContinuationCompletion::Return(child),
+                                None => ContinuationCompletion::Errno(carrick_abi::LINUX_ESRCH),
+                            }
+                        }
+                        ContinuationFamily::WaitOnSharedWord => match &self.state().detail {
+                            ContinuationDetail::SharedWord {
+                                sysv: Some(sysv), ..
+                            } => sysv.completion_after_wake().map_or(
+                                ContinuationCompletion::Redispatch,
+                                |outcome| match outcome {
+                                    DispatchOutcome::Errno { errno } => {
+                                        ContinuationCompletion::Errno(errno)
+                                    }
+                                    _ => ContinuationCompletion::Redispatch,
+                                },
+                            ),
+                            _ => ContinuationCompletion::Redispatch,
+                        },
+                        _ => ContinuationCompletion::Redispatch,
+                    },
+                },
+                ContinuationEvent::Timeout => match family {
+                    ContinuationFamily::ZoneFutexWait
+                    | ContinuationFamily::FutexWait
+                    | ContinuationFamily::FutexWaitv
+                    | ContinuationFamily::SharedFutexWait
+                    | ContinuationFamily::SharedFutexWaitv => {
+                        ContinuationCompletion::Errno(LINUX_ETIMEDOUT)
+                    }
+                    ContinuationFamily::WaitOnFds | ContinuationFamily::WaitOnPollFds => {
+                        let value = match &self.state().detail {
+                            ContinuationDetail::Fds { on_timeout, .. } => *on_timeout,
+                            _ => 0,
+                        };
+                        ContinuationCompletion::Return(value)
+                    }
+                    ContinuationFamily::WaitOnSignals => {
+                        ContinuationCompletion::Errno(LINUX_EAGAIN)
+                    }
+                    ContinuationFamily::WaitOnFdsSelect | ContinuationFamily::WaitOnSleep => {
+                        ContinuationCompletion::ReturnWithGuestWrites(
+                            0,
+                            self.guest_outputs().to_vec(),
+                        )
+                    }
+                    ContinuationFamily::BlockingWrite => {
+                        let offset = match &self.state().detail {
+                            ContinuationDetail::BlockingWrite(write) => {
+                                write.lock().offset() as i64
+                            }
+                            _ => 0,
+                        };
+                        ContinuationCompletion::Return(offset)
                     }
                     ContinuationFamily::TimerFdRead => {
                         let read = match &self.state().detail {
@@ -2132,188 +2273,105 @@ impl BlockedContinuation {
                             sig_mask: signal_masks.temporary.unwrap_or(WaitSigMask::NONE),
                         }
                     }
-                    ContinuationFamily::VforkParent => {
-                        match self
-                            .vfork_child()
-                            .and_then(|key| self.authority().namespace_task_id(key))
-                        {
-                            Some(child) => ContinuationCompletion::Return(child),
-                            None => ContinuationCompletion::Errno(carrick_abi::LINUX_ESRCH),
-                        }
-                    }
-                    ContinuationFamily::WaitOnSharedWord => match &self.state().detail {
-                        ContinuationDetail::SharedWord {
-                            sysv: Some(sysv), ..
-                        } => sysv.completion_after_wake().map_or(
-                            ContinuationCompletion::Redispatch,
-                            |outcome| match outcome {
-                                DispatchOutcome::Errno { errno } => {
-                                    ContinuationCompletion::Errno(errno)
-                                }
-                                _ => ContinuationCompletion::Redispatch,
-                            },
-                        ),
-                        _ => ContinuationCompletion::Redispatch,
-                    },
                     _ => ContinuationCompletion::Redispatch,
                 },
-            },
-            ContinuationEvent::Timeout => match family {
-                ContinuationFamily::ZoneFutexWait
-                | ContinuationFamily::FutexWait
-                | ContinuationFamily::FutexWaitv
-                | ContinuationFamily::SharedFutexWait
-                | ContinuationFamily::SharedFutexWaitv => {
-                    ContinuationCompletion::Errno(LINUX_ETIMEDOUT)
-                }
-                ContinuationFamily::WaitOnFds | ContinuationFamily::WaitOnPollFds => {
-                    let value = match &self.state().detail {
-                        ContinuationDetail::Fds { on_timeout, .. } => *on_timeout,
-                        _ => 0,
+                event @ (ContinuationEvent::Signal | ContinuationEvent::ReservedSignal(_)) => {
+                    let reserved_signal = event.reserved_signal().cloned();
+                    let signal_authority = context.signal_authority();
+                    let effective_mask = match signal_masks.temporary {
+                        Some(WaitSigMask::Additive(extra)) => signal_masks.persistent.union(extra),
+                        Some(WaitSigMask::Replace(replacement)) => replacement,
+                        None => signal_masks.persistent,
                     };
-                    ContinuationCompletion::Return(value)
-                }
-                ContinuationFamily::WaitOnSignals => ContinuationCompletion::Errno(LINUX_EAGAIN),
-                ContinuationFamily::WaitOnFdsSelect | ContinuationFamily::WaitOnSleep => {
-                    ContinuationCompletion::ReturnWithGuestWrites(0, self.guest_outputs().to_vec())
-                }
-                ContinuationFamily::BlockingWrite => {
-                    let offset = match &self.state().detail {
-                        ContinuationDetail::BlockingWrite(write) => write.lock().offset() as i64,
-                        _ => 0,
-                    };
-                    ContinuationCompletion::Return(offset)
-                }
-                ContinuationFamily::TimerFdRead => {
-                    let read = match &self.state().detail {
-                        ContinuationDetail::TimerFdRead(read) => read.lock().take(),
-                        _ => None,
-                    }
-                    .ok_or(ContinuationResumeError::MissingContinuation)?;
-                    ContinuationCompletion::TimerFdRead(read)
-                }
-                ContinuationFamily::Semop => {
-                    let semop = match &self.state().detail {
-                        ContinuationDetail::Semop(semop) => semop.lock().take(),
-                        _ => None,
-                    }
-                    .ok_or(ContinuationResumeError::MissingContinuation)?;
-                    ContinuationCompletion::Semop(semop)
-                }
-                ContinuationFamily::Mqueue => {
-                    let mqueue = match &self.state().detail {
-                        ContinuationDetail::Mqueue(mqueue) => mqueue.lock().take(),
-                        _ => None,
-                    }
-                    .ok_or(ContinuationResumeError::MissingContinuation)?;
-                    ContinuationCompletion::Mqueue(mqueue)
-                }
-                ContinuationFamily::FdWait => {
-                    let wait = match &self.state().detail {
-                        ContinuationDetail::FdWait(wait) => wait.lock().take(),
-                        _ => None,
-                    }
-                    .ok_or(ContinuationResumeError::MissingContinuation)?;
-                    ContinuationCompletion::FdWait {
-                        wait,
-                        sig_mask: signal_masks.temporary.unwrap_or(WaitSigMask::NONE),
-                    }
-                }
-                _ => ContinuationCompletion::Redispatch,
-            },
-            event @ (ContinuationEvent::Signal | ContinuationEvent::ReservedSignal(_)) => {
-                let reserved_signal = event.reserved_signal().cloned();
-                let signal_authority = context.signal_authority();
-                let effective_mask = match signal_masks.temporary {
-                    Some(WaitSigMask::Additive(extra)) => signal_masks.persistent.union(extra),
-                    Some(WaitSigMask::Replace(replacement)) => replacement,
-                    None => signal_masks.persistent,
-                };
-                let deliverable = signal_authority
-                    .thread_pending()
-                    .union(signal_authority.task_pending())
-                    .difference(effective_mask);
-                let deliverable_action = reserved_signal
-                    .as_ref()
-                    .map(ReservedSignal::action)
-                    .or_else(|| {
-                        deliverable.lowest_signum().and_then(|signum| {
-                            crate::kernel::LinuxSignal::for_signal_number(signum)
-                                .ok()
-                                .map(|signal| signal_authority.action(signal))
-                        })
+                    let deliverable = signal_authority
+                        .thread_pending()
+                        .union(signal_authority.task_pending())
+                        .difference(effective_mask);
+                    let deliverable_action = reserved_signal
+                        .as_ref()
+                        .map(ReservedSignal::action)
+                        .or_else(|| {
+                            deliverable.lowest_signum().and_then(|signum| {
+                                crate::kernel::LinuxSignal::for_signal_number(signum)
+                                    .ok()
+                                    .map(|signal| signal_authority.action(signal))
+                            })
+                        });
+                    let caught_handler = deliverable_action.is_some_and(|action| {
+                        action.sa_handler != carrick_abi::LINUX_SIG_DFL
+                            && action.sa_handler != carrick_abi::LINUX_SIG_IGN
                     });
-                let caught_handler = deliverable_action.is_some_and(|action| {
-                    action.sa_handler != carrick_abi::LINUX_SIG_DFL
-                        && action.sa_handler != carrick_abi::LINUX_SIG_IGN
-                });
-                let action_requests_restart = caught_handler
-                    && deliverable_action
-                        .is_some_and(|action| action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0);
-                let partial_write_progress = match &self.state().detail {
-                    ContinuationDetail::BlockingWrite(write) => write.lock().offset() != 0,
-                    _ => false,
-                };
-                if let ContinuationDetail::Mqueue(mqueue) = &self.state().detail {
-                    if let Some(mqueue) = mqueue.lock().as_ref() {
-                        mqueue.cancel();
-                    }
-                }
-                let restart = if family != ContinuationFamily::WaitOnSignals
-                    && !partial_write_progress
-                    && restart_class != RestartClass::Never
-                    && action_requests_restart
-                {
-                    RestartDecision::Restart
-                } else {
-                    RestartDecision::NoRestart
-                };
-                let completion = if family == ContinuationFamily::BlockingWrite {
-                    let offset = match &self.state().detail {
-                        ContinuationDetail::BlockingWrite(write) => write.lock().offset() as i64,
-                        _ => 0,
+                    let action_requests_restart = caught_handler
+                        && deliverable_action.is_some_and(|action| {
+                            action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0
+                        });
+                    let partial_write_progress = match &self.state().detail {
+                        ContinuationDetail::BlockingWrite(write) => write.lock().offset() != 0,
+                        _ => false,
                     };
-                    if offset != 0 {
-                        ContinuationCompletion::Return(offset)
+                    if let ContinuationDetail::Mqueue(mqueue) = &self.state().detail {
+                        if let Some(mqueue) = mqueue.lock().as_ref() {
+                            mqueue.cancel();
+                        }
+                    }
+                    let restart = if family != ContinuationFamily::WaitOnSignals
+                        && !partial_write_progress
+                        && restart_class != RestartClass::Never
+                        && action_requests_restart
+                    {
+                        RestartDecision::Restart
+                    } else {
+                        RestartDecision::NoRestart
+                    };
+                    let completion = if family == ContinuationFamily::BlockingWrite {
+                        let offset = match &self.state().detail {
+                            ContinuationDetail::BlockingWrite(write) => {
+                                write.lock().offset() as i64
+                            }
+                            _ => 0,
+                        };
+                        if offset != 0 {
+                            ContinuationCompletion::Return(offset)
+                        } else {
+                            ContinuationCompletion::Errno(LINUX_EINTR)
+                        }
+                    } else if family == ContinuationFamily::WaitOnSleep {
+                        ContinuationCompletion::InterruptedSleep {
+                            remaining: self.guest_outputs().first().copied().map(|range| {
+                                (
+                                    range,
+                                    self.deadline().map_or(Duration::ZERO, |deadline| {
+                                        deadline.saturating_duration_since(Instant::now())
+                                    }),
+                                )
+                            }),
+                        }
                     } else {
                         ContinuationCompletion::Errno(LINUX_EINTR)
+                    };
+                    signal_authority.set_active_wait_set(None);
+                    if signal_masks.temporary.is_some() {
+                        if let Some(reserved) = reserved_signal.as_ref() {
+                            signal_authority.set_blocked(reserved.effective_mask());
+                            signal_authority.arm_restore_mask(Some(reserved.persistent_restore()));
+                        } else if caught_handler {
+                            signal_authority.arm_restore_mask(Some(
+                                signal_masks
+                                    .restore_after_signal
+                                    .unwrap_or(signal_masks.persistent),
+                            ));
+                        } else {
+                            signal_authority.set_blocked(signal_masks.persistent);
+                            signal_authority.arm_restore_mask(signal_masks.restore_after_signal);
+                        }
                     }
-                } else if family == ContinuationFamily::WaitOnSleep {
-                    ContinuationCompletion::InterruptedSleep {
-                        remaining: self.guest_outputs().first().copied().map(|range| {
-                            (
-                                range,
-                                self.deadline().map_or(Duration::ZERO, |deadline| {
-                                    deadline.saturating_duration_since(Instant::now())
-                                }),
-                            )
-                        }),
-                    }
-                } else {
-                    ContinuationCompletion::Errno(LINUX_EINTR)
-                };
-                signal_authority.set_active_wait_set(None);
-                if signal_masks.temporary.is_some() {
-                    if let Some(reserved) = reserved_signal.as_ref() {
-                        signal_authority.set_blocked(reserved.effective_mask());
-                        signal_authority.arm_restore_mask(Some(reserved.persistent_restore()));
-                    } else if caught_handler {
-                        signal_authority.arm_restore_mask(Some(
-                            signal_masks
-                                .restore_after_signal
-                                .unwrap_or(signal_masks.persistent),
-                        ));
-                    } else {
-                        signal_authority.set_blocked(signal_masks.persistent);
-                        signal_authority.arm_restore_mask(signal_masks.restore_after_signal);
-                    }
+                    self.state_mut().cleanup.settle();
+                    return Ok(ContinuationResult {
+                        completion,
+                        restart,
+                        reserved_signal,
+                    });
                 }
-                self.state_mut().cleanup.settle();
-                return Ok(ContinuationResult {
-                    completion,
-                    restart,
-                    reserved_signal,
-                });
             }
         };
         let authority = context.signal_authority();
