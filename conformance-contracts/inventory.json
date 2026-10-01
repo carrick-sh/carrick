@@ -3106,6 +3106,7 @@
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
+        "kernel.el1.task-load-entry",
         "kernel.el1.thread-lifecycle",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.exec-heap-window",

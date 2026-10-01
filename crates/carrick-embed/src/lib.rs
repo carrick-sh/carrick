@@ -159,8 +159,8 @@ pub use carrick_runtime::{El1FrameGrantStats, el1_frame_grant_stats};
 /// exits are a different quantity and must not be substituted.
 pub use carrick_runtime::{HostCowSnapshot, host_cow_snapshot};
 pub use carrick_runtime::{
-    read_el1_counters, reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total,
-    vcpu_run_exit_classes, vcpu_run_exits_total,
+    hvpatch_task_loads_total, read_el1_counters, reset_el1_counters, vcpu_hvc_not_svc_reasons,
+    vcpu_hvc_not_svc_total, vcpu_run_exit_classes, vcpu_run_exits_total,
 };
 pub use carrick_spec::{
     Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec, SecuritySpec,

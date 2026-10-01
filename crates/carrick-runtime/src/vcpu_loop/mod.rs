@@ -3205,16 +3205,6 @@ pub(crate) mod tests {
             }
         }
 
-        fn complete_task_load_barrier(&mut self) -> Result<(), TrapError> {
-            if self.exec_support {
-                Ok(())
-            } else {
-                Err(TrapError::Hypervisor(
-                    "crash timeout test does not complete task-load barriers".to_owned(),
-                ))
-            }
-        }
-
         fn bind_task_snapshot_identity(&mut self, mm_generation: u64, asid_generation: u64) {
             if let Some(carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu)) =
                 self.snapshot_cpu.as_mut()

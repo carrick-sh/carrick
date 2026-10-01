@@ -290,17 +290,6 @@
       "domain": "mem::el1_trampoline"
     },
     {
-      "file": "crates/carrick-mem/src/memory.rs",
-      "function": "el1_maintenance_bytes",
-      "ordinal_in_function": 2,
-      "fingerprint": "24a3738a7f2fd8aa183b2a99b22b4c96450c3a81147beac75d7ee100312d61a5",
-      "verdict": "carrier_fault",
-      "failure_domain": "mem::el1_trampoline",
-      "rationale": "Relative offset to EL1 load barrier trampoline exceeded host pointer width during buffer layout.",
-      "sink": "fatal",
-      "domain": "mem::el1_trampoline"
-    },
-    {
       "file": "crates/carrick-signal-linux/src/fasync.rs",
       "function": "invariant_failure",
       "ordinal_in_function": 1,

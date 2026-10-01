@@ -2001,36 +2001,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .is_ok_and(|pstate| (pstate >> 2) & 0b11 != 0)
     }
 
-    pub fn complete_task_load_on_vcpu(vcpu: &mut V::Vcpu) -> Result<(), TrapError> {
-        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-        let saved_pc = vcpu.get_reg(Reg::Pc)?;
-        let saved_pstate = vcpu.get_reg(Reg::Pstate)?;
-        let saved_elr = vcpu.get_reg(Reg::ElrEl1)?;
-        let saved_spsr = vcpu.get_reg(Reg::SpsrEl1)?;
-        vcpu.set_reg(Reg::Pc, carrick_mem::memory::LINUX_EL1_LOAD_BARRIER_BASE)?;
-        vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
-        let result = loop {
-            match vcpu.run() {
-                Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
-                Ok(Aarch64Exit::Kicked) => continue,
-                Ok(other) => {
-                    // The full exit payload (FAR/ESR/ELR for a fault) is the
-                    // whole diagnosis when the barrier dies — the bare
-                    // variant name cost the vforkexecthread hunt a round.
-                    break Err(TrapError::UnexpectedExit {
-                        reason: format!("{other:?} during EL1 task-load barrier"),
-                    });
-                }
-                Err(error) => break Err(error),
-            }
-        };
-        vcpu.set_reg(Reg::Pc, saved_pc)?;
-        vcpu.set_reg(Reg::Pstate, saved_pstate)?;
-        vcpu.set_reg(Reg::ElrEl1, saved_elr)?;
-        vcpu.set_reg(Reg::SpsrEl1, saved_spsr)?;
-        result
-    }
-
     fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
         Self::run_el1_maintenance_on(&mut self.vcpu)
     }
@@ -4500,25 +4470,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn mark_exec_predecessor_shared(&mut self, shared: bool) {
         self.exec_predecessor_shared = Some(shared);
         self.vm.mark_exec_predecessor_shared(shared);
-    }
-
-    fn complete_task_load_barrier(&mut self) -> Result<(), TrapError> {
-        Self::complete_task_load_on_vcpu(&mut self.vcpu).map_err(|error| {
-            // A barrier failure is a stage-1 story: append the live TTBR and
-            // the four walked descriptors for the barrier base so the death
-            // carries its own page-table forensics (the vforkexecthread hunt
-            // needed exactly this to see WHICH level of the shared old root
-            // went invalid under a sibling exec).
-            match self
-                .diagnostic_fault_page_tables(carrick_mem::memory::LINUX_EL1_LOAD_BARRIER_BASE)
-            {
-                Some((ttbr, descriptors)) => TrapError::Hypervisor(format!(
-                    "{error} [barrier walk: ttbr0={ttbr:#x} l0={:#x} l1={:#x} l2={:#x} l3={:#x}]",
-                    descriptors[0], descriptors[1], descriptors[2], descriptors[3]
-                )),
-                None => error,
-            }
-        })
     }
 
     fn supports_in_process_fork(&self) -> bool {

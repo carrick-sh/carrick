@@ -304,6 +304,18 @@ pub fn host_cow_snapshot() -> HostCowSnapshot {
     HostCowSnapshot::default()
 }
 
+/// HVPatch task loads that completed on a persistent executor: every
+/// `PersistentExecutor::load` that committed ASID residence, plus every exec
+/// replacement load. Carrier-wide and monotonic; difference two readings.
+pub(crate) static HVPATCH_TASK_LOADS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Carrier-wide count of completed HVPatch task loads (see
+/// [`HVPATCH_TASK_LOADS`]).
+pub fn hvpatch_task_loads_total() -> u64 {
+    HVPATCH_TASK_LOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn vcpu_run_exits_total() -> u64 {
     0

@@ -122,7 +122,7 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.metadata-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry"]
 
 [[surfaces]]
 path = "crates/carrick-mmu-core/src/aarch64.rs"
@@ -413,7 +413,7 @@ contracts = ["kernel.wait.process-group"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs"
-contracts = ["kernel.el1.files.cross-process-readers", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy"]
+contracts = ["kernel.el1.files.cross-process-readers", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.task-load-entry"]
 
 [[surfaces]]
 path = "fixtures/embed-zone-readers/src/main.rs"
@@ -642,3 +642,7 @@ contracts = ["kernel.time.coarse-clock-vdso"]
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs"
 contracts = ["kernel.mm.exec-heap-window"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/exec.rs"
+contracts = ["kernel.el1.task-load-entry"]

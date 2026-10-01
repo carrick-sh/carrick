@@ -472,7 +472,6 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
         || frame.contains("overlay_task_state_on_live_executor")
         || frame.contains("reaffirm_resident_task_state")
         || frame.contains("flush_resident_task")
-        || frame.contains("complete_task_load_barrier")
         || frame.contains("restore_persistent_executor_invariant")
         || frame.contains("PersistentExecutor>::load")
         || frame.contains("PersistentExecutor>::save")

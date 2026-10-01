@@ -2113,16 +2113,7 @@ where
         kernel
             .dispatcher
             .cleanup_sysv_shm_attachments_on_process_exit();
-        if replacement_asid_load.is_some()
-            && let Err(error) = engine.complete_task_load_barrier()
-        {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("complete replacement task-load DSB/ISB barrier: {error}"),
-            )
-            .map(Some);
-        }
+        let replacement_loaded = replacement_asid_load.is_some();
         if let Some(load) = replacement_asid_load
             && let Err(error) = load.mark_resident()
         {
@@ -2132,6 +2123,9 @@ where
                 &format!("commit replacement ASID residence after exec: {error}"),
             )
             .map(Some);
+        }
+        if replacement_loaded {
+            crate::HVPATCH_TASK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let committed_mm = committed_context.shared().mm().id();
         let committed_asid_generation = kernel.hvpatch_process.as_ref().map_or(

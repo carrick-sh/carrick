@@ -7,8 +7,6 @@ use std::sync::atomic::AtomicBool;
 use parking_lot::Mutex;
 
 use carrick_fatal::carrick_fatal;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use carrick_hal::ThreadedEngine as _;
 
 #[path = "residency.rs"]
 pub mod residency;
@@ -748,10 +746,6 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             },
         )?;
         self.cow_invalidation_observer = Some(cow_invalidation_observer);
-        self.current
-            .as_mut()
-            .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost barrier engine".into()))?
-            .complete_task_load_barrier()?;
         let task_id = carrick_el1_abi::El1TaskId::from_linux_tid(task.thread_key().tid.raw());
         let generation = task.generation().raw();
         let file_table = task.lease().file_table_id().map_or(0, |id| id.raw());
@@ -772,7 +766,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         asid_load.mark_resident().map_err(|error| {
             self.clear_live_current_task();
             TrapError::Hypervisor(format!("HVPatch ASID residence commit failed: {error}"))
-        })
+        })?;
+        crate::HVPATCH_TASK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     fn note_bound_cpu(&mut self, cpu: Option<u32>) {

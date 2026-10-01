@@ -1144,7 +1144,7 @@ fn retire_initial_mmap_arena_rejects_corrupted_shape() {
 }
 
 #[test]
-fn exec_replacement_preserves_canonical_scoped_asid_and_load_barrier_code() {
+fn exec_replacement_preserves_canonical_scoped_asid_code() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut input = root_exec_test_plan();
     let mut maintenance = exec_mapping_for_order(
@@ -1182,10 +1182,6 @@ fn exec_replacement_preserves_canonical_scoped_asid_and_load_barrier_code() {
     bytes_at(
         carrick_mem::memory::LINUX_EL1_ASID_MAINT_BASE,
         carrick_mem::memory::el1_asid_maintenance_bytes(),
-    );
-    bytes_at(
-        carrick_mem::memory::LINUX_EL1_LOAD_BARRIER_BASE,
-        carrick_mem::memory::el1_load_barrier_bytes(),
     );
 }
 
