@@ -24,6 +24,9 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-observability = { path = "../carrick-observability" }
+# The EL1-editor exclusion witness is registered from the sched-core proof
+# (`ExcludedEditor`). No cycle: carrick-sched-core has no dependencies.
+carrick-sched-core = { path = "../carrick-sched-core" }
 # Timer-delivery trait return/arg types (`PosixTimerSpec`, `TimerArm`) live in the
 # neutral timer-core; carrick-hal re-exports them through the `TimerDelivery`
 # trait so backends name one set of types. No cycle: timer-core depends only on

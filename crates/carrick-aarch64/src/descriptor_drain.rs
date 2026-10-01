@@ -135,6 +135,79 @@ pub trait GuestDrainVenue {
         carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
         GuestPublishError,
     >;
+    /// Apply `txn` with the host as the MM's editor when this thread holds
+    /// the MM's EL1 editor exclusion: EL1's executor run on the host, the
+    /// receipt's ASID invalidation already done, no drain call (no VM exit
+    /// beyond a required invalidation). `None`: no such exclusion here, and
+    /// the EL1 drain applies it.
+    fn apply_as_host(
+        &mut self,
+        _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        _slots: &carrick_el1_abi::DescriptorTxnSlots,
+    ) -> Option<Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt, TrapError>>
+    {
+        None
+    }
+}
+
+/// The host-as-editor application every venue shares: when this thread
+/// holds `txn`'s MM EL1 editor exclusion, first apply any submission already
+/// waiting for the MM (in order, as EL1's drain would), then run EL1's
+/// executor on the live words through `tables`, with break-before-make
+/// invalidations through `maintenance` and `invalidate_asid` wherever a
+/// receipt requires it, all before `check` (the venue's own failure check)
+/// and before anything settles the receipt. `None` without the exclusion,
+/// for a COW repoint, or when a waiting submission must be EL1's (EL1
+/// copies a COW repoint's page as it applies it): the EL1 drain applies
+/// the transaction and everything ahead of it.
+pub fn apply_as_host_if_excluded<M>(
+    tables: &crate::stage1_authority::Stage1Authority,
+    slots: &carrick_el1_abi::DescriptorTxnSlots,
+    txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    maintenance: &M,
+    invalidate_asid: &dyn Fn(),
+    check: impl FnOnce() -> Result<(), TrapError>,
+) -> Option<Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt, TrapError>>
+where
+    M: carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance + ?Sized,
+{
+    if matches!(
+        txn.op,
+        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint { .. }
+    ) {
+        return None;
+    }
+    let failed = |error| {
+        TrapError::Hypervisor(format!(
+            "host-applied guest descriptor {:?}: {error:?}",
+            txn.id
+        ))
+    };
+    carrick_hal::el1_editor_exclusion::with_held_exclusion(txn.id.mm_key.get(), |excluded| {
+        let excluded = excluded?;
+        // Submissions already waiting for the MM (a frame grant EL1 has yet
+        // to apply) land first, in submission order: applied after them, a
+        // retirement could be overtaken by a grant's prepare onto the freed
+        // range (windowcoherence lane on: "prepare ... Refused(Occupied)").
+        match tables.apply_submitted_as_host(slots, excluded, maintenance, invalidate_asid) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => return Some(Err(failed(error))),
+        }
+        Some(
+            tables
+                .execute_guest_descriptor_txn_as_host(txn, excluded, maintenance)
+                .map_err(failed)
+                .and_then(|receipt| {
+                    if carrick_mmu_core::aarch64::descriptor_txn::outcome_requires_invalidation(
+                        &receipt.outcome,
+                    ) {
+                        invalidate_asid();
+                    }
+                    check().map(|()| receipt)
+                }),
+        )
+    })
 }
 
 /// The production venue: the engine's own vCPU and the shared EL1 region.
@@ -200,6 +273,18 @@ pub fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
     let mut verified = Vec::with_capacity(txns.len());
     let mut rest = txns;
     while let Some(first) = rest.first() {
+        // The host holds the MM's EL1 editor: it applies the transaction
+        // itself, in order, and settles it exactly as a drained one.
+        if let Some(applied) = venue.apply_as_host(first, slots) {
+            let receipt = applied.map_err(GuestPublishError::Unsettled)?;
+            match venue.settle(first, &receipt) {
+                Ok(receipt) => verified.push(receipt),
+                Err(error) if verified.is_empty() => return Err(error),
+                Err(error) => return Err(error.into_partial()),
+            }
+            rest = &rest[1..];
+            continue;
+        }
         let ttbr0 = venue.live_ttbr0()?;
         if ttbr0 & 0x0000_FFFF_FFFF_F000 != first.root.raw() {
             return Err(GuestPublishError::Unsettled(fail(format!(

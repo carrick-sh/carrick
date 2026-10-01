@@ -700,6 +700,10 @@ pub struct El1EditorExclusion {
     tables: SpaceTables,
     index: SpaceIndex,
     key: u64,
+    /// This thread's witness registration (`carrick_hal::el1_editor_exclusion`):
+    /// while it is held, engine code on this thread may store to the MM's
+    /// live descriptors itself. Released before the gate is lowered.
+    held: Option<carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion>,
 }
 
 impl std::fmt::Debug for El1EditorExclusion {
@@ -734,11 +738,18 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
         .spaces
         .raise_and_wait_for_editor(index, core::hint::spin_loop);
     settle_excluded(tables, &excluded);
-    Some(El1EditorExclusion { tables, index, key })
+    let held = Some(carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded));
+    Some(El1EditorExclusion {
+        tables,
+        index,
+        key,
+        held,
+    })
 }
 
 impl Drop for El1EditorExclusion {
     fn drop(&mut self) {
+        drop(self.held.take());
         if self.tables.live() {
             self.tables.spaces.lower(self.index);
         }

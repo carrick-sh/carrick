@@ -1464,6 +1464,22 @@ impl DescriptorTxnSlot {
         })
     }
 
+    /// Whether the submission waiting for `mm_key` is a COW repoint, whose
+    /// page copy only EL1's applier performs. Read before claiming it.
+    #[must_use]
+    pub fn submitted_cow_repoint_for(&self, mm_key: u64) -> bool {
+        self.submitted_for(mm_key)
+            && self.kind.load(Ordering::Relaxed) == DescriptorOp::KIND_COW_REPOINT
+    }
+
+    /// Whether a transaction for `mm_key` is being applied right now (claimed,
+    /// receipt not yet published).
+    #[must_use]
+    pub fn applying_for(&self, mm_key: u64) -> bool {
+        self.state.load(Ordering::Acquire) == DESCRIPTOR_TXN_GUEST_APPLYING
+            && self.mm_key.load(Ordering::Relaxed) == mm_key
+    }
+
     /// EL1: claim the submitted transaction for `mm_key`. The caller must
     /// already hold that MM's exact editor and must publish a receipt for
     /// every successful claim.

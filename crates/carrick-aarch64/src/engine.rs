@@ -500,11 +500,71 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
             .map_err(|error| {
                 crate::descriptor_drain::GuestPublishError::from_settle(
                     error,
-                    "settle COW descriptor",
+                    "settle guest descriptor",
                 )
             })
     }
+    fn apply_as_host(
+        &mut self,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+    ) -> Option<Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt, TrapError>>
+    {
+        let (process_asid, carrier_root) = (self.process_asid, self.carrier_root);
+        let maintenance = VcpuBbmMaintenance::<V> {
+            vcpu: std::cell::RefCell::new(&mut *self.vcpu),
+            process_asid,
+            carrier_root,
+            error: std::cell::RefCell::new(None),
+        };
+        crate::descriptor_drain::apply_as_host_if_excluded(
+            &self.tables,
+            slots,
+            txn,
+            &maintenance,
+            // As EL1's completion does: each ASID invalidation an outcome
+            // requires completes before its receipt can be settled.
+            &|| {
+                carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance::invalidate_range(
+                    &maintenance,
+                    0,
+                    0,
+                )
+            },
+            || match maintenance.error.borrow_mut().take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            },
+        )
+    }
 }
+
+/// Break-before-make invalidations a host-applied guest transaction asks
+/// for, run at once on the applying vCPU (ASID-wide, inner shareable). The
+/// first failure is kept and the transaction's result reported unsettled.
+struct VcpuBbmMaintenance<'a, V: Aarch64Vmm> {
+    vcpu: std::cell::RefCell<&'a mut V::Vcpu>,
+    process_asid: Option<u16>,
+    carrier_root: Option<carrick_mem::memory::CarrierMaintenanceRoot>,
+    error: std::cell::RefCell<Option<TrapError>>,
+}
+
+impl<V: Aarch64Vmm> carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance
+    for VcpuBbmMaintenance<'_, V>
+{
+    fn publish_barrier(&self) {}
+
+    fn invalidate_range(&self, _va: u64, _len: u64) {
+        if let Err(error) = Aarch64EngineCore::<V>::run_stage1_maintenance_on(
+            &mut self.vcpu.borrow_mut(),
+            self.process_asid,
+            self.carrier_root,
+        ) {
+            self.error.borrow_mut().get_or_insert(error);
+        }
+    }
+}
+
 impl<V: Aarch64Vmm> crate::vmm::Stage1Services for EngineStage1Services<'_, V> {
     fn flush(&mut self) -> Result<(), TrapError> {
         Aarch64EngineCore::<V>::run_stage1_maintenance_on(
@@ -1597,7 +1657,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 .prepare_guest_descriptor_txn(mm, op)
                 .map_err(|error| failure(format!("prepare at 0x{va:x}: {error:?}")))?;
             crate::descriptor_drain::apply_guest_descriptor_txns_now(
-                &mut crate::descriptor_drain::EngineDrainVenue(self),
+                &mut self.descriptor_services(),
                 slots,
                 &[txn],
             )
@@ -1665,7 +1725,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 Err(error) => return Err(failure(format!("prepare at 0x{start:x}: {error:?}"))),
             };
             crate::descriptor_drain::apply_guest_descriptor_txns_now(
-                &mut crate::descriptor_drain::EngineDrainVenue(self),
+                &mut self.descriptor_services(),
                 slots,
                 &[txn],
             )
@@ -2054,6 +2114,22 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 Self::invalidate_asid_on_vcpu(vcpu, asid, root)
             }
             None => Self::run_el1_maintenance_on(vcpu),
+        }
+    }
+
+    /// This engine's own publication venue: its vCPU, tables, slot and
+    /// ASID maintenance. Applies a guest transaction as the host when this
+    /// thread holds the MM's EL1 editor exclusion, else through EL1.
+    fn descriptor_services(&mut self) -> EngineStage1Services<'_, V> {
+        let slot = self.mailbox_slot();
+        let carrier_root = self.vm.carrier_maintenance_root().ok();
+        EngineStage1Services::<V> {
+            vcpu: &mut self.vcpu,
+            tables: self.page_tables.clone(),
+            slot,
+            process_asid: self.process_asid,
+            carrier_root,
+            suspended_el1_sp: self.suspended_el1_sp,
         }
     }
 

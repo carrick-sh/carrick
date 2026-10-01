@@ -492,6 +492,76 @@ impl Stage1Authority {
         Ok(txn)
     }
 
+    /// Execute a prepared guest transaction with the host as the MM's
+    /// editor: EL1's journaled executor and receipt, no drain call. Only a
+    /// holder of the MM's EL1 editor exclusion on this thread can name
+    /// `excluded`; an exclusion of another MM is refused. The caller
+    /// performs the ASID invalidation the receipt requires before settling
+    /// it ([`Self::settle_guest_descriptor_receipt`]).
+    pub fn execute_guest_descriptor_txn_as_host<M>(
+        &self,
+        txn: &DescriptorTxn,
+        excluded: &carrick_hal::el1_editor_exclusion::El1EditorExcluded,
+        maintenance: &M,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt, GuestTxnPrepareError>
+    where
+        M: carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance + ?Sized,
+    {
+        if excluded.mm() != txn.id.mm_key.get() {
+            return Err(GuestTxnPrepareError::Manager(
+                PageTableError::GuestOwnsLiveDescriptors,
+            ));
+        }
+        let inner = self.inner.lock();
+        let manager = inner
+            .manager
+            .as_ref()
+            .ok_or(GuestTxnPrepareError::NotLive)?;
+        // SAFETY: `excluded` proves this thread holds the exact MM's EL1
+        // editor exclusion for at least the duration of this call.
+        unsafe { manager.execute_guest_descriptor_txn_as_host(txn, maintenance) }
+    }
+
+    /// Apply every submission already waiting for `excluded`'s MM, in
+    /// submission order, with the host as the editor, as EL1's drain would
+    /// (each receipt is left in its slot for its owner to settle). `false`
+    /// without applying anything when one of them must be EL1's: a COW
+    /// repoint (EL1 copies its page) or a submission mid-application.
+    pub fn apply_submitted_as_host<M>(
+        &self,
+        slots: &carrick_el1_abi::DescriptorTxnSlots,
+        excluded: &carrick_hal::el1_editor_exclusion::El1EditorExcluded,
+        maintenance: &M,
+        invalidate_asid: &dyn Fn(),
+    ) -> Result<bool, GuestTxnPrepareError>
+    where
+        M: carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance + ?Sized,
+    {
+        let mm = excluded.mm();
+        if slots
+            .as_slice()
+            .iter()
+            .any(|slot| slot.applying_for(mm) || slot.submitted_cow_repoint_for(mm))
+        {
+            return Ok(false);
+        }
+        let inner = self.inner.lock();
+        let manager = inner
+            .manager
+            .as_ref()
+            .ok_or(GuestTxnPrepareError::NotLive)?;
+        for slot in slots.submitted_in_order(mm) {
+            // SAFETY: `excluded` proves this thread holds the exact MM's EL1
+            // editor exclusion for at least the duration of this call.
+            unsafe {
+                manager.apply_submitted_descriptor_txn_as_host(slot, mm, maintenance, || {
+                    invalidate_asid();
+                })?;
+            }
+        }
+        Ok(true)
+    }
+
     /// Authenticate EL1's receipt for a transaction built by
     /// [`Self::prepare_guest_descriptor_txn`] and return its unused grants.
     /// Backing adapters require the returned receipt before committing
