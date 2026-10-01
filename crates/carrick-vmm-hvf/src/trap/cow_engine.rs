@@ -3006,6 +3006,201 @@ impl HvfTaskState {
         None
     }
 
+    /// Whether every 4 KiB page of `span` translates (valid or retained
+    /// output) to `old_ipa` at its offset in the manager's shadow.
+    fn span_names_old_frame_exactly(&self, span: CowArmedSpan, old_ipa: u64) -> bool {
+        const PAGE_SIZE: u64 = 4 * 1024;
+        let span_start = span.va & !(PAGE_SIZE - 1);
+        let span_end = span.va.saturating_add(span.len as u64);
+        self.page_tables_authority()
+            .with_manager(|manager| {
+                let mut page_va = span_start;
+                while page_va < span_end {
+                    let Some(expected) = old_ipa.checked_add(page_va.saturating_sub(span.va))
+                    else {
+                        return false;
+                    };
+                    if manager.translate_retained_output(page_va) != Some(expected) {
+                        return false;
+                    }
+                    page_va = page_va.saturating_add(PAGE_SIZE);
+                }
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Serve a write fault on a fork-armed compound whose frame this mm alone
+    /// maps ([`CowWriteRoute::ReuseSoleOwner`]) by making its leaves writable
+    /// where the guest may write, under the same undo journal, live-backing
+    /// authentication and stage-1 maintenance as a COW publication. The leaf
+    /// keeps naming `old_ipa`.
+    fn reuse_sole_owner_cow_in_place(
+        &mut self,
+        span: CowArmedSpan,
+        old_ipa: u64,
+        page_table_host: *mut u8,
+        source_guest_writable: bool,
+        flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
+    ) -> Result<(), TrapError> {
+        const PAGE_SIZE: u64 = 4 * 1024;
+        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+        const AP_MASK: u64 = 0b11 << 6;
+        const AP_USER_RW: u64 = 0b01 << 6;
+        const VALID: u64 = 1;
+        const TYPE_TABLE_OR_PAGE: u64 = 0b11;
+        const NON_GLOBAL: u64 = 1 << 11;
+        let span_start = span.va & !(PAGE_SIZE - 1);
+        let span_end = span.va.saturating_add(span.len as u64);
+        let page_table_result = {
+            let page_tables_authority = self.page_tables_authority();
+            page_tables_authority.edit(
+                || {
+                    page_tables_authority.emit_absent_probe(2);
+                    Err(TrapError::Hypervisor(
+                        "HVPatch sole-owner COW reuse has no page-table manager".to_owned(),
+                    ))
+                },
+                |manager| -> Result<(), TrapError> {
+                    manager.begin_undo().map_err(|error| match error {
+                        carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
+                            TrapError::MetadataAllocation
+                        }
+                        other => TrapError::Hypervisor(format!(
+                            "begin undo HVPatch sole-owner COW reuse: {other:?}"
+                        )),
+                    })?;
+                    let mut pre_edit_ap = std::collections::BTreeMap::new();
+                    let mut page_va = span_start;
+                    while page_va < span_end {
+                        pre_edit_ap.insert(page_va, manager.debug_walk(page_va)[3] & AP_MASK);
+                        page_va = page_va.saturating_add(PAGE_SIZE);
+                    }
+                    HvfVmState::refresh_stage1_exclusivity(manager.manager);
+                    let mut page_va = span_start;
+                    while page_va < span_end {
+                        if source_guest_writable && !self.protections.range_write_denied(page_va, 1)
+                        {
+                            manager
+                                .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
+                                .map_err(|error| {
+                                    TrapError::Hypervisor(format!(
+                                        "grant HVPatch sole-owner page write: {error:?}"
+                                    ))
+                                })?;
+                        }
+                        page_va = page_va.saturating_add(PAGE_SIZE);
+                    }
+                    self.publish_stage1_extension_arenas(manager.manager)?;
+                    let page_table_resolver =
+                        self.page_table_resolver(manager.base(), Some(page_table_host));
+                    unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "HVPatch sole-owner COW reuse sync_to_host failed: {error:?}"
+                        ))
+                    })?;
+                    // Authenticate exactly what the hardware walker will read:
+                    // shadow and live agree, every leaf still names the old
+                    // frame, and the AP bits are the granted (or preserved) ones.
+                    let mut page_va = span_start;
+                    while page_va < span_end {
+                        let expected_ipa = old_ipa
+                            .checked_add(page_va.saturating_sub(span.va))
+                            .ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "HVPatch sole-owner COW leaf IPA overflow".to_owned(),
+                                )
+                            })?;
+                        let shadow = manager.debug_walk(page_va);
+                        let live = unsafe { manager.debug_walk_host(page_table_resolver, page_va) }
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "HVPatch sole-owner COW debug_walk_host failed: {error:?}"
+                                ))
+                            })?;
+                        if shadow != live {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch sole-owner COW shadow/live mismatch at VA 0x{page_va:x}"
+                            )));
+                        }
+                        let leaf = live[3];
+                        let expected_ap = if source_guest_writable
+                            && !self.protections.range_write_denied(page_va, 1)
+                        {
+                            AP_USER_RW
+                        } else {
+                            pre_edit_ap.get(&page_va).copied().ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "HVPatch sole-owner COW pre-edit AP bits are absent for VA 0x{page_va:x}"
+                                ))
+                            })?
+                        };
+                        if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                            || (leaf & VALID != 0
+                                && (leaf & 0b11 != TYPE_TABLE_OR_PAGE
+                                    || leaf & AP_MASK != expected_ap
+                                    || leaf & NON_GLOBAL == 0))
+                        {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch sole-owner COW leaf authentication failed at VA 0x{page_va:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}"
+                            )));
+                        }
+                        if page_va == span_start {
+                            // Phase 7: an in-place write grant after the
+                            // VM-wide sole-owner proof (no copy).
+                            crate::probes::pt_alias_receipt(
+                                page_va,
+                                leaf,
+                                expected_ipa,
+                                expected_ap,
+                                7,
+                            );
+                        }
+                        crate::probes::pt_alias_walk(page_va, live, 1 << 3);
+                        page_va = page_va.saturating_add(PAGE_SIZE);
+                    }
+                    Ok(())
+                },
+            )
+        };
+        if let Err(error) = page_table_result {
+            let _ = self.page_tables_authority().edit(
+                || Err(()),
+                |manager| {
+                    let page_table_resolver =
+                        self.page_table_resolver(manager.base(), Some(page_table_host));
+                    // SAFETY: the COW quiesce and topology guards remain held;
+                    // no vCPU walks or edits this mm while the journalled
+                    // pre-images are replayed into its live backing.
+                    let _ = unsafe { manager.rollback_undo(page_table_resolver) };
+                    Ok::<(), ()>(())
+                },
+            );
+            if let Err(flush_error) = flush_stage1.flush() {
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "HVPatch sole-owner COW rollback stage-1 TLBI failed: {flush_error}"
+                );
+            }
+            return Err(error);
+        }
+        let _ = self.page_tables_authority().edit(
+            || Err(()),
+            |manager| {
+                manager.commit_undo();
+                Ok::<(), ()>(())
+            },
+        );
+        if let Err(error) = flush_stage1.flush() {
+            carrick_fatal!(
+                "hvpatch::mm_authority",
+                "HVPatch sole-owner COW stage-1 TLBI failed: {error}"
+            );
+        }
+        self.cow_armed.lock().disarm(span);
+        Ok(())
+    }
+
     pub(crate) fn perform_frame_cow(
         &mut self,
         custody: &std::sync::Arc<CarrierVmCustody>,
@@ -3211,12 +3406,7 @@ impl HvfTaskState {
                 }
             }
         };
-        let CowInventorySplitShape {
-            old_key: old_inventory_key,
-            old: old_inventory_extent,
-            fragments: fragment_shapes,
-            retirement,
-        } = {
+        let shape = {
             let inventory = self.frame_inventory.lock();
             let shape = HvfVmState::cow_inventory_split_shape(
                 &inventory,
@@ -3282,6 +3472,20 @@ impl HvfTaskState {
             }
             shape?
         };
+        let route = shape.write_route(
+            intent,
+            span.kernel_only,
+            span.len,
+            retain_old_compound,
+            guest_lane,
+        );
+        let CowInventorySplitShape {
+            old_key: old_inventory_key,
+            old: old_inventory_extent,
+            fragments: fragment_shapes,
+            retirement,
+            sole_owner: _,
+        } = shape;
         let old_frame = old_inventory_extent.frame;
         // Resolve every authority needed for stage-1 publication before the
         // first physical/staged-inventory mutation.  A fork-time response can
@@ -3297,6 +3501,31 @@ impl HvfTaskState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
             })?;
+        // Reuse grants write to the span's leaves without repointing them, so
+        // every 4 KiB page of the span must already name the old frame at its
+        // offset (a valid or retained-output leaf). A page with no output at
+        // all (a never-touched page inside the compound) is what the copy
+        // path's repoint would create; keep copying for such a span.
+        let route = if route == CowWriteRoute::ReuseSoleOwner
+            && self.span_names_old_frame_exactly(span, old_ipa)
+        {
+            CowWriteRoute::ReuseSoleOwner
+        } else {
+            CowWriteRoute::Copy
+        };
+        if route == CowWriteRoute::ReuseSoleOwner {
+            // The writer is the frame's only owner: no copy, no new frame, no
+            // inventory or alias change; its leaves become writable in place.
+            drop(old_source.take());
+            self.reuse_sole_owner_cow_in_place(
+                span,
+                old_ipa,
+                page_table_host,
+                source_guest_writable,
+                flush_stage1,
+            )?;
+            return Ok(true);
+        }
 
         let receipt_va = align_down(fault_va, 4 * 1024);
         let trigger_event = carrick_observability::probes::HvpatchFrameCowTrigger::new(

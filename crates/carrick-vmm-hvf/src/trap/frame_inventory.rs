@@ -145,6 +145,11 @@ pub(crate) struct CowInventorySplitShape {
     pub(crate) old: InventoryExtent,
     pub(crate) fragments: Vec<(u64, u64)>,
     pub(crate) retirement: CowInventoryRetirementDecision,
+    /// Every backend reference to the frame and every VM-wide Kernel mapping
+    /// of it is one of this mm's own extents, both read under the frame
+    /// registry. (A frame split by an earlier COW is mapped by several
+    /// extents of the same mm; it is still solely owned.)
+    pub(crate) sole_owner: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -161,6 +166,51 @@ pub(crate) struct CowInventoryReplacementStage {
 pub(crate) struct CowInventoryRetirementDecision {
     pub(crate) retire_old_frame: bool,
     pub(crate) backend_frame_references_complete: bool,
+}
+
+/// How a write fault on a fork-armed page is served.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CowWriteRoute {
+    /// Copy the compound to a new frame and repoint the writer at it.
+    Copy,
+    /// The writer is the frame's only owner: make its leaves writable in
+    /// place, as Linux reuses a page whose only mapper writes it.
+    ReuseSoleOwner,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CowInventorySplitShape {
+    /// How to serve this write. Reuse needs sole ownership: no backend
+    /// holder but this mm and a Kernel VM-wide mapping count of exactly this
+    /// one mapping, read under the frame registry, so a sibling whose
+    /// retirement decided but whose Kernel unmap is not applied yet still
+    /// counts and forces a copy. The frame may be wider than the compound:
+    /// nobody else maps any of it, so granting write to this compound needs
+    /// no split. Only a guest-visible user write of a whole private 16 KiB
+    /// compound, not retained by another projection, on the host descriptor
+    /// lane qualifies.
+    pub(crate) fn write_route(
+        &self,
+        intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        kernel_only: bool,
+        span_len: usize,
+        retain_old_compound: bool,
+        guest_lane: bool,
+    ) -> CowWriteRoute {
+        let reusable = self.sole_owner
+            && intent == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
+            && !kernel_only
+            && span_len as u64 == CowArmedRanges::COMPOUND_SIZE
+            && matches!(self.old.backing, InventoryBackingIdentity::Private(_))
+            && !retain_old_compound
+            && !guest_lane;
+        if reusable {
+            CowWriteRoute::ReuseSoleOwner
+        } else {
+            CowWriteRoute::Copy
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1514,19 +1564,20 @@ impl HvfVmState {
         if compound_end < old_end {
             fragments.push((compound_end, old_end - compound_end));
         }
-        let global_references = inventory
-            .frames
-            .lock()
-            .references
-            .get(&old.frame)
-            .copied()
-            .ok_or_else(|| {
+        // Read the backend population and the Kernel's count under the frame
+        // registry, as retirement decides: a sibling retirement removes its
+        // backend reference under this lock and its Kernel mapping only when
+        // applied, so both reads see one consistent order.
+        let (global_references, authoritative_references) = {
+            let frames = inventory.frames.lock();
+            let global = frames.references.get(&old.frame).copied().ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "HVPatch COW frame {:?} lacks backend references",
                     old.frame
                 ))
             })?;
-        let authoritative_references = authority_mapping_count(old.frame)?;
+            (global, authority_mapping_count(old.frame)?)
+        };
         let backend_frame_references_complete = authoritative_references == Some(global_references);
         let retire_old_frame =
             global_references == 1 && fragments.is_empty() && authoritative_references == Some(1);
@@ -1537,6 +1588,14 @@ impl HvfVmState {
             retirement: CowInventoryRetirementDecision {
                 retire_old_frame,
                 backend_frame_references_complete,
+            },
+            sole_owner: {
+                let local = inventory
+                    .extents
+                    .values()
+                    .filter(|extent| extent.frame == old.frame)
+                    .count();
+                global_references == local && authoritative_references == Some(local)
             },
         })
     }

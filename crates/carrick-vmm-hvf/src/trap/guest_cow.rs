@@ -457,6 +457,7 @@ pub(crate) fn settle_one(
         old,
         fragments,
         retirement,
+        sole_owner: _,
     } = HvfVmState::cow_inventory_split_shape(
         &state.frame_inventory.ledger.lock(),
         old_physical_ipa,
