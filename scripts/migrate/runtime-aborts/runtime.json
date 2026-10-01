@@ -2476,21 +2476,10 @@
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
       "function": "run_threaded_loop_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "af3a615c24de93762245ec2d4bc302fe84856e2bf2f04bc53d129f27b2b92eda",
+      "fingerprint": "55fe70528492c118ae7045518e2881de60ea3fe00a5b530fdfc5943b161398fa",
       "verdict": "carrier_fault",
       "failure_domain": "threaded_loop::root_activation",
       "rationale": "The first-root activation callback lost the prepared publication bundle it exclusively owned; continuing would publish a ready kernel without its lifecycle and frame commitments.",
-      "sink": "fatal",
-      "domain": "threaded_loop::root_activation"
-    },
-    {
-      "file": "crates/carrick-runtime/src/threaded_loop.rs",
-      "function": "run_threaded_loop_inner",
-      "ordinal_in_function": 2,
-      "fingerprint": "af3a615c24de93762245ec2d4bc302fe84856e2bf2f04bc53d129f27b2b92eda",
-      "verdict": "carrier_fault",
-      "failure_domain": "threaded_loop::root_activation",
-      "rationale": "The activated root could not recapture its exact kernel context before terminal-route publication; continuing could bind carrier-wide TTY service to the wrong task generation.",
       "sink": "fatal",
       "domain": "threaded_loop::root_activation"
     },
