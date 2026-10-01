@@ -50,6 +50,44 @@ pub(crate) enum ZoneCtl {
     HostHalf(HostHalfReason),
 }
 
+/// Why an epoll description has no zone record and keeps every item in
+/// its host half (EL1 then forwards each wait on it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZoneEpollRefusal {
+    /// `CARRICK_EL1_EPOLL=0` (exact): the bisection hatch.
+    Disabled,
+    /// No shared IPC authority serves this description's file table.
+    NoAuthority,
+    /// The shared record's object or description stores are exhausted.
+    Exhausted,
+}
+
+/// Whether `CARRICK_EL1_EPOLL` (its value, if set) leaves zone epolls on:
+/// on unless exactly `0`.
+fn hatch_allows(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim() != "0")
+}
+
+fn hatch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| hatch_allows(std::env::var("CARRICK_EL1_EPOLL").ok().as_deref()))
+}
+
+/// Admit a zone record for a new epoll description: the record, or why the
+/// description keeps every item in the host half.
+pub(crate) fn admit(
+    owner: Option<Arc<HostIpc>>,
+) -> Result<(Arc<HostIpc>, IpcObjectHandle), ZoneEpollRefusal> {
+    if !hatch_enabled() {
+        return Err(ZoneEpollRefusal::Disabled);
+    }
+    let owner = owner.ok_or(ZoneEpollRefusal::NoAuthority)?;
+    let object = owner
+        .create_epoll()
+        .map_err(|_| ZoneEpollRefusal::Exhausted)?;
+    Ok((owner, object))
+}
+
 /// The zone record of one epoll description.
 pub(crate) struct ZoneEpoll {
     owner: Arc<HostIpc>,
@@ -83,14 +121,14 @@ pub(crate) struct ZoneHarvest {
 impl ZoneEpoll {
     /// Create the record for a new epoll description. `kqueue` and
     /// `wait_queue` are the description's host wake channels (weak: the
-    /// description owns them). `None`: no IPC authority, or its stores are
+    /// description owns them). Refused when the description stores are
     /// exhausted; the epoll then keeps every item in the host half.
     pub(crate) fn create(
         owner: &Arc<HostIpc>,
         object: IpcObjectHandle,
         kqueue: Weak<crate::dispatch::EpollKqueue>,
         wait_queue: Weak<crate::kernel::WaitQueue>,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Arc<Self>, ZoneEpollRefusal> {
         let backing = IpcBacking::Epoll { object }.encode();
         let lifetime = match owner.admit_description(fd::Description::new(
             backing,
@@ -100,7 +138,7 @@ impl ZoneEpoll {
             Ok(lifetime) => lifetime,
             Err(_) => {
                 let _ = owner.region().epoll_destroy(object, &HostLockWait);
-                return None;
+                return Err(ZoneEpollRefusal::Exhausted);
             }
         };
         let publisher: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -113,7 +151,7 @@ impl ZoneEpoll {
         });
         let primer: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         owner.register_host_waker(object, &publisher, &primer);
-        Some(Arc::new(Self {
+        Ok(Arc::new(Self {
             owner: Arc::clone(owner),
             object,
             lifetime: Mutex::new(Some(lifetime)),
@@ -313,3 +351,17 @@ pub(crate) fn detach_member_file(member: &ZoneMember) {
         .epoll_detach_file(member.object, member.file_key, &HostLockWait);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::hatch_allows;
+
+    #[test]
+    fn epoll_hatch_is_on_unless_exactly_zero() {
+        assert!(hatch_allows(None));
+        assert!(hatch_allows(Some("1")));
+        assert!(hatch_allows(Some("")));
+        assert!(hatch_allows(Some("00")));
+        assert!(!hatch_allows(Some("0")));
+        assert!(!hatch_allows(Some(" 0 ")));
+    }
+}

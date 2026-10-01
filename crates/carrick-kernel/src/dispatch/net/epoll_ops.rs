@@ -51,21 +51,25 @@ fn new_epoll_description(
         crate::event_mux::make_event_multiplexer().map_err(|_| crate::linux_abi::LINUX_EMFILE)?;
     let _ = mux.register_user(0);
     let kqueue = Arc::new(crate::dispatch::EpollKqueue::new(mux, wake_registry));
-    let object = owner.and_then(|owner| owner.create_epoll().ok().map(|object| (owner, object)));
+    // A refusal (the `CARRICK_EL1_EPOLL=0` hatch, no IPC authority, full
+    // stores) keeps every item in the host half; EL1 forwards its waits.
+    let object = super::epoll_zone::admit(owner);
     let wait_queue = Arc::new(match &object {
-        Some((owner, object)) => crate::kernel::WaitQueue::with_subscription(
+        Ok((owner, object)) => crate::kernel::WaitQueue::with_subscription(
             super::epoll_zone::ZoneEpoll::queue_subscription(Arc::clone(owner), *object),
         ),
-        None => crate::kernel::WaitQueue::new(),
+        Err(_) => crate::kernel::WaitQueue::new(),
     });
-    let zone = object.and_then(|(owner, object)| {
-        super::epoll_zone::ZoneEpoll::create(
-            &owner,
-            object,
-            Arc::downgrade(&kqueue),
-            Arc::downgrade(&wait_queue),
-        )
-    });
+    let zone = object
+        .and_then(|(owner, object)| {
+            super::epoll_zone::ZoneEpoll::create(
+                &owner,
+                object,
+                Arc::downgrade(&kqueue),
+                Arc::downgrade(&wait_queue),
+            )
+        })
+        .ok();
     Ok(OpenDescription::Epoll {
         interest: HashMap::new(),
         synthetic_interest_count: 0,
