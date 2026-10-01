@@ -2529,6 +2529,141 @@ fn el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation() {
     );
 }
 
+/// Contract `kernel.mm.tlb-maintenance-budget` (required invalidations): a
+/// running thread's `mprotect` restriction, `mprotect` restore and `munmap`
+/// of a touched page each need a TLB invalidation, and none may cost a host
+/// TLB-maintenance round trip (exit class `Maintenance`): the thread's own
+/// vCPU issues it, broadcast, on its way back to EL0. Measured as the slope
+/// of maintenance exits between two round counts of `tlb-edit-budget` (a
+/// two-thread MM; three required invalidations per round), so process start
+/// and exit cancel.
+#[test]
+fn el1_tlb_running_thread_mm_edits_cost_no_maintenance() {
+    const ROUNDS: [u64; 2] = [4, 36];
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for rounds in ROUNDS {
+        let measured = run_fixture(
+            &carrier,
+            &["tlb-edit-budget", &rounds.to_string()],
+            Duration::from_secs(120),
+        );
+        let maintenance =
+            measured.exit_classes[carrick_el1_abi::HostExitClass::Maintenance as usize];
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched tlb-edit-budget rounds={rounds} maintenance_exits={maintenance} exits={} {}",
+            measured.exits,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            stdout.contains(&format!("tlb-edit-budget rounds={rounds} errors=0 ok=true")),
+            "{stdout:?}"
+        );
+        runs.push(maintenance);
+    }
+    let added = runs[1].saturating_sub(runs[0]);
+    println!(
+        "el1-sched tlb-edit-budget maintenance {}->{} (+{added}) over {} added rounds",
+        runs[0],
+        runs[1],
+        ROUNDS[1] - ROUNDS[0]
+    );
+    assert_eq!(
+        added,
+        0,
+        "{} added rounds of required invalidations cost {added} host TLB-maintenance exits \
+         (budget: 0)",
+        ROUNDS[1] - ROUNDS[0]
+    );
+}
+
+/// The stale-translation half of the TLB-maintenance contract with more than
+/// one other vCPU running the MM: workers on guest CPUs 1 and 2 keep a page
+/// hot while CPU 0 `mprotect`s it read-only and `munmap`s it. Every worker's
+/// next write and next read must fault.
+#[test]
+fn el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation_on_any_thread() {
+    const ROUNDS: u64 = 300;
+    const WORKERS: u64 = 2;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &[
+            "tlb-stale-threads",
+            &ROUNDS.to_string(),
+            &WORKERS.to_string(),
+        ],
+        Duration::from_secs(120),
+    );
+    let stdout = measured.result.stdout_utf8();
+    println!(
+        "el1-sched tlb-stale-threads exits={} maintenance_exits={} {}",
+        measured.exits,
+        measured.exit_classes[carrick_el1_abi::HostExitClass::Maintenance as usize],
+        stdout.trim()
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        stdout.contains(&format!(
+            "tlb-stale-threads rounds={ROUNDS} workers={WORKERS} expected_faults={} \
+             faults={:?} stale=0 errors=0 timeouts=0 ok=true",
+            2 * ROUNDS,
+            [2 * ROUNDS; WORKERS as usize]
+        )),
+        "a stale stage-1 translation survived a cross-vCPU mm edit: {stdout:?}"
+    );
+}
+
+/// Fork and exec around required invalidations: a writable translation a
+/// worker on CPU 1 holds must not survive the fork's copy-on-write arming
+/// (its post-fork write must not reach the child), and a page unmapped just
+/// before `execve` must not stay reachable from CPU 1 in the new image.
+#[test]
+fn el1_tlb_fork_and_exec_leave_no_stale_translation() {
+    const ROUNDS: u64 = 50;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let fork = run_fixture(
+        &carrier,
+        &["tlb-fork-stale", &ROUNDS.to_string()],
+        Duration::from_secs(120),
+    );
+    let stdout = fork.result.stdout_utf8();
+    println!(
+        "el1-sched tlb-fork-stale exits={} {}",
+        fork.exits,
+        stdout.trim()
+    );
+    assert!(fork.result.success(), "{}", describe(&fork));
+    assert!(
+        stdout.contains(&format!(
+            "tlb-fork-stale rounds={ROUNDS} child_failures=0 parent_failures=0 errors=0 \
+             timeouts=0 ok=true"
+        )),
+        "{stdout:?}"
+    );
+    let exec = run_fixture(&carrier, &["tlb-exec-stale"], Duration::from_secs(120));
+    let stdout = exec.result.stdout_utf8();
+    println!(
+        "el1-sched tlb-exec-stale exits={} {}",
+        exec.exits,
+        stdout.trim()
+    );
+    assert!(exec.result.success(), "{}", describe(&exec));
+    assert!(
+        stdout
+            .contains("tlb-exec-stale faults=1 stale_reads=0 seen=0x0 errors=0 timeouts=0 ok=true"),
+        "{stdout:?}"
+    );
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PermissionRun {
     pages: u64,
