@@ -2305,6 +2305,12 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 new_ipa,
                 ..
             } => {
+                // A page with no leaf (no output, not valid) cannot contradict
+                // the compound's backing: the host's COW span keeps it, and
+                // the repoint leaves it empty, as the host lane does.
+                if descriptor & VALID == 0 && descriptor & PA_MASK_4KIB == 0 {
+                    return Ok(descriptor);
+                }
                 if descriptor & PA_MASK_4KIB != old_ipa.raw() + (base - va) {
                     return Err(DescriptorRefusal::WrongBacking);
                 }
@@ -4294,6 +4300,76 @@ mod tests {
                     (destination + index as u64 * PT_PAGE) | expected
                 );
             }
+        }
+
+        /// The host's COW span keeps a page with no leaf at all (an untouched
+        /// page of a sparse mapping): it cannot contradict the compound's
+        /// backing, and the host lane's repoint leaves it empty. The guest
+        /// CowRepoint must too, not refuse the compound as WrongBacking
+        /// (cpython-threading lane-on: "prepare guest COW compound:
+        /// Refused(WrongBacking)").
+        #[test]
+        fn cow_repoint_leaves_a_page_without_a_leaf_empty() {
+            let flags = (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL | UXN;
+            let destination = 0x009d_0000_0000;
+            for (access, flags) in [
+                (
+                    CowRepointAccess::User {
+                        writable_pages: 0b0011,
+                    },
+                    flags,
+                ),
+                (
+                    CowRepointAccess::Kernel,
+                    crate::aarch64::KERNEL_PAGE_FLAGS | NON_GLOBAL,
+                ),
+            ] {
+                let words = fixture(3);
+                words.set(leaf_pa(VA), IPA | flags);
+                words.set(leaf_pa(VA + PT_PAGE), (IPA + PT_PAGE) | flags);
+                applied(run(
+                    &words,
+                    DescriptorOp::CowRepoint {
+                        access,
+                        va: VA,
+                        len: 4 * PT_PAGE,
+                        old_ipa: SubstrateGpa(IPA),
+                        new_ipa: SubstrateGpa(destination),
+                        backing: backing(80),
+                    },
+                    &TableGrants::NONE,
+                ));
+                for index in 0..2 {
+                    assert_eq!(
+                        words.get(leaf_pa(VA + index * PT_PAGE)) & PA_MASK_4KIB,
+                        destination + index * PT_PAGE
+                    );
+                }
+                for index in 2..4 {
+                    assert_eq!(words.get(leaf_pa(VA + index * PT_PAGE)), 0, "{access:?}");
+                }
+            }
+            // A leaf naming another frame still refuses the compound.
+            let words = fixture(3);
+            words.set(leaf_pa(VA), IPA | flags);
+            words.set(leaf_pa(VA + PT_PAGE), (IPA + 0x10_0000) | flags);
+            assert_eq!(
+                run(
+                    &words,
+                    DescriptorOp::CowRepoint {
+                        access: CowRepointAccess::User {
+                            writable_pages: 0b0011,
+                        },
+                        va: VA,
+                        len: 2 * PT_PAGE,
+                        old_ipa: SubstrateGpa(IPA),
+                        new_ipa: SubstrateGpa(destination),
+                        backing: backing(80),
+                    },
+                    &TableGrants::NONE,
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking)
+            );
         }
 
         #[test]
