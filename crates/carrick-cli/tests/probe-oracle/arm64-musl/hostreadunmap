@@ -1,0 +1,16 @@
+cf54919b82a740d0
+write_called=true
+write_made_progress=true
+write_foreign_bytes=0
+write_unexpected_bytes=0
+write_unexpected_errno=0
+write_length_mismatch=0
+pwritev_called=true
+pwritev_made_progress=true
+pwritev_foreign_bytes=0
+pwritev_unexpected_bytes=0
+pwritev_unexpected_errno=0
+pwritev_length_mismatch=0
+remapper_cycled=true
+remapper_failures=0
+neighbor_clean_exit=true
