@@ -53,6 +53,8 @@ fn test_hardware_kick(raw_vcpu_id: u64) -> super::ExactHardwareKick {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Step {
     Syscalls(usize),
+    /// Exits taken mid-EL1 (a stage-1 COW fault resolved), resumed in place.
+    ResumeEl1(usize),
     ComputeUntilKick,
     HostWait,
     Block,
@@ -925,6 +927,10 @@ impl PersistentExecutor for FakeExecutor {
                     steps.push_front(Step::Syscalls(remaining - 1));
                     Step::Syscalls(remaining)
                 }
+                Step::ResumeEl1(remaining) if remaining > 1 => {
+                    steps.push_front(Step::ResumeEl1(remaining - 1));
+                    Step::ResumeEl1(remaining)
+                }
                 other => other,
             }
         };
@@ -932,6 +938,7 @@ impl PersistentExecutor for FakeExecutor {
         self.system_ns = self.system_ns.saturating_add(3_000);
         match step {
             Step::Syscalls(_) => Ok(ExecutorExit::Syscall),
+            Step::ResumeEl1(_) => Ok(ExecutorExit::ResumeEl1),
             Step::HostWait => {
                 let guard = submission.begin_host_wait()?;
                 binding
@@ -4088,6 +4095,50 @@ fn queued_task_preempts_resident_syscall_loop_at_boundary() {
     assert_eq!(second_binding.progress.load(Ordering::SeqCst), 1);
     assert_eq!(report.created(), 1);
     assert_eq!(report.destroyed(), 1);
+}
+
+/// An exit taken while EL1 is mid-operation (a stage-1 COW fault EL1 code
+/// hit, resolved) is not a thread boundary: the slot's in-guest scheduler
+/// state (its switched-in record) belongs to that operation, so the task is
+/// resumed on its vCPU at once, never preempted and reloaded later (which
+/// found the slot still holding the record: `EL1 zone slot 2 still held
+/// threads when a task was loaded on it`, pidtaskdomain).
+#[test]
+fn queued_task_never_preempts_a_task_stopped_mid_el1() {
+    let (kernel, first) = bootstrap(14_026);
+    let second = sibling(&kernel, &first, 24_026);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+
+    let first_entered = Arc::new(Barrier::new(2));
+    let first_resume = Arc::new(Barrier::new(2));
+    let first_binding = FakeBinding::new(33, [Step::ResumeEl1(10_000), Step::Exit]);
+    *first_binding.entered.lock() = Some(Arc::clone(&first_entered));
+    *first_binding.resume.lock() = Some(Arc::clone(&first_resume));
+
+    let second_entered = Arc::new(Barrier::new(2));
+    let second_binding = FakeBinding::new(34, [Step::Exit]);
+    *second_binding.entered.lock() = Some(Arc::clone(&second_entered));
+
+    factory.install(&first, Arc::clone(&first_binding));
+    factory.install(&second, Arc::clone(&second_binding));
+
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+    let first_authority = enqueue_root(&scheduler, &first, publish(&first, 33));
+
+    first_entered.wait();
+    let second_authority = enqueue_root(&scheduler, &second, publish(&second, 34));
+    first_resume.wait();
+
+    second_entered.wait();
+    assert_eq!(
+        first_binding.progress.load(Ordering::SeqCst),
+        10_001,
+        "task B entered only after task A left EL1 (its exit)"
+    );
+
+    drop((first_authority, second_authority));
+    pool.shutdown().expect("clean shutdown");
 }
 
 #[test]

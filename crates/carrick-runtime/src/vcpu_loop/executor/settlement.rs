@@ -65,6 +65,11 @@ impl<B: PersistentTaskBinding> RunnableTask<'_, B> {
 #[derive(Debug)]
 pub(crate) enum ExecutorExit {
     Syscall,
+    /// The vCPU stopped while EL1 code was mid-operation (a stage-1 COW
+    /// fault EL1 hit, now resolved): not a thread boundary. The task must
+    /// be re-entered on this vCPU at once: the slot's in-guest scheduler
+    /// state belongs to that EL1 operation until it leaves EL1.
+    ResumeEl1,
     Blocked(BlockedReason),
     BlockedContinuation {
         continuation: Box<carrick_kernel::kernel::continuation::BlockedContinuation>,
@@ -421,6 +426,7 @@ pub(crate) fn executor_boundary_event_code(exit: &ExecutorExit) -> i32 {
         ExecutorExit::Exited => 7,
         ExecutorExit::InvalidState => 8,
         ExecutorExit::Syscall => 0,
+        ExecutorExit::ResumeEl1 => 9,
     }
 }
 

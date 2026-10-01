@@ -4121,7 +4121,10 @@ where
                     engine.resolve_frame_cow_fault(syndrome, far)?
                 {
                     self.state.note_cow_resolution(far, syndrome, translation)?;
-                    return Ok(executor::ExecutorExit::Syscall);
+                    // EL1 stopped mid-operation and its slot's zone state is
+                    // that operation's: re-enter now, never a preemption
+                    // point (a reload found the slot still holding it).
+                    return Ok(executor::ExecutorExit::ResumeEl1);
                 }
                 return Err(RuntimeError::Trap(TrapError::GuestAtEl1 {
                     esr_el1: syndrome,

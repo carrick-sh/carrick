@@ -674,6 +674,11 @@ where
                     ));
                 }
             };
+            // EL1 is mid-operation on this vCPU: re-enter it now. Neither a
+            // syscall boundary nor a preemption point.
+            if !is_consumed && matches!(exit, ExecutorExit::ResumeEl1) {
+                continue 'quantum;
+            }
             if !is_consumed && matches!(exit, ExecutorExit::Syscall) {
                 scheduler.note_syscall_boundary(&running);
                 receipts.record(
@@ -1348,7 +1353,9 @@ where
                     }
                     settled
                 }
-                ExecutorExit::Syscall | ExecutorExit::InvalidState => unreachable!(),
+                ExecutorExit::Syscall | ExecutorExit::ResumeEl1 | ExecutorExit::InvalidState => {
+                    unreachable!()
+                }
             },
         };
         // A guest `sched_yield` (or a preemption tick) requeued this task at
