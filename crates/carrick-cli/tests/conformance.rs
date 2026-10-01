@@ -2925,10 +2925,11 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// waiter woken by a sibling thread's write. `clockcoarsevdso` covers the
 /// vDSO COARSE clocks and vDSO/syscall `clock_getres` agreement.
 /// `brkbeyondbreak` covers the unmapped heap past the break, before and after
-/// execve, bringing the inventory to 546 sources: 517 conformance sources
-/// (494 generic, 23 dedicated), 28 performance sources, and one helper. Both
-/// libc lanes gate 1034 rows.
-const PROBE_SOURCE_COUNT: usize = 546;
+/// execve. `childrusage` covers wait4/RUSAGE_CHILDREN CPU usage of reaped
+/// children, bringing the inventory to 547 sources: 518 conformance sources
+/// (495 generic, 23 dedicated), 28 performance sources, and one helper. Both
+/// libc lanes gate 1036 rows.
+const PROBE_SOURCE_COUNT: usize = 547;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4701,9 +4702,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 494);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 517);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1034);
+    assert_eq!(generic.len(), 495);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 518);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1036);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
