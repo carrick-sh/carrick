@@ -1475,6 +1475,12 @@ impl<'a> Stage1Editor<'a> {
         )
     }
 
+    /// See [`PageTableManager::clear_el1_cow_arm`].
+    pub fn clear_el1_cow_arm(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+        self.manager
+            .clear_el1_cow_arm(va, len, self.arena_source.as_deref_mut())
+    }
+
     pub fn repoint_preserving_attributes(
         &mut self,
         guest_va: u64,

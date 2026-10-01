@@ -3805,6 +3805,13 @@ impl HvfTaskState {
                                         "repoint HVPatch COW stage-1 compound: {error:?}"
                                     ))
                                 })?;
+                            // The span is private now: its EL1 COW arm goes
+                            // with the host record this commit disarms.
+                            manager.clear_el1_cow_arm(span.va, span.len).map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "disarm EL1 COW tags of the HVPatch COW compound: {error:?}"
+                                ))
+                            })?;
                             let span_end = span.va.saturating_add(span.len as u64);
                             let mut page_va = span.va & !(PAGE_SIZE - 1);
                             while page_va < span_end {

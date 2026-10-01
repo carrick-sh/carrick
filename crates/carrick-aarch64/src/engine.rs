@@ -854,6 +854,10 @@ struct ParentForkCowRollback {
     /// per newly armed range. Nothing was stored; rollback returns their
     /// grants, and commit refuses unless the runtime took them for EL1.
     guest_arm: Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>,
+    /// The runtime took the guest arm for EL1: the parent's leaves are armed,
+    /// so a failed fork keeps the armed-range record that matches them (an
+    /// armed span only costs a private copy on the next write).
+    guest_arm_taken: bool,
 }
 
 fn aarch64_task_state_from_snapshot(
@@ -4816,6 +4820,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             self.pending_process_fork = Some(ParentForkCowRollback {
                 armed_ranges: parent_armed_snapshot,
                 guest_arm,
+                guest_arm_taken: false,
             });
             emit_stage(
                 HvpatchForkProcessSpecStagePhase::ParentCowPublication,
@@ -4941,6 +4946,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             self.pending_process_fork = Some(ParentForkCowRollback {
                 armed_ranges: parent_armed_snapshot,
                 guest_arm: Vec::new(),
+                guest_arm_taken: false,
             });
             emit_stage(
                 HvpatchForkProcessSpecStagePhase::ParentCowPublication,
@@ -5003,7 +5009,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     ) -> Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
         self.pending_process_fork
             .as_mut()
-            .map(|pending| std::mem::take(&mut pending.guest_arm))
+            .map(|pending| {
+                let arm = std::mem::take(&mut pending.guest_arm);
+                pending.guest_arm_taken |= !arm.is_empty();
+                arm
+            })
             .unwrap_or_default()
     }
 
@@ -5011,6 +5021,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };
+        if rollback.guest_arm_taken {
+            // EL1 armed the parent's leaves: keep the record that matches
+            // them, so every later guest COW of them settles.
+            return Ok(());
+        }
         if !rollback.guest_arm.is_empty() {
             // Nothing reached the live tables: return the grants and restore
             // the backend's armed-range metadata.

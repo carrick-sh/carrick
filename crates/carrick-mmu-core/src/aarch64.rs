@@ -5598,6 +5598,40 @@ impl PageTableManager {
     /// The caller has already established that these exact semantic pages are
     /// writable; preserving UXN/PXN avoids reintroducing execute permission on
     /// a page whose post-fork `mprotect` state differs from its boot mapping.
+    /// Clear the EL1 fork-COW arm of every valid EL1-private leaf in
+    /// `[va, va + len)`, preserving everything else. A host-lane frame COW
+    /// that made the span private calls this after its repoint: the arm is
+    /// EL1's authority to copy on the guest lane, so a stale one would let
+    /// EL1 copy a span the host already resolved (and disarmed) once the MM
+    /// moves to the guest lane. Returns whether a descriptor changed.
+    pub fn clear_el1_cow_arm(
+        &mut self,
+        va: u64,
+        len: usize,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<bool, PageTableError> {
+        const FOUR_KIB: u64 = 1 << 12;
+        if descriptor_txn::copy_window::overlaps_cow_copy_window(va, len as u64) {
+            return Err(PageTableError::CarrickOwnedWindow);
+        }
+        let pages = (len as u64).div_ceil(FOUR_KIB);
+        let mut changed = false;
+        for index in 0..pages {
+            let page_va = (va & !(FOUR_KIB - 1)) + index * FOUR_KIB;
+            let (loc, level) = self.leaf_offset(page_va, true, source.as_deref_mut())?;
+            if level != 3 {
+                return Err(PageTableError::BadAddress);
+            }
+            let descriptor = self.read_desc(loc)?;
+            if !el1_cow(descriptor) {
+                continue;
+            }
+            self.write_desc(loc, descriptor & !SW_EL1_COW)?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     pub fn set_writable_preserving_attributes(
         &mut self,
         va: u64,
