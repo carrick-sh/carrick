@@ -440,7 +440,8 @@ mod tests {
         }
         impl PreparedHostReservations for View {
             fn lock(&self, _mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-                self.table.lock(self.index, self.mm)
+                self.table
+                    .lock_waiting(self.index, self.mm, &crate::el1_zone::HostLockWait)
             }
         }
         let table: Arc<SharedReservations> = Arc::from(shared());
