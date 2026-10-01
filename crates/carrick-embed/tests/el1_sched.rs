@@ -2441,6 +2441,94 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
     }
 }
 
+/// Contract `kernel.mm.tlb-maintenance-budget` (host-lane stage-1 editing):
+/// publishing an EL1 frame grant over a range with no valid translation needs
+/// no TLB invalidation (AArch64 never caches an invalid translation), so first
+/// touches add no TLB-maintenance host round trips (`hvc #1`, exit class
+/// `Maintenance`). Measured as the slope of maintenance exits against frame
+/// grants between two scales of `mapping-retirement` (map, touch every page,
+/// unmap), so process start and exit cancel. Before: one maintenance exit per
+/// grant publication.
+#[test]
+fn el1_tlb_frame_grant_publication_costs_no_maintenance() {
+    const SCALES: [u64; 2] = [256, 2048];
+    const ROUNDS: u64 = 4;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for pages in SCALES {
+        let before = carrick_embed::el1_frame_grant_stats();
+        let measured = run_fixture(
+            &carrier,
+            &[
+                "mapping-retirement",
+                &pages.to_string(),
+                &ROUNDS.to_string(),
+            ],
+            Duration::from_secs(120),
+        );
+        let after = carrick_embed::el1_frame_grant_stats();
+        let grants = after.grants_succeeded - before.grants_succeeded;
+        let maintenance =
+            measured.exit_classes[carrick_el1_abi::HostExitClass::Maintenance as usize];
+        println!(
+            "el1-sched tlb-budget mapping-retirement pages={pages} rounds={ROUNDS} grants={grants} maintenance_exits={maintenance} exits={}",
+            measured.exits
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(grants > 0, "workload published no EL1 frame grants");
+        runs.push((grants, maintenance));
+    }
+    let (g0, m0) = runs[0];
+    let (g1, m1) = runs[1];
+    let added = m1.saturating_sub(m0);
+    println!(
+        "el1-sched tlb-budget grants {g0}->{g1}: maintenance {m0}->{m1} (+{added}) over {ROUNDS} rounds"
+    );
+    // The larger scale's munmap leaves EL1 for the host and retires valid
+    // leaves: one invalidation per round is required, and that is all the
+    // added work may be. Each added grant must cost none.
+    assert!(
+        added <= ROUNDS,
+        "{} added frame grants cost {added} TLB-maintenance exits (budget: {ROUNDS}, one per \
+         host munmap); an invalid->valid publication needs none",
+        g1 - g0
+    );
+}
+
+/// Correctness half of the TLB-maintenance contract: a page a worker on one
+/// vCPU keeps hot must not stay reachable through a stale translation after
+/// another vCPU `mprotect`s it read-only or `munmap`s it. Every round's write
+/// probe and read probe must fault exactly once, and the read after `munmap`
+/// must see a fresh zero page.
+#[test]
+fn el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation() {
+    const ROUNDS: u64 = 300;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["cross-vcpu-stale", &ROUNDS.to_string()],
+        Duration::from_secs(120),
+    );
+    let stdout = measured.result.stdout_utf8();
+    println!(
+        "el1-sched cross-vcpu-stale exits={} maintenance_exits={} {}",
+        measured.exits,
+        measured.exit_classes[carrick_el1_abi::HostExitClass::Maintenance as usize],
+        stdout.trim()
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        stdout.contains(&format!(
+            "cross-vcpu-stale rounds={ROUNDS} write_faults={ROUNDS} read_faults={ROUNDS} stale_reads=0 errors=0 timeouts=0 ok=true"
+        )),
+        "a stale stage-1 translation survived a cross-vCPU mm edit: {stdout:?}"
+    );
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PermissionRun {
     pages: u64,
