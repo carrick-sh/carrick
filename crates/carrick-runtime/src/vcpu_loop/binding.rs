@@ -3430,589 +3430,617 @@ where
             return Ok(executor::ExecutorExit::Exited);
         }
         drop(self.slot_wait.take());
-        if self.state.guest_execution.is_none() {
-            drop(self.registration_wait.take());
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let pending_control_quantum = self.control_quantum()?.is_some();
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let pending_control_quantum = false;
-            let registration_wake_mode =
-                registration_wake_uses_control(&self.phase, pending_control_quantum);
-            let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "persistent registration admission lost exact Kernel context".to_owned(),
+        // EL1 stopped mid-operation on this vCPU (a stage-1 COW fault EL1
+        // took, resolved by the host): re-enter it before ANY host boundary
+        // work. Admission, control quanta, quiesce and job-control suspension,
+        // kernel-wake signals: each would act on a thread whose zone record
+        // EL1 still holds on-CPU mid-operation, and a suspension unloads it
+        // (the reload then finds the slot still holding it).
+        if !engine.el1_operation_suspended() {
+            if self.state.guest_execution.is_none() {
+                drop(self.registration_wait.take());
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let pending_control_quantum = self.control_quantum()?.is_some();
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                let pending_control_quantum = false;
+                let registration_wake_mode =
+                    registration_wake_uses_control(&self.phase, pending_control_quantum);
+                let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "persistent registration admission lost exact Kernel context".to_owned(),
+                    )
+                })?;
+                let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "persistent registration admission lost shared scheduler".to_owned(),
+                    )
+                })?;
+                let scheduler = runtime.continuation_services(context.kernel()).0;
+                let wake_registration = registration_wake_callback(
+                    scheduler,
+                    context.thread().key(),
+                    registration_wake_mode,
+                );
+                let slot = carrick_kernel::kernel::execution_slot_for_current_thread(
+                    engine.mailbox_slot(),
                 )
-            })?;
-            let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "persistent registration admission lost shared scheduler".to_owned(),
-                )
-            })?;
-            let scheduler = runtime.continuation_services(context.kernel()).0;
-            let wake_registration = registration_wake_callback(
-                scheduler,
-                context.thread().key(),
-                registration_wake_mode,
-            );
-            let slot =
-                carrick_kernel::kernel::execution_slot_for_current_thread(engine.mailbox_slot())
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            let (participation, enrollment) = loop {
-                match enter_mm_executor_then_register(
-                    &self.kernel.dispatcher,
-                    self.state.kernel_thread.as_ref().map(Arc::clone),
-                    Arc::clone(&self.state.kicker),
-                    self.state.this_tid,
-                    slot,
-                    || {
-                        self.state
-                            .subscribe_register_vcpu(engine, Arc::clone(&wake_registration))
-                    },
-                ) {
-                    Ok(entered) => break entered,
-                    Err(carrick_kernel::kernel::MmOccupancyError::SlotBusy { .. }) => {
-                        if let Some(exit) = self.park_for_slot_release(slot)? {
-                            return Ok(exit);
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                let (participation, enrollment) = loop {
+                    match enter_mm_executor_then_register(
+                        &self.kernel.dispatcher,
+                        self.state.kernel_thread.as_ref().map(Arc::clone),
+                        Arc::clone(&self.state.kicker),
+                        self.state.this_tid,
+                        slot,
+                        || {
+                            self.state
+                                .subscribe_register_vcpu(engine, Arc::clone(&wake_registration))
+                        },
+                    ) {
+                        Ok(entered) => break entered,
+                        Err(carrick_kernel::kernel::MmOccupancyError::SlotBusy { .. }) => {
+                            if let Some(exit) = self.park_for_slot_release(slot)? {
+                                return Ok(exit);
+                            }
+                        }
+                        Err(error) => {
+                            return Err(RuntimeError::Configuration(error.to_string()).into());
                         }
                     }
-                    Err(error) => return Err(RuntimeError::Configuration(error.to_string()).into()),
-                }
-            };
-            self.state.guest_execution = Some(participation);
-            match enrollment {
-                carrick_hal::VcpuRegistrationEnrollment::Registered => {}
-                carrick_hal::VcpuRegistrationEnrollment::Waiting { subscription, .. } => {
-                    self.registration_wait = Some(subscription);
-                    return Ok(self.suspend(
-                        HvpatchLoopSuspension::InitialAdmission,
-                        executor::ExecutorExit::Blocked(
-                            carrick_kernel::kernel::objects::BlockedReason::HostWait,
-                        ),
-                    ));
+                };
+                self.state.guest_execution = Some(participation);
+                match enrollment {
+                    carrick_hal::VcpuRegistrationEnrollment::Registered => {}
+                    carrick_hal::VcpuRegistrationEnrollment::Waiting { subscription, .. } => {
+                        self.registration_wait = Some(subscription);
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::InitialAdmission,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
                 }
             }
-        }
 
-        // The task is loaded on this vCPU: it occupies the vCPU's execution
-        // slot with its MM from here until the executor unloads it
-        // (`end_residency`), even across syscall boundaries that preempt it.
-        if self.state.guest_execution.is_some() {
-            let slot =
-                carrick_kernel::kernel::execution_slot_for_current_thread(engine.mailbox_slot())
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            loop {
-                let Some(participation) = self.state.guest_execution.as_mut() else {
-                    carrick_fatal!(
-                        "vcpu_loop::slot_admission",
-                        "MM participation vanished during slot admission"
-                    );
-                };
-                let admission = participation.occupy_slot(slot);
-                match admission {
-                    Ok(()) => break,
-                    Err(carrick_kernel::kernel::MmOccupancyError::SlotBusy { .. }) => {
-                        if let Some(exit) = self.park_for_slot_release(slot)? {
-                            return Ok(exit);
+            // The task is loaded on this vCPU: it occupies the vCPU's execution
+            // slot with its MM from here until the executor unloads it
+            // (`end_residency`), even across syscall boundaries that preempt it.
+            if self.state.guest_execution.is_some() {
+                let slot = carrick_kernel::kernel::execution_slot_for_current_thread(
+                    engine.mailbox_slot(),
+                )
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                loop {
+                    let Some(participation) = self.state.guest_execution.as_mut() else {
+                        carrick_fatal!(
+                            "vcpu_loop::slot_admission",
+                            "MM participation vanished during slot admission"
+                        );
+                    };
+                    let admission = participation.occupy_slot(slot);
+                    match admission {
+                        Ok(()) => break,
+                        Err(carrick_kernel::kernel::MmOccupancyError::SlotBusy { .. }) => {
+                            if let Some(exit) = self.park_for_slot_release(slot)? {
+                                return Ok(exit);
+                            }
+                        }
+                        Err(error) => {
+                            return Err(RuntimeError::Configuration(error.to_string()).into());
                         }
                     }
-                    Err(error) => return Err(RuntimeError::Configuration(error.to_string()).into()),
+                }
+                // The first load of an address space that guest EL1 could
+                // install itself publishes it (its roots, its gate following
+                // this MM's fence), so EL1 can switch a vCPU running another
+                // process's thread to this process's threads without an exit.
+                if let Some(binding) = control.binding {
+                    let Some(participation) = self.state.guest_execution.as_ref() else {
+                        carrick_fatal!(
+                            "vcpu_loop::slot_admission",
+                            "admitted MM vanished before publication"
+                        );
+                    };
+                    binding.publish_address_space(|lease_ttbr0| {
+                        let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
+                        (ttbr0 == lease_ttbr0)
+                            .then(|| participation.publish_address_space(ttbr0, ttbr1))
+                            .flatten()
+                    });
                 }
             }
-            // The first load of an address space that guest EL1 could
-            // install itself publishes it (its roots, its gate following
-            // this MM's fence), so EL1 can switch a vCPU running another
-            // process's thread to this process's threads without an exit.
-            if let Some(binding) = control.binding {
-                let Some(participation) = self.state.guest_execution.as_ref() else {
-                    carrick_fatal!(
-                        "vcpu_loop::slot_admission",
-                        "admitted MM vanished before publication"
-                    );
-                };
-                binding.publish_address_space(|lease_ttbr0| {
-                    let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
-                    (ttbr0 == lease_ttbr0)
-                        .then(|| participation.publish_address_space(ttbr0, ttbr1))
-                        .flatten()
-                });
-            }
-        }
 
-        // Exec/exit can force a blocked vfork parent runnable solely so it can
-        // retire its exact logical result. Do not resume the old continuation
-        // or touch guest state after that terminal ownership transition.
-        let exec_finish =
-            thread_should_finish_for_exec_replacement(&self.state.registry, self.state.this_tid);
-        if !self.phase.is_terminal_transition() && (self.kernel.process_exiting() || exec_finish) {
-            self.state.trace_hvpatch_thread_terminal(
-                carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop,
-                i32::from(self.kernel.process_exiting()),
+            // Exec/exit can force a blocked vfork parent runnable solely so it can
+            // retire its exact logical result. Do not resume the old continuation
+            // or touch guest state after that terminal ownership transition.
+            let exec_finish = thread_should_finish_for_exec_replacement(
+                &self.state.registry,
+                self.state.this_tid,
             );
-            match self
-                .state
-                .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps)
+            if !self.phase.is_terminal_transition()
+                && (self.kernel.process_exiting() || exec_finish)
             {
-                // The drain path always finishes ThreadDone: the terminal
-                // owner or exec survivor owns the task's end, so a
-                // registry-derived process-exit claim is discarded here
-                // exactly as it always was.
-                threads::PersistentThreadExitDisposition::Done(_) => {
-                    return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
-                }
-                threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
-                    // Ownership passed: on this drain path the thread is
-                    // here BECAUSE an exec replacement or the process
-                    // terminal is retiring it — the Busy holder is (or is
-                    // superseded by) the very transaction that retires this
-                    // thread's kernel row. Its own exit_thread is redundant,
-                    // and parking for the holder STRANDS: the retirement
-                    // makes every registry-addressed wake UnknownThread
-                    // (measured live — parks at observed_epoch with three
-                    // later publishes, final wake Err(UnknownThread), 10/12
-                    // teardown hangs). Finish; the owner retires the row.
-                    let _ = observed_epoch;
-                    if !self.state.thread_exit_withdrawn {
-                        let _ = self
-                            .state
-                            .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
-                        self.state.thread_exit_withdrawn = true;
+                self.state.trace_hvpatch_thread_terminal(
+                    carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop,
+                    i32::from(self.kernel.process_exiting()),
+                );
+                match self
+                    .state
+                    .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps)
+                {
+                    // The drain path always finishes ThreadDone: the terminal
+                    // owner or exec survivor owns the task's end, so a
+                    // registry-derived process-exit claim is discarded here
+                    // exactly as it always was.
+                    threads::PersistentThreadExitDisposition::Done(_) => {
+                        return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
                     }
-                    return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                    threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
+                        // Ownership passed: on this drain path the thread is
+                        // here BECAUSE an exec replacement or the process
+                        // terminal is retiring it — the Busy holder is (or is
+                        // superseded by) the very transaction that retires this
+                        // thread's kernel row. Its own exit_thread is redundant,
+                        // and parking for the holder STRANDS: the retirement
+                        // makes every registry-addressed wake UnknownThread
+                        // (measured live — parks at observed_epoch with three
+                        // later publishes, final wake Err(UnknownThread), 10/12
+                        // teardown hangs). Finish; the owner retires the row.
+                        let _ = observed_epoch;
+                        if !self.state.thread_exit_withdrawn {
+                            let _ = self
+                                .state
+                                .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                            self.state.thread_exit_withdrawn = true;
+                        }
+                        return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                    }
                 }
             }
-        }
 
-        self.state
-            .publish_thread_run_state(carrick_kernel::run_state::RunState::Running, 'R');
+            self.state
+                .publish_thread_run_state(carrick_kernel::run_state::RunState::Running, 'R');
 
-        // A control exec is a peer-root operation, not completion of the
-        // init's blocked syscall. Service it at this scheduler safe point
-        // before ResumeBlocked consumes and re-parks the continuation. The
-        // typed token survives a fork retry and restores the exact frame and
-        // vfork identity after publication.
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some(quantum) = self.control_quantum()?
-            && let Some(deferred_resume_blocked) =
-                DeferredResumeBlocked::capture(&self.phase, quantum.blocked_reason)
-        {
-            if let Some(work) = self.kernel.try_take_control_exec() {
-                return Ok(self.begin_control_exec_fork(
+            // A control exec is a peer-root operation, not completion of the
+            // init's blocked syscall. Service it at this scheduler safe point
+            // before ResumeBlocked consumes and re-parks the continuation. The
+            // typed token survives a fork retry and restores the exact frame and
+            // vfork identity after publication.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some(quantum) = self.control_quantum()?
+                && let Some(deferred_resume_blocked) =
+                    DeferredResumeBlocked::capture(&self.phase, quantum.blocked_reason)
+            {
+                if let Some(work) = self.kernel.try_take_control_exec() {
+                    return Ok(self.begin_control_exec_fork(
+                        engine,
+                        control,
+                        work,
+                        Some(deferred_resume_blocked),
+                    )?);
+                }
+                // Admission may have been cancelled before the owner claimed it.
+                // Consume only the control edge and put the untouched continuation
+                // back; never turn this into guest readiness.
+                return Ok(self.finish_control_quantum(
                     engine,
                     control,
-                    work,
                     Some(deferred_resume_blocked),
                 )?);
             }
-            // Admission may have been cancelled before the owner claimed it.
-            // Consume only the control edge and put the untouched continuation
-            // back; never turn this into guest readiness.
-            return Ok(self.finish_control_quantum(
-                engine,
-                control,
-                Some(deferred_resume_blocked),
-            )?);
-        }
 
-        self.refresh_zone_key(control);
-        let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
-        match phase {
-            HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
+            self.refresh_zone_key(control);
+            let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
+            match phase {
+                HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                HvpatchProductionPhase::BootstrapProcessChild(bootstrap) => {
+                    bootstrap_hvpatch_process_child(
+                        &self.kernel,
+                        &mut self.state,
+                        engine,
+                        bootstrap,
+                    )?;
+                    if let Some(work) = self.kernel.take_external_exec_work() {
+                        self.external_exec = Some(work);
+                        return self.start_external_exec(engine, control);
+                    }
+                }
+                HvpatchProductionPhase::BootstrapThreadChild => {
+                    self.state
+                        .complete_precompleted_child(&self.kernel.reporter, 0)?;
+                }
+                HvpatchProductionPhase::ResumeForkQuiesce { _subscription } => {
+                    drop(_subscription);
+                }
+                HvpatchProductionPhase::ResumeJobControlStop { _subscription } => {
+                    drop(_subscription);
+                    let context = match self.state.service_kernel_context.as_ref() {
+                        Some(context) => context.retain_exact(),
+                        None => self
+                            .kernel
+                            .dispatcher
+                            .capture_kernel_context(self.state.linux_tid)
+                            .map_err(|error| {
+                                RuntimeError::Configuration(format!(
+                                    "resume from job control stop lost Kernel context: {error}"
+                                ))
+                            })?,
+                    };
+                    self.state.service_kernel_context = Some(context.retain_exact());
+                    if let Some(outcome) = service_signals_threaded(
+                        &self.kernel,
+                        &context,
+                        engine,
+                        self.state.this_tid,
+                        self.state.fatal_image_generation,
+                        None,
+                        None,
+                        None,
+                        None,
+                        self.traps,
+                    )? {
+                        return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                    }
+                }
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                HvpatchProductionPhase::RetryProcessFork {
+                    frame,
+                    request,
+                    coordinator,
+                    external_exec,
+                    deferred_resume_blocked,
+                    _subscription,
+                } => {
+                    drop(_subscription);
+                    let context = self
+                        .state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "persistent fork retry lost exact Kernel context".to_owned(),
+                            )
+                        })?
+                        .retain_exact();
+                    let prepared = self.state.prepare_in_process_fork(
+                        &self.kernel,
+                        &context,
+                        engine,
+                        control,
+                        &mut ProductionHvpatchProcessBackendOps,
+                        quiesce::ProcessForkAttempt {
+                            request,
+                            coordinator,
+                            external_exec,
+                        },
+                    )?;
+                    return Ok(self.complete_persistent_process_fork(
+                        engine,
+                        control,
+                        frame,
+                        deferred_resume_blocked,
+                        prepared,
+                    )?);
+                }
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                HvpatchProductionPhase::RetryCloneThread {
+                    frame,
+                    request,
+                    prepared,
+                    _subscription,
+                } => {
+                    drop(_subscription);
+                    let context = self
+                        .state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "persistent clone retry lost exact Kernel context".to_owned(),
+                            )
+                        })?
+                        .retain_exact();
+                    return match self.spawn_persistent_hvpatch_clone_thread(
+                        engine,
+                        control,
+                        &context,
+                        request,
+                        prepared,
+                        &mut ProductionHvpatchCloneBackendOps,
+                    )? {
+                        PersistentHvpatchCloneAttempt::Complete(spawned) => {
+                            Ok(self.complete_persistent_hvpatch_clone(engine, spawned)?)
+                        }
+                        PersistentHvpatchCloneAttempt::Wait {
+                            prepared,
+                            subscription,
+                        } => {
+                            self.phase = HvpatchProductionPhase::RetryCloneThread {
+                                frame,
+                                request,
+                                prepared,
+                                _subscription: subscription,
+                            };
+                            Ok(self.suspend(
+                                HvpatchLoopSuspension::BlockedContinuation,
+                                executor::ExecutorExit::Blocked(
+                                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                                ),
+                            ))
+                        }
+                    };
+                }
+                HvpatchProductionPhase::RetryThreadExit { code } => {
+                    // Drop the reservation subscription for this attempt; a
+                    // fresh one is installed if the retry parks again.
+                    self.state.thread_exit_retry_subscription = None;
+                    let context = self
+                        .state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "persistent thread-exit retry lost exact Kernel context".to_owned(),
+                            )
+                        })?
+                        .retain_exact();
+                    let disposition = self.state.handle_persistent_thread_exit(
+                        &self.kernel,
+                        engine,
+                        code,
+                        self.traps,
+                    );
+                    return Ok(self.settle_persistent_thread_exit(
+                        engine,
+                        code,
+                        context,
+                        disposition,
+                    ));
+                }
+                HvpatchProductionPhase::ResumeBlocked {
+                    frame,
+                    vfork_child_pid,
+                } => {
+                    let resumed = self.state.resume_persistent_continuation(
+                        &self.kernel,
+                        engine,
+                        control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                    )?;
+                    if vfork_child_pid.is_some()
+                        && matches!(&resumed, Some(DispatchOutcome::Returned { .. }))
+                    {
+                        let parent_context =
+                            self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                                RuntimeError::Configuration(
+                                    "vfork parent identity restore lost Kernel context".to_owned(),
+                                )
+                            })?;
+                        carrick_kernel::kernel::identity_page::stamp_identity_page(
+                            engine,
+                            &self.kernel.dispatcher,
+                            parent_context,
+                        )
+                        .map_err(|error| {
+                            RuntimeError::Trap(TrapError::Hypervisor(format!(
+                                "restore vfork parent identity page: {error}"
+                            )))
+                        })?;
+                    }
+                    let outcome = match (vfork_child_pid, resumed) {
+                        (Some(child_pid), Some(DispatchOutcome::Returned { .. })) => {
+                            DispatchOutcome::Returned {
+                                value: i64::from(child_pid),
+                            }
+                        }
+                        (Some(_), Some(DispatchOutcome::ThreadExit { code })) => {
+                            DispatchOutcome::ThreadExit { code }
+                        }
+                        (Some(_), _) => {
+                            return Err(RuntimeError::Configuration(
+                                "vfork parent resumed without release completion".to_owned(),
+                            )
+                            .into());
+                        }
+                        (None, Some(outcome)) => outcome,
+                        (None, None) => self.state.redispatch_threaded_syscall(
+                            &self.kernel,
+                            engine,
+                            control.submission.host_wait_context(),
+                        )?,
+                    };
+                    if self.kernel.dispatcher.take_signal_pump_request() {
+                        self.kernel
+                            .signal_pump
+                            .start_signal_pump(&self.state.kicker, &self.state.platform_futex);
+                    }
+                    return self.service_outcome(engine, control, frame, outcome);
+                }
+                HvpatchProductionPhase::ExecSiblingDrain { context, owner } => {
+                    if !owner.is_ready() {
+                        self.phase = HvpatchProductionPhase::ExecSiblingDrain { context, owner };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::ExecSiblingDrain,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::ChildState,
+                            ),
+                        ));
+                    }
+                    let finished = match self.state.finish_prepared_execve_drain(
+                        &self.kernel,
+                        engine,
+                        &self.completion,
+                        *owner,
+                    ) {
+                        Ok(finished) => finished,
+                        Err(failure) => {
+                            return Err(ProductionHvpatchPollError::from_exec_failure(failure));
+                        }
+                    };
+                    return self.finish_exec_suffix(engine, control, finished);
+                }
+                HvpatchProductionPhase::TerminalProcessDrain {
+                    terminal,
+                    context,
+                    drain,
+                } => {
+                    if !drain.is_ready() {
+                        self.phase = HvpatchProductionPhase::TerminalProcessDrain {
+                            terminal,
+                            context,
+                            drain,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::TerminalSiblingDrain,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::ChildState,
+                            ),
+                        ));
+                    }
+                    let completions = self
+                        .state
+                        .finish_persistent_sibling_drain(&self.completion)?;
+                    self.kernel
+                        .process_physical_retirement
+                        .publish(completions)?;
+                    return Ok(self.finalize_persistent_process_terminal(engine, context, terminal));
+                }
+                HvpatchProductionPhase::TerminalClaimRetry {
+                    terminal,
+                    context,
+                    _subscription,
+                } => {
+                    drop(_subscription);
+                    return Ok(self.begin_persistent_process_terminal(engine, terminal, context));
+                }
+                HvpatchProductionPhase::TerminalRetireRetry {
+                    terminal,
+                    context,
+                    _subscription,
+                } => {
+                    drop(_subscription);
+                    return Ok(self.finalize_persistent_process_terminal(engine, context, terminal));
+                }
+                HvpatchProductionPhase::Resident => {}
+                HvpatchProductionPhase::Complete => return Ok(executor::ExecutorExit::Exited),
+            }
+
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            HvpatchProductionPhase::BootstrapProcessChild(bootstrap) => {
-                bootstrap_hvpatch_process_child(&self.kernel, &mut self.state, engine, bootstrap)?;
-                if let Some(work) = self.kernel.take_external_exec_work() {
-                    self.external_exec = Some(work);
-                    return self.start_external_exec(engine, control);
+            if self.control_quantum()?.is_some() {
+                if let Some(work) = self.kernel.try_take_control_exec() {
+                    return Ok(self.begin_control_exec_fork(engine, control, work, None)?);
+                }
+                return Ok(self.finish_control_quantum(engine, control, None)?);
+            }
+
+            if let Some(exit) = self.suspend_for_process_quiesce(engine, control)? {
+                return Ok(exit);
+            }
+
+            if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                return Ok(exit);
+            }
+
+            if control.need_resched() {
+                return Ok(self.suspend(
+                    HvpatchLoopSuspension::Preemption,
+                    executor::ExecutorExit::Preempted,
+                ));
+            }
+            match self.step_trap_watchdog(Instant::elapsed, trap_watchdog_wall_window) {
+                TrapWatchdog::KeepRunning | TrapWatchdog::ResetBudget => {}
+                TrapWatchdog::Trip => {
+                    let context = self
+                        .state
+                        .service_kernel_context
+                        .as_ref()
+                        .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context on trap limit outcome assembly"))
+                        .retain_exact();
+                    let outcome = VcpuLoopOutcome::TrapLimit(Box::new(assemble_run_result(
+                        &self.kernel,
+                        -1,
+                        None,
+                        self.state.max_traps,
+                        true,
+                    )));
+                    return Ok(self.begin_persistent_process_terminal(
+                        engine,
+                        PersistentTerminal::from_outcome(outcome),
+                        context,
+                    ));
                 }
             }
-            HvpatchProductionPhase::BootstrapThreadChild => {
-                self.state
-                    .complete_precompleted_child(&self.kernel.reporter, 0)?;
+            self.traps = self.traps.saturating_add(1);
+            let pt_quiesce = self.kernel.pt_quiesce();
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let entered_guest = quiesce::enter_hvpatch_guest_or_service_invalidation(
+                &self.state.in_guest,
+                &pt_quiesce,
+                engine,
+                control,
+            )?;
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let entered_guest = quiesce::enter_guest_or_park(&self.state.in_guest, &pt_quiesce);
+            if !entered_guest {
+                return Ok(executor::ExecutorExit::Syscall);
             }
-            HvpatchProductionPhase::ResumeForkQuiesce { _subscription } => {
-                drop(_subscription);
-            }
-            HvpatchProductionPhase::ResumeJobControlStop { _subscription } => {
-                drop(_subscription);
-                let context = match self.state.service_kernel_context.as_ref() {
-                    Some(context) => context.retain_exact(),
-                    None => self
-                        .kernel
-                        .dispatcher
-                        .capture_kernel_context(self.state.linux_tid)
-                        .map_err(|error| {
-                            RuntimeError::Configuration(format!(
-                                "resume from job control stop lost Kernel context: {error}"
-                            ))
-                        })?,
+            // Close the publication-vs-entry race for kernel-originated wakes. The
+            // participant first publishes `in_guest`, then checks debt belonging to
+            // this exact registration enrollment. A publication after the prior
+            // host-side signal check therefore either observes us in guest and
+            // kicks, or is observed here before the engine can enter.
+            if let Some(debt) = self.state.kicker.kernel_wake_debt_for(self.state.this_tid) {
+                self.state.in_guest.leave_guest();
+                // At EL0 this is a kick-style interruption and the live PC/PSTATE
+                // are authoritative. At EL1 the engine is parked in Carrick's
+                // syscall/ERET trampoline, so treating that PC as guest code would
+                // corrupt the in-flight return; use the syscall-boundary ELR/SPSR
+                // path instead. This is the same invariant enforced inside HVF's
+                // run-until-syscall kick handling.
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let interrupted_pc = if carrick_hal::ExecLevel::from_pstate(
+                    engine
+                        .get_reg(carrick_hal::Reg::Pstate)
+                        .map_err(|error| TrapError::Hypervisor(error.to_string()))?,
+                )
+                .is_guest()
+                {
+                    Some(engine.current_pc()?)
+                } else {
+                    None
                 };
-                self.state.service_kernel_context = Some(context.retain_exact());
-                if let Some(outcome) = service_signals_threaded(
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                let interrupted_pc = Some(engine.current_pc()?);
+                let signal_context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture kernel-wake signal context: {error}"
+                        ))
+                    })?;
+                let outcome = service_signals_threaded(
                     &self.kernel,
-                    &context,
+                    &signal_context,
                     engine,
                     self.state.this_tid,
                     self.state.fatal_image_generation,
                     None,
-                    None,
+                    interrupted_pc,
                     None,
                     None,
                     self.traps,
-                )? {
+                )?;
+                self.state
+                    .kicker
+                    .acknowledge_kernel_wake_debt(self.state.this_tid, debt);
+                if let Some(outcome) = outcome {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
                 }
+                return Ok(executor::ExecutorExit::Syscall);
             }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            HvpatchProductionPhase::RetryProcessFork {
-                frame,
-                request,
-                coordinator,
-                external_exec,
-                deferred_resume_blocked,
-                _subscription,
-            } => {
-                drop(_subscription);
-                let context = self
-                    .state
-                    .service_kernel_context
-                    .as_ref()
-                    .ok_or_else(|| {
-                        RuntimeError::Configuration(
-                            "persistent fork retry lost exact Kernel context".to_owned(),
-                        )
-                    })?
-                    .retain_exact();
-                let prepared = self.state.prepare_in_process_fork(
-                    &self.kernel,
-                    &context,
-                    engine,
-                    control,
-                    &mut ProductionHvpatchProcessBackendOps,
-                    quiesce::ProcessForkAttempt {
-                        request,
-                        coordinator,
-                        external_exec,
-                    },
-                )?;
-                return Ok(self.complete_persistent_process_fork(
-                    engine,
-                    control,
-                    frame,
-                    deferred_resume_blocked,
-                    prepared,
-                )?);
-            }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            HvpatchProductionPhase::RetryCloneThread {
-                frame,
-                request,
-                prepared,
-                _subscription,
-            } => {
-                drop(_subscription);
-                let context = self
-                    .state
-                    .service_kernel_context
-                    .as_ref()
-                    .ok_or_else(|| {
-                        RuntimeError::Configuration(
-                            "persistent clone retry lost exact Kernel context".to_owned(),
-                        )
-                    })?
-                    .retain_exact();
-                return match self.spawn_persistent_hvpatch_clone_thread(
-                    engine,
-                    control,
-                    &context,
-                    request,
-                    prepared,
-                    &mut ProductionHvpatchCloneBackendOps,
-                )? {
-                    PersistentHvpatchCloneAttempt::Complete(spawned) => {
-                        Ok(self.complete_persistent_hvpatch_clone(engine, spawned)?)
-                    }
-                    PersistentHvpatchCloneAttempt::Wait {
-                        prepared,
-                        subscription,
-                    } => {
-                        self.phase = HvpatchProductionPhase::RetryCloneThread {
-                            frame,
-                            request,
-                            prepared,
-                            _subscription: subscription,
-                        };
-                        Ok(self.suspend(
-                            HvpatchLoopSuspension::BlockedContinuation,
-                            executor::ExecutorExit::Blocked(
-                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
-                            ),
-                        ))
-                    }
-                };
-            }
-            HvpatchProductionPhase::RetryThreadExit { code } => {
-                // Drop the reservation subscription for this attempt; a
-                // fresh one is installed if the retry parks again.
-                self.state.thread_exit_retry_subscription = None;
-                let context = self
-                    .state
-                    .service_kernel_context
-                    .as_ref()
-                    .ok_or_else(|| {
-                        RuntimeError::Configuration(
-                            "persistent thread-exit retry lost exact Kernel context".to_owned(),
-                        )
-                    })?
-                    .retain_exact();
-                let disposition = self.state.handle_persistent_thread_exit(
-                    &self.kernel,
-                    engine,
-                    code,
-                    self.traps,
-                );
-                return Ok(self.settle_persistent_thread_exit(engine, code, context, disposition));
-            }
-            HvpatchProductionPhase::ResumeBlocked {
-                frame,
-                vfork_child_pid,
-            } => {
-                let resumed = self.state.resume_persistent_continuation(
-                    &self.kernel,
-                    engine,
-                    control.execution_lease_mut().map_err(RuntimeError::Trap)?,
-                )?;
-                if vfork_child_pid.is_some()
-                    && matches!(&resumed, Some(DispatchOutcome::Returned { .. }))
-                {
-                    let parent_context =
-                        self.state.service_kernel_context.as_ref().ok_or_else(|| {
-                            RuntimeError::Configuration(
-                                "vfork parent identity restore lost Kernel context".to_owned(),
-                            )
-                        })?;
-                    carrick_kernel::kernel::identity_page::stamp_identity_page(
-                        engine,
-                        &self.kernel.dispatcher,
-                        parent_context,
-                    )
-                    .map_err(|error| {
-                        RuntimeError::Trap(TrapError::Hypervisor(format!(
-                            "restore vfork parent identity page: {error}"
-                        )))
-                    })?;
-                }
-                let outcome = match (vfork_child_pid, resumed) {
-                    (Some(child_pid), Some(DispatchOutcome::Returned { .. })) => {
-                        DispatchOutcome::Returned {
-                            value: i64::from(child_pid),
-                        }
-                    }
-                    (Some(_), Some(DispatchOutcome::ThreadExit { code })) => {
-                        DispatchOutcome::ThreadExit { code }
-                    }
-                    (Some(_), _) => {
-                        return Err(RuntimeError::Configuration(
-                            "vfork parent resumed without release completion".to_owned(),
-                        )
-                        .into());
-                    }
-                    (None, Some(outcome)) => outcome,
-                    (None, None) => self.state.redispatch_threaded_syscall(
-                        &self.kernel,
-                        engine,
-                        control.submission.host_wait_context(),
-                    )?,
-                };
-                if self.kernel.dispatcher.take_signal_pump_request() {
-                    self.kernel
-                        .signal_pump
-                        .start_signal_pump(&self.state.kicker, &self.state.platform_futex);
-                }
-                return self.service_outcome(engine, control, frame, outcome);
-            }
-            HvpatchProductionPhase::ExecSiblingDrain { context, owner } => {
-                if !owner.is_ready() {
-                    self.phase = HvpatchProductionPhase::ExecSiblingDrain { context, owner };
-                    return Ok(self.suspend(
-                        HvpatchLoopSuspension::ExecSiblingDrain,
-                        executor::ExecutorExit::Blocked(
-                            carrick_kernel::kernel::objects::BlockedReason::ChildState,
-                        ),
-                    ));
-                }
-                let finished = match self.state.finish_prepared_execve_drain(
-                    &self.kernel,
-                    engine,
-                    &self.completion,
-                    *owner,
-                ) {
-                    Ok(finished) => finished,
-                    Err(failure) => {
-                        return Err(ProductionHvpatchPollError::from_exec_failure(failure));
-                    }
-                };
-                return self.finish_exec_suffix(engine, control, finished);
-            }
-            HvpatchProductionPhase::TerminalProcessDrain {
-                terminal,
-                context,
-                drain,
-            } => {
-                if !drain.is_ready() {
-                    self.phase = HvpatchProductionPhase::TerminalProcessDrain {
-                        terminal,
-                        context,
-                        drain,
-                    };
-                    return Ok(self.suspend(
-                        HvpatchLoopSuspension::TerminalSiblingDrain,
-                        executor::ExecutorExit::Blocked(
-                            carrick_kernel::kernel::objects::BlockedReason::ChildState,
-                        ),
-                    ));
-                }
-                let completions = self
-                    .state
-                    .finish_persistent_sibling_drain(&self.completion)?;
-                self.kernel
-                    .process_physical_retirement
-                    .publish(completions)?;
-                return Ok(self.finalize_persistent_process_terminal(engine, context, terminal));
-            }
-            HvpatchProductionPhase::TerminalClaimRetry {
-                terminal,
-                context,
-                _subscription,
-            } => {
-                drop(_subscription);
-                return Ok(self.begin_persistent_process_terminal(engine, terminal, context));
-            }
-            HvpatchProductionPhase::TerminalRetireRetry {
-                terminal,
-                context,
-                _subscription,
-            } => {
-                drop(_subscription);
-                return Ok(self.finalize_persistent_process_terminal(engine, context, terminal));
-            }
-            HvpatchProductionPhase::Resident => {}
-            HvpatchProductionPhase::Complete => return Ok(executor::ExecutorExit::Exited),
-        }
-
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if self.control_quantum()?.is_some() {
-            if let Some(work) = self.kernel.try_take_control_exec() {
-                return Ok(self.begin_control_exec_fork(engine, control, work, None)?);
-            }
-            return Ok(self.finish_control_quantum(engine, control, None)?);
-        }
-
-        if let Some(exit) = self.suspend_for_process_quiesce(engine, control)? {
-            return Ok(exit);
-        }
-
-        if let Some(exit) = self.suspend_for_job_control(engine, control)? {
-            return Ok(exit);
-        }
-
-        if control.need_resched() {
-            return Ok(self.suspend(
-                HvpatchLoopSuspension::Preemption,
-                executor::ExecutorExit::Preempted,
-            ));
-        }
-        match self.step_trap_watchdog(Instant::elapsed, trap_watchdog_wall_window) {
-            TrapWatchdog::KeepRunning | TrapWatchdog::ResetBudget => {}
-            TrapWatchdog::Trip => {
-                let context = self
-                    .state
-                    .service_kernel_context
-                    .as_ref()
-                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context on trap limit outcome assembly"))
-                    .retain_exact();
-                let outcome = VcpuLoopOutcome::TrapLimit(Box::new(assemble_run_result(
-                    &self.kernel,
-                    -1,
-                    None,
-                    self.state.max_traps,
-                    true,
-                )));
-                return Ok(self.begin_persistent_process_terminal(
-                    engine,
-                    PersistentTerminal::from_outcome(outcome),
-                    context,
-                ));
-            }
-        }
-        self.traps = self.traps.saturating_add(1);
-        let pt_quiesce = self.kernel.pt_quiesce();
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let entered_guest = quiesce::enter_hvpatch_guest_or_service_invalidation(
-            &self.state.in_guest,
-            &pt_quiesce,
-            engine,
-            control,
-        )?;
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let entered_guest = quiesce::enter_guest_or_park(&self.state.in_guest, &pt_quiesce);
-        if !entered_guest {
-            return Ok(executor::ExecutorExit::Syscall);
-        }
-        // Close the publication-vs-entry race for kernel-originated wakes. The
-        // participant first publishes `in_guest`, then checks debt belonging to
-        // this exact registration enrollment. A publication after the prior
-        // host-side signal check therefore either observes us in guest and
-        // kicks, or is observed here before the engine can enter.
-        if let Some(debt) = self.state.kicker.kernel_wake_debt_for(self.state.this_tid) {
-            self.state.in_guest.leave_guest();
-            // At EL0 this is a kick-style interruption and the live PC/PSTATE
-            // are authoritative. At EL1 the engine is parked in Carrick's
-            // syscall/ERET trampoline, so treating that PC as guest code would
-            // corrupt the in-flight return; use the syscall-boundary ELR/SPSR
-            // path instead. This is the same invariant enforced inside HVF's
-            // run-until-syscall kick handling.
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let interrupted_pc = if carrick_hal::ExecLevel::from_pstate(
-                engine
-                    .get_reg(carrick_hal::Reg::Pstate)
-                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?,
-            )
-            .is_guest()
-            {
-                Some(engine.current_pc()?)
-            } else {
-                None
-            };
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let interrupted_pc = Some(engine.current_pc()?);
-            let signal_context = self
-                .kernel
-                .dispatcher
-                .capture_kernel_context(self.state.linux_tid)
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "capture kernel-wake signal context: {error}"
-                    ))
-                })?;
-            let outcome = service_signals_threaded(
-                &self.kernel,
-                &signal_context,
-                engine,
-                self.state.this_tid,
-                self.state.fatal_image_generation,
-                None,
-                interrupted_pc,
-                None,
-                None,
-                self.traps,
-            )?;
-            self.state
-                .kicker
-                .acknowledge_kernel_wake_debt(self.state.this_tid, debt);
-            if let Some(outcome) = outcome {
-                return Ok(self.enter_terminal_with_outcome(engine, outcome));
-            }
-            return Ok(executor::ExecutorExit::Syscall);
         }
         self.state
             .publish_thread_run_state(carrick_kernel::run_state::RunState::Running, 'R');
@@ -7126,6 +7154,53 @@ mod tests {
         let (published, _) = finish_persistent_process_handles(&handles, &exec_completion)
             .expect("drain exact leader result without synthesizing one");
         assert_eq!(published, 0, "the leader settled its own job");
+    }
+
+    /// A task stopped by a stage-1 COW fault in EL1 (`ResumeEl1`) is
+    /// re-entered before ANY host boundary work: every pre-run step that can
+    /// suspend, unload or redirect the thread (admission, control quanta,
+    /// quiesce and job-control suspension, kernel-wake signals) sits behind
+    /// the suspended-EL1 guard. One of them unloading the thread left EL1's
+    /// zone record on-CPU, and the reload died "EL1 zone slot N still held
+    /// threads when a task was loaded on it" (c21: cpython-subprocess and
+    /// memflagmatrix under load).
+    #[test]
+    fn a_suspended_el1_operation_is_reentered_before_host_boundary_work() {
+        let source = include_str!("binding.rs");
+        let poll = source
+            .split("fn poll_with_engine(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn poll_with_engine_typed(").next())
+            .expect("production job poll");
+        let guard = poll
+            .find("if !engine.el1_operation_suspended() {")
+            .expect("suspended-EL1 guard");
+        let run = poll
+            .find("let next = engine.next_syscall();")
+            .expect("guest run");
+        for step in [
+            "guest_execution.is_none()",
+            "control_quantum()",
+            "suspend_for_process_quiesce(engine, control)",
+            "suspend_for_job_control(engine, control)",
+            "acknowledge_kernel_wake_debt",
+        ] {
+            let at = poll.find(step).unwrap_or_else(|| panic!("{step} present"));
+            assert!(
+                guard < at && at < run,
+                "{step} runs before the guard or after the run"
+            );
+        }
+        let guarded = &poll[guard..run];
+        let end = guarded
+            .find("\n        }\n        self.state\n            .publish_thread_run_state(")
+            .expect("the guard closes before the guest run");
+        for step in [
+            "suspend_for_process_quiesce(",
+            "acknowledge_kernel_wake_debt",
+        ] {
+            assert!(guarded[..end].contains(step), "{step} is inside the guard");
+        }
     }
 
     #[test]
