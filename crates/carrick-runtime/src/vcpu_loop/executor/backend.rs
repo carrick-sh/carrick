@@ -1344,10 +1344,20 @@ fn publish_zone_slot(
     };
     if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot) {
         drive_zone_slot(zone_slot, driver);
+        // What the slot still holds, for the fatal below: the record EL1
+        // left switched in, its claim and identity, and the slot's queue.
+        let held = zone.slot(zone_slot).current().map(|record| {
+            let rec = zone.record(record);
+            (record, rec.claim(), rec.identity())
+        });
+        let host_record = zone.slot(zone_slot).host_record();
+        let queued = zone.slot(zone_slot).queued();
         if !zone.reset_slot(zone_slot) {
             carrick_fatal!(
                 "vcpu_loop::el1_zone",
-                "EL1 zone slot {slot} still held threads when a task was loaded on it"
+                "EL1 zone slot {slot} still held threads when a task was loaded on it: \
+                 current={held:?} host_record={host_record:?} queued={queued} \
+                 loading mm={mm:#x} serial={serial} driver={driver}"
             );
         }
         // Threads queued here for another address space stay: EL1 leaves
