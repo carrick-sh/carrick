@@ -8435,6 +8435,13 @@ fn semantic_lookup_rejects_foreign_va_alias_at_same_live_ipa() {
     assert_eq!(selected.end, va + OWNER_LEN as u64);
 }
 
+/// The access the shared-repoint fixture's leaves are published with.
+const RW_EXEC_REPOINT: carrick_mmu_core::aarch64::UserLeafAccess =
+    carrick_mmu_core::aarch64::UserLeafAccess {
+        writable: true,
+        executable: true,
+    };
+
 #[test]
 fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
@@ -8534,7 +8541,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     // has no physical owner in the VMM's global frame stage-2 arena.
     let disconnected_ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x1000;
     let disconnected_err = task
-        .publish_shared_repoint(repoint_va, disconnected_ipa, repoint_len)
+        .publish_shared_repoint(repoint_va, disconnected_ipa, repoint_len, RW_EXEC_REPOINT)
         .unwrap_err();
     assert!(
         disconnected_err
@@ -8546,7 +8553,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     // Repointing outside any extent still fails with "no physical owner".
     let outside_ipa = extent_base + (size as u64) + 0x1000;
     let outside_err = task
-        .publish_shared_repoint(repoint_va, outside_ipa, repoint_len)
+        .publish_shared_repoint(repoint_va, outside_ipa, repoint_len, RW_EXEC_REPOINT)
         .unwrap_err();
     assert!(
         outside_err.to_string().contains("has no physical owner"),
@@ -8564,7 +8571,8 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     // unpublished target, even when its physical owner is authentic.
     let before = task.translate_va(repoint_va);
     let before_mappings = task.mappings.len();
-    let unpublished = task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len);
+    let unpublished =
+        task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len, RW_EXEC_REPOINT);
     assert!(
         unpublished.is_err(),
         "bookkeeping wrote an unpublished leaf"
@@ -8596,12 +8604,17 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     // A correct first leaf cannot authorize bookkeeping for an unpublished
     // neighbor or for another physical output.
     assert!(
-        task.publish_shared_repoint(repoint_va, repoint_ipa, 2 * repoint_len)
+        task.publish_shared_repoint(repoint_va, repoint_ipa, 2 * repoint_len, RW_EXEC_REPOINT)
             .is_err()
     );
     assert!(
-        task.publish_shared_repoint(repoint_va, repoint_ipa + 0x1000, repoint_len)
-            .is_err()
+        task.publish_shared_repoint(
+            repoint_va,
+            repoint_ipa + 0x1000,
+            repoint_len,
+            RW_EXEC_REPOINT
+        )
+        .is_err()
     );
     assert_eq!(task.mappings.len(), before_mappings);
     tables
@@ -8625,7 +8638,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
         )
         .expect("read-only publication");
     assert!(
-        task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len)
+        task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len, RW_EXEC_REPOINT)
             .is_err()
     );
     assert_eq!(task.mappings.len(), before_mappings);
@@ -8650,7 +8663,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
         )
         .expect("writable publication");
     tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
-    task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len)
+    task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len, RW_EXEC_REPOINT)
         .expect("record published 4 KiB sub-page of covering shared extent");
 
     // translate_va on the repointed VA returns extent_base + 0x1000.

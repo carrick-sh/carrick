@@ -3640,7 +3640,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
         classify_private_repoint_tlbi(self.run_stage1_maintenance())?;
         self.vm
-            .publish_private_repoint(va, overlay_ipa, len)
+            .publish_private_repoint(va, overlay_ipa, len, UserLeafAccess::READ_WRITE)
             .map_err(|error| {
                 RepointPrivateError::indeterminate(MemoryError::HostMap(format!(
                     "publish private repoint frame ownership: {error}"
@@ -3668,21 +3668,27 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
         let outcome = self
             .pt_edit_locked(|mgr| {
-                let mut changed = mgr.map_aliased(va, target_ipa, len as u64, access)?;
-                if prot_none {
-                    changed |= mgr.set_prot_none(va, len)?.changed;
-                }
-                Ok(PageTableApplyOutcome::new(changed, changed))
+                mgr.map_aliased(va, target_ipa, len as u64, access)
+                    .map(|changed| PageTableApplyOutcome::new(changed, changed))
             })
             .map_err(|e| MemoryError::HostMap(format!("repoint shared leaf pt edit: {e}")))?;
         if !outcome.changed {
-            return Ok(());
+            return if prot_none {
+                self.protect_range(va, len, 0)
+            } else {
+                Ok(())
+            };
         }
         self.run_stage1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("repoint shared leaf tlbi: {e}")))?;
         self.vm
-            .publish_shared_repoint(va, target_ipa, len)
+            .publish_shared_repoint(va, target_ipa, len, access)
             .map_err(|e| MemoryError::HostMap(format!("publish shared repoint: {e}")))?;
+        // A PROT_NONE move keeps its output and loses its access only after
+        // the ownership edge is published against the live leaf.
+        if prot_none {
+            self.protect_range(va, len, 0)?;
+        }
         Ok(())
     }
 

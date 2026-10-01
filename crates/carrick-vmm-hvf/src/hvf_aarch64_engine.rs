@@ -2529,8 +2529,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         va: u64,
         overlay_ipa: u64,
         len: usize,
+        access: carrick_mmu_core::aarch64::UserLeafAccess,
     ) -> Result<(), TrapError> {
-        self.state.publish_private_repoint(va, overlay_ipa, len)
+        self.state
+            .publish_private_repoint(va, overlay_ipa, len, access)
     }
 
     fn publish_shared_repoint(
@@ -2538,8 +2540,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         va: u64,
         target_ipa: u64,
         len: usize,
+        access: carrick_mmu_core::aarch64::UserLeafAccess,
     ) -> Result<(), TrapError> {
-        self.state.publish_shared_repoint(va, target_ipa, len)
+        self.state
+            .publish_shared_repoint(va, target_ipa, len, access)
     }
 
     fn translated_read(&self, va: u64, _ipa: u64, len: usize) -> Result<Vec<u8>, MemoryError> {

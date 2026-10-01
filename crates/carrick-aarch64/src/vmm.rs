@@ -1064,6 +1064,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _va: u64,
         _overlay_ipa: u64,
         _len: usize,
+        _access: carrick_mmu_core::aarch64::UserLeafAccess,
     ) -> Result<(), TrapError> {
         Ok(())
     }
@@ -1076,6 +1077,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _va: u64,
         _target_ipa: u64,
         _len: usize,
+        _access: carrick_mmu_core::aarch64::UserLeafAccess,
     ) -> Result<(), TrapError> {
         Ok(())
     }
