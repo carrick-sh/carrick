@@ -69,6 +69,16 @@ ATTRIBUTION_PROFILES = (
 )
 HYPERVISOR_ENTITLEMENT = "com.apple.security.hypervisor"
 METRICS = ("cpu_s", "elapsed_ms", "workload_ms")
+# Whole-carrier sampled split (hvpatch-carrier-cpu-attribution summary keys).
+CARRIER_SHARE_KEYS = (
+    ("guest", "guest_execution"),
+    ("syscall", "host_syscall"),
+    ("fault", "fault_service"),
+    ("sched", "executor_scheduling"),
+    ("el1-mailbox", "el1_mailbox"),
+    ("lock", "lock_wait"),
+    ("other", "other"),
+)
 REPO = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_MANIFESTS = (
     REPO / "scripts/conformance/suites.toml",
@@ -661,6 +671,11 @@ def build_report(carrick: dict, attribution: dict | None, docker: dict | None) -
                             .get("hvpatch-carrier-cpu-attribution", {}) or {}).get("summary"))
             if cpu_summary:
                 arm_row["carrier_cpu_attribution"] = cpu_summary
+                population = max(1, int(cpu_summary["sample_population"]))
+                arm_row["carrier_cpu_share"] = {
+                    name: int(cpu_summary[f"{key}_samples"]) / population
+                    for name, key in CARRIER_SHARE_KEYS
+                }
             entry[label] = arm_row
         if oracle:
             entry["docker"] = {k: oracle.get(k) for k in ("median_elapsed_ms", "median_workload_ms")}
@@ -672,14 +687,15 @@ def render_report(report: dict[str, object]) -> str:
     arms = report["arms"]  # type: ignore[index]
     labels = [arms["A"]["label"], arms["B"]["label"]]  # type: ignore[index]
     lines = [
-        "| workload | arm | wall ms | window ms | cpu s | wall/docker | window/docker | exits syscall/fault/kick-idle/other | host ms syscall/fault/kick-idle/other |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| workload | arm | wall ms | window ms | cpu s | wall/docker | window/docker | exits syscall/fault/kick-idle/other | host ms syscall/fault/kick-idle/other | carrier CPU % guest/syscall/fault/sched |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, entry in report["workloads"].items():  # type: ignore[union-attr]
         for label in labels:
             row = entry.get(label, {})
             exits = row.get("exits_by_bucket")
             host = row.get("host_oncpu_ms_by_bucket")
+            share = row.get("carrier_cpu_share")
             order = ("syscall", "fault", "kick-idle", "other")
             fmt = lambda v, spec: "-" if v is None else format(v, spec)  # noqa: E731
             lines.append(
@@ -687,7 +703,8 @@ def render_report(report: dict[str, object]) -> str:
                 f"| {fmt(row.get('median_cpu_s'), '.2f')} | {fmt(row.get('elapsed_over_docker'), '.2f')}x "
                 f"| {fmt(row.get('workload_over_docker'), '.2f')}x "
                 f"| {'/'.join(str(exits[k]) for k in order) if exits else '-'} "
-                f"| {'/'.join(format(host[k], '.0f') for k in order) if host else '-'} |"
+                f"| {'/'.join(format(host[k], '.0f') for k in order) if host else '-'} "
+                f"| {'/'.join(format(100 * share[k], '.0f') for k in ('guest', 'syscall', 'fault', 'sched')) if share else '-'} |"
             )
     return "\n".join(lines)
 
