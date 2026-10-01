@@ -775,6 +775,18 @@ pub trait GuestMemory {
         self.set_no_access(address, len, unmapped);
     }
 
+    /// Drop every host protection fact for `[address, address + len)` without
+    /// marking it unmapped: the range's placement and permissions now belong
+    /// to the MM's EL1 reservation root (a reconciled deferred return), which
+    /// may place a new mapping there without the host. A host `unmapped` mark
+    /// would outlive that placement and refuse every host copyout into it.
+    fn return_to_root(&mut self, address: u64, len: usize) {
+        // `set_unmapped(true)` clears every other fact; `false` then clears
+        // the unmapped mark itself.
+        self.set_unmapped(address, len, true);
+        self.set_unmapped(address, len, false);
+    }
+
     /// Publish all permission metadata for one live mapping as a single state
     /// transition. Real shared-memory backends override this to keep sibling
     /// vCPUs from observing an accessible gap between separate updates.

@@ -484,7 +484,7 @@ impl MemState {
 
     /// The protection a first touch of root-owned `page` publishes, or
     /// `None` when it is already resident or inaccessible.
-    fn root_armed_prot(
+    pub(in crate::dispatch) fn root_armed_prot(
         &self,
         mapping: &Mapping,
         incarnation: ReservationIncarnation,
