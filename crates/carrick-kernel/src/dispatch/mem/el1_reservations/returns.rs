@@ -153,7 +153,9 @@ impl MemView<'_> {
                         error,
                     });
                 }
-                memory.set_unmapped(range.start(), len, true);
+                // The VA is the root's to place again once acknowledged:
+                // leave no host protection fact behind for its next mapping.
+                memory.return_to_root(range.start(), len);
                 self.remove_mapping_metadata(range.start(), range.len());
             }
             self.mark_vma_dispatch(&mut dispatch);
