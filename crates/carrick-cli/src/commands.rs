@@ -1297,12 +1297,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 raw_path,
                                 capture_status,
                             )?;
-                            if let Some(jsonl_path) = summary_jsonl {
-                                let json = serde_json::to_string(&summary)?;
-                                std::fs::write(&jsonl_path, format!("{json}\n")).with_context(
-                                    || format!("write summary JSON to {}", jsonl_path.display()),
-                                )?;
-                            }
+                            write_profile_summary_jsonl(summary_jsonl.as_deref(), &summary)?;
                             eprintln!("{}", summary.render_human());
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchExitAttribution
@@ -1311,12 +1306,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 raw_path,
                                 capture_status,
                             )?;
-                            if let Some(jsonl_path) = summary_jsonl {
-                                let json = serde_json::to_string(&summary)?;
-                                std::fs::write(&jsonl_path, format!("{json}\n")).with_context(
-                                    || format!("write summary JSON to {}", jsonl_path.display()),
-                                )?;
-                            }
+                            write_profile_summary_jsonl(summary_jsonl.as_deref(), &summary)?;
                             eprintln!("{}", summary.render_human());
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchInotify09Population
@@ -1429,6 +1419,21 @@ fn build_source_marker_json() -> serde_json::Value {
         "tree": option_env!("CARRICK_BUILD_SOURCE_TREE").unwrap_or("unstamped"),
         "state": option_env!("CARRICK_BUILD_SOURCE_STATE").unwrap_or("unstamped"),
     })
+}
+
+/// Write one profile summary as a single JSON line to the user-selected
+/// `--summary-jsonl` path, when one was given.
+#[cfg(target_os = "macos")]
+fn write_profile_summary_jsonl(
+    path: Option<&std::path::Path>,
+    summary: &impl serde::Serialize,
+) -> anyhow::Result<()> {
+    let Some(jsonl_path) = path else {
+        return Ok(());
+    };
+    let json = serde_json::to_string(summary)?;
+    std::fs::write(jsonl_path, format!("{json}\n"))
+        .with_context(|| format!("write summary JSON to {}", jsonl_path.display()))
 }
 
 fn custom_trace_report_is_rejected(
