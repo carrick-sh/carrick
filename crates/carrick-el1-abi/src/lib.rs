@@ -416,6 +416,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(Counters, irq_taken) as u64,
         core::mem::offset_of!(Counters, fault_taken) as u64,
         core::mem::offset_of!(Counters, ipc_leaves) as u64,
+        core::mem::offset_of!(Counters, anonymous_leaves) as u64,
         core::mem::size_of::<CurrentTask>() as u64,
         core::mem::offset_of!(CurrentTask, file_table) as u64,
         core::mem::offset_of!(CurrentTask, pending_host_work) as u64,
@@ -2616,6 +2617,49 @@ impl IpcLeave {
     pub const COUNT: usize = 23;
 }
 
+/// Why EL1 left a delegated-MM anonymous `brk`/`mmap`/`munmap`/`mprotect`
+/// (an MM with an admitted reservation root) for the host, counted beside
+/// `forwarded[nr]` so a signed run names each remaining forward cause.
+/// Append only: the embed witnesses read the ordinals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum AnonymousLeave {
+    /// Host work was pending at entry (a kick, a signal, an owed wake).
+    PendingHostWork,
+    /// The root guard was held (by the host venue, or EL1 on another vCPU).
+    RootBusy,
+    /// The root model could not decide now (`Busy`, `Stale`,
+    /// `MetadataRequired` from the decision itself).
+    RootUnavailable,
+    /// The root model routed the call to the host (a host-owned node, a
+    /// shape EL1 does not serve).
+    RootDeclined,
+    /// The MM's address space has no grant (gate closed) or no owner.
+    NoGrant,
+    /// Another EL1 editor holds the MM's descriptor editor.
+    EditorBusy,
+    /// The range's backing has a terminal the host owns (a leaf without
+    /// EL1 tags).
+    BackingHostOwnedLeaf,
+    /// The range's backing has an L1/L2 block terminal.
+    BackingBlock,
+    /// The range's backing is split into more backed runs than one step.
+    BackingMultiRun,
+    /// The range's backing has a malformed terminal, or a table outside
+    /// the primary arena.
+    BackingMalformed,
+    /// The range's backing has a retired terminal whose return is owed.
+    BackingRetired,
+    /// The descriptor step refused (permission or retirement edit).
+    EditRefused,
+    /// No owed-return journal slot was free.
+    JournalFull,
+}
+
+impl AnonymousLeave {
+    pub const COUNT: usize = 13;
+}
+
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
 #[repr(C)]
 pub struct Counters {
@@ -2634,6 +2678,9 @@ pub struct Counters {
     pub ipc_leaves: [AtomicU64; IpcLeave::COUNT],
     /// Exact lifecycle declines; separate from the eventual host exit class.
     pub lifecycle_declines: [AtomicU64; LifecycleDecline::COUNT],
+    /// Delegated-MM anonymous calls EL1 left for the host, by
+    /// [`AnonymousLeave`].
+    pub anonymous_leaves: [AtomicU64; AnonymousLeave::COUNT],
 }
 
 impl Counters {
@@ -2646,6 +2693,7 @@ impl Counters {
             exit_reasons: [const { AtomicU64::new(0) }; El1ExitReason::COUNT],
             ipc_leaves: [const { AtomicU64::new(0) }; IpcLeave::COUNT],
             lifecycle_declines: [const { AtomicU64::new(0) }; LifecycleDecline::COUNT],
+            anonymous_leaves: [const { AtomicU64::new(0) }; AnonymousLeave::COUNT],
         }
     }
 
@@ -2681,6 +2729,12 @@ impl Counters {
             .zip(&self.lifecycle_declines)
         {
             target.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for i in 0..AnonymousLeave::COUNT {
+            snapshot.anonymous_leaves[i].store(
+                self.anonymous_leaves[i].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
         snapshot
     }
@@ -3110,6 +3164,45 @@ static HOST_WORK_PUBLICATIONS: [AtomicU64; HostWorkPublishReason::COUNT] =
 /// Process-lifetime count of pending-host-work publications by source.
 pub fn host_work_publication_counts() -> [u64; HostWorkPublishReason::COUNT] {
     core::array::from_fn(|i| HOST_WORK_PUBLICATIONS[i].load(Ordering::Relaxed))
+}
+
+/// Per-vCPU-slot run sequence, host-process state: odd while the slot's vCPU
+/// is inside the host run loop (`carrick_vmm_hvf` `run_to_exit`), which
+/// resumes an interrupted EL1 critical section to completion before it
+/// returns; even otherwise. Bumped at every entry and every return, so a
+/// host thread that reads the same even value twice knows that slot's vCPU
+/// executed nothing in between: EL1 there can neither take nor release a
+/// lock.
+static SLOT_RUN_SEQUENCE: [AtomicU64; EL1_STACK_SLOTS as usize] =
+    [const { AtomicU64::new(0) }; EL1_STACK_SLOTS as usize];
+
+/// The slot's run sequence (see [`SlotRun`]); 0 for a slot out of range.
+pub fn slot_run_sequence(slot: usize) -> u64 {
+    SLOT_RUN_SEQUENCE
+        .get(slot)
+        .map_or(0, |sequence| sequence.load(Ordering::SeqCst))
+}
+
+/// The host run loop's residence on one vCPU slot: entered when the loop
+/// starts running the slot's vCPU, left when it returns to its caller.
+pub struct SlotRun(Option<usize>);
+
+impl SlotRun {
+    pub fn enter(slot: Option<usize>) -> Self {
+        let slot = slot.filter(|slot| *slot < EL1_STACK_SLOTS as usize);
+        if let Some(slot) = slot {
+            SLOT_RUN_SEQUENCE[slot].fetch_add(1, Ordering::SeqCst);
+        }
+        Self(slot)
+    }
+}
+
+impl Drop for SlotRun {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0 {
+            SLOT_RUN_SEQUENCE[slot].fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Mark return-to-user work pending for the vCPU at `slot`.
@@ -3930,7 +4023,14 @@ mod tests {
     fn test_counters_layout() {
         assert_eq!(
             core::mem::size_of::<Counters>(),
-            (1024 + 32 + 1 + El1ExitReason::COUNT + IpcLeave::COUNT + LifecycleDecline::COUNT) * 8
+            (1024
+                + 32
+                + 1
+                + El1ExitReason::COUNT
+                + IpcLeave::COUNT
+                + LifecycleDecline::COUNT
+                + AnonymousLeave::COUNT)
+                * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);

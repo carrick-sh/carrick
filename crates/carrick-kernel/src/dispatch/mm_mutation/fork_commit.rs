@@ -112,7 +112,7 @@ impl ForkCommit<'_> {
     /// can admit the child's root before the child is published. `None`: no
     /// EL1 zone, or the publication was refused (the child then runs with
     /// its address space unpublished, as before).
-    pub fn publish_child_address_space(
+    pub(crate) fn publish_child_address_space(
         &self,
         ttbr0: u64,
         ttbr1: u64,
@@ -126,7 +126,10 @@ impl ForkCommit<'_> {
     /// memory, seeded from the parent's committed root
     /// ([`El1AdmissionOrigin::ForkCommit`]). `parent` is the dispatcher of
     /// the MM whose guard minted this commit.
-    pub fn admit_child_root(&self, parent: &SyscallDispatcher) -> Result<El1Admission, Refusal> {
+    pub(crate) fn admit_child_root(
+        &self,
+        parent: &SyscallDispatcher,
+    ) -> Result<El1Admission, Refusal> {
         // The parent guard is borrowed for this commit's whole lifetime.
         let parent_permit = HostAliasPermit {
             coordinator: Arc::clone(&self.parent_coordinator),
@@ -142,5 +145,36 @@ impl ForkCommit<'_> {
                 parent_permit: &parent_permit,
             },
         )
+    }
+
+    /// Publish the never-run child's address space, whose user root is
+    /// `child_ttbr0`, and admit its reservation root seeded from the
+    /// parent's committed root, as one step of the fork commit: the child is
+    /// published only with its admission decided, before it can run, so its
+    /// first load finds its address space already settled and never binds
+    /// it as a fresh MM. `parent` is the dispatcher of the MM whose guard
+    /// minted this commit.
+    ///
+    /// The child is switchable by guest EL1 exactly when its parent is: a
+    /// copied MM keeps its parent's memory model, and an EL1-switchable
+    /// address space installs its own root in both `TTBR0_EL1` and
+    /// `TTBR1_EL1` (`Aarch64Vcpu::el1_switchable_roots`). `None`: the parent
+    /// has no published address space, or the table refused the child.
+    /// Every admission outcome fires `hvpatch-el1-root-admission`.
+    pub fn publish_and_admit_child(
+        &self,
+        parent: &SyscallDispatcher,
+        child_ttbr0: u64,
+    ) -> Option<crate::kernel::AddressSpacePublication> {
+        if !crate::kernel::is_address_space_published(self.parent_mm) {
+            return None;
+        }
+        let publication = self.publish_child_address_space(child_ttbr0, child_ttbr0)?;
+        crate::dispatch::mem::el1_reservations::RootAdmission::of(self.admit_child_root(parent))
+            .trace(
+                self.child_mm,
+                carrick_observability::probes::HvpatchEl1RootOrigin::ForkCommit,
+            );
+        Some(publication)
     }
 }

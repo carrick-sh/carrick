@@ -100,9 +100,11 @@ pub(in crate::dispatch) struct Root {
 struct View(Carrier);
 impl PreparedHostReservations for View {
     fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-        self.0
-            .table
-            .lock_waiting(self.0.slot(mm)?, mm, &crate::el1_zone::HostLockWait)
+        self.0.table.lock_waiting(
+            self.0.slot(mm)?,
+            mm,
+            &crate::dispatch::mem::el1_reservations::RootHostWait::new(),
+        )
     }
 }
 struct Provider(Carrier);
@@ -825,12 +827,17 @@ fn delegated_fault_classifier_waits_out_a_guest_venue_holder() {
     let Twin {
         delegated, root, ..
     } = &twin;
-    let held = root.lock();
+    // EL1 on slot 9 holds the root while its vCPU is in the run loop.
+    const SLOT: u32 = 9;
+    let running = carrick_el1_abi::SlotRun::enter(Some(SLOT as usize));
+    let slot = root.carrier.slot(root.mm).unwrap();
+    let held = root.carrier.table.lock_el1(slot, root.mm, SLOT).unwrap();
     let tracked = std::thread::scope(|scope| {
         let classifier = scope.spawn(|| delegated.fault_requires_mm_mutation(base));
         // The classifier reaches the held root before it is released.
         std::thread::sleep(std::time::Duration::from_millis(20));
         drop(held);
+        drop(running);
         classifier.join().expect("the classifier finishes")
     });
     assert!(
@@ -3715,4 +3722,77 @@ fn delegated_returned_va_carries_no_host_protection_fact_into_its_next_mapping()
         "a stale host mark denies host copyout into the root's new mapping"
     );
     assert!(!protections.range_no_write(first, (2 * PAGE) as usize));
+}
+
+/// A host-venue `munmap` of root-owned memory hands the hole back to the
+/// root: no host `unmapped` mark may outlive it, because the root may place
+/// a new mapping there on the guest venue, which the host registry never
+/// hears of. Signed, cpython's `fork(2)` returned EFAULT reading its
+/// `child_tid` from a TLS page EL1 had mapped over such a hole.
+#[test]
+fn delegated_host_venue_munmap_leaves_no_host_mark_for_the_roots_next_mapping() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory =
+        super::tests::ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (64 * PAGE) as usize);
+    let first = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    // The munmap reaches the host venue (EL1 forwarded it).
+    let outcome = dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(SYS_MUNMAP, SyscallArgs([first, 2 * PAGE, 0, 0, 0, 0])),
+            &mut memory,
+            &CompatReporter::default(),
+        )
+        .expect("munmap dispatch");
+    assert_eq!(returned(outcome), 0);
+    // The root places the VA again, on its own venue.
+    assert_eq!(
+        root.guest_mmap(
+            Placement::Fixed(first),
+            2 * PAGE,
+            ReservationProtection::READ_WRITE
+        ),
+        Ok(first)
+    );
+    let protections = carrick_guest_mem::GuestMemory::protections(&memory).unwrap();
+    assert!(
+        !protections.range_no_access(first, (2 * PAGE) as usize),
+        "a stale host mark denies host reads of the root's new mapping"
+    );
+    assert!(!protections.range_no_write(first, (2 * PAGE) as usize));
+}
+
+/// At admission the root takes over its holes: a host mark there (the
+/// engine seeds the heap past the break `unmapped`) would refuse host reads
+/// of every page EL1 later maps or grows the break over.
+#[test]
+fn delegated_admission_releases_host_marks_over_the_roots_holes() {
+    let dispatcher = SyscallDispatcher::new();
+    let _root = Root::admit(&dispatcher);
+    let mut memory =
+        super::tests::ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (64 * PAGE) as usize);
+    let layout = dispatcher.mem().lock().layout;
+    carrick_guest_mem::GuestMemory::set_unmapped(
+        &mut memory,
+        layout.heap_base,
+        (16 * PAGE) as usize,
+        true,
+    );
+    carrick_guest_mem::GuestMemory::set_unmapped(
+        &mut memory,
+        layout.mmap_base,
+        (16 * PAGE) as usize,
+        true,
+    );
+    dispatcher.mem_view().release_root_territory(&mut memory);
+    let protections = carrick_guest_mem::GuestMemory::protections(&memory).unwrap();
+    assert!(!protections.range_no_access(layout.heap_base, (16 * PAGE) as usize));
+    assert!(!protections.range_no_access(layout.mmap_base, (16 * PAGE) as usize));
 }

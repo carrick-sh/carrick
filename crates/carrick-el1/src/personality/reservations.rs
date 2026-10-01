@@ -176,9 +176,51 @@ struct State {
     retired_below: u64,
 }
 
+/// Who holds a root's guard, as its lock word spells it (0: free).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootHolder {
+    /// A host thread (host venue, publication, final settlement).
+    Host,
+    /// Guest EL1 on this vCPU slot.
+    El1Slot(u32),
+}
+
+impl RootHolder {
+    const fn word(self) -> u64 {
+        match self {
+            Self::Host => 1,
+            Self::El1Slot(slot) => 2 + slot as u64,
+        }
+    }
+
+    /// The holder a nonzero lock word names.
+    fn of_word(word: u64) -> Self {
+        match word.checked_sub(2) {
+            Some(slot) => Self::El1Slot(slot as u32),
+            None => Self::Host,
+        }
+    }
+}
+
+/// How an acquisition waits for a held root: shown the holder after each
+/// failed attempt, it waits and answers whether to try again.
+pub trait RootWait {
+    fn wait(&self, attempt: u32, holder: RootHolder) -> bool;
+}
+
+/// One attempt: a held root answers `Busy` (guest EL1, which forwards).
+pub struct NoRootWait;
+
+impl RootWait for NoRootWait {
+    fn wait(&self, _attempt: u32, _holder: RootHolder) -> bool {
+        false
+    }
+}
+
 #[repr(C)]
 struct Root {
     key: AtomicU64,
+    /// The holder's [`RootHolder::word`], 0 when free.
     locked: AtomicU64,
     epoch: AtomicU64,
     state: UnsafeCell<MaybeUninit<State>>,
@@ -402,6 +444,10 @@ pub struct Reservations<'a> {
     /// host reserve before the shared pool, so a host commit that retires
     /// and re-inserts cannot lose its own nodes to another MM in between.
     host_venue: bool,
+    /// The guard is a host thread's: its shared-pool pops retry a lost
+    /// free-list race (another allocation completed) until they win or the
+    /// pool is empty. EL1's take one attempt and forward on `Busy`.
+    host_holder: bool,
 }
 impl Drop for Reservations<'_> {
     fn drop(&mut self) {
@@ -423,7 +469,12 @@ impl SharedReservations {
         }
         let root = self.roots.get(index).ok_or(Refusal::Invalid)?;
         root.locked
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                0,
+                RootHolder::Host.word(),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .map_err(|_| Refusal::Busy)?;
         let result = if root.key.load(Ordering::Acquire) != 0 {
             Err(Refusal::Collision)
@@ -476,20 +527,59 @@ impl SharedReservations {
         }
     }
 
-    /// EL1's acquisition: one attempt. A held root answers `Busy` and the
-    /// syscall or fault goes to the host, which serves it on its own venue.
-    pub fn lock(&self, index: usize, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-        self.lock_waiting(index, mm, &carrick_sched_core::BoundedSpin(0))
+    /// EL1's acquisition on vCPU slot `slot`: one attempt. A held root
+    /// answers `Busy` and the syscall or fault goes to the host, which serves
+    /// it on its own venue. The lock word names the slot while it is held
+    /// ([`Self::el1_slot_holding`]).
+    pub fn lock_el1(
+        &self,
+        index: usize,
+        mm: ReservationMm,
+        slot: u32,
+    ) -> Result<Reservations<'_>, Refusal> {
+        self.lock_using(
+            index,
+            mm,
+            None,
+            cfg!(target_os = "none"),
+            &NoRootWait,
+            RootHolder::El1Slot(slot).word(),
+        )
     }
 
-    /// [`Self::lock`] with `wait` deciding whether to retry a held root.
+    /// A host thread's single attempt (final settlement, model fixtures).
+    pub fn lock(&self, index: usize, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
+        self.lock_waiting(index, mm, &NoRootWait)
+    }
+
+    /// A host thread's acquisition, `wait` deciding whether to retry a held
+    /// root.
     pub fn lock_waiting(
         &self,
         index: usize,
         mm: ReservationMm,
-        wait: &dyn carrick_sched_core::LockWait,
+        wait: &dyn RootWait,
     ) -> Result<Reservations<'_>, Refusal> {
-        self.lock_using(index, mm, None, cfg!(target_os = "none"), wait)
+        self.lock_using(
+            index,
+            mm,
+            None,
+            cfg!(target_os = "none"),
+            wait,
+            RootHolder::Host.word(),
+        )
+    }
+
+    /// The root EL1 on vCPU slot `slot` holds, read without any guard: the
+    /// host asks at an exit that slot took from inside the EL1 image, which
+    /// must never leave a root held (an EL1 critical section is resumed to
+    /// completion; one that leaves its image while holding a root would make
+    /// a host waiter wait on a vCPU that is not running).
+    pub fn el1_slot_holding(&self, slot: u32) -> Option<usize> {
+        let word = RootHolder::El1Slot(slot).word();
+        self.roots
+            .iter()
+            .position(|root| root.locked.load(Ordering::Acquire) == word)
     }
 
     fn lock_using<'a>(
@@ -498,7 +588,8 @@ impl SharedReservations {
         mm: ReservationMm,
         banks: Option<&'a dyn storage::NodeBanks>,
         identity: bool,
-        wait: &dyn carrick_sched_core::LockWait,
+        wait: &dyn RootWait,
+        holder: u64,
     ) -> Result<Reservations<'a>, Refusal> {
         if self.layout_hash.load(Ordering::Acquire) != LAYOUT_HASH {
             return Err(Refusal::Stale);
@@ -509,12 +600,11 @@ impl SharedReservations {
         // host serializes its own venues per MM first). EL1 gives up at once;
         // the host waits the holder out.
         let mut attempt = 0u32;
-        while root
-            .locked
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+        while let Err(held) =
+            root.locked
+                .compare_exchange(0, holder, Ordering::Acquire, Ordering::Acquire)
         {
-            if !wait.wait(attempt) {
+            if held != 0 && !wait.wait(attempt, RootHolder::of_word(held)) {
                 return Err(Refusal::Busy);
             }
             attempt = attempt.saturating_add(1);
@@ -531,6 +621,7 @@ impl SharedReservations {
             banks,
             node_capacity: self.storage.capacity(),
             host_venue: false,
+            host_holder: holder == RootHolder::Host.word(),
         };
         if (banks.is_none() && !identity && self.storage.capacity() > NODES as u32)
             || banks.is_some_and(|banks| banks.count() < self.storage.bank_count())
@@ -555,6 +646,10 @@ impl SharedReservations {
         let index = head as u32;
         if index > capacity {
             return Err(Refusal::MetadataRequired);
+        }
+        #[cfg(test)]
+        if index != 0 && tests::lose_pop_race() {
+            return Err(Refusal::Busy);
         }
         if index != 0 {
             let next = self.node(index, banks).next_free.load(Ordering::Relaxed);
@@ -1128,11 +1223,23 @@ impl Reservations<'_> {
         });
         Ok(Decision::Work(request))
     }
+    /// One node from the shared pool. A lost free-list race means another
+    /// allocation completed: a host guard retries it (lock-free progress,
+    /// no wait on any event), EL1 answers `Busy` and forwards. Only an
+    /// empty pool ends a host pop (`MetadataRequired`).
+    fn pool_node(&self) -> Result<u32, Refusal> {
+        loop {
+            match self.table.allocate(self.banks, self.node_capacity) {
+                Err(Refusal::Busy) if self.host_holder => core::hint::spin_loop(),
+                result => return result,
+            }
+        }
+    }
     /// One bounded allocation attempt per spare; failure returns every node.
     fn allocate_spares(&mut self, needed: usize) -> Result<[u32; 5], Refusal> {
         let mut nodes = [0; 5];
         for slot in nodes.iter_mut().take(needed) {
-            match self.table.allocate(self.banks, self.node_capacity) {
+            match self.pool_node() {
                 Ok(node) => *slot = node,
                 Err(reason) => {
                     self.release_spares(nodes);
@@ -1169,7 +1276,7 @@ impl Reservations<'_> {
     /// reserve. Pool exhaustion or contention never fails a host commit the
     /// reserve covers.
     fn host_node(&mut self) -> Result<u32, Refusal> {
-        if let Ok(id) = self.table.allocate(self.banks, self.node_capacity) {
+        if let Ok(id) = self.pool_node() {
             return Ok(id);
         }
         let head = self.state().host_reserve_head;
@@ -1209,10 +1316,8 @@ impl Reservations<'_> {
     pub fn secure_host_nodes(&mut self, needed: u32) -> Result<(), Refusal> {
         self.host_venue = true;
         while self.state().host_reserved < HOST_RESERVE {
-            let id = match self.table.allocate(self.banks, self.node_capacity) {
-                Ok(id) => id,
-                Err(Refusal::Busy) => continue,
-                Err(_) => break,
+            let Ok(id) = self.pool_node() else {
+                break;
             };
             self.free_node(id);
         }
@@ -2113,7 +2218,7 @@ impl Reservations<'_> {
         let n = self.read(id);
         self.copy_in_order(n.left, list)?;
         if !n.flags().contains(ReservationNodeFlags::DONTFORK) {
-            let copy = self.table.allocate(self.banks, self.node_capacity)?;
+            let copy = self.pool_node()?;
             let mut data = n;
             data.left = 0;
             data.right = 0;
@@ -2323,6 +2428,86 @@ mod tests {
             assert_eq!(visits, 128);
             assert_eq!(model.work - before, 128, "one node read per output mapping");
         }
+    }
+
+    /// A lost free-list race (another allocation won the CAS) is not an
+    /// answer a host guard may give: it retries the pop. EL1 declines with
+    /// its one attempt and forwards.
+    #[test]
+    fn a_host_pool_pop_retries_a_lost_race_and_el1_declines() {
+        let table = table();
+        let mm = ReservationMm::new(61).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        table.lock(0, mm).unwrap().finish_import().unwrap();
+        // Put two nodes on the shared free list.
+        {
+            let model = table.lock(0, mm).unwrap();
+            let (a, b) = (model.pool_node().unwrap(), model.pool_node().unwrap());
+            model.table.release(a, model.banks);
+            model.table.release(b, model.banks);
+        }
+        LOSE_POPS.with(|lose| lose.set(2));
+        let host = table.lock(0, mm).unwrap();
+        assert!(host.pool_node().is_ok(), "the host retries past lost races");
+        drop(host);
+        LOSE_POPS.with(|lose| lose.set(1));
+        let guest = table.lock_el1(0, mm, 4).unwrap();
+        assert_eq!(
+            guest.pool_node(),
+            Err(Refusal::Busy),
+            "EL1 takes one attempt"
+        );
+        LOSE_POPS.with(|lose| lose.set(0));
+    }
+
+    thread_local! {
+        static LOSE_POPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Test hook: the next pops of this thread lose their free-list race.
+    pub(super) fn lose_pop_race() -> bool {
+        LOSE_POPS.with(|lose| {
+            let left = lose.get();
+            lose.set(left.saturating_sub(1));
+            left != 0
+        })
+    }
+
+    /// The root's lock word names its holder: the host asks, at an exit a
+    /// vCPU took from inside the EL1 image, whether EL1 on that slot still
+    /// holds a root, and only that slot's EL1 guard answers yes.
+    #[test]
+    fn an_el1_root_guard_is_named_by_its_slot_until_released() {
+        let table = table();
+        let a = ReservationMm::new(41).unwrap();
+        let b = ReservationMm::new(42).unwrap();
+        table.publish(3, a, layout()).unwrap();
+        table.publish(4, b, layout()).unwrap();
+        assert_eq!(
+            table.el1_slot_holding(5),
+            None,
+            "nothing held after publish"
+        );
+        {
+            let _guest = table.lock_el1(3, a, 5).unwrap();
+            assert_eq!(table.el1_slot_holding(5), Some(3));
+            assert_eq!(
+                table.el1_slot_holding(6),
+                None,
+                "another slot holds nothing"
+            );
+            assert!(
+                matches!(table.lock_el1(3, a, 6), Err(Refusal::Busy)),
+                "EL1 gives up on a held root at once"
+            );
+            let _host = table.lock(4, b).unwrap();
+            assert_eq!(
+                table.el1_slot_holding(5),
+                Some(3),
+                "a host guard is never an EL1 slot's"
+            );
+        }
+        assert_eq!(table.el1_slot_holding(5), None, "released with the guard");
     }
 
     #[test]
