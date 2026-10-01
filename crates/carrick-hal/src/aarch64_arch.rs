@@ -45,9 +45,9 @@ impl PageTableCodec for Aarch64Mmu {
     type Manager = carrick_mmu_core::aarch64::PageTableManager;
     type Error = carrick_mmu_core::aarch64::PageTableError;
 
-    fn new_manager(bytes: Vec<u8>, base: u64) -> Self::Manager {
-        carrick_mmu_core::aarch64::PageTableManager::new(
-            bytes,
+    fn manager_from_live(live: &[u8], base: u64) -> Self::Manager {
+        carrick_mmu_core::aarch64::PageTableManager::from_live_image(
+            live,
             base,
             carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         )
@@ -230,7 +230,7 @@ mod tests {
         // manager's translate and the stateless walk see nothing.
         let base = 0x8000_0000u64;
         let bytes = vec![0u8; 4096 * 6];
-        let mgr = Aarch64Mmu::new_manager(bytes.clone(), base);
+        let mgr = Aarch64Mmu::manager_from_live(&bytes, base);
         assert_eq!(mgr.translate(0x40_0000), None);
         assert_eq!(
             Aarch64Mmu::walk_descriptors(&bytes, base, 0x40_0000),

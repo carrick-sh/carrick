@@ -2037,14 +2037,54 @@ impl PageTableManager {
     }
 
     pub fn new(mut bytes: Vec<u8>, base: u64, layout: PageTableLayoutConfig) -> Self {
-        let next_free = discover_next_free_spare(&bytes);
+        let capacity = bytes.len();
+        let next_free = discover_next_free_spare(&bytes).min(capacity as u64);
+        bytes.truncate(next_free as usize);
+        Self::from_occupied_prefix(bytes, capacity, base, layout)
+    }
+
+    /// Build the editor over a borrowed snapshot of a live table region of
+    /// `live.len()` bytes (the primary capacity). Only the occupied prefix
+    /// (through the last non-zero table page) is copied; the zero tail stays
+    /// capacity that `alloc_table` grows into on demand.
+    pub fn from_live_image(live: &[u8], base: u64, layout: PageTableLayoutConfig) -> Self {
+        Self::from_image_prefix(live, live.len(), base, layout)
+    }
+
+    /// [`Self::from_live_image`] over `image`, the leading bytes of a primary
+    /// arena of `capacity` bytes whose remainder is zero (an exec plan's
+    /// occupied-prefix payload, see [`Self::into_occupied_bytes`]).
+    pub fn from_image_prefix(
+        image: &[u8],
+        capacity: usize,
+        base: u64,
+        layout: PageTableLayoutConfig,
+    ) -> Self {
+        let next_free = discover_next_free_spare(image).min(capacity as u64) as usize;
+        let next_free = next_free.min(image.len());
+        let mut bytes = image[..next_free].to_vec();
+        // `discover_next_free_spare` never reports below the spare start,
+        // which a short image may not reach.
+        let floor = (SPARE_START_OFFSET as usize).min(capacity);
+        if bytes.len() < floor {
+            bytes.resize(floor, 0);
+        }
+        Self::from_occupied_prefix(bytes, capacity, base, layout)
+    }
+
+    /// `prefix` holds every non-zero table page of a primary arena of
+    /// `capacity` bytes; everything past it is zero.
+    fn from_occupied_prefix(
+        bytes: Vec<u8>,
+        capacity: usize,
+        base: u64,
+        layout: PageTableLayoutConfig,
+    ) -> Self {
+        let next_free = bytes.len() as u64;
         let asid_scoped_leaves =
             terminal_descriptor(walk_descriptors(&bytes, base, layout.user_leaf_check_va))
                 & NON_GLOBAL
                 != 0;
-        let capacity = bytes.len();
-        let next_free = next_free.min(capacity as u64);
-        bytes.truncate(next_free as usize);
         Self {
             arenas: vec![TableArena {
                 snapshot_scratch: Vec::new(),
@@ -2985,16 +3025,28 @@ impl PageTableManager {
     /// Consume the manager, returning the (possibly edited) table-region bytes of the primary arena.
     /// Used by the boot-time ELF read-only-span pass, which edits the pristine
     /// `stage1_identity_page_tables` image before it is mapped into the guest.
-    pub fn into_bytes(mut self) -> Result<Vec<u8>, PageTableError> {
+    pub fn into_bytes(self) -> Result<Vec<u8>, PageTableError> {
+        let capacity = self.arenas[0].capacity;
+        let mut bytes = self.into_occupied_bytes()?;
+        if bytes.len() < capacity {
+            bytes.resize(capacity, 0);
+        }
+        Ok(bytes)
+    }
+
+    /// The primary arena's occupied table prefix (through the bump cursor),
+    /// without the zero capacity tail [`Self::into_bytes`] appends. For a
+    /// consumer that installs the image into zeroed backing of the full
+    /// capacity and rebuilds a manager with [`Self::from_live_image`].
+    pub fn into_occupied_bytes(mut self) -> Result<Vec<u8>, PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering};
 
         let primary = self.arenas.remove(0);
         let mut bytes = match primary.storage {
             TableArenaStorage::Owned(bytes) => bytes,
             TableArenaStorage::Live => {
-                let mut bytes = Vec::with_capacity(primary.capacity);
                 let prefix_len = primary.next_free as usize;
-                bytes.resize(prefix_len, 0);
+                let mut bytes = vec![0; prefix_len];
                 let resolver = self
                     .resolver
                     .as_ref()
@@ -3011,9 +3063,7 @@ impl PageTableManager {
                 bytes
             }
         };
-        if bytes.len() < primary.capacity {
-            bytes.resize(primary.capacity, 0);
-        }
+        bytes.truncate(primary.next_free as usize);
         Ok(bytes)
     }
 
@@ -5851,6 +5901,54 @@ mod tests {
                 "warmed live image reuse allocated arena buffers at scale {scale}"
             );
         }
+    }
+
+    /// A manager built over a live table region copies the occupied table
+    /// prefix, never the whole primary capacity: the exec and first-edit
+    /// paths build one per process, and the region is 1.75 MiB of mostly zero
+    /// pages. The capacity stays the region's, so later tables still fit.
+    #[test]
+    fn manager_from_live_image_copies_only_occupied_tables() {
+        let live = hvpatch_manager().into_bytes().unwrap();
+        assert_eq!(live.len(), LINUX_PAGE_TABLES_SIZE as usize);
+        let reference = PageTableManager::new(live.clone(), LINUX_PAGE_TABLES_BASE, test_layout());
+        let occupied = reference.copied_bytes() as usize;
+        assert!(
+            occupied < live.len() / 4,
+            "fixture must be mostly spare capacity"
+        );
+        snapshot_allocations::LARGE.with(|n| n.set(Some(0)));
+        snapshot_allocations::ALLOCATED_BYTES.with(|n| n.set(Some(0)));
+        let mut built =
+            PageTableManager::from_live_image(&live, LINUX_PAGE_TABLES_BASE, test_layout());
+        let large = snapshot_allocations::LARGE
+            .with(|n| n.replace(None))
+            .unwrap();
+        let bytes = snapshot_allocations::ALLOCATED_BYTES
+            .with(|n| n.replace(None))
+            .unwrap();
+        std::eprintln!(
+            "from_live_image occupied={occupied} capacity={} allocated={bytes} large={large}",
+            live.len()
+        );
+        assert_eq!(large, 0, "copied the whole primary capacity");
+        assert!(
+            bytes <= occupied + 4096,
+            "allocated {bytes} bytes for {occupied} occupied table bytes"
+        );
+        assert_eq!(built.copied_bytes(), reference.copied_bytes());
+        for va in [
+            LINUX_NULL_GUARD_END,
+            LINUX_PAGE_TABLES_BASE,
+            LINUX_MMAP_BASE,
+        ] {
+            assert_eq!(built.debug_walk(va), reference.debug_walk(va));
+        }
+        assert_eq!(built.pool_stats(), reference.pool_stats());
+        // Capacity is the live region's: a new table still allocates.
+        built
+            .set_rw(LINUX_MMAP_BASE + 0x40_0000_0000, 0x1000, false, None)
+            .expect("a table beyond the copied prefix allocates");
     }
 
     #[derive(Debug)]

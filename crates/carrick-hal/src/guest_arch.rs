@@ -39,9 +39,10 @@ pub trait PageTableCodec {
     /// `carrick_mmu_core::aarch64::PageTableError`).
     type Error;
 
-    /// Build the editor over a byte snapshot of the live tables rooted at
-    /// `base` (the existing `PageTableManager::new` contract, verbatim).
-    fn new_manager(bytes: Vec<u8>, base: u64) -> Self::Manager;
+    /// Build the editor over a borrowed view of the live table region rooted
+    /// at `base` (its length is the primary capacity). Implementations copy
+    /// only what they need; the caller keeps the view.
+    fn manager_from_live(live: &[u8], base: u64) -> Self::Manager;
 
     /// Raw descriptor walk for diagnostics: the four descriptors the hardware
     /// walker would traverse for `va` in tables at `base` (no state).
@@ -170,7 +171,7 @@ mod tests {
                 index_bits: 9,
             }
         }
-        fn new_manager(_bytes: Vec<u8>, _base: u64) -> Self::Manager {}
+        fn manager_from_live(_live: &[u8], _base: u64) -> Self::Manager {}
         fn walk_descriptors(_bytes: &[u8], _base: u64, _va: u64) -> [u64; 4] {
             [0; 4]
         }

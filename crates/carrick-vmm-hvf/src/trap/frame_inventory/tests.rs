@@ -953,6 +953,42 @@ fn exec_rebuild_leaves_the_heap_window_unmapped() {
     );
 }
 
+/// The rebuilt image's table payload is its occupied table prefix, not the
+/// 1.75 MiB root-slot capacity: every exec copies this payload into the slot,
+/// records it as the slot's populated prefix (zeroed again when the slot is
+/// recycled), and builds the engine's manager from it. The zero tail is
+/// already zero in a fresh or recycled slot.
+#[test]
+fn exec_plan_table_payload_is_the_occupied_prefix() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let plan = root_exec_test_plan();
+    let GlobalExecPlan { plan: rebuilt, .. } = prepare_global_exec_plan(&plan, None).unwrap();
+    let root = rebuilt.stage1_page_tables_base.unwrap();
+    let table = rebuilt
+        .mappings
+        .iter()
+        .find(|mapping| mapping.ipa_start == root)
+        .expect("rebuilt table mapping");
+    let capacity = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
+    let reference = carrick_mmu_core::aarch64::PageTableManager::from_live_image(
+        table.image.as_ref(),
+        root,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    let occupied = reference.copied_bytes() as usize;
+    assert!(
+        occupied < capacity / 4,
+        "fixture must leave most capacity spare"
+    );
+    assert_eq!(
+        table.image.len(),
+        occupied,
+        "exec table payload carries {} bytes for {occupied} occupied table bytes",
+        table.image.len()
+    );
+    assert_eq!(table.payload_size, occupied as u64);
+}
+
 #[test]
 fn root_exec_plan_owns_every_materialized_stage2_extent() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();

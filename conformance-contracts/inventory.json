@@ -3125,6 +3125,7 @@
         "kernel.el1.guest-scheduler",
         "kernel.el1.task-load-entry",
         "kernel.el1.thread-lifecycle",
+        "kernel.exec.stage1-image",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.exec-heap-window",
         "kernel.time.realtime-calibration"
