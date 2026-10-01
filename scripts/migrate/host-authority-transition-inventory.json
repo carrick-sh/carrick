@@ -770,18 +770,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8013 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8019 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000048",
     "source": {
-      "byte_end": 359605,
-      "byte_start": 359593,
+      "byte_end": 359991,
+      "byte_start": 359979,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8013,
-      "line_end": 8013,
-      "line_start": 8013
+      "line": 8019,
+      "line_end": 8019,
+      "line_start": 8019
     }
   },
   {
@@ -798,18 +798,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8089 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8095 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000049",
     "source": {
-      "byte_end": 363888,
-      "byte_start": 363876,
+      "byte_end": 364274,
+      "byte_start": 364262,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8089,
-      "line_end": 8089,
-      "line_start": 8089
+      "line": 8095,
+      "line_end": 8095,
+      "line_start": 8095
     }
   },
   {
@@ -826,18 +826,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8192 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8198 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 369929,
-      "byte_start": 369917,
+      "byte_end": 370315,
+      "byte_start": 370303,
       "column": 29,
       "column_end": 41,
       "column_start": 29,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8192,
-      "line_end": 8192,
-      "line_start": 8192
+      "line": 8198,
+      "line_end": 8198,
+      "line_start": 8198
     }
   },
   {
@@ -12107,18 +12107,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/frame_inventory.rs:1061 in `prepare_reservation`, `std::process::id` identifies only the calling host process so the authority discards cached entropy after a host fork; it neither supplies a guest identity nor selects a host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/frame_inventory.rs:1063 in `prepare_reservation`, `std::process::id` identifies only the calling host process so the authority discards cached entropy after a host fork; it neither supplies a guest identity nor selects a host target.",
     "review_id": "HA-000649",
     "source": {
-      "byte_end": 38815,
-      "byte_start": 38799,
+      "byte_end": 38938,
+      "byte_start": 38922,
       "column": 48,
       "column_end": 64,
       "column_start": 48,
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1061,
-      "line_end": 1061,
-      "line_start": 1061
+      "line": 1063,
+      "line_end": 1063,
+      "line_start": 1063
     }
   },
   {
