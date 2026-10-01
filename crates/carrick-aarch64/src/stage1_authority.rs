@@ -17,7 +17,7 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 use carrick_mmu_core::aarch64::{
     GuestLaneRefusal, GuestTxnPrepareError, GuestTxnSettleError, HostArenaResolver,
     LiveDescriptorOwner, PageTableApplyOutcome, PageTableError, PageTableManager, PtOp,
-    TableArenaSource, TerminalRule,
+    TableArenaSource, TerminalRule, UserLeafAccess,
 };
 
 /// Explicit sharing lifecycle for stage-1 page tables across process fork/execve boundaries.
@@ -1514,13 +1514,13 @@ impl<'a> Stage1Editor<'a> {
         guest_va: u64,
         target_ipa: u64,
         size: u64,
-        writable: bool,
+        access: UserLeafAccess,
     ) -> Result<bool, PageTableError> {
         self.manager.map_aliased(
             guest_va,
             target_ipa,
             size,
-            writable,
+            access,
             self.arena_source.as_deref_mut(),
         )
     }
@@ -1530,13 +1530,13 @@ impl<'a> Stage1Editor<'a> {
         guest_va: u64,
         target_ipa: u64,
         size: u64,
-        writable: bool,
+        access: UserLeafAccess,
     ) -> Result<bool, PageTableError> {
         self.manager.map_private_aliased(
             guest_va,
             target_ipa,
             size,
-            writable,
+            access,
             self.arena_source.as_deref_mut(),
         )
     }
@@ -1686,6 +1686,12 @@ mod tests {
         }
     }
     use carrick_guest_mem::Gpa;
+
+    /// The executable leaves these fixtures were written against.
+    const RWX: UserLeafAccess = UserLeafAccess {
+        writable: true,
+        executable: true,
+    };
     use carrick_mem::memory::{
         AARCH64_LINUX_PAGE_TABLE_LAYOUT, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
         LINUX_PAGE_TABLES_SIZE, stage1_hvpatch_page_tables,
@@ -2712,7 +2718,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.map_aliased(va, ipa1, 0x1000, true).expect("map 1");
+                    editor.map_aliased(va, ipa1, 0x1000, RWX).expect("map 1");
                     unsafe { editor.sync_to_host(&*resolver).expect("sync 1") };
                     Ok::<(), PageTableError>(())
                 },
@@ -2727,7 +2733,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.map_aliased(va, ipa2, 0x1000, true).expect("map 2");
+                    editor.map_aliased(va, ipa2, 0x1000, RWX).expect("map 2");
                     unsafe { editor.sync_to_host(&*resolver).expect("sync 2") };
                     Ok::<(), PageTableError>(())
                 },
@@ -2968,7 +2974,7 @@ mod tests {
                     assert!(!editor.undo_is_open());
                     editor.begin_undo().unwrap();
                     assert!(editor.undo_is_open());
-                    editor.map_aliased(va1, 0x80_0000, 0x1000, true).unwrap();
+                    editor.map_aliased(va1, 0x80_0000, 0x1000, RWX).unwrap();
                     editor.set_readonly(va1, 0x1000, false).unwrap();
                     unsafe { editor.sync_to_host(&*resolver).unwrap() };
                     editor.commit_undo();
@@ -2989,7 +2995,7 @@ mod tests {
             || panic!("manager must be present"),
             |editor| {
                 editor.begin_undo()?;
-                editor.map_aliased(va2, 0x90_0000, 0x1000, true)
+                editor.map_aliased(va2, 0x90_0000, 0x1000, RWX)
             },
         );
         test_allocator::FAIL_AFTER.with(|c| c.set(None));
@@ -3049,7 +3055,7 @@ mod tests {
                 || panic!("manager must be present"),
                 |editor| {
                     editor.begin_undo().unwrap();
-                    editor.map_aliased(va2, 0x90_0000, 0x1000, true).unwrap();
+                    editor.map_aliased(va2, 0x90_0000, 0x1000, RWX).unwrap();
                     unsafe { editor.sync_to_host(&*resolver).unwrap() };
                     editor.commit_undo();
                     assert!(!editor.undo_is_open());
@@ -3100,7 +3106,7 @@ mod tests {
                     for i in 0..10 {
                         let va = 0x80_0000_0000 + (i as u64) * 0x20_0000;
                         let ipa = 0x90_0000_0000 + (i as u64) * 0x20_0000;
-                        editor.map_aliased(va, ipa, 0x1000, true).unwrap();
+                        editor.map_aliased(va, ipa, 0x1000, RWX).unwrap();
                     }
                     assert!(editor.manager.arenas.len() > 8);
 

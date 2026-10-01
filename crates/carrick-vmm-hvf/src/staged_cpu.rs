@@ -235,6 +235,7 @@ mod tests {
             el1_vectors_base: Some(carrick_mem::memory::LINUX_EL1_VECTORS_BASE),
             stage1_page_tables_base: Some(0x9a_0000_0000),
             ro_spans: Vec::new(),
+            rw_spans: Vec::new(),
             mappings: Vec::new(),
         }
     }

@@ -39,8 +39,17 @@ fn translation_after_hole(reusable: bool, retained: bool) {
     let mut pt = tables();
     assert_eq!(pt.translate(VA), None);
     assert_eq!(pt.translate_retained_output(VA), None);
-    pt.map_aliased(VA + PAGE as u64, q, PAGE as u64, false, None)
-        .unwrap();
+    pt.map_aliased(
+        VA + PAGE as u64,
+        q,
+        PAGE as u64,
+        carrick_mmu_core::aarch64::UserLeafAccess {
+            writable: false,
+            executable: true,
+        },
+        None,
+    )
+    .unwrap();
     if retained {
         pt.set_prot_none(VA + PAGE as u64, PAGE, None).unwrap();
     }
@@ -123,7 +132,17 @@ fn retained_interior_pages_republish_lifetime_edges() {
         ..prefix
     });
     let mut pt = tables();
-    pt.map_aliased(VA, ipa, LEN as u64, false, None).unwrap();
+    pt.map_aliased(
+        VA,
+        ipa,
+        LEN as u64,
+        carrick_mmu_core::aarch64::UserLeafAccess {
+            writable: false,
+            executable: true,
+        },
+        None,
+    )
+    .unwrap();
     pt.set_prot_none(VA, LEN, None).unwrap();
     task.page_tables_authority().set_manager(pt);
     let mut vm = test_vm_state(task);
@@ -367,7 +386,17 @@ fn enumerated_layouts_match_pre_batch_page_reference() {
             let va = VA + (page * PAGE) as u64;
             let ipa = if state == 1 { 0x2000_0000 } else { 0x3000_0000 } + (page * PAGE) as u64;
             if state != 0 {
-                pt.map_aliased(va, ipa, PAGE as u64, false, None).unwrap();
+                pt.map_aliased(
+                    va,
+                    ipa,
+                    PAGE as u64,
+                    carrick_mmu_core::aarch64::UserLeafAccess {
+                        writable: false,
+                        executable: true,
+                    },
+                    None,
+                )
+                .unwrap();
                 if state == 3 {
                     pt.set_prot_none(va, PAGE, None).unwrap();
                 }

@@ -251,6 +251,95 @@ pub fn ro_page_spans(plan: &LoadPlan) -> Vec<RoSpan> {
     resolved
 }
 
+/// A page-granular guest-VA span of an ELF image's WRITABLE `PT_LOAD`
+/// pages: `.data`, `.bss`, a writable RELRO head. Linux maps each segment
+/// with its own permissions, so these pages are read/write and executable
+/// only when a segment with `PF_X` also covers them. The host region mapping
+/// is merged/escalated (see [`RoSpan`]), so the stage-1 leaf permission is
+/// re-applied from these spans — otherwise every `.data`/`.bss` page
+/// inherits the merged region's execute permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RwSpan {
+    /// Page-aligned guest VA of the first writable page.
+    pub start: u64,
+    /// Page-aligned length in bytes (never 0).
+    pub len: u64,
+    /// Whether an executable segment also touches these pages.
+    pub exec: bool,
+}
+
+/// Compute the page-granular writable spans for a load plan: every page a
+/// writable `PT_LOAD` segment touches, split where an executable segment
+/// also touches a page (that page stays executable, matching the read-only
+/// rule in [`ro_page_spans`] that executability wins on a shared page).
+/// Together with [`ro_page_spans`] this covers every page of the image.
+pub fn rw_page_spans(plan: &LoadPlan) -> Vec<RwSpan> {
+    const PAGE: u64 = 0x1000;
+    let floor = |v: u64| v & !(PAGE - 1);
+    let ceil = |v: u64| v.checked_add(PAGE - 1).map(|c| c & !(PAGE - 1));
+    let extent = |seg: &LoadSegment| -> Option<(u64, u64)> {
+        let end = seg.virtual_address.checked_add(seg.memory_size)?;
+        Some((floor(seg.virtual_address), ceil(end)?))
+    };
+    let exec_extents: Vec<(u64, u64)> = plan
+        .segments
+        .iter()
+        .filter(|seg| seg.perms.execute && seg.memory_size > 0)
+        .filter_map(extent)
+        .collect();
+
+    let mut out = Vec::new();
+    for seg in &plan.segments {
+        if !seg.perms.write || seg.memory_size == 0 {
+            continue;
+        }
+        let Some((start, end)) = extent(seg) else {
+            continue;
+        };
+        if seg.perms.execute {
+            out.push(RwSpan {
+                start,
+                len: end - start,
+                exec: true,
+            });
+            continue;
+        }
+        // Split off the pages an executable segment shares.
+        let mut cursor = start;
+        let mut shared: Vec<(u64, u64)> = exec_extents
+            .iter()
+            .filter(|(x_start, x_end)| *x_start < end && *x_end > start)
+            .map(|(x_start, x_end)| ((*x_start).max(start), (*x_end).min(end)))
+            .collect();
+        shared.sort_unstable();
+        for (x_start, x_end) in shared {
+            if x_start > cursor {
+                out.push(RwSpan {
+                    start: cursor,
+                    len: x_start - cursor,
+                    exec: false,
+                });
+            }
+            if x_end > cursor {
+                out.push(RwSpan {
+                    start: x_start.max(cursor),
+                    len: x_end - x_start.max(cursor),
+                    exec: true,
+                });
+                cursor = x_end;
+            }
+        }
+        if end > cursor {
+            out.push(RwSpan {
+                start: cursor,
+                len: end - cursor,
+                exec: false,
+            });
+        }
+    }
+    out
+}
+
 #[derive(Debug, Error)]
 pub enum ElfInspectError {
     #[error("failed to read ELF binary: {0}")]

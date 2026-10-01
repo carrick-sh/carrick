@@ -203,13 +203,13 @@ impl GuestAliasContext<'_> {
     }
 
     /// Publish `va -> target_ipa` over the authenticated `retained` pieces
-    /// as user-accessible, executable leaves (the host editor's `map_aliased`
-    /// flags) writable iff `writable`.
+    /// as user-accessible leaves carrying exactly `access` (the host editor's
+    /// `map_aliased` flags for the same access).
     pub(super) fn publish(
         &self,
         va: u64,
         target_ipa: u64,
-        writable: bool,
+        access: carrick_mmu_core::aarch64::UserLeafAccess,
         retained: &[RetainedAliasTarget],
         services: &mut dyn Stage1Services,
     ) -> Result<(), AliasPublishFailure> {
@@ -219,8 +219,8 @@ impl GuestAliasContext<'_> {
         self.require_output_outside_excluded_window(target_ipa, len)
             .map_err(AliasPublishFailure::Unsubmitted)?;
         let access = AliasAccess::User {
-            writable,
-            executable: true,
+            writable: access.writable,
+            executable: access.executable,
         };
         let mut published = false;
         for region in retained {
@@ -304,8 +304,16 @@ impl GuestAliasContext<'_> {
             return Ok(());
         }
         let retained = self.authenticate(va, len)?;
-        self.publish(va, va, true, &retained, services)
-            .map_err(AliasPublishFailure::into_error)?;
+        // Read/write and non-executable; the caller publishes the mapping's
+        // protection next, exactly as on the host lane.
+        self.publish(
+            va,
+            va,
+            carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+            &retained,
+            services,
+        )
+        .map_err(AliasPublishFailure::into_error)?;
         drop(retained);
         Ok(())
     }
@@ -374,7 +382,13 @@ impl GuestAliasContext<'_> {
                 return Err(self.roll_back_host_alias(va, len, &receipt, &staged, services, error));
             }
         };
-        if let Err(failure) = self.publish(va, gpa, writable, &retained, services) {
+        // Never executable here: a PROT_EXEC alias is published by the
+        // caller's `protect_range`, exactly as on the host lane.
+        let access = carrick_mmu_core::aarch64::UserLeafAccess {
+            writable,
+            executable: false,
+        };
+        if let Err(failure) = self.publish(va, gpa, access, &retained, services) {
             drop(retained);
             return Err(self.roll_back_host_alias(
                 va,

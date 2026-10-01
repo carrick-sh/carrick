@@ -51,16 +51,26 @@ fn global_exec_readonly_spans_preserve_rebased_ipa() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
-        .map_aliased(va, ipa, 0x20_000, true, None)
+        .map_aliased(
+            va,
+            ipa,
+            0x20_000,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
+            None,
+        )
         .expect("rebase merged writable load region");
 
-    reapply_global_exec_readonly_spans(
+    reapply_global_exec_page_spans(
         &mut tables,
         &[carrick_mem::elf::RoSpan {
             start: va + 0x4000,
             len: 0x2000,
             exec: false,
         }],
+        &[],
     )
     .expect("restore PT_LOAD protection");
 

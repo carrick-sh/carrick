@@ -876,6 +876,7 @@ fn root_exec_test_plan() -> GuestMappingPlan {
             len: 0x4000,
             exec: false,
         }],
+        rw_spans: Vec::new(),
     }
 }
 
@@ -1782,7 +1783,16 @@ fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
     let parent_va = 0x6000_2000_0000;
     let parent_ipa = 0x9b00_7700_0000;
     tables
-        .map_aliased(parent_va, parent_ipa, 0x4000, true, None)
+        .map_aliased(
+            parent_va,
+            parent_ipa,
+            0x4000,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
+            None,
+        )
         .unwrap();
     let parent_tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(tables));
     task.mm_access
@@ -6433,7 +6443,16 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     copied_tables
-        .map_aliased(coarse.start, coarse.ipa, coarse.size as u64, true, None)
+        .map_aliased(
+            coarse.start,
+            coarse.ipa,
+            coarse.size as u64,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
+            None,
+        )
         .expect("map coarse copied-mm projection");
     invalidate_projected_fork_omissions(&mut copied_tables, false, &mixed)
         .expect("invalidate copied-mm omitted leaf");
@@ -6455,7 +6474,16 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     shared_tables
-        .map_aliased(coarse.start, coarse.ipa, coarse.size as u64, true, None)
+        .map_aliased(
+            coarse.start,
+            coarse.ipa,
+            coarse.size as u64,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
+            None,
+        )
         .expect("map coarse shared-mm projection");
     invalidate_projected_fork_omissions(&mut shared_tables, true, &mixed)
         .expect("shared-mm projection bypass");

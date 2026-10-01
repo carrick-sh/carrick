@@ -1355,10 +1355,19 @@ where
                                     "host alias length exceeds usize"
                                 );
                             };
-                            if prot_none && runtime.protect_range(va.raw(), len, 0).is_err() {
+                            // PROT_NONE and PROT_EXEC are published from the
+                            // VMA's own protection: the backend alias is never
+                            // executable on its own.
+                            let exec = carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
+                                .contains(carrick_abi::LinuxProtFlags::EXEC);
+                            if (prot_none || exec)
+                                && runtime
+                                    .protect_range(va.raw(), len, if prot_none { 0 } else { prot })
+                                    .is_err()
+                            {
                                 carrick_fatal!(
                                     "runtime::host_alias_mapping",
-                                    "protect_range PROT_NONE failed for host alias"
+                                    "protect_range failed for host alias"
                                 );
                             }
                             // Publish the dispatcher's authoritative Linux VMA
@@ -2497,8 +2506,9 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
         va: u64,
         target_ipa: u64,
         len: usize,
+        prot: u64,
     ) -> Result<(), MemoryError> {
-        self.mem.repoint_shared_leaf(va, target_ipa, len)
+        self.mem.repoint_shared_leaf(va, target_ipa, len, prot)
     }
     fn translate_va(&self, va: u64) -> Option<u64> {
         self.mem.translate_va(va)

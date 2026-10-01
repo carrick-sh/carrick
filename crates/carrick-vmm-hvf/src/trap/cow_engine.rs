@@ -664,6 +664,7 @@ impl HvfVmState {
         target_ipa: u64,
         len: usize,
         content: Option<&[u8]>,
+        access: carrick_mmu_core::aarch64::UserLeafAccess,
         services: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         use super::guest_alias::AliasPublishFailure;
@@ -714,7 +715,7 @@ impl HvfVmState {
                 }
             }
         }
-        match context.publish(va, target_ipa, true, &retained, services) {
+        match context.publish(va, target_ipa, access, &retained, services) {
             Ok(()) => {}
             Err(AliasPublishFailure::Unsubmitted(e)) => return Err(e),
             Err(AliasPublishFailure::PartiallyPublished(e)) => {

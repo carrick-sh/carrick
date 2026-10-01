@@ -1178,6 +1178,13 @@ pub struct AddressSpace {
     /// `plan_windows`/`build_pml4`. Empty for non-ELF images.
     #[serde(skip)]
     ro_spans: Vec<crate::elf::RoSpan>,
+    /// Page-granular writable spans of the loaded ELF images (`.data`,
+    /// `.bss`): read/write and non-executable unless an executable segment
+    /// shares the page. Baked into the aarch64 stage-1 image next to
+    /// [`AddressSpace::ro_spans`], so the merged region's execute permission
+    /// never reaches a writable data page. Empty for non-ELF images.
+    #[serde(skip)]
+    rw_spans: Vec<crate::elf::RwSpan>,
     /// Exact guest file-backed PT_LOAD provenance used by Linux core NT_FILE.
     /// Runtime/anonymous executable regions never appear here.
     #[serde(skip)]
@@ -1339,6 +1346,12 @@ impl MemoryRegion {
 pub enum AddressSpaceError {
     #[error("failed to inspect ELF load plan: {0}")]
     Elf(#[from] ElfInspectError),
+    #[error("stage-1 image cannot express the permission of 0x{start:x}..0x{end:x}: {reason}")]
+    Stage1Protection {
+        start: u64,
+        end: u64,
+        reason: String,
+    },
     #[error("failed to read ELF bytes: {0}")]
     Io(#[from] std::io::Error),
     #[error(
@@ -1520,6 +1533,7 @@ impl AddressSpace {
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
         let linux_auxv = linux_auxv_from_load_plan(&plan, None);
         let ro_spans = crate::elf::ro_page_spans(&plan);
+        let rw_spans = crate::elf::rw_page_spans(&plan);
         let file_mappings = file_mappings_from_load_plan(&plan, "");
         let mut regions = regions_from_load_plan(file, &plan)?;
         regions.extend(linux_runtime_regions()?);
@@ -1527,6 +1541,7 @@ impl AddressSpace {
         let mut image = Self::from_regions(plan.entry, regions)?;
         image.linux_auxv = linux_auxv;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -1560,6 +1575,7 @@ impl AddressSpace {
         let mut entry = plan.entry;
         let mut interpreter_base = None;
         let mut ro_spans = crate::elf::ro_page_spans(&plan);
+        let mut rw_spans = crate::elf::rw_page_spans(&plan);
 
         if let Some(interpreter_path) = plan.interpreter.as_deref() {
             let interpreter = read_interp(interpreter_path)
@@ -1571,6 +1587,7 @@ impl AddressSpace {
                 interpreter_path,
             ));
             ro_spans.extend(crate::elf::ro_page_spans(&interpreter_plan));
+            rw_spans.extend(crate::elf::rw_page_spans(&interpreter_plan));
             regions.extend(regions_from_load_plan_with_shape(
                 &interpreter,
                 &interpreter_plan,
@@ -1587,6 +1604,7 @@ impl AddressSpace {
         let mut image = Self::from_regions(entry, regions)?;
         image.linux_auxv = linux_auxv;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -1652,6 +1670,7 @@ impl AddressSpace {
             linux_auxv: Vec::new(),
             linux_auxv_image: Vec::new(),
             ro_spans: Vec::new(),
+            rw_spans: Vec::new(),
             file_mappings: Vec::new(),
         })
     }
@@ -1890,6 +1909,7 @@ impl AddressSpace {
             linux_auxv,
             linux_auxv_image,
             ro_spans,
+            rw_spans,
             file_mappings,
             ..
         } = self;
@@ -1901,6 +1921,7 @@ impl AddressSpace {
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -1911,6 +1932,11 @@ impl AddressSpace {
     /// them in [`AddressSpace::with_stage1_page_tables`].
     pub fn ro_spans(&self) -> &[crate::elf::RoSpan] {
         &self.ro_spans
+    }
+
+    /// Page-granular writable spans of the loaded ELF images; see the field.
+    pub fn rw_spans(&self) -> &[crate::elf::RwSpan] {
+        &self.rw_spans
     }
 
     pub fn initial_stack_pointer(&self) -> Option<u64> {
@@ -1979,6 +2005,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
             ..
         } = self;
@@ -1993,6 +2020,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2136,6 +2164,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
             ..
         } = self;
@@ -2147,6 +2176,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2181,6 +2211,7 @@ impl AddressSpace {
             el0_trampoline_entry,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
             ..
         } = self;
@@ -2192,6 +2223,7 @@ impl AddressSpace {
         image.el1_vectors_base = Some(LINUX_EL1_VECTORS_BASE);
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2240,6 +2272,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
             ..
         } = self;
@@ -2251,6 +2284,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2285,6 +2319,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -2295,6 +2330,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2330,6 +2366,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -2340,6 +2377,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2380,6 +2418,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -2390,6 +2429,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2424,42 +2464,20 @@ impl AddressSpace {
         self,
         initial_tables: Vec<u8>,
     ) -> Result<Self, AddressSpaceError> {
-        let bytes = if self.ro_spans.is_empty() {
-            initial_tables
-        } else {
-            let mut mgr = carrick_mmu_core::aarch64::PageTableManager::new(
-                initial_tables,
-                LINUX_PAGE_TABLES_BASE,
-                AARCH64_LINUX_PAGE_TABLE_LAYOUT,
-            );
-            mgr.set_multi_vcpu(true); // no coalesce: keep spare allocation sequential
-            for span in &self.ro_spans {
-                // Clamp below the null guard (never mapped; nothing to protect).
-                let start = span.start.max(LINUX_NULL_GUARD_END);
-                let Some(end) = span.start.checked_add(span.len) else {
-                    continue;
-                };
-                if end <= start {
-                    continue;
-                }
-                let Ok(len) = usize::try_from(end - start) else {
-                    continue;
-                };
-                // Best-effort per span: a span the identity map cannot express
-                // (BadAddress) is skipped — protection is an upgrade and must
-                // never block boot. OutOfTables is likewise skipped: the spare
-                // pool comfortably covers real images, and a pathological one
-                // degrades to the historical (writable) behaviour.
-                let _ = mgr.set_readonly(start, len, span.exec, None);
-            }
-            match mgr.into_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    carrick_fatal!(
-                        "mem::load_elf",
-                        "failed to serialize stage-1 page tables: {err}"
-                    );
-                }
+        let mut mgr = carrick_mmu_core::aarch64::PageTableManager::new(
+            initial_tables,
+            LINUX_PAGE_TABLES_BASE,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        mgr.set_multi_vcpu(true); // no coalesce: keep spare allocation sequential
+        apply_image_protections(&mut mgr, &self.regions, &self.ro_spans, &self.rw_spans)?;
+        let bytes = match mgr.into_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                carrick_fatal!(
+                    "mem::load_elf",
+                    "failed to serialize stage-1 page tables: {err}"
+                );
             }
         };
         let start = LINUX_PAGE_TABLES_BASE;
@@ -2506,6 +2524,7 @@ impl AddressSpace {
             el0_trampoline_entry,
             el1_vectors_base,
             ro_spans,
+            rw_spans,
             file_mappings,
             ..
         } = self;
@@ -2518,6 +2537,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = Some(LINUX_PAGE_TABLES_BASE);
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2604,6 +2624,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
         } = self;
         for aux in &mut linux_auxv {
@@ -2620,6 +2641,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -2698,6 +2720,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            rw_spans,
             file_mappings,
             ..
         } = self;
@@ -2725,6 +2748,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.rw_spans = rw_spans;
         image.file_mappings = file_mappings;
         Ok(image)
     }
@@ -3530,6 +3554,111 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
             );
         }
     }
+}
+
+/// The part of `[start, start + len)` the identity image can protect: below
+/// the null guard nothing is mapped, and a high-VA alias (Rosetta) is reached
+/// through its own alias tables and keeps its alias mapping's permission.
+fn protection_window(start: u64, len: u64) -> Option<(u64, usize)> {
+    let end = start.checked_add(len)?;
+    if end > LINUX_HIGH_VA_THRESHOLD {
+        return None;
+    }
+    let start = start.max(LINUX_NULL_GUARD_END);
+    if end <= start {
+        return None;
+    }
+    usize::try_from(end - start).ok().map(|len| (start, len))
+}
+
+/// Give every EL0 page of a fresh image exactly its mapping's permission.
+///
+/// Linux maps each region with its own protection and nothing is executable
+/// unless its owner asked for `PROT_EXEC`. The identity image starts every
+/// user block read/write/executable, so the image builder applies:
+///
+/// - each user region's own permission (the stack and the runtime's
+///   read/write pages become non-executable, its code pages read-only);
+/// - then the ELF images' page spans: [`crate::elf::RoSpan`] pages read-only
+///   and [`crate::elf::RwSpan`] pages read/write, each executable only where
+///   an executable segment covers the page (the host regions merge an
+///   image's segments, so the region permission alone would leave `.data`
+///   and `.bss` executable).
+///
+/// Windows with their own rule are left alone here: the heap window (sealed
+/// by [`seal_heap_window`]), the sparse mmap arena, Carrick's EL1-only
+/// ranges and the high-VA aliases. A failure is returned rather than
+/// skipped: an image whose data would stay executable is not booted.
+pub fn apply_image_protections(
+    mgr: &mut carrick_mmu_core::aarch64::PageTableManager,
+    regions: &[MemoryRegion],
+    ro_spans: &[crate::elf::RoSpan],
+    rw_spans: &[crate::elf::RwSpan],
+) -> Result<(), AddressSpaceError> {
+    let refused = |start: u64, end: u64, error: carrick_mmu_core::aarch64::PageTableError| {
+        AddressSpaceError::Stage1Protection {
+            start,
+            end,
+            reason: format!("{error:?}"),
+        }
+    };
+    for region in regions {
+        let own_rule = region.start == LINUX_HEAP_BASE
+            || region.start == LINUX_MMAP_BASE
+            || region.start >= LINUX_HIGH_VA_THRESHOLD
+            || is_carrick_kernel_only_range(region.start, region.end);
+        if own_rule || !(region.perms.read || region.perms.write) {
+            continue;
+        }
+        let Some((start, len)) =
+            protection_window(region.start, region.end.saturating_sub(region.start))
+        else {
+            continue;
+        };
+        let exec = region.perms.execute;
+        let applied = if region.perms.write {
+            mgr.set_rw(start, len, exec, None)
+        } else {
+            mgr.set_readonly(start, len, exec, None)
+        };
+        applied.map_err(|error| refused(region.start, region.end, error))?;
+    }
+    apply_image_page_spans(mgr, ro_spans, rw_spans)
+}
+
+/// Re-apply the ELF images' page spans over a stage-1 image whose regions
+/// already carry their own permission: [`crate::elf::RoSpan`] pages
+/// read-only, [`crate::elf::RwSpan`] pages read/write, each executable only
+/// where an executable segment covers it. The boot builder
+/// ([`apply_image_protections`]) and the HVPatch exec rebuild, which remaps
+/// each region onto new frames with its own permission, both finish here.
+pub fn apply_image_page_spans(
+    mgr: &mut carrick_mmu_core::aarch64::PageTableManager,
+    ro_spans: &[crate::elf::RoSpan],
+    rw_spans: &[crate::elf::RwSpan],
+) -> Result<(), AddressSpaceError> {
+    let refused = |start: u64, end: u64, error: carrick_mmu_core::aarch64::PageTableError| {
+        AddressSpaceError::Stage1Protection {
+            start,
+            end,
+            reason: format!("{error:?}"),
+        }
+    };
+    for span in ro_spans {
+        let Some((start, len)) = protection_window(span.start, span.len) else {
+            continue;
+        };
+        mgr.set_readonly(start, len, span.exec, None)
+            .map_err(|error| refused(span.start, span.start + span.len, error))?;
+    }
+    for span in rw_spans {
+        let Some((start, len)) = protection_window(span.start, span.len) else {
+            continue;
+        };
+        mgr.set_rw(start, len, span.exec, None)
+            .map_err(|error| refused(span.start, span.start + span.len, error))?;
+    }
+    Ok(())
 }
 
 /// Make the whole heap window `[LINUX_HEAP_BASE, +LINUX_HEAP_SIZE)` unmapped
@@ -6402,6 +6531,7 @@ mod loader_tests {
     const PT_INTERP: u32 = 3;
     const PF_R: u32 = 4;
     const PF_X: u32 = 1;
+    const PF_W: u32 = 2;
 
     #[test]
     fn core_file_mappings_preserve_nonzero_page_offset_and_exact_path() {
@@ -6629,6 +6759,79 @@ mod loader_tests {
             "page past the span stays RW"
         );
         assert!(mgr.translate(0x400000).is_some(), "RO leaf is still mapped");
+    }
+
+    /// A two-segment static image: R+X text at 0x400000, then R+W data at
+    /// 0x401000 whose bss runs to 0x404000.
+    fn text_and_data_elf() -> Vec<u8> {
+        let mut elf = synthetic_elf(ET_EXEC_TYPE, 183, 0x400000, 0x400000, None);
+        elf[56..58].copy_from_slice(&2_u16.to_le_bytes());
+        let ph = 64 + 56;
+        elf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_W).to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[ph + 16..ph + 24].copy_from_slice(&0x401000_u64.to_le_bytes());
+        elf[ph + 24..ph + 32].copy_from_slice(&0x401000_u64.to_le_bytes());
+        elf[ph + 32..ph + 40].copy_from_slice(&4_u64.to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&0x3000_u64.to_le_bytes());
+        elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf
+    }
+
+    /// `kernel.mm.image-page-permissions` (VM-free): Linux maps each PT_LOAD
+    /// with its own permission, so `.data`/`.bss` and the stack are never
+    /// executable. The merged image region is RWX and every identity leaf
+    /// starts executable; the fresh-image builder must give each page its
+    /// mapping's own permission.
+    #[test]
+    fn fresh_image_data_bss_and_stack_are_not_executable() {
+        const UXN: u64 = 1 << 54;
+        const AP_MASK: u64 = 0b11 << 6;
+        const AP_RO: u64 = 0b11 << 6;
+        const AP_RW: u64 = 0b01 << 6;
+        let image = AddressSpace::load_elf_bytes(&text_and_data_elf())
+            .unwrap()
+            .with_linux_initial_stack(["probe"], std::iter::empty::<&str>())
+            .unwrap();
+        assert_eq!(
+            image.rw_spans(),
+            &[crate::elf::RwSpan {
+                start: 0x401000,
+                len: 0x3000,
+                exec: false,
+            }]
+        );
+        let image = image.with_hvpatch_stage1_page_tables().unwrap();
+        let pt_region = image
+            .regions()
+            .iter()
+            .find(|r| r.start == LINUX_PAGE_TABLES_BASE)
+            .expect("stage-1 page-table region");
+        let mgr = carrick_mmu_core::aarch64::PageTableManager::new(
+            pt_region.bytes().to_vec(),
+            LINUX_PAGE_TABLES_BASE,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let leaf = |va: u64| carrick_mmu_core::aarch64::terminal_descriptor(mgr.debug_walk(va));
+        assert_eq!(
+            leaf(0x400000) & (AP_MASK | UXN),
+            AP_RO,
+            "text: RO, executable"
+        );
+        for va in [0x401000, 0x402000, 0x403000] {
+            assert_eq!(
+                leaf(va) & (AP_MASK | UXN),
+                AP_RW | UXN,
+                "data/bss {va:#x}: RW, NX"
+            );
+        }
+        let stack = image.initial_stack_pointer().expect("initial stack") & !0xfff;
+        assert_eq!(leaf(stack) & (AP_MASK | UXN), AP_RW | UXN, "stack: RW, NX");
+        assert_eq!(
+            leaf(LINUX_SIGRETURN_TRAMPOLINE_BASE) & (AP_MASK | UXN),
+            AP_RO,
+            "sigreturn trampoline: RO, executable"
+        );
     }
 
     #[test]

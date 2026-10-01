@@ -10,7 +10,7 @@ contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
-contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.el1.fault-entry", "kernel.el1.stage1-publication"]
+contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.el1.fault-entry", "kernel.el1.stage1-publication", "kernel.mm.image-page-permissions"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_transparent.rs"
@@ -90,7 +90,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.for
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs"
-contracts = ["kernel.el1.stage1-publication"]
+contracts = ["kernel.el1.stage1-publication", "kernel.mm.image-page-permissions"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/vdso.rs"
@@ -114,7 +114,7 @@ contracts = ["kernel.time.realtime-calibration"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs"
-contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image"]
+contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.mm.image-page-permissions"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/stage1_authority.rs"
@@ -122,11 +122,11 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.metadata-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions"]
 
 [[surfaces]]
 path = "crates/carrick-mmu-core/src/aarch64.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.el1.gic", "kernel.mm.metadata-refusal", "kernel.el1.stage1-publication", "kernel.exec.stage1-image"]
+contracts = ["kernel.fork.stage1-image", "kernel.el1.gic", "kernel.mm.metadata-refusal", "kernel.el1.stage1-publication", "kernel.exec.stage1-image", "kernel.mm.image-page-permissions"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/quiesce.rs"
@@ -641,8 +641,20 @@ contracts = ["kernel.time.coarse-clock-vdso"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs"
-contracts = ["kernel.mm.exec-heap-window", "kernel.exec.stage1-image"]
+contracts = ["kernel.mm.exec-heap-window", "kernel.exec.stage1-image", "kernel.mm.image-page-permissions"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/exec.rs"
 contracts = ["kernel.el1.task-load-entry"]
+
+[[surfaces]]
+path = "crates/carrick-mem/src/elf.rs"
+contracts = ["kernel.mm.image-page-permissions"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/guest_alias.rs"
+contracts = ["kernel.mm.image-page-permissions"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/mod.rs"
+contracts = ["kernel.mm.image-page-permissions"]

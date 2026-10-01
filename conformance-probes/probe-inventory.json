@@ -1480,6 +1480,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "nxwritableimage": {
+    "class": "conformance",
+    "contract_ids": [
+      "kernel.mm.image-page-permissions"
+    ],
+    "excluded": false,
+    "runner": "generic"
+  },
   "oappendroundtrip": {
     "class": "conformance",
     "excluded": false,

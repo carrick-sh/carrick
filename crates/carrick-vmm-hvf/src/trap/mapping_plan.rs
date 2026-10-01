@@ -32,6 +32,11 @@ pub struct GuestMappingPlan {
     /// seeds the shared syscall protection table from them so copyout-style
     /// syscalls return `EFAULT` for `.text`/`.rodata` destinations.
     pub ro_spans: Vec<carrick_mem::elf::RoSpan>,
+    /// Page-granular writable guest-VA spans (`.data`/`.bss`) of the same ELF
+    /// images: read/write and non-executable unless an executable segment
+    /// shares the page. The exec rebuild re-applies them after remapping the
+    /// merged regions.
+    pub rw_spans: Vec<carrick_mem::elf::RwSpan>,
     pub mappings: Vec<GuestMapping>,
 }
 
@@ -358,6 +363,7 @@ impl GuestMappingPlan {
             el1_vectors_base: address_space.el1_vectors_base(),
             stage1_page_tables_base: address_space.stage1_page_tables_base(),
             ro_spans: address_space.ro_spans().to_vec(),
+            rw_spans: address_space.rw_spans().to_vec(),
             mappings,
         })
     }

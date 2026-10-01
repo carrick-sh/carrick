@@ -766,12 +766,14 @@ fn install_mm_sparse(
     // A private data mapping, as Linux makes one: not executable (an
     // executable armed page is the host's to COW, never EL1's).
     tables
-        .map_private_aliased_with_permissions(
+        .map_private_aliased(
             TEST_VA,
             data_ipa,
             data_len as u64,
-            false,
-            false,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: false,
+            },
             None,
         )
         .expect("map foreign test leaf");
@@ -3263,7 +3265,15 @@ fn foreign_cow_prepare_write_rejects_out_of_span_alias() {
                 || Err(TrapError::Hypervisor("manager must be present".to_owned())),
                 |editor| {
                     editor
-                        .map_aliased(alias_va, cow.physical_base().raw(), 0x1000, true)
+                        .map_aliased(
+                            alias_va,
+                            cow.physical_base().raw(),
+                            0x1000,
+                            carrick_mmu_core::aarch64::UserLeafAccess {
+                                writable: true,
+                                executable: true,
+                            },
+                        )
                         .expect("map stage-1 alias outside compound span");
                     unsafe {
                         editor
@@ -5577,7 +5587,16 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         child_page_tables
-            .map_aliased(vvar_ipa, translated_ipa, vvar_len, false, None)
+            .map_aliased(
+                vvar_ipa,
+                translated_ipa,
+                vvar_len,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable: false,
+                    executable: true,
+                },
+                None,
+            )
             .expect("map child vvar translation");
         child_page_tables
             .rebase(root_slot_base, None)
@@ -7551,13 +7570,40 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     child_pt
-        .map_aliased(0x0040_0000, parent_rx_ipa, 0x4000, false, None)
+        .map_aliased(
+            0x0040_0000,
+            parent_rx_ipa,
+            0x4000,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("map child user aliased rx");
     child_pt
-        .map_aliased(0x0060_0000, parent_rw_ipa, 0x4000, true, None)
+        .map_aliased(
+            0x0060_0000,
+            parent_rw_ipa,
+            0x4000,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: true,
+                executable: true,
+            },
+            None,
+        )
         .expect("map child user aliased rw");
     child_pt
-        .map_aliased(0x0080_0000, parent_cow_ipa, 0x4000, false, None)
+        .map_aliased(
+            0x0080_0000,
+            parent_cow_ipa,
+            0x4000,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("map child user aliased cow");
     child_pt
         .rebase(root_slot_base, None)
@@ -8362,7 +8408,16 @@ fn semantic_lookup_rejects_foreign_va_alias_at_same_live_ipa() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
-        .map_aliased(va, key.0, key.1, false, None)
+        .map_aliased(
+            va,
+            key.0,
+            key.1,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("stage-1 mapping");
     task.page_tables_authority().set_manager(tables);
     let selected = task
@@ -8459,7 +8514,16 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
-        .map_aliased(va, extent_base, size as u64, false, None)
+        .map_aliased(
+            va,
+            extent_base,
+            size as u64,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("stage-1 mapping");
     task.page_tables_authority().set_manager(tables);
 
@@ -8516,7 +8580,15 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
-                    .map_aliased(repoint_va, repoint_ipa, repoint_len as u64, true)
+                    .map_aliased(
+                        repoint_va,
+                        repoint_ipa,
+                        repoint_len as u64,
+                        carrick_mmu_core::aarch64::UserLeafAccess {
+                            writable: true,
+                            executable: true,
+                        },
+                    )
                     .map_err(|error| TrapError::Hypervisor(format!("test publication: {error}")))
             },
         )
@@ -8537,7 +8609,15 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
-                    .map_aliased(repoint_va, repoint_ipa, repoint_len as u64, false)
+                    .map_aliased(
+                        repoint_va,
+                        repoint_ipa,
+                        repoint_len as u64,
+                        carrick_mmu_core::aarch64::UserLeafAccess {
+                            writable: false,
+                            executable: true,
+                        },
+                    )
                     .map_err(|error| {
                         TrapError::Hypervisor(format!("test read-only publication: {error}"))
                     })
@@ -8554,7 +8634,15 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
-                    .map_aliased(repoint_va, repoint_ipa, repoint_len as u64, true)
+                    .map_aliased(
+                        repoint_va,
+                        repoint_ipa,
+                        repoint_len as u64,
+                        carrick_mmu_core::aarch64::UserLeafAccess {
+                            writable: true,
+                            executable: true,
+                        },
+                    )
                     .map_err(|error| {
                         TrapError::Hypervisor(format!("test writable publication: {error}"))
                     })
@@ -8661,7 +8749,16 @@ fn semantic_lookup_isolates_same_va_in_different_mm() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables_a
-        .map_aliased(va, key_a.0, key_a.1, false, None)
+        .map_aliased(
+            va,
+            key_a.0,
+            key_a.1,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("stage-1 mapping a");
     task_a.page_tables_authority().set_manager(tables_a);
 
@@ -8671,7 +8768,16 @@ fn semantic_lookup_isolates_same_va_in_different_mm() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables_b
-        .map_aliased(va, key_b.0, key_b.1, false, None)
+        .map_aliased(
+            va,
+            key_b.0,
+            key_b.1,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("stage-1 mapping b");
     task_b.page_tables_authority().set_manager(tables_b);
 
@@ -8750,7 +8856,10 @@ fn semantic_lookup_rejects_overlapping_row_with_wrong_va_to_ipa_offset() {
             va,
             key.0 + 0x2000,
             key.1.saturating_sub(0x2000),
-            false,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
             None,
         )
         .expect("stage-1 mapping with offset mismatch");
@@ -8808,7 +8917,16 @@ fn semantic_lookup_rejects_stale_owner_generation_and_accepts_current() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
-        .map_aliased(va, key.0, key.1, false, None)
+        .map_aliased(
+            va,
+            key.0,
+            key.1,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("stage-1 mapping");
     task.page_tables_authority().set_manager(tables);
 
@@ -8878,7 +8996,16 @@ fn semantic_lookup_enforces_exact_boundary_length_and_overflow_protection() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
-        .map_aliased(va, key.0, key.1, false, None)
+        .map_aliased(
+            va,
+            key.0,
+            key.1,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("stage-1 mapping");
     task.page_tables_authority().set_manager(tables);
 
@@ -9044,7 +9171,16 @@ fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
-        .map_aliased(edge_va, stale.ipa, edge_len as u64, false, None)
+        .map_aliased(
+            edge_va,
+            stale.ipa,
+            edge_len as u64,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("publish bulk-lease edge leaves");
     tables
         .set_prot_none(edge_va, edge_len, None)
@@ -9072,7 +9208,16 @@ fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
-        .map_aliased(edge_va, replacement.ipa, edge_len as u64, false, None)
+        .map_aliased(
+            edge_va,
+            replacement.ipa,
+            edge_len as u64,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("publish replacement edge leaves");
     tables
         .set_prot_none(edge_va, edge_len, None)
@@ -9192,7 +9337,16 @@ fn semantic_lookup_preserves_map_shared_and_maintenance_fallback() {
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
-        .map_aliased(va, key.0, key.1, false, None)
+        .map_aliased(
+            va,
+            key.0,
+            key.1,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("stage-1 mapping");
     task.page_tables_authority().set_manager(tables);
 
@@ -9222,7 +9376,16 @@ fn cow_source_falls_back_to_offset_logical_inventory_with_current_physical_owner
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     page_tables
-        .map_aliased(semantic_va, key.0, key.1, false, None)
+        .map_aliased(
+            semantic_va,
+            key.0,
+            key.1,
+            carrick_mmu_core::aarch64::UserLeafAccess {
+                writable: false,
+                executable: true,
+            },
+            None,
+        )
         .expect("publish live COW source stage-1 compound");
     task.page_tables_authority().set_manager(page_tables);
     task.mappings.insert(HvfMappedRegion {

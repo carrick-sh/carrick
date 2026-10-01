@@ -2496,10 +2496,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         target_ipa: u64,
         len: usize,
         content: Option<&[u8]>,
+        access: carrick_mmu_core::aarch64::UserLeafAccess,
         services: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         self.state
-            .repoint_guest_alias(va, target_ipa, len, content, services)
+            .repoint_guest_alias(va, target_ipa, len, content, access, services)
     }
 
     fn publish_guest_host_alias(
