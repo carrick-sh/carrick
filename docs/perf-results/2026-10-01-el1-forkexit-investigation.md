@@ -141,10 +141,11 @@ reported zero for both IDs.
 
 The signal-mask and altstack handlers exist in `lifecycle.rs`. They are not
 refused by `setup_open` in these production runs: the missing venue prevents
-`lifecycle::serve` from being called in the first place. On 2026-10-01 the
-director requested reporting these paths without fixing them yet. Enabling
-the lifecycle venue enables these paths as well as clone/exit, so that scope
-boundary needs resolution before implementation.
+`lifecycle::serve` from being called in the first place. The director
+confirmed that L4 must enable one shared venue for clone, exit, signal masks
+and altstack together. That supersedes the temporary report-only restriction
+on setup serving. Cheap-layer signal inheritance/delivery contracts and the
+full signed signal and EL1 gates remain required; ptrace stays report-only.
 
 The director also confirmed that guest-lane refusal is expected on this
 baseline: descriptor-lane default-on lands in landing I. Final acceptance
