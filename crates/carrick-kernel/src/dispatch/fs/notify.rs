@@ -372,7 +372,7 @@ impl<'a> FsView<'a> {
             }
             let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
             let mask = mask as u32;
-            let current_gen = carrick_vfs::fs_resolve_cache::current_generation();
+            let current_gen = this.fs.rootfs_vfs.dentry_cache.coherence.current_generation();
             let (existing, is_known_rootfs) = this
                 .fs
                 .inotify_registry

@@ -47,6 +47,7 @@ pub struct NativeReexecBindMountV1 {
 }
 
 pub struct BindVfs {
+    coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
     mount_point: String,
     host_path: PathBuf,
     readonly: bool,
@@ -66,6 +67,7 @@ impl BindVfs {
         // reports its real host error; capsule validation then fails closed.
         let host_path = std::path::absolute(&host_path).unwrap_or(host_path);
         Self {
+            coherence: std::sync::Arc::default(),
             mount_point: mount_point.into(),
             host_path,
             readonly,
@@ -223,7 +225,13 @@ fn read_u32_xattr(host: &Path, name: &str, nofollow: bool) -> Option<u32> {
     (n == 4).then(|| u32::from_le_bytes(value))
 }
 
-fn write_u32_xattr(host: &Path, name: &str, value: u32, nofollow: bool) -> Result<(), VfsError> {
+fn write_u32_xattr(
+    coherence: &crate::fs_resolve_cache::FsCacheCoherence,
+    host: &Path,
+    name: &str,
+    value: u32,
+    nofollow: bool,
+) -> Result<(), VfsError> {
     let cpath = CString::new(host.as_os_str().as_bytes()).map_err(|_| LINUX_EINVAL)?;
     let cname = CString::new(name).map_err(|_| LINUX_EINVAL)?;
     let value = value.to_le_bytes();
@@ -253,7 +261,7 @@ fn write_u32_xattr(host: &Path, name: &str, value: u32, nofollow: bool) -> Resul
     }
     // The bind mount just rewrote a carrick metadata xattr on a node the
     // `--fs host` stat cache may already hold; publish that.
-    crate::fs_resolve_cache::bump_meta_generation();
+    coherence.bump_meta_generation();
     Ok(())
 }
 
@@ -287,6 +295,7 @@ fn is_socket_marker(host: &Path, nofollow: bool) -> bool {
 }
 
 fn write_owner_xattrs(
+    coherence: &crate::fs_resolve_cache::FsCacheCoherence,
     host: &Path,
     uid: Option<carrick_abi::NsUid>,
     gid: Option<carrick_abi::NsGid>,
@@ -294,6 +303,7 @@ fn write_owner_xattrs(
 ) -> Result<(), VfsError> {
     if let Some(uid) = uid {
         write_u32_xattr(
+            coherence,
             host,
             crate::fs_backend::CARRICK_UID_XATTR_NAME,
             uid.raw(),
@@ -302,6 +312,7 @@ fn write_owner_xattrs(
     }
     if let Some(gid) = gid {
         write_u32_xattr(
+            coherence,
             host,
             crate::fs_backend::CARRICK_GID_XATTR_NAME,
             gid.raw(),
@@ -366,6 +377,12 @@ fn real_stat_from_host(
 }
 
 impl Vfs for BindVfs {
+    fn set_cache_coherence(
+        &mut self,
+        coherence: std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>,
+    ) {
+        self.coherence = coherence;
+    }
     fn native_reexec_bind_mount(&self) -> Option<NativeReexecBindMountV1> {
         Some(NativeReexecBindMountV1 {
             mount_point: self.mount_point.clone(),
@@ -548,7 +565,13 @@ impl Vfs for BindVfs {
             }
         }
         if flags.create && !existed_before_create {
-            let _ = write_owner_xattrs(&host, Some(ctx.euid), Some(ctx.egid), false);
+            let _ = write_owner_xattrs(
+                &self.coherence,
+                &host,
+                Some(ctx.euid),
+                Some(ctx.egid),
+                false,
+            );
         }
 
         let status_flags = if flags.nonblock {
@@ -735,6 +758,7 @@ impl Vfs for BindVfs {
         file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
             .map_err(map_io_error)?;
         write_u32_xattr(
+            &self.coherence,
             &host,
             crate::fs_backend::CARRICK_SOCKET_XATTR_NAME,
             1,
@@ -776,7 +800,7 @@ impl Vfs for BindVfs {
             return write_symlink_owner_sidecar(&host, uid, gid);
         }
         let _ = &meta;
-        write_owner_xattrs(&host, uid, gid, nofollow)
+        write_owner_xattrs(&self.coherence, &host, uid, gid, nofollow)
     }
 
     fn set_times(

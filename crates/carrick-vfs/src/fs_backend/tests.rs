@@ -721,12 +721,22 @@ fn device_marker_flips_dir_overlay_interference() {
 #[test]
 fn host_backend_reexec_authority_reattaches_exact_root() {
     let scratch = tempfile::tempdir().unwrap();
-    let backend = HostFsBackend::attach(scratch.path()).unwrap();
+    let backend = HostFsBackend::attach(scratch.path(), std::sync::Arc::default()).unwrap();
     backend
         .set_file_contents("/handoff", b"same-root".to_vec())
         .unwrap();
     let authority = backend.native_reexec_authority().unwrap();
     let resumed = HostFsBackend::attach_for_reexec(&authority).unwrap();
+
+    // Anonymous generation mappings have never crossed host self-reexec.
+    // Reopening the same durable root must establish a new coherence cohort.
+    assert!(!std::sync::Arc::ptr_eq(
+        backend.cache_coherence(),
+        resumed.cache_coherence()
+    ));
+    let fresh = resumed.coherence.current_generation();
+    backend.coherence.bump_generation();
+    assert_eq!(resumed.coherence.current_generation(), fresh);
 
     assert_eq!(
         resumed.file_contents("/handoff"),
@@ -739,7 +749,7 @@ fn host_backend_reexec_authority_reattaches_exact_root() {
 fn host_backend_reexec_authority_rejects_substituted_root() {
     let scratch = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
-    let backend = HostFsBackend::attach(scratch.path()).unwrap();
+    let backend = HostFsBackend::attach(scratch.path(), std::sync::Arc::default()).unwrap();
     let mut authority = backend.native_reexec_authority().unwrap();
     authority.root_path = other.path().as_os_str().as_encoded_bytes().to_vec();
 
@@ -750,7 +760,7 @@ fn host_backend_reexec_authority_rejects_substituted_root() {
 #[test]
 fn host_backend_reexec_authority_transfers_ephemeral_cleanup() {
     let path = tempfile::tempdir().unwrap().keep();
-    let backend = HostFsBackend::attach(&path).unwrap();
+    let backend = HostFsBackend::attach(&path, std::sync::Arc::default()).unwrap();
     let mut authority = backend.native_reexec_authority().unwrap();
     authority.cleanup_on_drop = true;
     drop(backend);
@@ -1296,7 +1306,11 @@ fn authority_root_mode_roundtrip_uses_root_fd() {
 fn authority_attached_handles_observe_directory_rename() {
     let scratch = tempfile::tempdir().unwrap();
     let first = HostFsBackend::from_path(scratch.path()).unwrap();
-    let second = HostFsBackend::attach(scratch.path()).unwrap();
+    let second = HostFsBackend::attach(
+        scratch.path(),
+        std::sync::Arc::clone(first.cache_coherence()),
+    )
+    .unwrap();
     first.make_dir("/old").unwrap();
     first
         .set_file_contents("/old/file", b"data".to_vec())
@@ -1483,9 +1497,10 @@ fn attach_shares_an_existing_scratch_across_handles() {
     // exec relies on this: a second backend attached to the same on-disk
     // scratch sees the first's writes (the shared container overlay).
     let scratch = tempfile::TempDir::new().unwrap();
-    let a = HostFsBackend::attach(scratch.path()).unwrap();
+    let a = HostFsBackend::attach(scratch.path(), std::sync::Arc::default()).unwrap();
     a.set_file_contents("/hello", b"world".to_vec()).unwrap();
-    let b = HostFsBackend::attach(scratch.path()).unwrap();
+    let b =
+        HostFsBackend::attach(scratch.path(), std::sync::Arc::clone(a.cache_coherence())).unwrap();
     assert_eq!(b.file_contents("/hello").as_deref(), Some(&b"world"[..]));
 }
 
@@ -2020,7 +2035,7 @@ fn plain_tree_stat_fill_is_the_inode_alone() {
     // Plant an override xattr WITHOUT stamping the root marker.
     {
         let f = std::fs::File::open(b.root_path.join("pkg/f")).unwrap();
-        fset_u32_xattr(f.as_raw_fd(), CARRICK_MODE_XATTR, 0o400);
+        fset_u32_xattr(None, f.as_raw_fd(), CARRICK_MODE_XATTR, 0o400);
     }
     let real = b.stat_cache_get_or_fill(Path::new("pkg/f")).unwrap();
     assert_eq!(real.mode, on_disk_mode, "plain fill trusts the inode");
@@ -2077,7 +2092,7 @@ fn moved_marker_node_keeps_the_destination_directory_interference_tracked() {
         "hard link must stamp the destination directory"
     );
     // Durable: a sibling backend on the same scratch reads the stamps.
-    let reattached = HostFsBackend::attach(scratch.path()).unwrap();
+    let reattached = HostFsBackend::attach(scratch.path(), std::sync::Arc::default()).unwrap();
     assert!(reattached.dir_has_overlay_interference("/b"));
     assert!(reattached.dir_has_overlay_interference("/c"));
 }
@@ -2114,7 +2129,7 @@ fn chmod_on_a_socket_marker_node_replaces_its_creation_mode() {
     );
 
     // Durable: a reattached backend reads the new mode, not the xattr.
-    let reattached = HostFsBackend::attach(scratch.path()).unwrap();
+    let reattached = HostFsBackend::attach(scratch.path(), std::sync::Arc::default()).unwrap();
     let durable = reattached.metadata("/sock").unwrap();
     assert_eq!(durable.kind, RootFsEntryKind::Socket);
     assert_eq!(durable.mode & 0o7777, 0o600);
@@ -2171,6 +2186,58 @@ fn trusted_dirent_stream_owns_its_seek_offset() {
 mod serial_host {
     use super::*;
 
+    #[test]
+    fn cohort_generation_words_survive_host_fork() {
+        let cohort = crate::fs_resolve_cache::FsCacheCoherence::default();
+        let before = cohort.current_generation();
+        let local = cohort.local_path_bump_count();
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            cohort.bump_generation();
+            cohort.bump_dir_generation();
+            cohort.bump_marker_generation();
+            cohort.bump_meta_generation();
+            unsafe {
+                libc::close(fds[0]);
+                libc::write(fds[1], [1u8].as_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(fds[1]);
+        }
+        let mut ready = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut ready, 1, 5000) };
+        if rc != 1 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        unsafe {
+            libc::close(fds[0]);
+        }
+        assert_eq!(rc, 1, "child generation publication must finish");
+        assert_eq!(status, 0);
+        assert_eq!(cohort.current_generation(), before + 1);
+        assert_eq!(cohort.current_dir_generation(), 2);
+        assert_eq!(cohort.current_marker_generation(), 2);
+        assert_eq!(cohort.current_meta_generation(), 2);
+        assert_eq!(
+            cohort.local_path_bump_count(),
+            local,
+            "local count is fork-private"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn marker_nodes_flip_dir_overlay_interference() {
@@ -2204,7 +2271,7 @@ mod serial_host {
         // ... including for a SIBLING backend on the same scratch (the
         // fork-coherence property: the truth is the directory xattr, not the
         // in-process bool).
-        let reattached = HostFsBackend::attach(scratch.path()).unwrap();
+        let reattached = HostFsBackend::attach(scratch.path(), std::sync::Arc::default()).unwrap();
         assert!(reattached.dir_has_overlay_interference("/walk"));
         assert!(!reattached.dir_has_overlay_interference("/elsewhere"));
     }
@@ -2391,7 +2458,7 @@ mod serial_host {
     #[test]
     fn host_backend_reexec_authority_preserves_sparse_upper_fast_miss() {
         let scratch = tempfile::tempdir().unwrap();
-        let mut backend = HostFsBackend::attach(scratch.path()).unwrap();
+        let mut backend = HostFsBackend::attach(scratch.path(), std::sync::Arc::default()).unwrap();
         backend.enable_sparse_upper_fast_miss();
         let authority = backend.native_reexec_authority().unwrap();
         assert!(authority.sparse_upper_fast_miss);
@@ -2475,8 +2542,6 @@ mod serial_host {
     #[cfg(target_os = "macos")]
     #[test]
     fn file_rename_keeps_dir_cache_but_dir_and_symlink_renames_invalidate() {
-        use crate::fs_resolve_cache::current_dir_generation;
-
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
         for dir in ["/a", "/a/b", "/a/b/c", "/a/b/d", "/a/b/moved"] {
@@ -2488,7 +2553,7 @@ mod serial_host {
         b.dir_fd_for(Path::new("a/b/c")).unwrap();
         b.dir_fd_for(Path::new("a/b/d")).unwrap();
 
-        let generation = current_dir_generation();
+        let generation = b.coherence.current_dir_generation();
         b.reset_path_walk_host_opens();
         // Same directory, onto a fresh name.
         assert!(matches!(
@@ -2513,7 +2578,7 @@ mod serial_host {
             "a file rename must not force a directory re-walk"
         );
         assert_eq!(
-            current_dir_generation(),
+            b.coherence.current_dir_generation(),
             generation,
             "a file rename must not flush every process's directory cache"
         );
@@ -2527,16 +2592,16 @@ mod serial_host {
             b.rename_overlay_entry("/a/b/link", "/a/b/link2"),
             Ok(crate::fs_backend::OverlayRenameOutcome::Renamed)
         ));
-        assert_ne!(current_dir_generation(), generation);
+        assert_ne!(b.coherence.current_dir_generation(), generation);
 
         // A directory rename must invalidate, and the next walk re-opens.
-        let generation = current_dir_generation();
+        let generation = b.coherence.current_dir_generation();
         b.dir_fd_for(Path::new("a/b/d")).unwrap();
         assert!(matches!(
             b.rename_overlay_entry("/a/b/d", "/a/b/moved/d"),
             Ok(crate::fs_backend::OverlayRenameOutcome::Renamed)
         ));
-        assert_ne!(current_dir_generation(), generation);
+        assert_ne!(b.coherence.current_dir_generation(), generation);
         b.reset_path_walk_host_opens();
         b.dir_fd_for(Path::new("a/b/c")).unwrap();
         assert!(
@@ -2838,12 +2903,12 @@ mod serial_host {
     #[test]
     fn host_may_have_fifo_nodes_tracks_durable_marker() {
         let scratch = tempfile::TempDir::new().unwrap();
-        let a = HostFsBackend::attach(scratch.path()).unwrap();
+        let a = HostFsBackend::attach(scratch.path(), std::sync::Arc::default()).unwrap();
         assert!(!a.may_have_fifo_nodes(), "fresh scratch has no FIFOs");
         // Regular activity does not flip it, even across a structural
         // generation bump (which forces a durable-marker re-read).
         a.set_file_contents("/plain", b"x".to_vec()).unwrap();
-        crate::fs_resolve_cache::bump_generation();
+        a.coherence.bump_generation();
         assert!(!a.may_have_fifo_nodes());
 
         a.create_fifo("/f", 0o600).unwrap();
@@ -2854,7 +2919,8 @@ mod serial_host {
         // another): the DURABLE marker must answer, where an in-process flag
         // would silently say false and route the FIFO open down the blocking
         // regular-file path.
-        let b = HostFsBackend::attach(scratch.path()).unwrap();
+        let b = HostFsBackend::attach(scratch.path(), std::sync::Arc::clone(a.cache_coherence()))
+            .unwrap();
         assert!(b.may_have_fifo_nodes());
     }
 

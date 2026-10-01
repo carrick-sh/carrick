@@ -6,8 +6,11 @@ impl SyscallDispatcher {
     pub fn register_mount(
         &mut self,
         point: impl Into<std::path::PathBuf>,
-        vfs: Box<dyn carrick_vfs::Vfs>,
+        mut vfs: Box<dyn carrick_vfs::Vfs>,
     ) {
+        vfs.set_cache_coherence(std::sync::Arc::clone(
+            &self.fs.rootfs_vfs.dentry_cache.coherence,
+        ));
         crate::el1_inotify::invalidate_name_cache_all();
         self.fs.vfs_mounts_mut().mount(point, vfs);
     }
