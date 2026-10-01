@@ -2532,11 +2532,15 @@ fn el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation() {
 /// Contract `kernel.mm.tlb-maintenance-budget` (required invalidations): a
 /// running thread's `mprotect` restriction, `mprotect` restore and `munmap`
 /// of a touched page each need a TLB invalidation, and none may cost a host
-/// TLB-maintenance round trip (exit class `Maintenance`): the thread's own
-/// vCPU issues it, broadcast, on its way back to EL0. Measured as the slope
-/// of maintenance exits between two round counts of `tlb-edit-budget` (a
-/// two-thread MM; three required invalidations per round), so process start
-/// and exit cancel.
+/// TLB-maintenance round trip: the thread's own vCPU issues it, broadcast,
+/// on its way back to EL0. Measured as slopes between two round counts of
+/// `tlb-edit-budget` (a two-thread MM editing a host-mapped private file
+/// page; three required invalidations per round), so process start and exit
+/// cancel: required invalidations the
+/// host issued (`ResumeInvalidationStats::issued_by_host`) must not grow.
+/// The Maintenance exit-class slope is printed too; it also counts stale
+/// first-touch fault retries and task loads, which are not invalidations an
+/// edit requires.
 #[test]
 fn el1_tlb_running_thread_mm_edits_cost_no_maintenance() {
     const ROUNDS: [u64; 2] = [4, 36];
@@ -2545,16 +2549,22 @@ fn el1_tlb_running_thread_mm_edits_cost_no_maintenance() {
     let carrier = carrier_or_fail();
     let mut runs = Vec::new();
     for rounds in ROUNDS {
+        let before = carrick_embed::resume_invalidation_stats();
         let measured = run_fixture(
             &carrier,
             &["tlb-edit-budget", &rounds.to_string()],
             Duration::from_secs(120),
         );
+        let after = carrick_embed::resume_invalidation_stats();
         let maintenance =
             measured.exit_classes[carrick_el1_abi::HostExitClass::Maintenance as usize];
+        let owed = after.owed - before.owed;
+        let on_return = after.issued_on_return - before.issued_on_return;
+        let by_host = after.issued_by_host - before.issued_by_host;
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched tlb-edit-budget rounds={rounds} maintenance_exits={maintenance} exits={} {}",
+            "el1-sched tlb-edit-budget rounds={rounds} owed={owed} issued_on_return={on_return} \
+             issued_by_host={by_host} maintenance_exits={maintenance} exits={} {}",
             measured.exits,
             stdout.trim()
         );
@@ -2563,21 +2573,24 @@ fn el1_tlb_running_thread_mm_edits_cost_no_maintenance() {
             stdout.contains(&format!("tlb-edit-budget rounds={rounds} errors=0 ok=true")),
             "{stdout:?}"
         );
-        runs.push(maintenance);
+        runs.push((owed, by_host, maintenance));
     }
-    let added = runs[1].saturating_sub(runs[0]);
+    let added_rounds = ROUNDS[1] - ROUNDS[0];
+    let owed = runs[1].0.saturating_sub(runs[0].0);
+    let by_host = runs[1].1.saturating_sub(runs[0].1);
+    let maintenance = runs[1].2 as i64 - runs[0].2 as i64;
     println!(
-        "el1-sched tlb-edit-budget maintenance {}->{} (+{added}) over {} added rounds",
-        runs[0],
-        runs[1],
-        ROUNDS[1] - ROUNDS[0]
+        "el1-sched tlb-edit-budget over {added_rounds} added rounds: owed +{owed}, issued by \
+         host +{by_host}, maintenance exits {maintenance:+}"
+    );
+    assert!(
+        owed >= 3 * added_rounds,
+        "{added_rounds} added rounds owed only {owed} invalidations to their returns"
     );
     assert_eq!(
-        added,
-        0,
-        "{} added rounds of required invalidations cost {added} host TLB-maintenance exits \
-         (budget: 0)",
-        ROUNDS[1] - ROUNDS[0]
+        by_host, 0,
+        "{added_rounds} added rounds of required invalidations cost {by_host} host \
+         TLB-maintenance round trips (budget: 0)"
     );
 }
 

@@ -1045,6 +1045,25 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
             HvfVcpuBacking::Staged(cpu) => cpu.get_mut().take_owed(),
         }
     }
+
+    fn returns_syscalls_through_resume_invalidation(&self) -> bool {
+        // Mailbox transport installs the mailbox vectors, which carry the
+        // resume-invalidation entry; the legacy transport does not.
+        matches!(&self.backing, HvfVcpuBacking::Live(live)
+            if live.mailbox.transport() == HvfSyscallTransport::Mailbox)
+    }
+
+    fn resume_through_invalidation(&mut self) -> Result<bool, TrapError> {
+        if !self.returns_syscalls_through_resume_invalidation() {
+            return Ok(false);
+        }
+        let layout = carrick_mem::memory::mailbox_resume_layout();
+        if self.get_reg(Reg::Pc)? != layout.hvc_return {
+            return Ok(false);
+        }
+        self.set_reg(Reg::Pc, layout.entry)?;
+        Ok(true)
+    }
 }
 
 // ─── HvfAarch64Vmm ───────────────────────────────────────────────────────────

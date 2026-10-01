@@ -158,6 +158,7 @@ pub use carrick_runtime::{El1FrameGrantStats, el1_frame_grant_stats};
 /// before treating a zero `host_cow_resolutions` delta as evidence. Host fault
 /// exits are a different quantity and must not be substituted.
 pub use carrick_runtime::{HostCowSnapshot, host_cow_snapshot};
+pub use carrick_runtime::{ResumeInvalidationStats, resume_invalidation_stats};
 pub use carrick_runtime::{
     hvpatch_task_loads_total, read_el1_counters, reset_el1_counters, vcpu_hvc_not_svc_reasons,
     vcpu_hvc_not_svc_total, vcpu_run_exit_classes, vcpu_run_exits_total,

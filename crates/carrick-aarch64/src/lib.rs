@@ -33,6 +33,7 @@ mod guest_alias_writer_tests;
 pub mod icache;
 pub mod mailbox;
 pub mod owed_kick;
+pub mod resume_invalidation;
 pub mod stage1_authority;
 pub mod vmm;
 

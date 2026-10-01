@@ -43,6 +43,10 @@ struct HvpatchResidentTaskRecord {
     thread: ThreadKey,
     binding: std::sync::Weak<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
     metadata: carrick_aarch64::Aarch64ResidentTaskMetadata,
+    /// The stage-1 invalidation the task's last syscall owes to its return
+    /// (`carrick_aarch64::resume_invalidation`): issued as it resumes when
+    /// it is reaffirmed here, or on this vCPU when it is evicted.
+    owed_invalidation: Option<carrick_aarch64::resume_invalidation::ResumeInvalidation>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -641,7 +645,10 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             if resident.thread == task.thread_key() && matches_thread_token {
                 true
             } else if resident.thread == task.thread_key() {
-                self.resident_task = None;
+                let stale = self.resident_task.take();
+                self.issue_resident_invalidation(
+                    stale.and_then(|record| record.owed_invalidation),
+                )?;
                 self.residency_generation = self.residency_generation.next();
                 false
             } else {
@@ -722,10 +729,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         self.current = Some(engine);
         self.binding = Some(Arc::clone(task.binding()));
         if let Some(resident) = resident_record {
-            self.current
+            let engine = self
+                .current
                 .as_mut()
-                .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?
-                .reaffirm_resident_task_state_on_live_executor(cpu, &resident.metadata)?;
+                .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?;
+            engine.reaffirm_resident_task_state_on_live_executor(cpu, &resident.metadata)?;
+            engine.adopt_owed_resume_invalidation(resident.owed_invalidation)?;
         } else {
             self.current
                 .as_mut()
@@ -925,6 +934,17 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 return Err(ExecutorSaveError::new(error, lease));
             }
         };
+        // A zone-saved task may resume through the EL1 scheduler, never
+        // through this vCPU's syscall return: issue its owed invalidation
+        // now. A resident one keeps it for its return here.
+        let owed_invalidation = if zone_save.is_some() {
+            if let Err(error) = engine.settle_owed_resume_invalidation() {
+                return Err(ExecutorSaveError::new(error, lease));
+            }
+            None
+        } else {
+            engine.take_owed_resume_invalidation()
+        };
         if let Err(error) = engine.restore_persistent_executor_invariants() {
             return Err(ExecutorSaveError::new(error, lease));
         }
@@ -988,6 +1008,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 thread: lease.thread_key(),
                 binding: Arc::downgrade(&binding),
                 metadata,
+                owed_invalidation,
             });
         }
         if let Err(error) = restore_worker_vcpu_before_binding_publication(
@@ -1201,7 +1222,8 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
     }
 
     fn flush_resident_task(&mut self) -> Result<(), TrapError> {
-        if let Some(resident) = self.resident_task.take() {
+        if let Some(mut resident) = self.resident_task.take() {
+            self.issue_resident_invalidation(resident.owed_invalidation.take())?;
             let vcpu = self.vcpu.as_ref().ok_or_else(|| {
                 TrapError::Hypervisor("flush resident task missing worker vCPU".into())
             })?;
@@ -1227,9 +1249,10 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         if generation != self.residency_generation {
             return Err(TrapError::Hypervisor("stale residency generation".into()));
         }
-        let Some(resident) = self.resident_task.take() else {
+        let Some(mut resident) = self.resident_task.take() else {
             return Err(TrapError::Hypervisor("no resident task on executor".into()));
         };
+        self.issue_resident_invalidation(resident.owed_invalidation.take())?;
         let vcpu = self.vcpu.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("snapshot resident task missing worker vCPU".into())
         })?;
@@ -1251,6 +1274,26 @@ impl Drop for HvpatchPersistentExecutor {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchPersistentExecutor {
+    /// Issue, on this idle executor's vCPU, the invalidation a resident task
+    /// evicted before its syscall return still owes.
+    fn issue_resident_invalidation(
+        &mut self,
+        owed: Option<carrick_aarch64::resume_invalidation::ResumeInvalidation>,
+    ) -> Result<(), TrapError> {
+        let Some(owed) = owed else {
+            return Ok(());
+        };
+        let lifecycle = self.lifecycle.as_mut().ok_or_else(|| {
+            TrapError::Hypervisor("owed invalidation lost idle worker lifecycle".into())
+        })?;
+        let vcpu = self.vcpu.as_mut().ok_or_else(|| {
+            TrapError::Hypervisor("owed invalidation lost idle worker vCPU".into())
+        })?;
+        carrick_vmm_hvf::hvf_aarch64_engine::invalidate_worker_asid(lifecycle, vcpu, owed.asid())?;
+        owed.complete_by_host();
+        Ok(())
+    }
+
     /// The mailbox slot of the vCPU this executor holds right now, loaded or
     /// idle. Read at every use, never cached: M:N reclaim and fork rebuild
     /// give the vCPU a fresh mailbox lease, and a slot number kept from an

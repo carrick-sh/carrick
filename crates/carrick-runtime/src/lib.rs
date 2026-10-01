@@ -267,6 +267,12 @@ pub struct El1FrameGrantStats {
     pub bytes_returned: u64,
 }
 
+/// Required stage-1 invalidations owed to syscall returns, and where each
+/// ran (`carrick_aarch64::resume_invalidation`).
+pub use carrick_aarch64::resume_invalidation::{
+    ResumeInvalidationStats, stats as resume_invalidation_stats,
+};
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
     El1FrameGrantStats::default()
