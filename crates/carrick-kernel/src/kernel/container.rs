@@ -1158,6 +1158,8 @@ impl ClockDomain {
 pub struct Container {
     id: ContainerId,
     launch: LaunchContext,
+    /// Launch-owned terminal authority survives adapter-to-carrier handoff.
+    tty_registry: Arc<super::tty::TtyRegistry>,
     /// Initial network and UTS namespaces for this container. Each task's
     /// `NsProxy` clones these exact Arcs at publication; a later container can
     /// therefore never rename or republish an already-running sibling.
@@ -1214,6 +1216,7 @@ impl Container {
     ) -> Self {
         Self {
             id: launch.container_id,
+            tty_registry: Arc::new(super::tty::TtyRegistry::default()),
             launch,
             net_ns: Arc::new(NetNs::from_model(alloc_ns_id(), network)),
             uts_ns: Arc::new(UtsNs::new(alloc_ns_id(), hostname.into())),
@@ -1347,6 +1350,10 @@ impl Container {
 
     pub fn run_id(&self) -> &RunId {
         &self.launch.run_id
+    }
+
+    pub fn tty_registry(&self) -> &Arc<super::tty::TtyRegistry> {
+        &self.tty_registry
     }
 
     pub fn launch(&self) -> &LaunchContext {

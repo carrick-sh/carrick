@@ -485,7 +485,7 @@ impl<'a> FsView<'a> {
                 }
                 let offered = bytes.len();
                 let outcome = this.complete_wait_fd_authority(
-                    this.write_output_fd(out_fd.0, &bytes, tid),
+                    this.write_output_fd(cx.kernel.container().tty_registry(), out_fd.0, &bytes, tid),
                     &this.captured_file_table(),
                     [in_fd.0, out_fd.0],
                 );
@@ -615,7 +615,7 @@ impl<'a> FsView<'a> {
             // given offset on a real host fd and advance *off_out.
             let written = if off_out_addr == 0 {
                 let outcome = this.complete_wait_fd_authority(
-                    this.write_output_fd(out_fd.0, &bytes, tid),
+                    this.write_output_fd(cx.kernel.container().tty_registry(), out_fd.0, &bytes, tid),
                     &this.captured_file_table(),
                     [in_fd.0, out_fd.0],
                 );
