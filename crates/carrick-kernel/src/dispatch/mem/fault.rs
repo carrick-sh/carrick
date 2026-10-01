@@ -597,10 +597,6 @@ impl MemState {
             .hand_over(range, piece.owner(), ResidencyOwner::Host);
         locked_ranges_insert(&mut self.resident_tracked_ranges, range);
         self.resident_fault_ranges.disarm(range);
-        let prot = LinuxProtFlags::from_bits_truncate(piece.protection.bits());
-        if prot.is_empty() {
-            return;
-        }
         let mut untouched = vec![range];
         for (start, end) in
             self.resident
@@ -610,6 +606,19 @@ impl MemState {
             {
                 locked_ranges_remove(&mut untouched, resident);
             }
+        }
+        // The root's untouched pages are fresh zero; as host facts they keep
+        // that provenance, or their bulk frame grant could never publish
+        // (a guest-venue mmap never reserved them with the host).
+        for sub in &untouched {
+            let (start, end) = (sub.start().raw(), sub.end().raw());
+            if let Ok(len) = usize::try_from(end - start) {
+                let _ = self.deferred_anonymous.adopt_pristine(GuestVa(start), len);
+            }
+        }
+        let prot = LinuxProtFlags::from_bits_truncate(piece.protection.bits());
+        if prot.is_empty() {
+            return;
         }
         for sub in untouched {
             self.resident_fault_ranges.arm(sub, prot);
@@ -1003,11 +1012,15 @@ impl<'a> MemView<'a> {
         let page = page_floor(address, page_size);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        let grant = match mem.first_touch_owner(page) {
-            FirstTouchOwner::Host => mem.resident_fault_ranges.grant_for_page(page, max_len)?,
-            FirstTouchOwner::Root(mapping, incarnation) => {
-                mem.root_grant_for_page(&mapping, incarnation, page, max_len)?
-            }
+        let (grant, root_owned) = match mem.first_touch_owner(page) {
+            FirstTouchOwner::Host => (
+                mem.resident_fault_ranges.grant_for_page(page, max_len)?,
+                false,
+            ),
+            FirstTouchOwner::Root(mapping, incarnation) => (
+                mem.root_grant_for_page(&mapping, incarnation, page, max_len)?,
+                true,
+            ),
             FirstTouchOwner::Unmapped => return None,
         };
         let mut start = grant.range.start().raw();
@@ -1029,6 +1042,17 @@ impl<'a> MemView<'a> {
         }
         if start >= end {
             return None;
+        }
+        if root_owned {
+            // The root's run is untouched, non-resident memory of its live
+            // incarnations: fresh zero. A guest-venue mmap placed it without
+            // crossing to the host, so the host's pristine provenance, which
+            // the grant's backing publication requires, never learned of it.
+            // Publish it from the root's answer under this MM's permit.
+            let len = usize::try_from(end - start).ok()?;
+            mem.deferred_anonymous
+                .adopt_pristine(GuestVa(start), len)
+                .ok()?;
         }
         Some(ResidentFrameGrantPlan {
             fault_page: page,

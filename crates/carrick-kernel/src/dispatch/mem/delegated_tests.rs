@@ -3056,3 +3056,79 @@ fn fork_commit_cannot_be_forged_outside_a_fork() {
     });
     drop(root);
 }
+
+/// Contract `kernel.el1.anonymous-first-touch`: the bulk frame grant of an
+/// untouched root-owned page is published from pristine zero provenance,
+/// exactly as on host setup. A guest-venue `mmap` never crosses to the host,
+/// so the root's untouched non-resident pages are that provenance; without
+/// it every first touch of EL1-placed memory fell back to page-granular
+/// host service (signed: ~2 exits per page).
+#[test]
+fn delegated_frame_grant_span_carries_pristine_provenance() {
+    let mut twin = Twin::new();
+    // As on HVF: host-setup anonymous mmap is lazy (deferred) backing.
+    twin.host_memory.defer_anon = true;
+    twin.delegated_memory.defer_anon = true;
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    twin.anonymous(base, 4 * PAGE, RW);
+    let grant_is_pristine = |dispatcher: &SyscallDispatcher, page: u64| {
+        let (start, len) = dispatcher
+            .with_resident_frame_grant_plan_for_test(page, 4 * PAGE, |plan| {
+                (plan.start(), plan.len())
+            })
+            .expect("an untouched anonymous page has a bulk grant plan");
+        let state = dispatcher
+            .deferred_anonymous_state(dispatcher.mm_authority().mm_id)
+            .expect("the dispatcher's own deferred state");
+        (
+            start,
+            len,
+            state.covers_pristine(carrick_guest_mem::GuestVa(start), len as usize),
+        )
+    };
+    twin.same("an untouched mapping's grant span", |d, _| {
+        grant_is_pristine(d, base + PAGE)
+    });
+    assert!(grant_is_pristine(&twin.host, base + PAGE).2);
+
+    // A touched page leaves the run; the rest stays pristine.
+    twin.touch(base);
+    twin.same("the grant span beside a touched page", |d, _| {
+        grant_is_pristine(d, base + 2 * PAGE)
+    });
+}
+
+/// Contract `kernel.el1.anonymous-first-touch`, fork: the host-setup twin
+/// of a delegated parent keeps the pristine provenance of the parent root's
+/// untouched pages, so the child's first touch is a bulk frame grant too.
+/// A touched page is not pristine in either MM.
+#[test]
+fn delegated_fork_twin_keeps_pristine_provenance_of_untouched_root_pages() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = root
+        .guest_mmap(
+            Placement::Anywhere,
+            4 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    // The parent touches one page through the host fault path.
+    dispatcher
+        .with_resident_fault_plan_for_test(base, |plan| dispatcher.commit_resident_fault(plan));
+    let child_mm = crate::kernel::MmId::from_registry_allocation(
+        std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
+    );
+    let child = dispatcher.mm_authority().fork_private(child_mm);
+    let pristine = |at: u64, len: u64| {
+        child
+            .lock()
+            .deferred_anonymous
+            .covers_pristine(carrick_guest_mem::GuestVa(at), len as usize)
+    };
+    assert!(
+        pristine(base + PAGE, 3 * PAGE),
+        "the twin's untouched root pages are fresh zero"
+    );
+    assert!(!pristine(base, PAGE), "a touched page is never pristine");
+}

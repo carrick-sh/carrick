@@ -166,6 +166,16 @@ impl DeferredAnonymousState {
         insert(&mut state.pristine, range);
         Ok(())
     }
+    /// Publish pristine provenance for `[start, start + len)` whose fresh
+    /// zero state another exact-MM authority attests (a delegated MM's
+    /// reservation root: an untouched, non-resident page of its current
+    /// incarnation). Unlike [`Self::reserve_fresh`] this is no new
+    /// reservation: logical zero-read residency is kept.
+    pub fn adopt_pristine(&self, start: GuestVa, len: usize) -> Result<(), DeferredAnonymousError> {
+        let range = extent(start, len)?;
+        insert(&mut self.state.lock().pristine, range);
+        Ok(())
+    }
     pub fn retire(&self, start: GuestVa, len: usize) -> Result<(), DeferredAnonymousError> {
         let range = extent(start, len)?;
         let mut state = self.state.lock();
