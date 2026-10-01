@@ -713,8 +713,8 @@ pub const LINUX_PRIVATE_OVERLAY_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB, mi
 /// a dense pool of 2 MiB per-mm table slots; every guest/kernel data frame is
 /// allocated monotonically from the remaining arena and mapped into stage-2
 /// exactly once.  Neither range is guest-VA identity-accessible.
-pub const LINUX_HVPATCH_ROOT_SLOT_BASE: u64 = 0x9A_0000_0000; // 616 GiB
-pub const LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+pub const LINUX_HVPATCH_ROOT_SLOT_BASE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE; // 616 GiB
+pub const LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE;
 pub const LINUX_HVPATCH_GLOBAL_FRAME_BASE: u64 =
     LINUX_HVPATCH_ROOT_SLOT_BASE + LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE;
 pub const LINUX_HVPATCH_GLOBAL_FRAME_SIZE: u64 = 0x63_0000_0000; // 396 GiB

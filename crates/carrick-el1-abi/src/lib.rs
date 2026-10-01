@@ -114,6 +114,29 @@ pub const AARCH64_STAGE1_TABLES_ALIAS_BASE: u64 = 0x2D_0002_0000;
 /// publication must reject every descriptor outside this primary arena.
 pub const AARCH64_STAGE1_TABLES_PRIMARY_SIZE: u64 = 0x1C_0000;
 
+/// Guest-physical base of the carrier's dense pool of 2 MiB stage-1 table
+/// arenas: every MM's primary arena (its root slot) and every extension arena
+/// it grows into are slots of this pool. Every HVPatch image maps the whole
+/// pool EL1-only at its own address (VA == IPA, EL0 no access, never
+/// executable), so EL1 reaches every table of every arena the host grants it
+/// and the guest lane's table supply grows exactly like the host lane's.
+pub const AARCH64_STAGE1_TABLE_POOL_BASE: u64 = 0x9A_0000_0000;
+
+/// Bytes of [`AARCH64_STAGE1_TABLE_POOL_BASE`]'s pool (2048 arenas).
+pub const AARCH64_STAGE1_TABLE_POOL_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// EL1's view of every stage-1 table: the pool's descriptor words, the
+/// physical address of the first word, and the view's length in bytes.
+/// Only meaningful on the guest (EL1), where the pool is mapped.
+#[must_use]
+pub const fn stage1_table_view() -> (*mut core::sync::atomic::AtomicU64, u64, usize) {
+    (
+        AARCH64_STAGE1_TABLE_POOL_BASE as *mut core::sync::atomic::AtomicU64,
+        AARCH64_STAGE1_TABLE_POOL_BASE,
+        AARCH64_STAGE1_TABLE_POOL_SIZE as usize,
+    )
+}
+
 /// Canonical accessible user address used when adopting a live AArch64 table
 /// image and detecting its ASID-scoped construction mode.
 pub const AARCH64_USER_LEAF_CHECK_VA: u64 = 0x1_0000;

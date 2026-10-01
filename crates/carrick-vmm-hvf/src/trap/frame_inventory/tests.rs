@@ -2167,8 +2167,16 @@ fn root_exec_rebuilds_tables_with_sparse_and_hvpatch_reservations() {
             .map(|mapping| mapping.ipa_start)
     );
     assert_eq!(manager.translate(crate::memory::LINUX_MMAP_BASE), None);
+    // The table pool is EL1's table view: mapped at its own address, with no
+    // EL0 access; the global-frame arena is closed.
+    let pool = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
+    assert_eq!(manager.translate(pool), Some(pool));
     assert_eq!(
-        manager.translate(crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE),
+        carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(pool)) & (0b11 << 6),
+        0
+    );
+    assert_eq!(
+        manager.translate(crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE),
         None
     );
     assert!(

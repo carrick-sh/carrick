@@ -390,12 +390,15 @@ pub enum GuestPreparedCommitError {
 ///
 /// # Safety
 ///
-/// `words` names the writable primary table arena for `physical_base`; the
-/// exact-MM editor excludes every other host or guest mutation of this graph.
+/// `words` names a writable table view whose first word is at
+/// `physical_base` and that holds every table of the graph rooted at `root`;
+/// the exact-MM editor excludes every other host or guest mutation of this
+/// graph.
 pub unsafe fn commit_existing_el1_prepared_page(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
     byte_len: usize,
+    root: u64,
     va: u64,
     expected_ipa: u64,
     access: LeafAccess,
@@ -411,7 +414,7 @@ pub unsafe fn commit_existing_el1_prepared_page(
     let mut journal = descriptor_txn::InlineJournal::new();
     let outcome = descriptor_txn::execute_descriptor_op(
         &live,
-        SubstrateGpa(physical_base),
+        SubstrateGpa(root),
         DescriptorOp::Publish {
             span: PageSpan::new(va, PT_PAGE),
             expected_ipa: SubstrateGpa(expected_ipa),
@@ -733,6 +736,7 @@ pub unsafe fn protect_existing_el1_private_pages(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
     byte_len: usize,
+    root: u64,
     edit: GuestPermissionEdit,
 ) -> Result<usize, GuestPermissionEditError> {
     use descriptor_txn::{DescriptorOp, DescriptorOutcome, DescriptorRefusal};
@@ -746,7 +750,7 @@ pub unsafe fn protect_existing_el1_private_pages(
     let mut journal = descriptor_txn::InlineJournal::new();
     match descriptor_txn::execute_descriptor_op(
         &live,
-        SubstrateGpa(physical_base),
+        SubstrateGpa(root),
         DescriptorOp::Protect(edit),
         &descriptor_txn::TableGrants::NONE,
         &mut journal,
@@ -791,6 +795,7 @@ pub unsafe fn retire_existing_el1_private_pages(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
     byte_len: usize,
+    root: u64,
     va: u64,
     len: u64,
 ) -> Result<usize, GuestRetirementError> {
@@ -805,7 +810,7 @@ pub unsafe fn retire_existing_el1_private_pages(
     let mut journal = descriptor_txn::InlineJournal::new();
     match descriptor_txn::execute_descriptor_op(
         &live,
-        SubstrateGpa(physical_base),
+        SubstrateGpa(root),
         DescriptorOp::Retire(PageSpan::new(va, len)),
         &descriptor_txn::TableGrants::NONE,
         &mut journal,
@@ -1277,16 +1282,14 @@ pub(crate) const fn sub_table_level_reclaimable(level: usize) -> bool {
     matches!(level, 2 | 3)
 }
 
-/// Whether the table page `pa` lies in the runtime spare tail of the primary
-/// arena whose first byte is `primary_base`: never one of the boot tables
-/// (null guard, kernel hole, Rosetta alias), which must never be freed.
-/// Callers bound the other end: the host by its bump cursor, EL1 by the
-/// arena it can reach.
-pub(crate) fn primary_spare_table(primary_base: u64, pa: u64) -> bool {
-    pa.is_multiple_of(PT_PAGE)
-        && pa
-            .checked_sub(primary_base)
-            .is_some_and(|offset| offset >= SPARE_START_OFFSET)
+/// Whether the table page `pa` may be a runtime spare table of the MM whose
+/// root (the first byte of its primary arena) is `root`: never one of the
+/// primary arena's boot tables (null guard, kernel hole, Rosetta alias),
+/// which must never be freed. A page of an extension arena is spare. Callers
+/// bound the rest: the host by each arena's bump cursor, EL1 by the table
+/// view it can reach.
+pub(crate) fn spare_table(root: u64, pa: u64) -> bool {
+    pa.is_multiple_of(PT_PAGE) && !(pa >= root && pa - root < SPARE_START_OFFSET)
 }
 
 /// Whether one entry of a sub-table at `level`, covering `entry_va`, records
@@ -1817,6 +1820,61 @@ pub enum TableArenaStorage {
     Live,
 }
 
+/// The host's planning view of a guest-owned image: the descriptor words of
+/// every arena, each resolved through the image's live host resolver. It
+/// only loads; a guest-owned graph is stored to by EL1 alone.
+struct ArenaTableWords<'a> {
+    arenas: &'a [TableArena],
+    resolver: &'a (dyn HostArenaResolver + Send + Sync),
+}
+
+impl descriptor_txn::LiveDescriptorWords for ArenaTableWords<'_> {
+    fn load(&self, pa: u64) -> Result<u64, descriptor_txn::DescriptorRefusal> {
+        use descriptor_txn::DescriptorRefusal;
+        if !pa.is_multiple_of(8) {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        let arena = self
+            .arenas
+            .iter()
+            .find(|arena| pa >= arena.base && pa - arena.base < arena.capacity as u64)
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
+        let host = self
+            .resolver
+            .host_const_ptr_for_range(arena.base, arena.capacity)
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
+        // SAFETY: the resolver maps the whole arena resident and aligned; the
+        // offset is in bounds and 8-byte aligned.
+        let word = unsafe {
+            &*host
+                .add((pa - arena.base) as usize)
+                .cast::<core::sync::atomic::AtomicU64>()
+        };
+        Ok(word.load(core::sync::atomic::Ordering::Acquire))
+    }
+
+    fn compare_exchange(
+        &self,
+        _pa: u64,
+        _current: u64,
+        _new: u64,
+    ) -> Result<bool, descriptor_txn::DescriptorRefusal> {
+        Err(descriptor_txn::DescriptorRefusal::BadRange)
+    }
+
+    fn store_unlinked(
+        &self,
+        _pa: u64,
+        _value: u64,
+    ) -> Result<(), descriptor_txn::DescriptorRefusal> {
+        Err(descriptor_txn::DescriptorRefusal::BadRange)
+    }
+
+    fn publish_barrier(&self) {}
+
+    fn invalidate_range(&self, _va: u64, _len: u64) {}
+}
+
 #[derive(Debug)]
 pub struct TableArena {
     pub base: u64,
@@ -2195,15 +2253,19 @@ impl PageTableManager {
         Ok(())
     }
 
-    /// Reserve `count` unlinked table pages in the EL1-reachable primary
-    /// arena for one guest descriptor transaction. The host remains the only
+    /// Reserve `count` unlinked table pages for one guest descriptor
+    /// transaction, from any arena of this image: freed pages first, then the
+    /// spare tail of the primary arena, then the extension arenas, then new
+    /// extension arenas taken from `source` exactly as the host editor grows
+    /// (every arena is a slot of the table pool EL1 reaches, see
+    /// `carrick_el1_abi::stage1_table_view`). The host remains the only
     /// allocator of table-page identity; EL1 fills and links the pages it
-    /// uses. Extension arenas are never granted: EL1 cannot reach them, so a
-    /// shortfall is `OutOfTables` and the transaction must not be submitted.
-    /// Nothing is reserved on failure.
-    pub fn reserve_primary_table_grants(
+    /// uses. Nothing is reserved on failure; an arena taken from `source`
+    /// stays with the image for later tables.
+    pub fn reserve_table_grants(
         &mut self,
         count: usize,
+        mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<descriptor_txn::TableGrants, PageTableError> {
         if count > descriptor_txn::MAX_TABLE_GRANTS {
             return Err(PageTableError::OutOfTables);
@@ -2213,48 +2275,95 @@ impl PageTableManager {
         }
         let mut pages = [SubstrateGpa(0); descriptor_txn::MAX_TABLE_GRANTS];
         let mut reserved = 0;
-        let mut from_free = 0;
-        let primary_base = self.arenas[0].base;
-        let primary_end = primary_base + self.arenas[0].capacity as u64;
         for &pa in self.free_tables.iter().rev() {
             if reserved == count {
                 break;
             }
-            if pa >= primary_base && pa < primary_end {
-                pages[reserved] = SubstrateGpa(pa);
+            pages[reserved] = SubstrateGpa(pa);
+            reserved += 1;
+        }
+        let from_free = reserved;
+        // Bump cursors, committed only once every page is found.
+        let mut cursors = [(usize::MAX, 0u64); descriptor_txn::MAX_TABLE_GRANTS];
+        let mut used_cursors = 0;
+        let mut index = 0;
+        while reserved < count {
+            if index == self.arenas.len() {
+                let Some(gpa) = source.as_mut().and_then(|source| source.take_arena()) else {
+                    return Err(PageTableError::OutOfTables);
+                };
+                if let Err(error) = self.adopt_extension_arena(gpa) {
+                    if let Some(source) = source.as_mut() {
+                        source.return_arena(gpa);
+                    }
+                    return Err(error);
+                }
+            }
+            let wanted = (count - reserved) as u64;
+            if index == 0 {
+                let arena = &self.arenas[0];
+                let available = (arena.capacity as u64).saturating_sub(arena.next_free) / PT_PAGE;
+                self.skip_occupied_primary_candidates(wanted.min(available))?;
+            }
+            let arena = &self.arenas[index];
+            let available = (arena.capacity as u64).saturating_sub(arena.next_free) / PT_PAGE;
+            let take = wanted.min(available);
+            for page in 0..take {
+                pages[reserved] = SubstrateGpa(arena.base + arena.next_free + page * PT_PAGE);
                 reserved += 1;
             }
-        }
-        from_free += reserved;
-        let bump_needed = (count - reserved) as u64;
-        self.skip_occupied_primary_candidates(bump_needed)?;
-        let arena = &self.arenas[0];
-        let bump_end = arena
-            .next_free
-            .checked_add(bump_needed * PT_PAGE)
-            .ok_or(PageTableError::OutOfTables)?;
-        if bump_end > arena.capacity as u64 {
-            return Err(PageTableError::OutOfTables);
-        }
-        for index in 0..bump_needed {
-            pages[reserved] = SubstrateGpa(arena.base + arena.next_free + index * PT_PAGE);
-            reserved += 1;
+            if take != 0 {
+                cursors[used_cursors] = (index, arena.next_free + take * PT_PAGE);
+                used_cursors += 1;
+            }
+            index += 1;
         }
         let grants =
             descriptor_txn::TableGrants::new(&pages[..count]).ok_or(PageTableError::BadAddress)?;
-        if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[0].storage {
-            let needed = bump_end as usize;
-            if bytes.len() < needed {
-                bytes
-                    .try_reserve(needed - bytes.len())
-                    .map_err(|_| PageTableError::MetadataAllocation)?;
-                bytes.resize(needed, 0);
+        for &(arena_index, bump_end) in &cursors[..used_cursors] {
+            if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[arena_index].storage {
+                let needed = bump_end as usize;
+                if bytes.len() < needed {
+                    bytes
+                        .try_reserve(needed - bytes.len())
+                        .map_err(|_| PageTableError::MetadataAllocation)?;
+                    bytes.resize(needed, 0);
+                }
             }
         }
         self.free_tables
             .retain(|pa| !pages[..from_free].contains(&SubstrateGpa(*pa)));
-        self.arenas[0].next_free = bump_end;
+        for &(arena_index, bump_end) in &cursors[..used_cursors] {
+            self.arenas[arena_index].next_free = bump_end;
+        }
         Ok(grants)
+    }
+
+    /// Append the extension arena at `gpa` (just taken from the image's
+    /// source) with nothing issued yet.
+    fn adopt_extension_arena(&mut self, gpa: SubstrateGpa) -> Result<(), PageTableError> {
+        let capacity = self.layout.extension_arena_capacity;
+        let storage = match self.arenas[0].storage {
+            TableArenaStorage::Owned(_) => {
+                let mut bytes = Vec::new();
+                if bytes.try_reserve_exact(capacity).is_err() {
+                    return Err(PageTableError::MetadataAllocation);
+                }
+                TableArenaStorage::Owned(bytes)
+            }
+            TableArenaStorage::Live => TableArenaStorage::Live,
+        };
+        if self.arenas.try_reserve(1).is_err() {
+            return Err(PageTableError::MetadataAllocation);
+        }
+        self.arenas.push(TableArena {
+            snapshot_scratch: Vec::new(),
+            base: gpa.0,
+            storage,
+            next_free: 0,
+            capacity,
+        });
+        Ok(())
     }
 
     /// Build the guest descriptor transaction for `op` on this guest-owned
@@ -2267,33 +2376,23 @@ impl PageTableManager {
         &mut self,
         id: descriptor_txn::DescriptorTxnId,
         op: descriptor_txn::DescriptorOp,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<descriptor_txn::DescriptorTxn, GuestTxnPrepareError> {
         if self.live_descriptor_owner != LiveDescriptorOwner::Guest {
             return Err(GuestTxnPrepareError::NotGuestOwned);
         }
-        let Some(primary) = self.arenas.first().filter(|arena| arena.is_live()) else {
+        if !self.arenas.first().is_some_and(TableArena::is_live) {
             return Err(GuestTxnPrepareError::NotLive);
-        };
-        let (base, capacity) = (primary.base, primary.capacity);
+        }
         let resolver = self
             .resolver
             .as_ref()
             .ok_or(GuestTxnPrepareError::NotLive)?;
-        let host = resolver.host_const_ptr_for_range(base, capacity).ok_or(
-            GuestTxnPrepareError::Manager(PageTableError::UnresolvedArena(base)),
-        )?;
-        let maintenance = descriptor_txn::CallerInvalidatesAsid;
-        // SAFETY: the resolver contract makes `host` a resident, aligned
-        // mapping of the whole primary arena. Planning only loads.
-        let words = unsafe {
-            descriptor_txn::PrimaryTableWords::new(
-                host.cast_mut().cast::<core::sync::atomic::AtomicU64>(),
-                base,
-                capacity,
-                &maintenance,
-            )
-        }
-        .map_err(GuestTxnPrepareError::Refused)?;
+        // Planning only loads, from whichever arena holds each table.
+        let words = ArenaTableWords {
+            arenas: &self.arenas,
+            resolver: resolver.as_ref(),
+        };
         let root = SubstrateGpa(self.base());
         let plan = descriptor_txn::plan_descriptor_op(&words, root, op)
             .map_err(GuestTxnPrepareError::Refused)?;
@@ -2310,7 +2409,7 @@ impl PageTableManager {
             other => other,
         };
         let tables = self
-            .reserve_primary_table_grants(plan.table_grants)
+            .reserve_table_grants(plan.table_grants, source)
             .map_err(GuestTxnPrepareError::Manager)?;
         Ok(descriptor_txn::DescriptorTxn {
             id,
@@ -2404,16 +2503,16 @@ impl PageTableManager {
         match txn.verify_receipt(receipt) {
             Ok(verified) => {
                 let reclaimed = verified.reclaimed_tables();
-                // Verification bounded them below by the root's spare tail;
-                // the allocator bounds them above by what it issued.
-                let issued_end = self
+                // Verification kept them off the root's boot tables; the
+                // allocator bounds them by what each arena issued.
+                let root_is_primary = self
                     .arenas
                     .first()
-                    .filter(|arena| arena.base == txn.root.raw())
-                    .map_or(0, |primary| primary.base + primary.next_free);
-                if reclaimed
-                    .iter()
-                    .any(|&pa| pa >= issued_end || self.free_tables.contains(&pa))
+                    .is_some_and(|arena| arena.base == txn.root.raw());
+                if !root_is_primary
+                    || reclaimed
+                        .iter()
+                        .any(|&pa| !self.is_spare_table(pa) || self.free_tables.contains(&pa))
                 {
                     return Err(GuestTxnSettleError::Receipt(
                         ReceiptError::InconsistentReceipt,
@@ -2959,7 +3058,10 @@ impl PageTableManager {
             return false;
         }
         let primary = &self.arenas[0];
-        if primary_spare_table(primary.base, pa) && pa < primary.base + primary.next_free {
+        if spare_table(primary.base, pa)
+            && pa >= primary.base
+            && pa < primary.base + primary.next_free
+        {
             return true;
         }
         for arena in &self.arenas[1..] {
@@ -4302,7 +4404,7 @@ impl PageTableManager {
     /// reconstruct the high-water mark once from the authoritative live
     /// image; never hand a guest-linked table page out again, whether to the
     /// host editor ([`Self::alloc_table`]) or as an EL1 table grant
-    /// ([`Self::reserve_primary_table_grants`]).
+    /// ([`Self::reserve_table_grants`]).
     fn skip_occupied_primary_candidates(&mut self, pages: u64) -> Result<(), PageTableError> {
         let arena = &self.arenas[0];
         let Some(candidate_end) = pages
@@ -5425,6 +5527,28 @@ impl PageTableManager {
             len,
             KERNEL_ATTRS | TYPE_BLOCK,
             KERNEL_ATTRS | TYPE_TABLE_OR_PAGE,
+            source,
+        )
+    }
+
+    /// Map Carrick-owned EL1 data at `[va, va + len)`: AP=00 (EL1 read/write,
+    /// no EL0 access), never executable at either level. The stage-1 table
+    /// pool view (`carrick_el1_abi::stage1_table_view`) is mapped this way.
+    pub fn map_kernel_data_aliased(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<bool, PageTableError> {
+        const KERNEL_DATA_ATTRS: u64 =
+            (1u64 << 54) | (1u64 << 53) | NON_GLOBAL | (1 << 10) | (0b11 << 8);
+        self.map_aliased_with_flags(
+            va,
+            ipa,
+            len,
+            KERNEL_DATA_ATTRS | TYPE_BLOCK,
+            KERNEL_DATA_ATTRS | TYPE_TABLE_OR_PAGE,
             source,
         )
     }
@@ -9789,6 +9913,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     GuestPermissionEdit {
                         va,
                         len: 2 * PT_PAGE,
@@ -9829,6 +9954,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     GuestPermissionEdit {
                         va,
                         len: 2 * PT_PAGE,
@@ -9876,6 +10002,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     GuestPermissionEdit {
                         va,
                         len: 1 << 21,
@@ -9904,6 +10031,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     GuestPermissionEdit {
                         va: va + PT_PAGE,
                         len: PT_PAGE,
@@ -9944,6 +10072,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     va,
                     1 << 21,
                 )
@@ -9975,6 +10104,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     leaf_va,
                     PT_PAGE,
                 )
@@ -10013,6 +10143,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     va + PT_PAGE,
                     PT_PAGE,
                 )
@@ -10029,6 +10160,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     va,
                     1 << 21,
                 )
@@ -10095,6 +10227,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     va,
                     5 * PT_PAGE,
                 )
@@ -10116,6 +10249,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     words.len() * core::mem::size_of::<AtomicU64>(),
+                    root,
                     va,
                     PT_PAGE,
                 )
@@ -10750,6 +10884,7 @@ mod tests {
                 words.as_mut_ptr(),
                 root,
                 len,
+                root,
                 va,
                 expected_ipa,
                 access,
@@ -10826,6 +10961,7 @@ mod tests {
                     words.as_mut_ptr(),
                     root,
                     byte_len,
+                    root,
                     GuestPermissionEdit {
                         va,
                         len: PT_PAGE,
@@ -10856,6 +10992,7 @@ mod tests {
                         words.as_mut_ptr(),
                         root,
                         byte_len,
+                        root,
                         va,
                         PT_PAGE,
                     )
@@ -11125,6 +11262,7 @@ mod tests {
                         words,
                         LINUX_PAGE_TABLES_BASE,
                         LINUX_PAGE_TABLES_SIZE as usize,
+                        LINUX_PAGE_TABLES_BASE,
                         edit,
                     )
                 },
@@ -11165,6 +11303,7 @@ mod tests {
                         words,
                         LINUX_PAGE_TABLES_BASE,
                         LINUX_PAGE_TABLES_SIZE as usize,
+                        LINUX_PAGE_TABLES_BASE,
                         GuestPermissionEdit {
                             readable: true,
                             writable: true,
@@ -11262,6 +11401,7 @@ mod tests {
                             words,
                             LINUX_PAGE_TABLES_BASE,
                             LINUX_PAGE_TABLES_SIZE as usize,
+                            LINUX_PAGE_TABLES_BASE,
                             edit,
                         )
                     },
@@ -11402,10 +11542,10 @@ mod tests {
     }
 
     #[test]
-    fn primary_table_grants_are_exact_reversible_and_never_extension_pages() {
+    fn primary_table_grants_are_exact_and_reversible() {
         let (mut mgr, _resolver) = create_live_fixture();
         let cursor = mgr.arenas[0].next_free;
-        let grants = mgr.reserve_primary_table_grants(3).expect("three pages");
+        let grants = mgr.reserve_table_grants(3, None).expect("three pages");
         assert_eq!(
             grants.as_slice(),
             &[
@@ -11421,27 +11561,81 @@ mod tests {
 
         // The unused suffix returns to the allocator and is granted again.
         mgr.release_table_grants(grants.unused_after(1)).unwrap();
-        let again = mgr.reserve_primary_table_grants(2).expect("reuse");
+        let again = mgr.reserve_table_grants(2, None).expect("reuse");
         let mut reused = again.as_slice().to_vec();
         reused.sort_unstable();
         assert_eq!(reused, grants.as_slice()[1..].to_vec());
 
-        // A shortfall reserves nothing: EL1 cannot reach extension arenas.
+        // A shortfall without a source reserves nothing.
         let free_before = mgr.free_tables.clone();
         let cursor_before = mgr.arenas[0].next_free;
         let remaining = (mgr.arenas[0].capacity as u64 - cursor_before) / PT_PAGE;
         if remaining < descriptor_txn::MAX_TABLE_GRANTS as u64 {
             assert_eq!(
-                mgr.reserve_primary_table_grants(remaining as usize + 1),
+                mgr.reserve_table_grants(remaining as usize + 1, None),
                 Err(PageTableError::OutOfTables)
             );
         }
         assert_eq!(
-            mgr.reserve_primary_table_grants(descriptor_txn::MAX_TABLE_GRANTS + 1),
+            mgr.reserve_table_grants(descriptor_txn::MAX_TABLE_GRANTS + 1, None),
             Err(PageTableError::OutOfTables)
         );
         assert_eq!(mgr.free_tables, free_before);
         assert_eq!(mgr.arenas[0].next_free, cursor_before);
+    }
+
+    /// The guest lane's table supply grows like the host editor's: once the
+    /// primary arena is exhausted, grants come from extension arenas taken
+    /// from the image's source (EL1 reaches every arena through its table
+    /// view). Red before 2026-09-30: grants were primary-only, so a process
+    /// with more than one arena of tables (`pagetablegrow`, a sparse
+    /// `MAP_FIXED` storm) hit `OutOfTables` and the carrier aborted in
+    /// `brk`/`mmap` (`protect_range ... Manager(OutOfTables)`).
+    #[test]
+    fn table_grants_grow_into_extension_arenas_once_the_primary_is_exhausted() {
+        let (mut mgr, resolver) = create_live_fixture();
+        mgr.arenas[0].next_free = mgr.arenas[0].capacity as u64;
+        mgr.free_tables.clear();
+        assert_eq!(
+            mgr.reserve_table_grants(3, None),
+            Err(PageTableError::OutOfTables),
+            "without a source the shortfall is refused whole"
+        );
+        assert_eq!(mgr.arenas.len(), 1);
+
+        let extension = SubstrateGpa(LINUX_PAGE_TABLES_BASE + 0x40_0000);
+        resolver.register_arena(extension.0, mgr.layout.extension_arena_capacity);
+        let available = std::sync::Arc::new(std::sync::Mutex::new(vec![extension]));
+        let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut source = TestArenaSource {
+            id: TableArenaSourceId(extension),
+            available: std::sync::Arc::clone(&available),
+            returned: std::sync::Arc::clone(&returned),
+        };
+        let grants = mgr
+            .reserve_table_grants(3, Some(&mut source))
+            .expect("grants from a new extension arena");
+        assert_eq!(
+            grants.as_slice(),
+            &[
+                extension.0,
+                extension.0 + PT_PAGE,
+                extension.0 + 2 * PT_PAGE
+            ]
+        );
+        assert_eq!(mgr.arenas.len(), 2);
+        assert_eq!(mgr.arenas[1].next_free, 3 * PT_PAGE);
+        // The arena stays with the image: the next grant needs no new one.
+        let more = mgr.reserve_table_grants(2, None).expect("same arena");
+        assert_eq!(
+            more.as_slice(),
+            &[extension.0 + 3 * PT_PAGE, extension.0 + 4 * PT_PAGE]
+        );
+        assert!(returned.lock().unwrap().is_empty());
+        // Every granted page is a spare table the host may take back.
+        for &page in grants.as_slice().iter().chain(more.as_slice()) {
+            assert!(mgr.is_spare_table(page));
+        }
     }
 
     /// A guest editor can link a table page past the host's cached cursor
@@ -11456,7 +11650,7 @@ mod tests {
         // EL1 filled the second candidate page (a linked L3 table).
         let occupied = cursor + PT_PAGE;
         resolver.write_word(LINUX_PAGE_TABLES_BASE, occupied as usize + 8, VALID);
-        let grants = mgr.reserve_primary_table_grants(3).expect("three pages");
+        let grants = mgr.reserve_table_grants(3, None).expect("three pages");
         for &page in grants.as_slice() {
             assert!(
                 page > LINUX_PAGE_TABLES_BASE + occupied,
@@ -11553,7 +11747,7 @@ mod tests {
         };
         let before = live_arena_bytes(&resolver);
         let txn = mgr
-            .prepare_guest_descriptor_txn(id, op)
+            .prepare_guest_descriptor_txn(id, op, None)
             .expect("plan and reserve");
         assert_eq!(
             live_arena_bytes(&resolver),
@@ -11613,7 +11807,9 @@ mod tests {
             generation: core::num::NonZeroU64::new(2).unwrap(),
             ..id
         };
-        let copyout_txn = mgr.prepare_guest_descriptor_txn(id2, copyout).unwrap();
+        let copyout_txn = mgr
+            .prepare_guest_descriptor_txn(id2, copyout, None)
+            .unwrap();
         assert!(copyout_txn.tables.is_empty());
         let before = live_arena_bytes(&resolver);
         assert!(slot.submit(&copyout_txn));
@@ -11631,7 +11827,7 @@ mod tests {
             generation: core::num::NonZeroU64::new(3).unwrap(),
             ..id
         };
-        let occupied = mgr.prepare_guest_descriptor_txn(id3, op);
+        let occupied = mgr.prepare_guest_descriptor_txn(id3, op, None);
         assert_eq!(
             occupied,
             Err(GuestTxnPrepareError::Refused(
@@ -11653,7 +11849,8 @@ mod tests {
                 descriptor_txn::DescriptorOp::Retire(descriptor_txn::PageSpan::new(
                     LINUX_MMAP_BASE,
                     PT_PAGE
-                ))
+                )),
+                None
             ),
             Err(GuestTxnPrepareError::NotGuestOwned)
         );
@@ -11739,9 +11936,7 @@ mod tests {
         for &(va, len, kernel_only, executable) in &ranges {
             let op = guest.fork_arm_op(va, len, kernel_only, executable, false);
             let plan = descriptor_txn::plan_descriptor_op(&live, SubstrateGpa(base), op).unwrap();
-            let grants: TableGrants = guest
-                .reserve_primary_table_grants(plan.table_grants)
-                .unwrap();
+            let grants: TableGrants = guest.reserve_table_grants(plan.table_grants, None).unwrap();
             let outcome = execute_descriptor_op(
                 &live,
                 SubstrateGpa(base),
@@ -12000,9 +12195,7 @@ mod tests {
         for &(va, len, rule) in &cases {
             let op = guest.terminal_op(va, len, rule);
             let plan = descriptor_txn::plan_descriptor_op(&live, SubstrateGpa(base), op).unwrap();
-            let grants: TableGrants = guest
-                .reserve_primary_table_grants(plan.table_grants)
-                .unwrap();
+            let grants: TableGrants = guest.reserve_table_grants(plan.table_grants, None).unwrap();
             let outcome = execute_descriptor_op(
                 &live,
                 SubstrateGpa(base),
@@ -12228,9 +12421,7 @@ mod tests {
                 },
                 root: SubstrateGpa(base),
                 op: DescriptorOp::Terminal { span, edit },
-                tables: guest
-                    .reserve_primary_table_grants(plan.table_grants)
-                    .unwrap(),
+                tables: guest.reserve_table_grants(plan.table_grants, None).unwrap(),
             };
             let receipt =
                 execute_descriptor_txn(&live, SubstrateGpa(base), &txn, &mut InlineJournal::new());
@@ -12323,7 +12514,7 @@ mod tests {
         };
         let before = live_arena_bytes(&resolver);
         let txn = mgr
-            .prepare_guest_descriptor_txn(id, mgr.unmap_aliased_op(g + TWO_MIB, PT_PAGE))
+            .prepare_guest_descriptor_txn(id, mgr.unmap_aliased_op(g + TWO_MIB, PT_PAGE), None)
             .expect("plan");
         assert_eq!(
             live_arena_bytes(&resolver),
@@ -12368,7 +12559,7 @@ mod tests {
         );
         assert_eq!(mgr.free_tables.len(), free_before + 1);
         // The next grant reissues the reclaimed page.
-        let grants = mgr.reserve_primary_table_grants(1).unwrap();
+        let grants = mgr.reserve_table_grants(1, None).unwrap();
         assert_eq!(grants.as_slice(), &[l3]);
     }
 

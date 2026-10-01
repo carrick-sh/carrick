@@ -54,9 +54,20 @@ impl std::ops::DerefMut for TrackedStage1Image {
     }
 }
 
+/// The backend venue that makes a newly grown extension arena usable by both
+/// venues before any descriptor names it: its stage-2 backing and owner
+/// (exactly what the host editor publishes after an edit that grew one).
+pub trait TableArenaPublisher: Send + Sync {
+    /// Publish every extension arena of `manager` the backend does not hold
+    /// yet. An error leaves the arenas unpublished.
+    fn publish_extension_arenas(&self, manager: &PageTableManager) -> Result<(), String>;
+}
+
 struct Stage1AuthorityInner {
     manager: TrackedStage1Image,
     arena_source: Option<Box<dyn TableArenaSource>>,
+    /// Publishes extension arenas a guest descriptor transaction grows into.
+    arena_publisher: Option<Arc<dyn TableArenaPublisher>>,
     host_resolver: Option<Arc<dyn HostArenaResolver + Send + Sync>>,
     vfork_shares: usize,
     engines: usize,
@@ -220,6 +231,7 @@ impl Stage1Authority {
                     generation: std::num::NonZeroU64::new(1),
                 },
                 arena_source: None,
+                arena_publisher: None,
                 host_resolver: None,
                 vfork_shares: 0,
                 engines: 1,
@@ -403,6 +415,12 @@ impl Stage1Authority {
         Ok(GuestLaneSelection::Selected)
     }
 
+    /// Install the backend publisher for extension arenas a guest descriptor
+    /// transaction grows into (see [`TableArenaPublisher`]).
+    pub fn set_arena_publisher(&self, publisher: Arc<dyn TableArenaPublisher>) {
+        self.inner.lock().arena_publisher = Some(publisher);
+    }
+
     /// The venue that owns this address space's live descriptor stores.
     pub fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
         self.inner.lock().live_owner
@@ -427,13 +445,39 @@ impl Stage1Authority {
             .and_then(std::num::NonZeroU64::new)
             .ok_or(GuestTxnPrepareError::Manager(PageTableError::BadAddress))?;
         let live_owner = inner.live_owner;
-        let manager = inner
+        let inner_ref = &mut *inner;
+        let manager = inner_ref
             .manager
             .as_mut()
             .ok_or(GuestTxnPrepareError::NotLive)?;
         manager.set_live_descriptor_owner(live_owner);
-        let txn =
-            manager.prepare_guest_descriptor_txn(DescriptorTxnId { mm_key, generation }, op)?;
+        // The guest lane grows into extension arenas exactly as the host
+        // editor does; EL1 reaches every arena through its table view.
+        let source: Option<&mut dyn TableArenaSource> = match inner_ref.arena_source.as_mut() {
+            Some(source) => Some(source.as_mut()),
+            None => None,
+        };
+        let arenas_before = manager.extension_arena_bases().len();
+        let txn = manager.prepare_guest_descriptor_txn(
+            DescriptorTxnId { mm_key, generation },
+            op,
+            source,
+        )?;
+        // A grant from a new arena is usable only once its backing and owner
+        // are published, before EL1 can touch it.
+        if manager.extension_arena_bases().len() != arenas_before {
+            let published = inner_ref
+                .arena_publisher
+                .as_ref()
+                .is_some_and(|publisher| publisher.publish_extension_arenas(manager).is_ok());
+            if !published {
+                let base = manager.extension_arena_bases().last().copied().unwrap_or(0);
+                let _ = manager.abandon_guest_descriptor_txn(&txn);
+                return Err(GuestTxnPrepareError::Manager(
+                    PageTableError::UnresolvedArena(base),
+                ));
+            }
+        }
         inner.txn_generation = generation.get();
         Ok(txn)
     }
@@ -1261,14 +1305,11 @@ impl<'a> Stage1Editor<'a> {
         self.manager.set_stage1_exclusive(exclusive);
     }
 
+    /// See [`crate::engine::reserve_hvpatch_process_apertures`].
     pub fn reserve_hvpatch_process_apertures(
         &mut self,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        self.set_prot_none(
-            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
-            (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
-                + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE) as usize,
-        )
+        crate::engine::reserve_hvpatch_process_apertures(self.manager)
     }
 
     /// Host-lane mprotect: apply [`protection_terminal_rules`] with the
