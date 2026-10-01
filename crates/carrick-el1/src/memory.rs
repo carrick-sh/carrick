@@ -387,17 +387,51 @@ pub const MAX_BACKED_RUNS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stage1Backing {
     pub summary: RangeBacking,
+    /// Why a `Foreign` summary is foreign (the leave EL1 counts).
+    pub foreign: ForeignBacking,
     runs: [(u64, u64); MAX_BACKED_RUNS],
     count: usize,
+}
+
+/// Which [`RangeBacking::Foreign`] a range is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignBacking {
+    /// A terminal the host owns: a page leaf without EL1 tags.
+    HostOwnedLeaf,
+    /// An L1/L2 block terminal.
+    Block,
+    /// More backed runs than one classification reports.
+    TooManyRuns,
+    /// A malformed terminal, a table outside the primary arena, or a range
+    /// that wraps.
+    Malformed,
+}
+
+impl ForeignBacking {
+    pub const fn leave(self) -> carrick_el1_abi::AnonymousLeave {
+        match self {
+            Self::HostOwnedLeaf => carrick_el1_abi::AnonymousLeave::BackingHostOwnedLeaf,
+            Self::Block => carrick_el1_abi::AnonymousLeave::BackingBlock,
+            Self::TooManyRuns => carrick_el1_abi::AnonymousLeave::BackingMultiRun,
+            Self::Malformed => carrick_el1_abi::AnonymousLeave::BackingMalformed,
+        }
+    }
 }
 
 impl Stage1Backing {
     pub const fn of(summary: RangeBacking) -> Self {
         Self {
             summary,
+            foreign: ForeignBacking::Malformed,
             runs: [(0, 0); MAX_BACKED_RUNS],
             count: 0,
         }
+    }
+    /// A `Foreign` range, for `why`.
+    pub const fn foreign(why: ForeignBacking) -> Self {
+        let mut backing = Self::of(RangeBacking::Foreign);
+        backing.foreign = why;
+        backing
     }
     /// `summary` over exactly these backed runs; `Foreign` if too many.
     pub fn with_runs(summary: RangeBacking, runs: &[(u64, u64)]) -> Self {
@@ -412,6 +446,7 @@ impl Stage1Backing {
             self.runs[self.count - 1].1 = end;
         } else if self.count == MAX_BACKED_RUNS {
             self.summary = RangeBacking::Foreign;
+            self.foreign = ForeignBacking::TooManyRuns;
         } else {
             self.runs[self.count] = (start, end);
             self.count += 1;
@@ -437,9 +472,9 @@ pub fn classify_stage1_range(
     const TABLE: u64 = 0b11;
     const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
     const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
-    let foreign = Stage1Backing::of(RangeBacking::Foreign);
+    let malformed = Stage1Backing::foreign(ForeignBacking::Malformed);
     let Some(end) = va.checked_add(len) else {
-        return foreign;
+        return malformed;
     };
     let mut backing = Stage1Backing::of(RangeBacking::Empty);
     let (mut private, mut resident) = (false, false);
@@ -450,7 +485,7 @@ pub fn classify_stage1_range(
         let mut level = 0;
         let descriptor = loop {
             let Some(descriptor) = read(table + index[level] as u64 * 8) else {
-                return foreign;
+                return malformed;
             };
             if level < 3 && descriptor & (VALID | TABLE) == VALID | TABLE {
                 table = descriptor & TABLE_PA;
@@ -471,13 +506,17 @@ pub fn classify_stage1_range(
                 El1PrivateLeafState::Retired => {
                     return Stage1Backing::of(RangeBacking::Retired);
                 }
-                El1PrivateLeafState::Unowned | El1PrivateLeafState::Malformed => {
-                    return foreign;
+                El1PrivateLeafState::Unowned if level < 3 => {
+                    return Stage1Backing::foreign(ForeignBacking::Block);
                 }
+                El1PrivateLeafState::Unowned => {
+                    return Stage1Backing::foreign(ForeignBacking::HostOwnedLeaf);
+                }
+                El1PrivateLeafState::Malformed => return malformed,
             }
             backing.push(cursor, next.min(end));
             if backing.summary == RangeBacking::Foreign {
-                return foreign;
+                return Stage1Backing::foreign(ForeignBacking::TooManyRuns);
             }
         }
         if next <= cursor {
@@ -608,26 +647,19 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     editor: &mut E,
 ) -> DelegatedAnonymous {
     let nr = frame.x[8];
-    if !matches!(nr, SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT) {
-        return DelegatedAnonymous::NotDelegated;
-    }
-    let mm_key = current.zone_mm.load(Ordering::Acquire);
-    let (Some(mm), Some(index)) = (
-        carrick_el1_abi::ReservationMm::new(mm_key),
-        spaces.find(mm_key),
-    ) else {
+    let Some((mm, index)) = delegated_anonymous_root(nr, current, spaces, table) else {
         return DelegatedAnonymous::NotDelegated;
     };
-    if !table.admitted(index.index(), mm) {
-        return DelegatedAnonymous::NotDelegated;
-    }
-    let forward = || {
+    let mm_key = mm.raw();
+    let forward = |why: carrick_el1_abi::AnonymousLeave| {
         counters.forwarded[nr as usize].fetch_add(1, Ordering::Relaxed);
+        counters.anonymous_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
         DelegatedAnonymous::Forward
     };
+    use carrick_el1_abi::AnonymousLeave as Leave;
     // Busy: the host venue holds the root; it serves the syscall itself.
-    let Ok(mut model) = table.lock(index.index(), mm) else {
-        return forward();
+    let Ok(mut model) = table.lock_el1(index.index(), mm, frame.slot as u32) else {
+        return forward(Leave::RootBusy);
     };
     let mut pending = match crate::personality::dispatch::dispatch_anonymous_with_reservations(
         frame, counters, current, &mut model,
@@ -635,40 +667,42 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         crate::personality::dispatch::AnonymousReservationRoute::Action(
             carrick_el1_abi::Action::Served,
         ) => return DelegatedAnonymous::Served,
-        // Counted by the route.
+        // `forwarded[nr]` counted by the route.
         crate::personality::dispatch::AnonymousReservationRoute::Action(_) => {
+            counters.anonymous_leaves[Leave::RootDeclined as usize].fetch_add(1, Ordering::Relaxed);
             return DelegatedAnonymous::Forward;
         }
         crate::personality::dispatch::AnonymousReservationRoute::Unavailable(_) => {
-            return forward();
+            return forward(Leave::RootUnavailable);
         }
         crate::personality::dispatch::AnonymousReservationRoute::Work(pending) => pending,
     };
     let request = pending.request();
     let refuse = |pending: PendingReservationSyscall,
-                  model: &mut reservations::Reservations<'_>| {
+                  model: &mut reservations::Reservations<'_>,
+                  why: Leave| {
         // The proposal is this guard's own; refusing it cannot be stale.
         let _ = pending.cancel(model);
-        forward()
+        forward(why)
     };
     let (Some(grant), Some(owner)) = (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
     else {
-        return refuse(pending, &mut model);
+        return refuse(pending, &mut model, Leave::NoGrant);
     };
     let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
-        return refuse(pending, &mut model);
+        return refuse(pending, &mut model, Leave::EditorBusy);
     };
     let (va, len) = (request.range.start(), request.range.len());
-    let backing = match request.operation {
-        carrick_el1_abi::ReservationOperation::Move => Stage1Backing::of(RangeBacking::Foreign),
-        _ => editor.backing(grant.ttbr0, va, len),
-    };
+    if request.operation == carrick_el1_abi::ReservationOperation::Move {
+        return refuse(pending, &mut model, Leave::RootDeclined);
+    }
+    let backing = editor.backing(grant.ttbr0, va, len);
     // One editor call is one all-or-nothing step: a range whose backing is
     // split into several runs by holes goes to the host.
     let run = match backing.runs() {
         [] => None,
         [(start, end)] => Some((*start, *end - *start)),
-        _ => return refuse(pending, &mut model),
+        _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
     use carrick_el1_abi::ReservationOperation::{Prepare, Protect, Retire};
     // A fresh mapping into a root hole over this MM's first-touch stock
@@ -691,8 +725,11 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
                 && nodes == 0
         };
     let owed_return = match (request.operation, backing.summary, run) {
-        (_, RangeBacking::Foreign | RangeBacking::Retired, _) => {
-            return refuse(pending, &mut model);
+        (_, RangeBacking::Foreign, _) => {
+            return refuse(pending, &mut model, backing.foreign.leave());
+        }
+        (_, RangeBacking::Retired, _) => {
+            return refuse(pending, &mut model, Leave::BackingRetired);
         }
         (_, RangeBacking::Empty, _) | (_, _, None) => None,
         // The permission editor is the descriptor step of an mprotect and
@@ -713,7 +750,7 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
                 Err(GuestPermissionEditError::RollbackFailed) => {
                     panic!("EL1 anonymous permission rollback failed")
                 }
-                Err(_) => return refuse(pending, &mut model),
+                Err(_) => return refuse(pending, &mut model, Leave::EditRefused),
             }
         }
         (
@@ -725,7 +762,7 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
             // must not fail for lack of room. The whole range is owed; its
             // pages without a terminal have nothing to return.
             let Ok(slot) = model.reserve_return(request.range) else {
-                return refuse(pending, &mut model);
+                return refuse(pending, &mut model, Leave::JournalFull);
             };
             match editor.retire_and_invalidate(grant.ttbr0, start, run_len) {
                 Ok(()) => {
@@ -739,11 +776,11 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
                 }
                 Err(_) => {
                     model.release_return(slot);
-                    return refuse(pending, &mut model);
+                    return refuse(pending, &mut model, Leave::EditRefused);
                 }
             }
         }
-        _ => return refuse(pending, &mut model),
+        _ => return refuse(pending, &mut model, Leave::RootDeclined),
     };
     // SAFETY: this guard holds the exact MM's root with `request` pending and
     // its exact descriptor editor. Every descriptor edit and its ASID
@@ -781,8 +818,29 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         Err(refusal) if retired => {
             panic!("EL1 anonymous retirement commit refused: {refusal:?}")
         }
-        Err(_) => refuse(pending, &mut model),
+        Err(_) => refuse(pending, &mut model, Leave::RootUnavailable),
     }
+}
+
+/// The admitted root that owns syscall `nr` when it is a delegated MM's
+/// anonymous `brk`/`mmap`/`munmap`/`mprotect` (`None`: the MM keeps the
+/// paths it had before admission).
+pub fn delegated_anonymous_root(
+    nr: u64,
+    current: &CurrentTask,
+    spaces: &AddressSpaces,
+    table: &reservations::SharedReservations,
+) -> Option<(
+    carrick_el1_abi::ReservationMm,
+    carrick_sched_core::spaces::SpaceIndex,
+)> {
+    if !matches!(nr, SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT) {
+        return None;
+    }
+    let mm_key = current.zone_mm.load(Ordering::Acquire);
+    let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+    let index = spaces.find(mm_key)?;
+    table.admitted(index.index(), mm).then_some((mm, index))
 }
 
 /// Try to retire a complete resident private-anonymous `munmap(2)` range in
@@ -1907,6 +1965,36 @@ mod tests {
             assert_eq!(
                 classify(&words, va + (1 << 21), 0x1000),
                 RangeBacking::Foreign
+            );
+            // Each foreign range names its cause (the leave EL1 counts).
+            let cause = |words: &Vec<u64>, va: u64, len: u64| {
+                let read = |pa: u64| {
+                    let offset = pa.checked_sub(root)?;
+                    words.get((offset / 8) as usize).copied()
+                };
+                let backing = classify_stage1_range(&read, root, va, len);
+                assert_eq!(backing.summary, RangeBacking::Foreign);
+                backing.foreign
+            };
+            assert_eq!(
+                cause(&words, va + 0x3000, 0x1000),
+                ForeignBacking::HostOwnedLeaf
+            );
+            assert_eq!(
+                cause(&words, va + (1 << 21), 0x1000),
+                ForeignBacking::Malformed
+            );
+            // An L2 block without EL1 tags.
+            words[1024 + 2] = 0x9040_0000 | VALID;
+            assert_eq!(cause(&words, va + (2 << 21), 0x1000), ForeignBacking::Block);
+            // Nine private runs separated by holes: more than one step takes.
+            for page in 0..9 {
+                words[leaf(16 + 2 * page)] =
+                    (0x9001_0000 + page as u64 * 0x2000) | PRIVATE | VALID | TABLE;
+            }
+            assert_eq!(
+                cause(&words, va + 0x10000, 0x12000),
+                ForeignBacking::TooManyRuns
             );
         }
     }

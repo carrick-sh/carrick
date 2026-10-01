@@ -110,6 +110,7 @@ pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
 fn root_admits_commit(
     roots: Option<&crate::memory::reservations::SharedReservations>,
     spaces: &AddressSpaces,
+    slot: u32,
     mm_key: u64,
     page: u64,
     access: LeafAccess,
@@ -120,7 +121,7 @@ fn root_admits_commit(
     if !roots.admitted(index, mm) {
         return None;
     }
-    let Ok(mut model) = roots.lock(index, mm) else {
+    let Ok(mut model) = roots.lock_el1(index, mm, slot) else {
         return Some(false);
     };
     let bits = match access {
@@ -888,6 +889,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         if root_admits_commit(
             prepared.as_ref().and_then(|path| path.roots),
             spaces,
+            frame.slot as u32,
             mm_key,
             frame.far & !4095,
             prepared_access,
