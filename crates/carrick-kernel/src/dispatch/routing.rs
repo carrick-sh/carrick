@@ -208,6 +208,24 @@ impl SyscallDispatcher {
         mut ctx: MutationSyscallCtx<'_, 'authority, 'lease, M>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_mutation_handler(ctx.request.number.raw())?;
+        // A delegated MM's host mapping syscall first reconciles the returns
+        // its EL1 root owes, so no host step plans over retired memory.
+        let permit = ctx.mm_mutation.host_alias_permit();
+        let reconciled = self
+            .mem_view()
+            .reconcile_el1_deferred_returns(&permit, ctx.memory);
+        drop(permit);
+        match reconciled {
+            Ok(_) => {}
+            Err(mem::el1_reservations::El1ReturnError::Authority(refusal)) => {
+                return Some(Err(DispatchError::ReservationAuthority(refusal)));
+            }
+            // The backend could not retire the extents (they stay owed):
+            // the same answer a failed `munmap` backend retirement gives.
+            Err(mem::el1_reservations::El1ReturnError::Backend { .. }) => {
+                return Some(Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOMEM)));
+            }
+        }
         if let Some(errno) = self.secure_host_venue_metadata(&ctx.request) {
             return Some(errno.map(DispatchOutcome::errno));
         }

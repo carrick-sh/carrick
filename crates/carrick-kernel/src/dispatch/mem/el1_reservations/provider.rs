@@ -160,6 +160,12 @@ impl DispatchMmAuthority {
         self.reservation_provider.lock().published = true;
     }
 
+    /// Whether this MM's address space was published (its provider sealed):
+    /// an MM that never published never ran guest code under EL1.
+    pub(in crate::dispatch) fn reservation_provider_published(&self) -> bool {
+        self.reservation_provider.lock().published
+    }
+
     pub(in crate::dispatch) fn has_reservation_provider(&self) -> bool {
         self.reservation_provider.lock().provider.is_some()
     }

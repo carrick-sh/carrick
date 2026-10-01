@@ -2746,3 +2746,313 @@ fn delegated_fork_commit_refuses_a_parent_that_moved_on() {
     assert!(child.mem().lock().host_arena().is_some());
     assert!(!child_root.lock().is_admitted());
 }
+
+// S3 T4b: returns guest EL1 deferred are reconciled by the host venue in one
+// transaction and acknowledged; a fork commit derives the child's authority
+// and admits its root.
+
+impl Root {
+    /// What guest EL1 does for `munmap` of RESIDENT anonymous memory: retire
+    /// its stage-1 terminals in place and journal the range as a return the
+    /// host owes (`complete_deferring_return`), frames still in inventory.
+    fn guest_munmap_resident(&self, start: u64, len: u64) {
+        let mut root = self.lock();
+        let range = ReservationRange::new(start, start + len).unwrap();
+        let Decision::Work(request) = root.munmap(range).unwrap() else {
+            panic!("a resident munmap carries work");
+        };
+        let slot = root.reserve_return(range).unwrap();
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete_deferring_return(completion, slot).unwrap();
+    }
+
+    /// The extents this root owes the host.
+    fn owed(&self) -> Vec<(u64, u64)> {
+        let mut owed = Vec::new();
+        self.lock().observe_deferred_returns(&mut |entry| {
+            owed.push((entry.range.start(), entry.range.end()));
+        });
+        owed
+    }
+}
+
+/// `dispatcher`'s reconciliation at a host boundary, under its own permit.
+fn reconcile(
+    dispatcher: &SyscallDispatcher,
+    memory: &mut CountingMmapMemory,
+) -> Result<usize, crate::dispatch::mem::el1_reservations::El1ReturnError> {
+    crate::dispatch::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| dispatcher.reconcile_el1_deferred_returns(permit, memory),
+    )
+}
+
+#[test]
+fn delegated_el1_resident_munmap_reconciles_at_the_next_host_boundary() {
+    let (dispatcher, mut memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let first = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    let second = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    // Two EL1-served resident munmaps: both owed, VA not placeable again.
+    root.guest_munmap_resident(first, 2 * PAGE);
+    root.guest_munmap_resident(second + PAGE, PAGE);
+    let owed = root.owed();
+    assert_eq!(owed.len(), 2, "{owed:x?}");
+    assert!(dispatcher.el1_returns_owed());
+    assert_eq!(
+        root.guest_mmap(
+            Placement::Fixed(first),
+            PAGE,
+            ReservationProtection::READ_WRITE
+        ),
+        Err(Refusal::Busy)
+    );
+
+    // The next host boundary: ONE transaction retires every owed extent
+    // through the backend (its frames return), then acknowledges.
+    memory.unmap_log.borrow_mut().clear();
+    assert_eq!(reconcile(&dispatcher, &mut memory).unwrap(), 2);
+    let mut retired = memory.unmap_log.borrow().clone();
+    retired.sort_unstable();
+    let mut expected: Vec<(u64, usize)> = owed
+        .iter()
+        .map(|&(start, end)| (start, (end - start) as usize))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(retired, expected, "each owed extent retired exactly once");
+    assert!(root.owed().is_empty());
+    assert!(!dispatcher.el1_returns_owed());
+    // Acknowledged: the VAs are placeable again, by either venue.
+    assert_eq!(
+        root.guest_mmap(
+            Placement::Fixed(first),
+            PAGE,
+            ReservationProtection::READ_WRITE
+        ),
+        Ok(first)
+    );
+    // Idempotent: nothing is owed, nothing retires again.
+    memory.unmap_log.borrow_mut().clear();
+    assert_eq!(reconcile(&dispatcher, &mut memory).unwrap(), 0);
+    assert!(memory.unmap_log.borrow().is_empty());
+}
+
+#[test]
+fn delegated_failed_return_reconciliation_acknowledges_nothing() {
+    let (dispatcher, mut memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let first = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    root.guest_munmap_resident(first, 2 * PAGE);
+    memory.set_fail_unmap_at(Some(first));
+    assert!(matches!(
+        reconcile(&dispatcher, &mut memory),
+        Err(crate::dispatch::mem::el1_reservations::El1ReturnError::Backend { .. })
+    ));
+    // Still owed: the frames stay unreusable until a retirement succeeds.
+    assert_eq!(root.owed(), vec![(first, first + 2 * PAGE)]);
+    memory.set_fail_unmap_at(None);
+    assert_eq!(reconcile(&dispatcher, &mut memory).unwrap(), 1);
+    assert!(root.owed().is_empty());
+}
+
+#[test]
+fn delegated_host_mmap_over_an_owed_range_reconciles_first() {
+    let (mut dispatcher, mut memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let first = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    root.guest_munmap_resident(first, 2 * PAGE);
+    // A host MAP_FIXED over the owed range: the host venue reconciles the
+    // owed return before it plans, so the Prepare lands on settled memory.
+    memory.unmap_log.borrow_mut().clear();
+    assert_eq!(
+        returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            first,
+            PAGE,
+            RW,
+            ANON | LINUX_MAP_FIXED,
+            -1,
+        )) as u64,
+        first
+    );
+    assert!(root.owed().is_empty());
+    assert_eq!(
+        memory.unmap_log.borrow().first().copied(),
+        Some((first, (2 * PAGE) as usize))
+    );
+    assert!(root.lock().mapping(first).is_some_and(|m| m.anonymous));
+}
+
+#[test]
+fn delegated_final_settlement_drains_owed_returns() {
+    let (dispatcher, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let first = root
+        .guest_mmap(
+            Placement::Anywhere,
+            4 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    root.guest_munmap_resident(first, 2 * PAGE);
+    root.guest_munmap_resident(first + 3 * PAGE, PAGE);
+    assert_eq!(root.owed().len(), 2);
+    // Final-MM settlement (`mm_occupancy::retire_reservation_root`): owed
+    // returns never make the root Busy; every extent is released with it.
+    assert_eq!(
+        crate::dispatch::mem::el1_reservations::settle_final_root(root.lock()),
+        Ok(2)
+    );
+    let slot = root.carrier.slot(root.mm).unwrap();
+    // The root is gone and its journal slots are free for another MM.
+    assert_eq!(
+        root.carrier.table.lock(slot, root.mm).err(),
+        Some(Refusal::Stale)
+    );
+    let other = SyscallDispatcher::new();
+    let other_root = Root {
+        carrier: root.carrier.clone(),
+        mm: root.carrier.publish(&other),
+    };
+    let model = other_root.lock();
+    let mut owed = 0;
+    model.observe_deferred_returns(&mut |_| owed += 1);
+    assert_eq!(owed, 0);
+}
+
+/// The parent's fork transaction over `child`, as `commit_parent` holds it.
+fn with_fork_commit<T>(
+    parent: &SyscallDispatcher,
+    child: &SyscallDispatcher,
+    step: impl FnOnce(
+        Result<
+            crate::dispatch::mm_mutation::ForkCommit<'_>,
+            crate::dispatch::mm_mutation::ForkCommitRefusal,
+        >,
+    ) -> T,
+) -> T {
+    crate::dispatch::mm_mutation::test_support::with_guard(
+        parent.mm_mutation_coordinator(),
+        |guard| {
+            let topology = guard.begin_transaction();
+            step(guard.fork_commit(&topology, child))
+        },
+    )
+}
+
+#[test]
+fn fork_commit_admits_the_published_child_root() {
+    let (parent, mut memory, a) = populated_host_setup_mm();
+    let root = Root::admit(&parent);
+    let guest = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    // An owed return before the fork: the fork boundary reconciles first,
+    // so the child is seeded from settled memory.
+    root.guest_munmap_resident(guest, PAGE);
+    assert_eq!(reconcile(&parent, &mut memory).unwrap(), 1);
+    let child = fork_child(&parent);
+    let admitted = with_fork_commit(&parent, &child, |commit| {
+        let commit = commit.expect("a fork commit over the parent's own twin");
+        assert_eq!(commit.child_mm(), child.mm_authority().mm_id);
+        // The carrier publishes the child's root (production:
+        // `publish_child_address_space` from its `Stage1MmLease`).
+        let child_root = root.publish_child(&child);
+        (commit.admit_child_root(&parent), child_root)
+    });
+    let (admission, child_root) = admitted;
+    assert_eq!(admission, Ok(El1Admission::Delegated));
+    assert!(child.mem().lock().delegated_root().is_some());
+    assert!(child_root.lock().mapping(a).is_some());
+    assert!(child_root.lock().mapping(guest + PAGE).is_some());
+    assert!(child_root.lock().mapping(guest).is_none());
+}
+
+#[test]
+fn fork_commit_cannot_be_forged_outside_a_fork() {
+    let (parent, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&parent);
+    let child = fork_child(&parent);
+    // The parent itself is no child.
+    with_fork_commit(&parent, &parent, |commit| {
+        assert_eq!(
+            commit.err(),
+            Some(crate::dispatch::mm_mutation::ForkCommitRefusal::SharedMm)
+        );
+    });
+    // A transaction another MM's guard minted names no fork of this parent.
+    let (stranger, _, _) = populated_host_setup_mm();
+    crate::dispatch::mm_mutation::test_support::with_guard(
+        parent.mm_mutation_coordinator(),
+        |guard| {
+            crate::dispatch::mm_mutation::test_support::with_guard(
+                stranger.mm_mutation_coordinator(),
+                |other| {
+                    let foreign = other.begin_transaction();
+                    assert_eq!(
+                        guard.fork_commit(&foreign, &child).err(),
+                        Some(crate::dispatch::mm_mutation::ForkCommitRefusal::ForeignTransaction)
+                    );
+                },
+            );
+        },
+    );
+    // Another parent's fork twin is not this parent's child.
+    let stranger_root = Root::admit(&stranger);
+    let strangers_child = fork_child(&stranger);
+    with_fork_commit(&parent, &strangers_child, |commit| {
+        assert_eq!(
+            commit.err(),
+            Some(crate::dispatch::mm_mutation::ForkCommitRefusal::NotThisParentsChild)
+        );
+    });
+    drop(stranger_root);
+    // An MM that published its address space may have run: no commit.
+    child.mm_authority().seal_reservation_provider();
+    with_fork_commit(&parent, &child, |commit| {
+        assert_eq!(
+            commit.err(),
+            Some(crate::dispatch::mm_mutation::ForkCommitRefusal::ChildPublished)
+        );
+    });
+    drop(root);
+}
