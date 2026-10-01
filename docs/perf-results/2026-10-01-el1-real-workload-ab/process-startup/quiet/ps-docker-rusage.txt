@@ -1,0 +1,4 @@
+RUSAGE true n=20 wall_p50_ms=0.5 wall_min_ms=0.5 user_ms=0.3 sys_ms=0.2 faults=504 ctxsw=1 nproc=10
+RUSAGE python_pass n=20 wall_p50_ms=5.3 wall_min_ms=5.1 user_ms=4.3 sys_ms=0.9 faults=1402 ctxsw=1 nproc=10
+RUSAGE node_e0 n=20 wall_p50_ms=10.1 wall_min_ms=9.4 user_ms=7.4 sys_ms=3.3 faults=3409 ctxsw=20 nproc=10
+RUSAGE testpy_import n=20 wall_p50_ms=28.2 wall_min_ms=27.5 user_ms=24.1 sys_ms=3.8 faults=3886 ctxsw=1 nproc=10

@@ -1,0 +1,11 @@
+nproc=10
+true lanes=1 per_process_ms=0.4
+python_pass lanes=1 per_process_ms=5.0
+node_e0 lanes=1 per_process_ms=10.3
+true lanes=4 per_process_ms=0.4
+python_pass lanes=4 per_process_ms=5.5
+node_e0 lanes=4 per_process_ms=11.8
+true lanes=10 per_process_ms=0.6
+python_pass lanes=10 per_process_ms=8.6
+node_e0 lanes=10 per_process_ms=19.9
+testpy_import lanes=1 per_process_ms=27.9
