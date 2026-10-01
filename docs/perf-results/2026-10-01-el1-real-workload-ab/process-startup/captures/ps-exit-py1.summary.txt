@@ -1,0 +1,28 @@
+[2m2026-10-01T12:04:15.722560Z[0m [33m WARN[0m [2mcarrick::commands[0m[2m:[0m carrick trace: not root; re-executing under sudo
+LOOP lanes=1 N=20 per_process_ms=54.4
+HVPatch exit attribution (instrumented run; counts citable, times inflated): exits=11359 forwarded_syscalls=7858 guest_oncpu_ms=282.5 (39.3%) host_oncpu_ms=436.6 (60.7%)
+  bucket fault      exits=      1918 ( 16.9%) host_oncpu_ms=      57.7
+  bucket kick-idle  exits=       155 (  1.4%) host_oncpu_ms=       4.7
+  bucket other      exits=      1450 ( 12.8%) host_oncpu_ms=      71.1
+  bucket syscall    exits=      7836 ( 69.0%) host_oncpu_ms=     303.1
+    class canceled     exits=        78 host_oncpu_ms=       0.7
+    class idle         exits=        77 host_oncpu_ms=       3.9
+    class maintenance  exits=      1428 host_oncpu_ms=      71.0
+    class syscall      exits=      9776 host_oncpu_ms=     303.1
+    hvc#2 not-svc ec=0x18    exits=        22 host_oncpu_ms=       0.1
+    hvc#2 not-svc ec=0x24    exits=      1918 host_oncpu_ms=      57.7
+  forwarded nr=134  rt_sigaction         count=      1599 wall_ms=       4.3 oncpu_ms=       3.7
+  forwarded nr=79   newfstatat           count=      1352 wall_ms=       8.7 oncpu_ms=       7.4
+  forwarded nr=56   openat               count=       696 wall_ms=      34.6 oncpu_ms=      31.2
+  forwarded nr=80   fstat                count=       687 wall_ms=       7.1 oncpu_ms=       6.6
+  forwarded nr=222  mmap                 count=       549 wall_ms=      66.0 oncpu_ms=      53.3
+  forwarded nr=57   close                count=       517 wall_ms=       6.2 oncpu_ms=       4.4
+  forwarded nr=135  rt_sigprocmask       count=       396 wall_ms=       2.1 oncpu_ms=       2.0
+  forwarded nr=61   getdents64           count=       336 wall_ms=      16.9 oncpu_ms=      16.5
+  forwarded nr=29   ioctl                count=       242 wall_ms=       0.8 oncpu_ms=       0.4
+  forwarded nr=215  munmap               count=       216 wall_ms=      18.2 oncpu_ms=      16.2
+  forwarded nr=226  mprotect             count=       216 wall_ms=       9.4 oncpu_ms=       4.9
+  forwarded nr=214  brk                  count=       188 wall_ms=      20.8 oncpu_ms=      14.5
+  forwarded nr=25   fcntl                count=       107 wall_ms=       6.1 oncpu_ms=       5.3
+  forwarded nr=62   lseek                count=       107 wall_ms=       0.5 oncpu_ms=       0.1
+  forwarded nr=63   read                 count=        69 wall_ms=       1.7 oncpu_ms=       1.0

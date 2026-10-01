@@ -1,0 +1,29 @@
+[2m2026-10-01T12:03:57.580493Z[0m [33m WARN[0m [2mcarrick::commands[0m[2m:[0m carrick trace: not root; re-executing under sudo
+LOOP lanes=1 N=20 per_process_ms=184.1
+HVPatch exit attribution (instrumented run; counts citable, times inflated): exits=28355 forwarded_syscalls=12592 guest_oncpu_ms=613.6 (36.8%) host_oncpu_ms=1055.7 (63.2%)
+  bucket fault      exits=     11165 ( 39.4%) host_oncpu_ms=     157.1
+  bucket kick-idle  exits=      1069 (  3.8%) host_oncpu_ms=      33.2
+  bucket other      exits=      3401 ( 12.0%) host_oncpu_ms=     186.3
+  bucket syscall    exits=     12720 ( 44.9%) host_oncpu_ms=     679.1
+    class canceled     exits=       422 host_oncpu_ms=       3.4
+    class idle         exits=       627 host_oncpu_ms=      29.4
+    class kick         exits=        20 host_oncpu_ms=       0.4
+    class maintenance  exits=      3339 host_oncpu_ms=     186.1
+    class syscall      exits=     23947 host_oncpu_ms=     679.1
+    hvc#2 not-svc ec=0x18    exits=        62 host_oncpu_ms=       0.2
+    hvc#2 not-svc ec=0x24    exits=     11165 host_oncpu_ms=     157.1
+  forwarded nr=215  munmap               count=      1576 wall_ms=     140.6 oncpu_ms=     121.9
+  forwarded nr=134  rt_sigaction         count=      1539 wall_ms=      24.4 oncpu_ms=       5.3
+  forwarded nr=222  mmap                 count=      1347 wall_ms=     140.2 oncpu_ms=     118.0
+  forwarded nr=135  rt_sigprocmask       count=       996 wall_ms=      15.9 oncpu_ms=       8.9
+  forwarded nr=233  madvise              count=       719 wall_ms=      77.0 oncpu_ms=      36.8
+  forwarded nr=25   fcntl                count=       547 wall_ms=       2.3 oncpu_ms=       1.5
+  forwarded nr=226  mprotect             count=       535 wall_ms=      97.8 oncpu_ms=      79.7
+  forwarded nr=57   close                count=       463 wall_ms=       7.7 oncpu_ms=       6.5
+  forwarded nr=80   fstat                count=       447 wall_ms=       4.0 oncpu_ms=       3.2
+  forwarded nr=214  brk                  count=       366 wall_ms=      18.8 oncpu_ms=      12.8
+  forwarded nr=56   openat               count=       342 wall_ms=      29.3 oncpu_ms=      29.1
+  forwarded nr=174  getuid               count=       304 wall_ms=       1.1 oncpu_ms=       0.3
+  forwarded nr=175  geteuid              count=       304 wall_ms=       0.3 oncpu_ms=       0.2
+  forwarded nr=176  getgid               count=       304 wall_ms=       0.7 oncpu_ms=       0.3
+  forwarded nr=177  getegid              count=       304 wall_ms=       0.7 oncpu_ms=       0.3
