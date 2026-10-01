@@ -274,12 +274,10 @@ fn wait_result<P: CarrierProcess + ?Sized>(
                     "zombie namespace_pid exceeds i32 in wait_result"
                 );
             };
-            WaitResult::Exited(ChildExit::new(
-                zombie.key.id,
-                visible_pid,
-                zombie.ruid,
-                zombie.status.raw(),
-            ))
+            WaitResult::Exited(
+                ChildExit::new(zombie.key.id, visible_pid, zombie.ruid, zombie.status.raw())
+                    .with_rusage(zombie.total_charge_to_reaper()),
+            )
         }
         // A P_PIDFD wait runs in Consume mode too, so reporting a
         // job-control event as "still running" DISCARDS it. Render the

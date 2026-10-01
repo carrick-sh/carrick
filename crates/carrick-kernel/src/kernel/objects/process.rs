@@ -498,8 +498,8 @@ pub struct Zombie {
     pub euid: NsUid,
     pub rusage: TaskRusage,
     /// What this task had itself accumulated from reaping its own children.
-    /// Kept separate from `rusage` so `wait4` can report the child's own CPU
-    /// while the reaper still charges the whole subtree to its children ledger.
+    /// Kept separate for own-process diagnostics. Consuming waits return and
+    /// charge the combined subtree total.
     pub children_rusage: TaskRusage,
     /// Which `wait(2)` class this zombie belongs to (`__WCLONE`/`__WALL`).
     pub exit_signal: ChildExitSignal,
@@ -509,8 +509,7 @@ pub struct Zombie {
 impl Zombie {
     /// Capture the exiting task's two CPU ledgers at the moment it becomes a
     /// zombie. Both are read from the kernel's own accounting: `rusage` is the
-    /// child's own CPU, which `wait4` reports through its `rusage` argument,
-    /// and `children_rusage` is what the child had already accumulated from
+    /// child's own CPU, and `children_rusage` is what it had accumulated from
     /// reaping its own children. Linux charges a reaper BOTH, which is how
     /// `tms_cutime` totals a whole process subtree.
     pub fn from_task(

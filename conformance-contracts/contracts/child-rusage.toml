@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.wait.child-rusage"
+title = "Consuming child waits preserve subtree CPU usage"
+guest_surfaces = ["syscall:wait4", "syscall:getrusage", "syscall:times"]
+semantic_authority = ["man 2 wait4", "man 2 getrusage"]
+fixture = "unit:wait4_preserves_subtree_usage_and_charges_children_once"
+scale_points = [1]
+structural_budgets = []
+rationale = "The exact-generation zombie is the single reap authority. A consuming wait adds its own process CPU, including threads, plus already-reaped descendants to the parent once. The returned receipt carries that same total. Observing a zombie and repeating a consumed wait never charge the parent. Rendering two timevals adds constant work and no population scan. The VM-free binding asserts exact CPU totals and exactly-once charge directly."
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::proc::kernel_process_dispatch_tests::wait4_preserves_subtree_usage_and_charges_children_once"
+embed = "carrick-conformance-next::generic_probe_shard_1 filtered to childrusage, arm64 gnu and musl"
+
+[bindings.unresolved]
+docker = "Predicted all-true CPU oracle awaits director blessing on native arm64 Docker."
+observation = "No WorkObservation metric is registered for child-CPU ledger additions; the deterministic test checks exact totals and no second charge."
+faults_and_switches = "Director restricted this slice to CPU. Per-task minor-fault and context-switch accounting requires execution-boundary ledgers in both EL1 and host paths."

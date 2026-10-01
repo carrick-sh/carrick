@@ -29,6 +29,7 @@ pub struct ChildExit {
     ruid: carrick_abi::NsUid,
     status: i32,
     stop_kind: Option<StopKind>,
+    rusage: crate::kernel::TaskRusage,
 }
 
 impl ChildExit {
@@ -47,7 +48,22 @@ impl ChildExit {
             ruid,
             status,
             stop_kind: None,
+            rusage: crate::kernel::TaskRusage {
+                user_time: std::time::Duration::ZERO,
+                system_time: std::time::Duration::ZERO,
+            },
         }
+    }
+
+    /// Preserve the total captured by the exact-generation zombie, including
+    /// usage the child had accumulated from its own reaped children.
+    pub(crate) const fn with_rusage(mut self, rusage: crate::kernel::TaskRusage) -> Self {
+        self.rusage = rusage;
+        self
+    }
+
+    pub const fn rusage(self) -> crate::kernel::TaskRusage {
+        self.rusage
     }
 
     /// Record one stopped child transition, deriving the encoded Linux stop
@@ -66,6 +82,10 @@ impl ChildExit {
             ruid,
             status: (signal.raw() << 8) | 0x7f,
             stop_kind: Some(kind),
+            rusage: crate::kernel::TaskRusage {
+                user_time: std::time::Duration::ZERO,
+                system_time: std::time::Duration::ZERO,
+            },
         }
     }
 

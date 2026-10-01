@@ -1380,7 +1380,12 @@ fn task_children_cpu_us() -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
-fn rusage_from(user_us: u64, system_us: u64, maxrss_bytes: u64, majflt: u64) -> LinuxRusage {
+pub(super) fn rusage_from(
+    user_us: u64,
+    system_us: u64,
+    maxrss_bytes: u64,
+    majflt: u64,
+) -> LinuxRusage {
     let timeval = |us: u64| crate::linux_abi::LinuxTimeval {
         tv_sec: (us / 1_000_000) as i64,
         tv_usec: (us % 1_000_000) as i64,
