@@ -950,6 +950,18 @@ where
                     driver_error: None,
                 })?;
         let configured_workers = bound_workers + spare_workers;
+        // The scheduler's one preemption driver is claimed before anything
+        // else is published or spawned. A refusal then leaves no worker to
+        // roll back: a worker that had already received `Run` parks in the
+        // run queue, where a `Stop` command does not reach it. Every later
+        // failure drops `driver`, which detaches it again.
+        let driver = super::preemption::PreemptionDriver::start(Arc::clone(&scheduler)).map_err(
+            |error| ExecutorPoolStartError {
+                configured_workers,
+                message: format!("preemption driver start failed: {error}"),
+                driver_error: Some(error),
+            },
+        )?;
         resolver
             .install_scheduler(&scheduler)
             .map_err(|error| ExecutorPoolStartError {
@@ -982,7 +994,7 @@ where
             // assigns them round-robin); the rest are spares that park.
             let is_spare = index >= bound_workers;
             let (command_tx, command_rx) = mpsc::channel();
-            let scheduler = Arc::clone(&scheduler);
+            let scheduler_for_worker = Arc::clone(&scheduler);
             let factory = Arc::clone(&factory);
             let resolver = Arc::clone(&resolver);
             let receipts_for_worker = Arc::clone(&receipts);
@@ -993,7 +1005,7 @@ where
                 .spawn(move || {
                     executor_worker(
                         WorkerSlot { index, is_spare },
-                        scheduler,
+                        scheduler_for_worker,
                         factory,
                         resolver,
                         receipts_for_worker,
@@ -1006,7 +1018,7 @@ where
                 }) {
                 Ok(join) => join,
                 Err(error) => {
-                    let cleanup_failures = stop_and_join_startup(&control, handles);
+                    let cleanup_failures = stop_and_join_startup(&scheduler, &control, handles);
                     let mut message = format!("worker {index} spawn failed: {error}");
                     append_failures(&mut message, cleanup_failures);
                     return Err(ExecutorPoolStartError {
@@ -1057,7 +1069,10 @@ where
         }
 
         if let Some(mut message) = startup_failure {
-            append_failures(&mut message, stop_and_join_startup(&control, handles));
+            append_failures(
+                &mut message,
+                stop_and_join_startup(&scheduler, &control, handles),
+            );
             return Err(ExecutorPoolStartError {
                 configured_workers,
                 message,
@@ -1068,7 +1083,10 @@ where
         for handle in &handles {
             if handle.command.send(WorkerCommand::Run).is_err() {
                 let mut message = "worker stopped before pool publication".to_owned();
-                append_failures(&mut message, stop_and_join_startup(&control, handles));
+                append_failures(
+                    &mut message,
+                    stop_and_join_startup(&scheduler, &control, handles),
+                );
                 return Err(ExecutorPoolStartError {
                     configured_workers,
                     message,
@@ -1081,19 +1099,6 @@ where
             .install_discard_recorder(Arc::clone(&receipts)
                 as Arc<dyn carrick_kernel::kernel::scheduler::DiscardRecorder>);
         let debug_aux_registration = debug_aux_publication.commit();
-
-        let driver = match super::preemption::PreemptionDriver::start(Arc::clone(&scheduler)) {
-            Ok(driver) => driver,
-            Err(error) => {
-                let mut message = format!("preemption driver start failed: {error}");
-                append_failures(&mut message, stop_and_join_startup(&control, handles));
-                return Err(ExecutorPoolStartError {
-                    configured_workers,
-                    message,
-                    driver_error: Some(error),
-                });
-            }
-        };
 
         Ok(Self {
             scheduler,
@@ -1208,11 +1213,21 @@ where
     }
 }
 
-fn stop_and_join_startup(control: &PoolControl, handles: Vec<WorkerHandle>) -> Vec<String> {
+fn stop_and_join_startup(
+    scheduler: &Scheduler,
+    control: &PoolControl,
+    handles: Vec<WorkerHandle>,
+) -> Vec<String> {
     control.begin_shutdown();
     for handle in &handles {
         let _ = handle.command.send(WorkerCommand::Stop);
     }
+    // A worker that already received `Run` reads its command channel only at
+    // its loop top; parked in the run queue it would never see `Stop`. The
+    // control epoch bounces every executor out of the queue to that loop top,
+    // and the epoch is state, not a signal: a worker that enters the queue
+    // after this still observes it, so no wake is lost.
+    scheduler.poke_executor_control();
     let mut failures = Vec::new();
     for handle in handles {
         match handle.join.join() {
