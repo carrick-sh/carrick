@@ -195,7 +195,15 @@ class ReportTest(unittest.TestCase):
             "guest_oncpu_ns": 3, "host_oncpu_ns": 1,
             "forwarded": [{"nr": 98, "name": "futex", "count": 7}],
         }
-        attribution = {"workloads": {"go-build": {"lane-on": {"hvpatch-exit-attribution": {"summary": exit_summary}}}}}
+        cpu_summary = {
+            "sample_population": 100, "guest_execution_samples": 60, "host_syscall_samples": 20,
+            "fault_service_samples": 10, "executor_scheduling_samples": 5, "el1_mailbox_samples": 1,
+            "lock_wait_samples": 1, "other_samples": 3,
+        }
+        attribution = {"workloads": {"go-build": {"lane-on": {
+            "hvpatch-exit-attribution": {"summary": exit_summary},
+            "hvpatch-carrier-cpu-attribution": {"summary": cpu_summary},
+        }}}}
         docker = {"workloads": {"go-build": {"median_elapsed_ms": 500.0, "median_workload_ms": 250.0}}}
         report = ab.build_report(carrick, attribution, docker)
         on = report["workloads"]["go-build"]["lane-on"]
@@ -206,7 +214,8 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(on["executor_guest_oncpu_share"], 0.75)
         self.assertEqual(report["workloads"]["go-build"]["lane-off"]["elapsed_over_docker"], 4.0)
         table = ab.render_report(report)
-        self.assertIn("| go-build | lane-on | 1000 | 500 | 10.00 | 2.00x | 2.00x | 4/3/2/1 |", table)
+        self.assertEqual(on["carrier_cpu_share"]["guest"], 0.6)
+        self.assertIn("| go-build | lane-on | 1000 | 500 | 10.00 | 2.00x | 2.00x | 4/3/2/1 | 4/3/2/1 | 60/20/10/5 |", table)
 
 
 if __name__ == "__main__":
