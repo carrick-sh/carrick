@@ -135,6 +135,11 @@ fn normalize(s: &str) -> String {
 /// Per-case run id, stamped into the carrick carrier's title via CARRICK_RUN_ID.
 static CASE_SEQ: AtomicU64 = AtomicU64::new(0);
 fn case_run_id() -> String {
+    // The contract runs cases sequentially; preserve the caller's scoped ID
+    // so an external repetition gate can reap precisely its own invocation.
+    if let Ok(run_id) = std::env::var("CARRICK_RUN_ID") {
+        return run_id;
+    }
     format!(
         "cr-gate-{}-{}",
         std::process::id(),

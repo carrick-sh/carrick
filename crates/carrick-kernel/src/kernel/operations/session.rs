@@ -11,6 +11,7 @@ use super::{
     KernelFailpoint, KernelOperationError, TaskOperationReservation, check_failpoint,
     ensure_task_unreserved, namespace_visible_task_id, next_revision,
 };
+use crate::kernel::ContainerId;
 use crate::kernel::core::{
     Kernel, KernelContext, ProcessGroupRecord, RegistryState, SessionRecord,
 };
@@ -59,6 +60,17 @@ impl Kernel {
         drop(ttys);
         drop(state);
         crate::kernel::tty::acknowledge_ready(self, container);
+    }
+
+    /// Acknowledge the launch tty after the carrier relay route is installed.
+    /// Initialization owns session/group references before guest execution; a
+    /// completed root need not remain in the task registry for publication.
+    /// A retired container or a non-interactive launch has nothing to publish.
+    pub fn acknowledge_launch_controlling_tty(&self, container: ContainerId) {
+        let initialized = self.controlling_ttys.lock().contains_key(&container);
+        if initialized {
+            crate::kernel::tty::acknowledge_ready(self, container);
+        }
     }
 
     pub(crate) fn tty_acquire(

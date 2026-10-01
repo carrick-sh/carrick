@@ -543,23 +543,9 @@ where
                 .commit_publications();
             // The relay route and debug endpoint must never point at a root
             // that the carrier still reports as provisional. TTY authority
-            // is initialized only after the route exists so its ready
-            // acknowledgement cannot be lost.
-            carrick_kernel::kernel::tty::install(runtime.kernel());
-            kernel
-                .dispatcher
-                .initialize_controlling_tty_for(
-                    &kernel
-                        .dispatcher
-                        .capture_kernel_context(root_linux_tid)
-                        .unwrap_or_else(|error| {
-                            tracing::error!(%error, "cannot capture activated HVPatch root tty context");
-                            carrick_fatal!(
-                                "threaded_loop::root_activation",
-                                "cannot capture activated HVPatch root tty context"
-                            );
-                        }),
-                );
+            // was initialized before execution; acknowledge it only after the
+            // route exists, without recapturing a possibly exited root.
+            publish_root_tty(&kernel.dispatcher, runtime.kernel());
             carrick_kernel::kernel::KernelDebugServer::install(
                 Arc::clone(runtime.kernel()),
                 kernel
@@ -625,6 +611,14 @@ where
     Ok(result)
 }
 
+fn publish_root_tty(
+    dispatcher: &SyscallDispatcher,
+    kernel: &std::sync::Arc<carrick_kernel::kernel::Kernel>,
+) {
+    carrick_kernel::kernel::tty::install(kernel);
+    kernel.acknowledge_launch_controlling_tty(dispatcher.container().id());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +631,29 @@ mod tests {
             main_registry_id().raw(),
             carrick_abi::LINUX_BOOTSTRAP_PID as i32,
         );
+    }
+
+    #[test]
+    fn root_tty_publication_survives_root_exit_before_activation() {
+        for interactive in [false, true] {
+            let dispatcher = SyscallDispatcher::new();
+            if interactive {
+                dispatcher.register_controlling_pty("/dev/ttyrace-test".to_owned());
+            }
+            let root = dispatcher.capture_one_task_context().expect("root context");
+            dispatcher.initialize_controlling_tty_for(&root);
+            let tid = root.thread().key().tid;
+            // Force the fast-exit interleaving without timing or a guest VM.
+            root.kernel()
+                .exit_task(
+                    root.task().key().id,
+                    carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(42 << 8),
+                    None,
+                )
+                .expect("root exits");
+            assert!(dispatcher.capture_kernel_context(tid).is_err());
+            publish_root_tty(&dispatcher, root.kernel());
+        }
     }
 
     fn root_context(pid: i32) -> carrick_kernel::kernel::KernelContext {
