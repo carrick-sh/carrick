@@ -4564,6 +4564,9 @@ pub fn el1_vectors_bytes_shim_fd_ceiling() -> Vec<u8> {
 
 const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
 const MAILBOX_HANDLER_SIZE: usize = 0x200;
+/// The ordinary request capture: the same offset in every mailbox image (the
+/// optional fstat guard and EL1 hook branch are NOP-padded when absent).
+const MAILBOX_CAPTURE_OFFSET: usize = MAILBOX_HANDLER_OFFSET + 44;
 
 const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
 /// The EL0 IRQ hook ([`El1IrqMode::Gic`]): the lower-EL IRQ slot branches
@@ -5067,6 +5070,102 @@ pub fn el1_vectors_bytes_mailbox_irq(
     el1_enabled: bool,
     irq: El1IrqMode,
 ) -> Vec<u8> {
+    el1_vectors_bytes_mailbox_with_layout(identity_fast_path, fd_ceiling, el1_enabled, irq).0
+}
+
+/// Where a forwarded syscall resumes after its `hvc #2`, and the
+/// resume-invalidation entry the host may resume it through instead.
+///
+/// The instruction after the mailbox handler's `hvc` stores the guest's x16
+/// and x17 into the slot (`resume_x16`/`resume_x17`), after which both are
+/// dead. The entry performs those two stores itself, invalidates the stage-1
+/// TLB entries of the ASID in `TTBR0_EL1` on every PE of the Inner Shareable
+/// domain (`TLBI ASIDE1IS`, completed by `DSB ISH`), and branches to the
+/// instruction after the stores. A required invalidation the host owes this
+/// MM is thereby issued by the vCPU that returns the syscall, before it
+/// reaches EL0 and without a host round trip. The handler is emitted at a
+/// fixed offset with the same code in every mailbox image, so the layout is
+/// one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxResumeLayout {
+    /// The instruction a forwarded syscall's vCPU stops at (`hvc` + 4).
+    pub hvc_return: u64,
+    /// The resume-invalidation entry.
+    pub entry: u64,
+    /// One past its last instruction.
+    pub end: u64,
+}
+
+pub fn mailbox_resume_layout() -> &'static MailboxResumeLayout {
+    static LAYOUT: std::sync::OnceLock<MailboxResumeLayout> = std::sync::OnceLock::new();
+    LAYOUT.get_or_init(|| {
+        el1_vectors_bytes_mailbox_with_layout(false, false, false, El1IrqMode::Masked).1
+    })
+}
+
+/// The resume-invalidation entry's fixed offset in every mailbox image: the
+/// last 64 bytes of the vector region (NOP fill), past every hook.
+const RESUME_INVALIDATION_OFFSET: usize = LINUX_EL1_VECTORS_SIZE as usize - 0x40;
+const AARCH64_MRS_X16_TTBR0_EL1_OPCODE: u32 = 0xd538_2010;
+/// `and x16, x16, #0xffff000000000000`: the ASID field of a TTBR0 value.
+const AARCH64_AND_X16_ASID_FIELD_OPCODE: u32 = 0x9250_3e10;
+const AARCH64_DSB_ISHST_OPCODE: u32 = 0xd503_3a9f;
+const AARCH64_DSB_ISH_OPCODE: u32 = 0xd503_3b9f;
+const AARCH64_TLBI_ASIDE1IS_X16_OPCODE: u32 = 0xd508_8350;
+
+/// Emit the resume-invalidation entry for a handler whose `hvc` returns at
+/// `hvc_return` (see [`MailboxResumeLayout`]).
+fn write_resume_invalidation(bytes: &mut [u8], hvc_return: usize) -> MailboxResumeLayout {
+    let stores = [
+        enc_str_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+        enc_str_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    ];
+    for (index, store) in stores.iter().enumerate() {
+        let at = hvc_return + index * 4;
+        assert_eq!(
+            &bytes[at..at + 4],
+            &store.to_le_bytes(),
+            "the mailbox handler's hvc return no longer starts by storing x16/x17"
+        );
+    }
+    let start = RESUME_INVALIDATION_OFFSET;
+    assert!(
+        bytes[start..start + 0x40]
+            .chunks(4)
+            .all(|word| word == AARCH64_NOP_OPCODE.to_le_bytes()),
+        "the resume-invalidation entry overlaps emitted vector code"
+    );
+    let mut cursor = start;
+    let ops = [
+        stores[0],
+        stores[1],
+        AARCH64_MRS_X16_TTBR0_EL1_OPCODE,
+        AARCH64_AND_X16_ASID_FIELD_OPCODE,
+        AARCH64_DSB_ISHST_OPCODE,
+        AARCH64_TLBI_ASIDE1IS_X16_OPCODE,
+        AARCH64_DSB_ISH_OPCODE,
+        AARCH64_ISB_OPCODE,
+    ];
+    for op in ops {
+        bytes[cursor..cursor + 4].copy_from_slice(&op.to_le_bytes());
+        cursor += 4;
+    }
+    let branch = enc_b(cursor as u64, (hvc_return + 8) as u64);
+    bytes[cursor..cursor + 4].copy_from_slice(&branch.to_le_bytes());
+    cursor += 4;
+    MailboxResumeLayout {
+        hvc_return: LINUX_EL1_VECTORS_BASE + hvc_return as u64,
+        entry: LINUX_EL1_VECTORS_BASE + start as u64,
+        end: LINUX_EL1_VECTORS_BASE + cursor as u64,
+    }
+}
+
+fn el1_vectors_bytes_mailbox_with_layout(
+    identity_fast_path: bool,
+    fd_ceiling: bool,
+    el1_enabled: bool,
+    irq: El1IrqMode,
+) -> (Vec<u8>, MailboxResumeLayout) {
     let mut bytes = if identity_fast_path {
         el1_vectors_bytes_shim_inner(fd_ceiling)
     } else if fd_ceiling {
@@ -5126,6 +5225,12 @@ pub fn el1_vectors_bytes_mailbox_irq(
             &mut cursor,
             enc_beq(branch_pc2 as u64, handler as u64),
         );
+    } else {
+        // Keep the capture (and the hvc return after it) at one offset in
+        // every image: see `MailboxResumeLayout`.
+        for _ in 0..4 {
+            emit(&mut bytes, &mut cursor, AARCH64_NOP_OPCODE);
+        }
     }
     if el1_enabled {
         let hook_branch = cursor;
@@ -5134,8 +5239,11 @@ pub fn el1_vectors_bytes_mailbox_irq(
             &mut cursor,
             enc_b(hook_branch as u64, EL1_VECTOR_HOOK_OFFSET as u64),
         );
+    } else {
+        emit(&mut bytes, &mut cursor, AARCH64_NOP_OPCODE);
     }
     let mailbox_capture = cursor;
+    assert_eq!(mailbox_capture, MAILBOX_CAPTURE_OFFSET);
 
     emit(
         &mut bytes,
@@ -5598,7 +5706,9 @@ pub fn el1_vectors_bytes_mailbox_irq(
             let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
         }
     }
-    bytes
+    // `portal_hvc` loads x16 and x17, then traps: the hvc returns 12 bytes on.
+    let layout = write_resume_invalidation(&mut bytes, portal_hvc + 12);
+    (bytes, layout)
 }
 
 pub fn el1_vectors_bytes_mailbox(identity_fast_path: bool) -> Vec<u8> {
@@ -7117,6 +7227,48 @@ mod stage1_tests {
     }
 
     #[test]
+    fn mailbox_resume_invalidation_entry_is_identical_in_every_image() {
+        let layout = *mailbox_resume_layout();
+        let offset = |va: u64| (va - LINUX_EL1_VECTORS_BASE) as usize;
+        let reference = el1_vectors_bytes_mailbox_irq(false, false, false, El1IrqMode::Masked);
+        let span = offset(layout.hvc_return)..offset(layout.hvc_return) + 8;
+        let entry = offset(layout.entry)..offset(layout.end);
+        let op = |bytes: &[u8], at: usize| {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().expect("word"))
+        };
+        // Two stores, the ASID invalidation, then a branch past the stores.
+        assert_eq!(entry.len(), 9 * 4);
+        assert_eq!(op(&reference, entry.start), op(&reference, span.start));
+        assert_eq!(
+            op(&reference, entry.start + 4),
+            op(&reference, span.start + 4)
+        );
+        assert_eq!(
+            op(&reference, entry.start + 20),
+            AARCH64_TLBI_ASIDE1IS_X16_OPCODE
+        );
+        assert_eq!(
+            op(&reference, entry.start + 32),
+            enc_b((entry.start + 32) as u64, (span.start + 8) as u64)
+        );
+        for identity in [false, true] {
+            for fd_ceiling in [false, true] {
+                for el1 in [false, true] {
+                    for irq in [El1IrqMode::Masked, El1IrqMode::Gic] {
+                        let bytes = el1_vectors_bytes_mailbox_irq(identity, fd_ceiling, el1, irq);
+                        assert_eq!(bytes[span.clone()], reference[span.clone()]);
+                        assert_eq!(bytes[entry.clone()], reference[entry.clone()]);
+                    }
+                    let clock =
+                        el1_vectors_bytes_mailbox_clock(identity, fd_ceiling, El1IrqMode::Masked);
+                    assert_eq!(clock[span.clone()], reference[span.clone()]);
+                    assert_eq!(clock[entry.clone()], reference[entry.clone()]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn el1_maintenance_bytes_emit_tlbi_then_hvc1() {
         let bytes = el1_maintenance_bytes();
         assert_eq!(bytes.len() as u64, LINUX_EL1_MAINT_SIZE);
@@ -7738,11 +7890,7 @@ mod el1_shim_tests {
                 if mailbox_handler != MAILBOX_HANDLER_OFFSET {
                     el1_clock::tests::assert_fstat_host_fallback(bytes, mailbox_handler);
                 }
-                if el1_kernel_enabled() {
-                    MAILBOX_HANDLER_OFFSET + 28
-                } else {
-                    MAILBOX_HANDLER_OFFSET + 24
-                }
+                MAILBOX_CAPTURE_OFFSET
             } else {
                 fallback_target
             };
@@ -8521,29 +8669,26 @@ mod el1_shim_tests {
             "enabled EL1 vectors must differ from disabled (CARRICK_EL1=0)"
         );
 
-        // Before 0x984 (fstat fallback branch), bytes must be identical
+        // The optional fstat guard and the hook branch are NOP-padded when
+        // absent, so everything before the hook slot is identical.
+        let hook = MAILBOX_CAPTURE_OFFSET - 4;
         assert_eq!(
-            vectors_disabled[..0x984],
-            vectors_enabled[..0x984],
-            "vectors before fstat fallback branch must be identical"
+            vectors_disabled[..hook],
+            vectors_enabled[..hook],
+            "vectors before the EL1 hook branch must be identical"
         );
-        // At 0x984, both branch to mailbox_capture (0xA18 vs 0xA1C)
+        // Enabled vectors branch to 0x1000 (EL1 hook); disabled ones fall through.
         assert_eq!(
-            vectors_disabled[0x988..0xA14],
-            vectors_enabled[0x988..0xA14],
-            "vectors between fstat fallback and non_svc_branch must be identical"
-        );
-        // At 0xA18, enabled vectors branch to 0x1000 (EL1 hook)
-        assert_eq!(
-            rd_u32(&vectors_enabled, 0xA18),
-            enc_b(0xA18, 0x1000),
+            rd_u32(&vectors_enabled, hook),
+            enc_b(hook as u64, 0x1000),
             "hook branch must branch to 0x1000"
         );
-        // The mailbox capture code is identical, shifted by 4 bytes (the hook branch at 0xA18)
+        assert_eq!(rd_u32(&vectors_disabled, hook), AARCH64_NOP_OPCODE);
+        // The mailbox capture code is identical, at the same offset.
         assert_eq!(
-            vectors_disabled[0xA18..0xB88],
-            vectors_enabled[0xA1C..0xB8C],
-            "mailbox capture code must be identical (modulo 4-byte hook branch shift)"
+            vectors_disabled[MAILBOX_CAPTURE_OFFSET..MAILBOX_CAPTURE_OFFSET + 0x170],
+            vectors_enabled[MAILBOX_CAPTURE_OFFSET..MAILBOX_CAPTURE_OFFSET + 0x170],
+            "mailbox capture code must be identical"
         );
         // Hook is installed at 0x1000
         assert_ne!(

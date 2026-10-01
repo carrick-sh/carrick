@@ -417,6 +417,22 @@ pub trait Aarch64Vcpu {
     fn take_deferred_stage1_maintenance(&mut self) -> OwedStage1Maintenance {
         OwedStage1Maintenance::default()
     }
+
+    /// Whether this vCPU returns syscalls through a vector with the
+    /// resume-invalidation entry (`carrick_mem::memory::MailboxResumeLayout`),
+    /// so a required invalidation can be owed to the return
+    /// ([`crate::resume_invalidation`]). `false` by default.
+    fn returns_syscalls_through_resume_invalidation(&self) -> bool {
+        false
+    }
+
+    /// If this vCPU is stopped at a forwarded syscall's `hvc` return, move it
+    /// to the resume-invalidation entry, which issues `TLBI ASIDE1IS` for the
+    /// ASID in `TTBR0_EL1` and then continues exactly where it stood. `false`
+    /// (nothing changed) when it stands anywhere else, or by default.
+    fn resume_through_invalidation(&mut self) -> Result<bool, TrapError> {
+        Ok(false)
+    }
 }
 
 /// One stage-1 TLB invalidation the engine asks a vCPU to run.

@@ -165,6 +165,9 @@ pub fn apply_as_host_if_excluded<M>(
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
     maintenance: &M,
+    // The required invalidation of a completed transaction (run now, or owed
+    // to the syscall's return); `maintenance` runs break-before-make ones,
+    // including the one before an emptied table is unlinked and reclaimed.
     invalidate_asid: &dyn Fn(),
     check: impl FnOnce() -> Result<(), TrapError>,
 ) -> Option<Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt, TrapError>>

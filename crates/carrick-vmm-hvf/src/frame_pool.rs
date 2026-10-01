@@ -54,6 +54,12 @@ pub(crate) struct PreMappedFramePool {
     host_mapping: crate::host_mapping::OwnedHostMapping,
     lease: Mutex<Option<crate::trap::GlobalFrameStage2Lease>>,
     free_compounds: Mutex<Vec<u32>>,
+    /// Compounds recycled while a stage-1 invalidation was owed to a
+    /// syscall's return, with the release tag they wait for
+    /// (`carrick_aarch64::resume_invalidation`): another vCPU may still
+    /// reach one through a stale translation, so it is neither scrubbed nor
+    /// reused until every invalidation owed at its release has completed.
+    quarantined: Mutex<Vec<(u32, u64)>>,
     allocated_count: AtomicUsize,
 }
 
@@ -116,6 +122,7 @@ impl PreMappedFramePool {
             host_mapping,
             lease: Mutex::new(Some(lease)),
             free_compounds: Mutex::new(free_compounds),
+            quarantined: Mutex::new(Vec::new()),
             allocated_count: AtomicUsize::new(0),
         })
     }
@@ -140,12 +147,14 @@ impl PreMappedFramePool {
             host_mapping,
             lease: Mutex::new(None),
             free_compounds: Mutex::new(free_compounds),
+            quarantined: Mutex::new(Vec::new()),
             allocated_count: AtomicUsize::new(0),
         }
     }
 
     /// Allocate a 16 KiB compound from the pool, if available.
     pub(crate) fn allocate_compound(self: &Arc<Self>) -> Option<PooledFrameHandle> {
+        self.release_quarantined();
         let index = self.free_compounds.lock().pop()?;
         self.allocated_count.fetch_add(1, Ordering::Relaxed);
         let compound_size = crate::trap::CowArmedRanges::COMPOUND_SIZE as usize;
@@ -164,12 +173,47 @@ impl PreMappedFramePool {
     /// Return a compound to the pool upon final reference drop.
     /// Re-zeros the compound buffer before releasing it back to the free list.
     fn recycle(&self, compound_index: u32, host_ptr: *mut u8, len: usize) {
+        if let Some(tag) = carrick_aarch64::resume_invalidation::release_tag() {
+            self.quarantined.lock().push((compound_index, tag));
+            return;
+        }
+        self.scrub_and_free(compound_index, host_ptr, len);
+    }
+
+    fn scrub_and_free(&self, compound_index: u32, host_ptr: *mut u8, len: usize) {
         // Zero-fill guarantee: scrub the recycled memory before making it available again
         unsafe {
             std::ptr::write_bytes(host_ptr, 0, len);
         }
         self.free_compounds.lock().push(compound_index);
         self.allocated_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Scrub and free every quarantined compound whose owed invalidations
+    /// have all completed.
+    fn release_quarantined(&self) {
+        let released: Vec<u32> = {
+            let mut quarantined = self.quarantined.lock();
+            if quarantined.is_empty() {
+                return;
+            }
+            let mut released = Vec::new();
+            quarantined.retain(|&(index, tag)| {
+                let done = carrick_aarch64::resume_invalidation::completed_through(tag);
+                if done {
+                    released.push(index);
+                }
+                !done
+            });
+            released
+        };
+        let compound_size = crate::trap::CowArmedRanges::COMPOUND_SIZE as usize;
+        for index in released {
+            let offset = index as usize * compound_size;
+            // SAFETY: `index` names a compound of this pool's mapping.
+            let host_ptr = unsafe { self.host_mapping.as_ptr().add(offset) };
+            self.scrub_and_free(index, host_ptr, compound_size);
+        }
     }
 
     /// Test whether a given IPA lies within this pool's pre-mapped extent.
@@ -661,6 +705,35 @@ mod tests {
         let clean_slice =
             unsafe { std::slice::from_raw_parts(reacquired.as_ptr(), reacquired.len()) };
         assert!(clean_slice.iter().all(|&b| b == 0));
+    }
+
+    /// A compound recycled while a stage-1 invalidation is owed to a
+    /// syscall's return may still be reachable through a stale translation
+    /// on another vCPU: it is neither reused nor scrubbed (a stale store
+    /// would land after the scrub) until the invalidation completed.
+    #[test]
+    fn frame_pool_quarantines_compounds_released_under_an_owed_invalidation() {
+        use carrick_aarch64::resume_invalidation::ResumeInvalidation;
+        let pool = Arc::new(PreMappedFramePool::new_test_fixture(2));
+        let c0 = pool.allocate_compound().expect("c0");
+        let c1 = pool.allocate_compound().expect("c1");
+        let released_ipa = c0.ipa();
+        let owed = ResumeInvalidation::owe(0x7e57, 0x7e);
+        drop(c0);
+        // Only c0 was free and it is quarantined.
+        assert!(pool.allocate_compound().is_none());
+        let stale = unsafe { c1.as_mut_ptr().sub(c1.len()) };
+        // A stale translation's store still lands in the released compound.
+        unsafe { std::ptr::write_bytes(stale, 0x5a, c1.len()) };
+        owed.complete();
+        let reacquired = pool.allocate_compound().expect("released after completion");
+        assert_eq!(reacquired.ipa(), released_ipa);
+        let bytes = unsafe { std::slice::from_raw_parts(reacquired.as_ptr(), reacquired.len()) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "scrubbed after the invalidation"
+        );
+        drop(c1);
     }
 
     #[test]

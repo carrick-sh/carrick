@@ -418,6 +418,11 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// [`Self::overlay_task_state_on_live_executor`] before the task's first
     /// instruction.
     owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance,
+
+    /// The required invalidation the current syscall's host-lane edits owe,
+    /// issued by this vCPU when it returns the syscall (see
+    /// [`crate::resume_invalidation`]).
+    owed_resume_invalidation: Option<crate::resume_invalidation::ResumeInvalidation>,
 }
 
 pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
@@ -477,6 +482,10 @@ struct EngineStage1Services<'a, V: Aarch64Vmm> {
     process_asid: Option<u16>,
     carrier_root: Option<carrick_mem::memory::CarrierMaintenanceRoot>,
     suspended_el1_sp: Option<u64>,
+    /// Set when a host-applied transaction needs its required (not
+    /// break-before-make) invalidation, which the caller then runs once for
+    /// its whole edit; `None` runs every invalidation at once.
+    required_invalidation: Option<&'a std::cell::Cell<bool>>,
 }
 impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Services<'_, V> {
     fn slot(&self) -> Option<usize> {
@@ -519,6 +528,7 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
     ) -> Option<Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt, TrapError>>
     {
         let (process_asid, carrier_root) = (self.process_asid, self.carrier_root);
+        let required_invalidation = self.required_invalidation;
         let maintenance = VcpuBbmMaintenance::<V> {
             vcpu: std::cell::RefCell::new(&mut *self.vcpu),
             process_asid,
@@ -531,13 +541,17 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
             txn,
             &maintenance,
             // As EL1's completion does: each ASID invalidation an outcome
-            // requires completes before its receipt can be settled.
-            &|| {
-                carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance::invalidate_range(
-                    &maintenance,
-                    0,
-                    0,
-                )
+            // requires completes before the edit's caller returns (at once,
+            // or once for the caller's whole edit).
+            &|| match required_invalidation {
+                Some(required) => required.set(true),
+                None => {
+                    carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance::invalidate_range(
+                        &maintenance,
+                        0,
+                        0,
+                    )
+                }
             },
             || match maintenance.error.borrow_mut().take() {
                 Some(error) => Err(error),
@@ -647,10 +661,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
+            owed_resume_invalidation: None,
         }
     }
 
-    pub fn into_injected_task_only_backend(self) -> (V, V::Vcpu, Aarch64TaskRuntimeProjection) {
+    pub fn into_injected_task_only_backend(mut self) -> (V, V::Vcpu, Aarch64TaskRuntimeProjection) {
+        self.settle_owed_resume_invalidation_or_log();
         let Self {
             vm,
             vcpu,
@@ -759,6 +775,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     pub fn snapshot_task_state_from_live_executor(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
+        self.settle_owed_resume_invalidation()?;
         let continuation = self
             .vm
             .take_task_continuation_for_executor_switch(&mut self.vcpu)?;
@@ -803,7 +820,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .restore_persistent_executor_invariants(&mut self.vcpu)
     }
 
-    pub fn into_task_state_and_vcpu(self) -> (Aarch64TaskEngineState<V>, V::Vcpu) {
+    pub fn into_task_state_and_vcpu(mut self) -> (Aarch64TaskEngineState<V>, V::Vcpu) {
+        self.settle_owed_resume_invalidation_or_log();
         let Self {
             vm,
             mut vcpu,
@@ -887,6 +905,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_process_fork,
             exec_predecessor_shared: None,
             owed_stage1_maintenance,
+            owed_resume_invalidation: None,
         }
     }
 }
@@ -1211,6 +1230,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
+            owed_resume_invalidation: None,
         }
     }
 
@@ -1334,6 +1354,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
+            owed_resume_invalidation: None,
         }
     }
 
@@ -1614,7 +1635,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // to invalidate.
             return Ok(());
         }
-        self.run_stage1_maintenance()
+        self.invalidate_after_edit()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
     }
 
@@ -1628,7 +1649,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         if !outcome.flush_required {
             return Ok(());
         }
-        self.run_stage1_maintenance()
+        self.invalidate_after_edit()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
     }
 
@@ -1657,21 +1678,40 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .ok_or_else(|| failure("no descriptor slots".to_owned()))?;
         self.load_live_stage1_manager()?;
         let tables = self.page_tables.clone();
+        // Like the host lane's single TLBI after every rule: the plan's
+        // required invalidations collapse into one after its last
+        // transaction (break-before-make ones still run inside each).
+        let required = std::cell::Cell::new(false);
+        let mut applied = Ok(());
         for &(va, len, rule) in rules {
-            let op = tables
-                .with_manager(|manager| manager.terminal_op(va, len as u64, rule))
-                .ok_or_else(|| failure("stage-1 image absent".to_owned()))?;
             let txn = tables
-                .prepare_guest_descriptor_txn(mm, op)
-                .map_err(|error| failure(format!("prepare at 0x{va:x}: {error:?}")))?;
-            crate::descriptor_drain::apply_guest_descriptor_txns_now(
-                &mut self.descriptor_services(),
-                slots,
-                &[txn],
-            )
-            .map_err(|error| failure(format!("apply at 0x{va:x}: {error}")))?;
+                .with_manager(|manager| manager.terminal_op(va, len as u64, rule))
+                .ok_or_else(|| failure("stage-1 image absent".to_owned()))
+                .and_then(|op| {
+                    tables
+                        .prepare_guest_descriptor_txn(mm, op)
+                        .map_err(|error| failure(format!("prepare at 0x{va:x}: {error:?}")))
+                });
+            applied = txn.and_then(|txn| {
+                let mut services = self.descriptor_services();
+                services.required_invalidation = Some(&required);
+                crate::descriptor_drain::apply_guest_descriptor_txns_now(
+                    &mut services,
+                    slots,
+                    &[txn],
+                )
+                .map(|_| ())
+                .map_err(|error| failure(format!("apply at 0x{va:x}: {error}")))
+            });
+            if applied.is_err() {
+                break;
+            }
         }
-        Ok(())
+        if required.get() {
+            self.invalidate_after_edit()
+                .map_err(|error| failure(format!("stage-1 TLBI failed: {error}")))?;
+        }
+        applied
     }
 
     /// munmap retirement of `[va, va+len)` on either lane. `reclaim` also
@@ -1708,38 +1748,53 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .ok_or_else(|| failure("no descriptor slots".to_owned()))?;
         self.load_live_stage1_manager()?;
         let tables = self.page_tables.clone();
+        // One required invalidation after the last piece, as in
+        // `apply_stage1_rules`.
+        let required = std::cell::Cell::new(false);
         const TWO_MIB: u64 = 2 << 20;
-        let mut pending = vec![(va, len as u64)];
-        while let Some((start, span)) = pending.pop() {
-            let op = tables
-                .with_manager(|manager| manager.unmap_aliased_op(start, span))
-                .ok_or_else(|| failure("stage-1 image absent".to_owned()))?;
-            let txn = match tables.prepare_guest_descriptor_txn(mm, op) {
-                Ok(txn) => txn,
-                Err(carrick_mmu_core::aarch64::GuestTxnPrepareError::Refused(
-                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ReclaimCapacity,
-                )) => {
-                    let mid = (start + span / 2) & !(TWO_MIB - 1);
-                    if mid <= start || mid >= start + span {
-                        return Err(failure(format!(
-                            "0x{start:x}+0x{span:x} empties more tables than one receipt carries"
-                        )));
+        let mut retire = || -> Result<(), MemoryError> {
+            let mut pending = vec![(va, len as u64)];
+            while let Some((start, span)) = pending.pop() {
+                let op = tables
+                    .with_manager(|manager| manager.unmap_aliased_op(start, span))
+                    .ok_or_else(|| failure("stage-1 image absent".to_owned()))?;
+                let txn = match tables.prepare_guest_descriptor_txn(mm, op) {
+                    Ok(txn) => txn,
+                    Err(carrick_mmu_core::aarch64::GuestTxnPrepareError::Refused(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ReclaimCapacity,
+                    )) => {
+                        let mid = (start + span / 2) & !(TWO_MIB - 1);
+                        if mid <= start || mid >= start + span {
+                            return Err(failure(format!(
+                                "0x{start:x}+0x{span:x} empties more tables than one receipt carries"
+                            )));
+                        }
+                        // Upper half first so the lower half is submitted first.
+                        pending.push((mid, start + span - mid));
+                        pending.push((start, mid - start));
+                        continue;
                     }
-                    // Upper half first so the lower half is submitted first.
-                    pending.push((mid, start + span - mid));
-                    pending.push((start, mid - start));
-                    continue;
-                }
-                Err(error) => return Err(failure(format!("prepare at 0x{start:x}: {error:?}"))),
-            };
-            crate::descriptor_drain::apply_guest_descriptor_txns_now(
-                &mut self.descriptor_services(),
-                slots,
-                &[txn],
-            )
-            .map_err(|error| failure(format!("apply at 0x{start:x}: {error}")))?;
+                    Err(error) => {
+                        return Err(failure(format!("prepare at 0x{start:x}: {error:?}")));
+                    }
+                };
+                let mut services = self.descriptor_services();
+                services.required_invalidation = Some(&required);
+                crate::descriptor_drain::apply_guest_descriptor_txns_now(
+                    &mut services,
+                    slots,
+                    &[txn],
+                )
+                .map_err(|error| failure(format!("apply at 0x{start:x}: {error}")))?;
+            }
+            Ok(())
+        };
+        let retired = retire();
+        if required.get() {
+            self.invalidate_after_edit()
+                .map_err(|error| failure(format!("stage-1 TLBI failed: {error}")))?;
         }
-        Ok(())
+        retired
     }
 
     /// Revert uncommitted page table edits from the undo journal to shadow and host memory,
@@ -2145,6 +2200,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             process_asid: self.process_asid,
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
+            required_invalidation: None,
         }
     }
 
@@ -2154,6 +2210,303 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             self.process_asid,
             self.vm.carrier_maintenance_root().ok(),
         )
+    }
+
+    /// Whether a required invalidation the current edit needs may be owed
+    /// to this vCPU's return of the syscall ([`crate::resume_invalidation`]):
+    /// an eligible syscall of an MM with its own ASID, being returned
+    /// through the mailbox vector.
+    fn may_owe_resume_invalidation(&self) -> bool {
+        crate::resume_invalidation::enabled()
+            && self.process_asid.is_some()
+            && self.mm_generation != 0
+            && self.pending_resume_pc.is_some()
+            && self.last_syscall_nr.is_some_and(|number| {
+                crate::resume_invalidation::eligible_syscall(carrick_abi::CanonicalNr(number))
+            })
+            && self.vcpu.returns_syscalls_through_resume_invalidation()
+    }
+
+    fn owe_resume_invalidation(&mut self) {
+        let Some(asid) = self.process_asid else {
+            return;
+        };
+        if self.owed_resume_invalidation.is_none() {
+            self.owed_resume_invalidation = Some(
+                crate::resume_invalidation::ResumeInvalidation::owe(self.mm_generation, asid),
+            );
+        }
+    }
+
+    /// The invalidation this task owes, for a save that keeps the task's
+    /// registers resident on its vCPU: the record carries it until the task
+    /// is reaffirmed there ([`Self::adopt_owed_resume_invalidation`]) or
+    /// evicted, which issues it on that vCPU.
+    pub fn take_owed_resume_invalidation(
+        &mut self,
+    ) -> Option<crate::resume_invalidation::ResumeInvalidation> {
+        self.owed_resume_invalidation.take()
+    }
+
+    /// Re-adopt an owed invalidation carried by a resident record. One
+    /// already held is issued first (a freshly attached engine holds none).
+    pub fn adopt_owed_resume_invalidation(
+        &mut self,
+        owed: Option<crate::resume_invalidation::ResumeInvalidation>,
+    ) -> Result<(), TrapError> {
+        if let Some(owed) = owed {
+            self.settle_owed_resume_invalidation()?;
+            self.owed_resume_invalidation = Some(owed);
+        }
+        Ok(())
+    }
+
+    /// The required invalidation after a host-lane edit changed a valid
+    /// leaf: owed to the syscall's return when allowed, else run now.
+    fn invalidate_after_edit(&mut self) -> Result<(), TrapError> {
+        if self.may_owe_resume_invalidation() {
+            self.owe_resume_invalidation();
+            return Ok(());
+        }
+        crate::resume_invalidation::note_issued_by_host();
+        self.run_stage1_maintenance()
+    }
+
+    /// Issue an owed invalidation now, as a host round trip: the task is
+    /// leaving this vCPU, or its return cannot use the entry.
+    pub fn settle_owed_resume_invalidation(&mut self) -> Result<(), TrapError> {
+        let Some(owed) = self.owed_resume_invalidation.take() else {
+            return Ok(());
+        };
+        match self.run_stage1_maintenance() {
+            Ok(()) => {
+                owed.complete_by_host();
+                Ok(())
+            }
+            Err(error) => {
+                self.owed_resume_invalidation = Some(owed);
+                Err(error)
+            }
+        }
+    }
+
+    /// [`Self::settle_owed_resume_invalidation`] where the caller cannot fail.
+    /// A failure leaves the debt outstanding (dropped with the engine), so
+    /// frames released under it stay quarantined.
+    fn settle_owed_resume_invalidation_or_log(&mut self) {
+        if let Err(error) = self.settle_owed_resume_invalidation() {
+            tracing::error!(%error, "owed stage-1 invalidation failed before the task left its vCPU");
+        }
+    }
+
+    fn run_to_next_syscall(&mut self) -> Result<Option<RawSyscall>, TrapError> {
+        // One guest run per call. The loop exists ONLY to re-enter the guest when a
+        // kick lands mid-syscall-trap (the `Kicked` arm); every other exit returns.
+        // A kick absorbed inside Carrick's EL1 code is owed to the next EL0
+        // boundary and settled by whichever exit surfaces first (see `OwedKick`).
+        let mut owed_kick = crate::owed_kick::OwedKick::default();
+        // Whatever EL1 operation a COW fault suspended resumes with this run.
+        self.suspended_el1_sp = None;
+        loop {
+            // Account the guest's CPU time (wall time inside the backend's guest
+            // run) into this thread's guest_cpu slot so getrusage(RUSAGE_SELF) /
+            // times / `/proc` see it. Done ONCE here, so every aarch64 backend on
+            // this shared engine gets it for free (mirrors carrick-x86).
+            let run = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
+            self.pending_guest_run_receipt_ns = self
+                .pending_guest_run_receipt_ns
+                .saturating_add(run.elapsed_ns);
+            match run
+                .value
+                .map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))?
+            {
+                Aarch64Exit::Syscall {
+                    frame,
+                    resume_pc,
+                    current_guest_sp,
+                } => {
+                    // The EL0 `svc` re-entered EL1 and hit the sentinel store. The
+                    // hardware already set ELR_EL1 = (svc addr + 4); the EL1
+                    // vector's own `eret` (after the sentinel store) consumes it —
+                    // so we do NOT touch the PC here; we just read the frame. The
+                    // ENGINE owns the pending state (§2.1).
+                    self.pending_resume_pc = Some(resume_pc);
+                    self.last_syscall_nr = Some(frame.x8);
+                    self.last_syscall_orig_x0 = frame.x0;
+                    // Decode through this engine's `GuestArch` so the runtime loop is
+                    // ISA-neutral: x8 → number, x0..x5 → args. `last_syscall_nr`/
+                    // `orig_x0` stay set from the raw frame above (their x8/x0
+                    // meaning is aarch64-fixed).
+                    owed_kick.settle(&mut self.vcpu)?;
+                    let (number, args) = <Self as ThreadedEngine>::Arch::decode_syscall(&frame);
+                    let guest_abi = <Self as ThreadedEngine>::Arch::linux_guest_abi();
+                    return Ok(Some(RawSyscall {
+                        current_guest_sp,
+                        number: carrick_abi::CanonicalNr(number),
+                        args,
+                        guest_abi,
+                        // aarch64 guests already issue canonical numbers, so the
+                        // ISA-native number equals the dispatch number.
+                        native_number: carrick_abi::NativeNr(number),
+                    }));
+                }
+                Aarch64Exit::EL0Fault {
+                    syndrome,
+                    elr,
+                    far,
+                    x16,
+                    x17,
+                    x29,
+                    x30,
+                    sp,
+                    from_el0_direct,
+                } => {
+                    // The fault ESR is only valid between fault and delivery; latch
+                    // it so `inject_signal` can put it in the arm64 sigframe's
+                    // `esr_context` (required by Rosetta's handler).
+                    self.last_fault_esr = syndrome;
+                    owed_kick.settle(&mut self.vcpu)?;
+                    return Err(TrapError::el0_fault(
+                        syndrome,
+                        elr,
+                        far,
+                        x16,
+                        x17,
+                        x29,
+                        x30,
+                        sp,
+                        from_el0_direct,
+                    ));
+                }
+                Aarch64Exit::Stage1CowFault { syndrome, far } => {
+                    self.last_fault_esr = syndrome;
+                    self.suspended_el1_sp =
+                        Some(self.vcpu.get_reg(Reg::SpEl1).map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "read SP_EL1 of EL1 stopped by a COW fault: {error}"
+                            ))
+                        })?);
+                    owed_kick.settle(&mut self.vcpu)?;
+                    return Err(TrapError::Stage1CowFault {
+                        syndrome,
+                        far,
+                        elr: self.vcpu.get_reg(Reg::Pc).unwrap_or(0),
+                        spsr: self.vcpu.get_reg(Reg::Pstate).unwrap_or(0),
+                    });
+                }
+                Aarch64Exit::Sys64Read { esr: _ } => {
+                    // An EL0 `MRS` of an emulated ID/timer/cache register (Rosetta
+                    // x86-on-arm + HVF). KVM's config never traps `MRS`, so this
+                    // never surfaces on the KVM path; a future HVF migration
+                    // services it via the shared `emulate_el0_sys64_read` and
+                    // re-enters. Re-run the guest for now (no-op on KVM).
+                    owed_kick.rearm(&mut self.vcpu)?;
+                    continue;
+                }
+                Aarch64Exit::MaintenanceDone => {
+                    // The maintenance trampoline's completion vehicle is consumed by
+                    // `run_el1_maintenance`'s own loop; reaching it here is a
+                    // spurious re-entry — re-run the guest.
+                    owed_kick.rearm(&mut self.vcpu)?;
+                    continue;
+                }
+                // A WFI/halt with no pending syscall: report `None` so the run loop
+                // can run signal delivery and resume.
+                Aarch64Exit::Halt => {
+                    owed_kick.settle(&mut self.vcpu)?;
+                    return Ok(None);
+                }
+                Aarch64Exit::Kicked => {
+                    // A cross-thread kick (host signal → KVM_RUN EINTR, e.g. a timer
+                    // or `tgkill`) can land while the guest is MID-SYSCALL-TRAP: the
+                    // EL0 `svc` has already re-entered EL1 and the vCPU PC is inside
+                    // carrick's EL1 vector, with the sentinel-store MMIO not yet
+                    // surfaced. Reporting that as a deliverable kick (→ the loop
+                    // injects a signal at the EL1-vector PC) corrupts the in-flight
+                    // syscall and wedges the guest in an EL0 spin. If the PC is in
+                    // the EL1 vector, swallow the kick and re-enter the guest so the
+                    // syscall completes; the pending signal is delivered cleanly on
+                    // the syscall return. Only a kick taken in genuine guest EL0 code
+                    // is reported (`Ok(None)`).
+                    let pc = self.vcpu.get_reg(Reg::Pc)?;
+                    let in_vector = carrick_mem::memory::is_carrick_el1_vector_va(pc);
+                    let in_el1_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                        ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                            + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE)
+                        .contains(&pc);
+                    if in_vector
+                        || in_el1_image
+                        || carrick_mem::memory::is_carrick_el0_clock_stub_va(pc)
+                    {
+                        // Clock completion may have already passed its flag
+                        // check. Normalize to the original SVC, then owe the
+                        // kick to EL0: it is taken at the SVC's PC BEFORE the
+                        // syscall replays, and the replay crosses host
+                        // dispatch afterwards with the kick already served.
+                        let normalized = self.vcpu.force_clock_host_boundary()?;
+                        if in_vector || in_el1_image || normalized {
+                            let site = if in_vector {
+                                crate::owed_kick::AbsorbedKickSite::El1Vector
+                            } else if in_el1_image {
+                                crate::owed_kick::AbsorbedKickSite::El1Image
+                            } else {
+                                crate::owed_kick::AbsorbedKickSite::El0ClockStub
+                            };
+                            owed_kick.absorb(&mut self.vcpu, pc, site)?;
+                            continue;
+                        }
+                    }
+                    owed_kick.settle(&mut self.vcpu)?;
+                    return Ok(None);
+                }
+                Aarch64Exit::Memory { gpa, va } => {
+                    // A sparse/alias backend (HVF lazy high-VA alias re-map) can
+                    // resolve + retry; KVM keeps the default `Ok(false)`. Unhandled
+                    // → surface.
+                    if self.vm.handle_memory_exit(gpa, va)? {
+                        owed_kick.rearm(&mut self.vcpu)?;
+                        continue;
+                    }
+                    return Err(TrapError::Hypervisor(format!(
+                        "aarch64 backend did not handle memory exit for gpa=0x{gpa:x} va=0x{va:x}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Before running the guest: resume an owed invalidation's syscall
+    /// through the resume-invalidation entry and return the debt the run
+    /// completes, or issue it now when the vCPU stands anywhere else. An mm
+    /// syscall of an MM that another thread still owes for also returns
+    /// through the entry, so it cannot reach EL0 over a translation the
+    /// other thread's edit retired (e.g. its `mmap` reusing a range the
+    /// other `munmap`ped).
+    fn arm_resume_invalidation(
+        &mut self,
+    ) -> Result<Option<crate::resume_invalidation::ResumeInvalidation>, TrapError> {
+        if let Some(owed) = self.owed_resume_invalidation.take() {
+            return match self.vcpu.resume_through_invalidation() {
+                Ok(true) => Ok(Some(owed)),
+                Ok(false) => {
+                    self.owed_resume_invalidation = Some(owed);
+                    self.settle_owed_resume_invalidation().map(|()| None)
+                }
+                Err(error) => {
+                    self.owed_resume_invalidation = Some(owed);
+                    Err(error)
+                }
+            };
+        }
+        if crate::resume_invalidation::enabled()
+            && self.last_syscall_nr.is_some_and(|number| {
+                crate::resume_invalidation::eligible_syscall(carrick_abi::CanonicalNr(number))
+            })
+            && crate::resume_invalidation::outstanding_for_mm(self.mm_generation)
+        {
+            self.vcpu.resume_through_invalidation()?;
+        }
+        Ok(None)
     }
 
     fn repoint_guest_alias(
@@ -2172,6 +2525,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             process_asid: self.process_asid,
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
+            required_invalidation: None,
         };
         self.vm
             .repoint_guest_alias(va, target_ipa, len, content, &mut services)
@@ -2198,6 +2552,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             process_asid,
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
+            required_invalidation: None,
         };
         vm.ensure_frame_cow_write(va, len, intent, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
@@ -2242,6 +2597,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             process_asid: self.process_asid,
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
+            required_invalidation: None,
         };
         vm.ensure_sparse_mmap_backing(va, len, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch sparse mmap backing: {error}")))
@@ -3036,6 +3392,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             process_asid: self.process_asid,
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
+            required_invalidation: None,
         };
         vm.materialize_private_file_backing(va, len, host_fd, offset, source, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
@@ -3131,6 +3488,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 process_asid: self.process_asid,
                 carrier_root,
                 suspended_el1_sp: self.suspended_el1_sp,
+                required_invalidation: None,
             };
             return self
                 .vm
@@ -3423,179 +3781,19 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     }
 
     fn next_syscall(&mut self) -> Result<Option<RawSyscall>, TrapError> {
-        // One guest run per call. The loop exists ONLY to re-enter the guest when a
-        // kick lands mid-syscall-trap (the `Kicked` arm); every other exit returns.
-        // A kick absorbed inside Carrick's EL1 code is owed to the next EL0
-        // boundary and settled by whichever exit surfaces first (see `OwedKick`).
-        let mut owed_kick = crate::owed_kick::OwedKick::default();
-        // Whatever EL1 operation a COW fault suspended resumes with this run.
-        self.suspended_el1_sp = None;
-        loop {
-            // Account the guest's CPU time (wall time inside the backend's guest
-            // run) into this thread's guest_cpu slot so getrusage(RUSAGE_SELF) /
-            // times / `/proc` see it. Done ONCE here, so every aarch64 backend on
-            // this shared engine gets it for free (mirrors carrick-x86).
-            let run = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
-            self.pending_guest_run_receipt_ns = self
-                .pending_guest_run_receipt_ns
-                .saturating_add(run.elapsed_ns);
-            match run
-                .value
-                .map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))?
-            {
-                Aarch64Exit::Syscall {
-                    frame,
-                    resume_pc,
-                    current_guest_sp,
-                } => {
-                    // The EL0 `svc` re-entered EL1 and hit the sentinel store. The
-                    // hardware already set ELR_EL1 = (svc addr + 4); the EL1
-                    // vector's own `eret` (after the sentinel store) consumes it —
-                    // so we do NOT touch the PC here; we just read the frame. The
-                    // ENGINE owns the pending state (§2.1).
-                    self.pending_resume_pc = Some(resume_pc);
-                    self.last_syscall_nr = Some(frame.x8);
-                    self.last_syscall_orig_x0 = frame.x0;
-                    // Decode through this engine's `GuestArch` so the runtime loop is
-                    // ISA-neutral: x8 → number, x0..x5 → args. `last_syscall_nr`/
-                    // `orig_x0` stay set from the raw frame above (their x8/x0
-                    // meaning is aarch64-fixed).
-                    owed_kick.settle(&mut self.vcpu)?;
-                    let (number, args) = <Self as ThreadedEngine>::Arch::decode_syscall(&frame);
-                    let guest_abi = <Self as ThreadedEngine>::Arch::linux_guest_abi();
-                    return Ok(Some(RawSyscall {
-                        current_guest_sp,
-                        number: carrick_abi::CanonicalNr(number),
-                        args,
-                        guest_abi,
-                        // aarch64 guests already issue canonical numbers, so the
-                        // ISA-native number equals the dispatch number.
-                        native_number: carrick_abi::NativeNr(number),
-                    }));
-                }
-                Aarch64Exit::EL0Fault {
-                    syndrome,
-                    elr,
-                    far,
-                    x16,
-                    x17,
-                    x29,
-                    x30,
-                    sp,
-                    from_el0_direct,
-                } => {
-                    // The fault ESR is only valid between fault and delivery; latch
-                    // it so `inject_signal` can put it in the arm64 sigframe's
-                    // `esr_context` (required by Rosetta's handler).
-                    self.last_fault_esr = syndrome;
-                    owed_kick.settle(&mut self.vcpu)?;
-                    return Err(TrapError::el0_fault(
-                        syndrome,
-                        elr,
-                        far,
-                        x16,
-                        x17,
-                        x29,
-                        x30,
-                        sp,
-                        from_el0_direct,
-                    ));
-                }
-                Aarch64Exit::Stage1CowFault { syndrome, far } => {
-                    self.last_fault_esr = syndrome;
-                    self.suspended_el1_sp =
-                        Some(self.vcpu.get_reg(Reg::SpEl1).map_err(|error| {
-                            TrapError::Hypervisor(format!(
-                                "read SP_EL1 of EL1 stopped by a COW fault: {error}"
-                            ))
-                        })?);
-                    owed_kick.settle(&mut self.vcpu)?;
-                    return Err(TrapError::Stage1CowFault {
-                        syndrome,
-                        far,
-                        elr: self.vcpu.get_reg(Reg::Pc).unwrap_or(0),
-                        spsr: self.vcpu.get_reg(Reg::Pstate).unwrap_or(0),
-                    });
-                }
-                Aarch64Exit::Sys64Read { esr: _ } => {
-                    // An EL0 `MRS` of an emulated ID/timer/cache register (Rosetta
-                    // x86-on-arm + HVF). KVM's config never traps `MRS`, so this
-                    // never surfaces on the KVM path; a future HVF migration
-                    // services it via the shared `emulate_el0_sys64_read` and
-                    // re-enters. Re-run the guest for now (no-op on KVM).
-                    owed_kick.rearm(&mut self.vcpu)?;
-                    continue;
-                }
-                Aarch64Exit::MaintenanceDone => {
-                    // The maintenance trampoline's completion vehicle is consumed by
-                    // `run_el1_maintenance`'s own loop; reaching it here is a
-                    // spurious re-entry — re-run the guest.
-                    owed_kick.rearm(&mut self.vcpu)?;
-                    continue;
-                }
-                // A WFI/halt with no pending syscall: report `None` so the run loop
-                // can run signal delivery and resume.
-                Aarch64Exit::Halt => {
-                    owed_kick.settle(&mut self.vcpu)?;
-                    return Ok(None);
-                }
-                Aarch64Exit::Kicked => {
-                    // A cross-thread kick (host signal → KVM_RUN EINTR, e.g. a timer
-                    // or `tgkill`) can land while the guest is MID-SYSCALL-TRAP: the
-                    // EL0 `svc` has already re-entered EL1 and the vCPU PC is inside
-                    // carrick's EL1 vector, with the sentinel-store MMIO not yet
-                    // surfaced. Reporting that as a deliverable kick (→ the loop
-                    // injects a signal at the EL1-vector PC) corrupts the in-flight
-                    // syscall and wedges the guest in an EL0 spin. If the PC is in
-                    // the EL1 vector, swallow the kick and re-enter the guest so the
-                    // syscall completes; the pending signal is delivered cleanly on
-                    // the syscall return. Only a kick taken in genuine guest EL0 code
-                    // is reported (`Ok(None)`).
-                    let pc = self.vcpu.get_reg(Reg::Pc)?;
-                    let in_vector = carrick_mem::memory::is_carrick_el1_vector_va(pc);
-                    let in_el1_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-                        ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-                            + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE)
-                        .contains(&pc);
-                    if in_vector
-                        || in_el1_image
-                        || carrick_mem::memory::is_carrick_el0_clock_stub_va(pc)
-                    {
-                        // Clock completion may have already passed its flag
-                        // check. Normalize to the original SVC, then owe the
-                        // kick to EL0: it is taken at the SVC's PC BEFORE the
-                        // syscall replays, and the replay crosses host
-                        // dispatch afterwards with the kick already served.
-                        let normalized = self.vcpu.force_clock_host_boundary()?;
-                        if in_vector || in_el1_image || normalized {
-                            let site = if in_vector {
-                                crate::owed_kick::AbsorbedKickSite::El1Vector
-                            } else if in_el1_image {
-                                crate::owed_kick::AbsorbedKickSite::El1Image
-                            } else {
-                                crate::owed_kick::AbsorbedKickSite::El0ClockStub
-                            };
-                            owed_kick.absorb(&mut self.vcpu, pc, site)?;
-                            continue;
-                        }
-                    }
-                    owed_kick.settle(&mut self.vcpu)?;
-                    return Ok(None);
-                }
-                Aarch64Exit::Memory { gpa, va } => {
-                    // A sparse/alias backend (HVF lazy high-VA alias re-map) can
-                    // resolve + retry; KVM keeps the default `Ok(false)`. Unhandled
-                    // → surface.
-                    if self.vm.handle_memory_exit(gpa, va)? {
-                        owed_kick.rearm(&mut self.vcpu)?;
-                        continue;
-                    }
-                    return Err(TrapError::Hypervisor(format!(
-                        "aarch64 backend did not handle memory exit for gpa=0x{gpa:x} va=0x{va:x}"
-                    )));
-                }
+        let armed = self.arm_resume_invalidation()?;
+        let result = self.run_to_next_syscall();
+        if let Some(owed) = armed {
+            // Kicks inside the entry are absorbed and re-run, so any surfaced
+            // exit lies past it: the invalidation completed. Stopped inside it
+            // (a failed run) the debt stays owed.
+            let layout = carrick_mem::memory::mailbox_resume_layout();
+            match self.vcpu.get_reg(Reg::Pc) {
+                Ok(pc) if !(layout.entry..layout.end).contains(&pc) => owed.complete_on_return(),
+                _ => self.owed_resume_invalidation = Some(owed),
             }
         }
+        result
     }
 
     fn last_syscall_nr(&self) -> Option<u64> {
@@ -3607,6 +3805,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     }
 
     fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
+        self.settle_owed_resume_invalidation_or_log();
         self.vm.process_exit_cleanup()
     }
 
@@ -3627,6 +3826,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     }
 
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+        self.settle_owed_resume_invalidation()?;
         let expected_shared = self.exec_predecessor_shared.take();
         let authority_id = self.page_tables.authority_id();
         // Delegate the image replacement to the backend (remap slots / rebuild VM +
@@ -3866,6 +4066,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             process_asid: self.process_asid,
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
+            required_invalidation: None,
         };
         let refusal =
             match self
@@ -4126,6 +4327,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn snapshot_guest_state_for_publication(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
+        self.settle_owed_resume_invalidation()?;
         let snapshot = self.vcpu.snapshot()?;
         let continuation = self.vm.task_continuation(&self.vcpu)?;
         Ok(GuestCpuState::from_aarch64_v1(
@@ -4373,6 +4575,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             process_asid,
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
+            required_invalidation: None,
         };
         vm.refresh_fork_process_state(&mut flush)?;
         drop(flush);
@@ -4422,6 +4625,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             process_asid,
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
+            required_invalidation: None,
         };
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
         let resolution = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
@@ -5636,6 +5840,13 @@ mod tests {
         assert!(service.contains("run_stage1_maintenance_on("));
         assert!(service.contains("self.process_asid"));
         assert!(!service.contains("run_el1_maintenance"));
+        // Owed or not, a required invalidation after an edit is ASIDE1IS.
+        let after_edit = production
+            .split("fn invalidate_after_edit")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("required invalidation after an edit");
+        assert!(after_edit.contains("self.run_stage1_maintenance()"));
         for live_path in [
             "fn repoint_guest_alias",
             "fn pt_edit_and_flush",
@@ -5653,6 +5864,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("production live mutation path {live_path}"));
             assert!(
                 body.contains("run_stage1_maintenance")
+                    || body.contains("self.invalidate_after_edit()")
                     || (body.contains("EngineStage1Services::<V>")
                         && body.contains("process_asid")),
                 "{live_path} must select ASIDE1IS directly or through the driving-vCPU service"
