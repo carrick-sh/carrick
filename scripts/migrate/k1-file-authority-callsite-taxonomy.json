@@ -3165,7 +3165,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 3362,
+      "line": 3368,
       "categories": [
         "description_guard"
       ],
