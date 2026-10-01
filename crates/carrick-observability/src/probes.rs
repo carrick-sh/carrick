@@ -877,6 +877,49 @@ impl HvpatchFirstTouchDeliverReason {
     }
 }
 
+/// Where an address space's reservation root admission came from. Append
+/// only: `scripts/dtrace/` reads the ordinals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchEl1RootOrigin {
+    /// The MM's first load: the initial runner, or the new MM of an exec.
+    Bind = 0,
+    /// The fork commit of a copied MM.
+    ForkCommit = 1,
+}
+
+impl HvpatchEl1RootOrigin {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// What a published address space's root admission decided. Append only:
+/// `scripts/dtrace/` reads the ordinals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchEl1RootAdmission {
+    /// The root owns the MM's anonymous-private memory: EL1 serves it.
+    Delegated = 0,
+    /// The host keeps it: `CARRICK_EL1_RESERVATIONS=0`, or no provider.
+    HostSetup = 1,
+    /// No exact-MM mutation authority could be taken; nothing was asked.
+    NoAuthority = 2,
+    /// The kernel refused (each refusal below); the MM stays in host setup.
+    RefusedBusy = 3,
+    RefusedStale = 4,
+    RefusedInvalid = 5,
+    RefusedMetadataRequired = 6,
+    /// Any other refusal (an import that collided or hit a limit).
+    RefusedOther = 7,
+}
+
+impl HvpatchEl1RootAdmission {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Exact authority that triggered a frame-COW transaction. Append only: these
 /// ordinals are part of the signed structural-receipt ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5175,6 +5218,16 @@ mod real {
         /// (`HvpatchFirstTouchDeliverReason`), Linux TID. Fires once per
         /// delivered fault, never on a resolved one.
         fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}
+        /// An address space's reservation root admission at its publication.
+        /// Args: MM id, origin (0 = the MM's first load: initial runner or
+        /// exec; 1 = fork commit), outcome (`HvpatchEl1RootAdmission`
+        /// ordinal). Fires once per published address space.
+        fn hvpatch__el1__root__admission(_: u64, _: u32, _: u32) {}
+        /// A host-venue step on a delegated MM's reservation root was
+        /// refused and fails its syscall. Arg: the `Refusal` ordinal (0 Busy,
+        /// 1 Stale, 2 Invalid, 3 Collision, 4 Hole, 5 ForeignMapping,
+        /// 6 Limit, 7 MetadataRequired). The stack names the step.
+        fn hvpatch__el1__root__host__refusal(_: u32) {}
         /// A first-touch or grow-down resolution was refused by the backend.
         /// Args: fault page VA, access class (0=Read, 1=Write, 2=Execute, 3=Unknown),
         /// site id (1=resident fault plan, 2=mmap growdown plan), formatted error.
@@ -5710,6 +5763,13 @@ mod real {
         /// authority: guest-physical output, bytes, and how many
         /// invalidations it issued (0 when every page was already clean).
         fn hvpatch__exec__publication(_: u64, _: u64, _: u32) {}
+        /// A host read of guest memory (a syscall argument, a buffer the
+        /// host consumes) refused. Args: the failing page's guest VA, the
+        /// read's length, phase (0 EL1-private leaf denies the read, 1 no
+        /// host translation and not fresh zero, 2 backend read failed), and
+        /// that page's live terminal descriptor (0 when no walk). The caller
+        /// usually lowers the refusal to EFAULT.
+        fn guest__internal__read__fault(_: u64, _: u64, _: u32, _: u64) {}
         /// Fires inside rt_sigreturn/restore. `saved_pc` is the PC about to be
         /// restored into ELR_EL1, `sp` the SP_EL0 the frame was read from,
         /// `magic` the frame magic read back. A corrupted `saved_pc` or `magic`
@@ -6525,6 +6585,23 @@ mod real {
             u32::from(invalidated),
             retries
         ));
+    }
+
+    /// An address space's reservation root admission at its publication.
+    /// See the `hvpatch__el1__root__admission` provider doc.
+    #[inline(never)]
+    pub fn hvpatch_el1_root_admission(
+        mm: u64,
+        origin: super::HvpatchEl1RootOrigin,
+        outcome: super::HvpatchEl1RootAdmission,
+    ) {
+        carrick_usdt::hvpatch__el1__root__admission!(|| (mm, origin.raw(), outcome.raw()));
+    }
+
+    /// See the `hvpatch__el1__root__host__refusal` provider doc.
+    #[inline(never)]
+    pub fn hvpatch_el1_root_host_refusal(refusal: u32) {
+        carrick_usdt::hvpatch__el1__root__host__refusal!(|| refusal);
     }
 
     /// The runtime delivered an EL0 data abort as a signal instead of
@@ -7840,6 +7917,10 @@ mod real {
         carrick_usdt::hvpatch__exec__publication!(|| (output, len, invalidations));
     }
 
+    pub fn guest_internal_read_fault(page: u64, length: u64, phase: u32, live_descriptor: u64) {
+        carrick_usdt::guest__internal__read__fault!(|| (page, length, phase, live_descriptor));
+    }
+
     pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
         carrick_usdt::signal__restore!(|| (saved_pc, sp, magic));
     }
@@ -8887,6 +8968,8 @@ mod stub {
     stub!(hvpatch_stale_stage1_fault(far: u64, kind: u32, invalidated: bool, retries: u32));
     stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
+    stub!(hvpatch_el1_root_admission(mm: u64, origin: super::HvpatchEl1RootOrigin, outcome: super::HvpatchEl1RootAdmission));
+    stub!(hvpatch_el1_root_host_refusal(refusal: u32));
     stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
     stub!(hvpatch_anonymous_discard_entry(va: u64, len: u64, granule: u64));
@@ -8981,6 +9064,9 @@ mod stub {
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(guest_internal_write_fault(address: u64, length: u64, phase: u32, error: &str));
     stub!(hvpatch_exec_publication(output: u64, len: u64, invalidations: u32));
+    }
+
+    stub!(guest_internal_read_fault(page: u64, length: u64, phase: u32, live_descriptor: u64));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
     stub!(kick_in_kernel(pc: u64, el: u32));
     stub!(vcpu_kick(vcpu: u64, valid: i32, rc: i32));

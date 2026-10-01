@@ -328,6 +328,19 @@ where
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(target_os = "none")]
+        if let (Some(zone), Some(task)) = (zone.as_ref(), cur_task)
+            && memory::delegated_anonymous_root(
+                nr as u64,
+                task,
+                &zone.tables.spaces,
+                memory::reservations::shared_guest(),
+            )
+            .is_some()
+        {
+            counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::PendingHostWork as usize]
+                .fetch_add(1, Ordering::Relaxed);
+        }
         return Action::Forward;
     }
 

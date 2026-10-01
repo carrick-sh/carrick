@@ -231,7 +231,7 @@ impl SyscallDispatcher {
         match reconciled {
             Ok(_) => {}
             Err(mem::el1_reservations::El1ReturnError::Authority(refusal)) => {
-                return Some(Err(DispatchError::ReservationAuthority(refusal)));
+                return Some(Err(mem::anonymous::root_refusal(refusal)));
             }
             // The backend could not retire the extents (they stay owed):
             // the same answer a failed `munmap` backend retirement gives.
