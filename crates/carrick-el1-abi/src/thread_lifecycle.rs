@@ -1238,7 +1238,7 @@ mod tests {
         let mut seen = Vec::new();
         let h = LifecycleHatches::from_lookup(|name: &str| {
             seen.push(std::string::String::from(name));
-            (name == EL1_SIGMASK_HATCH_ENV).then_some(" 0 ")
+            (name == EL1_SIGMASK_HATCH_ENV).then_some("0")
         });
         assert_eq!(
             h,
@@ -1259,6 +1259,24 @@ mod tests {
         assert!(!p.serves_threads());
         assert!(p.serves_sigmask());
         assert!(ThreadLifecyclePage::new().serves_threads());
+    }
+
+    #[test]
+    fn lifecycle_hatches_require_an_exact_zero() {
+        for value in ["", "1", "false", "00", " 0", "0 ", "\t0\n"] {
+            assert_eq!(
+                LifecycleHatches::from_lookup(|_| Some(value)),
+                LifecycleHatches::ON,
+                "only the exact string 0 disables lifecycle serving: {value:?}"
+            );
+        }
+        assert_eq!(
+            LifecycleHatches::from_lookup(|_| Some("0")),
+            LifecycleHatches {
+                threads: false,
+                sigmask: false
+            }
+        );
     }
 
     #[test]

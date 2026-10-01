@@ -175,3 +175,19 @@ The requested `just test-kernel`, serial `carrick-vmm-hvf` lib tests,
 `just clippy`, `just lint-domains`, full signed `el1_` batch and CLI
 `hvpatch-exit-attribution` trace have not been run here. The focused signed
 counters establish the reported reds, not completion of those gates.
+
+## L4 contract checkpoint
+
+The first kernel contracts reserve identities in two live processes and
+prepare them in reverse order, and mutate each parent's mask and affinity
+between reservation and preparation. They require identity and inheritance
+to be fixed at claim time. A separate ABI contract requires only the exact
+string `0` to disable lifecycle serving, including whitespace counterexamples.
+
+These contracts are not yet observed red. The command
+`CARGO_BUILD_JOBS=3 cargo test -p carrick-kernel --lib lifecycle_ -- --nocapture`
+was interrupted with exit 130 during compilation when the director paused
+all builds and tests for landing I. No test executed. Production code remains
+unchanged. After resume, run the focused contracts, implement their fixes,
+then continue shared backing, venue wiring, settlement and admission work.
+Rebase onto landing I before signed acceptance, as directed.
