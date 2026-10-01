@@ -39,6 +39,54 @@ so per-start latency grows with queue length. Off-CPU lock waits add about
 20 ms per start at ten lanes: the exec cache, the alias-registry
 retirement and frame-grant inventory locks.
 
+## Quiet-host comparison (director's window, 2026-10-01)
+
+The director ran the Docker side and a Carrick `startup.sh` in a quiet window
+([`process-startup/quiet/`](process-startup/quiet/)). These times are
+quiet-host numbers. The earlier tables below were taken on a loaded host and
+are superseded wherever they disagree.
+
+| per process (1 lane) | Carrick | Docker (native arm64 Linux) | ratio |
+|---|---|---|---|
+| `/bin/true` (fork+exec+wait) | 2.8 ms | 0.4 ms | 7.0× |
+| `python3 -c pass` | 12.3 ms | 5.0 ms | 2.5× |
+| `node24 -e 0` | 28.4 ms | 10.3 ms | 2.8× |
+| `tools/test.py --help` (import) | 59.5 ms | 27.9 ms | 2.1× |
+| `node24 -e 0` at 4 lanes | 42.0 ms | 11.8 ms | 3.6× |
+| `node24 -e 0` at 10 lanes | 108.6 ms | 19.9 ms | 5.5× |
+| `nproc` seen by the guest | 4 | 10 | |
+
+Native per-start cost from `rusage.py`:
+
+| command | user | sys | minor faults |
+|---|---|---|---|
+| `/bin/true` | 0.3 ms | 0.2 ms | 504 |
+| `python -c pass` | 4.3 ms | 0.9 ms | 1402 |
+| `node -e 0` | 7.4 ms | 3.3 ms | 3409 |
+| `test.py` import | 24.1 ms | 3.8 ms | 3886 |
+
+Docker `node -e 0` throughput scales to 536 starts/s at 10 lanes. Carrick
+plateaus at about 35/s on its 4 guest CPUs.
+
+What this changes:
+
+- **The fixed cost is mostly Carrick's, not the program's.**
+  - Native node start is 10.7 ms of CPU. Carrick's untraced 28.4 ms
+    leaves about 18 ms of Carrick overhead per start.
+  - For `/bin/true` it is about 2.4 ms per fork+exec+wait, against 0.4 ms
+    native: process creation is the largest relative cost (7×).
+- **Fault count is not the problem; cost per fault is.**
+  - Native node takes 3409 minor faults per start. Carrick takes 549 EL0
+    aborts, because grants and arming cover many pages per fault.
+  - Carrick's cost is per-event: forwarded mm syscalls, TLB-maintenance
+    round trips (`hvc #1`), fork/exec page-table work.
+  - The lever order above stands. Process creation and address-space
+    mutation lead; fault count reduction would not help.
+- **Concurrency gap.**
+  - At 10 lanes Carrick is 5.5× native against 2.8× at one lane. Part of
+    that is the 4-vCPU cap; part is the shared locks named below.
+  - Native throughput keeps scaling to 10 lanes.
+
 ## Method
 
 - Short commands run in a loop inside the image
