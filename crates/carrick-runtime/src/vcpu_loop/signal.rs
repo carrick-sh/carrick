@@ -3612,6 +3612,8 @@ mod guest_descriptor_lane_tests {
         /// ordinal on; earlier ones apply.
         refuse_from: Option<usize>,
         answered: usize,
+        /// Host-driven drain calls taken: each is a VM exit and entry.
+        calls: usize,
     }
 
     impl GuestDrainVenue for FakeVenue<'_> {
@@ -3627,6 +3629,7 @@ mod guest_descriptor_lane_tests {
         ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
             assert_eq!(frame.esr, carrick_el1_abi::DESCRIPTOR_DRAIN_ESR);
             assert_eq!(frame.slot, 9, "the frame is the calling vCPU's");
+            self.calls += 1;
             let mm = frame.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM];
             let in_flight = self.slots.submitted_for(mm).count();
             self.max_in_flight = self.max_in_flight.max(in_flight);
@@ -3777,6 +3780,7 @@ mod guest_descriptor_lane_tests {
                 max_in_flight: 0,
                 refuse_from: None,
                 answered: 0,
+                calls: 0,
             };
             assert!(
                 carrick_aarch64::descriptor_drain::publish_copyout(
@@ -3831,6 +3835,7 @@ mod guest_descriptor_lane_tests {
             max_in_flight: 0,
             refuse_from: None,
             answered: 0,
+            calls: 0,
         };
         let receipt = carrick_aarch64::descriptor_drain::publish_copyout(
             &mut venue,
@@ -3872,13 +3877,15 @@ mod guest_descriptor_lane_tests {
             max_in_flight: 0,
             refuse_from: None,
             answered: 0,
+            calls: 0,
         };
         let receipts = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap();
         assert_eq!(receipts.len(), 2);
-        assert_eq!(
-            venue.max_in_flight, 1,
-            "one submission at a time, settled in order"
-        );
+        // Every arm transaction rides one host-driven drain call (one VM
+        // exit, not one per range); EL1 applies them in submission order
+        // and the host settles each receipt in that order.
+        assert_eq!(venue.max_in_flight, 2);
+        assert_eq!(venue.calls, 1, "one drain call for the whole arm");
         assert!(!writable(&authority, VA));
         assert!(!writable(&authority, VA + 4096));
         assert!(writable(&authority, VA + 2 * 4096), "outside the arm");
@@ -3904,6 +3911,7 @@ mod guest_descriptor_lane_tests {
             max_in_flight: 0,
             refuse_from: None,
             answered: 0,
+            calls: 0,
         };
         assert!(apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).is_err());
         assert!(
@@ -3948,6 +3956,7 @@ mod guest_descriptor_lane_tests {
                 max_in_flight: 0,
                 refuse_from: Some(refuse_from),
                 answered: 0,
+                calls: 0,
             };
             let error = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap_err();
             assert_eq!(

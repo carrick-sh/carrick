@@ -38,6 +38,19 @@ pub enum GuestPublishError {
 }
 
 impl GuestPublishError {
+    /// The same failure once another transaction of the publication
+    /// applied: live state is partial, never a clean refusal.
+    #[must_use]
+    pub fn into_partial(self) -> Self {
+        match self {
+            Self::NotApplied { outcome, error } => Self::Unsettled(TrapError::Hypervisor(format!(
+                "refused ({outcome:?}) after another transaction of the publication applied: \
+                 {error}"
+            ))),
+            unsettled @ Self::Unsettled(_) => unsettled,
+        }
+    }
+
     /// Classify a settlement failure by its typed receipt error.
     #[must_use]
     pub fn from_settle(error: GuestTxnSettleError, context: &str) -> Self {
@@ -162,13 +175,15 @@ impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
 }
 
 /// Apply `txns` for one MM synchronously, in order, on the venue's vCPU while
-/// the host holds that MM: each is submitted into a free slot, EL1 applies it
-/// through the host-driven drain call under the host's delegated custody, and
-/// its exact receipt is settled before the next one is submitted. Any
-/// refusal, blocked drain or unauthenticated receipt is an error; the caller
-/// decides whether that is fatal. Only a clean refusal of the FIRST
-/// transaction is [`GuestPublishError::NotApplied`]: once one applied, a later
-/// refusal leaves the publication partial.
+/// the host holds that MM. The transactions are submitted into free slots
+/// in order and ride one host-driven drain call (one VM exit, however many
+/// there are; more only when the slots run out); EL1 applies every
+/// submission for the MM in submission order under the host's delegated
+/// custody, and each exact receipt is settled in that order. Any refusal,
+/// blocked drain or unauthenticated receipt is an error; the caller decides
+/// whether that is fatal. Only a call in which EL1 applied nothing and
+/// refused the FIRST transaction cleanly is [`GuestPublishError::NotApplied`]:
+/// once one applied, a refusal leaves the publication partial.
 pub fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
     venue: &mut V,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
@@ -181,47 +196,85 @@ pub fn apply_guest_descriptor_txns_now<V: GuestDrainVenue>(
     let own = venue
         .slot()
         .ok_or_else(|| fail("vCPU has no slot".to_owned()))?;
+    let count = slots.as_slice().len();
     let mut verified = Vec::with_capacity(txns.len());
-    for txn in txns {
+    let mut rest = txns;
+    while let Some(first) = rest.first() {
         let ttbr0 = venue.live_ttbr0()?;
-        if ttbr0 & 0x0000_FFFF_FFFF_F000 != txn.root.raw() {
+        if ttbr0 & 0x0000_FFFF_FFFF_F000 != first.root.raw() {
             return Err(GuestPublishError::Unsettled(fail(format!(
                 "vCPU TTBR0 0x{ttbr0:x} is not the transaction root 0x{:x}",
-                txn.root.raw()
+                first.root.raw()
             ))));
         }
-        let used = (0..slots.as_slice().len())
-            .map(|offset| (own + offset) % slots.as_slice().len())
-            .find(|&slot| slots.submit(slot, txn))
-            .ok_or_else(|| fail("every descriptor slot is busy".to_owned()))?;
-        let frame = drain_frame(own, txn.id.mm_key.get(), ttbr0);
+        // Submit in order into free slots, as many as fit, all for one root.
+        let mut submitted = Vec::new();
+        let mut cursor = 0;
+        for txn in rest {
+            if txn.root != first.root || txn.id.mm_key != first.id.mm_key {
+                break;
+            }
+            let Some(used) = (cursor..count)
+                .map(|offset| (own + offset) % count)
+                .find(|&slot| slots.submit(slot, txn))
+            else {
+                break;
+            };
+            cursor = (used + count - own) % count + 1;
+            submitted.push((used, txn));
+        }
+        if submitted.is_empty() {
+            return Err(fail("every descriptor slot is busy".to_owned()).into());
+        }
+        let withdraw = |from: &[(
+            usize,
+            &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        )]| {
+            for &(used, txn) in from {
+                let _ = slots.withdraw(used, txn.id);
+            }
+        };
+        let frame = drain_frame(own, first.id.mm_key.get(), ttbr0);
         let answered = match venue.drain_call(frame) {
             Ok(answered) => answered,
             Err(error) => {
-                let _ = slots.withdraw(used, txn.id);
+                withdraw(&submitted);
                 return Err(error.into());
             }
         };
         if answered.x[0] & carrick_el1_abi::DESCRIPTOR_DRAIN_BLOCKED != 0 {
-            let _ = slots.withdraw(used, txn.id);
+            withdraw(&submitted);
             return Err(fail("EL1 could not claim the MM".to_owned()).into());
         }
-        let receipt = slots
-            .take_receipt(used, txn.id)
-            .ok_or_else(|| fail(format!("no receipt for {:?}", txn.id)))?;
-        match venue.settle(txn, &receipt) {
-            Ok(receipt) => verified.push(receipt),
-            Err(GuestPublishError::NotApplied { outcome, error }) if !verified.is_empty() => {
-                return Err(GuestPublishError::Unsettled(TrapError::Hypervisor(
-                    format!(
-                        "guest descriptor {:?} not applied ({outcome:?}) after {} applied: {error}",
-                        txn.id,
-                        verified.len()
-                    ),
-                )));
+        // Settle every receipt in order; consume them all even after an
+        // error so no slot keeps this call's receipt.
+        let mut first_error = None;
+        let mut applied_after_error = false;
+        for &(used, txn) in &submitted {
+            let Some(receipt) = slots.take_receipt(used, txn.id) else {
+                let _ = slots.withdraw(used, txn.id);
+                first_error.get_or_insert(GuestPublishError::Unsettled(fail(format!(
+                    "no receipt for {:?}",
+                    txn.id
+                ))));
+                continue;
+            };
+            match venue.settle(txn, &receipt) {
+                Ok(receipt) if first_error.is_none() => verified.push(receipt),
+                Ok(_) => applied_after_error = true,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
-            Err(error) => return Err(error),
         }
+        if let Some(error) = first_error {
+            return Err(if verified.is_empty() && !applied_after_error {
+                error
+            } else {
+                error.into_partial()
+            });
+        }
+        rest = &rest[submitted.len()..];
     }
     Ok(verified)
 }
