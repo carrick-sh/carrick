@@ -1030,9 +1030,12 @@ fn retire_reservation_root(tables: SpaceTables, index: carrick_sched_core::Space
     let Some(key) = carrick_el1_abi::ReservationMm::new(mm.raw()) else {
         return;
     };
+    // The space is closed and drained: EL1 journals no return again, and
+    // the owed extents' frames retire with the MM's own inventory.
     match table
         .lock(index.index(), key)
-        .and_then(|model| model.retire())
+        .and_then(crate::dispatch::mem::el1_reservations::settle_final_root)
+        .map(|_| ())
     {
         Ok(()) | Err(Refusal::Stale) => {}
         Err(_) => carrick_fatal!(

@@ -284,6 +284,49 @@ impl MemView<'_> {
     }
 }
 
+impl MemView<'_> {
+    /// Whether this MM is a copied-MM fork twin of `parent`: a delegated
+    /// parent's twin names its root; a host-setup parent's child carries no
+    /// seed. A delegated MM is nobody's unsealed twin.
+    pub(in crate::dispatch) fn is_fork_twin_of(&self, parent: crate::kernel::MmId) -> bool {
+        match self.mm_authority().lock().anonymous_authority() {
+            AnonymousAuthority::Delegated(_) => false,
+            AnonymousAuthority::HostSetup(arena) => arena
+                .fork_seed
+                .is_none_or(|seed| seed.parent.raw() == parent.raw()),
+        }
+    }
+
+    /// Publish a fork child's address space (and its reservation root) at
+    /// its fork commit, with the anchors its host-setup twin carries and the
+    /// forking thread's limits, which the child inherits. See
+    /// [`crate::dispatch::mm_mutation::ForkCommit::publish_child_address_space`].
+    pub(in crate::dispatch) fn publish_fork_child_address_space(
+        &self,
+        ttbr0: u64,
+        ttbr1: u64,
+    ) -> Option<crate::kernel::AddressSpacePublication> {
+        let authority = self.mm_authority();
+        authority.seal_reservation_provider();
+        let (brk_current, mmap_next) = {
+            let state = authority.lock();
+            (state.program_break(), state.arena_high_water())
+        };
+        let (address, data) = self
+            .address_space_limits_apply(true)
+            .unwrap_or((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY));
+        crate::kernel::publish_address_space_with_layout(
+            authority.mm_id,
+            authority.pt_quiesce(),
+            ttbr0,
+            ttbr1,
+            brk_current,
+            mmap_next,
+            crate::kernel::ReservationLimits { address, data },
+        )
+    }
+}
+
 impl SyscallDispatcher {
     /// The ONE production admission of this MM's delegated anonymous root.
     ///
@@ -681,3 +724,8 @@ pub use projection::{NonAnonymousVmas, ReservationProcMaps};
 mod provider;
 pub(in crate::dispatch) use provider::{DelegatedRoot, ReservationProviderSlot};
 pub use provider::{HostReservationProvider, PreparedHostReservations, PreparedReservationSession};
+
+#[path = "el1_reservations/returns.rs"]
+mod returns;
+pub use returns::El1ReturnError;
+pub(crate) use returns::settle_final_root;

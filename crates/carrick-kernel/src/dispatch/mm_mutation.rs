@@ -245,6 +245,7 @@ impl<'authority> MmMutationGuard<'authority> {
     /// the stage-1 page-table exclusion.
     pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {
         MmTransactionGuard {
+            mm: Some(self.mm),
             depth: {
                 carrick_thread::fork_quiesce::emit_topology_lock(
                     self.operation,
@@ -548,6 +549,9 @@ impl HostAliasPermit<'_> {
 /// stage-1 pause is already held: the P -> topology order becomes a type,
 /// not a comment.
 pub struct MmTransactionGuard<'guard> {
+    /// The MM whose mutation guard minted this transaction (`None`: the
+    /// terminal retirement transaction, which has no guard).
+    mm: Option<MmId>,
     depth: carrick_thread::fork_quiesce::TopologyDepth,
     operation: carrick_observability::probes::HvpatchTopologyOperation,
     guest_pid: i32,
@@ -614,6 +618,10 @@ impl Drop for HostAliasCoordinatorGuard<'_> {
         self.coordinator.idle.notify_all();
     }
 }
+
+#[path = "mm_mutation/fork_commit.rs"]
+mod fork_commit;
+pub use fork_commit::{ForkCommit, ForkCommitRefusal};
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support {
@@ -776,6 +784,7 @@ mod tests {
 /// paths; the source-shape test in `mm_authority.rs` pins both.
 pub fn terminal_process_transaction() -> MmTransactionGuard<'static> {
     MmTransactionGuard {
+        mm: None,
         depth: {
             let operation = carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire;
             carrick_thread::fork_quiesce::emit_topology_lock(
