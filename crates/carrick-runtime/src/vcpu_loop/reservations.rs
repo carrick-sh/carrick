@@ -89,6 +89,11 @@ impl PreparedHostReservations for PreparedView {
                 .cast::<carrick_el1_abi::ZoneTables>()
         };
         let index = zone.spaces.find(mm.raw()).ok_or(Refusal::Stale)?.index();
-        table(&self.0.access)?.lock_resolved(index, mm, &self.0.nodes)
+        table(&self.0.access)?.lock_resolved(
+            index,
+            mm,
+            &self.0.nodes,
+            &carrick_kernel::el1_zone::HostLockWait,
+        )
     }
 }

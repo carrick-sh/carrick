@@ -16,6 +16,9 @@ pub trait PreparedHostReservations {
     /// The returned guard borrows this view, retaining the region and exact
     /// extent pins until the operation finishes. Resolve the exact MM's slot
     /// and use SharedReservations::lock_resolved, never a guest pointer cast.
+    /// The host waits out a held root (`HostLockWait`): its holder is EL1 on
+    /// some vCPU, whose critical section always completes, so `Busy` from
+    /// this lock is never an answer the host venue sees.
     fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal>;
 }
 
@@ -30,9 +33,9 @@ pub struct PreparedReservationSession {
 pub(in crate::dispatch) struct ReservationProviderSlot {
     published: bool,
     provider: Option<Arc<dyn HostReservationProvider>>,
-    /// Serializes every host venue of THIS MM's root. The root lock is a
-    /// bounded try-lock sized for EL1 critical sections; two host threads of
-    /// one MM must queue here instead of refusing each other with `Busy`.
+    /// Serializes every host venue of THIS MM's root, so the root lock's
+    /// only other holder a host venue can meet is an EL1 critical section,
+    /// which it waits out (see [`PreparedHostReservations::lock`]).
     host_serial: Arc<parking_lot::Mutex<()>>,
     /// Root node reads by every host-venue step on this MM's root: the
     /// work-budget instrument of the delegated readers' cost contracts.
