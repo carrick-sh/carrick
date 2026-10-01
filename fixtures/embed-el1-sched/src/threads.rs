@@ -1408,6 +1408,7 @@ pub fn ptrace_clone() -> i32 {
     let mut new_thread_stopped = Vec::new();
     let mut exit_code = None;
     let mut options_ok = false;
+    let mut options_errno = None;
     while Instant::now() < deadline && exit_code.is_none() {
         let Some((who, status)) = waited(libc::WNOHANG) else {
             std::thread::sleep(Duration::from_millis(1));
@@ -1435,6 +1436,9 @@ pub fn ptrace_clone() -> i32 {
             options_ok =
                 unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, libc::PTRACE_O_TRACECLONE) }
                     == 0;
+            if !options_ok {
+                options_errno = std::io::Error::last_os_error().raw_os_error();
+            }
             unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, 0) };
         } else if event == libc::PTRACE_EVENT_CLONE {
             clone_event = true;
@@ -1474,7 +1478,7 @@ pub fn ptrace_clone() -> i32 {
         && attached
         && exit_code == Some(0);
     println!(
-        "ptrace-clone initial_stop={initial_stop} options_ok={options_ok} clone_event={clone_event} new_tid={new_tid} new_thread_stopped={new_thread_stopped:?} exit={exit_code:?} {} ok={ok}",
+        "ptrace-clone initial_stop={initial_stop} options_ok={options_ok} options_errno={options_errno:?} clone_event={clone_event} new_tid={new_tid} new_thread_stopped={new_thread_stopped:?} exit={exit_code:?} {} ok={ok}",
         notes.join(",")
     );
     if ok { 0 } else { 1 }
