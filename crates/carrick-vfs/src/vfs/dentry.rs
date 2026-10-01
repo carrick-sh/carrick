@@ -3845,7 +3845,7 @@ mod tests {
 
     /// Deterministic (single-threaded, no cross-test contamination)
     /// regression test for `check_fork`'s foreign-bump branch, using the
-    /// `cfg(test)` helper `fs_resolve_cache::simulate_sibling_path_bump` to
+    /// `cfg(test)` helper `fs_resolve_cache::FsCacheCoherence::simulate_sibling_path_bump` to
     /// force exactly the "a sibling process mutated the shared namespace"
     /// condition `d48c36823` handles, without relying on unrelated test
     /// threads to bump the process-global generation word.

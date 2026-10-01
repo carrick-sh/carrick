@@ -33,10 +33,10 @@ const PATH_GENERATION_SLOT: usize = 0;
 /// equally fork-shared.
 const DIR_GENERATION_SLOT: usize = 1;
 /// Index of the sandbox-root MARKER generation within the shared page — see
-/// [`current_marker_generation`].
+/// [`FsCacheCoherence::current_marker_generation`].
 const MARKER_GENERATION_SLOT: usize = 2;
 /// Index of the guest-METADATA generation within the shared page — see
-/// [`current_meta_generation`].
+/// [`FsCacheCoherence::current_meta_generation`].
 const META_GENERATION_SLOT: usize = 3;
 /// Number of generation words in the shared page.
 const GENERATION_SLOTS: usize = 4;
@@ -134,7 +134,7 @@ impl FsCacheCoherence {
     /// cache stamps its open dirfds with.
     ///
     /// This is deliberately a SECOND, much slower-moving counter than
-    /// [`current_generation`]. A cached dirfd names an *inode*, so it is only
+    /// [`FsCacheCoherence::current_generation`]. A cached dirfd names an *inode*, so it is only
     /// invalidated by an operation that can change which inode an existing
     /// directory PATH names: a rename or exchange involving a directory, and a
     /// directory removal. Creating a file, writing one, unlinking one, or creating
@@ -153,7 +153,7 @@ impl FsCacheCoherence {
     /// Invalidate every process's directory cache. Call ONLY from an operation
     /// that can re-point an existing directory path — rename/exchange where either
     /// side is a directory, and directory removal (including a whiteout that hides
-    /// one). See [`current_dir_generation`] for why the set is this narrow.
+    /// one). See [`FsCacheCoherence::current_dir_generation`] for why the set is this narrow.
     ///
     /// Returns the generation this call established. A caller that knows EXACTLY
     /// which of its own cached entries the mutation invalidated can re-stamp the
@@ -176,7 +176,7 @@ impl FsCacheCoherence {
     /// A third, near-static counter. Those answers are read from durable root
     /// xattrs that only ever go absent → present, and only a marker STAMP
     /// (`stamp_root_marker`) can change one; a file creation or unlink cannot.
-    /// Keying the absent readings on [`current_generation`] instead made every
+    /// Keying the absent readings on [`FsCacheCoherence::current_generation`] instead made every
     /// structural mutation invalidate all five, so a create/unlink loop re-read
     /// the root xattr (`openat`+`fgetxattr`+`close`) several times per guest
     /// syscall — 3 of the 12 host opens behind one guest `unlink`.
@@ -221,72 +221,11 @@ impl FsCacheCoherence {
     }
 }
 
-/// The shared generation words, one `MAP_SHARED` page, shared with every
-/// host-forked descendant so a mutation in any process invalidates every
-/// process's caches.
-fn generation_word_at(slot: usize) -> &'static AtomicU64 {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let base = *CELL.get_or_init(|| {
-        // SAFETY: a fresh anonymous shared page owned for the process lifetime.
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_SHARED,
-                -1,
-                0,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            // mmap failing at boot means the host is already OOM; fall back to a
-            // leaked process-local array (cross-fork coherence lost, but the
-            // run is failing anyway).
-            let fallback: Box<[AtomicU64; GENERATION_SLOTS]> =
-                Box::new(std::array::from_fn(|_| AtomicU64::new(1)));
-            return Box::into_raw(fallback) as usize;
-        }
-        // SAFETY: `p` is a writable 4 KiB page; `GENERATION_SLOTS` AtomicU64s
-        // fit at its start. Start at 1 so a freshly-stamped entry (gen 1) is
-        // valid until the first mutation; 0 is reserved as "never stamped".
-        unsafe {
-            for slot in 0..GENERATION_SLOTS {
-                (*(p as *mut AtomicU64).add(slot)).store(1, Ordering::SeqCst);
-            }
-        }
-        p as usize
-    });
-    debug_assert!(slot < GENERATION_SLOTS);
-    // SAFETY: `base` points at a live [AtomicU64; GENERATION_SLOTS] valid for
-    // the whole process; MAP_SHARED makes it the SAME physical memory in every
-    // host-forked descendant. `slot` is one of the module constants.
-    unsafe { &*(base as *const AtomicU64).add(slot) }
-}
-
-fn generation_word() -> &'static AtomicU64 {
-    generation_word_at(PATH_GENERATION_SLOT)
-}
-
 /// Process-local generation counter. Incremented whenever this process is
 /// created via a host fork (`pthread_atfork` child callback, or explicit hook in
 /// `carrier::reset_after_fork_child` and `reinit_after_fork`).
 /// Used by in-process caches to detect fork without issuing `libc::getpid()`.
 static PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-// Process-private count of the generation bumps published by this host
-// process. The shared generation also includes sibling processes' bumps;
-// comparing deltas lets a dentry hook retain unaffected local names only when
-// every intervening bump came from this process.
-static LOCAL_PATH_BUMPS: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn local_path_bump_count() -> u64 {
-    LOCAL_PATH_BUMPS.load(Ordering::SeqCst)
-}
-
-#[cfg(test)]
-pub(crate) fn simulate_sibling_path_bump() {
-    generation_word().fetch_add(1, Ordering::SeqCst);
-}
 
 static ATFORK_INIT: std::sync::Once = std::sync::Once::new();
 
@@ -312,109 +251,10 @@ pub fn bump_process_generation() {
     PROCESS_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Force the shared generation word into existence in the ROOT process, BEFORE
-/// any guest `fork`, so every descendant inherits the one `MAP_SHARED` word (a
-/// child that first touched it after forking would map its own private page).
+/// Install process-fork detection. Cohort words are allocated eagerly by
+/// FsCacheCoherence construction, so no process-global mapping is needed.
 pub fn init() {
-    let _ = generation_word();
     ensure_atfork_installed();
-}
-
-/// Current fs-structure generation. A cache entry stamped with this value is
-/// valid until the next structural mutation.
-pub fn current_generation() -> u64 {
-    generation_word().load(Ordering::SeqCst)
-}
-
-/// Invalidate every process's resolve cache by bumping the shared generation.
-/// Call from every structural fs mutation (mkdir/rmdir/rename/symlink/link/
-/// unlink/mknod/create), NOT from content writes.
-pub fn bump_generation() {
-    generation_word().fetch_add(1, Ordering::SeqCst);
-    LOCAL_PATH_BUMPS.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Current DIRECTORY-TOPOLOGY generation — the one the kernel's directory
-/// cache stamps its open dirfds with.
-///
-/// This is deliberately a SECOND, much slower-moving counter than
-/// [`current_generation`]. A cached dirfd names an *inode*, so it is only
-/// invalidated by an operation that can change which inode an existing
-/// directory PATH names: a rename or exchange involving a directory, and a
-/// directory removal. Creating a file, writing one, unlinking one, or creating
-/// a new directory cannot — a new name cannot re-point an existing one.
-///
-/// That distinction is what makes a directory cache viable on a build
-/// workload. A cold `go build` performs thousands of file creations and
-/// unlinks, every one of which bumps the path generation and so flushes the
-/// resolve cache; almost none of them touch directory topology, so the dirfds
-/// survive and the walk they replace is never repaid.
-pub fn current_dir_generation() -> u64 {
-    generation_word_at(DIR_GENERATION_SLOT).load(Ordering::SeqCst)
-}
-
-/// Invalidate every process's directory cache. Call ONLY from an operation
-/// that can re-point an existing directory path — rename/exchange where either
-/// side is a directory, and directory removal (including a whiteout that hides
-/// one). See [`current_dir_generation`] for why the set is this narrow.
-///
-/// Returns the generation this call established. A caller that knows EXACTLY
-/// which of its own cached entries the mutation invalidated can re-stamp the
-/// survivors with this value (see
-/// `HostFsBackend::evict_dir_cache_subtree_restamping`) instead of paying the
-/// global invalidation it just imposed on every other process. Using the
-/// returned value rather than a fresh `current_dir_generation()` read is what
-/// makes that sound: if a SIBLING process bumps in between, the survivors stay
-/// stamped at the older value and are correctly invalidated on their next read.
-pub fn bump_dir_generation() -> u64 {
-    generation_word_at(DIR_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst) + 1
-}
-
-/// Current sandbox-root MARKER generation — the one the host backend's
-/// "no FIFO / marker node / metadata xattr / whiteout / symlink anywhere in
-/// the upper" answers are stamped with.
-///
-/// A third, near-static counter. Those answers are read from durable root
-/// xattrs that only ever go absent → present, and only a marker STAMP
-/// (`stamp_root_marker`) can change one; a file creation or unlink cannot.
-/// Keying the absent readings on [`current_generation`] instead made every
-/// structural mutation invalidate all five, so a create/unlink loop re-read
-/// the root xattr (`openat`+`fgetxattr`+`close`) several times per guest
-/// syscall — 3 of the 12 host opens behind one guest `unlink`.
-pub fn current_marker_generation() -> u64 {
-    generation_word_at(MARKER_GENERATION_SLOT).load(Ordering::SeqCst)
-}
-
-/// Invalidate every process's absent-marker readings. Call ONLY after a root
-/// marker xattr has been stamped present (the stamp first, then the bump, so
-/// a reader that sampled the old generation before the stamp is born stale).
-pub fn bump_marker_generation() {
-    generation_word_at(MARKER_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst);
-}
-
-/// Current guest-METADATA generation — the one the host backend's stat cache
-/// stamps each entry with.
-///
-/// A cached `RealStat` carries fields the host inode cannot answer: the guest
-/// mode override, owner uid/gid, and the AF_UNIX-socket marker, all read from
-/// carrick's own `user.carrick.*` xattrs. Their ONLY writers are carrick's
-/// own metadata helpers, and every one bumps this word after writing. So an
-/// entry stamped with the current value still holds those fields even when
-/// the inode's ctime/mtime/size moved — a directory gaining or losing a
-/// child, a file being appended — and revalidation can serve it with just the
-/// fresh volatile fields instead of refilling (a second `fstatat` plus an
-/// `openat`+`flistxattr`+`close` xattr pass). A create/unlink loop used to pay
-/// that refill for the parent directory on every iteration.
-pub fn current_meta_generation() -> u64 {
-    generation_word_at(META_GENERATION_SLOT).load(Ordering::SeqCst)
-}
-
-/// Invalidate every process's cached guest-metadata readings. Call from every
-/// writer of a `user.carrick.*` metadata xattr (mode/uid/gid/socket/rdev), set
-/// OR remove, AFTER the write lands — a reader that stamped the old generation
-/// before the write then revalidates through a refill.
-pub fn bump_meta_generation() {
-    generation_word_at(META_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst);
 }
 
 /// Per-process resolve cache, validated against the shared generation. The map
@@ -445,7 +285,7 @@ impl ResolveCache {
 
     /// The cached resolution for `key`, or `None` if absent or STALE — its
     /// stamped generation no longer matches `current` (the caller passes the
-    /// live [`current_generation`], read at the get, so a mutation between an
+    /// live [`FsCacheCoherence::current_generation`], read at the get, so a mutation between an
     /// entry's birth and this lookup invalidates it).
     pub fn get(&self, key: &str, current: u64) -> Option<String> {
         let guard = self.map.read();
@@ -511,22 +351,25 @@ mod tests {
 
     #[test]
     fn shared_generation_advances_monotonically() {
+        let cohort = FsCacheCoherence::default();
         // Robust under parallel tests: fetch_add is monotonic even if other
         // tests bump concurrently.
-        let a = current_generation();
-        bump_generation();
-        assert!(current_generation() > a);
+        let a = cohort.current_generation();
+        cohort.bump_generation();
+        assert!(cohort.current_generation() > a);
     }
 
     #[test]
     fn dir_generation_advances_monotonically() {
-        let a = current_dir_generation();
-        bump_dir_generation();
-        assert!(current_dir_generation() > a);
+        let cohort = FsCacheCoherence::default();
+        let a = cohort.current_dir_generation();
+        cohort.bump_dir_generation();
+        assert!(cohort.current_dir_generation() > a);
     }
 
     #[test]
     fn path_and_dir_generations_are_independent_words() {
+        let cohort = FsCacheCoherence::default();
         // The whole point of the second counter: a file create/unlink storm
         // must NOT flush the directory cache. Bumping the path generation
         // leaves the dir generation exactly where it was.
@@ -535,9 +378,9 @@ mod tests {
         // generation concurrently is harmless, but a concurrent
         // `bump_dir_generation` would be a real aliasing bug, and this test
         // would catch it.
-        let dir_before = current_dir_generation();
-        bump_generation();
-        bump_generation();
-        assert_eq!(current_dir_generation(), dir_before);
+        let dir_before = cohort.current_dir_generation();
+        cohort.bump_generation();
+        cohort.bump_generation();
+        assert_eq!(cohort.current_dir_generation(), dir_before);
     }
 }

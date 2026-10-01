@@ -2531,14 +2531,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
-      "symbol": "generation_word_at::CELL",
-      "fingerprint": "5ddd9a26bc50591d368264245d366c2c048ad61c12501d50f2e4b3673c00607c",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static generation_word_at::CELL in crates/carrick-runtime/src/fs_resolve_cache.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-vfs/src/layer_cache.rs",
       "symbol": "reflink_or_copy_file::FALLBACK_FLAGGED",
       "fingerprint": "be74cb5b68663042ef31d41c120e4754c786d129fd9d3a7eafd4dbea60560ea6",
@@ -3656,14 +3648,6 @@
       "fingerprint": "dcb29d707999589c126682a8aeaa4fc4c76c8bb1d50f7ffe6025ae9c3d455573",
       "classification": "config_debug",
       "rationale": "Cached value of the CARRICK_EL1_DESCRIPTOR_LANE hatch in crates/carrick-runtime/src/vcpu_loop/signal.rs; read once, immutable for the carrier's life."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
-      "symbol": "LOCAL_PATH_BUMPS",
-      "fingerprint": "e8cf50950e19a23bf12a62c17b964003216162466f208e3d1977d40b48de2d6b",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide monotonic count of path-generation bumps published by this host process (crates/carrick-vfs/src/fs_resolve_cache.rs); compared with the shared generation so a dentry hook keeps unaffected local names only when every intervening bump came from this process. Host-process lifecycle state, not Linux process state."
     },
     {
       "kind": "thread_local",
