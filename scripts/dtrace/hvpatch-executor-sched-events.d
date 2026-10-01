@@ -30,6 +30,22 @@
  *     return address in the caller of the inlining function, e.g.
  *     `run_executor_loop+<off>` after the `prepare_registration` or
  *     `enroll` call) from guest-requested host writes.
+ *   - WAKE-TO-RUN LATENCY of every blocked continuation, as log-linear
+ *     histograms in microseconds, split by the blocked syscall
+ *     (`epoll_pwait` = aarch64 nr 22, else `other`) and by stage:
+ *       ready-to-wake   reactor `poll` returned -> scheduler wake of the
+ *                       thread, on the reactor thread (reactor-sourced
+ *                       wakes only);
+ *       wake-to-claim   scheduler wake -> an executor claims the thread
+ *                       (run-queue placement + idle executor wake-up);
+ *       claim-to-run    claim -> the next `hv_vcpu_run` on that executor
+ *                       (task load, continuation resume, syscall
+ *                       completion);
+ *       wake-to-run     the sum of the last two;
+ *       ready-to-run    the whole reactor-sourced path.
+ *     Blocked = the thread's last settlement was kind 2
+ *     (BlockedContinuation); its syscall is the last
+ *     `hvpatch-syscall-service-begin` on the settling executor thread.
  *
  * (b) PROVIDER ABI (carrick USDT, crates/carrick-observability/src/probes.rs,
  *     qualified live on macOS 27.2 / M4, 2026-10-01, binary c2c6b14f)
@@ -42,6 +58,11 @@
  *   hvpatch-reactor-cycle (u32 regs, u32 visited, u32 pollfds, i32 timeout_ms)
  *   hvpatch-fork-quiesce (i32 ppid, i32 tid, u32 siblings, u64 polls, u64 ns)
  *   host-image-base (i32 host_pid, u64 text_base, u64 slide)
+ *   hvpatch-scheduler-wake (u64 thread_serial, u32 kind, u32 found_state,
+ *                           u64 found_gen, u64 queued_gen)
+ *   vcpu-run-enter (u64 vcpu), fired on the executor's own host thread
+ *   syscall::poll:entry arg2 = timeout; the reactor's poll is the only
+ *   carrier poll with a nonzero timeout (readiness samples use 0).
  *   syscall::{write,poll,close,psynch_cvwait,psynch_cvbroad,psynch_cvsignal}:entry
  *   `ustack(3)` is trustworthy only because `.cargo/config.toml` forces frame
  *   pointers; addresses print raw and are symbolized offline against the
@@ -67,6 +88,9 @@
 #pragma D option dynvarsize=64m
 
 self uint64_t last_load;
+self uint64_t exit_ts;
+self uint64_t exit_class;
+self uint64_t cvret;
 
 
 dtrace:::BEGIN
@@ -100,6 +124,136 @@ carrick*:::hvpatch-executor-claim
     @claims = count();
 }
 
+/* ---- wake-to-run latency of blocked continuations ---- */
+
+carrick*:::hvpatch-syscall-service-begin
+/pid == $target || progenyof($target)/
+{
+    self->last_nr = arg3;
+}
+
+carrick*:::hvpatch-lease-settle
+/(pid == $target || progenyof($target)) && arg1 == 2/
+{
+    blocked_class[arg0] = self->last_nr == 22 ? 1 : 2;
+    wake_ts[arg0] = 0;
+    ready_ts[arg0] = 0;
+}
+
+syscall::poll:entry
+/carrier_pid != 0 && pid == carrier_pid && (int)arg2 != 0/
+{
+    self->reactor_poll = 1;
+}
+
+syscall::poll:return
+/self->reactor_poll/
+{
+    self->reactor_poll = 0;
+    self->ready = timestamp;
+}
+
+carrick*:::hvpatch-scheduler-wake
+/(pid == $target || progenyof($target)) && blocked_class[arg0] != 0/
+{
+    @wake_state[arg1, arg2, arg4 != 0 ? "queued" : "no-action"] = count();
+}
+
+carrick*:::hvpatch-scheduler-wake
+/(pid == $target || progenyof($target)) && blocked_class[arg0] != 0 && wake_ts[arg0] == 0 && arg4 != 0/
+{
+    wake_ts[arg0] = timestamp;
+    ready_ts[arg0] = self->ready;
+    @wake_src[blocked_class[arg0] == 1 ? "epoll_pwait" : "other",
+        self->ready != 0 ? "reactor" : "producer"] = count();
+}
+
+carrick*:::hvpatch-scheduler-wake
+/(pid == $target || progenyof($target)) && blocked_class[arg0] != 0 && ready_ts[arg0] != 0 && wake_ts[arg0] == timestamp/
+{
+    @lat["ready-to-wake", blocked_class[arg0] == 1 ? "epoll_pwait" : "other"] =
+        llquantize((timestamp - ready_ts[arg0]) / 1000, 10, 0, 5, 20);
+}
+
+syscall::psynch_cvwait:return
+/carrier_pid != 0 && pid == carrier_pid/
+{
+    self->cvret = timestamp;
+}
+
+/*
+ * How the claiming executor came to claim: the latest of a condvar park
+ * return (`psynch_cvwait`) and a guest exit (an executor idling in the
+ * guest zone leaves `hv_vcpu_run` on a kick or its idle timer) after the
+ * wake, or neither (it was already running host-side and found the thread).
+ */
+carrick*:::hvpatch-executor-claim
+/(pid == $target || progenyof($target)) && blocked_class[arg1] != 0 && wake_ts[arg1] != 0/
+{
+    this->cls = blocked_class[arg1] == 1 ? "epoll_pwait" : "other";
+    this->w = wake_ts[arg1];
+    this->ev = self->cvret > self->exit_ts ? self->cvret : self->exit_ts;
+    this->how = this->ev <= this->w ? "host-running"
+        : self->cvret > self->exit_ts ? "condvar-unpark"
+        : self->exit_class == 2 ? "guest-exit-kick"
+        : self->exit_class == 1 ? "guest-exit-idle"
+        : self->exit_class == 3 ? "guest-exit-syscall"
+        : "guest-exit-other";
+    @claim_by[this->cls, this->how] = count();
+    @lat[strjoin("wake-to-event:", this->how), this->cls] =
+        llquantize(this->ev > this->w ? (this->ev - this->w) / 1000 : 0, 10, 0, 5, 20);
+    @lat[strjoin("event-to-claim:", this->how), this->cls] =
+        llquantize(this->ev > this->w ? (timestamp - this->ev) / 1000 : (timestamp - this->w) / 1000,
+        10, 0, 5, 20);
+}
+
+carrick*:::hvpatch-executor-claim
+/(pid == $target || progenyof($target)) && blocked_class[arg1] != 0 && wake_ts[arg1] != 0/
+{
+    this->cls = blocked_class[arg1] == 1 ? "epoll_pwait" : "other";
+    @lat["wake-to-claim", this->cls] =
+        llquantize((timestamp - wake_ts[arg1]) / 1000, 10, 0, 5, 20);
+    self->run_cls = blocked_class[arg1];
+    self->run_wake = wake_ts[arg1];
+    self->run_ready = ready_ts[arg1];
+    self->run_claim = timestamp;
+    blocked_class[arg1] = 0;
+    wake_ts[arg1] = 0;
+    ready_ts[arg1] = 0;
+}
+
+carrick*:::vcpu-run-enter
+/self->run_claim/
+{
+    this->cls = self->run_cls == 1 ? "epoll_pwait" : "other";
+    @lat["claim-to-run", this->cls] =
+        llquantize((timestamp - self->run_claim) / 1000, 10, 0, 5, 20);
+    @lat["wake-to-run", this->cls] =
+        llquantize((timestamp - self->run_wake) / 1000, 10, 0, 5, 20);
+    @lat_n["wake-to-run", this->cls] = count();
+    @lat_sum["wake-to-run", this->cls] = sum(timestamp - self->run_wake);
+    @lat_sum["claim-to-run", this->cls] = sum(timestamp - self->run_claim);
+    @lat_sum["wake-to-claim", this->cls] = sum(self->run_claim - self->run_wake);
+}
+
+carrick*:::vcpu-run-enter
+/self->run_claim && self->run_ready/
+{
+    @lat["ready-to-run", self->run_cls == 1 ? "epoll_pwait" : "other"] =
+        llquantize((timestamp - self->run_ready) / 1000, 10, 0, 5, 20);
+    @lat_sum["ready-to-wake", self->run_cls == 1 ? "epoll_pwait" : "other"] =
+        sum(self->run_wake - self->run_ready);
+}
+
+carrick*:::vcpu-run-enter
+/self->run_claim/
+{
+    self->run_claim = 0;
+    self->run_wake = 0;
+    self->run_ready = 0;
+    self->run_cls = 0;
+}
+
 carrick*:::hvpatch-executor-lifecycle
 /pid == $target || progenyof($target)/
 {
@@ -123,6 +277,8 @@ carrick*:::vcpu-run-exit
 /pid == $target || progenyof($target)/
 {
     @exits[arg1] = count();
+    self->exit_ts = timestamp;
+    self->exit_class = arg1;
 }
 
 carrick*:::hvpatch-syscall-service-begin
@@ -185,6 +341,13 @@ dtrace:::END
     printa("HVPSCHEDEV|reactor-cycles|count=%@d\n", @reactor);
     printa("HVPSCHEDEV|fork-quiesce|count=%@d\n", @quiesce);
     printa("HVPSCHEDEV|thread|serial=%d|settlements=%@d\n", @threads);
+    printa("HVPSCHEDEV|wake-source|class=%s|source=%s|count=%@d\n", @wake_src);
+    printa("HVPSCHEDEV|wake-state|kind=%d|found=%d|action=%s|count=%@d\n", @wake_state);
+    printa("HVPSCHEDEV|claim-by|class=%s|executor=%s|count=%@d\n", @claim_by);
+    printa("HVPSCHEDEV|latency-count|stage=%s|class=%s|count=%@d\n", @lat_n);
+    printa("HVPSCHEDEV|latency-sum-ns|stage=%s|class=%s|sum=%@d\n", @lat_sum);
+    printf("HVPSCHEDEV|section=latency-us\n");
+    printa("HVPSCHEDEV|latency|stage=%s|class=%s%@d\n", @lat);
     printf("HVPSCHEDEV|section=host-syscalls\n");
     printa("%s%k%@d\n", @hostsys);
 }
