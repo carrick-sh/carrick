@@ -1273,10 +1273,13 @@ fn pre_fork_exec_hardware_and_shutdown_guards_are_fail_closed() {
     let dirty = concrete_load
         .find("arm_hardware_dirty")
         .expect("pre-mutation ASID load arm");
-    let barrier = concrete_load
-        .find("complete_task_load_barrier")
-        .expect("post-TTBR DSB/ISB load barrier");
-    assert!(begin_asid < dirty && dirty < overlay && overlay < barrier && barrier < resident);
+    assert!(begin_asid < dirty && dirty < overlay && overlay < resident);
+    // The installed context reaches the PE at the task's own next entry (a
+    // context synchronization event); the load runs no vCPU of its own.
+    assert!(
+        !concrete_load.contains(".run(") && !concrete_load.contains("task_load_barrier"),
+        "a task load must not spend an hv_vcpu_run round trip of its own"
+    );
 
     let worker_loop = source
         .split("fn run_executor_loop")

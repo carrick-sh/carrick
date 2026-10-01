@@ -1,0 +1,35 @@
+schema_version = 1
+id = "kernel.el1.task-load-entry"
+title = "Loading a task on a persistent executor costs no host round trip of its own"
+guest_surfaces = ["scheduler:execution-admission", "syscall:execve", "vmm:hvf"]
+semantic_authority = [
+  "Arm ARM D19 (context synchronization): exception return is a context synchronization event, so system-register writes made before it (TTBR0_EL1, TCR_EL1, the ASID) govern every instruction after it",
+  "Apple Hypervisor.framework hv_vcpu_set_sys_reg: a stopped vCPU's system registers are saved context state that the next hv_vcpu_run installs on the PE",
+]
+fixture = "embed:el1-sched timed-wait (host-served 1 ms futex timeouts, one task load per wait)"
+scale_points = [100, 400]
+structural_budgets = []
+rationale = """
+A host task load installs the task's registers, TTBR0/TCR and ASID on the
+executor's stopped vCPU with hv_vcpu_set_sys_reg. Those writes are vCPU
+context: they reach the PE only at the next hv_vcpu_run, whose entry into the
+guest is an exception return and therefore a context synchronization event, so
+the task's first instruction already translates under the new context.
+The load path used to run a separate EL1 trampoline (DSB SY; ISB; HVC #1) on
+the vCPU before that entry: one full hv_vcpu_run round trip per load, counted
+as a Maintenance exit, 28-37 per `node -e 0`. The DSB in it ordered only the
+guest PE's own earlier accesses, of which a freshly loaded task has none, and
+host stores to translation tables are already relied on without a guest DSB
+on every host-lane invalid->valid publication (backed by stale-fault
+recovery). The in-guest switch (kernel.el1.address-space-switch) installs its
+roots in EL1 with its own ISB and is unaffected. ASID residence is armed
+hardware-dirty before the install, so no invalidation can miss the vCPU.
+The signed binding asserts the budget directly: between the two scales,
+completed task loads add zero Maintenance-class exits. No work-meter metric
+or runtime ratio is claimed.
+"""
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::executor::tests::pre_fork_exec_hardware_and_shutdown_guards_are_fail_closed"
+embed = "carrick-embed::el1_sched::el1_task_load_costs_no_host_round_trip"
+docker = "not applicable: carrier-internal executor work with no Linux-visible output; the guest-visible half is covered by every signed probe that loads a task"

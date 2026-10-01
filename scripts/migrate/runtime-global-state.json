@@ -3832,6 +3832,14 @@
       "fingerprint": "eda0aaee2c19c4ba05071c8c3adc306547494145cfa9e92d5fdddb25338c20b0",
       "classification": "test_only",
       "rationale": "cfg(test)-only per-host-thread count of GuestGrantLedger slot locks, backing the empty-ledger settle work-budget test (an empty ledger settles with zero slot locks). Absent from a non-test build; measures the calling thread's own work."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/lib.rs",
+      "symbol": "HVPATCH_TASK_LOADS",
+      "fingerprint": "a4ed092d751869008733dab933ce42a3f1209627bd6847753ce072c8abc9a84d",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide monotonic diagnostic counter of completed HVPatch task loads (persistent-executor loads and exec replacement loads); read by the signed task-load work-budget test, never consulted by guest semantics."
     }
   ]
 }

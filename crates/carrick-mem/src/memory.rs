@@ -276,7 +276,6 @@ pub const LINUX_PAGE_TABLES_SIZE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_P
 pub const LINUX_EL1_MAINT_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x1E0000;
 pub const LINUX_EL1_MAINT_SIZE: u64 = 0x4000;
 pub const LINUX_EL1_ASID_MAINT_BASE: u64 = LINUX_EL1_MAINT_BASE + 0x100;
-pub const LINUX_EL1_LOAD_BARRIER_BASE: u64 = LINUX_EL1_MAINT_BASE + 0x200;
 // Layout invariant: the page tables + the maintenance trampoline must both sit
 // inside the kernel hole's first 2 MiB block (mapped kernel-only EL1-RWX by the
 // single KERNEL_BLOCK_FLAGS 2 MiB block in `stage1_identity_page_tables`).
@@ -3778,17 +3777,6 @@ pub fn el1_maintenance_bytes() -> Vec<u8> {
         });
     let asid = el1_asid_maintenance_bytes();
     bytes[asid_offset..asid_offset + asid.len()].copy_from_slice(&asid);
-    let load_offset = usize::try_from(LINUX_EL1_LOAD_BARRIER_BASE - LINUX_EL1_MAINT_BASE)
-        .unwrap_or_else(|_| {
-            carrick_fatal!(
-                "mem::el1_trampoline",
-                "relative offset to EL1 load barrier trampoline ({:#x} - {:#x}) exceeded host pointer width",
-                LINUX_EL1_LOAD_BARRIER_BASE,
-                LINUX_EL1_MAINT_BASE
-            );
-        });
-    let load = el1_load_barrier_bytes();
-    bytes[load_offset..load_offset + load.len()].copy_from_slice(&load);
     bytes
 }
 
@@ -3796,17 +3784,6 @@ pub fn el1_asid_maintenance_bytes() -> Vec<u8> {
     [
         AARCH64_DSB_SY_OPCODE,
         AARCH64_TLBI_ASIDE1IS_X0_OPCODE,
-        AARCH64_DSB_SY_OPCODE,
-        AARCH64_ISB_OPCODE,
-        AARCH64_HVC1_OPCODE,
-    ]
-    .into_iter()
-    .flat_map(u32::to_le_bytes)
-    .collect()
-}
-
-pub fn el1_load_barrier_bytes() -> Vec<u8> {
-    [
         AARCH64_DSB_SY_OPCODE,
         AARCH64_ISB_OPCODE,
         AARCH64_HVC1_OPCODE,
@@ -7163,7 +7140,7 @@ mod stage1_tests {
     }
 
     #[test]
-    fn canonical_maintenance_image_contains_scoped_asid_and_load_barrier_routines() {
+    fn canonical_maintenance_image_contains_scoped_asid_routine() {
         let bytes = el1_maintenance_bytes();
         let opcode = |address: u64, index: usize| {
             let offset = usize::try_from(address - LINUX_EL1_MAINT_BASE).unwrap() + index * 4;
@@ -7174,12 +7151,6 @@ mod stage1_tests {
         assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 2), AARCH64_DSB_SY_OPCODE);
         assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 3), AARCH64_ISB_OPCODE);
         assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 4), AARCH64_HVC1_OPCODE);
-        assert_eq!(
-            opcode(LINUX_EL1_LOAD_BARRIER_BASE, 0),
-            AARCH64_DSB_SY_OPCODE
-        );
-        assert_eq!(opcode(LINUX_EL1_LOAD_BARRIER_BASE, 1), AARCH64_ISB_OPCODE);
-        assert_eq!(opcode(LINUX_EL1_LOAD_BARRIER_BASE, 2), AARCH64_HVC1_OPCODE);
     }
 
     #[test]

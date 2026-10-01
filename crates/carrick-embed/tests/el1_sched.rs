@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use carrick_abi::{NsGid, NsUid};
 use carrick_embed::{
-    Carrier, ContainerResult, EmbedError, InMemoryFileVfs, PullPolicy, read_el1_counters,
-    reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total, vcpu_run_exit_classes,
-    vcpu_run_exits_total,
+    Carrier, ContainerResult, EmbedError, InMemoryFileVfs, PullPolicy, hvpatch_task_loads_total,
+    read_el1_counters, reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total,
+    vcpu_run_exit_classes, vcpu_run_exits_total,
 };
 
 const FIXTURE: &str = "/opt/carrick/el1-sched";
@@ -3814,4 +3814,54 @@ fn el1_thread_lifecycle_parked_threads_beyond_executor_pool() {
     reset_el1_counters();
     let carrier = carrier_or_fail();
     thread_witness(&carrier, "futex-flood", &["192"], Duration::from_secs(180));
+}
+
+/// Contract `kernel.el1.task-load-entry` (persistent-executor task load):
+/// installing a task on an executor's vCPU (TTBR0/TCR/ASID plus the
+/// register file) costs no extra `hv_vcpu_run` round trip. The new context
+/// reaches the PE at the task's own next entry, which is a context
+/// synchronization event, so a separate EL1 DSB/ISB trampoline run before
+/// it (one `Maintenance` exit per load) is pure overhead. Measured as the
+/// slope of maintenance exits against completed host task loads between
+/// two scales of a workload whose waits the host serves, so process start
+/// and exit cancel. Before: one maintenance exit per load.
+#[test]
+fn el1_task_load_costs_no_host_round_trip() {
+    const SCALES: [u64; 2] = [100, 400];
+    const WORKLOAD: &str = "sock-pingpong";
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for iters in SCALES {
+        let loads_before = hvpatch_task_loads_total();
+        let measured = run_fixture(
+            &carrier,
+            &[WORKLOAD, &iters.to_string(), "pinned"],
+            Duration::from_secs(120),
+        );
+        let loads = hvpatch_task_loads_total() - loads_before;
+        let maintenance =
+            measured.exit_classes[carrick_el1_abi::HostExitClass::Maintenance as usize];
+        println!(
+            "el1-sched task-load-budget {WORKLOAD} iters={iters} loads={loads} maintenance_exits={maintenance} exits={}",
+            measured.exits
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        runs.push((loads, maintenance));
+    }
+    let (l0, m0) = runs[0];
+    let (l1, m1) = runs[1];
+    let added_loads = l1.saturating_sub(l0);
+    let added = m1.saturating_sub(m0);
+    println!("el1-sched task-load-budget loads {l0}->{l1}: maintenance {m0}->{m1} (+{added})");
+    assert!(
+        added_loads >= SCALES[1] - SCALES[0],
+        "the workload must load a task per host-served wait: {added_loads} added loads for {} added waits",
+        SCALES[1] - SCALES[0]
+    );
+    assert_eq!(
+        added, 0,
+        "{added_loads} added task loads cost {added} TLB-maintenance-class host round trips; a task load needs none"
+    );
 }

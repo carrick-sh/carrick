@@ -3239,15 +3239,9 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// authority is `MmResources` lease sharing, computed fresh per exec —
     /// the backend flag existed but was NEVER SET in production, so every
     /// vfork-shared exec retired the shared mm and the surviving child's
-    /// stage-1 walk read zeroed tables (vforkexecthread: barrier fetch
-    /// fault at LINUX_EL1_LOAD_BARRIER_BASE, all four descriptors 0x0).
+    /// stage-1 walk read zeroed tables (vforkexecthread: the since-removed
+    /// task-load barrier's fetch faulted with all four descriptors 0x0).
     fn mark_exec_predecessor_shared(&mut self, _shared: bool) {}
-
-    fn complete_task_load_barrier(&mut self) -> Result<(), TrapError> {
-        Err(TrapError::Hypervisor(
-            "backend does not expose the required task-load DSB/ISB barrier".to_owned(),
-        ))
-    }
 
     /// True only for a backend that represents Linux fork as another vCPU plus
     /// another stage-1 address space inside the current host VM.

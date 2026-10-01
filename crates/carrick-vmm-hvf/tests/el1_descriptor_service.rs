@@ -85,7 +85,6 @@ fn serial_host_el1_descriptor_service_executes_and_settles() {
     let mut engine =
         carrick_vmm_hvf::hvf_aarch64_engine::attach_task_engine(task, &mut lifecycle, vcpu);
     engine.overlay_task_state_on_live_executor(&cpu).unwrap();
-    engine.complete_task_load_barrier().unwrap();
     assert_eq!(engine.next_syscall().unwrap().unwrap().number.raw(), 93);
     // Adopt the actual boot tables before transferring this isolated root.
     engine.protect_range(DATA, 4096, 3).unwrap();
