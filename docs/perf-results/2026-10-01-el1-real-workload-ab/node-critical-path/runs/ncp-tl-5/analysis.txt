@@ -1,0 +1,35 @@
+wall 2827 ms | runner->first spawn 254 | config probes 254..682 | first test spawn 699 | last exit->runner end 185
+test                                        start   life  exec  boot  w_new  w_up wkrs  js_end  reap
+*                                             699    118     8    35    nan   nan    0      98    12
+*-arraybuffer                                 702     85     7    43    nan   nan    0      62    16
+*-close                                       705     81     7    38    nan   nan    0      60    14
+*-close-while-receiving                       708     76     7    42    nan   nan    0      58    11
+*-constructor                                 815     87    11    39    nan   nan    0      59    18
+*-drain                                       816    262    10    37     19   128    2     235    17
+*-infinite-message-loop                       820     95     9    40    nan   nan    0      77     9
+*-inspect-during-init-hook                    860    119    11    65    nan   nan    0      90    17
+*-jstransferable-nested-untransferable        952    105    11    49    nan   nan    0      73    21
+*-message-before-close                        953   1689    15    45     22    64    1    1666     8
+*-message-port-transferring                  1036     94    16    46    nan   nan    0      69     9
+*-move                                       1102     85     9    40    nan   nan    0      65    11
+*-multiple-sharedarraybuffers                1157     76     7    39    nan   nan    0      54    14
+*-receive-message                            1182     71    10    33    nan   nan    0      51    10
+*-terminate-transfer-list                    1228    449    10    37      9    50    1     405    34
+*-transfer-closed                            1264     72     7    38    nan   nan    0      56     9
+*-transfer-duplicate                         1285     68     8    35    nan   nan    0      50    10
+*-transfer-fake-js-transferable              1363     82     8    38    nan   nan    0      61    13
+*-transfer-fake-js-transferable-internal     1379     92     9    47    nan   nan    0      72    11
+*-transfer-filehandle                        1476    249     9    73    nan   nan    0     210    30
+*-transfer-native                            1537    221    49   145    nan   nan    0     164     8
+*-transfer-self                              1786    118     8    36    nan   nan    0      96    15
+*-transfer-target                            1833     88     7    48    nan   nan    0      69    12
+*-transfer-terminate                         1875    394    10    42     11   nan   10     362    21
+*-wasm-module                                1972    316    21   184     17    79    1     284    11
+*-wasm-threads                               1984    321    22   184     29    69    1     288    11
+median exec: 9.0 ms (n=26, sum 307)
+median boot: 41.0 ms (n=26, sum 1497)
+median worker_start: 69.0 ms (n=5, sum 390)
+median exit_to_reap: 11.8 ms (n=26, sum 374)
+median life: 94.6 ms (n=26, sum 5515)
+node_e0_ms=31.2
+worker_create_join_ms=28.08237168 roundtrip_us=114.6830415
