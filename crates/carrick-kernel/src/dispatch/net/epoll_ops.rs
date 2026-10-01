@@ -2442,6 +2442,40 @@ mod nested_epoll_readiness_tests {
         assert!(dupfd >= 0);
     }
 
+    /// Linux pipe poll: a write end whose last reader closed is both
+    /// writable and in error, EPOLLOUT|EPOLLERR (probe `epollzonetrigger`,
+    /// `writer_reader_closed_mask=12`).
+    #[test]
+    fn pipe_writer_with_closed_reader_is_out_and_err() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let pipe2 = SyscallRequest::new(59, SyscallArgs::from([0x1000, 0, 0, 0, 0, 0]));
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, pipe2, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+        let fds = guest_mem.read_bytes(0x1000, 8).unwrap();
+        let read_fd = i32::from_ne_bytes([fds[0], fds[1], fds[2], fds[3]]);
+        let write_fd = i32::from_ne_bytes([fds[4], fds[5], fds[6], fds[7]]);
+        assert_eq!(
+            dispatcher.epoll_ready_events(write_fd, LINUX_EPOLLOUT),
+            LINUX_EPOLLOUT
+        );
+        assert!(close_guest_fd(
+            &mut dispatcher,
+            &kernel,
+            &mut guest_mem,
+            &reporter,
+            read_fd
+        ));
+        assert_eq!(
+            dispatcher.epoll_ready_events(write_fd, LINUX_EPOLLOUT),
+            LINUX_EPOLLOUT | LINUX_EPOLLERR
+        );
+    }
+
     #[test]
     fn empty_inner_epoll_has_no_false_in_on_poll_or_outer_epoll() {
         let mut dispatcher = SyscallDispatcher::new();
