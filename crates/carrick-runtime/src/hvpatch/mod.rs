@@ -1198,10 +1198,13 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         root.context(),
         launch_fs_context,
     );
+    // Establish session/foreground authority before this root can execute or
+    // exit. First-root relay acknowledgement is replayed after carrier service
+    // publication; it must not recapture a root that may already have exited.
+    dispatcher.initialize_controlling_tty_for(root.context());
     let first_root_publications = if root.is_first_boot() {
         Some(initialization)
     } else {
-        dispatcher.initialize_controlling_tty_for(root.context());
         initialization.commit_publications();
         None
     };
