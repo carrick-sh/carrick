@@ -284,8 +284,15 @@ pub(crate) fn read_host_pipe_at(
     read_host_pipe(memory, guest_addr, length, target.with_offset(offset))
 }
 
-fn read_host_pipe_direct(
-    buf: &mut [u8],
+/// Read from a host fd straight into a raw guest-memory destination, without
+/// ever constructing a Rust slice over guest memory. The caller retains the
+/// backing via a [`HostWriteGuard`](carrick_guest_mem::HostWriteGuard) for
+/// the whole call; this function uses the raw pointer directly in the host
+/// syscall. A concurrent guest write to those bytes is a guest race (matches
+/// Linux) and tolerated.
+fn read_host_pipe_raw(
+    dst: *mut u8,
+    len: usize,
     target: HostPipeReadTarget<'_>,
 ) -> Result<DispatchOutcome, super::outcome::DispatchError> {
     let HostPipeReadTarget {
@@ -299,20 +306,15 @@ fn read_host_pipe_direct(
         host_wait,
     } = target;
     let mut n = 0isize;
-    let read_fn = |buf: &mut [u8]| -> isize {
+    let read_fn = |dst: *mut u8, len: usize| -> isize {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_host_read();
         if let Some(flow) = socket_flow {
             let mut ledger = flow.lock_ledger();
             let n = unsafe {
                 match offset {
-                    Some(off) => libc::pread(
-                        host_fd,
-                        buf.as_mut_ptr() as *mut _,
-                        buf.len(),
-                        off as libc::off_t,
-                    ),
-                    None => libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()),
+                    Some(off) => libc::pread(host_fd, dst as *mut _, len, off as libc::off_t),
+                    None => libc::read(host_fd, dst as *mut _, len),
                 }
             };
             if n > 0 {
@@ -327,23 +329,18 @@ fn read_host_pipe_direct(
         } else {
             unsafe {
                 match offset {
-                    Some(off) => libc::pread(
-                        host_fd,
-                        buf.as_mut_ptr() as *mut _,
-                        buf.len(),
-                        off as libc::off_t,
-                    ),
-                    None => libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()),
+                    Some(off) => libc::pread(host_fd, dst as *mut _, len, off as libc::off_t),
+                    None => libc::read(host_fd, dst as *mut _, len),
                 }
             }
         }
     };
     if let Some(hw) = host_wait {
         hw.run_with_host_wait(&mut || {
-            n = read_fn(buf);
+            n = read_fn(dst, len);
         })?;
     } else {
-        n = read_fn(buf);
+        n = read_fn(dst, len);
     }
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
     if let Err(e) = n.host_syscall_errno() {
@@ -383,8 +380,10 @@ pub(crate) fn read_host_pipe(
             Ok(g) => g,
             Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
         };
-        let buf = unsafe { std::slice::from_raw_parts_mut(host_ptr, length) };
-        read_host_pipe_direct(buf, target)
+        // No Rust slice over guest memory: pass the raw pointer straight to
+        // the host syscall. The HostWriteGuard retains the backing and the
+        // raw pointer discipline matches the write side (HostWritePayload::Guest).
+        read_host_pipe_raw(host_ptr, length, target)
     } else if length <= SMALL_HOST_READ_BUF {
         let mut buf = [0u8; SMALL_HOST_READ_BUF];
         read_host_pipe_into(memory, guest_addr, &mut buf[..length], target)
@@ -990,6 +989,98 @@ mod host_wait_policy_tests {
         assert!(write_requires_host_wait(HostWriteKind::PipeLike));
         assert!(write_requires_host_wait(HostWriteKind::SocketLike));
         assert!(write_requires_host_wait(HostWriteKind::Other));
+    }
+}
+
+/// The zero-copy destination path through `read_host_pipe` must use raw
+/// pointers, never a Rust slice over guest memory. `read_host_pipe_raw`
+/// accepts `(*mut u8, usize)` — the old `read_host_pipe_direct(&mut [u8])`
+/// signature would be a compile error here.
+///
+/// This test exercises the path: `host_ptr_for_write` → `HostWriteGuard` →
+/// `read_host_pipe_raw` → `libc::read`, then verifies the data landed in
+/// guest memory correctly and the budget stayed zero-allocation.
+#[cfg(test)]
+mod host_pipe_read_pin_tests {
+    use super::*;
+    use crate::dispatch::budget_meter;
+    use crate::dispatch::outcome::LinearMemory;
+    use carrick_guest_mem::GuestMemory;
+
+    const MEM_BASE: u64 = 0x1000_0000;
+    const MEM_LEN: usize = 0x10_0000; // 1 MiB
+
+    /// Verify that `read_host_pipe` takes the zero-copy raw-pointer path
+    /// (not the staging-buffer path) when `host_ptr_for_write` succeeds,
+    /// and that host data lands in guest memory without constructing a Rust
+    /// slice over it.
+    #[test]
+    fn host_pipe_read_uses_raw_pointer_not_slice() {
+        // Create a host pipe and pre-fill the write end with known data.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // Make the read end non-blocking so read_host_pipe won't park.
+        unsafe { libc::fcntl(read_fd, libc::F_SETFL, libc::O_NONBLOCK) };
+
+        let payload = vec![0xABu8; 128];
+        let written = unsafe { libc::write(write_fd, payload.as_ptr() as *const _, payload.len()) };
+        assert_eq!(written as usize, payload.len());
+
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let guest_addr = MEM_BASE + 0x1000;
+        let length = payload.len();
+
+        // Confirm LinearMemory provides host_ptr_for_write (zero-copy path).
+        assert!(
+            memory.host_ptr_for_write(guest_addr, length).is_some(),
+            "LinearMemory must provide a host pointer for the zero-copy path"
+        );
+
+        let target = HostPipeReadTarget::new(
+            read_fd,
+            None,
+            true, // nonblocking
+            crate::dispatch::wait_authority::WaitFdAuthority::Empty,
+        );
+
+        let (outcome, snapshot) = budget_meter::measure_no_allocations(|| {
+            read_host_pipe(&mut memory, guest_addr, length, target)
+                .expect("read_host_pipe should succeed")
+        });
+
+        // Verify the read returned the full payload length.
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: length as i64
+            },
+            "read_host_pipe should return the payload length"
+        );
+
+        // Verify the data landed in guest memory correctly.
+        let received = memory
+            .read_bytes(guest_addr, length)
+            .expect("guest memory read");
+        assert_eq!(
+            received, payload,
+            "host data must land in guest memory through the raw-pointer path"
+        );
+
+        // The zero-copy path must not allocate.
+        assert_eq!(
+            snapshot.allocations, 0,
+            "zero-copy read must not allocate: got {} ({} bytes)",
+            snapshot.allocations, snapshot.allocated_bytes
+        );
+
+        // Exactly one host read.
+        assert_eq!(snapshot.host_reads, 1, "expected exactly 1 host read");
+
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 }
 
