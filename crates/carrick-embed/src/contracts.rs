@@ -1,6 +1,8 @@
 //! Conformance contract bindings for carrick-embed.
 
+mod host_namespace;
 mod inotify_hotpath;
+pub use host_namespace::host_namespace_fixture;
 mod write_seek;
 pub use inotify_hotpath::inotify_hotpath_structural_contract;
 pub use write_seek::write_seek_structural_contract;

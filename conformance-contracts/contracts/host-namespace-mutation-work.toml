@@ -7,21 +7,23 @@ guest_surfaces = [
   "syscall:rename",
   "syscall:unlink",
   "syscall:openat",
+  "syscall:linkat",
 ]
 semantic_authority = [
   "man 2 renameat2",
   "man 2 unlinkat",
   "man 2 openat",
+  "man 2 linkat",
 ]
 fixture = "carrick-vfs::serial_host::test_namespace_mutation_work"
 scale_points = [1, 8, 32, 128]
 rationale = "Mutating namespace operations (renameat2, unlinkat) operate under an admitted namespace permit that resolves and holds parent directory descriptors. Admitted operations must not repeat host directory opens or whole-path walks from root. Warm mutations issue 0 host opens; each regular-file openat performs one real backend open with independent description offset. The open fixture measures writable and truncating opens with 0/128 unrelated parents and bounds metadata/identity calls by 3*n. Cache ownership is unchanged."
 
 [bindings]
+embed = "carrick-cli::trace::host-namespace-work(carrick_embed::contracts::host_namespace_fixture)"
 vm_free = "carrick-vfs::serial_host::test_namespace_mutation_work"
 
 [bindings.unresolved]
-embed_structural = "Signed embed structural binding pending higher-layer guest test bring-up."
 docker = "The fixture checks Linux namespace mutation semantics directly."
 
 [[structural_budgets]]
@@ -29,5 +31,21 @@ kind = "affine"
 metric = "host_backend_calls"
 base = 0
 per_unit = 8
-layers = ["vm-free"]
+layers = ["vm-free", "embed-structural"]
 rationale = "Warm namespace mutations under resolved parent descriptors require 0 host directory opens and only necessary descriptor-relative leaf existence and parent identity checks."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "namespace_path_visits"
+base = 0
+per_unit = 8
+layers = ["embed-structural"]
+rationale = "Exact executed owned dentry and host namei parent/leaf visits in the warm two-actor fixture, per actor and operation; excludes lexical normalization and cap-std internal walks. The same bound applies at unrelated populations 0/128."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_namespace_mutation_opens"
+base = 0
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "Warm rename/unlink/link must reuse admitted parent capabilities. Every openat request separately requires exactly one real backend open, checked by the fail-closed census reader."

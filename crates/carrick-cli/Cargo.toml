@@ -28,19 +28,19 @@ default        = ["syscall-shim", "platform-macos"]
 # because libmalloc sub-allocates a few large regions. Opt-in: it makes the
 # binary much slower, so it is a measurement build, never a shipping one.
 alloc-census   = ["dep:dhat"]
-syscall-shim   = ["carrick-runtime/syscall-shim"]
+syscall-shim   = ["carrick-runtime/syscall-shim", "carrick-embed/syscall-shim"]
 # Exactly one platform-* is active at a time; `default` keeps macOS building
 # exactly as today. `platform-linux` links NO HVF.
-platform-macos = ["dep:carrick-vmm-hvf", "dep:carrick-host-bsd", "carrick-runtime/platform-macos", "carrick-engine/platform-macos"]
-platform-linux = ["dep:carrick-vmm-kvm", "carrick-runtime/platform-linux", "carrick-engine/platform-linux"]
+platform-macos = ["dep:carrick-vmm-hvf", "dep:carrick-host-bsd", "carrick-runtime/platform-macos", "carrick-engine/platform-macos", "carrick-embed/platform-macos"]
+platform-linux = ["dep:carrick-vmm-kvm", "carrick-runtime/platform-linux", "carrick-engine/platform-linux", "carrick-embed/platform-linux"]
 # `dep:carrick-vmm-bhyve` / `dep:carrick-vmm-nvmm` resolve against the
 # ARCH-SCOPED target tables at the bottom of this file: both VMMs are
 # x86_64-only, while the platform feature names the HOST backend on every arch.
 # On a non-matching target cargo accepts the `dep:` reference and activates
 # nothing, so one feature name covers both arches (see carrick-runtime's
 # Cargo.toml for the full rationale).
-platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd", "carrick-runtime/platform-freebsd", "carrick-engine/platform-freebsd"]
-platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd", "carrick-runtime/platform-netbsd", "carrick-engine/platform-netbsd"]
+platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd", "carrick-runtime/platform-freebsd", "carrick-engine/platform-freebsd", "carrick-embed/platform-freebsd"]
+platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd", "carrick-runtime/platform-netbsd", "carrick-engine/platform-netbsd", "carrick-embed/platform-netbsd"]
 # In-memory fs backend selection (`--fs memory`). Default OFF on purpose; opt in
 # with `cargo build -p carrick-cli --features fs-memory`.
 fs-memory = ["carrick-spec/fs-memory", "carrick-engine/fs-memory", "carrick-runtime/fs-memory"]
@@ -70,6 +70,8 @@ debug-all = [
 ]
 
 [dependencies]
+carrick-embed = { path = "../carrick-embed", default-features = false }
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
 carrick-kernel = { path = "../carrick-kernel" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }

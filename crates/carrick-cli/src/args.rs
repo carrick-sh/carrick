@@ -932,6 +932,14 @@ pub(crate) enum VolumeCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum DebugCommand {
+    /// Run the registered two-actor namespace fixture through the public Carrier.
+    HostNamespaceWork {
+        image: String,
+        probes: PathBuf,
+        scale: u64,
+        population: u64,
+        parents: String,
+    },
     /// Validate a Linux ELF core file and print a summary as JSON.
     ///
     /// Parses the core the way an external debugger would and fails BY NAME on
