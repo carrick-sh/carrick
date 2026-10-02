@@ -1009,6 +1009,55 @@ mod tests {
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
 
     #[test]
+    fn red_until_step3_m2_shared_close_still_needs_host_endpoint_release() {
+        use carrick_el1_abi::ipc::fd;
+        for pairs in [1, 8, 64] {
+            let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+            let parent = owner.create_table(256, 256).unwrap();
+            let peer = owner.create_table(256, 256).unwrap();
+            let region = owner.region();
+            let authority = region.fd(HostLockWait);
+            let mut retained = 0;
+            for index in 0..pairs {
+                let pipe = PipeInner::create(Arc::clone(&owner), index as u64, PIPE_BUF).unwrap();
+                pipe.retain_endpoint(core_pipe::End::Reader);
+                pipe.retain_endpoint(core_pipe::End::Writer);
+                pipe.install_endpoint_for_test(core_pipe::End::Reader, parent, fd::Fd(index))
+                    .unwrap();
+                pipe.install_endpoint_for_test(core_pipe::End::Writer, peer, fd::Fd(index))
+                    .unwrap();
+                assert!(authority.close(peer, fd::Fd(index)).unwrap().is_none());
+                retained += pipe.snapshot().writers;
+                // Explicit host release is still necessary after the final
+                // guest writer slot closes. The live reader sees EOF only then.
+                pipe.release_endpoint(core_pipe::End::Writer);
+                assert_eq!(pipe.snapshot().writers, 0);
+                assert_eq!(pipe.read_with(1, |_| panic!("EOF copies nothing")), Ok(0));
+                assert!(authority.close(parent, fd::Fd(index)).unwrap().is_none());
+                pipe.release_endpoint(core_pipe::End::Reader);
+                assert!(pipe.is_retired());
+            }
+            assert_eq!(retained, pairs as usize);
+            let result = if retained == 0 {
+                Ok(())
+            } else {
+                Err("final shared writer close retains host endpoint pin")
+            };
+            assert_eq!(
+                result.expect_err("flips at M2 cutover"),
+                "final shared writer close retains host endpoint pin"
+            );
+            for table in [parent, peer] {
+                owner.reclaim_descriptors(
+                    authority
+                        .destroy_table(table, |_| panic!("empty table"))
+                        .unwrap(),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn serial_host_el1_ipc_pipe_flags_are_shared_per_endpoint() {
         use carrick_el1_abi::ipc::fd;
         let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
