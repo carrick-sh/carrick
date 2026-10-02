@@ -42,13 +42,10 @@ pub(crate) fn partial_write_interrupt_outcome(
     }
 }
 
-// ============================================================}
-
+// ===================================================================
 // EL0 synchronous-fault translation (moved from runtime/fault.rs; the
 // classifier fns are pure and the delivery fn is generic over the engine).
-// ============================================================}
-
-
+// ===================================================================
 /// Map an EL0 synchronous-fault `ESR_EL1` to the Linux `(signum, si_code)` the
 /// kernel would deliver, or `None` for a class we don't translate (kept fatal).
 pub(crate) fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
