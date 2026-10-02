@@ -33,6 +33,7 @@ pub mod scheduler;
 pub mod snapshot;
 mod socket_rpc;
 pub mod thread_ledger;
+mod thread_retirement;
 pub mod tty;
 pub mod wait_set;
 

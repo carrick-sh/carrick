@@ -26,10 +26,10 @@ use crate::kernel::objects::{
 };
 
 /// Which authority already removed the departing thread from the ABI census.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(in crate::kernel) enum ThreadRetirementLane {
     Host,
-    ExitedInZone,
+    ExitedInZone(crate::kernel::thread_retirement::RetirementReservation),
 }
 
 /// Exit publication token whose fallible topology and revision checks have
@@ -324,17 +324,19 @@ impl Kernel {
             return Err(KernelOperationError::UnknownThread(tid));
         }
         let next = next_revision(record.revision)?;
-        state
-            .retired_threads
-            .try_reserve_exact(1)
-            .map_err(|_| KernelOperationError::RetiredThreadCapacity(1))?;
+        if matches!(lane, ThreadRetirementLane::Host) {
+            state
+                .retired_threads
+                .try_reserve_exact(1)
+                .map_err(|_| KernelOperationError::RetiredThreadCapacity(1))?;
+        }
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
         let thread = context
             .task
             .retire_thread(context.thread.key())
             .ok_or(KernelOperationError::UnknownThread(tid))?;
-        if lane == ThreadRetirementLane::Host {
+        if matches!(lane, ThreadRetirementLane::Host) {
             thread
                 .control_lease()
                 .lifecycle()
@@ -360,12 +362,18 @@ impl Kernel {
                 _claim: claim,
             });
         } else {
-            state.retired_threads.push(RetiredThreadRecord {
+            let retired = RetiredThreadRecord {
                 _key: thread.key(),
                 _task: thread.task_key(),
                 thread: Arc::downgrade(&thread),
                 _claim: claim,
-            });
+            };
+            match lane {
+                ThreadRetirementLane::Host => state.retired_threads.push(retired),
+                ThreadRetirementLane::ExitedInZone(reservation) => {
+                    state.retired_threads.push_reserved(reservation, retired)
+                }
+            }
         }
         Ok(next)
     }
