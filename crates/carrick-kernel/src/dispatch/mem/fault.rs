@@ -484,6 +484,21 @@ impl MemState {
 
     /// The protection a first touch of root-owned `page` publishes, or
     /// `None` when it is already resident or inaccessible.
+    fn root_owes_backing_at(&self, page: u64) -> bool {
+        self.delegated_root().is_some_and(|root| {
+            root.with_root(|model| {
+                let mut overlaps = false;
+                model.observe_deferred_returns(&mut |entry| {
+                    overlaps |= entry.range.start() <= page && page < entry.range.end();
+                });
+                Ok(overlaps)
+            })
+            .unwrap_or_else(|refusal| {
+                super::anonymous::broken_root("a resident fault predecessor observation", refusal)
+            })
+        })
+    }
+
     pub(in crate::dispatch) fn root_armed_prot(
         &self,
         mapping: &Mapping,
@@ -1086,24 +1101,8 @@ impl<'a> MemView<'a> {
         if bus_fault_contains(&mem.bus_fault_ranges, page) {
             return None;
         }
-        if let Some(root) = mem.delegated_root() {
-            let owed = root
-                .with_root(|model| {
-                    let mut overlaps = false;
-                    model.observe_deferred_returns(&mut |entry| {
-                        overlaps |= entry.range.start() <= page && page < entry.range.end();
-                    });
-                    Ok(overlaps)
-                })
-                .unwrap_or_else(|refusal| {
-                    super::anonymous::broken_root(
-                        "a resident fault predecessor observation",
-                        refusal,
-                    )
-                });
-            if owed {
-                return None;
-            }
+        if mem.root_owes_backing_at(page) {
+            return None;
         }
         let prot = match mem.first_touch_owner(page) {
             FirstTouchOwner::Host => mem.resident_fault_ranges.prot_for_page(page)?,
@@ -1220,13 +1219,27 @@ impl<'a> MemView<'a> {
         {
             return None;
         }
-        let fault = self.resident_fault_plan(permit, resident.va)?;
-        if fault.prot != protection.bits() {
-            return None;
-        }
+        let exclusion = self.begin_host_alias_dispatch(permit);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        let root_owned = matches!(mem.first_touch_owner(fault.page), FirstTouchOwner::Root(..));
+        if bus_fault_contains(&mem.bus_fault_ranges, resident.va)
+            || mem.root_owes_backing_at(resident.va)
+        {
+            return None;
+        }
+        // The authenticated publication is not a fresh allocation. EL1's
+        // residency reconciliation may already have committed this page.
+        let (prot, root_owned) = match mem.first_touch_owner(resident.va) {
+            FirstTouchOwner::Root(mapping, _) => (
+                LinuxProtFlags::from_bits_truncate(mapping.protection.bits()),
+                true,
+            ),
+            FirstTouchOwner::Host => (mem.resident_fault_ranges.prot_for_page(resident.va)?, false),
+            FirstTouchOwner::Unmapped => return None,
+        };
+        if prot != protection {
+            return None;
+        }
         let stock = root_owned
             && mem.delegated_root().is_some_and(|root| {
                 ReservationRange::new(publication.va, end).is_some_and(|span| {
@@ -1241,11 +1254,11 @@ impl<'a> MemView<'a> {
         Some(ResidentFrameGrantPlan {
             root_owned,
             stock,
-            fault_page: fault.page,
+            fault_page: resident.va,
             start: publication.va,
             len: publication.len,
-            prot: fault.prot,
-            exclusion: fault.exclusion,
+            prot: prot.bits(),
+            exclusion,
         })
     }
 
