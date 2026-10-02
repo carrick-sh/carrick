@@ -9,7 +9,7 @@ rationale = "Two live tables send original descriptions through sender close and
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::net::scm_rights::tests::{red_until_step3_m4_rights_create_placeholder_per_message,a_dup_of_the_placeholder_claims_the_parked_description,gc_releases_a_placeholder_nobody_can_receive_any_more,abort_returns_the_references_of_an_unsent_batch}"
+vm_free = "carrick-kernel::dispatch::net::scm_rights::tests::{red_until_step3_m4_cyclic_rights_survive_last_external_close,red_until_step3_m4_rights_create_placeholder_per_message,a_dup_of_the_placeholder_claims_the_parked_description,gc_releases_a_placeholder_nobody_can_receive_any_more,abort_returns_the_references_of_an_unsent_batch}"
 
 [bindings.unresolved]
 embed_structural = "No EL0 execution in preparation. Cutover requires carrick-conformance-next bindings for the unresolved scenarios listed in the witness ledger."

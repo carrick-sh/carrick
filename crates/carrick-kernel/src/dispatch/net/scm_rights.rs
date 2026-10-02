@@ -297,6 +297,125 @@ mod tests {
     }
 
     #[test]
+    fn red_until_step3_m4_cyclic_rights_survive_last_external_close() {
+        use crate::dispatch::fd_table::HostFdRef;
+        use crate::kernel::ids::ObjectIdRegistry;
+        use crate::kernel::{FileSlotNumber, FileTable};
+        use std::collections::VecDeque;
+        fn send_right(socket: i32, right: i32) {
+            let mut byte = 1u8;
+            let mut iov = libc::iovec {
+                iov_base: (&mut byte as *mut u8).cast(),
+                iov_len: 1,
+            };
+            let space = unsafe { libc::CMSG_SPACE(core::mem::size_of::<i32>() as u32) } as usize;
+            let mut control = vec![0usize; space.div_ceil(core::mem::size_of::<usize>())];
+            let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            // SAFETY: aligned control backing covers CMSG_SPACE for one fd;
+            // the byte, iovec and control remain live through synchronous send.
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&msg);
+                assert!(!header.is_null());
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(core::mem::size_of::<i32>() as u32) as _;
+                core::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<i32>(), right);
+                assert_eq!(libc::sendmsg(socket, &msg, 0), 1);
+            }
+        }
+        for cycles in [1, 8, 64] {
+            let ids = ObjectIdRegistry::new();
+            let first = FileTable::new(ids.file_table_id().unwrap());
+            let second = FileTable::new(ids.file_table_id().unwrap());
+            let mut retained = 0;
+            for _ in 0..cycles {
+                let mut pair = [-1; 2];
+                // SAFETY: pair is writable for the two newly owned descriptors.
+                assert_eq!(
+                    unsafe {
+                        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr())
+                    },
+                    0
+                );
+                let descriptions: Vec<_> = pair
+                    .iter()
+                    .map(|raw| {
+                        let mut base = OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR);
+                        base.set_connected(true);
+                        crate::dispatch::fd_table::kernel_file_description(
+                            Arc::new(RwLock::new(OpenDescription::HostSocket {
+                                base,
+                                host_fd: HostFdRef::new(*raw),
+                                family: crate::linux_abi::LINUX_AF_UNIX,
+                                type_: crate::linux_abi::LINUX_SOCK_STREAM,
+                                protocol: 0,
+                                mcast_memberships: Vec::new(),
+                                synthetic_recv: VecDeque::new(),
+                            })),
+                            crate::linux_abi::LINUX_O_RDWR,
+                        )
+                    })
+                    .collect();
+                for (table, description) in
+                    [(&first, &descriptions[0]), (&second, &descriptions[1])]
+                {
+                    description.retain_fd_ref();
+                    table.install(
+                        FileSlotNumber::for_open_fd(3).unwrap(),
+                        Arc::clone(description),
+                        false,
+                    );
+                }
+                let (left_key, left_placeholder) = park(Arc::clone(&descriptions[0])).unwrap();
+                let (right_key, right_placeholder) = park(Arc::clone(&descriptions[1])).unwrap();
+                // Each queued placeholder retains the description of its own
+                // receiving socket: two genuine host-message rights cycles.
+                send_right(pair[0], right_placeholder.as_raw_fd());
+                send_right(pair[1], left_placeholder.as_raw_fd());
+                drop(left_placeholder);
+                drop(right_placeholder);
+                for table in [&first, &second] {
+                    table
+                        .write_open_files()
+                        .remove(&3)
+                        .unwrap()
+                        .description
+                        .release_fd_ref();
+                }
+                gc();
+                {
+                    let vault = lock();
+                    retained += usize::from(vault.contains_key(&left_key));
+                    retained += usize::from(vault.contains_key(&right_key));
+                }
+                assert_eq!(descriptions[0].fd_ref_count(), 1);
+                assert_eq!(descriptions[1].fd_ref_count(), 1);
+                // Bounded fixture cleanup, not production cycle collection.
+                let left = claim(left_key).unwrap();
+                let right = claim(right_key).unwrap();
+                left.release_fd_ref();
+                right.release_fd_ref();
+                assert_eq!(descriptions[0].fd_ref_count(), 0);
+                assert_eq!(descriptions[1].fd_ref_count(), 0);
+            }
+            assert_eq!(retained, cycles * 2);
+            let result = if retained == 0 {
+                Ok(())
+            } else {
+                Err("SCM vault cannot collect queued socket-description cycles")
+            };
+            assert_eq!(
+                result.expect_err("flips at M4 cutover"),
+                "SCM vault cannot collect queued socket-description cycles"
+            );
+        }
+    }
+
+    #[test]
     fn a_dup_of_the_placeholder_claims_the_parked_description() {
         let description = eventfd_description();
         let (key, reader) = park(Arc::clone(&description)).expect("placeholder pipe");
