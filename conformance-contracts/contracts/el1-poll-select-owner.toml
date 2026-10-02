@@ -9,7 +9,7 @@ rationale = "Zone wait enrollment must create zero host readiness proxies at eac
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::net::epoll_zone::tests::red_until_step3_m3_zone_pipe_waits_create_host_proxies; carrick-kernel::dispatch::net::tests::{poll_and_epoll_negative_and_absent_fd_semantics,epoll_ctl_rejects_two_description_cycle_with_eloop,epoll_readiness_tracks_stored_target_identity_after_fd_close_and_reuse}; carrick-el1-abi::ipc::epoll::tests::{edge_triggered_reports_each_arrival_once,oneshot_disarms_until_modified,harvest_honours_maxevents_order_and_requeues_level_items_after_the_scan}"
+vm_free = "carrick-kernel::kernel::continuation::tests::{controller_mixed_ppoll_netlink_real_service_wake,red_until_step3_m3_cancel_leaves_temporary_wait_mask_installed}; carrick-kernel::dispatch::net::epoll_zone::tests::red_until_step3_m3_zone_pipe_waits_create_host_proxies; carrick-kernel::dispatch::net::tests::{poll_and_epoll_negative_and_absent_fd_semantics,epoll_ctl_rejects_two_description_cycle_with_eloop,epoll_readiness_tracks_stored_target_identity_after_fd_close_and_reuse}; carrick-el1-abi::ipc::epoll::tests::{edge_triggered_reports_each_arrival_once,oneshot_disarms_until_modified,harvest_honours_maxevents_order_and_requeues_level_items_after_the_scan}"
 
 [bindings.unresolved]
 embed_structural = "No EL0 execution in preparation. Cutover requires carrick-conformance-next bindings for the unresolved scenarios listed in the witness ledger."
