@@ -325,7 +325,7 @@ impl PreparedThreadClone {
     pub(in crate::kernel) fn publish_reserved(
         self,
         state: &mut RegistryState,
-        lane: PublicationLane,
+        mut lane: PublicationLane<'_>,
     ) -> Result<ReservedThreadPublication, KernelOperationError> {
         let Self {
             reservation,
@@ -360,7 +360,7 @@ impl PreparedThreadClone {
         let visible_tid = pid_identity
             .as_ref()
             .map_or(tid.raw(), |identity| identity.visible_id() as i32);
-        if lane == PublicationLane::HostClone {
+        if matches!(lane, PublicationLane::HostClone) {
             if let Some(publication) = publication.as_ref() {
                 publication.validate(state)?;
             } else {
@@ -373,7 +373,7 @@ impl PreparedThreadClone {
         if record.task.key() != task.key() {
             return Err(KernelOperationError::ParentExited);
         }
-        if lane == PublicationLane::HostClone {
+        if matches!(lane, PublicationLane::HostClone) {
             let current_shared = task.shared();
             let current_caller = task
                 .thread(caller.key().tid)
@@ -386,7 +386,12 @@ impl PreparedThreadClone {
                 return Err(KernelOperationError::StaleContext);
             }
         }
-        let published_revision = next_revision(record.revision)?;
+        let published_revision = match lane {
+            PublicationLane::AbiBorn(ref mut reservation) => record
+                .task
+                .consume_thread_revision(reservation, record.revision),
+            _ => next_revision(&record.task, record.revision)?,
+        };
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
         if pid_identity.is_some_and(|identity| !identity.commit()) {
             return Err(KernelOperationError::PidNamespaceMembership(task.key().id));
@@ -404,7 +409,7 @@ impl PreparedThreadClone {
                     "publish_thread failed in PreparedThreadClone::publish_reserved"
                 );
             });
-        if lane == PublicationLane::HostClone {
+        if matches!(lane, PublicationLane::HostClone) {
             thread
                 .control_lease()
                 .lifecycle()
@@ -450,10 +455,11 @@ impl PreparedThreadClone {
 
 /// Which lane is publishing a prepared thread; see
 /// [`PreparedThreadClone::publish_reserved`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PublicationLane {
+#[derive(Debug)]
+pub(in crate::kernel) enum PublicationLane<'a> {
     HostClone,
     Settle,
+    AbiBorn(&'a mut crate::kernel::revision_capacity::RevisionReservation),
 }
 
 /// A thread published under the registry write lock whose after-lock work —

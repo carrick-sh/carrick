@@ -506,7 +506,10 @@ impl Kernel {
                 .thread_claims
                 .len()
                 .saturating_sub(usize::from(active_leader));
-            let revision = record.revision.next().ok_or(ExecError::RevisionExhausted)?;
+            let revision = record
+                .task
+                .next_revision(record.revision)
+                .ok_or(ExecError::RevisionExhausted)?;
             let task = Arc::clone(&record.task);
             state
                 .retired_threads

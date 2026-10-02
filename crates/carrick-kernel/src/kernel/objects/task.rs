@@ -576,6 +576,7 @@ impl DumpableMode {
 #[derive(Debug)]
 pub struct Task {
     key: TaskKey,
+    revision_capacity: Arc<crate::kernel::revision_capacity::RevisionCapacity>,
     controls: super::thread_control::ThreadControlArena,
     parent: Mutex<Option<TaskKey>>,
     children: Mutex<BTreeSet<TaskKey>>,
@@ -827,6 +828,7 @@ impl Task {
     ) -> Self {
         Self {
             key,
+            revision_capacity: Arc::default(),
             controls: super::thread_control::ThreadControlArena::with_lifecycle(
                 key,
                 shared.pending_signals().lifecycle_lease(),
@@ -1394,6 +1396,36 @@ impl Task {
             self.cpu.children_user_us.load(Ordering::Acquire),
             self.cpu.children_system_us.load(Ordering::Acquire),
         )
+    }
+
+    #[cfg(test)]
+    pub(in crate::kernel) fn exhaust_unreserved_revisions_for_test(
+        &self,
+        current: crate::kernel::TaskRevision,
+    ) {
+        self.revision_capacity.exhaust_unreserved_for_test(current);
+    }
+
+    pub(in crate::kernel) fn next_revision(
+        &self,
+        current: crate::kernel::TaskRevision,
+    ) -> Option<crate::kernel::TaskRevision> {
+        self.revision_capacity.next(current)
+    }
+
+    pub(in crate::kernel) fn reserve_thread_revisions(
+        &self,
+        current: crate::kernel::TaskRevision,
+    ) -> Option<crate::kernel::revision_capacity::RevisionReservation> {
+        self.revision_capacity.reserve(current, 2)
+    }
+
+    pub(in crate::kernel) fn consume_thread_revision(
+        &self,
+        reservation: &mut crate::kernel::revision_capacity::RevisionReservation,
+        current: crate::kernel::TaskRevision,
+    ) -> crate::kernel::TaskRevision {
+        reservation.consume(&self.revision_capacity, current)
     }
 
     pub const fn key(&self) -> TaskKey {

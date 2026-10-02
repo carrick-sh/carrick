@@ -702,7 +702,8 @@ impl PreparedFork {
             if child_parent_record.revision != child_parent_revision {
                 return Err(KernelOperationError::ForkParentChanged);
             }
-            let next_child_parent_revision = next_revision(child_parent_record.revision)?;
+            let next_child_parent_revision =
+                next_revision(&child_parent_record.task, child_parent_record.revision)?;
             let process_group = child.process_group();
             let session = child.session();
             if !state.process_groups.contains_key(&process_group)
@@ -1114,7 +1115,7 @@ impl Kernel {
             .task
             .thread(tid)
             .ok_or(KernelOperationError::UnknownThread(tid))?;
-        let revision = next_revision(record.revision)?;
+        let revision = next_revision(&record.task, record.revision)?;
 
         record.task.replace_shared(Arc::clone(&shared));
         thread.replace_resources(Arc::clone(&resources));
@@ -1142,9 +1143,11 @@ impl Kernel {
     }
 }
 
-pub(super) fn next_revision(revision: TaskRevision) -> Result<TaskRevision, KernelOperationError> {
-    revision
-        .next()
+pub(super) fn next_revision(
+    task: &TaskRef,
+    revision: TaskRevision,
+) -> Result<TaskRevision, KernelOperationError> {
+    task.next_revision(revision)
         .ok_or(KernelOperationError::RevisionExhausted)
 }
 
