@@ -191,6 +191,27 @@ impl SyscallDispatcher {
 /// serve it: the request the backend prepares and the residency identity
 /// published once the grant is live.
 impl SyscallDispatcher {
+    /// Reclassify already-published backing after a sibling permission edit.
+    /// The caller holds the exact-MM mutation guard and authenticates the
+    /// current live resident leaf's exact IPA and protection in the backend.
+    /// This records residency only; it never republishes descriptor access.
+    pub fn reprotected_frame_grant_plan<'permit>(
+        &self,
+        permit: &'permit super::super::mm_mutation::HostAliasPermit<'_>,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+        protection: LinuxProtFlags,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        live_protection: LinuxProtFlags,
+    ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
+        self.mem_view().reprotected_frame_grant_plan(
+            permit,
+            grant,
+            protection,
+            receipt,
+            live_protection,
+        )
+    }
+
     /// The backend request for `plan`, faulted at `fault_va` with `access`.
     pub fn el1_frame_grant_request(
         plan: &ResidentFrameGrantPlan<'_>,
