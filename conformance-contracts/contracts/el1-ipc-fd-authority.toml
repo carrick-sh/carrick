@@ -1,0 +1,25 @@
+schema_version = 1
+id = "kernel.el1.ipc-fd-authority"
+title = "One shared descriptor incarnation retains exact OFD pins"
+guest_surfaces = ["kernel:filetable", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap"]
+semantic_authority = ["man 2 fork", "man 2 clone", "man 2 dup", "man 2 fcntl", "man 2 close_range", "man 7 unix", "man 2 mmap"]
+fixture = "fd-core:two-live-table owners and incarnation pins"
+scale_points = [65, 4096, 65536]
+rationale = "Fork shares OFD offsets/status, not descriptor flags. CLONE_FILES shares table identity; exec unshares first. Pins retain the original incarnation through close/dup2/reuse and final release occurs once. Allocation searches at most 2*bitmap_levels-1 words and backed steady-state operations allocate zero objects. See the M1 witness ledger for exact test bindings and evidence limits."
+
+# These bindings enforce typed fixture assertions directly (slot reads, bitmap
+# levels and incarnation identity), not fabricated WorkMetric observations.
+# The pre-existing fork.filetable WorkObservation budgets remain unchanged.
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-fd-core::tests::{fork_shares_description_but_not_descriptor_flags,m1_clone_files_exec_unshares_before_cloexec_sweep,unshare_close_range_keeps_siblings_intact,m1_rights_and_mapping_pins_outlive_dup2_and_numeric_reuse,el1_ipc_concurrent_pins_and_closes_release_exactly_once,logarithmic_work_at_four_scales_without_an_allocator,el1_ipc_direct_lookup_reads_one_slot_at_every_scale}; carrick-kernel::dispatch::fs::tests::{m1_failed_pair_copyout_leaves_no_descriptors_or_reserved_holes,m1_close_releases_posix_locks_before_last_alias_or_mapping,hvpatch_classic_record_locks_conflict_by_task_generation_and_release_on_close}; carrick-kernel::dispatch::fd_table::tests::{mapped_file_reference_survives_last_fd_and_releases_last_fragment,mapped_file_reference_release_does_not_close_a_live_fd}"
+
+[bindings.unresolved]
+embed_structural = "EL0 pair-copyout and actual mapped-file pin integration require a carrick-conformance-next binding after Phase B/memory integration; core pins alone do not prove those consumers."
+docker = "No Docker executed in M1 preparation. Native arm64 same-source semantic differential remains director-owned."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

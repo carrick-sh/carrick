@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "counts": {
-    "inspect_misc": 161,
+    "inspect_misc": 162,
     "lifecycle": 40,
     "create_install": 73,
     "slot_description_mutation": 27,
@@ -1436,7 +1436,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 5525,
+      "line": 5598,
       "categories": [
         "description_guard"
       ],
@@ -1447,7 +1447,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 5574,
+      "line": 5647,
       "categories": [
         "table_guard"
       ],
@@ -1458,7 +1458,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 5591,
+      "line": 5664,
       "categories": [
         "table_guard"
       ],
@@ -1469,7 +1469,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 7021,
+      "line": 7094,
       "categories": [
         "description_guard"
       ],
@@ -3695,7 +3695,18 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/ipc.rs",
-      "line": 305,
+      "line": 312,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let host_flag = parent.read_open_files().get(&3).unwrap().fd_flags != 0;",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "red_until_step3_m1_one_table_writer",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/ipc.rs",
+      "line": 369,
       "categories": [
         "table_guard"
       ],
@@ -3706,7 +3717,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/ipc.rs",
-      "line": 394,
+      "line": 458,
       "categories": [
         "table_guard"
       ],
@@ -3717,7 +3728,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/ipc.rs",
-      "line": 399,
+      "line": 463,
       "categories": [
         "table_guard"
       ],
@@ -3728,7 +3739,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/ipc.rs",
-      "line": 405,
+      "line": 469,
       "categories": [
         "table_guard"
       ],
@@ -3739,7 +3750,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/ipc.rs",
-      "line": 407,
+      "line": 471,
       "categories": [
         "table_guard"
       ],
@@ -3750,7 +3761,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/ipc.rs",
-      "line": 408,
+      "line": 472,
       "categories": [
         "table_guard"
       ],
@@ -3761,7 +3772,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/ipc.rs",
-      "line": 410,
+      "line": 474,
       "categories": [
         "table_guard"
       ],

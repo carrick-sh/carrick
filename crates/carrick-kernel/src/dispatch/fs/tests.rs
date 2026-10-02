@@ -4599,6 +4599,79 @@ impl SpliceTestRig {
 }
 
 #[test]
+fn m1_close_releases_posix_locks_before_last_alias_or_mapping() {
+    let mut h = SpliceTestRig::new(4096);
+    let path = "/m1-lock";
+    let opened = h.dispatcher.install_fd(
+        OpenDescription::File {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            path: path.into(),
+            metadata: RootFsMetadata {
+                path: path.into(),
+                kind: RootFsEntryKind::File,
+                mode: 0o600,
+                size: 0,
+            },
+            contents: FileContents::dense(Vec::new()),
+            offset: 0,
+            writable: true,
+        },
+        0,
+    );
+    let DispatchOutcome::Returned { value: fd } = opened else {
+        panic!("install file: {opened:?}")
+    };
+    let description = h.dispatcher.open_file(fd as i32).unwrap().description;
+    let mapping = description.retain_mapping().unwrap();
+    assert_eq!(
+        h.run(23, [fd as u64, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    let context = h.dispatcher.capture_one_task_context().unwrap();
+    let request = LogicalRecordLockRequest {
+        file: LeaseFileId::Path(path.into()),
+        owner: LogicalRecordLockOwner::from(context.task().key()),
+        range: LogicalRecordLockRange { start: 0, end: 10 },
+        write: true,
+    };
+    let competing = LogicalRecordLockRequest {
+        owner: LogicalRecordLockOwner::Process {
+            pid: i32::MAX,
+            serial: 7,
+        },
+        ..request.clone()
+    };
+    let locks = Arc::clone(&h.dispatcher.fs.classic_record_locks);
+    assert_eq!(locks.try_set(request), Ok(()));
+    assert_eq!(locks.try_set(competing.clone()), Err(LINUX_EAGAIN));
+    h.close(fd as u64);
+    assert_eq!(description.fd_ref_count(), 1, "duplicate still owns OFD");
+    assert_eq!(
+        locks.try_set(competing),
+        Ok(()),
+        "close-time, not final-OFD release"
+    );
+    h.close(4);
+    drop(mapping);
+}
+
+#[test]
+fn m1_failed_pair_copyout_leaves_no_descriptors_or_reserved_holes() {
+    let mut h = SpliceTestRig::new(4096);
+    let before = h.dispatcher.captured_file_table().slot_count();
+    assert_eq!(
+        h.run(SpliceTestRig::SYS_PIPE2, [0, 0, 0, 0, 0, 0]),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
+    assert_eq!(h.dispatcher.captured_file_table().slot_count(), before);
+    let (reader, writer) = h.pipe2(0x4000);
+    assert_eq!((reader, writer), (3, 4));
+    h.close(reader);
+    h.close(writer);
+    assert_eq!(h.pipe2(0x4000), (3, 4));
+}
+
+#[test]
 fn legacy_aio_nowait_empty_pipe_publishes_eagain_completion() {
     const SYS_IO_SETUP: u64 = 0;
     const SYS_IO_SUBMIT: u64 = 2;

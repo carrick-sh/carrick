@@ -12,7 +12,7 @@ scale_points = [1, 8, 32, 128]
 rationale = "Fork file-table copy cost must scale affinely with populated descriptors, avoiding redundant scans across unallocated descriptor space or unneeded allocations."
 
 [bindings]
-vm_free = "carrick-kernel-example::fork_filetable_contract"
+vm_free = "carrick-kernel-example::fork_filetable_contract; carrick-fd-core::tests::red_until_step3_m1_sparse_fork_visits_only_populated_descriptors"
 embed = "carrick-embed::fork_filetable_contract"
 docker = "probe:forkfiletable"
 ecosystem = ["ltp:fork14", "ltp:fork09", "cpython:multiprocessing_fork"]
@@ -34,3 +34,10 @@ rationale = "File table copy memory is affine in populated descriptor count (32 
 maximum = 2.0
 statistic = "p50"
 minimum_samples = 20
+
+# M1 extends this contract without widening its populated-descriptor budget.
+# Additional VM-free binding (flips at M1 cutover):
+# carrick-fd-core::tests::red_until_step3_m1_sparse_fork_visits_only_populated_descriptors
+# One populated high fd, backed capacities 65/4096/65536. Exact slot reads are
+# currently capacity, not population (1). expect_err matches the scan reason
+# and exact count at every scale; invert at cutover, never increase the budget.

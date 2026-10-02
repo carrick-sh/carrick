@@ -386,6 +386,7 @@ fmt:
 # The kernel semantics inner loop: no VM, codesign, or Docker. Full `just test`
 # also runs the serial host tests; run it and the signed gates before pushing.
 test-kernel *ARGS:
+    cargo test -p carrick-fd-core -p carrick-el1-abi --lib {{ARGS}}
     cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
     just --justfile {{justfile()}} test-kernel-semantics {{ARGS}}
 

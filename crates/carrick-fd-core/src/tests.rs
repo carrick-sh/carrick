@@ -572,6 +572,74 @@ fn table_with<const T: usize>(c: &View<T>, fds: i32) -> TableId {
     t
 }
 
+/// CLONE_FILES is a second live owner of the same table identity. The venue
+/// must fork/unshare that identity before exec, not sweep its peer's table.
+#[test]
+fn m1_clone_files_exec_unshares_before_cloexec_sweep() {
+    let c = authority::<3, 2>();
+    let parent = table_with(&c, 1);
+    let peer = parent;
+    c.setfd(peer, Fd(0), true).unwrap();
+    assert_eq!(c.getfd(parent, Fd(0)), Ok(true));
+    let exec = c.fork(peer, &mut storage(64)).unwrap();
+    c.exec(exec, |_| panic!("peer retains OFD")).unwrap();
+    assert_eq!(c.get(exec, Fd(0)), Err(Error::BadFd));
+    assert_eq!(c.getfd(parent, Fd(0)), Ok(true));
+    assert_eq!(c.refcount(parent, Fd(0)), Ok(1));
+}
+
+#[test]
+fn m1_rights_and_mapping_pins_outlive_dup2_and_numeric_reuse() {
+    let c = authority::<2, 4>();
+    let parent = table_with(&c, 2);
+    let child = c.fork(parent, &mut storage(64)).unwrap();
+    let (rights, original) = c.pin(parent, Fd(0)).unwrap();
+    let (mapping, _) = c.pin(child, Fd(0)).unwrap();
+    assert_eq!(c.dup2(parent, Fd(1), Fd(0)), Ok(None));
+    assert_eq!(c.close(child, Fd(0)), Ok(None));
+    assert_eq!(c.install_pin(child, Fd(0), &rights, true), Ok(()));
+    assert_eq!(c.get(child, Fd(0)).unwrap().backing, original.backing);
+    assert_eq!(c.getfd(child, Fd(0)), Ok(true));
+    assert_eq!(c.close(child, Fd(0)), Ok(None));
+    assert_eq!(c.unpin(rights), Ok(None));
+    assert_eq!(c.unpin(mapping).unwrap().unwrap().backing, original.backing);
+    c.destroy_table(parent, |_| panic!("child retains replacement"))
+        .unwrap();
+    let mut released = 0;
+    c.destroy_table(child, |_| released += 1).unwrap();
+    assert_eq!(released, 1);
+}
+
+/// Reconcile the populated-descriptor fork contract against the current core's
+/// backed-capacity scan without widening its budget. Flips at M1 cutover.
+#[test]
+fn red_until_step3_m1_sparse_fork_visits_only_populated_descriptors() {
+    for capacity in [65, 4096, 65_536] {
+        let c = authority::<2, 1>();
+        let parent = c.create_table(capacity, &mut storage(capacity)).unwrap();
+        c.open(parent, Fd((capacity - 1) as i32), description(1), false)
+            .unwrap();
+        let mut backing = storage(capacity);
+        let before = SLOT_READS.with(|n| n.get());
+        let child = c.fork(parent, &mut backing).unwrap();
+        let visits = SLOT_READS.with(|n| n.get()) - before;
+        let result = if visits <= 1 {
+            Ok(())
+        } else {
+            Err(("backed-capacity fork scan", visits))
+        };
+        assert_eq!(
+            result.expect_err("M1 must invert this gate when sparse fork is fixed"),
+            ("backed-capacity fork scan", capacity)
+        );
+        assert_eq!(
+            c.get(child, Fd((capacity - 1) as i32)).unwrap().backing,
+            BackingToken(1)
+        );
+        assert_eq!(c.refcount(parent, Fd((capacity - 1) as i32)), Ok(2));
+    }
+}
+
 #[test]
 fn el1_ipc_fd_reuse_during_blocked_io_keeps_pinned_description() {
     let c = authority::<2, 8>();

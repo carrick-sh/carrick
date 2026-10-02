@@ -357,7 +357,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.ipc-fd-authority"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -812,7 +814,9 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.epoll-zone",
-        "kernel.el1.files.cross-process-readers"
+        "kernel.el1.fd-single-owner",
+        "kernel.el1.files.cross-process-readers",
+        "kernel.el1.ipc-fd-authority"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -2961,7 +2965,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.ipc-fd-authority"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3106,6 +3112,7 @@
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
         "kernel.el1.delegated-root-fork",
+        "kernel.el1.fd-single-owner",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.fork-cow",
         "kernel.el1.guest-run-queue",
@@ -3132,6 +3139,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.fd-single-owner",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
@@ -3164,6 +3172,7 @@
         "kernel.el1.anonymous-retirement",
         "kernel.el1.delegated-root-fork",
         "kernel.el1.fault-entry",
+        "kernel.el1.ipc-fd-authority",
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
         "kernel.mm.address-space-occupancy",

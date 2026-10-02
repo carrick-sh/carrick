@@ -289,6 +289,70 @@ mod tests {
         }
     }
 
+    // No host fd, fork, environment mutation or global counter: VM-free
+    // authority witnesses run in the parallel kernel partition.
+    #[test]
+    fn red_until_step3_m1_one_table_writer() {
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let map = map();
+        let parent = FileTable::new(ids.file_table_id().unwrap());
+        let description = Arc::new(FileDescription::regular(ids.file_description_id().unwrap()));
+        description.retain_fd_ref();
+        parent.install(FileSlotNumber::for_open_fd(3).unwrap(), description, false);
+        parent.publish_ipc(Arc::clone(&owner), map).unwrap();
+        let peer = FileTable::for_fork_copy(ids.file_table_id().unwrap(), &parent);
+        peer.publish_ipc(Arc::clone(&owner), map).unwrap();
+        let region = owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let shared = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
+        let peer_id = fd::TableId::from_raw(map.lookup(peer.id().raw()).unwrap());
+        authority.setfd(shared, fd::Fd(3), true).unwrap();
+        assert_eq!(authority.getfd(peer_id, fd::Fd(3)), Ok(false));
+        let host_flag = parent.read_open_files().get(&3).unwrap().fd_flags != 0;
+        let result = if host_flag {
+            Ok(())
+        } else {
+            Err("host slot flags diverge from shared authority")
+        };
+        assert_eq!(
+            result.expect_err("flips at M1 cutover"),
+            "host slot flags diverge from shared authority"
+        );
+    }
+
+    #[test]
+    fn red_until_step3_m1_no_host_slot_selection() {
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let map = map();
+        let parent = Arc::new(FileTable::new(ids.file_table_id().unwrap()));
+        parent.publish_ipc(Arc::clone(&owner), map).unwrap();
+        let peer = FileTable::for_fork_copy(ids.file_table_id().unwrap(), &parent);
+        peer.publish_ipc(Arc::clone(&owner), map).unwrap();
+        let region = owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let shared = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
+        // Bare stdio is present only as implicit markers in the host map.
+        assert_eq!(parent.slot_count(), 0);
+        for number in 0..3 {
+            assert!(authority.get(shared, fd::Fd(number)).is_ok());
+        }
+        authority.close(shared, fd::Fd(0)).unwrap();
+        // The one authority's lowest free slot is now 0. Host selection still
+        // considers implicit stdio open and chooses 3, even with a live peer.
+        let selected = parent.reserve_slot_at_or_above(0, 64).unwrap();
+        let result = if selected.fd() == 0 {
+            Ok(())
+        } else {
+            Err("host selector ignores shared fd zero hole")
+        };
+        assert_eq!(
+            result.expect_err("flips at M1 cutover"),
+            "host selector ignores shared fd zero hole"
+        );
+    }
+
     #[test]
     fn serial_host_el1_ipc_file_table_fork_exec_and_refusal() {
         let ids = ObjectIdRegistry::new();
