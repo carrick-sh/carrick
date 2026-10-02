@@ -1164,6 +1164,12 @@ where
                 "post-join exact dormant cancellation failed: error={error}"
             );
         }
+        // SAFETY: all executor threads have joined; no vCPU can resume a birth record.
+        unsafe {
+            self.scheduler
+                .kernel()
+                .release_thread_birth_capacity_after_executors_stop();
+        }
         self.scheduler.wait_closed();
         let events = self.receipts.snapshot();
         let (created, destroyed) = self.receipts.lifecycle_counts();

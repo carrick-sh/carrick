@@ -712,6 +712,18 @@ pub struct ThreadSpec {
     pub(crate) cow_identity: Option<carrick_hal::FrameCowIdentity>,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ThreadSpec {
+    pub(crate) fn thread_services(&self) -> HvpatchThreadServices {
+        HvpatchThreadServices {
+            vm: self.vm.clone(),
+            mailbox_slots: self.mailbox_slots.clone(),
+            syscall_transport: self.syscall_transport,
+            carrier_foreign_mm_transport: self.carrier_foreign_mm_transport.clone(),
+        }
+    }
+}
+
 // SAFETY: `ThreadSpec` carries raw `*mut u8` host pointers (inside the
 // mapping descriptors). Those pointers name buffers that are valid for the
 // entire host process address space — they outlive every guest thread and

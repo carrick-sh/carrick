@@ -2250,33 +2250,11 @@ where
                 return Err(RuntimeError::Configuration(error));
             }
         };
-        if let Err(error) = ops.bind_child_kernel(&mut task_backend, child_token) {
-            drop(task_backend);
-            self.rollback_published_hvpatch_clone(
-                memory,
-                &child_context,
-                generation,
-                tid,
-                &tid_outputs,
-                None,
-                false,
-            );
-            return Err(error);
-        }
-        if let Err(error) = check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::TokenBind) {
-            drop(task_backend);
-            self.rollback_published_hvpatch_clone(
-                memory,
-                &child_context,
-                generation,
-                tid,
-                &tid_outputs,
-                None,
-                false,
-            );
-            return Err(error);
-        }
-        if let Err(error) = ops.activate_child(&mut task_backend) {
+        if let Err(error) =
+            lifecycle::bind_activate_child::<M, _>(ops, &mut task_backend, child_token, || {
+                check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::TokenBind)
+            })
+        {
             drop(task_backend);
             self.rollback_published_hvpatch_clone(
                 memory,
@@ -5246,7 +5224,7 @@ where
     let HvpatchLogicalJobInput {
         kernel,
         state,
-        task_backend,
+        mut task_backend,
         context,
         cpu,
         generation,
@@ -5268,17 +5246,27 @@ where
             "prepared HVPatch logical job rejected Kernel/CPU/MM identity".to_owned(),
         ));
     }
-    let factory = super::thread_adoption::ProcessThreadAdoptionFactory::capture(&kernel, &state)
-        .ok_or_else(|| {
-            TrapError::Hypervisor("thread adoption factory has no owner process".into())
-        })?
-        .with_cpu_template(&context, cpu.clone())?;
-    context
-        .task()
-        .install_thread_adoption_factory(Arc::new(factory))
-        .map_err(|_| {
-            TrapError::Hypervisor("thread adoption factory rejected foreign task owner".into())
-        })?;
+    if context
+        .thread()
+        .control_lease()
+        .lifecycle()
+        .serves_threads()
+    {
+        let factory =
+            super::thread_adoption::ProcessThreadAdoptionFactory::capture(&kernel, &state)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("thread adoption factory has no owner process".into())
+                })?
+                .with_cpu_template(&context, cpu.clone())?
+                .with_backend_template(&context, task_backend.thread_birth_template(&cpu.cpu)?);
+        context
+            .task()
+            .install_thread_adoption_factory(Arc::new(factory))
+            .map_err(|_| {
+                TrapError::Hypervisor("thread adoption factory rejected foreign task owner".into())
+            })?;
+        context.kernel().prepare_executable_thread_births(&context);
+    }
     let result = HvpatchLoopResult::pending();
     let completion = continuation::LogicalJobCompletion::pending();
     let terminal_settlement =

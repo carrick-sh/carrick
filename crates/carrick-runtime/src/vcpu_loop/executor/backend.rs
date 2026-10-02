@@ -169,6 +169,24 @@ enum HvpatchTaskEngineBindingPayload {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchTaskEngineBindingState {
+    pub(crate) fn thread_birth_template(
+        &mut self,
+        cpu: &carrick_hal::threaded::GuestCpuState,
+    ) -> Result<Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate>, TrapError>
+    {
+        match &mut self.payload {
+            HvpatchTaskEngineBindingPayload::Resident(state) => {
+                carrick_vmm_hvf::hvf_aarch64_engine::resident_thread_birth_template(state, cpu)
+                    .map(Some)
+            }
+            HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
+                state.thread_birth_template().map(Some)
+            }
+            #[cfg(test)]
+            HvpatchTaskEngineBindingPayload::Test => Ok(None),
+        }
+    }
+
     pub(crate) fn preflight_runtime_projection(
         &self,
         cpu: &carrick_hal::threaded::GuestCpuState,

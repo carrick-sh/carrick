@@ -443,8 +443,8 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
         // The host binds the child's execution generation at adoption.
         generation: 0,
         affinity,
-        lifecycle_page: 0,
-        control_slot: 0,
+        lifecycle_page: core::ptr::from_ref(page).addr() as u64,
+        control_slot: core::ptr::from_ref(child_slot).addr() as u64,
     }) else {
         // Exhausted: the identity goes back to the pool, the host clones.
         let _ = page.unclaim(claimed);
@@ -619,12 +619,20 @@ impl LifecycleVenue for GuestLifecycleVenue {
             }
         })
     }
-    fn born_slot(
-        &self,
-        _page: &ThreadLifecyclePage,
-        _entry: EntryRef,
-    ) -> Option<&ThreadControlSlot> {
-        None
+    fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot> {
+        let address = page.control_address(entry)?;
+        let end = address.checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)?;
+        if address < carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+            || end
+                > carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
+            || !address.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
+        {
+            return None;
+        }
+        // SAFETY: the host stocks this address only after reserving executable custody;
+        // carrier metadata retains its exact backing across every zone reference.
+        Some(unsafe { &*(address as *const ThreadControlSlot) })
     }
 }
 

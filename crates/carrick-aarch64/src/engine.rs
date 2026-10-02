@@ -470,6 +470,14 @@ impl Aarch64TaskRuntimeProjection {
 unsafe impl<V: Aarch64Vmm> Send for Aarch64TaskEngineState<V> {}
 
 impl<V: Aarch64Vmm> Aarch64TaskEngineState<V> {
+    pub fn runtime_projection(&self) -> Aarch64TaskRuntimeProjection {
+        Aarch64TaskRuntimeProjection {
+            page_tables: self.page_tables.clone(),
+            protections: self.protections.clone(),
+            process_asid: self.process_asid,
+        }
+    }
+
     pub fn backend_mut(&mut self) -> &mut V {
         &mut self.vm
     }

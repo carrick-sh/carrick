@@ -1088,6 +1088,7 @@ unsafe impl Sync for HvpatchPersistentExecutorFactoryAuthority {}
 pub type HvpatchTaskEngineState = carrick_aarch64::Aarch64TaskEngineState<HvfAarch64Vmm>;
 
 pub struct HvpatchTaskOnlyEngineState {
+    thread_services: crate::trap::HvpatchThreadServices,
     _backend: HvpatchTaskOnlyBackendState,
     _snapshot: Aarch64VcpuSnapshot,
     runtime_projection: TaskOnlyRuntimeProjectionSlot,
@@ -1176,7 +1177,105 @@ impl TaskOnlyRuntimeProjectionSlot {
     }
 }
 
+/// Owned Send recipe. No executor-local handle is retained or allocated.
+pub struct HvpatchThreadBirthTemplate {
+    spec: crate::trap::ThreadSpec,
+    projection: carrick_aarch64::Aarch64TaskRuntimeProjection,
+    snapshot: Aarch64VcpuSnapshot,
+}
+impl HvpatchThreadBirthTemplate {
+    pub fn reserve(
+        &self,
+        identity: HvpatchCarrierTaskIdentity,
+        directory: Arc<HvpatchCarrierTaskStateDirectory>,
+    ) -> Result<HvpatchTaskOnlyEngineState, TrapError> {
+        let _no_executor_allocation = TaskOnlyNoExecutorAllocationGuard::capture();
+        let spec = self.spec.clone();
+        let thread_services = spec.thread_services();
+        HvpatchPreparedTaskOnlyEngineState {
+            carrier: HvpatchPreparedCarrierTaskState::sibling(identity, spec)?,
+            thread_services,
+            snapshot: self.snapshot.clone(),
+            page_tables: self.projection.page_tables.clone(),
+            protections: self.projection.protections.clone(),
+            process_asid: self.projection.process_asid,
+            _not_send: std::marker::PhantomData,
+        }
+        .commit(directory)
+    }
+}
+
+pub fn resident_thread_birth_template(
+    state: &mut HvpatchTaskEngineState,
+    cpu: &carrick_hal::threaded::GuestCpuState,
+) -> Result<HvpatchThreadBirthTemplate, TrapError> {
+    let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = cpu else {
+        return Err(TrapError::Hypervisor(
+            "thread birth template requires AArch64".into(),
+        ));
+    };
+    let projection = state.runtime_projection();
+    let mut spec = state.backend_mut().state.build_thread_spec()?;
+    spec.cow_authority = None;
+    spec.cow_identity = None;
+    let snapshot = Aarch64VcpuSnapshot {
+        gprs: cpu.gprs,
+        pc: cpu.pc,
+        pstate: cpu.pstate,
+        sp_el0: cpu.sp_el0,
+        sp_el1: 0,
+        elr_el1: cpu.elr_el1,
+        spsr_el1: cpu.spsr_el1,
+        ttbr0: cpu.ttbr0,
+        ttbr1: cpu.ttbr1,
+        tcr: cpu.tcr,
+        sctlr: cpu.sctlr_el1,
+        mair: cpu.mair_el1,
+        vbar: cpu.vbar_el1,
+        cpacr: cpu.cpacr_el1,
+        cntkctl_el1: cpu.cntkctl_el1,
+        tpidr_el0: cpu.tpidr_el0,
+        tpidrro_el0: cpu.tpidrro_el0,
+        tpidr_el1: cpu.tpidr_el1,
+        contextidr_el1: cpu.contextidr_el1,
+        actlr_el1: cpu.actlr_el1,
+        vregs: cpu.vregs,
+        fpsr: cpu.fpsr,
+        fpcr: cpu.fpcr,
+    };
+    Ok(HvpatchThreadBirthTemplate {
+        spec,
+        projection,
+        snapshot,
+    })
+}
+
 impl HvpatchTaskOnlyEngineState {
+    pub fn thread_birth_template(&self) -> Result<HvpatchThreadBirthTemplate, TrapError> {
+        let projection = self.runtime_projection.projection.lock();
+        let projection = projection
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("birth template task is loaded".into()))?;
+        let parked = self.parked_task.lock();
+        let parked = parked
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("birth template task is not active".into()))?;
+        Ok(HvpatchThreadBirthTemplate {
+            spec: {
+                let mut spec = self.thread_services.sibling(parked);
+                spec.cow_authority = None;
+                spec.cow_identity = None;
+                spec
+            },
+            projection: carrick_aarch64::Aarch64TaskRuntimeProjection {
+                page_tables: projection.page_tables.clone(),
+                protections: projection.protections.clone(),
+                process_asid: projection.process_asid,
+            },
+            snapshot: self._snapshot.clone(),
+        })
+    }
+
     pub fn frame_cow_owner_inventory(
         &self,
     ) -> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
@@ -1316,6 +1415,7 @@ impl Drop for HvpatchTaskOnlyEngineState {
 }
 
 pub struct HvpatchPreparedTaskOnlyEngineState {
+    thread_services: crate::trap::HvpatchThreadServices,
     carrier: HvpatchPreparedCarrierTaskState,
     snapshot: Aarch64VcpuSnapshot,
     page_tables: carrick_aarch64::Stage1Authority,
@@ -1343,6 +1443,7 @@ impl HvpatchPreparedTaskOnlyEngineState {
     ) -> Result<HvpatchTaskOnlyEngineState, TrapError> {
         let Self {
             carrier,
+            thread_services,
             snapshot,
             page_tables,
             protections,
@@ -1353,6 +1454,7 @@ impl HvpatchPreparedTaskOnlyEngineState {
         let custody = backend.carrier_vm_custody()?;
         Ok(HvpatchTaskOnlyEngineState {
             _backend: backend,
+            thread_services,
             _snapshot: snapshot,
             runtime_projection: TaskOnlyRuntimeProjectionSlot::new(
                 carrick_aarch64::Aarch64TaskRuntimeProjection {
@@ -1413,11 +1515,13 @@ pub fn materialize_hvpatch_sibling_without_vcpu(
 ) -> Result<HvpatchPreparedTaskOnlyEngineState, TrapError> {
     let _no_executor_allocation = TaskOnlyNoExecutorAllocationGuard::capture();
     let parts = spec.into_task_only_parts();
+    let thread_services = parts.builder.thread_services();
     let carrier = HvpatchPreparedCarrierTaskState::sibling(identity, parts.builder)?;
     #[cfg(test)]
     TASK_ONLY_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(HvpatchPreparedTaskOnlyEngineState {
         carrier,
+        thread_services,
         snapshot: parts.snapshot,
         page_tables: parts.page_tables,
         protections: parts.protections,
@@ -1432,11 +1536,13 @@ pub fn materialize_hvpatch_process_without_vcpu(
 ) -> Result<HvpatchPreparedTaskOnlyEngineState, TrapError> {
     let _no_executor_allocation = TaskOnlyNoExecutorAllocationGuard::capture();
     let parts = spec.into_task_only_parts();
+    let thread_services = parts.builder.thread_services();
     let carrier = HvpatchPreparedCarrierTaskState::process(identity, parts.builder)?;
     #[cfg(test)]
     TASK_ONLY_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(HvpatchPreparedTaskOnlyEngineState {
         carrier,
+        thread_services,
         snapshot: parts.snapshot,
         page_tables: parts.page_tables,
         protections: parts.protections,
@@ -1457,11 +1563,13 @@ pub fn materialize_hvpatch_process_without_vcpu_with_reservation(
     let _no_executor_allocation = TaskOnlyNoExecutorAllocationGuard::capture();
     let mut parts = spec.into_task_only_parts();
     parts.builder.stage_with_reservation_factory(reserve)?;
+    let thread_services = parts.builder.thread_services();
     let carrier = HvpatchPreparedCarrierTaskState::process(identity, parts.builder)?;
     #[cfg(test)]
     TASK_ONLY_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(HvpatchPreparedTaskOnlyEngineState {
         carrier,
+        thread_services,
         snapshot: parts.snapshot,
         page_tables: parts.page_tables,
         protections: parts.protections,
@@ -1478,12 +1586,14 @@ pub fn materialize_hvpatch_shared_process_without_vcpu(
     let _no_executor_allocation = TaskOnlyNoExecutorAllocationGuard::capture();
     let parts = spec.into_task_only_parts();
     parts.page_tables.share_with_vfork_child();
+    let thread_services = parts.builder.thread_services();
     let carrier =
         HvpatchPreparedCarrierTaskState::shared_process(identity, shared_kernel_mm, parts.builder)?;
     #[cfg(test)]
     TASK_ONLY_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(HvpatchPreparedTaskOnlyEngineState {
         carrier,
+        thread_services,
         snapshot: parts.snapshot,
         page_tables: parts.page_tables,
         protections: parts.protections,

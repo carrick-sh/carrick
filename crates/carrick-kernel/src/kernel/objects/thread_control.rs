@@ -287,11 +287,15 @@ impl Deref for ThreadLifecycleLease {
 static LIFECYCLE_HATCHES: LazyLock<LifecycleHatches> =
     LazyLock::new(|| LifecycleHatches::from_lookup(|name| std::env::var(name).ok()));
 
+type BirthControlPins =
+    [Option<(carrick_el1_abi::EntryRef, Weak<Lease>)>; carrick_el1_abi::THREAD_POOL_ENTRIES];
+
 #[derive(Debug)]
 struct Arena {
     owner: TaskKey,
     lifecycle: ThreadLifecycleLease,
     free: Mutex<Vec<FreeSlot>>,
+    births: Mutex<BirthControlPins>,
 }
 
 /// One process's control storage. A fork creates a distinct arena. Free-list
@@ -313,6 +317,7 @@ impl ThreadControlArena {
             owner,
             lifecycle,
             free: Mutex::new(Vec::new()),
+            births: Mutex::new(std::array::from_fn(|_| None)),
         }))
     }
 
@@ -379,6 +384,29 @@ impl Drop for Lease {
 pub struct ThreadControlLease(Arc<Lease>);
 
 impl ThreadControlLease {
+    pub(in crate::kernel) fn register_birth_entry(&self, entry: carrick_el1_abi::EntryRef) {
+        if let Some(arena) = self.0.arena.upgrade() {
+            arena.births.lock()[entry.index()] = Some((entry, Arc::downgrade(&self.0)));
+        }
+    }
+    pub fn birth_controls(&self) -> Vec<(carrick_el1_abi::EntryRef, Self)> {
+        let Some(arena) = self.0.arena.upgrade() else {
+            return Vec::new();
+        };
+        arena
+            .births
+            .lock()
+            .iter()
+            .flatten()
+            .filter_map(|(entry, control)| {
+                let control = Self(control.upgrade()?);
+                (control.lifecycle().state(entry.index())
+                    == Some((entry.generation(), carrick_el1_abi::EntryState::Reserved)))
+                .then_some((*entry, control))
+            })
+            .collect()
+    }
+
     fn allocation(&self) -> &FreeSlot {
         self.0.allocation.as_ref().unwrap_or_else(|| {
             carrick_fatal::carrick_fatal!("thread::control", "live lease lost its allocation")

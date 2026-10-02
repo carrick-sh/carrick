@@ -53,6 +53,18 @@ unsafe impl RetainedMetadataBacking for ControlBacking {
 }
 
 #[derive(Debug)]
+struct ActivityBacking(carrick_kernel::kernel::objects::ThreadLedgerActivityLease);
+// SAFETY: the retained owner exposes only a closed ABI activity granule.
+unsafe impl RetainedMetadataBacking for ActivityBacking {
+    fn host_base(&self) -> HostVa {
+        self.0.backing_base()
+    }
+    fn mapped_len(&self) -> usize {
+        self.0.backing_len()
+    }
+}
+
+#[derive(Debug)]
 struct LifecycleBacking(ThreadLifecycleLease);
 // SAFETY: the lease retains a MAP_SHARED slab containing only ABI granules.
 unsafe impl RetainedMetadataBacking for LifecycleBacking {
@@ -147,10 +159,38 @@ impl CarrierLifecycleMappings {
             };
             publish_resolved(task, || {
                 let mut state = self.state.lock();
+                state.threads.retain(|_, control| {
+                    control.entry().is_none_or(|entry| {
+                        !matches!(control.lifecycle().state(entry.index()), Some((generation,
+                            carrick_el1_abi::EntryState::Reaped | carrick_el1_abi::EntryState::Revoked))
+                            if generation == entry.generation())
+                    })
+                });
                 let page = self.map(&mut state, Arc::new(LifecycleBacking(control.lifecycle())))?;
                 let page_offset = lifecycle.page_address().raw() - lifecycle.backing_base().raw();
                 let base = self.map(&mut state, Arc::new(ControlBacking(control.clone())))?;
                 let offset = control.slot_address().raw() - control.backing_base().raw();
+                if lifecycle.serves_threads() {
+                    if let Some(activity) = lifecycle.ledger_activity() {
+                        let offset =
+                            activity.activity_address().raw() - activity.backing_base().raw();
+                        let activity_base =
+                            self.map(&mut state, Arc::new(ActivityBacking(activity)))?;
+                        // SAFETY: this carrier mapping retains the exact immutable activity owner.
+                        unsafe {
+                            lifecycle.bind_guest_activity(activity_base.raw() + offset as u64);
+                        }
+                    }
+                    for (entry, born) in control.birth_controls() {
+                        let base = self.map(&mut state, Arc::new(ControlBacking(born.clone())))?;
+                        let offset = born.slot_address().raw() - born.backing_base().raw();
+                        let address = base.raw() + offset as u64;
+                        if lifecycle.control_address(entry) != Some(address) {
+                            let _ = lifecycle.bind_control_address(entry, address);
+                        }
+                        state.retain_thread(born);
+                    }
+                }
                 state.retain_thread(control);
                 Ok((page.raw() + page_offset as u64, base.raw() + offset as u64))
             })
