@@ -787,7 +787,53 @@ impl HvfTaskState {
             for projected in
                 projected_fork_mappings(source, request.shares_mm(), &projection_ranges)?
             {
-                projected_source_mappings.push((index, projected));
+                if ForkCarrickWindow::containing(projected.mapping.start, projected.mapping.end)
+                    .is_some()
+                {
+                    projected_source_mappings.push((index, projected));
+                    continue;
+                }
+                let spans = page_tables
+                    .fork_backed_spans(projected.mapping.start, projected.mapping.size)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("project child fork backing: {error:?}"))
+                    })?;
+                let mut cursor = projected.mapping.start;
+                for span in spans {
+                    if cursor < span.start {
+                        page_tables
+                            .clear_offline_fork_range(cursor, (span.start - cursor) as usize)
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "clear pristine child fork backing: {error:?}"
+                                ))
+                            })?;
+                    }
+                    let mapping = projected
+                        .mapping
+                        .semantic_slice(span.start, span.end)
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "fork backing slice escapes semantic owner".to_owned(),
+                            )
+                        })?;
+                    let plan = projected_fork_mapping_disposition(
+                        &mapping,
+                        request.shares_mm(),
+                        &projection_ranges,
+                    );
+                    projected_source_mappings.push((index, ProjectedForkMapping { mapping, plan }));
+                    cursor = span.end;
+                }
+                if cursor < projected.mapping.end {
+                    page_tables
+                        .clear_offline_fork_range(cursor, (projected.mapping.end - cursor) as usize)
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "clear pristine child fork backing tail: {error:?}"
+                            ))
+                        })?;
+                }
             }
         }
         for (source_index, projected) in projected_source_mappings {
@@ -1448,7 +1494,7 @@ impl HvfTaskState {
                 })
             {
                 return Err(TrapError::Hypervisor(format!(
-                    "hvpatch child stage-1 VA 0x{:x} resolves to IPA 0x{translated:x}, expected 0x{:x}; leaf=0x{:x} dynamic={} inherited={:?} sharing={:?} physical=0x{:x}+0x{:x} translated_in_inventory={}",
+                    "hvpatch child stage-1 VA 0x{:x} resolves to IPA 0x{translated:x}, expected 0x{:x}; leaf=0x{:x} dynamic={} inherited={:?} sharing={:?} physical=0x{:x}+0x{:x} translated_in_inventory={} semantic_end=0x{:x} projection={:?} shares_mm={}",
                     mapping.start,
                     mapping.ipa,
                     carrick_mmu_core::aarch64::terminal_descriptor(
@@ -1463,6 +1509,12 @@ impl HvfTaskState {
                         translated,
                         CowArmedRanges::COMPOUND_SIZE
                     )),
+                    mapping.end,
+                    projection_ranges
+                        .iter()
+                        .find(|range| range.va <= mapping.start
+                            && mapping.start < range.va + range.len),
+                    request.shares_mm(),
                 )));
             }
             if mapping.inherited_frame.is_some()
@@ -1827,6 +1879,11 @@ mod tests {
             owner_generation: 1,
             structural_owner: None,
         };
+        assert_eq!(
+            tables.fork_backed_spans(va, 0x8000).unwrap(),
+            vec![va + 0x4000..va + 0x8000],
+            "a mapped VMA's retired predecessor is not an inherited physical alias"
+        );
         let ranges = [carrick_hal::ForkProjectionRange {
             va: va + 0x4000,
             len: 0x4000,
