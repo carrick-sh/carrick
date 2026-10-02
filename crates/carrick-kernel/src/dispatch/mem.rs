@@ -2493,7 +2493,7 @@ impl SyscallDispatcher {
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
-    ) -> Result<ResidentFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
+    ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
         self.mem_view()
             .published_frame_grant_plan(permit, grant, protection, receipt)
     }
