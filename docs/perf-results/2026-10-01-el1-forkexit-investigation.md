@@ -986,3 +986,84 @@ execution ownership after adoption, exact retirement, abort classification,
 current full host gates, cached libc probes and hatch comparison. No Docker ran.
 A sibling worktree built concurrently during release linking; no quiet-host
 performance claim is made. Forward counts are the recorded structural witness.
+
+### Admission and watchdog checkpoint (2026-10-02)
+
+Rebased Phase B onto main `839f92126`. `ab012b68a` owns an exact-process
+birth admission close through exec preparation/commit, settles completed ABI
+births before the sibling census, revokes unused identities and inactive
+CPU/scheduler/backend custody, and clears the old executable factory before MM
+replacement. A two-live-process held-claim exec contract was red before the
+fix; the 14 exec contracts passed. The focused signed
+`el1_files_cross_process_readers_contract` passed in 3.11 seconds on that
+checkpoint (`/tmp/phaseb-exec-signed-readers.log`). This is not a new full-suite
+receipt.
+
+`641142102` extends exact-process admission custody to fork, credentials and
+ptrace. Three two-live-process contracts failed before the fix, then passed;
+all 28 ledger contracts passed. `869bd4a0d` separates the unbound post-exec
+image (`AwaitingExecBinding`) from an operation-owned `ForkClosing` gate:
+factory installation cannot reopen another operation's close, and a host fork
+can proceed before the new image installs its first executable birth factory.
+Unfinished lifecycle admission has a separate refusal from registry `TaskBusy`,
+so it cannot wait for a reservation notification that will never arrive. The
+factory-close scope contract was red; 28 ledger and 18 ABI contracts passed.
+
+The inotify watchdog then exposed missing cold-executor adoption progress.
+`7df8416a6` permits a pre-reserved unadopted birth to reach a cold executor;
+`8cf20216d` also admits it through queued migration, which publishes the SGI
+needed to wake an executor in WFI. Without the second fix, the two-process
+migration contract moved zero records instead of one. All 91 scheduler-core
+contracts pass with both fixes. Ordinary foreign-MM and home-record rules
+remain enforced.
+
+Signed `el1_inotify09_probe` on source `d3a3b2a74` passed: LTP TPASS,
+exit 0, observed wall 3.04370125 seconds. The negative entitlement control
+passed; both scoped cleanup counts were zero. Run ID:
+`phaseb-wake-d3a3b2a74-inotify-20261002`; log:
+`/tmp/phaseb-wake-signed-inotify.log`; retained artifact receipt:
+`/tmp/phaseb-wake-d3a3b2a74-artifacts.jsonl`.
+The probe executable SHA-256 is
+`9ea9e13e5562d521c2aa74889dffb594f68f7ee4c57539a57a895b980f8b754f`,
+CDHash `da9e82f1e9e5cc4a936e1bdead0976d59ff78a86`, UUID
+`7C046B7E-2035-3ECC-9914-D8805ACBDC46`; entitlement and DOF present.
+This is a watchdog/semantic receipt, not a controlled performance comparison.
+Earlier watchdog/core diagnostics remain in `/tmp/phaseb-{exec,admission,rebind}-*`
+and their exact-run `target/embed-post-mortem` directories.
+
+`d3a3b2a74` makes the spawn witness print its collected host exit classes and
+assert the accepted clone slope threshold as well as exit. No new signed
+spawn numbers have been collected. The last measured slopes remain the earlier
+0.2708 clone and 1.0000 exit; they do not constitute current-source acceptance.
+Adopted births still become home threads, so serving their exits needs an owned
+zone continuation and exact execution-binding retirement, while preserving
+EL1's home, pending-signal, robust-list and last-thread declines.
+
+The director requested a quiet window for memory-admission landing. The
+already-started inotify run finished and `quiet` was posted after zero-process
+cleanup. No further guest runs may start before `RELEASE`; rebase after the
+admission landing notice. Still open: current full-suite reader/inotify
+contracts and red census, spawn slopes and dominant clone-decline attribution,
+remaining limit/seccomp admission and exact retirement, occupancy/fork-storm
+refresh, cached libc probes, hatch comparison and the full host gates. Phase B
+is not accepted; no budgets, concurrency or timeouts changed and no Docker ran.
+
+Host validation found and fixed an admission-ordering regression.
+`just test-kernel` initially failed
+`credential_publication_waits_for_task_reservation_without_recapture`:
+credential mutation tried to close a page already owned by a fork instead of
+waiting for that task reservation. After moving the close after the wait, the
+same test caught notification preceding birth-guard release. A deterministic
+two-live-process reservation callback reproduced that second failure.
+`dcfc77491` waits first, closes, settles and revalidates before credential COW,
+and releases birth custody before reservation notifications on commit and
+rollback. The expected refusal remains errno 11, not an invariant diagnostic.
+`CARGO_BUILD_JOBS=3 just test-kernel` then exited zero: 2,376 kernel unit tests
+passed (one ignored, 155 serial-host tests filtered), with the remaining recipe
+ABI/FD and kernel-semantics suites green. Logs:
+`/tmp/phaseb-admission-test-kernel.log` (red),
+`/tmp/phaseb-credential-reservation-green.log` (second red),
+`/tmp/phaseb-admission-release-red.log` (deterministic scope red),
+`/tmp/phaseb-admission-test-kernel-green.log` (green).
+The signed watchdog receipt above belongs to `d3a3b2a74`, before this change;
+current-source signed acceptance still requires the released quiet window.
