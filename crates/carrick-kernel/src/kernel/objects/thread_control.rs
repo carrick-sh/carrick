@@ -27,6 +27,12 @@ struct AbiSlab {
     occupied: Mutex<u32>,
 }
 
+// SAFETY: the mapping address is stable for this owner's lifetime. Its bitmap
+// serializes exclusive granule claims; only synchronized AbiPage layouts are
+// initialized in claimed granules, and vacancy is published after final drop.
+unsafe impl Send for AbiSlab {}
+unsafe impl Sync for AbiSlab {}
+
 impl AbiSlab {
     fn base(&self) -> *mut u8 {
         // SAFETY: the aligned slab lies inside the overallocated mapping.
@@ -122,11 +128,6 @@ impl<T: AbiPage> SharedAbiPage<T> {
         }
     }
 }
-
-// SAFETY: only the two synchronized ABI page types instantiate this private
-// owner. No mutable reference escapes initialization; mmap never host-COWs.
-unsafe impl<T: AbiPage> Send for SharedAbiPage<T> {}
-unsafe impl<T: AbiPage> Sync for SharedAbiPage<T> {}
 
 impl<T: AbiPage> Deref for SharedAbiPage<T> {
     type Target = T;
