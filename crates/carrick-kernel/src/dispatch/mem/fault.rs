@@ -1164,6 +1164,72 @@ impl<'a> MemView<'a> {
         })
     }
 
+    pub(crate) fn published_frame_grant_plan<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+        protection: LinuxProtFlags,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+    ) -> Option<ResidentFrameGrantPlan<'permit>> {
+        let (publication, backing) = receipt.prepared_backing()?;
+        let resident = receipt.resident();
+        let end = publication.va.checked_add(publication.len)?;
+        if grant.mm_key != permit.mm().raw()
+            || receipt.id().mm_key.get() != grant.mm_key
+            || (publication.va, publication.ipa, publication.len)
+                != (grant.semantic_base, grant.physical_ipa, grant.len)
+            || (
+                backing.frame_id.get(),
+                backing.mapping_id.get(),
+                backing.owner_generation.get(),
+                backing.inventory_revision.get(),
+            ) != (
+                grant.frame_id,
+                grant.mapping_id,
+                grant.owner_generation,
+                grant.inventory_revision,
+            )
+            || resident.len != self.linux_page_size()
+            || resident.va < publication.va
+            || resident.end()? > end
+        {
+            return None;
+        }
+        if protection.is_empty()
+            || protection.contains(LinuxProtFlags::WRITE) != publication.writable
+            || protection.contains(LinuxProtFlags::EXEC) != publication.executable
+        {
+            return None;
+        }
+        let fault = self.resident_fault_plan(permit, resident.va)?;
+        if fault.prot != protection.bits() {
+            return None;
+        }
+        let mem_authority = self.mem();
+        let mem = mem_authority.lock();
+        let root_owned = matches!(mem.first_touch_owner(fault.page), FirstTouchOwner::Root(..));
+        let stock = root_owned
+            && mem.delegated_root().is_some_and(|root| {
+                ReservationRange::new(publication.va, end).is_some_and(|span| {
+                    !root
+                        .with_root(|model| root_holes(model, span))
+                        .unwrap_or_else(|refusal| {
+                            broken_root("a published grant stock observation", refusal)
+                        })
+                        .is_empty()
+                })
+            });
+        Some(ResidentFrameGrantPlan {
+            root_owned,
+            stock,
+            fault_page: fault.page,
+            start: publication.va,
+            len: publication.len,
+            prot: fault.prot,
+            exclusion: fault.exclusion,
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {
         self.track_resident_fault_range(
