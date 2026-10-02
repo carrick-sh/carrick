@@ -511,7 +511,12 @@ impl ThreadLedger {
                         record.revision,
                     );
                     kernel
-                        .retire_thread_in_registry(&context, &mut state, None)
+                        .retire_thread_in_registry(
+                            &context,
+                            &mut state,
+                            super::operations::exit::ThreadRetirementLane::ExitedInZone,
+                            None,
+                        )
                         .unwrap_or_else(|error| {
                             carrick_fatal::carrick_fatal!(
                                 "thread::ledger",
@@ -833,6 +838,36 @@ mod tests {
 
     fn fork_plan() -> ClonePlan {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
+    }
+
+    #[test]
+    fn lifecycle_host_membership_updates_only_its_process_live_count() {
+        let (kernel, root) = bootstrap(9_690);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_691),
+                "count-peer".into(),
+                None,
+            )
+            .unwrap();
+        let root_control = root.thread().control_lease();
+        let peer_control = peer.thread().control_lease();
+        let page = root_control.lifecycle();
+        let child = kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_692),
+                None,
+            )
+            .unwrap();
+        assert_eq!(page.live(), 2, "host birth absent from EL1 live authority");
+        assert_eq!(peer_control.lifecycle().live(), 1);
+        kernel.exit_thread(&child, None).unwrap();
+        assert_eq!(page.live(), 1, "host retirement left an EL1 phantom");
+        assert_eq!(peer_control.lifecycle().live(), 1);
     }
 
     #[test]
