@@ -95,6 +95,7 @@ NON_PRODUCT_CRATES = frozenset(
         "carrick-coordinator",
         "carrick-investigation",
         "carrick-test-support",
+        "carrick-xtask",
     }
 )
 
