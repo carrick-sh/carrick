@@ -1,8 +1,9 @@
 # M2–M5 contract preparation (no cutover)
 
 Baseline: `1047fefdc7cf6ee99faca70c90bf94b2e5e854d4`.
-Production behavior is unchanged. No Docker, signed execution, EL0 delivery,
-runtime ratio or migration acceptance is claimed. Known-red gates execute
+Production behavior is unchanged. No Docker, runtime ratio or migration
+acceptance is claimed. Scoped signed EL0 semantic receipts from the follow-up
+are recorded below; they do not establish EL1 delivery ownership. Known-red gates execute
 normally and use exact `expect_err` reasons; unexpected green fails. At
 cutover invert the assertion in the same commit that deletes the old owner.
 
@@ -242,3 +243,26 @@ exhaustion, concurrent born/exit/TID-reuse races and deterministic exact-route
 work budgets; CLONE_SIGHAND/exec composition; ppoll/pselect handler restore;
 stop/continue/SIGCHLD; traced/seccomp/fault/compute IRQ delivery owner proofs.
 Existing lifecycle and frame semantics alone do not close those requirements.
+
+## Follow-up signed verification receipts
+
+Source: `c808b83002d099990f6e4defd1f8c97699820b0f`, clean for both runs.
+Evidence: `docs/perf-results/2026-10-02-step3-m2-m5-followup/` contains full
+logs, signed artifact receipts and SHA-256 for the ten freshly cross-built
+probe/init binaries. Builds used `CARGO_BUILD_JOBS=3 cargo build --release`
+with each aarch64 Linux libc target and the five named binaries; GNU used
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/opt/homebrew/bin/aarch64-unknown-linux-gnu-gcc`.
+
+- `CARGO_BUILD_JOBS=3 CARRICK_RUN_ID=s3m25-frames-20261002-a CARRICK_CONTRACT_ID=kernel.el1.signal-delivery-owner scripts/test-signed.sh carrick-conformance-next m5_el0_nested_altstack_and_fault_frame_bindings --nocapture`: pass, all eight probe/libc comparisons.
+- `CARGO_BUILD_JOBS=3 CARRICK_RUN_ID=s3m25-pstate-20261002-a CARRICK_CONTRACT_ID=kernel.el1.signal-delivery-owner scripts/test-signed.sh carrick-embed el1_sched_pstate_seen_by_the_guest_is_unchanged --nocapture`: pass.
+
+Each script passed the unentitled negative control and reported zero scoped
+remaining processes for the run ID and its CLI suffix. Receipts carry SHA-256,
+CDHash, LC_UUID, entitlement digest and DOF presence for invoked executables.
+The frame tests validate the committed source-hash-checked oracle; no fresh
+Docker oracle was run. The Ubuntu image tag is not an immutable image-digest
+acceptance receipt. These focused runs do not confer full backend acceptance.
+
+No milestone is yet claimed fully cutover-ready: the precise M2–M5 remaining
+lists above still apply. This follow-up supplies the requested four binding
+areas and records the newly observed cancellation, cycle and tgkill reds.
