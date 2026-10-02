@@ -269,6 +269,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.epoll-zone",
+        "kernel.el1.ipc-lifecycle",
         "kernel.el1.ipc-two-process"
       ],
       "claims": [],
@@ -816,7 +817,8 @@
         "kernel.el1.epoll-zone",
         "kernel.el1.fd-single-owner",
         "kernel.el1.files.cross-process-readers",
-        "kernel.el1.ipc-fd-authority"
+        "kernel.el1.ipc-fd-authority",
+        "kernel.el1.ipc-lifecycle"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -845,6 +847,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.epoll-zone",
+        "kernel.el1.ipc-lifecycle",
         "kernel.el1.ipc-two-process"
       ],
       "claims": [],
@@ -915,6 +918,7 @@
         "kernel.el1.files.shared-inode",
         "kernel.el1.guest-run-queue",
         "kernel.el1.inotify",
+        "kernel.el1.ipc-lifecycle",
         "kernel.el1.ipc-two-process",
         "kernel.el1.zone-entry-at-open",
         "kernel.inotify.readiness",
@@ -943,6 +947,7 @@
         "kernel.el1.files.shared-inode",
         "kernel.el1.guest-run-queue",
         "kernel.el1.inotify",
+        "kernel.el1.ipc-lifecycle",
         "kernel.el1.ipc-two-process",
         "kernel.el1.transparent",
         "kernel.el1.zone-entry-at-open",

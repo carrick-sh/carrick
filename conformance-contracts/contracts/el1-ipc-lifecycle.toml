@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.el1.ipc-lifecycle"
+title = "Pipe and eventfd lifecycle has one shared owner"
+guest_surfaces = ["syscall:pipe2", "syscall:eventfd2", "syscall:read", "syscall:write", "syscall:close", "kernel:continuation"]
+semantic_authority = ["man 7 pipe", "man 2 eventfd", "man 2 splice", "man 2 tee"]
+fixture = "two live descriptor owners; final endpoint close at 1/8/64 pairs"
+scale_points = [1, 8, 64]
+rationale = "Final shared writer close must release its endpoint without a second host pin owner. Typed fixtures count retained endpoints at every scale. Existing continuation fixtures prove no replay; they do not prove EL1 creation or executor exhaustion. See the M2-M5 witness ledger."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::fs::pipe::tests::{red_until_step3_m2_shared_close_still_needs_host_endpoint_release,parked_large_write_keeps_writer_functional_after_numeric_close,in_memory_pipe_broken_pipe_and_eof,in_memory_pipe_zero_length_write_returns_zero}; carrick-el1-abi::ipc::tests::{el1_ipc_blocked_write_resumes_from_its_continuation_without_replay,el1_ipc_two_processes_with_overlapping_user_vas_complete_their_own_reads}"
+
+[bindings.unresolved]
+embed_structural = "Cutover must bind two scheduled processes and 32 writers exhausting the default executor pool in carrick-conformance-next; VM-free owners are descriptor tables, not EL0 execution."
+docker = "No Docker in preparation; eventfd/pipe lifecycle differential remains cutover acceptance."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20
