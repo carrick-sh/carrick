@@ -674,3 +674,7 @@ contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects/ipc.rs"
 contracts = ["kernel.el1.fd-single-owner", "kernel.el1.ipc-fd-authority"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/native_ownership_tests.rs"
+contracts = ["kernel.el1.mm-exclusive-owner"]
