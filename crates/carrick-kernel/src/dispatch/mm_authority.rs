@@ -1097,6 +1097,8 @@ impl PreparedDispatchMmFork {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareDispatchMmForkError {
+    #[error("EL1 stock and owed returns must be settled before a copied-MM snapshot")]
+    UnsettledEl1Backing,
     #[error(transparent)]
     Projection(#[from] carrick_hal::ForkProjectionError),
     #[error("shared MM preparation requires identical parent and child MM identities")]
