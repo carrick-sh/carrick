@@ -3184,7 +3184,12 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// EL1-resident and maps exactly `expected_ipa`. One call per grant reads
     /// the live root once and resolves each table arena once, however many
     /// pages the grant committed.
-    fn live_el1_grant_pages(&self, _pages: &[(u64, u64)], _resident: &mut dyn FnMut(u64)) {}
+    fn live_el1_grant_pages(
+        &self,
+        _pages: &[(u64, u64)],
+        _resident: &mut dyn FnMut(u64, carrick_abi::LinuxProtFlags),
+    ) {
+    }
 
     /// Refresh fork-private backend state after the child frame inventory and
     /// exact MM/COW authority are live, but before the child enters guest code.
