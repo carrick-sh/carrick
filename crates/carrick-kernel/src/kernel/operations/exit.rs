@@ -29,6 +29,7 @@ use crate::kernel::objects::{
 #[derive(Debug)]
 pub(in crate::kernel) enum ThreadRetirementLane {
     Host,
+    HostAdopted(crate::kernel::thread_ledger::PublishedAbiThread),
     ExitedInZone {
         storage: crate::kernel::thread_retirement::RetirementReservation,
         revisions: crate::kernel::revision_capacity::RevisionReservation,
@@ -326,8 +327,17 @@ impl Kernel {
         {
             return Err(KernelOperationError::UnknownThread(tid));
         }
+        check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
+        if matches!(lane, ThreadRetirementLane::Host) {
+            if let Some(owned) = record.thread_pool.take_published(context.thread.key()) {
+                lane = ThreadRetirementLane::HostAdopted(owned);
+            }
+        }
         let next = match &mut lane {
             ThreadRetirementLane::Host => next_revision(&record.task, record.revision)?,
+            ThreadRetirementLane::HostAdopted(owned) => record
+                .task
+                .consume_thread_revision(&mut owned.revisions, record.revision),
             ThreadRetirementLane::ExitedInZone { revisions, .. } => record
                 .task
                 .consume_thread_revision(revisions, record.revision),
@@ -338,13 +348,12 @@ impl Kernel {
                 .try_reserve_exact(1)
                 .map_err(|_| KernelOperationError::RetiredThreadCapacity(1))?;
         }
-        check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
         let thread = context
             .task
             .retire_thread(context.thread.key())
             .ok_or(KernelOperationError::UnknownThread(tid))?;
-        if matches!(lane, ThreadRetirementLane::Host) {
+        if !matches!(lane, ThreadRetirementLane::ExitedInZone { .. }) {
             thread
                 .control_lease()
                 .lifecycle()
@@ -378,6 +387,19 @@ impl Kernel {
             };
             match lane {
                 ThreadRetirementLane::Host => state.retired_threads.push(retired),
+                ThreadRetirementLane::HostAdopted(owned) => {
+                    owned
+                        .control
+                        .lifecycle()
+                        .retire_published(owned.entry)
+                        .unwrap_or_else(|error| {
+                            carrick_fatal!(
+                                "kernel::thread_retirement",
+                                "host retirement lost exact published ABI generation: {error:?}"
+                            );
+                        });
+                    state.retired_threads.push_reserved(owned.storage, retired);
+                }
                 ThreadRetirementLane::ExitedInZone { storage, .. } => {
                     state.retired_threads.push_reserved(storage, retired)
                 }
