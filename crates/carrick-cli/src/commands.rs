@@ -1027,6 +1027,14 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         );
                     }
                 }
+                if profile == Some(crate::trace_profile::TraceProfileKind::HostNamespaceWork) {
+                    if trace_out.is_none() || summary_jsonl.is_some() {
+                        bail!(
+                            "host-namespace-work requires --trace-out and retains its strict raw census"
+                        );
+                    }
+                    crate::namespace_work_profile::fixture_scale(&command)?;
+                }
                 let me = std::env::current_exe()
                     .context("failed to resolve current carrick binary path")?;
                 if unsafe { libc::geteuid() } != 0 {
@@ -1106,6 +1114,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .as_deref()
                     .or_else(|| internal_trace.as_ref().map(tempfile::NamedTempFile::path));
                 let script_src = match profile {
+                    Some(crate::trace_profile::TraceProfileKind::HostNamespaceWork) => {
+                        Some(crate::namespace_work_profile::render_profile_script()?)
+                    }
                     Some(crate::trace_profile::TraceProfileKind::HvpatchInotify09Population) => {
                         Some(crate::hvpatch_inotify_population_profile::render_profile_script()?)
                     }
@@ -1191,6 +1202,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 {
                     bail!(
                         "inotify09 population capture was lossy, interrupted, or lacked a successful script exit"
+                    );
+                }
+                if profile == Some(crate::trace_profile::TraceProfileKind::HostNamespaceWork)
+                    && custom_trace_report_is_rejected(report, true)
+                {
+                    bail!(
+                        "namespace census was lossy, interrupted, or lacked a successful script exit"
                     );
                 }
                 if opts.script.is_some()
@@ -1309,6 +1327,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             )?;
                             write_profile_summary_jsonl(summary_jsonl.as_deref(), &summary)?;
                             eprintln!("{}", summary.render_human());
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::HostNamespaceWork
+                        {
+                            let raw = std::fs::read_to_string(raw_path)
+                                .context("read namespace work census")?;
+                            let scale = crate::namespace_work_profile::fixture_scale(&command)?;
+                            let census = crate::namespace_work_profile::validate(&raw, scale)?;
+                            eprintln!(
+                                "namespace work census accepted: scale {scale}, {} actor/operation populations, {} closed host syscall populations, {} path stages",
+                                census.calls.len(),
+                                census.host_calls.len(),
+                                census.visits.len()
+                            );
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchInotify09Population
                         {

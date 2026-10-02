@@ -865,6 +865,7 @@ impl DentryCache {
 
         while comp_idx < components.len() {
             let name = &components[comp_idx];
+            crate::probes::fs_op("path-visit:dentry", name, 0);
             let is_last = comp_idx + 1 == components.len();
 
             if current_id == DentryId::ROOT && (name == "proc" || name == "sys" || name == "dev") {
