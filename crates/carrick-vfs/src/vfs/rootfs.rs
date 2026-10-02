@@ -188,7 +188,15 @@ impl RootFsVfs {
             .archive_mutation_gate()
             .map(crate::fs_backend::ArchiveMutationGate::mutation);
         let resolve_parents = || {
-            let mut parents = Vec::with_capacity(paths.len());
+            let mut parents: Vec<crate::vfs::namespace_mutation::AnchoredParent> =
+                Vec::with_capacity(paths.len());
+            let mut resolved_parents: std::collections::HashMap<
+                &str,
+                (
+                    Option<Arc<OwnedFd>>,
+                    crate::vfs::namespace_mutation::NamespaceParentIdentity,
+                ),
+            > = std::collections::HashMap::new();
             for path in paths {
                 let path_obj = std::path::Path::new(path);
                 let parent = path_obj
@@ -196,6 +204,22 @@ impl RootFsVfs {
                     .and_then(std::path::Path::to_str)
                     .filter(|parent| !parent.is_empty())
                     .unwrap_or("/");
+                if let Some((fd, identity)) = resolved_parents.get(parent) {
+                    let leaf = path_obj
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .ok_or(LINUX_EINVAL)?;
+                    parents.push(crate::vfs::namespace_mutation::AnchoredParent {
+                        path: (*path).to_owned(),
+                        identity: identity.clone(),
+                        resolved: ResolvedParent {
+                            parent_fd: fd.clone(),
+                            leaf: CString::new(leaf).map_err(|_| LINUX_EINVAL)?,
+                            rel: crate::fs_backend::NormalizedRelPath::from_normalized_str(path),
+                        },
+                    });
+                    continue;
+                }
                 let resolved = self.resolved_parent(path)?;
                 let identity = if let Some(ref fd) = resolved.parent_fd {
                     crate::vfs::namespace_mutation::NamespaceParentIdentity::Host(
@@ -210,6 +234,7 @@ impl RootFsVfs {
                         crate::fs_backend::NormalizedRelPath::from_normalized_str(parent),
                     )
                 };
+                resolved_parents.insert(parent, (resolved.parent_fd.clone(), identity.clone()));
                 parents.push(crate::vfs::namespace_mutation::AnchoredParent {
                     path: (*path).to_owned(),
                     identity,
@@ -663,9 +688,13 @@ impl RootFsVfs {
 
     /// Create hard link in writable overlay and update dentry cache.
     pub fn link(&self, from: &str, to: &str) -> Result<(), LinuxErrno> {
-        self.with_namespace_batch(&[from, to], false, |_permit| {
-            let inode = self.path_inode_identity(from);
-            match self.overlay.hard_link(from, to) {
+        self.with_namespace_batch(&[from, to], false, |permit| {
+            let src = permit.parent(from).ok_or(LINUX_ENOENT)?;
+            let dst = permit.parent(to).ok_or(LINUX_ENOENT)?;
+            let inode = self
+                .admitted_entry_info(src, from)
+                .and_then(|entry| entry.inode);
+            match self.overlay.hard_link_at(src, dst) {
                 Ok(()) => {
                     self.dentry_cache.entry_created(to, inode);
                     self.dentry_cache.inode_changed(from, inode);

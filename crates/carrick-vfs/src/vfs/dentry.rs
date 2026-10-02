@@ -1752,20 +1752,39 @@ impl DentryCache {
         }
 
         if mode_type == libc::S_IFDIR as u32 {
+            // The name was freshly checked with fstatat above. A foreign
+            // generation change can discard its binding while retaining a
+            // pinned capability for this exact physical directory. Reuse
+            // that capability before opening, rather than opening and then
+            // discovering the retained identity in insert_dir.
+            let retained_upper = if !is_lower && st.st_dev != 0 {
+                let identity = InodeIdentity::new(st.st_dev as u64, st.st_ino);
+                let retained_id = self.orphaned_dirs.read().get(&identity).copied();
+                retained_id.and_then(|id| {
+                    self.dirs
+                        .read()
+                        .get(&id)
+                        .and_then(|dir| dir.upper_dir_fd.clone())
+                })
+            } else {
+                None
+            };
             let child_upper_dir_fd = if !is_lower {
-                let raw = unsafe {
-                    libc::openat(
-                        parent_fd.as_raw_fd(),
-                        name_c.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                    )
-                };
-                if raw >= 0 {
-                    self.host_opens.fetch_add(1, Ordering::Relaxed);
-                    Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
-                } else {
-                    backend.dir_fd_for(Path::new(rel_full))
-                }
+                retained_upper.or_else(|| {
+                    let raw = unsafe {
+                        libc::openat(
+                            parent_fd.as_raw_fd(),
+                            name_c.as_ptr(),
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                        )
+                    };
+                    if raw >= 0 {
+                        self.host_opens.fetch_add(1, Ordering::Relaxed);
+                        Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                    } else {
+                        backend.dir_fd_for(Path::new(rel_full))
+                    }
+                })
             } else {
                 let parent_upper_fd = self
                     .dirs
@@ -4128,6 +4147,42 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         churn_handle.join().unwrap();
+    }
+
+    #[test]
+    fn serial_host_pinned_parent_revalidation_does_not_reopen() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false, Arc::clone(backend.cache_coherence()));
+        fs::create_dir_all(tmp.path().join("parent/child")).unwrap();
+        fs::write(tmp.path().join("parent/child/old"), b"data").unwrap();
+        cache
+            .lookup_path("/parent/child/old", false, &backend, None)
+            .unwrap();
+        cache.pin_dir("/parent/child");
+        fs::rename(
+            tmp.path().join("parent/child/old"),
+            tmp.path().join("parent/child/new"),
+        )
+        .unwrap();
+        cache.coherence.simulate_sibling_path_bump();
+        cache.reset_host_open_count();
+        assert_eq!(
+            cache.stat("/parent/child/old", false, &backend, None),
+            Err(LINUX_ENOENT)
+        );
+        assert_eq!(
+            cache
+                .stat("/parent/child/new", false, &backend, None)
+                .unwrap()
+                .size,
+            4
+        );
+        assert_eq!(
+            cache.host_open_count(),
+            0,
+            "fresh physical identity must reuse retained parent capabilities"
+        );
     }
 
     #[test]

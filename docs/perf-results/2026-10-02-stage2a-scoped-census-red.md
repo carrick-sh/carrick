@@ -95,3 +95,47 @@ After making the archive helper propagate construction errors for clippy,
 `cargo test -p carrick-kernel-example --test namespace_two_process -- --nocapture`
 passed again (both matrix tests). Logs are `/tmp/stage2a-matrix-{test-kernel,
 test,clippy-final2,final,fmt-check}.log`.
+
+## Qualified concurrent baseline (2026-10-02)
+
+The replacement `host-namespace-work` profile uses aggregation counts, verifies
+one armed path census per request, and requires exact per-actor populations,
+closed host syscall pairs, a program digest, and one backend open per openat.
+The fixture now performs ONE operation in each family per actor/iteration.
+All 16 captures completed on a digest-pinned image through `carrick trace`.
+The first qualification exposed a DTrace declaration-order compile error;
+initializing the thread-local predicates fixed it before any measurements.
+
+CLI SHA-256: `e3909e5dc8774ab33beaf57d46fda08125f0cedeb151abdfa43b5cedf7b133d1`.
+Probe SHA-256: `d283dc1c61dc8f9a2f701e93546604ef3cc1a05daa7ed085e3365f7c7ba561d2`.
+Program SHA-256: `c3c40d892645c33efde691e5ab76fb3fd307467012c10f7abc0ddf338e86892b`.
+Source: be54151a6 plus the two-line predicate initialization in the durable script.
+Codesign, UUID, load commands, raw captures and zero-process cleanup receipts
+are in `target/el1-host-namespace/scoped-census-qualified-before/`.
+
+Each cell is **filesystem host calls / all Unix host calls / owned path visits**,
+across both actors; divide by `2 * scale` for per-call values. Filesystem calls
+are close, fgetxattr, fstat64, fstatat64, linkat, lseek, openat, pread, renameat,
+unlinkat. Other calls are synchronization and thread_selfusage, retained in the
+all-call count. Visits count the three named owned walk stages; lexical string
+processing and cap-std internal walks are excluded, as declared by the script.
+Those limitations must not be mistaken for an exhaustive lexical-work bound.
+
+| Scale | Population | Parents | Rename | Unlink | Link | Openat | Mutation opens |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | same | 16/17/14 | 8/9/14 | 14/20/29 | 12/12/0 | 0 |
+| 1 | 0 | unrelated | 16/16/14 | 8/8/14 | 35/35/32 | 12/12/0 | 5 |
+| 1 | 128 | same | 16/19/11 | 8/8/14 | 14/15/32 | 12/12/0 | 0 |
+| 1 | 128 | unrelated | 16/16/14 | 8/8/14 | 14/14/32 | 12/12/0 | 0 |
+| 8 | 0 | same | 128/153/100 | 64/94/112 | 98/120/256 | 96/96/0 | 0 |
+| 8 | 0 | unrelated | 146/149/121 | 65/66/112 | 124/126/264 | 96/96/0 | 12 |
+| 8 | 128 | same | 128/160/106 | 64/96/112 | 98/130/256 | 96/96/0 | 0 |
+| 8 | 128 | unrelated | 150/150/115 | 75/75/112 | 108/108/260 | 96/96/0 | 12 |
+| 32 | 0 | same | 512/613/409 | 256/408/439 | 384/531/1027 | 384/386/0 | 0 |
+| 32 | 0 | unrelated | 512/513/460 | 281/292/448 | 386/386/1063 | 384/385/0 | 6 |
+| 32 | 128 | same | 512/639/418 | 256/435/436 | 383/536/1006 | 384/384/0 | 0 |
+| 32 | 128 | unrelated | 540/540/457 | 279/279/448 | 389/389/1053 | 384/391/0 | 17 |
+| 128 | 0 | same | 2048/2526/1663 | 1024/1720/1753 | 1526/2168/4089 | 1536/1541/0 | 0 |
+| 128 | 0 | unrelated | 2071/2073/1807 | 1098/1100/1792 | 1617/1619/4289 | 1536/1538/0 | 61 |
+| 128 | 128 | same | 2049/2494/1627 | 1024/1710/1753 | 1546/2179/4109 | 1536/1536/0 | 5 |
+| 128 | 128 | unrelated | 2107/2114/1831 | 1043/1050/1792 | 1691/1702/4278 | 1536/1536/0 | 80 |
