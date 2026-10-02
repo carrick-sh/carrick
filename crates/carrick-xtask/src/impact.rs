@@ -911,8 +911,16 @@ pub fn run(root: Option<&Path>, action: Action) -> Result<()> {
         Action::Carrick {
             artifact,
             measurement,
-        } => measure(&root, &mut runner, "carrick", Some(&artifact), &measurement),
-        Action::Docker { measurement } => measure(&root, &mut runner, "docker", None, &measurement),
+        } => {
+            let _lease =
+                crate::host_lease::HostLease::acquire(crate::host_lease::HostLeaseMode::Carrick)?;
+            measure(&root, &mut runner, "carrick", Some(&artifact), &measurement)
+        }
+        Action::Docker { measurement } => {
+            let _lease =
+                crate::host_lease::HostLease::acquire(crate::host_lease::HostLeaseMode::Docker)?;
+            measure(&root, &mut runner, "docker", None, &measurement)
+        }
         Action::Report {
             base,
             candidate,
