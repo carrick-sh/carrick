@@ -1587,6 +1587,57 @@ mod tests {
     }
 
     #[test]
+    fn red_until_step3_m5_shared_pending_clear_does_not_consume_host_queue() {
+        use carrick_el1_abi::PendingSignals;
+        let target = Fixture::new();
+        let peer = Fixture::new();
+        let target_shared = target.task.shared();
+        let peer_shared = peer.task.shared();
+        let target_pending = target_shared.pending_signals();
+        let peer_pending = peer_shared.pending_signals();
+        let signal = LinuxSignal::for_signal_number(34).unwrap();
+        for count in [1, 8, 32, 128] {
+            for payload in 0..count {
+                target_pending.enqueue_realtime(signal, Some(siginfo(signal, payload)));
+                peer_pending.enqueue_realtime(signal, Some(siginfo(signal, -payload - 1)));
+            }
+            let page = target_pending.lifecycle_lease();
+            page.pending()
+                .clear(PendingSignals(SigSet::EMPTY.with(signal.raw()).raw()));
+            assert_eq!(page.pending().load().0, 0);
+            assert_eq!(target_pending.pending_count(), count as usize);
+            assert_eq!(peer_pending.pending_count(), count as usize);
+            let result = if target_pending.pending_count() == 0 {
+                Ok(())
+            } else {
+                Err("shared pending clear leaves host realtime queue authoritative")
+            };
+            assert_eq!(
+                result.expect_err("flips at M5 cutover"),
+                "shared pending clear leaves host realtime queue authoritative"
+            );
+            for payload in 0..count {
+                assert_eq!(
+                    target_pending
+                        .take_lowest_in(SigSet::EMPTY.with(signal.raw()))
+                        .unwrap()
+                        .siginfo,
+                    Some(siginfo(signal, payload))
+                );
+                assert_eq!(
+                    peer_pending
+                        .take_lowest_in(SigSet::EMPTY.with(signal.raw()))
+                        .unwrap()
+                        .siginfo,
+                    Some(siginfo(signal, -payload - 1))
+                );
+            }
+            assert_eq!(target_pending.pending_count(), 0);
+            assert_eq!(peer_pending.pending_count(), 0);
+        }
+    }
+
+    #[test]
     fn child_exit_interest_distinguishes_sigwait_from_sigsuspend_restore_mask() {
         let fixture = Fixture::new();
         let shared = fixture.task.shared();
