@@ -3021,6 +3021,39 @@
       "rationale": "Exhausting the task-owned group-stop epoch would alias a new stop to a parked continuation epoch and silently lose required EINTR; stop rather than publish ambiguous kernel authority. This is unreachable counter exhaustion, not a guest errno condition.",
       "sink": "fatal",
       "domain": "kernel::job_control"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/thread.rs",
+      "function": "Thread::prepare_clone",
+      "ordinal_in_function": 1,
+      "fingerprint": "addfe24991b31db83f10035e408ae106ab92a1ed13ebcee9b7557d0f7e177e67",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::control",
+      "rationale": "Clone adoption received a control lease from a different live arena. Continuing would bind one process to another process control authority; this is an internal ownership violation, not a guest clone refusal.",
+      "sink": "fatal",
+      "domain": "thread::control"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
+      "function": "ThreadControlArena::allocate",
+      "ordinal_in_function": 1,
+      "fingerprint": "c86c2e6113f2e80f30cb886dd25677095e02f65efdf6b89d3efc8574072a829c",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::control",
+      "rationale": "A successful control-page refill must supply a free slot while holding the arena lock. An empty free list here means the allocator invariant is corrupt; no guest resource shortage can produce this state.",
+      "sink": "fatal",
+      "domain": "thread::control"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
+      "function": "ThreadControlLease::allocation",
+      "ordinal_in_function": 1,
+      "fingerprint": "84a6068f484a61db0f7b5fe0178eca534e419595d0fb6e11dbd7b54ec166d524",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::control",
+      "rationale": "A live control lease must retain its allocation until final Drop. Missing backing means an internal lifetime violation; returning a control pointer would access invalid authority.",
+      "sink": "fatal",
+      "domain": "thread::control"
     }
   ]
 }
