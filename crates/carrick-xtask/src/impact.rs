@@ -101,6 +101,38 @@ fn parse_window(output: &str, window: &Window) -> Result<f64> {
     }
     Ok(ns as f64 / 1e9 / window.operations as f64)
 }
+fn output_tail(output: &str) -> String {
+    let lines = output.lines().collect::<Vec<_>>();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    tail.chars()
+        .skip(tail.chars().count().saturating_sub(4096))
+        .collect()
+}
+fn parse_sample_window(
+    output: &Output,
+    window: &Window,
+    workload: &str,
+    index: usize,
+) -> Result<f64> {
+    parse_window(&output.stdout, window).map_err(|error| {
+        let count = |text: &str| {
+            text.lines()
+                .filter(|line| line.starts_with(&window.prefix))
+                .count()
+        };
+        format!(
+            "{workload} sample {index} (warmup={}): {error}; prefix {:?} lines: stdout={}, stderr={}; exit_code={:?}, timed_out={}\nstdout tail:\n{}\nstderr tail:\n{}",
+            index == 0,
+            window.prefix,
+            count(&output.stdout),
+            count(&output.stderr),
+            output.code,
+            output.timed_out,
+            output_tail(&output.stdout),
+            output_tail(&output.stderr),
+        ).into()
+    })
+}
 fn windows(root: &Path) -> Result<BTreeMap<String, Window>> {
     Ok(serde_json::from_slice(&fs::read(
         root.join("scripts/perf/manifests/impact-windows.json"),
@@ -308,10 +340,12 @@ fn workloads(root: &Path) -> Result<Vec<Suite>> {
         .find(|s| s.name == "node-core-worker-message-port")
         .ok_or("missing worker shard")?;
     let mut startup = worker.clone();
-    startup.cmd = strings(&["-e", "0"]);
+    // Start with a positional executable: a leading `-e` is a Carrick
+    // environment option until the trailing guest command has begun.
+    startup.cmd = strings(&["/opt/nodejs-conformance/bin/node24", "-e", "0"]);
     startup.timeout_s = 30;
     startup.entrypoint = Some(EnginePair {
-        both: Some("/opt/nodejs-conformance/bin/node24".into()),
+        both: Some(String::new()),
         carrick: None,
         docker: None,
     });
@@ -583,7 +617,8 @@ fn measure(
     }
 
     let run_id = format!(
-        "impact-{}-{}",
+        "{}-{}-{}",
+        std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| "impact".into()),
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
@@ -660,7 +695,7 @@ fn measure(
                 let output = output?;
                 let per_op = windows
                     .get(&suite.name)
-                    .map(|window| parse_window(&output.stdout, window))
+                    .map(|window| parse_sample_window(&output, window, &suite.name, index))
                     .transpose();
                 let sample =
                     Sample {
@@ -1037,6 +1072,45 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn window_diagnostics_preserve_sample_and_both_streams() {
+        let window = Window {
+            operations: 1000,
+            prefix: "impact_window_ns=".into(),
+        };
+        for (stdout, stderr, count) in [
+            ("guest output", "impact_window_ns=1", 0),
+            ("impact_window_ns=1\nimpact_window_ns=2", "failure", 2),
+            ("impact_window_ns=NaN", "failure", 1),
+            ("impact_window_ns=0", "failure", 1),
+        ] {
+            let output = Output {
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+                code: Some(127),
+                ..Output::default()
+            };
+            let error = parse_sample_window(&output, &window, "spawn-loop", 0)
+                .expect_err("invalid window must fail closed")
+                .to_string();
+            assert!(error.contains("spawn-loop sample 0 (warmup=true)"));
+            assert!(error.contains(&format!("stdout={count}")));
+            assert!(error.contains("exit_code=Some(127)"));
+            assert!(error.contains(&format!("stdout tail:\n{stdout}")));
+            assert!(error.contains(&format!("stderr tail:\n{stderr}")));
+            assert!(error.contains(if count == 0 { "stderr=1" } else { "stderr=0" }));
+            assert!(
+                parse_sample_window(&output, &window, "spawn-loop", 2)
+                    .expect_err("measured sample must fail closed")
+                    .to_string()
+                    .contains("sample 2 (warmup=false)")
+            );
+        }
+        assert_eq!(output_tail(&"x".repeat(5000)).len(), 4096);
+        assert!(
+            !output_tail(&format!("excluded\n{}", "included\n".repeat(20))).contains("excluded")
+        );
+    }
+    #[test]
     fn guest_windows_fail_closed_and_drive_objective() -> Result<()> {
         let window = Window {
             operations: 1000,
@@ -1091,6 +1165,21 @@ mod tests {
     fn harness_argv_parity() -> Result<()> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let workloads = workloads(&root)?;
+        for suite in workloads
+            .iter()
+            .filter(|s| matches!(s.name.as_str(), "node-startup" | "thread-spawn"))
+        {
+            assert_eq!(suite.cmd[0], "/opt/nodejs-conformance/bin/node24");
+            assert_eq!(suite.cmd[1], "-e");
+            assert_eq!(
+                suite.entrypoint.as_ref().and_then(|e| e.for_carrick()),
+                Some(String::new())
+            );
+            assert_eq!(
+                suite.entrypoint.as_ref().and_then(|e| e.for_docker()),
+                Some(String::new())
+            );
+        }
         let manifest = Manifest::from_toml(&fs::read_to_string(
             root.join("scripts/perf/manifests/el1-real-workloads-v1.toml"),
         )?)?;
