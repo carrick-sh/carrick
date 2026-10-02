@@ -914,6 +914,19 @@ impl HvpatchRuntimeDirectory {
         Ok(started)
     }
 
+    pub(crate) fn published_birth_scheduler(
+        &self,
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
+    ) -> Option<Arc<carrick_kernel::kernel::Scheduler>> {
+        let scheduler = self.scheduler.lock();
+        let wait_service = self.continuation_wait_service.lock();
+        wait_service.as_ref()?;
+        scheduler
+            .as_ref()
+            .filter(|scheduler| Arc::ptr_eq(scheduler.kernel(), kernel))
+            .cloned()
+    }
+
     pub(crate) fn continuation_services(
         &self,
         kernel: &Arc<carrick_kernel::kernel::Kernel>,
@@ -1599,6 +1612,12 @@ mod tests {
         let context = alias_context(67_099);
         let directory = HvpatchRuntimeDirectory::default();
         let first = directory.prepare_persistent_services(context.kernel());
+        assert!(
+            directory
+                .published_birth_scheduler(context.kernel())
+                .is_none(),
+            "birth reservations must not publish services before the startup transaction commits"
+        );
         let error = directory
             .start_services_transaction(&first, || {
                 Err::<(), _>(RuntimeError::Configuration(
@@ -1621,6 +1640,12 @@ mod tests {
         directory
             .start_services_transaction(&retry, || Ok(()))
             .expect("retry start");
+        assert!(Arc::ptr_eq(
+            &directory
+                .published_birth_scheduler(context.kernel())
+                .unwrap(),
+            &retry.scheduler
+        ));
         assert!(Arc::ptr_eq(
             directory.scheduler.lock().as_ref().expect("scheduler"),
             &retry.scheduler,

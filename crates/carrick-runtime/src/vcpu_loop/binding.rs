@@ -5567,6 +5567,10 @@ where
                 return VcpuLoopLaunch::Direct(Err(error));
             }
         };
+        logical
+            .context
+            .kernel()
+            .prepare_executable_thread_births(&logical.context);
         if let Err(error) = dormant.activate(&prepared.scheduler, Arc::clone(&thread), proof) {
             // The job was never exposed. Remove its process-local drain handle
             // before closing a newly-created pool, or shutdown would wait on a
