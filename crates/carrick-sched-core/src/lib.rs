@@ -2061,7 +2061,9 @@ impl ZoneTables {
         let state = s.state();
         state.in_guest()
             && (home || state.is_idle())
-            && (home || self.runs_mm_of(slot, rec))
+            && (home
+                || self.runs_mm_of(slot, rec)
+                || (rec.is_unadopted_birth() && !self.executor_has_task(slot)))
             && (home || rec.allows_cpu(s.cpu.load(Ordering::Relaxed)))
     }
 
