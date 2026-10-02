@@ -117,20 +117,25 @@ fn forwarded_read_per_call_budget() {
 
 #[test]
 fn forwarded_write_per_call_budget() {
-    assert_forwarded_write_per_call_budget(|| {});
+    assert_forwarded_write_per_call_budget(|_| {});
 }
 
 mod serial_host {
     #[test]
     fn forwarded_write_after_foreign_namespace_bump_per_call_budget() {
-        super::assert_forwarded_write_per_call_budget(|| {
-            // This fixture explicitly mutates process-global generation state.
-            carrick_vfs::fs_resolve_cache::bump_generation();
+        super::assert_forwarded_write_per_call_budget(|dispatcher| {
+            // Publish through the same backing cohort used by production.
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .dentry_cache
+                .coherence
+                .bump_generation();
         });
     }
 }
 
-fn assert_forwarded_write_per_call_budget(before_write: impl FnOnce()) {
+fn assert_forwarded_write_per_call_budget(before_write: impl FnOnce(&SyscallDispatcher)) {
     let file = tempfile::tempfile().expect("tempfile");
 
     let mut dispatcher = SyscallDispatcher::new();
@@ -147,7 +152,7 @@ fn assert_forwarded_write_per_call_budget(before_write: impl FnOnce()) {
     let count = 8192u64;
     // Inject a mutation between cache construction and this first write.
     // No inode has been cached here, even when the namespace generation moves.
-    before_write();
+    before_write(&dispatcher);
 
     let (outcome, snapshot) = budget_meter::measure_no_allocations(|| {
         dispatcher
