@@ -491,6 +491,38 @@ fn generic_probe_shard_0() {
     }
 }
 
+/// `kernel.fork.stage1-image`: probeinit's pre-fork path lookup provisions
+/// first-touch stock over the boot heap; fork returns its unused part. The
+/// child must inherit live VMAs and exact owners, without treating the stock
+/// hole's retired output as the bootstrap heap translation. abortdeath also
+/// verifies the resulting parent/child wait and fatal-signal behavior.
+#[test]
+fn case_fork_bootstrap_heap_after_stock_return() {
+    let _guard = common::guest_lock();
+    let root = common::repo_root();
+    for (target, libc) in [
+        ("aarch64-unknown-linux-musl", "musl"),
+        ("aarch64-unknown-linux-gnu", "gnu"),
+    ] {
+        let dir = find_probe_binary_dir(&root, target).expect("built probe binaries");
+        let oracle = cached_probe_oracle(&root, "arm64", libc, "abortdeath")
+            .expect("source-validated committed Linux oracle");
+        let container = common::generic_probe_container(
+            "abortdeath",
+            &dir.join("abortdeath"),
+            &dir.join("probeinit"),
+        );
+        let name = format!("fork bootstrap heap after stock return {libc}");
+        let outcome = common::timed_probe_run(&name, || {
+            common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"]))
+        });
+        let result = common::run_named_or_fail(&name, outcome);
+        let mut output = String::from_utf8_lossy(&result.stdout).into_owned();
+        output.push_str(&String::from_utf8_lossy(&result.stderr));
+        assert_eq!(diff_lines(&normalize(&output), &oracle), None, "{libc}");
+    }
+}
+
 /// M5 EL0 frame bindings: reuse source-valid cached Linux oracles and the
 /// probeinit fork/exec topology. These are semantic witnesses, not proof of
 /// EL1 frame ownership. No new subprocess or executable probe is introduced.

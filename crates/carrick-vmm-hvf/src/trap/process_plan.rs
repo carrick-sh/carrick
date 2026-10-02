@@ -6,6 +6,47 @@
 
 use super::*;
 
+/// Remove guest VA holes from the offline child graph. Physical ownership is
+/// inherited through the projected aliases and deduplicated inventory, never
+/// through an inaccessible boot descriptor's retained output.
+fn clear_projected_fork_gaps(
+    tables: &mut carrick_mmu_core::aarch64::PageTableManager,
+    mapping: &ThreadMappingDesc,
+    shares_mm: bool,
+    ranges: &[carrick_hal::ForkProjectionRange],
+) -> Result<(), TrapError> {
+    if shares_mm || ForkCarrickWindow::containing(mapping.start, mapping.end).is_some() {
+        return Ok(());
+    }
+    let clear = |tables: &mut carrick_mmu_core::aarch64::PageTableManager, start, end| {
+        let len =
+            usize::try_from(end - start).map_err(|_| TrapError::MappingTooLarge(end - start))?;
+        tables
+            .clear_offline_fork_range(start, len)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "clear child fork VMA gap 0x{start:x}..0x{end:x}: {error:?}"
+                ))
+            })?;
+        Ok::<(), TrapError>(())
+    };
+    let mut cursor = mapping.start;
+    let first = ranges.partition_point(|range| range.va.saturating_add(range.len) <= cursor);
+    for range in &ranges[first..] {
+        if range.va >= mapping.end {
+            break;
+        }
+        if cursor < range.va {
+            clear(tables, cursor, range.va.min(mapping.end))?;
+        }
+        cursor = cursor.max(range.va.saturating_add(range.len).min(mapping.end));
+    }
+    if cursor < mapping.end {
+        clear(tables, cursor, mapping.end)?;
+    }
+    Ok(())
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn invalidate_projected_fork_omissions(
     page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
@@ -737,6 +778,12 @@ impl HvfTaskState {
                 // child extension arenas are allocated and installed into stage-2 below.
                 continue;
             }
+            clear_projected_fork_gaps(
+                page_tables,
+                source,
+                request.shares_mm(),
+                &projection_ranges,
+            )?;
             for projected in
                 projected_fork_mappings(source, request.shares_mm(), &projection_ranges)?
             {
@@ -1401,8 +1448,21 @@ impl HvfTaskState {
                 })
             {
                 return Err(TrapError::Hypervisor(format!(
-                    "hvpatch child stage-1 VA 0x{:x} resolves to IPA 0x{translated:x}, expected 0x{:x}",
-                    mapping.start, mapping.ipa
+                    "hvpatch child stage-1 VA 0x{:x} resolves to IPA 0x{translated:x}, expected 0x{:x}; leaf=0x{:x} dynamic={} inherited={:?} sharing={:?} physical=0x{:x}+0x{:x} translated_in_inventory={}",
+                    mapping.start,
+                    mapping.ipa,
+                    carrick_mmu_core::aarch64::terminal_descriptor(
+                        page_tables.debug_walk(mapping.start)
+                    ),
+                    mapping.is_dynamic_alias,
+                    mapping.inherited_frame,
+                    mapping.sharing,
+                    mapping.physical_ipa,
+                    mapping.physical_size,
+                    inventory_covers_compound(align_down(
+                        translated,
+                        CowArmedRanges::COMPOUND_SIZE
+                    )),
                 )));
             }
             if mapping.inherited_frame.is_some()
@@ -1729,6 +1789,123 @@ impl HvfTaskState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_bootstrap_heap_projects_live_vmas_after_stock_return() {
+        let va = carrick_mem::memory::LINUX_HEAP_BASE;
+        let ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
+        let stock = ipa + 0x20_0000;
+        let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        tables.declare_offline_private_image();
+        let access = carrick_mmu_core::aarch64::UserLeafAccess {
+            writable: true,
+            executable: false,
+        };
+        tables
+            .map_aliased(va, ipa, 0x20_0000, access, None)
+            .unwrap();
+        tables.map_aliased(va, stock, 0x4000, access, None).unwrap();
+        tables.invalidate(va, 0x4000, None).unwrap();
+        let source = ThreadMappingDesc {
+            start: va,
+            end: va + 0x20_0000,
+            ipa,
+            host_addr: std::ptr::null_mut(),
+            size: 0x20_0000,
+            physical_ipa: ipa,
+            physical_host_addr: std::ptr::null_mut(),
+            physical_size: 0x20_0000,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 1,
+            structural_owner: None,
+        };
+        let ranges = [carrick_hal::ForkProjectionRange {
+            va: va + 0x4000,
+            len: 0x4000,
+            disposition: carrick_hal::ForkLeafDisposition::Preserve,
+        }];
+        let projected = projected_fork_mappings(&source, false, &ranges).unwrap();
+        clear_projected_fork_gaps(&mut tables, &source, false, &ranges).unwrap();
+        assert_eq!(tables.translate_retained_output(va), None);
+        assert_eq!(tables.translate(va + 0x8000), None);
+        assert_eq!(projected.len(), 1);
+        let child = &projected[0].mapping;
+        assert_eq!(
+            tables
+                .translate(child.start)
+                .or_else(|| tables.translate_retained_output(child.start)),
+            Some(child.ipa),
+            "stock retirement must not leave a child semantic mapping over the stale heap-base output"
+        );
+        assert_eq!((child.start, child.end), (va + 0x4000, va + 0x8000));
+        assert_eq!((child.physical_ipa, child.physical_size), (ipa, 0x20_0000));
+
+        use carrick_mem::memory::*;
+        // Each non-VMA window is inherited by explicit domain, including
+        // all EL0-reachable synthetic pages and the carrier apertures.
+        for (kind, start, size) in [
+            (
+                ForkCarrickWindow::KernelControl,
+                LINUX_EL0_TRAMPOLINE_BASE,
+                LINUX_EL0_TRAMPOLINE_SIZE,
+            ),
+            (ForkCarrickWindow::El1Kernel, LINUX_EL1_KERNEL_BASE, 0x4000),
+            (
+                ForkCarrickWindow::DynamicMetadata,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                0x4000,
+            ),
+            (
+                ForkCarrickWindow::Ipc,
+                carrick_el1_abi::EL1_IPC_BASE,
+                0x4000,
+            ),
+            (
+                ForkCarrickWindow::ClockVdso,
+                carrick_mem::vdso::LINUX_VVAR_BASE,
+                carrick_mem::vdso::LINUX_VVAR_SIZE,
+            ),
+            (
+                ForkCarrickWindow::ClockVdso,
+                carrick_mem::vdso::LINUX_VDSO_BASE,
+                carrick_mem::vdso::LINUX_VDSO_SIZE,
+            ),
+            (
+                ForkCarrickWindow::ClockVdso,
+                LINUX_EL0_CLOCK_STUB_BASE,
+                LINUX_EL0_CLOCK_STUB_SIZE,
+            ),
+            (
+                ForkCarrickWindow::Sigreturn,
+                LINUX_SIGRETURN_TRAMPOLINE_BASE,
+                LINUX_SIGRETURN_TRAMPOLINE_SIZE,
+            ),
+        ] {
+            let mut window = source.clone();
+            window.start = start;
+            window.end = start + size;
+            window.size = size as usize;
+            assert_eq!(
+                ForkCarrickWindow::containing(window.start, window.end),
+                Some(kind)
+            );
+            let projected = projected_fork_mappings(&window, false, &[]).unwrap();
+            assert_eq!(projected.len(), 1, "{kind:?}");
+            assert_eq!(
+                (projected[0].mapping.start, projected[0].mapping.end),
+                (window.start, window.end)
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
