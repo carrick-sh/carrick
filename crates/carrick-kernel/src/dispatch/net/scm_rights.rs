@@ -230,6 +230,73 @@ mod tests {
     }
 
     #[test]
+    fn red_until_step3_m4_rights_create_placeholder_per_message() {
+        use crate::kernel::ids::ObjectIdRegistry;
+        use crate::kernel::{FileSlotNumber, FileTable};
+        for messages in [1, 8, 64] {
+            let ids = ObjectIdRegistry::new();
+            let sender = FileTable::new(ids.file_table_id().unwrap());
+            let receiver = FileTable::new(ids.file_table_id().unwrap());
+            let mut placeholders = 0;
+            for _ in 0..messages {
+                let original = eventfd_description();
+                original.retain_fd_ref();
+                sender.install(
+                    FileSlotNumber::for_open_fd(3).unwrap(),
+                    Arc::clone(&original),
+                    false,
+                );
+                let (key, placeholder) = park(Arc::clone(&original)).unwrap();
+                placeholders +=
+                    usize::from(PlaceholderKey::of_host_fd(placeholder.as_raw_fd()).is_some());
+                let old = sender.write_open_files().remove(&3).unwrap();
+                old.description.release_fd_ref();
+                let replacement = eventfd_description();
+                replacement.retain_fd_ref();
+                sender.install(
+                    FileSlotNumber::for_open_fd(3).unwrap(),
+                    Arc::clone(&replacement),
+                    false,
+                );
+                let received = claim(key).unwrap();
+                assert!(Arc::ptr_eq(&received, &original));
+                assert!(!Arc::ptr_eq(&received, &replacement));
+                received.retain_fd_ref();
+                receiver.install(
+                    FileSlotNumber::for_open_fd(3).unwrap(),
+                    Arc::clone(&received),
+                    true,
+                );
+                received.release_fd_ref();
+                assert_eq!(original.fd_ref_count(), 1);
+                let installed = receiver.write_open_files().remove(&3).unwrap();
+                assert_ne!(installed.fd_flags, 0);
+                installed.description.release_fd_ref();
+                assert_eq!(original.fd_ref_count(), 0);
+                sender
+                    .write_open_files()
+                    .remove(&3)
+                    .unwrap()
+                    .description
+                    .release_fd_ref();
+                assert_eq!(replacement.fd_ref_count(), 0);
+                drop(placeholder);
+                assert!(claim(key).is_none());
+            }
+            assert_eq!(placeholders, messages);
+            let result = if placeholders == 0 {
+                Ok(())
+            } else {
+                Err("guest rights transport creates host placeholder pipes")
+            };
+            assert_eq!(
+                result.expect_err("flips at M4 cutover"),
+                "guest rights transport creates host placeholder pipes"
+            );
+        }
+    }
+
+    #[test]
     fn a_dup_of_the_placeholder_claims_the_parked_description() {
         let description = eventfd_description();
         let (key, reader) = park(Arc::clone(&description)).expect("placeholder pipe");

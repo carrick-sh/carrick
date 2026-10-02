@@ -41,3 +41,31 @@ stale host token incarnation, zero/finite/infinite waits, copyout faults and
 atomic mask install/enroll/recheck/restore on ready/timeout/EINTR/cancel still
 need executable two-process bindings. Proxy count is not a queue-visit or
 forwarded-dispatch counter; no scan-work claim is made by this fixture.
+
+## M4 — flips at M4 cutover
+
+- `dispatch::net::scm_rights::tests::red_until_step3_m4_rights_create_placeholder_per_message`:
+  exact red `guest rights transport creates host placeholder pipes`.
+  Two live tables park an eventfd description, close/reuse sender fd 3,
+  claim the original description, install receiver fd 3 with CLOEXEC and
+  return every logical reference. Exactly 1/8/64 scoped placeholders remain
+  necessary for 1/8/64 messages. The fixture does not call host sendmsg.
+- `dispatch::net::unix_pure::tests::red_until_step3_m4_stream_payloads_live_in_host_socket_state`:
+  exact red `guest stream payload remains in host PureSocketState queue`.
+  Two live tables own the connected endpoints. At 1/8/64 streams,
+  7/56/448 payload bytes reside in host socket state before recv. Payload
+  roundtrip and guest peer credentials pass independently of ownership red.
+
+`kernel.el1.unix-owner` and `kernel.el1.unix-rights` are registered separately.
+`m4_equal_address_bytes_are_isolated_by_registry_owner` keeps identical abstract
+and pathname bytes in separate registries, removes/rebinds one and verifies
+that the other survives. This is registry isolation, not proof that two
+containers select different registries in production. Existing stream/dgram,
+shutdown/HUP, claim/abort/orphan-GC reducers are positive semantics.
+
+Still missing executable cutover bindings: pipe writer/epoll/host-file rights,
+shared flags and cursor, ancillary truncation/fault rollback, queued-message
+socket close, cyclic graph collection and bounded historical scan work,
+backlog/nonblock/partial stream writes, datagram peek/truncation and SEQPACKET,
+actual container namespace/pathname permission wiring and host-peer imports.
+No Linux-semantics defect was observed in these new fixtures.
