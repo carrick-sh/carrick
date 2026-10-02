@@ -123,6 +123,7 @@ fn main() {
         }
     }
 
+    println!("impact_window_ns={}", samples_ns.iter().sum::<u128>());
     samples_ns.sort_unstable();
     let pct = |p: f64| -> f64 {
         let idx = (((samples_ns.len() as f64) * p).ceil() as usize)

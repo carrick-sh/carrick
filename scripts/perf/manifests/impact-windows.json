@@ -1,0 +1,14 @@
+{
+  "spawn-loop": {
+    "operations": 1000,
+    "prefix": "impact_window_ns="
+  },
+  "thread-spawn": {
+    "operations": 1000,
+    "prefix": "impact_window_ns="
+  },
+  "fork-exec": {
+    "operations": 200,
+    "prefix": "impact_window_ns="
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "phase": "carrick",
+  "head": "ef1674b01af0ca29b005dae87966354f864db1ec",
+  "run_id": "impact-28458-1790928342021339000",
+  "measured_runs": 1,
+  "warmup_policy": "one excluded warm-up per workload; fixed measured run count",
+  "artifact": {
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-impact2/target/release/carrick",
+    "sha256": "cdd810d3694d4aeada6896ee71c91715802468f6f23c3e7068511d30e44b19ed",
+    "cdhash": "869f02b3de5871595506b1484133f39ea8727547",
+    "lc_uuid": "B4F0C6B1-6A56-37E6-AB04-BAF868A99D1C",
+    "entitlement": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+    "dof_present": true
+  },
+  "errors": [],
+  "workloads": {
+    "spawn-loop": {
+      "image": "ubuntu:24.04",
+      "image_digest": "sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+      "command": [
+        "/bin/sh",
+        "-c",
+        "set -eu; n=5; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+      ],
+      "declaration_sha256": "21fbdbb69d06b21d4d159b7c22815e5a371ff81832af0ea50b7e85b30aa33ca1",
+      "window": {
+        "operations": 5,
+        "prefix": "impact_window_ns="
+      },
+      "samples": [
+        {
+          "run_id": "impact-28458-1790928342021339000-spawn-loop-0",
+          "argv": [
+            "/Volumes/CaseSensitive/carrick/.worktrees/wt-impact2/target/release/carrick",
+            "run",
+            "--name",
+            "impact-28458-1790928342021339000-spawn-loop-0",
+            "--max-traps",
+            "18446744073709551615",
+            "--fs",
+            "host",
+            "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+            "/bin/sh",
+            "-c",
+            "set -eu; n=5; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+          ],
+          "warmup": true,
+          "wall_s": 0.423093667,
+          "child_cpu_s": 0.09331699999999998,
+          "per_op_s": 0.00260165,
+          "guest_window_s": 0.01300825,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_ok": true
+        },
+        {
+          "run_id": "impact-28458-1790928342021339000-spawn-loop-1",
+          "argv": [
+            "/Volumes/CaseSensitive/carrick/.worktrees/wt-impact2/target/release/carrick",
+            "run",
+            "--name",
+            "impact-28458-1790928342021339000-spawn-loop-1",
+            "--max-traps",
+            "18446744073709551615",
+            "--fs",
+            "host",
+            "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+            "/bin/sh",
+            "-c",
+            "set -eu; n=5; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+          ],
+          "warmup": false,
+          "wall_s": 0.066544416,
+          "child_cpu_s": 0.05895699999999998,
+          "per_op_s": 0.00245085,
+          "guest_window_s": 0.012254250000000001,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_ok": true
+        }
+      ]
+    }
+  }
+}
