@@ -2188,6 +2188,11 @@ fn cross_vcpu_stale(rounds: usize) -> i32 {
                     }
                 }
                 2 => {
+                    // Delayed grant settlement must preserve the bytes
+                    // written before the sibling lowered access to READ.
+                    if unsafe { std::ptr::read_volatile(ptr) } != 0x5A5A_003F {
+                        STALE_ERRORS.fetch_add(1, Ordering::SeqCst);
+                    }
                     STALE_PHASE.store(1, Ordering::SeqCst);
                     unsafe { std::ptr::write_volatile(ptr, 0xC0DE) };
                     if STALE_PHASE.swap(0, Ordering::SeqCst) != 0 {
