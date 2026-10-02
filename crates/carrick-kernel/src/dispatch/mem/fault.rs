@@ -1086,6 +1086,25 @@ impl<'a> MemView<'a> {
         if bus_fault_contains(&mem.bus_fault_ranges, page) {
             return None;
         }
+        if let Some(root) = mem.delegated_root() {
+            let owed = root
+                .with_root(|model| {
+                    let mut overlaps = false;
+                    model.observe_deferred_returns(&mut |entry| {
+                        overlaps |= entry.range.start() <= page && page < entry.range.end();
+                    });
+                    Ok(overlaps)
+                })
+                .unwrap_or_else(|refusal| {
+                    super::anonymous::broken_root(
+                        "a resident fault predecessor observation",
+                        refusal,
+                    )
+                });
+            if owed {
+                return None;
+            }
+        }
         let prot = match mem.first_touch_owner(page) {
             FirstTouchOwner::Host => mem.resident_fault_ranges.prot_for_page(page)?,
             FirstTouchOwner::Root(mapping, incarnation) => {
