@@ -448,6 +448,7 @@ pub struct Reservations<'a> {
     /// free-list race (another allocation completed) until they win or the
     /// pool is empty. EL1's take one attempt and forward on `Busy`.
     host_holder: bool,
+    host_proposal: bool,
 }
 impl Drop for Reservations<'_> {
     fn drop(&mut self) {
@@ -622,6 +623,7 @@ impl SharedReservations {
             node_capacity: self.storage.capacity(),
             host_venue: false,
             host_holder: holder == RootHolder::Host.word(),
+            host_proposal: false,
         };
         if (banks.is_none() && !identity && self.storage.capacity() > NODES as u32)
             || banks.is_some_and(|banks| banks.count() < self.storage.bank_count())
@@ -1237,6 +1239,9 @@ impl Reservations<'_> {
     }
     /// One bounded allocation attempt per spare; failure returns every node.
     fn allocate_spares(&mut self, needed: usize) -> Result<[u32; 5], Refusal> {
+        if self.host_proposal {
+            return self.host_spares(needed);
+        }
         let mut nodes = [0; 5];
         for slot in nodes.iter_mut().take(needed) {
             match self.pool_node() {
@@ -1324,6 +1329,16 @@ impl Reservations<'_> {
         if self.state().host_reserved < needed.min(HOST_RESERVE) {
             return Err(Refusal::MetadataRequired);
         }
+        Ok(())
+    }
+    /// A host-forwarded proposal consumes the same nodes secured by host
+    /// admission. Guest proposals must never consume that reserved capacity.
+    pub fn begin_host_proposal(&mut self) -> Result<(), Refusal> {
+        if !self.host_holder || self.pending().is_some() {
+            return Err(Refusal::Invalid);
+        }
+        self.host_venue = true;
+        self.host_proposal = true;
         Ok(())
     }
     /// Nodes a host retire of `range` needs: one per node straddling an end.
@@ -4065,6 +4080,12 @@ mod tests {
             Err(Refusal::MetadataRequired)
         );
         g.secure_host_nodes(0).unwrap();
+        // The host's proposal can consume its admitted reserve even when
+        // the guest shared pool has no node left.
+        g.begin_host_proposal().unwrap();
+        let decision = g.mmap(Placement::Fixed(0xe00000), 4096, rw).unwrap();
+        complete(&mut g, decision);
+        assert!(g.mapping(0xe00000).is_some());
         // Host retires refill the reserve first.
         g.retire_opaque(range(0x200000, 0x204000)).unwrap();
         assert_eq!(g.host_reserve(), HOST_RESERVE);
