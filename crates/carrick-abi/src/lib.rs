@@ -5013,6 +5013,8 @@ bitflags! {
         const VFORK = LINUX_CLONE_VFORK;
         const PARENT = LINUX_CLONE_PARENT;
         const THREAD = LINUX_CLONE_THREAD;
+        /// Legacy pthread flag, accepted and ignored by Linux clone.
+        const DETACHED = 0x0040_0000;
         const SETTLS = LINUX_CLONE_SETTLS;
         const PARENT_SETTID = LINUX_CLONE_PARENT_SETTID;
         const CHILD_CLEARTID = LINUX_CLONE_CHILD_CLEARTID;
