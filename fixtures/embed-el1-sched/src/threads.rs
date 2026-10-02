@@ -250,7 +250,10 @@ pub fn spawn_slope(n: usize, rounds: usize) -> i32 {
                     RAN.fetch_add(1, Ordering::Relaxed);
                 }) {
                     Ok(handle) => handles.push(handle),
-                    Err(_) => failures += 1,
+                    Err(error) => {
+                        failures += 1;
+                        println!("thread-spawn-slope role={} spawn_errno={} error={error}", role.name, error.raw_os_error().unwrap_or(0));
+                    }
                 }
             }
             for handle in handles {

@@ -88,6 +88,64 @@ impl Default for ThreadLedgerActivity {
 /// Pool entries per process: a task holds up to four identities ahead of use.
 pub const THREAD_POOL_ENTRIES: usize = 8;
 
+/// Why a lifecycle service leaves its unchanged syscall to the host.
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleDecline {
+    ExitDisabled,
+    ExitGate,
+    ExitNoEntry,
+    ExitEntryState,
+    ExitRobust,
+    ExitPending,
+    ExitNoCurrent,
+    ExitNoMm,
+    ExitHome,
+    ExitClaim,
+    ExitHostWork,
+    ExitCancelled,
+    ExitObjectOperation,
+    ExitIdentity,
+    ExitAdmission,
+    ExitLast,
+    ExitClearTidCopyout,
+    ExitClearTidWake,
+    ExitVenue,
+    ExitScheduler,
+    ExitDispatchHostWork,
+    CloneDispatchHostWork,
+    ClonePoolEmpty,
+}
+
+impl LifecycleDecline {
+    pub const COUNT: usize = Self::ClonePoolEmpty as usize + 1;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::ExitDisabled,
+        Self::ExitGate,
+        Self::ExitNoEntry,
+        Self::ExitEntryState,
+        Self::ExitRobust,
+        Self::ExitPending,
+        Self::ExitNoCurrent,
+        Self::ExitNoMm,
+        Self::ExitHome,
+        Self::ExitClaim,
+        Self::ExitHostWork,
+        Self::ExitCancelled,
+        Self::ExitObjectOperation,
+        Self::ExitIdentity,
+        Self::ExitAdmission,
+        Self::ExitLast,
+        Self::ExitClearTidCopyout,
+        Self::ExitClearTidWake,
+        Self::ExitVenue,
+        Self::ExitScheduler,
+        Self::ExitDispatchHostWork,
+        Self::CloneDispatchHostWork,
+        Self::ClonePoolEmpty,
+    ];
+}
+
 /// Bytes of one lifecycle page.
 pub const THREAD_LIFECYCLE_PAGE_SIZE: usize = 4096;
 

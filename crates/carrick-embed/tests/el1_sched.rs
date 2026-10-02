@@ -188,6 +188,7 @@ struct Measured {
     exit_classes: [u64; carrick_el1_abi::HostExitClass::COUNT],
     el1_exit_reasons: [u64; carrick_el1_abi::El1ExitReason::COUNT],
     forwarded_syscalls: Vec<(usize, u64)>,
+    lifecycle_declines: [u64; carrick_el1_abi::LifecycleDecline::COUNT],
     /// Pipe/eventfd calls EL1 left for the host, by `IpcLeave` index.
     ipc_leaves: [u64; carrick_el1_abi::IpcLeave::COUNT],
     host_work_publications: [u64; carrick_el1_abi::HostWorkPublishReason::COUNT],
@@ -212,6 +213,12 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         std::array::from_fn(|i| c.forwarded[i].load(std::sync::atomic::Ordering::Relaxed))
     });
     let host_work_before = carrick_el1_abi::host_work_publication_counts();
+    let declines_before =
+        read_el1_counters().map_or([0; carrick_el1_abi::LifecycleDecline::COUNT], |c| {
+            std::array::from_fn(|i| {
+                c.lifecycle_declines[i].load(std::sync::atomic::Ordering::Relaxed)
+            })
+        });
     let ipc_leaves_before = read_el1_counters()
         .map_or([0; carrick_el1_abi::IpcLeave::COUNT], |c| {
             std::array::from_fn(|i| c.ipc_leaves[i].load(std::sync::atomic::Ordering::Relaxed))
@@ -270,6 +277,14 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
             })
             .collect()
     });
+    let lifecycle_declines =
+        read_el1_counters().map_or([0; carrick_el1_abi::LifecycleDecline::COUNT], |c| {
+            std::array::from_fn(|i| {
+                c.lifecycle_declines[i]
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(declines_before[i])
+            })
+        });
     let ipc_leaves = read_el1_counters().map_or([0; carrick_el1_abi::IpcLeave::COUNT], |c| {
         std::array::from_fn(|i| {
             c.ipc_leaves[i]
@@ -289,6 +304,7 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         exit_classes,
         el1_exit_reasons,
         forwarded_syscalls,
+        lifecycle_declines,
         ipc_leaves,
         host_work_publications,
         cpu_ns,
@@ -4017,6 +4033,14 @@ fn thread_witness(
     let before = thread_counters();
     let measured = run_fixture(carrier, &argv, timeout);
     let after = thread_counters();
+    let declines: Vec<_> = carrick_el1_abi::LifecycleDecline::ALL
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, reason)| {
+            let count = measured.lifecycle_declines[i];
+            (count != 0).then_some((reason, count))
+        })
+        .collect();
     let delta = std::array::from_fn(|i| {
         [
             after[i][0].saturating_sub(before[i][0]),
@@ -4024,6 +4048,11 @@ fn thread_witness(
         ]
     });
     let stdout = measured.result.stdout_utf8();
+    println!("el1-sched {mode} lifecycle_declines={declines:?}");
+    println!(
+        "el1-sched {mode} forwarded_syscalls={:?}",
+        measured.forwarded_syscalls
+    );
     println!(
         "el1-sched {mode} {args:?} exits={} exit_classes=[{}] served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]={delta:?}\n{}",
         measured.exits,

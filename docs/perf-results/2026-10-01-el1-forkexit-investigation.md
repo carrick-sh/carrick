@@ -1067,3 +1067,30 @@ ABI/FD and kernel-semantics suites green. Logs:
 `/tmp/phaseb-admission-test-kernel-green.log` (green).
 The signed watchdog receipt above belongs to `d3a3b2a74`, before this change;
 current-source signed acceptance still requires the released quiet window.
+
+### 2026-10-02: typed gettid receipt, exit still unresolved
+
+`5ac2f1f555ecd79d15d336294fbbf350316abb6a` publishes the immutable visible
+TID in lifecycle control storage before Born and deletes the legacy
+CONTEXTIDR identity shim and stamps/readers in the same change. The
+director approved this single identity path and explicitly retained the
+home-record exit decline: returning an adopted job to the zone is not an
+authorized workaround.
+
+The signed spawn run `phaseb-gettid-5ac2f1f55-spawn-20261002` failed Linux
+semantics at its 512-thread scale (parent ran 255 of 256 threads, one
+failure). The 2048 scale did not run. There are no accepted three-scale
+slopes. At 128 threads, served/forwarded counts were clone 61/68, exit
+0/128 and gettid 128/2; at 512, they were clone 290/222, exit 0/511 and
+gettid 506/7. Sigmask and altstack forwards remained zero. Removing the
+gettid host trip did not enable exit; exact decline attribution is next.
+The negative entitlement control passed and both scoped cleanup IDs
+reported zero processes. Log: `/tmp/phaseb-gettid-signed-spawn.log`.
+
+The failed signed runner does not publish an acceptance receipt. The
+tested executable's identity was captured separately before another
+release build in `/tmp/phaseb-gettid-5ac2f1f55-artifact.txt`: SHA-256
+`6b437d30ced32ba23e4c47710c37bafffaf3c6743661494e2afdcc46d3c1b6e4`,
+CDHash `805d402281012cb89c2e14655ad282ed7f41b2a8`, LC_UUID
+`32E03C1C-BD77-3E35-BD40-1591FCDE169B`; hypervisor entitlement and
+`__dof_carrick` were present. This is failure provenance, not acceptance.
