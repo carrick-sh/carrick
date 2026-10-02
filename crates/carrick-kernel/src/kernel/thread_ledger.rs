@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use carrick_abi::NsUid;
 use carrick_el1_abi::{EntryRef, EntryState};
@@ -118,9 +118,33 @@ impl PooledThreadIdentity {
 #[derive(Debug, Default)]
 pub(crate) struct ThreadIdentityPool {
     entries: Mutex<VecDeque<PooledThreadIdentity>>,
+    published: Mutex<Vec<(EntryRef, super::objects::ThreadControlLease)>>,
 }
 
 impl ThreadIdentityPool {
+    fn take_births(&self) -> Vec<(PooledThreadIdentity, carrick_el1_abi::BornRecord)> {
+        let mut entries = self.entries.lock();
+        let mut births = Vec::new();
+        let mut index = 0;
+        while index < entries.len() {
+            let candidate = &entries[index];
+            if candidate.state() == EntryState::Born {
+                let born = candidate
+                    .page()
+                    .born_record(candidate.entry)
+                    .unwrap_or_else(|| {
+                        carrick_fatal::carrick_fatal!("thread::ledger", "Born entry lost payload")
+                    });
+                let identity = entries.remove(index).unwrap_or_else(|| {
+                    carrick_fatal::carrick_fatal!("thread::ledger", "Born entry lost custody")
+                });
+                births.push((identity, born));
+            } else {
+                index += 1;
+            }
+        }
+        births
+    }
     /// Claim the oldest standing entry. FIFO keeps successive thread tids
     /// ascending exactly as a clone-time reservation would issue them.
     fn claim(&self) -> Option<(ThreadIdentity, super::objects::ThreadControlLease)> {
@@ -257,23 +281,31 @@ pub struct ThreadLedger {
     /// the settler that took the births to finish publishing them.
     settling: Mutex<()>,
     in_flight: InFlightCounts,
-}
-
-impl Default for ThreadLedger {
-    fn default() -> Self {
-        Self::new(pool_depth_from_env())
-    }
+    activity: super::objects::ThreadLedgerActivityLease,
+    kernel: OnceLock<Weak<Kernel>>,
 }
 
 impl ThreadLedger {
-    pub(crate) fn new(depth: usize) -> Self {
+    pub(crate) fn for_root(page: &super::objects::ThreadLifecycleLease) -> Self {
+        let activity = super::objects::ThreadLedgerActivityLease::for_page(page);
+        page.bind_activity(activity.clone());
         Self {
-            depth: AtomicUsize::new(depth),
+            depth: AtomicUsize::new(pool_depth_from_env()),
             pending: AtomicUsize::new(0),
             births: Mutex::new(Vec::new()),
             settling: Mutex::new(()),
             in_flight: Arc::default(),
+            activity,
+            kernel: OnceLock::new(),
         }
+    }
+    pub(crate) fn bind_kernel(&self, kernel: &Arc<Kernel>) {
+        if self.kernel.set(Arc::downgrade(kernel)).is_err() {
+            carrick_fatal::carrick_fatal!("thread::ledger", "ledger kernel bound twice");
+        }
+    }
+    pub(crate) fn activity(&self) -> super::objects::ThreadLedgerActivityLease {
+        self.activity.clone()
     }
 
     /// Standing entries a multi-threaded task keeps.
@@ -297,20 +329,19 @@ impl ThreadLedger {
         let mut births = self.births.lock();
         births.push(prepared);
         self.pending.fetch_add(1, Ordering::AcqRel);
+        self.activity.announce();
     }
 
     /// Publish every recorded birth. With nothing pending this is one load.
     pub(super) fn settle(&self, lock: &RegistryLock) {
-        if self.pending.load(Ordering::Acquire) == 0 {
+        if self.activity.pending() == 0 {
             return;
         }
         let settling = self.settling.lock();
         let births = std::mem::take(&mut *self.births.lock());
-        if births.is_empty() {
-            return;
-        }
         let count = births.len();
         let mut published = Vec::with_capacity(count);
+        let mut abi_count = 0;
         {
             let mut state = lock.write();
             for birth in births {
@@ -321,8 +352,129 @@ impl ThreadLedger {
                     published.push(publication);
                 }
             }
+            let kernel = self
+                .kernel
+                .get()
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    carrick_fatal::carrick_fatal!(
+                        "thread::ledger",
+                        "pending ledger lost kernel owner"
+                    )
+                });
+            let tasks: Vec<_> = state.tasks.keys().copied().collect();
+            for task_id in tasks {
+                let Some(record) = state.tasks.get(&task_id) else {
+                    continue;
+                };
+                let mut born = record.thread_pool.take_births();
+                while !born.is_empty() {
+                    let mut progress = false;
+                    let mut index = 0;
+                    while index < born.len() {
+                        let (pooled, birth) = &born[index];
+                        let caller_tid = i32::try_from(birth.caller_task)
+                            .ok()
+                            .and_then(|tid| LinuxTid::from_abi_positive(tid).ok())
+                            .unwrap_or_else(|| {
+                                carrick_fatal::carrick_fatal!(
+                                    "thread::ledger",
+                                    "Born caller tid invalid"
+                                )
+                            });
+                        let record = state.tasks.get(&task_id).unwrap_or_else(|| {
+                            carrick_fatal::carrick_fatal!(
+                                "thread::ledger",
+                                "Born task lost registry custody"
+                            )
+                        });
+                        let Some(caller) = record.task.thread(caller_tid) else {
+                            index += 1;
+                            continue;
+                        };
+                        if caller.key().serial.raw() != birth.caller_serial {
+                            carrick_fatal::carrick_fatal!(
+                                "thread::ledger",
+                                "Born caller generation mismatch"
+                            );
+                        }
+                        let parent = KernelContext::from_parts(
+                            kernel.clone(),
+                            record.task.clone(),
+                            caller.clone(),
+                            record.task.shared(),
+                            caller.resources(),
+                            record.revision,
+                        );
+                        let control = pooled.control.clone();
+                        let entry = pooled.entry;
+                        let (pooled, birth) = born.remove(index);
+                        *self.in_flight.lock().entry(pooled.credit).or_default() += 1;
+                        let claimed = ClaimedThreadIdentity {
+                            identity: pooled.identity,
+                            credit: NprocCredit {
+                                uid: pooled.credit,
+                                counts: self.in_flight.clone(),
+                            },
+                            control: Some(control.clone()),
+                        };
+                        let prepared = kernel
+                            .prepare_abi_thread_birth(&parent, claimed, birth)
+                            .unwrap_or_else(|error| {
+                                carrick_fatal::carrick_fatal!(
+                                    "thread::ledger",
+                                    "ABI birth prepare failed: error={error}"
+                                )
+                            });
+                        let publication = prepared
+                            .publish_reserved(&mut state, PublicationLane::Settle)
+                            .unwrap_or_else(|error| {
+                                carrick_fatal::carrick_fatal!(
+                                    "thread::ledger",
+                                    "ABI birth publication failed: error={error}"
+                                )
+                            });
+                        control.lifecycle().publish(entry).unwrap_or_else(|error| {
+                            carrick_fatal::carrick_fatal!(
+                                "thread::ledger",
+                                "ABI birth state failed: error={error:?}"
+                            )
+                        });
+                        state
+                            .tasks
+                            .get(&task_id)
+                            .unwrap_or_else(|| {
+                                carrick_fatal::carrick_fatal!(
+                                    "thread::ledger",
+                                    "published birth lost task"
+                                )
+                            })
+                            .thread_pool
+                            .published
+                            .lock()
+                            .push((entry, control));
+                        published.push(publication);
+                        abi_count += 1;
+                        progress = true;
+                    }
+                    if !progress {
+                        carrick_fatal::carrick_fatal!(
+                            "thread::ledger",
+                            "Born caller dependency has no live authority"
+                        );
+                    }
+                }
+            }
         }
         self.pending.fetch_sub(count, Ordering::AcqRel);
+        self.activity
+            .complete(count as u64 + abi_count)
+            .unwrap_or_else(|pending| {
+                carrick_fatal::carrick_fatal!(
+                    "thread::ledger",
+                    "ledger activity underflow: pending={pending}"
+                )
+            });
         drop(settling);
         // After-lock work runs with neither the registry lock nor the settle
         // gate held: reservation-change subscribers read the registry.
@@ -581,7 +733,9 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Arc;
 
+    use crate::kernel::LinuxTid;
     use carrick_abi::{LinuxCloneFlags, LinuxResource, LinuxRlimit, NsGid, NsUid};
+    use carrick_el1_abi::EntryState;
     use carrick_hal::ThreadId;
 
     use crate::kernel::clone_plan::ClonePlan;
@@ -644,6 +798,85 @@ mod tests {
             page.unclaim(guest).unwrap();
             drop((host, sibling));
         }
+    }
+
+    #[test]
+    fn lifecycle_abi_birth_is_resolved_by_a_second_process() {
+        let (kernel, root) = bootstrap(9_670);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_671),
+                "birth-observer".into(),
+                None,
+            )
+            .unwrap();
+        let sibling = kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_672),
+                None,
+            )
+            .unwrap();
+        let page = root.thread().control_lease().lifecycle();
+        let claim = page.claim_any().unwrap();
+        let entry = claim.entry();
+        let identity = page.identity(entry).unwrap();
+        let control = {
+            let state = kernel.registry().settled().read();
+            state
+                .tasks
+                .get(&root.task().key().id)
+                .unwrap()
+                .thread_pool
+                .entries
+                .lock()
+                .iter()
+                .find(|candidate| candidate.entry == entry)
+                .unwrap()
+                .control
+                .clone()
+        };
+        control.reset_for_birth(carrick_el1_abi::BlockedMask(0x400), 0x8000, entry);
+        page.thread_born().unwrap();
+        page.record_born(
+            claim,
+            carrick_el1_abi::BornRecord {
+                caller_task: carrick_el1_abi::El1TaskId::from_linux_tid(
+                    root.thread().key().tid.raw(),
+                )
+                .raw(),
+                caller_serial: root.thread().key().serial.raw(),
+                clone_flags: (LinuxCloneFlags::THREAD
+                    | LinuxCloneFlags::SIGHAND
+                    | LinuxCloneFlags::VM)
+                    .bits(),
+                clear_child_tid: 0x8000,
+                blocked: carrick_el1_abi::BlockedMask(0x400),
+            },
+        )
+        .unwrap();
+        let tid = LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
+        assert_eq!(
+            peer.kernel().live_task_for_thread(None, tid),
+            Some(root.task().key().id),
+            "ABI birth must be visible before its first host syscall"
+        );
+        let adopted = kernel.context(root.task().key().id, tid).unwrap();
+        assert_eq!(adopted.thread().key().serial.raw(), identity.thread_serial);
+        assert_eq!(
+            adopted.thread().control_lease().slot_address(),
+            control.slot_address()
+        );
+        assert_eq!(adopted.thread().blocked_mask().raw(), 0x400);
+        assert_eq!(adopted.thread().control_slot().clear_child_tid(), 0x8000);
+        assert_eq!(
+            page.state(entry.index()),
+            Some((entry.generation(), EntryState::Published))
+        );
+        drop(sibling);
     }
 
     #[test]

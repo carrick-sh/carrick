@@ -1424,7 +1424,7 @@ impl Kernel {
                     session_id,
                 )]),
             },
-            super::thread_ledger::ThreadLedger::default(),
+            super::thread_ledger::ThreadLedger::for_root(&leader.control_lease().lifecycle()),
         );
         let mut observations = ObservationInventory::default();
         observations.register_task(
@@ -1468,6 +1468,7 @@ impl Kernel {
             unpublished_jobs: AtomicUsize::new(0),
             work_scope: RwLock::new(None),
         });
+        kernel.registry().thread_ledger().bind_kernel(&kernel);
         container.bind_kernel(&kernel);
         let diag_name = &bootstrap.diagnostic_name;
         kernel.syslog.append(
@@ -1624,6 +1625,10 @@ impl Kernel {
             mm,
             Arc::new(Sighand::new(self.object_ids.sighand_id()?)),
         ));
+        shared
+            .pending_signals()
+            .lifecycle_lease()
+            .bind_activity(self.registry().thread_ledger().activity());
         let resources = Arc::new(ThreadResources::new(
             Arc::new(FileTable::with_fd_ceiling(
                 self.object_ids.file_table_id()?,

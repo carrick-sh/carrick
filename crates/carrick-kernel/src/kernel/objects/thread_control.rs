@@ -93,7 +93,7 @@ struct ControlBacking {
 }
 
 /// Owns one ABI granule and shares its slab's host VM object. Slabs contain
-/// only the two closed ABI layouts and free bytes; allocator and Arc metadata
+/// only closed ABI layouts and free bytes; allocator and Arc metadata
 /// remain outside the exposed range.
 #[derive(Debug)]
 struct SharedAbiPage<T: AbiPage> {
@@ -103,11 +103,12 @@ struct SharedAbiPage<T: AbiPage> {
     value: std::marker::PhantomData<T>,
 }
 
-/// Closed to this module's two ABI-only layouts. Host objects cannot be
+/// Closed to this module's ABI-only layouts. Host objects cannot be
 /// accidentally placed inside an EL1-published granule by a generic caller.
 trait AbiPage: Send + Sync {}
 impl AbiPage for ControlPage {}
 impl AbiPage for LifecycleBacking {}
+impl AbiPage for ActivityBacking {}
 
 impl<T: AbiPage> SharedAbiPage<T> {
     fn new(value: T, pool: Arc<AbiPagePool>) -> Self {
@@ -165,27 +166,102 @@ struct LifecycleBacking {
     padding: [u8; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
 }
 
+#[repr(C, align(16384))]
+#[derive(Debug)]
+struct ActivityBacking {
+    activity: carrick_el1_abi::ThreadLedgerActivity,
+    padding: [u8; PAGE_BYTES - std::mem::size_of::<carrick_el1_abi::ThreadLedgerActivity>()],
+}
+
+/// Carrier-retainable ledger notification storage; owns no kernel objects.
+#[derive(Clone, Debug)]
+pub struct ThreadLedgerActivityLease(Arc<SharedAbiPage<ActivityBacking>>);
+impl ThreadLedgerActivityLease {
+    pub(in crate::kernel) fn for_page(page: &ThreadLifecycleLease) -> Self {
+        Self(Arc::new(SharedAbiPage::new(
+            ActivityBacking {
+                activity: carrick_el1_abi::ThreadLedgerActivity::new(),
+                padding: [0; PAGE_BYTES
+                    - std::mem::size_of::<carrick_el1_abi::ThreadLedgerActivity>()],
+            },
+            page.0.pool.clone(),
+        )))
+    }
+    pub fn backing_base(&self) -> HostVa {
+        HostVa(self.0.slab.base().addr())
+    }
+    pub const fn backing_len(&self) -> usize {
+        SLAB_BYTES
+    }
+    pub fn activity_address(&self) -> HostVa {
+        HostVa(std::ptr::from_ref(&self.0.activity).addr())
+    }
+}
+impl Deref for ThreadLedgerActivityLease {
+    type Target = carrick_el1_abi::ThreadLedgerActivity;
+    fn deref(&self) -> &Self::Target {
+        &self.0.activity
+    }
+}
+
 /// Pins a process's lifecycle page without retaining the task/kernel graph.
 #[derive(Clone, Debug)]
-pub struct ThreadLifecycleLease(Arc<SharedAbiPage<LifecycleBacking>>);
+pub struct ThreadLifecycleLease(
+    Arc<SharedAbiPage<LifecycleBacking>>,
+    Arc<std::sync::OnceLock<ThreadLedgerActivityLease>>,
+);
 
 impl ThreadLifecycleLease {
     pub(in crate::kernel) fn new() -> Self {
-        Self::in_pool(Arc::new(AbiPagePool::default()))
+        Self::in_pool(Arc::new(AbiPagePool::default()), Arc::default())
     }
 
     pub(in crate::kernel) fn for_fork(&self) -> Self {
-        Self::in_pool(self.0.pool.clone())
+        Self::in_pool(self.0.pool.clone(), self.1.clone())
     }
 
-    fn in_pool(pool: Arc<AbiPagePool>) -> Self {
-        Self(Arc::new(SharedAbiPage::new(
-            LifecycleBacking {
-                page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
-                padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
-            },
-            pool,
-        )))
+    fn in_pool(
+        pool: Arc<AbiPagePool>,
+        activity: Arc<std::sync::OnceLock<ThreadLedgerActivityLease>>,
+    ) -> Self {
+        let page = Self(
+            Arc::new(SharedAbiPage::new(
+                LifecycleBacking {
+                    page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
+                    padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
+                },
+                pool,
+            )),
+            activity,
+        );
+        if let Some(activity) = page.1.get() {
+            // SAFETY: the page lease retains its immutable activity owner.
+            unsafe {
+                page.bind_host_activity(std::ptr::from_ref(&**activity));
+            }
+        }
+        page
+    }
+
+    pub(in crate::kernel) fn bind_activity(&self, activity: ThreadLedgerActivityLease) {
+        if self.1.set(activity.clone()).is_err()
+            && self
+                .1
+                .get()
+                .is_none_or(|old| old.activity_address() != activity.activity_address())
+        {
+            carrick_fatal::carrick_fatal!(
+                "thread::ledger",
+                "lifecycle page changed ledger authority"
+            );
+        }
+        // SAFETY: the once-bound owner remains retained by every page lease.
+        unsafe {
+            self.bind_host_activity(std::ptr::from_ref(&*activity));
+        }
+    }
+    pub fn ledger_activity(&self) -> Option<ThreadLedgerActivityLease> {
+        self.1.get().cloned()
     }
 
     pub fn backing_base(&self) -> HostVa {

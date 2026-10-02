@@ -459,6 +459,40 @@ impl ReservedThreadPublication {
 }
 
 impl Kernel {
+    pub(in crate::kernel) fn prepare_abi_thread_birth(
+        self: &Arc<Self>,
+        parent: &KernelContext,
+        mut identity: ClaimedThreadIdentity,
+        born: carrick_el1_abi::BornRecord,
+    ) -> Result<PreparedThreadClone, KernelOperationError> {
+        let flags = carrick_abi::LinuxCloneFlags::from_bits(born.clone_flags)
+            .ok_or(KernelOperationError::ExpectedThreadGroup)?;
+        let plan =
+            ClonePlan::from_flags(flags).map_err(|_| KernelOperationError::ExpectedThreadGroup)?;
+        if plan.task() != CloneTaskMode::JoinThreadGroup {
+            return Err(KernelOperationError::ExpectedThreadGroup);
+        }
+        let control = identity
+            .control
+            .take()
+            .ok_or(KernelOperationError::StaleContext)?;
+        let registry_id = ThreadId::from_kernel_thread_identity(identity.identity.key.tid.raw());
+        ThreadCloneReservation {
+            kernel: self.clone(),
+            task: parent.task().clone(),
+            caller: parent.thread().clone(),
+            shared: parent.shared().clone(),
+            parent_resources: parent.resources().clone(),
+            seed: ThreadCloneSeed {
+                control,
+                affinity: parent.thread().affinity(),
+            },
+            plan,
+            identity,
+            failpoint: None,
+        }
+        .prepare(registry_id)
+    }
     /// Resolve one live Linux tid to its owning task, optionally requiring an
     /// exact tgid. Kernel-lane `tkill` uses the global form; `tgkill` supplies
     /// the tgid so a live tid from a different thread group is still ESRCH.

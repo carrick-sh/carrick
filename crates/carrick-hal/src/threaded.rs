@@ -81,6 +81,12 @@ impl ThreadId {
         Self(raw)
     }
 
+    /// Registry projection of an exact kernel-reserved Linux thread identity.
+    /// The carrier adopts this key; it does not allocate a second identity.
+    pub fn from_kernel_thread_identity(raw: i32) -> Self {
+        Self(raw)
+    }
+
     /// A synthetic registry key for TESTS (concurrency harnesses that
     /// fabricate worker keys like `100 + w`). Not for production code.
     pub fn synthetic_for_tests(raw: i32) -> Self {
