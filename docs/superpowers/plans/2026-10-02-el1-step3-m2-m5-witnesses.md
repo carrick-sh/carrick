@@ -266,3 +266,22 @@ acceptance receipt. These focused runs do not confer full backend acceptance.
 No milestone is yet claimed fully cutover-ready: the precise M2–M5 remaining
 lists above still apply. This follow-up supplies the requested four binding
 areas and records the newly observed cancellation, cycle and tgkill reds.
+
+### Final follow-up host gates
+
+On source `c808b8300` (kernel/clippy) and receipt tree `b230195c1`
+(lint/inventory; source unchanged), all four foreground commands exited zero:
+`CARGO_BUILD_JOBS=3 just test-kernel`, `CARGO_BUILD_JOBS=3 just clippy`,
+`CARGO_BUILD_JOBS=3 just lint-domains`, and
+`CARGO_BUILD_JOBS=3 just check-inventory`. Kernel: 2358 passed, one existing
+ignored, 155 serial-host cases filtered; ABI 109 and fdcore 32 passed, plus
+the kernel-semantics suites. The production compiler census retains the
+same 599 rows. Its macOS subset passes; Linux/FreeBSD/NetBSD profiles remain
+pending as before. One new table guard is classified test_or_definition;
+other operation inventory changes only rebind test line positions.
+
+Follow-up commits: M3 `87c949c86`, M4 `fd09845b8`, M5 `c808b8300`;
+signed evidence and inventory reconciliation `b230195c1`. The director's
+signed-lane hold was read at the final mailbox breakpoint after both signed
+runs had completed and scoped cleanup reported zero. No further signed runs
+were started after reading the hold.
