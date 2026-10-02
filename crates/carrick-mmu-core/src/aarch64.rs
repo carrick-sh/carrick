@@ -5608,6 +5608,47 @@ impl PageTableManager {
         Ok(())
     }
 
+    /// Physical aliases the offline child can inherit within a semantic VMA.
+    /// A live VMA can contain pristine pages with retired predecessor outputs;
+    /// those pages inherit the VMA, never that predecessor's physical alias.
+    /// Walk covering terminals, not every page in an empty/block span.
+    pub fn fork_backed_spans(
+        &mut self,
+        va: u64,
+        len: usize,
+    ) -> Result<Vec<core::ops::Range<u64>>, PageTableError> {
+        let end = va
+            .checked_add(len as u64)
+            .ok_or(PageTableError::BadAddress)?;
+        let mut current = va;
+        let mut spans: Vec<core::ops::Range<u64>> = Vec::new();
+        while current < end {
+            let (location, level) = self.leaf_offset(current, false, None)?;
+            let descriptor = self.read_desc(location)?;
+            let (span, mask) = Self::level_span(level);
+            let next = (current & mask)
+                .checked_add(span)
+                .ok_or(PageTableError::BadAddress)?
+                .min(end);
+            if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Malformed {
+                return Err(PageTableError::BadAddress);
+            }
+            if Self::records_output(descriptor, level)
+                && !terminal_descriptor_is_retired(descriptor)
+            {
+                if let Some(last) = spans.last_mut()
+                    && last.end == current
+                {
+                    last.end = next;
+                } else {
+                    spans.push(current..next);
+                }
+            }
+            current = next;
+        }
+        Ok(spans)
+    }
+
     /// Remove EL1-private authority from an invalid file BUS tail. The output
     /// remains recorded for the owning stage-2 lease, but no EL1 permission or
     /// prepared-backing decision may use it after the file fault is published.
