@@ -1910,6 +1910,17 @@ mod tests {
         assert_eq!((child.physical_ipa, child.physical_size), (ipa, 0x20_0000));
 
         use carrick_mem::memory::*;
+        let mut overlay = source.clone();
+        overlay.start = LINUX_PRIVATE_OVERLAY_BASE;
+        overlay.end = LINUX_PRIVATE_OVERLAY_BASE + LINUX_PRIVATE_OVERLAY_SIZE;
+        overlay.size = LINUX_PRIVATE_OVERLAY_SIZE as usize;
+        assert_eq!(
+            build_projected_fork_mappings(&mut tables, &overlay, false, &[])
+                .unwrap()
+                .len(),
+            1,
+            "private overlay storage is carrier backing, not a Linux VMA hole"
+        );
         // Each non-VMA window is inherited by explicit domain, including
         // all EL0-reachable synthetic pages and the carrier apertures.
         for (kind, start, size) in [
