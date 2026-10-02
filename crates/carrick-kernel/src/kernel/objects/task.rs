@@ -576,6 +576,8 @@ impl DumpableMode {
 #[derive(Debug)]
 pub struct Task {
     key: TaskKey,
+    thread_adoption_factory:
+        Mutex<Option<Arc<dyn crate::kernel::thread_adoption::ThreadBirthAdoptionFactory>>>,
     revision_capacity: Arc<crate::kernel::revision_capacity::RevisionCapacity>,
     controls: super::thread_control::ThreadControlArena,
     parent: Mutex<Option<TaskKey>>,
@@ -828,6 +830,7 @@ impl Task {
     ) -> Self {
         Self {
             key,
+            thread_adoption_factory: Mutex::new(None),
             revision_capacity: Arc::default(),
             controls: super::thread_control::ThreadControlArena::with_lifecycle(
                 key,
@@ -1426,6 +1429,23 @@ impl Task {
         current: crate::kernel::TaskRevision,
     ) -> crate::kernel::TaskRevision {
         reservation.consume(&self.revision_capacity, current)
+    }
+
+    pub fn install_thread_adoption_factory(
+        &self,
+        factory: Arc<dyn crate::kernel::thread_adoption::ThreadBirthAdoptionFactory>,
+    ) -> Result<(), TaskKey> {
+        if factory.owner() != self.key {
+            return Err(factory.owner());
+        }
+        *self.thread_adoption_factory.lock() = Some(factory);
+        Ok(())
+    }
+
+    pub(in crate::kernel) fn thread_adoption_factory(
+        &self,
+    ) -> Option<Arc<dyn crate::kernel::thread_adoption::ThreadBirthAdoptionFactory>> {
+        self.thread_adoption_factory.lock().clone()
     }
 
     pub const fn key(&self) -> TaskKey {
