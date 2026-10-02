@@ -23,10 +23,11 @@
 //! empty and reserves its one entry at clone time, through the same code.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use carrick_abi::NsUid;
+use carrick_el1_abi::{EntryRef, EntryState};
 use parking_lot::Mutex;
 
 use super::core::{Kernel, KernelContext, RegistryState, TaskRecord};
@@ -50,19 +51,6 @@ fn pool_depth_from_env() -> usize {
         Ok(value) if value == "0" => 0,
         _ => DEFAULT_THREAD_POOL_DEPTH,
     })
-}
-
-/// Lifecycle of one standing pool entry. `Born` and `Published` are carried
-/// by the typed owners a claim moves into (`ThreadCloneReservation` →
-/// `PreparedThreadClone` → a ledger birth → a registry thread claim), so the
-/// atomic only arbitrates the one race the pool itself has: a claimer and a
-/// revoker competing for an unclaimed entry.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EntryState {
-    Reserved = 0,
-    Claimed = 1,
-    Revoked = 2,
 }
 
 /// The exact kernel-issued identity of a thread: a reserved tid and serial
@@ -105,17 +93,22 @@ impl ThreadIdentity {
 
 #[derive(Debug)]
 struct PooledThreadIdentity {
-    state: AtomicU8,
+    entry: EntryRef,
+    control: super::objects::ThreadControlLease,
     /// The real uid this entry's `RLIMIT_NPROC` credit is charged to.
     credit: NsUid,
     identity: ThreadIdentity,
 }
 
 impl PooledThreadIdentity {
-    fn transition(&self, from: EntryState, to: EntryState) -> bool {
-        self.state
-            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    fn page(&self) -> super::objects::ThreadLifecycleLease {
+        self.control.lifecycle()
+    }
+    fn state(&self) -> EntryState {
+        self.page()
+            .state(self.entry.index())
+            .filter(|(generation, _)| *generation == self.entry.generation())
+            .map_or(EntryState::Revoked, |(_, state)| state)
     }
 }
 
@@ -130,19 +123,24 @@ pub(crate) struct ThreadIdentityPool {
 impl ThreadIdentityPool {
     /// Claim the oldest standing entry. FIFO keeps successive thread tids
     /// ascending exactly as a clone-time reservation would issue them.
-    fn claim(&self) -> Option<ThreadIdentity> {
+    fn claim(&self) -> Option<(ThreadIdentity, super::objects::ThreadControlLease)> {
         let mut entries = self.entries.lock();
-        while let Some(entry) = entries.pop_front() {
-            if entry.transition(EntryState::Reserved, EntryState::Claimed) {
-                return Some(entry.identity);
-            }
-            // Revoked: dropping it releases its tid.
-        }
-        None
+        // Host consumption and guest claim arbitrate on the same ABI CAS.
+        // A guest-owned entry remains in custody until birth settlement.
+        let index = entries
+            .iter()
+            .position(|entry| entry.page().revoke(entry.entry).is_ok())?;
+        entries
+            .remove(index)
+            .map(|entry| (entry.identity, entry.control))
     }
 
     fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| entry.state() == EntryState::Reserved)
+            .count()
     }
 
     fn credits(&self, uid: Option<NsUid>) -> usize {
@@ -150,8 +148,13 @@ impl ThreadIdentityPool {
             .lock()
             .iter()
             .filter(|entry| {
-                entry.state.load(Ordering::Acquire) == EntryState::Reserved as u8
-                    && uid.is_none_or(|uid| entry.credit == uid)
+                matches!(
+                    entry.state(),
+                    EntryState::Reserved
+                        | EntryState::Claimed
+                        | EntryState::Born
+                        | EntryState::ExitedInZone
+                ) && uid.is_none_or(|uid| entry.credit == uid)
             })
             .count()
     }
@@ -161,20 +164,41 @@ impl ThreadIdentityPool {
         let mut entries = self.entries.lock();
         let revoked = entries
             .iter()
-            .filter(|entry| {
-                entry.credit == uid && entry.transition(EntryState::Reserved, EntryState::Revoked)
-            })
+            .filter(|entry| entry.credit == uid && entry.page().revoke(entry.entry).is_ok())
             .count();
-        entries.retain(|entry| entry.state.load(Ordering::Acquire) == EntryState::Reserved as u8);
+        entries.retain(|entry| entry.state() != EntryState::Revoked);
         revoked
     }
 
-    fn push(&self, credit: NsUid, identity: ThreadIdentity) {
-        self.entries.lock().push_back(PooledThreadIdentity {
-            state: AtomicU8::new(EntryState::Reserved as u8),
+    fn push(&self, task: &TaskRef, credit: NsUid, identity: ThreadIdentity) -> bool {
+        let control = task.allocate_thread_control(identity.key);
+        let page = control.lifecycle();
+        let visible_tid = identity
+            .pid_identity
+            .as_ref()
+            .map_or(identity.key.tid.raw() as u32, |id| id.visible_id());
+        let mut entries = self.entries.lock();
+        let Some(entry) = (0..carrick_el1_abi::THREAD_POOL_ENTRIES).find_map(|index| {
+            page.stock(
+                index,
+                carrick_el1_abi::EntryIdentity {
+                    tid: identity.key.tid.raw() as u32,
+                    visible_tid,
+                    thread_serial: identity.key.serial.raw(),
+                    uid_credit: u64::from(credit.raw()),
+                },
+            )
+            .ok()
+        }) else {
+            return false;
+        };
+        entries.push_back(PooledThreadIdentity {
+            entry,
+            control,
             credit,
             identity,
         });
+        true
     }
 
     /// Tids currently standing in this pool (diagnostics and tests).
@@ -182,6 +206,7 @@ impl ThreadIdentityPool {
         self.entries
             .lock()
             .iter()
+            .filter(|entry| entry.state() == EntryState::Reserved)
             .map(|entry| entry.identity.key.tid)
             .collect()
     }
@@ -216,6 +241,7 @@ impl Drop for NprocCredit {
 pub(crate) struct ClaimedThreadIdentity {
     pub(crate) identity: ThreadIdentity,
     pub(crate) credit: NprocCredit,
+    pub(crate) control: Option<super::objects::ThreadControlLease>,
 }
 
 /// Registry-side thread lifecycle ledger. See the module documentation.
@@ -322,11 +348,15 @@ impl ThreadLedger {
         // counted against it.
         let claimed = record.thread_pool.claim();
         let credit = self.admit_thread(state, parent)?;
-        let identity = match claimed {
-            Some(identity) => identity,
-            None => ThreadIdentity::reserve(kernel, &record.task)?,
+        let (identity, control) = match claimed {
+            Some((identity, control)) => (identity, Some(control)),
+            None => (ThreadIdentity::reserve(kernel, &record.task)?, None),
         };
-        Ok(ClaimedThreadIdentity { identity, credit })
+        Ok(ClaimedThreadIdentity {
+            identity,
+            credit,
+            control,
+        })
     }
 
     /// Bring `task`'s pool back to depth after a publication. Each new entry
@@ -362,7 +392,9 @@ impl ThreadLedger {
             let Ok(identity) = ThreadIdentity::reserve(kernel, &record.task) else {
                 return;
             };
-            record.thread_pool.push(uid, identity);
+            if !record.thread_pool.push(&record.task, uid, identity) {
+                return;
+            }
         }
     }
 
@@ -569,6 +601,49 @@ mod tests {
 
     fn fork_plan() -> ClonePlan {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
+    }
+
+    #[test]
+    fn lifecycle_host_and_guest_claims_share_identity_authority_in_two_processes() {
+        let (kernel, root) = bootstrap(9_660);
+        kernel.registry().thread_ledger().set_pool_depth_for_test(4);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_661),
+                "pool-peer".into(),
+                None,
+            )
+            .unwrap();
+        for (index, parent) in [&root, &peer].into_iter().enumerate() {
+            let sibling = kernel
+                .clone_thread(
+                    parent,
+                    thread_plan(),
+                    ThreadId::synthetic_for_tests(9_662 + index as i32),
+                    None,
+                )
+                .unwrap();
+            let standing = kernel.standing_thread_identities(parent.task().key().id);
+            assert_eq!(standing.len(), 4);
+            let page = parent.thread().control_lease().lifecycle();
+            let guest = page
+                .claim_any()
+                .expect("kernel standing identities must be guest-claimable");
+            let identity = page.identity(guest.entry()).unwrap();
+            assert_eq!(identity.tid as i32, standing[0].raw());
+            let host = kernel
+                .reserve_thread_clone(parent, thread_plan(), None)
+                .unwrap();
+            assert_ne!(
+                host.tid().raw(),
+                identity.tid as i32,
+                "host reissued a guest-claimed identity"
+            );
+            page.unclaim(guest).unwrap();
+            drop((host, sibling));
+        }
     }
 
     #[test]

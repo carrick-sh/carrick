@@ -331,7 +331,11 @@ impl PreparedThreadClone {
             identity,
             failpoint,
         } = reservation;
-        let ClaimedThreadIdentity { identity, credit } = identity;
+        let ClaimedThreadIdentity {
+            identity,
+            credit,
+            control: _,
+        } = identity;
         let ThreadIdentity {
             key,
             reservation,
@@ -796,7 +800,7 @@ impl Kernel {
         if plan.task() != CloneTaskMode::JoinThreadGroup {
             return Err(KernelOperationError::ExpectedThreadGroup);
         }
-        let identity = {
+        let mut identity = {
             let state = self.registry().settled().read();
             ensure_task_unreserved(&state, parent.task.key().id)?;
             let record = state
@@ -826,11 +830,16 @@ impl Kernel {
                 .claim(self, &state, record, parent)?
         };
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
-        let control = crate::kernel::objects::Thread::prepare_clone_control(
-            &parent.task,
-            identity.identity.key,
-            parent.thread.blocked_mask(),
-        );
+        let control = identity.control.take().unwrap_or_else(|| {
+            crate::kernel::objects::Thread::prepare_clone_control(
+                &parent.task,
+                identity.identity.key,
+                parent.thread.blocked_mask(),
+            )
+        });
+        control.init_blocked(carrick_el1_abi::BlockedMask(
+            parent.thread.blocked_mask().raw(),
+        ));
         Ok(ThreadCloneReservation {
             kernel: self.clone(),
             task: Arc::clone(&parent.task),
