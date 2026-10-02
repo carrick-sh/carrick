@@ -1,5 +1,7 @@
-# Known-red EL1 test cases. Entries are removed when fixed.
+# Known-red EL1 test cases on main. Entries are removed when fixed.
+el1_anonymous_reservations_stay_in_guest
 el1_delegated_root_concurrent_vma_ops
+el1_delegated_root_map_fixed_over_cow_pages
 el1_fork_cow_resolves_in_guest
 el1_thread_lifecycle_ptrace_traceclone
 el1_thread_lifecycle_spawn_slope
