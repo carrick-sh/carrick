@@ -21,6 +21,28 @@ pub struct Cli {
 pub enum Commands {
     #[command(about = "Display repository information as JSON")]
     Info,
+
+    #[command(about = "Three-way merge of schema-aware classification ledgers")]
+    LedgerMerge {
+        #[arg(long, help = "Repo-relative path of the ledger being merged")]
+        path: PathBuf,
+        #[arg(long, help = "Path to base file")]
+        base: PathBuf,
+        #[arg(long, help = "Path to ours file")]
+        ours: PathBuf,
+        #[arg(long, help = "Path to theirs file")]
+        theirs: PathBuf,
+        #[arg(long, help = "Path to output file")]
+        output: PathBuf,
+    },
+
+    #[command(
+        about = "Regenerate contract inventory using generate-inventory --root <root>, followed by --check"
+    )]
+    LedgerRegenerateContracts {
+        #[arg(long, help = "Path to repository root")]
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +78,12 @@ pub enum CliError {
 
     #[error("failed to serialize repository info to JSON: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("ledger merge conflict: {0}")]
+    MergeConflict(#[from] crate::ledger_merge::MergeConflict),
+
+    #[error("ledger contract regeneration error: {0}")]
+    RegenerateContracts(#[from] crate::ledger_merge::RegenerateError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -139,6 +167,82 @@ where
             let info = resolve_repo_info(cli.root.as_deref())?;
             let json = serde_json::to_string_pretty(&info)?;
             writeln!(writer, "{json}").map_err(|e| CliError::Io {
+                path: PathBuf::from("stdout"),
+                source: e,
+            })?;
+            Ok(())
+        }
+        Commands::LedgerMerge {
+            path,
+            base,
+            ours,
+            theirs,
+            output,
+        } => {
+            let base_str = std::fs::read_to_string(&base).map_err(|e| CliError::Io {
+                path: base.clone(),
+                source: e,
+            })?;
+            let ours_str = std::fs::read_to_string(&ours).map_err(|e| CliError::Io {
+                path: ours.clone(),
+                source: e,
+            })?;
+            let theirs_str = std::fs::read_to_string(&theirs).map_err(|e| CliError::Io {
+                path: theirs.clone(),
+                source: e,
+            })?;
+
+            let path_str = path.to_string_lossy();
+            let merged =
+                crate::ledger_merge::merge_ledger(&path_str, &base_str, &ours_str, &theirs_str)?;
+
+            let parent_dir = output.parent().unwrap_or_else(|| Path::new("."));
+            let file_name = output
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "output".to_string());
+            let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+
+            let write_res = (|| -> Result<(), std::io::Error> {
+                let mut f = std::fs::File::create(&temp_path)?;
+                f.write_all(merged.to_json().as_bytes())?;
+                f.sync_all()?;
+                std::fs::rename(&temp_path, &output)?;
+                Ok(())
+            })();
+
+            if let Err(e) = write_res {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(CliError::Io {
+                    path: output.clone(),
+                    source: e,
+                });
+            }
+
+            writeln!(writer, "{}", merged.summary()).map_err(|e| CliError::Io {
+                path: PathBuf::from("stdout"),
+                source: e,
+            })?;
+            Ok(())
+        }
+        Commands::LedgerRegenerateContracts { root } => {
+            let resolved_root = match root {
+                Some(r) => r,
+                None => match &cli.root {
+                    Some(r) => r.clone(),
+                    None => {
+                        let info = resolve_repo_info(None)?;
+                        info.repository_root
+                    }
+                },
+            };
+            crate::ledger_merge::regenerate_contracts(&resolved_root)?;
+            writeln!(
+                writer,
+                "contract inventory regenerated and verified at {}",
+                resolved_root.display()
+            )
+            .map_err(|e| CliError::Io {
                 path: PathBuf::from("stdout"),
                 source: e,
             })?;
