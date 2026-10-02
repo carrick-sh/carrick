@@ -5134,6 +5134,169 @@ mod tests {
     }
 
     #[test]
+    fn m5_two_process_exact_thread_routing_isolated_at_four_populations() {
+        for population in [1, 8, 32, 128] {
+            let dispatcher = SyscallDispatcher::new();
+            let root = dispatcher.capture_one_task_context().unwrap();
+            let peer = root
+                .kernel()
+                .reserve_fork(
+                    &root,
+                    crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                        .unwrap(),
+                    "routing-peer".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_reference(crate::thread::ThreadId::synthetic_for_tests(930_000))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
+            let root = root
+                .kernel()
+                .context(root.task().key().id, root.thread().key().tid)
+                .unwrap();
+            let mut targets = Vec::new();
+            for index in 0..population {
+                let tid = dispatcher
+                    .register_one_task_thread(
+                        &root,
+                        crate::thread::ThreadId::synthetic_for_tests(930_001 + index),
+                    )
+                    .unwrap();
+                let context = root.kernel().context(root.task().key().id, tid).unwrap();
+                context
+                    .signal_authority()
+                    .set_blocked(SigSet::EMPTY.with(34));
+                targets.push(context);
+            }
+            let target = targets.last().unwrap();
+            let peer_pid = crate::namespace::pid::ns_visible_guest_tid(&peer).unwrap();
+            for _ in 0..3 {
+                let authorization = root.kernel().authorize_signal_target_exact(
+                    &peer,
+                    target.task().key(),
+                    Some(target.thread().key()),
+                    Some(crate::kernel::LinuxSignal::for_signal_number(34).unwrap()),
+                );
+                let crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) = authorization
+                else {
+                    panic!("peer signal authorization denied");
+                };
+                assert!(
+                    matches!(root.kernel().post_guest_thread_signal_to_authorized_target(&ticket,
+                    crate::kernel::LinuxSignal::for_signal_number(34).unwrap(),
+                    Some(LinuxSiginfo::kill(34, crate::linux_abi::LINUX_SI_TKILL,
+                        peer_pid as i32, peer.resources().credentials().ruid().raw()))),
+                    crate::kernel::ExactThreadSignalPost::Posted(Some(exact)) if exact == target.thread().key())
+                );
+            }
+            assert!(peer.signal_authority().thread_pending().is_empty());
+            assert!(root.signal_authority().thread_pending().is_empty());
+            for other in targets.iter().take(targets.len() - 1) {
+                assert!(other.signal_authority().thread_pending().is_empty());
+            }
+            for _ in 0..3 {
+                let queued = target
+                    .signal_authority()
+                    .take_lowest_in(SigSet::EMPTY.with(34))
+                    .unwrap();
+                assert_eq!(queued.pending.signal.raw(), 34);
+                let info = queued.pending.siginfo.unwrap();
+                let code = info.si_code;
+                assert_eq!(code, crate::linux_abi::LINUX_SI_TKILL);
+            }
+            assert!(target.signal_authority().thread_pending().is_empty());
+            assert_eq!(target.signal_authority().blocked(), SigSet::EMPTY.with(34));
+            let old = target.thread().key();
+            root.kernel().exit_thread(target, None).unwrap();
+            assert!(
+                root.kernel()
+                    .live_keys_for_thread(Some(root.task().key().id), old.tid)
+                    .is_none()
+            );
+            let replacement_tid = dispatcher
+                .register_one_task_thread(
+                    &root,
+                    crate::thread::ThreadId::synthetic_for_tests(930_001 + population),
+                )
+                .unwrap();
+            let replacement = root
+                .kernel()
+                .context(root.task().key().id, replacement_tid)
+                .unwrap();
+            assert_ne!(replacement.thread().key(), old);
+            assert!(replacement.signal_authority().thread_pending().is_empty());
+            assert!(peer.signal_authority().thread_pending().is_empty());
+        }
+    }
+
+    #[test]
+    fn red_until_step3_m5_peer_tgkill_selects_dispatcher_self_task() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let peer = root
+            .kernel()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                "tgkill-peer".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(crate::thread::ThreadId::synthetic_for_tests(940_000))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let root = root
+            .kernel()
+            .context(root.task().key().id, root.thread().key().tid)
+            .unwrap();
+        let tid = dispatcher
+            .register_one_task_thread(&root, crate::thread::ThreadId::synthetic_for_tests(940_001))
+            .unwrap();
+        let target = root.kernel().context(root.task().key().id, tid).unwrap();
+        let visible_tid = crate::namespace::pid::ns_visible_guest_tid(&target).unwrap();
+        let root_pid =
+            crate::namespace::pid::try_ns_self_pid_for(&root, root.task().key().id.raw() as u32)
+                .unwrap();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 64]);
+        let reporter = crate::compat::CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                &peer,
+                SyscallRequest::new(
+                    131,
+                    SyscallArgs([u64::from(root_pid), u64::from(visible_tid), 34, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        let result = if matches!(outcome, DispatchOutcome::SignalThread {
+            kernel_target: Some(exact), .. } if exact == target.thread().key())
+        {
+            Ok(())
+        } else {
+            assert_eq!(outcome, DispatchOutcome::errno(LINUX_ESRCH));
+            Err("peer tgkill resolves target tgid as dispatcher self task")
+        };
+        assert_eq!(
+            result.expect_err("flips at M5 cutover"),
+            "peer tgkill resolves target tgid as dispatcher self task"
+        );
+        assert!(target.signal_authority().thread_pending().is_empty());
+        assert!(peer.signal_authority().thread_pending().is_empty());
+    }
+
+    #[test]
     fn hvpatch_threaded_tkill_is_kernel_native_fifo_coalesced_and_exact() {
         let d = SyscallDispatcher::new();
         let caller_context = d.capture_one_task_context().expect("caller context");

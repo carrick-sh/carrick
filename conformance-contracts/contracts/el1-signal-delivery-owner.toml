@@ -9,7 +9,9 @@ rationale = "Two live tasks with separate containers retain independent realtime
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-kernel::kernel::objects::signal::tests::{red_until_step3_m5_shared_pending_clear_does_not_consume_host_queue,pending_queue_coalesces_standard_and_preserves_realtime_fifo_payloads,thread_signal_lifecycle_transforms_preserve_linux_owners,sighand_retains_full_actions_and_exec_preserves_only_ignore,signal_authority_preserves_thread_first_same_signum_provenance}"
+vm_free = "carrick-kernel::dispatch::signal::tests::{m5_two_process_exact_thread_routing_isolated_at_four_populations,red_until_step3_m5_peer_tgkill_selects_dispatcher_self_task}; carrick-kernel::kernel::objects::signal::tests::{red_until_step3_m5_shared_pending_clear_does_not_consume_host_queue,pending_queue_coalesces_standard_and_preserves_realtime_fifo_payloads,thread_signal_lifecycle_transforms_preserve_linux_owners,sighand_retains_full_actions_and_exec_preserves_only_ignore,signal_authority_preserves_thread_first_same_signum_provenance}"
+
+embed = "carrick-conformance-next::probes_shard_0::m5_el0_nested_altstack_and_fault_frame_bindings; carrick-embed::el1_sched::el1_sched_pstate_seen_by_the_guest_is_unchanged"
 
 [bindings.unresolved]
 embed_structural = "No EL0 execution in preparation. Cutover requires carrick-conformance-next bindings for the unresolved scenarios listed in the witness ledger."

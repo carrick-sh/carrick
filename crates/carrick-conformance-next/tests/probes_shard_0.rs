@@ -490,3 +490,46 @@ fn generic_probe_shard_0() {
         );
     }
 }
+
+/// M5 EL0 frame bindings: reuse source-valid cached Linux oracles and the
+/// probeinit fork/exec topology. These are semantic witnesses, not proof of
+/// EL1 frame ownership. No new subprocess or executable probe is introduced.
+#[test]
+fn m5_el0_nested_altstack_and_fault_frame_bindings() {
+    let _guard = common::guest_lock();
+    let root = common::repo_root();
+    for (target, libc) in [
+        ("aarch64-unknown-linux-musl", "musl"),
+        ("aarch64-unknown-linux-gnu", "gnu"),
+    ] {
+        let dir = find_probe_binary_dir(&root, target).expect("freshly built frame probes");
+        let init = dir.join("probeinit");
+        assert!(init.is_file());
+        for probe in [
+            "sigreenter",
+            "siglongjmpaltstack",
+            "sigbadstack",
+            "preemptsigstorm",
+        ] {
+            let binary = dir.join(probe);
+            assert!(binary.is_file(), "missing {target}:{probe}");
+            let oracle = cached_probe_oracle(&root, "arm64", libc, probe).unwrap();
+            let result = common::run_named_or_fail(
+                probe,
+                common::with_empty_stdin_pipe(|| {
+                    common::generic_probe_container(probe, &binary, &init)
+                        .run(["/tmp/carrick-init"])
+                }),
+            );
+            assert!(
+                result.success(),
+                "{target}:{probe}: exit={} signal={:?}",
+                result.exit_code,
+                result.signal
+            );
+            let mut output = result.stdout_utf8();
+            output.push_str(&String::from_utf8_lossy(&result.stderr));
+            assert_eq!(normalize(&output), oracle, "{target}:{probe}");
+        }
+    }
+}

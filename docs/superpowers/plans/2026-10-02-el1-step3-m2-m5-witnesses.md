@@ -202,3 +202,43 @@ Remaining M4: deterministic collector work budgets/historical VAULT visits,
 ancillary truncation/fault rollback, all backing-kind flags/cursor/EOF lifetime,
 SEQPACKET/message options and actual namespace/host-peer boundary bindings.
 The cycle witness is cutover input, not proof that a collector exists.
+
+### M5 multi-thread routing — flips at M5 cutover
+
+`dispatch::signal::tests::m5_two_process_exact_thread_routing_isolated_at_four_populations`
+keeps a fork peer and 1/8/32/128 live target threads. Exact kernel authorization
+and post send three RT instances to the last target, checking SI_TKILL,
+independent blocked masks and no queue changes in the leader, peer or other
+threads. Retirement removes the exact key; a replacement has another key
+and starts with no pending signal. This is a positive kernel routing binding,
+not an instrumented no-population-scan proof or a concurrent born-thread race.
+
+`red_until_step3_m5_peer_tgkill_selects_dispatcher_self_task` records exact
+failure `peer tgkill resolves target tgid as dispatcher self task`. A single
+carrier dispatcher receives a real `tgkill` request from the fork peer naming
+a live thread in the root task. When target TGID equals dispatcher cached
+identity PID, target resolution selects the caller task and returns numeric
+ESRCH (3), leaving both queues empty. Exact reproduction:
+`CARGO_BUILD_JOBS=3 cargo test -p carrick-kernel --lib m5_ -- --nocapture`.
+This is a cross-context syscall-boundary defect in the VM-free dispatcher;
+it is not yet reproduced through an EL0 application. No production fix.
+
+### M5 EL0 frame bindings
+
+`carrick-conformance-next::probes_shard_0::m5_el0_nested_altstack_and_fault_frame_bindings`
+reuses existing `sigreenter`, `siglongjmpaltstack`, `sigbadstack` and
+`preemptsigstorm` executables through the signed embed TestContainer and the
+existing probeinit fork/exec topology. Each runs for musl and glibc against
+its committed source-hash-validated Linux oracle. Nested altstack frames,
+siglongjmp reconciliation, faulted frame copyout and repeated async sigreturn
+need actual EL0 execution; a host-only reducer cannot prove them. Fresh local
+cross-builds and binary hashes precede these runs. No new executable probe
+or CLI subprocess runner is added, and no Docker is invoked.
+The existing signed PSTATE fixture is bound separately. These semantic
+bindings do not prove that frame construction/restoration moved to EL1.
+
+Remaining M5: malformed sigreturn frame validation, permission/accounting
+exhaustion, concurrent born/exit/TID-reuse races and deterministic exact-route
+work budgets; CLONE_SIGHAND/exec composition; ppoll/pselect handler restore;
+stop/continue/SIGCHLD; traced/seccomp/fault/compute IRQ delivery owner proofs.
+Existing lifecycle and frame semantics alone do not close those requirements.
