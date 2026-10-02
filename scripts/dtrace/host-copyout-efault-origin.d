@@ -35,10 +35,24 @@
  *     preparation refusal, before any EL1 store. Its VA/length cover the
  *     full proposed publication and its reason names DescriptorRefusal.
  *     This phase is not yet live-qualified.
+ *     Phase 24 names a refused or rolled-back EL1 frame-grant receipt at
+ *     host settlement, before its backing is rolled back. This phase is
+ *     not yet live-qualified either.
+ *     el1-mapping-leaf(phase, MM key, VA, span length, live descriptor)
+ *     samples a focus page and its neighbour: phases 0 preparation,
+ *     1 submitted, 2 host publication, 3 applied receipt before backend
+ *     settlement, 4 after settlement, 5 before unmap, 6 after unmap.
+ *     These descriptor walks execute only with this probe enabled.
+ *     guest-internal-read-fault(page, length, phase, live descriptor)
+ *     reports host-read refusal: phases 0 permission, 1 translation,
+ *     2 backing. The combined capture binds refusal to publication and
+ *     retirement in the same exact MM. New phases remain unqualified.
  *
  * (c) Perturbation: failure-only, with one ustack() per event. Thousands
  *     of repeated refusals can materially perturb a run; this profile
  *     diagnoses origin and provides no uninstrumented timing evidence.
+ *     Mapping lifecycle sampling adds two live walks per publication or
+ *     retirement while enabled; this is ordering evidence, not timing.
  *
  * Usage (keep the carrier alive briefly after the failure, or the stacks
  * cannot be symbolized once the process is gone):
@@ -49,7 +63,30 @@
 proc:::exit
 /pid == $target/
 {
+    target_exited = 1;
     exit(0);
+}
+
+tick-1s
+{
+    seconds++;
+}
+
+tick-1s
+/seconds >= 60 && !target_exited/
+{
+    printf("COPYORIGIN TRUNCATED seconds=%d\n", seconds);
+    exit(4);
+}
+
+dtrace:::ERROR
+{
+    errors++;
+}
+
+dtrace:::DROP
+{
+    drops++;
 }
 
 carrick*:::guest-internal-write-fault
@@ -59,6 +96,23 @@ carrick*:::guest-internal-write-fault
         pid, tid, arg0, arg1, arg2, copyinstr(arg3));
     ustack();
     @refused[arg2, copyinstr(arg3)] = count();
+}
+
+carrick*:::el1-mapping-leaf
+/pid == $target || progenyof($target)/
+{
+    mapping_events++;
+    printf("MAPLEAF ns=%d pid=%d tid=%d phase=%d mm=%d va=0x%x span=0x%x live=0x%x\n",
+        timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4);
+    @mapping_phase[arg0] = count();
+}
+
+carrick*:::guest-internal-read-fault
+/pid == $target || progenyof($target)/
+{
+    printf("READFAULT ns=%d pid=%d tid=%d page=0x%x len=%d phase=%d live=0x%x\n",
+        timestamp, pid, tid, arg0, arg1, arg2, arg3);
+    ustack();
 }
 
 carrick*:::syscall-return
@@ -71,6 +125,9 @@ carrick*:::syscall-return
 
 END
 {
+    printf("COPYORIGIN summary mapping_events=%d target_exited=%d errors=%d drops=%d\n",
+        mapping_events, target_exited, errors, drops);
+    printa("mapping phase=%d: %@d\n", @mapping_phase);
     printa("refused phase=%d %s: %@d\n", @refused);
     printa("EFAULT %s: %@d\n", @efault);
 }
