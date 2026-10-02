@@ -3012,6 +3012,17 @@
       "domain": "epoll::zone"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
+      "function": "park",
+      "ordinal_in_function": 1,
+      "fingerprint": "2e4e0aad59a9295d37505ace169fde5673784aeba91b610915c42cf74cf9d1a5",
+      "verdict": "carrier_fault",
+      "failure_domain": "scm_rights::vault",
+      "rationale": "Holding the write end of a placeholder pipe in the vault keeps the pipe object alive until claimed or collected; two live placeholder pipes sharing a key on insert breaks kernel object identity invariance and indicates corrupt pipe identity.",
+      "sink": "fatal",
+      "domain": "scm_rights::vault"
+    },
+    {
       "file": "crates/carrick-kernel/src/kernel/objects/task.rs",
       "function": "Task::stop_for_job_control",
       "ordinal_in_function": 1,
