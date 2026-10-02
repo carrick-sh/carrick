@@ -53,3 +53,5 @@ carrick-observability = { path = "../carrick-observability", features = ["confor
 carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }
 libc.workspace = true
 tempfile.workspace = true
+
+tar.workspace = true

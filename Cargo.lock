@@ -703,6 +703,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror",
 ]
