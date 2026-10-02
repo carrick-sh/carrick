@@ -2471,13 +2471,15 @@ pub trait FrameCowAuthority: Send + Sync {
         Ok(false)
     }
 
-    /// Whether a host read of `page`, whose live leaf has no output at all,
-    /// sees fresh zero: it is an untouched, readable page of a live mapping
-    /// whose backing does not exist yet (Linux maps the zero page there). A
-    /// host read needs no backing to answer it.
-    fn host_read_sees_fresh_zero(
+    /// Whether this exact MM permits `access` to an untouched root-owned
+    /// page. The caller authenticates its live descriptor separately. Reads
+    /// see fresh zero only without live backing. Copyout prevalidation grants
+    /// no residency: a grant or prepared-page commit must revalidate before
+    /// any write.
+    fn host_untouched_page_permits(
         &self,
         _page: u64,
+        _access: carrick_mmu_core::aarch64::LeafAccess,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         Ok(false)
     }
@@ -2719,12 +2721,13 @@ pub struct FrameCowIdentity {
 }
 
 /// Exact host-side input for preparing one unpublished EL1 frame grant. The
-/// runtime has already claimed the shared mailbox request and clipped the
-/// semantic range to one same-protection VMA window.
+/// runtime has claimed a mailbox request or holds exact-MM copyout authority,
+/// and clipped the semantic range to one same-protection window. Mailbox
+/// generation stays with its runtime claim/response protocol; backing does not
+/// own or authenticate that mailbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct El1FrameGrantRequest {
     pub mm_key: u64,
-    pub request_generation: u64,
     pub fault_va: u64,
     pub access: u64,
     pub semantic_base: u64,

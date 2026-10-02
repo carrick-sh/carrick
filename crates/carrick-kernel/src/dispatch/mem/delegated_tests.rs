@@ -3759,7 +3759,7 @@ fn delegated_fork_requires_stock_and_owed_returns_settled_before_snapshot() {
             .guest_mmap(Placement::Fixed(address), PAGE, rw)
             .unwrap();
         assert!(
-            child.host_read_sees_fresh_zero(address),
+            child.host_untouched_page_permits(address, carrick_mmu_core::aarch64::LeafAccess::Read),
             "the child must observe fresh zero, not a returned parent's frame"
         );
         assert!(
@@ -3976,7 +3976,27 @@ fn delegated_host_copyout_is_one_root_grant_per_run() {
         ReservationProtection::READ_WRITE,
     )
     .unwrap();
-    assert!(dispatcher.host_read_sees_fresh_zero(base));
+    assert!(
+        dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Read)
+    );
+    assert!(
+        dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Write)
+    );
+    let read_only = base + STOCK_WINDOW;
+    root.guest_mmap(Placement::Fixed(read_only), PAGE, READ)
+        .unwrap();
+    assert!(
+        dispatcher
+            .host_untouched_page_permits(read_only, carrick_mmu_core::aarch64::LeafAccess::Read)
+    );
+    assert!(
+        !dispatcher
+            .host_untouched_page_permits(read_only, carrick_mmu_core::aarch64::LeafAccess::Write)
+    );
+    assert!(!dispatcher.host_untouched_page_permits(
+        read_only + PAGE,
+        carrick_mmu_core::aarch64::LeafAccess::Write
+    ));
 
     let mut venue = CopyoutVenue::default();
     assert_eq!(copyout_grant(&dispatcher, base, PAGE, &mut venue), Ok(true));
@@ -3987,8 +4007,11 @@ fn delegated_host_copyout_is_one_root_grant_per_run() {
         "a one-page copyout backs one page"
     );
     assert!(
-        !dispatcher.host_read_sees_fresh_zero(base),
+        !dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Read),
         "the granted page is resident"
+    );
+    assert!(
+        !dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Write)
     );
     assert!(
         stock_span(&dispatcher, base).is_none(),
@@ -4076,7 +4099,7 @@ fn delegated_host_copyout_on_the_guest_lane_commits_after_the_receipt() {
     );
     assert_eq!(refused.calls, ["prepare", "publish", "apply", "roll_back"]);
     assert!(
-        dispatcher.host_read_sees_fresh_zero(base),
+        dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Read),
         "a refused grant commits nothing"
     );
 
@@ -4086,7 +4109,9 @@ fn delegated_host_copyout_on_the_guest_lane_commits_after_the_receipt() {
     };
     assert_eq!(copyout_grant(&dispatcher, base, PAGE, &mut venue), Ok(true));
     assert_eq!(venue.calls, ["prepare", "publish", "apply", "complete"]);
-    assert!(!dispatcher.host_read_sees_fresh_zero(base));
+    assert!(
+        !dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Read)
+    );
 }
 
 /// A host read of a never-touched page sees zero without any grant; a
@@ -4098,8 +4123,15 @@ fn delegated_host_read_of_an_untouched_page_is_fresh_zero() {
     let root = Root::admit(&dispatcher);
     let base = LINUX_MMAP_BASE + STOCK_WINDOW;
     root.guest_mmap(Placement::Fixed(base), PAGE, READ).unwrap();
-    assert!(dispatcher.host_read_sees_fresh_zero(base));
-    assert!(!dispatcher.host_read_sees_fresh_zero(base + 4 * PAGE));
+    assert!(
+        dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Read)
+    );
+    assert!(
+        !dispatcher.host_untouched_page_permits(
+            base + 4 * PAGE,
+            carrick_mmu_core::aarch64::LeafAccess::Read
+        )
+    );
     // A read-only page is no copyout target.
     let mut venue = CopyoutVenue::default();
     assert_eq!(
