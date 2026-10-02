@@ -702,6 +702,90 @@ mod mm_executor_release_tests {
     }
 
     #[test]
+    fn pwritev_borrowed_payload_with_host_wait_writes_all_bytes() {
+        use crate::dispatch::fd_table::HostFdRef;
+        use crate::dispatch::resources::with_captured_resources;
+        use crate::dispatch::{
+            DispatchOutcome, HostWaitContext, OpenDescription, OpenDescriptionBase,
+        };
+        use carrick_vfs::rootfs::{RootFsEntryKind, RootFsMetadata};
+        use std::os::fd::IntoRawFd;
+
+        let (dispatcher, context, lease, mut executor, _, _) = boundary_fixture();
+        context.thread().yield_from_executor(lease).unwrap();
+        let scheduler = crate::kernel::Scheduler::new_with_policy(
+            Arc::clone(context.kernel()),
+            Arc::new(carrick_hal::GuestCpuPolicy::new(1)),
+        );
+        let registration = scheduler
+            .register_executor(Arc::new(HostWaitKick::default()))
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&registration).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let host_fd = file.into_file().into_raw_fd();
+        let fd = dispatcher.install_fd(
+            OpenDescription::HostFile {
+                base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDWR),
+                host_fd: HostFdRef::new(host_fd),
+                metadata: RootFsMetadata {
+                    path,
+                    kind: RootFsEntryKind::File,
+                    mode: 0o600,
+                    size: 0,
+                },
+                writable: true,
+            },
+            0,
+        );
+        let DispatchOutcome::Returned { value: fd } = fd else {
+            panic!("install host file")
+        };
+        let mut memory = LinearMemory::new(0x10000, vec![0; 4096]);
+        use carrick_guest_mem::GuestMemory;
+        memory
+            .write_bytes(0x10000, &0x10100_u64.to_ne_bytes())
+            .unwrap();
+        memory.write_bytes(0x10008, &4_u64.to_ne_bytes()).unwrap();
+        memory.write_bytes(0x10100, b"test").unwrap();
+        assert!(memory.host_read(0x10100, 4).is_some());
+        let args = SyscallArgs::from([fd as u64, 0x10000, 1, 0, 0, 0]);
+        assert!(!crate::dispatch::syscall_requires_execution_lease(70, args));
+        let reporter = CompatReporter::default();
+        for host_wait in [true, false] {
+            assert_eq!(unsafe { libc::ftruncate(host_fd, 0) }, 0);
+            let mut syscall = SyscallCtx {
+                host_wait: host_wait.then_some(HostWaitContext {
+                    scheduler: &scheduler,
+                    registration: &registration,
+                }),
+                kernel: &context,
+                request: SyscallRequest::new(70, args),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: Some(running.lease()),
+                mm_executor: Some(&mut executor),
+            };
+            let handler = crate::dispatch::routing::resolve_handler::<LinearMemory>(70).unwrap();
+            assert_eq!(
+                with_captured_resources(&context, || handler(&dispatcher, &mut syscall)).unwrap(),
+                DispatchOutcome::Returned { value: 4 }
+            );
+            let mut bytes = [0_u8; 4];
+            assert_eq!(
+                unsafe { libc::pread(host_fd, bytes.as_mut_ptr().cast(), bytes.len(), 0) },
+                4
+            );
+            assert_eq!(&bytes, b"test");
+        }
+        drop(executor);
+        scheduler.settle_exited(running).unwrap();
+        scheduler.unregister_executor(&registration).unwrap();
+    }
+
+    #[test]
     fn host_wait_releases_mm_and_cpu_then_restores_both_even_on_unwind() {
         let (dispatcher, context, lease, mut executor, census, _) = boundary_fixture();
         context
