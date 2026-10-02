@@ -147,6 +147,36 @@ impl NodeBanks for IdentityBanks<'_> {
 }
 
 impl SharedReservations {
+    /// Layout of one elastic reservation bank, independent of MM population.
+    pub fn metadata_bank_layout() -> core::alloc::Layout {
+        core::alloc::Layout::new::<[Node; BANK_NODES]>()
+    }
+
+    /// Publish a retained carrier extent allocated outside every MM lock.
+    /// The pin authenticates both the host alias and the EL1 address; these
+    /// domains need not be numerically equal. A concurrent publication makes
+    /// this grant redundant and leaves it unpublished.
+    pub fn provision_metadata<P: PinnedMetadataExtent>(
+        &self,
+        pin: &P,
+        expected_generation: u32,
+    ) -> Result<(), Refusal> {
+        let extent = pin.extent();
+        let capacity = expected_generation
+            .checked_mul(BANK_NODES as u32)
+            .and_then(|n| n.checked_add(NODES as u32))
+            .ok_or(Refusal::Invalid)?;
+        self.install_bank(
+            pin.host_base().as_ptr(),
+            ExtentGrantReceipt {
+                base_va: extent.base(),
+                size: usize::try_from(extent.len()).map_err(|_| Refusal::Invalid)?,
+                token: extent.token(),
+            },
+            extent.base(),
+            capacity,
+        )
+    }
     /// Published immutable bank generation; prepare a new pinned view only
     /// after this changes. The generation is monotonic for this table lifetime.
     pub fn storage_generation(&self) -> u32 {
@@ -174,7 +204,7 @@ impl SharedReservations {
         let (ptr, receipt) = allocator
             .allocate_with_extent(layout)
             .ok_or(Refusal::MetadataRequired)?;
-        let result = self.install_bank(ptr, receipt, expected_capacity);
+        let result = self.install_bank(ptr, receipt, ptr as u64, expected_capacity);
         if result.is_err() {
             allocator.deallocate(ptr, layout);
         }
@@ -185,10 +215,10 @@ impl SharedReservations {
         &self,
         ptr: *mut u8,
         receipt: ExtentGrantReceipt,
+        base: u64,
         expected_capacity: u32,
     ) -> Result<(), Refusal> {
         let bytes = core::mem::size_of::<Node>() * BANK_NODES;
-        let base = ptr as u64;
         if !base.is_multiple_of(core::mem::align_of::<Node>() as u64)
             || base < receipt.base_va
             || base.checked_add(bytes as u64).is_none_or(|end| {
@@ -361,6 +391,7 @@ mod tests {
                     size,
                     token: 91,
                 },
+                ptr as u64,
                 table.storage.capacity(),
             )
             .unwrap();
@@ -387,6 +418,37 @@ mod tests {
         .unwrap();
         model.complete(completion).unwrap();
         request
+    }
+
+    #[test]
+    fn reservation_retained_capacity_uses_guest_identity_and_host_alias() {
+        let table = table();
+        let mm = ReservationMm::new(81).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        table.lock(0, mm).unwrap().finish_import().unwrap();
+        table.allocated.store(NODES as u32, Ordering::Relaxed);
+        let bytes = SharedReservations::metadata_bank_layout().size();
+        let owner = Rc::new(Backing(UnsafeCell::new(vec![0u128; bytes / 16])));
+        // Deliberately unmapped guest identity: dereferencing it on the host
+        // would crash. The resolver alone supplies the authenticated alias.
+        let extent = MetadataExtent::new(0x4000_0000_0000, bytes as u64, 92).unwrap();
+        let resolver = Resolver {
+            extent,
+            owner,
+            calls: Cell::new(0),
+        };
+        let pin = resolver.pin(extent).unwrap();
+        table.provision_metadata(&pin, 0).unwrap();
+        let mut host = ResolvedReservationNodes::default();
+        unsafe { host.refresh(&table, &resolver, NonNull::dangling()) }.unwrap();
+        let mut model = table.lock_resolved(0, mm, &host, &NoRootWait).unwrap();
+        let decision = model
+            .mmap(Placement::Anywhere, 4096, ReservationProtection::READ_WRITE)
+            .unwrap();
+        let request = finish(&mut model, decision);
+        assert!(model.mapping(request.range.start()).is_some());
+        assert_eq!(table.storage_generation(), 1);
+        assert!(model.work < 64);
     }
 
     #[test]

@@ -1259,11 +1259,15 @@ fn el1_epoll_eventfd_pingpong_stays_in_guest() {
             .map_or(0, |(_, n)| *n);
         println!(
             "el1-sched epoll-pingpong iters={iters} exits={} epoll_pwait_forwarded={epoll_forwards} \
-             exit_classes={} el1_reasons={} host_work={} carrier_cpu_ns={} zone={:?} {}",
+             exit_classes={} hvc_not_svc={} el1_reasons={} host_work={} ipc_leaves={:?} forwarded={:?} anonymous_leaves={:?} carrier_cpu_ns={} zone={:?} {}",
             measured.exits,
             exit_breakdown(&measured),
+            hvc_not_svc_breakdown(&measured),
             el1_reason_breakdown(&measured),
             host_work_breakdown(&measured),
+            ipc_leaves_breakdown(&measured),
+            measured.forwarded_syscalls,
+            anonymous_leaves_breakdown(&measured),
             measured.cpu_ns,
             measured.zone,
             stdout.trim()
@@ -2869,12 +2873,12 @@ fn el1_anonymous_permission_transitions_stay_in_guest() {
     for run in &runs {
         assert_eq!(
             run.served_mprotect,
-            4 * run.rounds,
+            4 * run.rounds + 1,
             "EL1 must serve every protection transition: {run:?}"
         );
         assert_eq!(
-            run.forwarded_mprotect, 1,
-            "only the process signal-stack guard may cross the host boundary: {run:?}"
+            run.forwarded_mprotect, 0,
+            "the admitted root serves both transitions and the process signal-stack guard: {run:?}"
         );
         assert!(
             run.faults >= 2 * run.rounds,
@@ -3468,6 +3472,25 @@ fn el1_anonymous_reservations_stay_in_guest() {
 
 /// Per-syscall served/forwarded counters for the delegated-root witnesses.
 const DELEGATED_SYSCALLS: [(&str, usize); 3] = [("mmap", 222), ("munmap", 215), ("mprotect", 226)];
+
+/// More distinct live mappings than the reservation bootstrap can hold.
+#[test]
+fn el1_reservation_metadata_grows_beyond_bootstrap() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["reservation-capacity", "1100"],
+        Duration::from_secs(120),
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        measured
+            .result
+            .stdout_utf8()
+            .contains("reservation-capacity count=1100 ok=true")
+    );
+}
 
 fn delegated_counters() -> [[u64; 2]; 3] {
     read_el1_counters().map_or([[0; 2]; 3], |c| {
