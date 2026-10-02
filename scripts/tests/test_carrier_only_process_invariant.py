@@ -119,6 +119,16 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
             ),
             "forbidden_product_process_creation",
         )
+        self.assertEqual(
+            GATE.classify(
+                finding(
+                    "crates/carrick-xtask/src/command.rs",
+                    "run_checked",
+                    "process_command",
+                )
+            ),
+            "out_of_product_scope",
+        )
 
     def test_every_workspace_library_source_defaults_to_product_scope(self):
         for path in (
@@ -156,6 +166,18 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
                 {},
             ),
             {"carrick-conformance"},
+        )
+        self.assertEqual(
+            GATE.dependency_package_names(
+                {
+                    "xtask_alias": {
+                        "package": "carrick-xtask",
+                        "path": "../carrick-xtask",
+                    }
+                },
+                {},
+            ),
+            {"carrick-xtask"},
         )
 
     def test_test_source_reachability_requires_an_exact_cfg_test_guard(self):
