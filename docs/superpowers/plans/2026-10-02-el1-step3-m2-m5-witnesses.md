@@ -69,3 +69,44 @@ socket close, cyclic graph collection and bounded historical scan work,
 backlog/nonblock/partial stream writes, datagram peek/truncation and SEQPACKET,
 actual container namespace/pathname permission wiring and host-peer imports.
 No Linux-semantics defect was observed in these new fixtures.
+
+## M5 — flips at M5 cutover
+
+`kernel::objects::signal::tests::red_until_step3_m5_shared_pending_clear_does_not_consume_host_queue`:
+exact red `shared pending clear leaves host realtime queue authoritative`.
+Two live task/thread fixtures in separate containers enqueue independent RT
+payloads at 1/8/32/128 queue lengths. Clearing the target shared summary
+leaves every host payload live; the peer remains unchanged. Host consumption
+then returns each payload FIFO and both queues empty.
+
+This intentionally exposes the projection seam. Summary clear is **not** a
+Linux signal-delivery operation. At cutover replace this seam operation with
+consumption through the new shared payload owner, then invert the red gate;
+do not make summary clear silently discard payloads to satisfy the test.
+The scale axis is queued payload count, not a target-population routing
+measurement. Existing standard coalescing, RT FIFO, fork/exec mask/pending/
+action reducers and thread-first provenance remain positive semantics.
+
+`kernel.el1.signal-delivery-owner` complements the existing lease-gap,
+thread-lifecycle and job-control contracts. Still missing executable cutover
+bindings: multi-thread born/exit/reuse routing, permission/sender info,
+CLONE_SIGHAND, exact routing at 1/8/32/128 targets, SIGPENDING accounting,
+SA_RESTART/NODEFER/RESETHAND, interrupted partial pipe/socket I/O,
+ppoll/pselect/sigsuspend/sigtimedwait/signalfd transactions, stop/continue/kill,
+SIGCHLD, nested altstack/siglongjmp/fault/malformed sigreturn/PSTATE,
+ptrace/seccomp and delivery on IRQ/fault EL0 returns.
+
+## Preparation status and evidence limits
+
+These five executable ownership seams and five registered descriptors are
+initial preparation, **not full M2–M5 contract coverage**. The missing bindings
+above must be authored before claiming any milestone is immediately ready
+for cutover. No new executable guest probe was added; all new fixtures are
+VM-free Rust unit tests. Any subsequent executable probe belongs in
+carrick-conformance-next. Two descriptor-owner tables follow M1's reducer
+convention; they do not substitute for scheduled two-process integration.
+No ownership assertion is ignored or should-panic. No budget is relaxed.
+
+Initial fixture checks caught insufficient descriptor backing and a private
+module import; both were corrected. Neither is Linux red evidence. No new
+Linux-semantics bug was reproduced, so no production fix is included.

@@ -316,6 +316,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.epoll-zone",
+        "kernel.el1.poll-select-owner",
         "kernel.signal.job-control-wait-interruption"
       ],
       "claims": [],
@@ -818,7 +819,8 @@
         "kernel.el1.fd-single-owner",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.ipc-fd-authority",
-        "kernel.el1.ipc-lifecycle"
+        "kernel.el1.ipc-lifecycle",
+        "kernel.el1.unix-rights"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -1076,7 +1078,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.poll-select-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1089,7 +1093,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.poll-select-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1895,6 +1901,7 @@
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
+        "kernel.el1.signal-delivery-owner",
         "kernel.el1.thread-lifecycle"
       ],
       "claims": [],
@@ -1938,7 +1945,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.signal-delivery-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2010,7 +2019,8 @@
       "handler": "signal",
       "authority": "guest",
       "contracts": [
-        "kernel.el1.guest-scheduler"
+        "kernel.el1.guest-scheduler",
+        "kernel.el1.signal-delivery-owner"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -2809,7 +2819,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.unix-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2822,7 +2834,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.unix-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2848,7 +2862,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.unix-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2861,7 +2877,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.unix-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2957,7 +2975,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.unix-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2971,7 +2991,9 @@
       "handler": "network",
       "authority": "host",
       "contracts": [
-        "kernel.el1.ipc-fd-authority"
+        "kernel.el1.ipc-fd-authority",
+        "kernel.el1.unix-owner",
+        "kernel.el1.unix-rights"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -2985,7 +3007,10 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.unix-owner",
+        "kernel.el1.unix-rights"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"

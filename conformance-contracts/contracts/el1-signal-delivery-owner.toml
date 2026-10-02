@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.el1.signal-delivery-owner"
+title = "Signal payload queues and delivery have one shared owner"
+guest_surfaces = ["signal:asynchronous-delivery", "syscall:rt_sigreturn", "syscall:rt_sigaction", "syscall:tgkill"]
+semantic_authority = ["man 7 signal", "man 2 sigaction", "man 2 sigreturn"]
+fixture = "VM-free scoped two-owner seam; see M2-M5 witness ledger"
+scale_points = [1, 8, 32, 128]
+rationale = "Two live tasks with separate containers retain independent realtime queues. Clearing shared pending summary leaves host payload authority; this preparation witness does not treat summary clear as a valid delivery transaction. FIFO and lifecycle reducers remain positive semantic requirements. Exact routing population work and EL0 frames remain unresolved."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel::kernel::objects::signal::tests::{red_until_step3_m5_shared_pending_clear_does_not_consume_host_queue,pending_queue_coalesces_standard_and_preserves_realtime_fifo_payloads,thread_signal_lifecycle_transforms_preserve_linux_owners,sighand_retains_full_actions_and_exec_preserves_only_ignore,signal_authority_preserves_thread_first_same_signum_provenance}"
+
+[bindings.unresolved]
+embed_structural = "No EL0 execution in preparation. Cutover requires carrick-conformance-next bindings for the unresolved scenarios listed in the witness ledger."
+docker = "No Docker in preparation; native arm64 differential remains required at cutover."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20
