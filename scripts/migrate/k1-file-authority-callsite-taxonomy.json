@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "counts": {
-    "inspect_misc": 162,
+    "inspect_misc": 165,
     "lifecycle": 40,
     "create_install": 73,
     "slot_description_mutation": 27,
@@ -2886,6 +2886,39 @@
       "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "enqueue_netlink_message",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
+      "line": 252,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let old = sender.write_open_files().remove(&3).unwrap();",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "red_until_step3_m4_rights_create_placeholder_per_message",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
+      "line": 272,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let installed = receiver.write_open_files().remove(&3).unwrap();",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "red_until_step3_m4_rights_create_placeholder_per_message",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
+      "line": 277,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".write_open_files()",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "red_until_step3_m4_rights_create_placeholder_per_message",
       "migration_family": "inspect_misc"
     },
     {

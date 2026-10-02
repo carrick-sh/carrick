@@ -2,7 +2,7 @@
   "schema": 1,
   "scope": "production Rust sources under crates/carrick-runtime/src, crates/carrick-kernel/src and crates/carrick-vfs/src",
   "counts": {
-    "table_guard": 168,
+    "table_guard": 171,
     "description_guard": 200,
     "description_backing": 24,
     "epoll": 509,
@@ -20,7 +20,7 @@
     "lifecycle": 16
   },
   "files": {
-    "table_guard": 26,
+    "table_guard": 27,
     "description_guard": 38,
     "description_backing": 8,
     "epoll": 49,
@@ -12465,6 +12465,33 @@
       "scope_kind": "production_callsite"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
+      "line": 252,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let old = sender.write_open_files().remove(&3).unwrap();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
+      "line": 272,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let installed = receiver.write_open_files().remove(&3).unwrap();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
+      "line": 277,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".write_open_files()",
+      "scope_kind": "test_or_definition"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
       "line": 348,
       "categories": [
@@ -19427,7 +19454,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 1642,
+      "line": 1693,
       "categories": [
         "lifecycle"
       ],
@@ -19436,7 +19463,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 1646,
+      "line": 1697,
       "categories": [
         "lifecycle"
       ],
@@ -19445,7 +19472,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/signal.rs",
-      "line": 1747,
+      "line": 1798,
       "categories": [
         "lifecycle"
       ],
