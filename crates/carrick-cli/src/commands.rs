@@ -1380,6 +1380,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                     serde_json::to_writer(&mut output, observation)?;
                                     writeln!(output)?;
                                 }
+                                use std::os::unix::fs::PermissionsExt;
+                                output
+                                    .as_file()
+                                    .set_permissions(std::fs::Permissions::from_mode(0o644))?;
                                 output.persist(path)?;
                                 let root =
                                     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

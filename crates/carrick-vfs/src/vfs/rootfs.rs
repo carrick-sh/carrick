@@ -207,7 +207,8 @@ impl RootFsVfs {
                 if let Some((fd, identity)) = resolved_parents.get(parent) {
                     let leaf = path_obj
                         .file_name()
-                        .and_then(std::ffi::OsStr::to_str)
+                        .ok_or(LINUX_ENOENT)?
+                        .to_str()
                         .ok_or(LINUX_EINVAL)?;
                     parents.push(crate::vfs::namespace_mutation::AnchoredParent {
                         path: (*path).to_owned(),
@@ -691,9 +692,14 @@ impl RootFsVfs {
         self.with_namespace_batch(&[from, to], false, |permit| {
             let src = permit.parent(from).ok_or(LINUX_ENOENT)?;
             let dst = permit.parent(to).ok_or(LINUX_ENOENT)?;
-            let inode = self
-                .admitted_entry_info(src, from)
-                .and_then(|entry| entry.inode);
+            let entry = self.admitted_entry_info(src, from);
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.kind == RootFsEntryKind::Directory)
+            {
+                return Err(carrick_abi::LINUX_EPERM);
+            }
+            let inode = entry.and_then(|entry| entry.inode);
             match self.overlay.hard_link_at(src, dst) {
                 Ok(()) => {
                     self.dentry_cache.entry_created(to, inode);

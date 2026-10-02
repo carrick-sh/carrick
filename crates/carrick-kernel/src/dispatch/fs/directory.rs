@@ -1085,6 +1085,7 @@ impl<'a> FsView<'a> {
             } else {
                 None
             };
+            let mut source_kind = None;
             let resolved_old = if old.is_empty() {
                 if !this.fd_is_valid(olddirfd as i32) {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -1092,9 +1093,11 @@ impl<'a> FsView<'a> {
                 None
             } else {
                 let resolved = this.resolve_at_path(olddirfd, &old)?;
+                let source_metadata = this.layered_metadata(&resolved).ok();
+                source_kind = source_metadata.as_ref().map(|metadata| metadata.kind);
                 let exists =
                     this.is_synthetic_virtual_path(cx.kernel, &resolved)
-                        || this.layered_metadata(&resolved).is_ok()
+                        || source_metadata.is_some()
                         || this.fs.vfs_mounts.resolve(&resolved).is_some_and(|m| m.vfs.lookup(&m.full_path).is_ok())
                         // An anon fd's magic symlink has no layered metadata; its
                         // existence is the live fd, validated below in the
@@ -1107,6 +1110,7 @@ impl<'a> FsView<'a> {
                 let resolved = if flags & LINUX_AT_SYMLINK_FOLLOW != 0
                     && anon_fd_candidate.is_none()
                 {
+                    source_kind = None;
                     this.canonicalize_following(&resolved)?
                 } else {
                     resolved
@@ -1174,8 +1178,8 @@ impl<'a> FsView<'a> {
             // carrick never offers). Check before the overlay hard_link, which
             // would otherwise surface EROFS (linkat01 case 21 links ".").
             if matches!(
-                this.layered_metadata(&src).map(|md| md.kind),
-                Ok(RootFsEntryKind::Directory)
+                source_kind.or_else(|| this.layered_metadata(&src).ok().map(|md| md.kind)),
+                Some(RootFsEntryKind::Directory)
             ) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
