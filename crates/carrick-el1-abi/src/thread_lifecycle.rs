@@ -48,7 +48,40 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 2;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 3;
+
+/// One retained notification authority for a kernel graph's thread ledger.
+#[repr(C, align(16))]
+#[derive(Debug)]
+pub struct ThreadLedgerActivity {
+    pending: AtomicU64,
+}
+
+impl ThreadLedgerActivity {
+    pub const fn new() -> Self {
+        Self {
+            pending: AtomicU64::new(0),
+        }
+    }
+    pub fn pending(&self) -> u64 {
+        self.pending.load(Ordering::Acquire)
+    }
+    pub fn announce(&self) {
+        self.pending.fetch_add(1, Ordering::Release);
+    }
+    pub fn complete(&self, count: u64) -> Result<(), u64> {
+        self.pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending.checked_sub(count)
+            })
+            .map(|_| ())
+    }
+}
+impl Default for ThreadLedgerActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Pool entries per process: a task holds up to four identities ahead of use.
 pub const THREAD_POOL_ENTRIES: usize = 8;
@@ -501,6 +534,9 @@ pub struct ThreadLifecyclePage {
     entries: [PoolEntry; THREAD_POOL_ENTRIES],
     /// [`LifecycleHatches`] bits, fixed when the page is built.
     serving: AtomicU32,
+    ledger_host: AtomicU64,
+    ledger_guest: AtomicU64,
+    controls: [AtomicU64; THREAD_POOL_ENTRIES],
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
@@ -563,6 +599,9 @@ impl ThreadLifecyclePage {
             pending: PendingSummary::new(),
             entries: [const { PoolEntry::new() }; THREAD_POOL_ENTRIES],
             serving: AtomicU32::new(hatches.bits()),
+            ledger_host: AtomicU64::new(0),
+            ledger_guest: AtomicU64::new(0),
+            controls: [const { AtomicU64::new(0) }; THREAD_POOL_ENTRIES],
         }
     }
 
@@ -579,6 +618,62 @@ impl ThreadLifecyclePage {
 
     pub fn pending(&self) -> &PendingSummary {
         &self.pending
+    }
+
+    /// Bind the immutable host-side notification authority before publication.
+    /// # Safety
+    /// The page owner must retain this exact activity allocation for every
+    /// access to the page, including accesses through carrier mappings.
+    pub unsafe fn bind_host_activity(&self, activity: *const ThreadLedgerActivity) {
+        self.ledger_host
+            .store(activity.addr() as u64, Ordering::Release);
+    }
+    /// Bind a retained EL1-only mapping of the same activity authority.
+    /// # Safety
+    /// `address` must name the retained mapping of the host-bound activity
+    /// and remain accessible in EL1 while any record names this page.
+    pub unsafe fn bind_guest_activity(&self, address: u64) {
+        self.ledger_guest.store(address, Ordering::Release);
+    }
+    pub fn guest_activity_address(&self) -> u64 {
+        self.ledger_guest.load(Ordering::Acquire)
+    }
+    fn activity(&self) -> Option<&ThreadLedgerActivity> {
+        #[cfg(target_os = "none")]
+        let address = self.ledger_guest.load(Ordering::Acquire);
+        #[cfg(not(target_os = "none"))]
+        let address = self.ledger_host.load(Ordering::Acquire);
+        if address == 0 {
+            return None;
+        }
+        // SAFETY: the immutable owner binding pins this exact allocation;
+        // each execution lane uses its own address domain.
+        Some(unsafe { &*(address as *const ThreadLedgerActivity) })
+    }
+
+    /// Publish a control binding while owning its Reserved -> Stocking CAS.
+    pub fn bind_control_address(
+        &self,
+        entry: EntryRef,
+        address: u64,
+    ) -> Result<(), TransitionError> {
+        self.transition(
+            entry,
+            &[EntryState::Reserved],
+            EntryState::Stocking,
+            Ordering::AcqRel,
+        )?;
+        self.controls[entry.index()].store(address, Ordering::Relaxed);
+        self.transition(
+            entry,
+            &[EntryState::Stocking],
+            EntryState::Reserved,
+            Ordering::Release,
+        )
+    }
+    pub fn control_address(&self, entry: EntryRef) -> Option<u64> {
+        self.identity(entry)?;
+        Some(self.controls[entry.index()].load(Ordering::Acquire))
     }
 
     // ---- gate ----
@@ -718,6 +813,7 @@ impl ThreadLifecyclePage {
             )
             .map_err(|now| TransitionError::WrongState(unpack(now).1))?;
         e.tid.store(identity.tid, Ordering::Relaxed);
+        self.controls[index].store(0, Ordering::Relaxed);
         e.visible_tid.store(identity.visible_tid, Ordering::Relaxed);
         e.thread_serial
             .store(identity.thread_serial, Ordering::Relaxed);
@@ -812,12 +908,22 @@ impl ThreadLifecyclePage {
         e.clear_child_tid
             .store(record.clear_child_tid, Ordering::Relaxed);
         e.blocked.store(record.blocked.0, Ordering::Relaxed);
-        self.transition(
+        let activity = self.activity();
+        if let Some(activity) = activity {
+            activity.announce();
+        }
+        let result = self.transition(
             r,
             &[EntryState::Claimed],
             EntryState::Born,
             Ordering::Release,
-        )?;
+        );
+        if result.is_err()
+            && let Some(activity) = activity
+        {
+            let _ = activity.complete(1);
+        }
+        result?;
         Ok(r)
     }
 
@@ -833,12 +939,22 @@ impl ThreadLifecyclePage {
 
     /// The thread exited in the zone: `Born | Published -> ExitedInZone`.
     pub fn exit_in_zone(&self, r: EntryRef) -> Result<(), TransitionError> {
-        self.transition(
+        let activity = self.activity();
+        if let Some(activity) = activity {
+            activity.announce();
+        }
+        let result = self.transition(
             r,
             &[EntryState::Born, EntryState::Published],
             EntryState::ExitedInZone,
             Ordering::AcqRel,
-        )
+        );
+        if result.is_err()
+            && let Some(activity) = activity
+        {
+            let _ = activity.complete(1);
+        }
+        result
     }
 
     /// Host settle folded the exit: `ExitedInZone -> Reaped`.
@@ -900,8 +1016,12 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 16] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 20] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
+    core::mem::size_of::<ThreadLedgerActivity>() as u64,
+    core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
+    core::mem::offset_of!(ThreadLifecyclePage, ledger_guest) as u64,
+    core::mem::offset_of!(ThreadLifecyclePage, controls) as u64,
     THREAD_POOL_ENTRIES as u64,
     core::mem::size_of::<ThreadLifecyclePage>() as u64,
     core::mem::align_of::<ThreadLifecyclePage>() as u64,

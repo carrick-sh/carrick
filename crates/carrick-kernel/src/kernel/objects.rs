@@ -26,7 +26,7 @@ pub mod signal;
 pub mod task;
 pub mod thread;
 mod thread_control;
-pub use thread_control::{ThreadControlLease, ThreadLifecycleLease};
+pub use thread_control::{ThreadControlLease, ThreadLedgerActivityLease, ThreadLifecycleLease};
 
 pub use self::credentials::Credentials;
 
