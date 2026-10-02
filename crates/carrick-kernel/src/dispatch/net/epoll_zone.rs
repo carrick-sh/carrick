@@ -356,6 +356,71 @@ mod tests {
     use super::hatch_allows;
 
     #[test]
+    fn red_until_step3_m3_zone_pipe_waits_create_host_proxies() {
+        use crate::dispatch::fd_table::{
+            OpenDescription, OpenDescriptionBase, kernel_file_description,
+        };
+        use crate::dispatch::fs::pipe::PipeInner;
+        use crate::kernel::ids::ObjectIdRegistry;
+        use crate::kernel::{FileSlotNumber, FileTable};
+        use std::sync::Arc;
+        for members in [1, 8, 64] {
+            let ids = ObjectIdRegistry::new();
+            let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+            let parent = FileTable::new(ids.file_table_id().unwrap());
+            let peer = FileTable::new(ids.file_table_id().unwrap());
+            let mut proxies = 0;
+            for index in 0..members {
+                let pipe =
+                    Arc::new(PipeInner::create(Arc::clone(&owner), index as u64, 4096).unwrap());
+                for (table, description, flags) in [
+                    (
+                        &parent,
+                        OpenDescription::PipeReader {
+                            base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDONLY),
+                            pipe: Arc::clone(&pipe),
+                        },
+                        carrick_abi::LINUX_O_RDONLY,
+                    ),
+                    (
+                        &peer,
+                        OpenDescription::PipeWriter {
+                            base: OpenDescriptionBase::new(carrick_abi::LINUX_O_WRONLY),
+                            pipe: Arc::clone(&pipe),
+                        },
+                        carrick_abi::LINUX_O_WRONLY,
+                    ),
+                ] {
+                    let description = kernel_file_description(
+                        Arc::new(parking_lot::RwLock::new(description)),
+                        flags,
+                    );
+                    description.retain_fd_ref();
+                    table.install(
+                        FileSlotNumber::for_open_fd(index + 3).unwrap(),
+                        description,
+                        false,
+                    );
+                }
+                assert!(pipe.initialized_read_poll_fd().is_none());
+                let proxy = pipe.read_poll_fd();
+                proxies += usize::from(proxy.is_some());
+                assert!(pipe.initialized_read_poll_fd().is_some());
+            }
+            assert_eq!(proxies, members as usize);
+            let result = if proxies == 0 {
+                Ok(())
+            } else {
+                Err("all-zone pipe wait enrollment creates host readiness proxies")
+            };
+            assert_eq!(
+                result.expect_err("flips at M3 cutover"),
+                "all-zone pipe wait enrollment creates host readiness proxies"
+            );
+        }
+    }
+
+    #[test]
     fn epoll_hatch_is_on_unless_exactly_zero() {
         assert!(hatch_allows(None));
         assert!(hatch_allows(Some("1")));
