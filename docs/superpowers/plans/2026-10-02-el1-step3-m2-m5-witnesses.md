@@ -148,3 +148,35 @@ dea04f5175d27233bcc4b0cec9b625681495ccb02a0b524173f5f5f01d96e649  crates/carrick
 d24c1ee0735def7a60c2352751854a1678151f5414903cad0ab26edf95254d24  crates/carrick-kernel/src/dispatch/net/unix_pure.rs
 a401dc5beb024894ad54fe0a3c51e65381356c62d03bcfefeaca49f0d988f287  crates/carrick-kernel/src/kernel/objects/signal.rs
 ```
+
+## Follow-up binding preparation, 2026-10-02
+
+Rebased onto main before continuation (already up to date at `948f43f4b`).
+The original receipt above remains historical; the following entries extend it.
+
+### M3 mixed mask — flips at M3 cutover
+
+`kernel::continuation::tests::controller_mixed_ppoll_netlink_real_service_wake`
+uses actual dispatcher ppoll on eventfd plus synthetic netlink, actual carrier
+service enrollment and netlink reply production. Two fork-related live tasks
+have different persistent masks. The waiter installs a replacement mask;
+ready completion restores its original mask and clears armed restoration,
+without touching the peer. This is a positive semantic binding, not an
+external-socket/pipe or all-EL1 owner proof.
+
+`red_until_step3_m3_cancel_leaves_temporary_wait_mask_installed` observes exact
+failure `cancelled wait retains temporary mask and armed restore` after
+`CancellationCause::ServiceShutdown`. The cleanup probe settles once but the
+surviving task stays unblocked and retains its armed persistent restore mask;
+the fork peer's mask is unchanged. No production correction is included.
+Exact reproduction: construct `WaitOnFds` Poll with `Replace(EMPTY)`, persistent
+SIGUSR1 blocked, call `install_temporary_signal_mask`, then `cancel` while
+keeping the context live. This is a cancellation API defect, not proof that
+an ordinary Linux syscall currently returns with the wrong mask.
+
+Remaining M3 cutover bindings: real external socket plus pipe simultaneous
+readiness, stale host completion incarnation and fd reuse, copyout fault,
+zero/finite/infinite deadlines, atomic enrollment signal-arrival race, and
+ready/timeout/EINTR/cancel restoration through ppoll/pselect/epoll_pwait.
+Inherited continuation signal/timeout reducers remain registered elsewhere;
+this new ready path does not claim their entire mixed-set composition.

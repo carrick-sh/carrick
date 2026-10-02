@@ -5295,6 +5295,28 @@ fn controller_mixed_ppoll_netlink_real_service_wake() {
     let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
     let context = dispatcher.capture_one_task_context().unwrap();
     let kernel = Arc::clone(context.kernel());
+    let published = kernel
+        .reserve_fork(
+            &context,
+            ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+            "mixed-mask peer".to_owned(),
+            None,
+        )
+        .unwrap()
+        .prepare_reference(ThreadId::synthetic_for_tests(153_980))
+        .unwrap()
+        .commit()
+        .unwrap();
+    let (peer, wait) = published.into_parts().unwrap();
+    assert!(wait.is_none());
+    let context = context
+        .task_binding()
+        .capture(context.thread().key().tid)
+        .unwrap();
+    let persistent = SigSet::EMPTY.with(10);
+    let peer_mask = SigSet::EMPTY.with(12);
+    context.signal_authority().set_blocked(persistent);
+    peer.signal_authority().set_blocked(peer_mask);
     let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 4096]);
     let reporter = crate::compat::CompatReporter::default();
     fn returned(outcome: DispatchOutcome) -> i64 {
@@ -5329,7 +5351,8 @@ fn controller_mixed_ppoll_netlink_real_service_wake() {
     pollfds[8..12].copy_from_slice(&(nlfd as i32).to_le_bytes());
     pollfds[12..14].copy_from_slice(&1i16.to_le_bytes());
     memory.write_bytes(0x4000, &pollfds).unwrap();
-    let req = SyscallRequest::new(73, SyscallArgs([0x4000, 2, 0, 0, 0, 0]));
+    memory.write_bytes(0x4200, &0u64.to_le_bytes()).unwrap();
+    let req = SyscallRequest::new(73, SyscallArgs([0x4000, 2, 0, 0x4200, 8, 0]));
     let outcome = dispatcher
         .dispatch(&context, req, &mut memory, &reporter)
         .unwrap();
@@ -5341,6 +5364,9 @@ fn controller_mixed_ppoll_netlink_real_service_wake() {
     let mut continuation =
         BlockedContinuation::from_dispatch_outcome(outcome, capture(&context, generation))
             .expect("actual mixed ppoll continuation");
+    continuation.install_temporary_signal_mask(&context);
+    assert_eq!(context.signal_authority().blocked(), SigSet::EMPTY);
+    assert_eq!(peer.signal_authority().blocked(), peer_mask);
     let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
     let mut registration = service.prepare_registration(&continuation);
     service
@@ -5412,6 +5438,69 @@ fn controller_mixed_ppoll_netlink_real_service_wake() {
         wait.complete(&mut memory, &dispatcher),
         crate::dispatch::fd_wait::BlockingFdWaitStep::Done(DispatchOutcome::Returned { value: 1 })
     ));
+    assert_eq!(context.signal_authority().blocked(), persistent);
+    assert_eq!(context.signal_authority().armed_restore_mask(), None);
+    assert_eq!(peer.signal_authority().blocked(), peer_mask);
+}
+
+#[test]
+fn red_until_step3_m3_cancel_leaves_temporary_wait_mask_installed() {
+    let (kernel, context) = bootstrap(153_981);
+    let published = kernel
+        .reserve_fork(
+            &context,
+            ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+            "cancel-mask peer".to_owned(),
+            None,
+        )
+        .unwrap()
+        .prepare_reference(ThreadId::synthetic_for_tests(153_982))
+        .unwrap()
+        .commit()
+        .unwrap();
+    let (peer, wait) = published.into_parts().unwrap();
+    assert!(wait.is_none());
+    let context = context
+        .task_binding()
+        .capture(context.thread().key().tid)
+        .unwrap();
+    let persistent = SigSet::EMPTY.with(10);
+    context.signal_authority().set_blocked(persistent);
+    peer.signal_authority().set_blocked(SigSet::EMPTY.with(12));
+    let generation = publish(&context, 0x983);
+    let probe = Arc::new(AtomicUsize::new(0));
+    let mut continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::empty(),
+            timeout: None,
+            sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
+            completion: FdWaitCompletion::Poll { on_timeout: 0 },
+        },
+        capture(&context, generation),
+    )
+    .unwrap();
+    continuation.install_cleanup_probe(Arc::clone(&probe));
+    continuation.install_temporary_signal_mask(&context);
+    let receipt = continuation.cancel(CancellationCause::ServiceShutdown);
+    assert_eq!(receipt.cleanup_count(), 1);
+    assert_eq!(probe.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.signal_authority().blocked(), SigSet::EMPTY.with(12));
+    let result = if context.signal_authority().blocked() == persistent
+        && context.signal_authority().armed_restore_mask().is_none()
+    {
+        Ok(())
+    } else {
+        Err("cancelled wait retains temporary mask and armed restore")
+    };
+    assert_eq!(
+        result.expect_err("flips at M3 cutover"),
+        "cancelled wait retains temporary mask and armed restore"
+    );
+    assert_eq!(context.signal_authority().blocked(), SigSet::EMPTY);
+    assert_eq!(
+        context.signal_authority().armed_restore_mask(),
+        Some(persistent)
+    );
 }
 
 #[test]
