@@ -130,7 +130,7 @@ impl ThreadIdentityPool {
             let candidate = &entries[index];
             if matches!(
                 candidate.state(),
-                EntryState::Born | EntryState::ExitedInZone
+                EntryState::Born | EntryState::ExitingBorn | EntryState::ExitedInZone
             ) {
                 let born = candidate
                     .page()
@@ -180,6 +180,7 @@ impl ThreadIdentityPool {
                     EntryState::Reserved
                         | EntryState::Claimed
                         | EntryState::Born
+                        | EntryState::ExitingBorn
                         | EntryState::ExitedInZone
                 ) && uid.is_none_or(|uid| entry.credit == uid)
             })
@@ -1053,7 +1054,7 @@ mod tests {
         let tid = LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
         let held = kernel.context(root.task().key().id, tid).unwrap();
         page.try_exit().unwrap();
-        page.exit_in_zone(entry).unwrap();
+        page.begin_exit(entry).unwrap().commit().unwrap();
         assert_eq!(
             peer.kernel().live_task_for_thread(None, tid),
             None,

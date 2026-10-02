@@ -17,7 +17,9 @@
 //! ```text
 //! Vacant/Reaped/Revoked --stock--> Reserved --claim--> Claimed --record_born--> Born
 //! Reserved --revoke--> Revoked          Born --publish--> Published
-//! Born|Published --exit_in_zone--> ExitedInZone --reap--> Reaped
+//! Born|Published --begin_exit--> ExitingBorn|ExitingPublished
+//! ExitingBorn|ExitingPublished --commit--> ExitedInZone --reap--> Reaped
+//! ExitingBorn --publish--> ExitingPublished (drop rolls back either exit state)
 //! ```
 //!
 //! Every transition is a compare-and-swap of the whole state word, which
@@ -48,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 3;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 4;
 
 /// One retained notification authority for a kernel graph's thread ledger.
 #[repr(C, align(16))]
@@ -111,6 +113,10 @@ pub enum EntryState {
     Reaped = 7,
     /// Withdrawn before use.
     Revoked = 8,
+    /// Exit owns admission; a host must drain it before conflicting work.
+    ExitingBorn = 9,
+    /// The host published a birth whose exit still owns admission.
+    ExitingPublished = 10,
 }
 
 impl EntryState {
@@ -124,6 +130,8 @@ impl EntryState {
             6 => Self::ExitedInZone,
             7 => Self::Reaped,
             8 => Self::Revoked,
+            9 => Self::ExitingBorn,
+            10 => Self::ExitingPublished,
             _ => Self::Vacant,
         }
     }
@@ -189,6 +197,66 @@ pub struct ClaimedEntry(EntryRef);
 impl ClaimedEntry {
     pub const fn entry(&self) -> EntryRef {
         self.0
+    }
+}
+
+/// Non-cloneable ownership of the bounded EL1 exit window. Dropping an
+/// unfinished exit restores membership, including a concurrent publication.
+pub struct ExitAdmission<'a> {
+    page: &'a ThreadLifecyclePage,
+    entry: EntryRef,
+    committed: bool,
+}
+
+impl ExitAdmission<'_> {
+    pub fn commit(mut self) -> Result<(), TransitionError> {
+        let activity = self.page.activity();
+        if let Some(activity) = activity {
+            activity.announce();
+        }
+        let result = self.page.transition(
+            self.entry,
+            &[EntryState::ExitingBorn, EntryState::ExitingPublished],
+            EntryState::ExitedInZone,
+            Ordering::SeqCst,
+        );
+        if result.is_err()
+            && let Some(activity) = activity
+        {
+            let _ = activity.complete(1);
+        }
+        self.committed = result.is_ok();
+        result
+    }
+}
+
+impl Drop for ExitAdmission<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Publication can race this rollback, so retry only that exact CAS
+        // conflict; no guest wait or authority acquisition occurs here.
+        loop {
+            let Some((generation, state)) = self.page.state(self.entry.index()) else {
+                return;
+            };
+            if generation != self.entry.generation() {
+                return;
+            }
+            let restored = match state {
+                EntryState::ExitingBorn => EntryState::Born,
+                EntryState::ExitingPublished => EntryState::Published,
+                _ => return,
+            };
+            if self
+                .page
+                .transition(self.entry, &[state], restored, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 }
 
@@ -709,12 +777,17 @@ impl ThreadLifecyclePage {
     pub fn close(&self) {
         self.gate.store(GateState::Closed as u32, Ordering::SeqCst);
     }
-    /// Entries currently `Claimed`: what a forker waits to drain after
-    /// `close_for_fork`. `SeqCst` scan (second half of the claim/gate pair).
+    /// Clone and exit admissions a host must drain after `close_for_fork`.
+    /// `SeqCst` scan (second half of both claim/gate pairs).
     pub fn claimed_count(&self) -> usize {
         self.entries
             .iter()
-            .filter(|e| unpack(e.state.load(Ordering::SeqCst)).1 == EntryState::Claimed)
+            .filter(|e| {
+                matches!(
+                    unpack(e.state.load(Ordering::SeqCst)).1,
+                    EntryState::Claimed | EntryState::ExitingBorn | EntryState::ExitingPublished
+                )
+            })
             .count()
     }
 
@@ -929,32 +1002,52 @@ impl ThreadLifecyclePage {
 
     /// Host settle: `Born -> Published`.
     pub fn publish(&self, r: EntryRef) -> Result<(), TransitionError> {
-        self.transition(
-            r,
-            &[EntryState::Born],
-            EntryState::Published,
-            Ordering::AcqRel,
-        )
+        loop {
+            let (generation, state) = self.state(r.index()).ok_or(TransitionError::NoSuchEntry)?;
+            if generation != r.generation() {
+                return Err(TransitionError::StaleGeneration);
+            }
+            let target = match state {
+                EntryState::Born => EntryState::Published,
+                EntryState::ExitingBorn => EntryState::ExitingPublished,
+                _ => return Err(TransitionError::WrongState(state)),
+            };
+            match self.transition(r, &[state], target, Ordering::AcqRel) {
+                Err(TransitionError::WrongState(_)) => continue,
+                result => return result,
+            }
+        }
     }
 
-    /// The thread exited in the zone: `Born | Published -> ExitedInZone`.
-    pub fn exit_in_zone(&self, r: EntryRef) -> Result<(), TransitionError> {
-        let activity = self.activity();
-        if let Some(activity) = activity {
-            activity.announce();
+    /// Claim exit admission before reading the gate (the Dekker peer of
+    /// close and drain). A close either refuses us or observes our window.
+    pub fn begin_exit(&self, r: EntryRef) -> Result<ExitAdmission<'_>, TransitionError> {
+        loop {
+            let (generation, state) = self.state(r.index()).ok_or(TransitionError::NoSuchEntry)?;
+            if generation != r.generation() {
+                return Err(TransitionError::StaleGeneration);
+            }
+            let target = match state {
+                EntryState::Born => EntryState::ExitingBorn,
+                EntryState::Published => EntryState::ExitingPublished,
+                _ => return Err(TransitionError::WrongState(state)),
+            };
+            match self.transition(r, &[state], target, Ordering::SeqCst) {
+                Err(TransitionError::WrongState(_)) => continue,
+                Err(error) => return Err(error),
+                Ok(()) => break,
+            }
         }
-        let result = self.transition(
-            r,
-            &[EntryState::Born, EntryState::Published],
-            EntryState::ExitedInZone,
-            Ordering::AcqRel,
-        );
-        if result.is_err()
-            && let Some(activity) = activity
-        {
-            let _ = activity.complete(1);
+        let admission = ExitAdmission {
+            page: self,
+            entry: r,
+            committed: false,
+        };
+        let gate = self.gate();
+        if gate != GateState::Open {
+            return Err(TransitionError::GateClosed(gate));
         }
-        result
+        Ok(admission)
     }
 
     /// Host settle folded the exit: `ExitedInZone -> Reaped`.
@@ -993,6 +1086,8 @@ impl ThreadLifecyclePage {
             || !matches!(
                 state,
                 EntryState::Born
+                    | EntryState::ExitingBorn
+                    | EntryState::ExitingPublished
                     | EntryState::Published
                     | EntryState::ExitedInZone
                     | EntryState::Reaped
@@ -1103,7 +1198,7 @@ mod tests {
         assert_eq!(st(&p, 0), EntryState::Born);
         assert_eq!(p.born_record(r), Some(born(0xff)));
         p.publish(r).unwrap();
-        p.exit_in_zone(r).unwrap();
+        p.begin_exit(r).and_then(ExitAdmission::commit).unwrap();
         p.reap(r).unwrap();
         assert_eq!(st(&p, 0), EntryState::Reaped);
         // Restock bumps the generation; the old reference is dead.
@@ -1118,8 +1213,47 @@ mod tests {
         let p = ThreadLifecyclePage::new();
         let r = p.stock(1, ident(1)).unwrap();
         let r = p.record_born(p.claim(r).unwrap(), born(0)).unwrap();
-        p.exit_in_zone(r).unwrap();
+        p.begin_exit(r).and_then(ExitAdmission::commit).unwrap();
         p.reap(r).unwrap();
+    }
+
+    #[test]
+    fn closed_admission_refuses_exit_without_closing_a_peer() {
+        let p = ThreadLifecyclePage::new();
+        let peer = ThreadLifecyclePage::new();
+        let r = p.stock(0, ident(1)).unwrap();
+        let r = p.record_born(p.claim(r).unwrap(), born(0)).unwrap();
+        p.close_for_fork().unwrap();
+        assert_eq!(
+            p.begin_exit(r).and_then(ExitAdmission::commit),
+            Err(TransitionError::GateClosed(GateState::ForkClosing)),
+            "closed admission let an exit cross conflicting host authority"
+        );
+        assert_eq!(st(&p, 0), EntryState::Born);
+        assert_eq!(peer.gate(), GateState::Open);
+    }
+
+    #[test]
+    fn exit_admission_drains_and_rolls_back_across_birth_publication() {
+        let p = ThreadLifecyclePage::new();
+        let peer = ThreadLifecyclePage::new();
+        let r = p.stock(0, ident(1)).unwrap();
+        let r = p.record_born(p.claim(r).unwrap(), born(0)).unwrap();
+        let admission = p.begin_exit(r).unwrap();
+        p.close_for_fork().unwrap();
+        assert_eq!(p.claimed_count(), 1, "fork did not see the exit window");
+        assert_eq!(peer.claimed_count(), 0);
+        p.publish(r).unwrap();
+        drop(admission);
+        assert_eq!(p.claimed_count(), 0);
+        assert_eq!(st(&p, 0), EntryState::Published);
+        p.reopen_after_fork().unwrap();
+        let admission = p.begin_exit(r).unwrap();
+        p.close_for_fork().unwrap();
+        admission.commit().unwrap();
+        assert_eq!(p.claimed_count(), 0);
+        assert_eq!(st(&p, 0), EntryState::ExitedInZone);
+        assert_eq!(peer.gate(), GateState::Open);
     }
 
     #[test]
@@ -1132,7 +1266,7 @@ mod tests {
             Err(TransitionError::WrongState(EntryState::Reserved))
         );
         assert_eq!(
-            p.exit_in_zone(r),
+            p.begin_exit(r).and_then(ExitAdmission::commit),
             Err(TransitionError::WrongState(EntryState::Reserved))
         );
         assert_eq!(
@@ -1180,9 +1314,9 @@ mod tests {
             p.reap(r),
             Err(TransitionError::WrongState(EntryState::Published))
         );
-        p.exit_in_zone(r).unwrap();
+        p.begin_exit(r).and_then(ExitAdmission::commit).unwrap();
         assert_eq!(
-            p.exit_in_zone(r),
+            p.begin_exit(r).and_then(ExitAdmission::commit),
             Err(TransitionError::WrongState(EntryState::ExitedInZone))
         );
         assert_eq!(
