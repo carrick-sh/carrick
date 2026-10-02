@@ -1324,7 +1324,8 @@ mod tests {
                     | LinuxCloneFlags::VM
                     | LinuxCloneFlags::FS
                     | LinuxCloneFlags::FILES
-                    | LinuxCloneFlags::DETACHED)
+                    | LinuxCloneFlags::DETACHED
+                    | LinuxCloneFlags::SYSVSEM)
                     .bits(),
                 clear_child_tid: 0x8000,
                 blocked: carrick_el1_abi::BlockedMask(0x400),
