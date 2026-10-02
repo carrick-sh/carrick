@@ -477,7 +477,7 @@ impl Kernel {
         let transaction = reservation.transaction;
         let leader_tid = LinuxTid::for_task_leader(prepared.task.id);
         let (task, revision) = {
-            let mut state = self.registry().settled().write();
+            let state = self.registry().settled().write();
             if state.reservations.get(&prepared.task.id) != Some(&transaction) {
                 return Err(ExecError::ReservationLost);
             }
@@ -663,7 +663,7 @@ impl Kernel {
     pub fn sweep_retired_threads_for_process(&self, process: Option<TaskId>) -> usize {
         {
             let state = self.registry().settled().read();
-            let has_drainable = state.retired_threads.iter().any(|retired| {
+            let has_drainable = state.retired_threads.records().iter().any(|retired| {
                 process.is_none_or(|pid| retired._task.id == pid)
                     && retired.thread.strong_count() == 0
             });
@@ -671,7 +671,7 @@ impl Kernel {
                 return 0;
             }
         }
-        let mut state = self.registry().settled().write();
+        let state = self.registry().settled().write();
         let before = state.retired_threads.len();
         state.retired_threads.retain(|retired| {
             if process.is_none_or(|pid| retired._task.id == pid) {

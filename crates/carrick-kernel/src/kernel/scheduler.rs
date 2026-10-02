@@ -3949,7 +3949,7 @@ impl Scheduler {
         // a task id can be reallocated, so `contains_key` alone would call a
         // successor's liveness this thread's own.
         if target.is_none() {
-            for retired in &state.retired_threads {
+            for retired in state.retired_threads.records().iter() {
                 if retired._key == thread {
                     target = Some(retired._task);
                     let owned = state

@@ -1409,7 +1409,7 @@ impl Kernel {
                     process_group_id,
                 )]),
                 reservations: BTreeMap::new(),
-                retired_threads: Vec::new(),
+                retired_threads: Default::default(),
                 sessions: BTreeMap::from([(
                     session_id,
                     SessionRecord {
@@ -2270,7 +2270,7 @@ impl Kernel {
                 }
             }
         }
-        for retired in &state.retired_threads {
+        for retired in state.retired_threads.records().iter() {
             if !self.ids.is_reserved_number(retired._claim.raw()) {
                 return Err(RegistryInvariantError::ThreadClaims);
             }
@@ -2708,7 +2708,7 @@ pub(super) struct RegistryState {
     pub(super) process_groups: BTreeMap<ProcessGroupId, ProcessGroupRecord>,
     pub(super) process_group_by_namespace: BTreeMap<(ContainerId, u32), ProcessGroupId>,
     pub(super) reservations: BTreeMap<TaskId, carrick_hal::KernelTransactionId>,
-    pub(super) retired_threads: Vec<RetiredThreadRecord>,
+    pub(super) retired_threads: super::thread_retirement::RetiredThreads,
     pub(super) sessions: BTreeMap<SessionId, SessionRecord>,
     pub(super) session_by_namespace: BTreeMap<(ContainerId, u32), SessionId>,
 }

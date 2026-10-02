@@ -99,6 +99,7 @@ struct PooledThreadIdentity {
     credit: NsUid,
     identity: ThreadIdentity,
     birth_resources: super::objects::ReservedThreadResources,
+    retirement: super::thread_retirement::RetirementReservation,
 }
 
 impl PooledThreadIdentity {
@@ -119,7 +120,13 @@ impl PooledThreadIdentity {
 #[derive(Debug, Default)]
 pub(crate) struct ThreadIdentityPool {
     entries: Mutex<VecDeque<PooledThreadIdentity>>,
-    published: Mutex<Vec<(EntryRef, super::objects::ThreadControlLease)>>,
+    published: Mutex<
+        Vec<(
+            EntryRef,
+            super::objects::ThreadControlLease,
+            super::thread_retirement::RetirementReservation,
+        )>,
+    >,
 }
 
 impl ThreadIdentityPool {
@@ -202,6 +209,7 @@ impl ThreadIdentityPool {
     fn push(
         &self,
         kernel: &Kernel,
+        state: &RegistryState,
         task: &TaskRef,
         credit: NsUid,
         identity: ThreadIdentity,
@@ -209,6 +217,9 @@ impl ThreadIdentityPool {
         let Ok(birth_resources) =
             super::objects::ReservedThreadResources::reserve(kernel.object_ids())
         else {
+            return false;
+        };
+        let Ok(retirement) = state.retired_threads.reserve() else {
             return false;
         };
         let control = task.allocate_thread_control(identity.key);
@@ -238,6 +249,7 @@ impl ThreadIdentityPool {
             credit,
             identity,
             birth_resources,
+            retirement,
         });
         true
     }
@@ -479,7 +491,7 @@ impl ThreadLedger {
                             .thread_pool
                             .published
                             .lock()
-                            .push((entry, control));
+                            .push((entry, control, pooled.retirement));
                         published.push(publication);
                         abi_count += 1;
                         progress = true;
@@ -491,23 +503,29 @@ impl ThreadLedger {
                         );
                     }
                 }
-                let exits: Vec<_> = state
+                let pool = &state
                     .tasks
                     .get(&task_id)
                     .unwrap_or_else(|| {
                         carrick_fatal::carrick_fatal!("thread::ledger", "exit task disappeared")
                     })
-                    .thread_pool
-                    .published
-                    .lock()
-                    .iter()
-                    .filter(|(entry, control)| {
-                        control.lifecycle().state(entry.index())
+                    .thread_pool;
+                let mut exits = Vec::new();
+                {
+                    let mut owned = pool.published.lock();
+                    let mut index = 0;
+                    while index < owned.len() {
+                        let (entry, control, _) = &owned[index];
+                        if control.lifecycle().state(entry.index())
                             == Some((entry.generation(), EntryState::ExitedInZone))
-                    })
-                    .cloned()
-                    .collect();
-                for (entry, control) in exits {
+                        {
+                            exits.push(owned.swap_remove(index));
+                        } else {
+                            index += 1;
+                        }
+                    }
+                }
+                for (entry, control, retirement) in exits {
                     let record = state.tasks.get(&task_id).unwrap_or_else(|| {
                         carrick_fatal::carrick_fatal!("thread::ledger", "exit lost task")
                     });
@@ -533,7 +551,7 @@ impl ThreadLedger {
                         .retire_thread_in_registry(
                             &context,
                             &mut state,
-                            super::operations::exit::ThreadRetirementLane::ExitedInZone,
+                            super::operations::exit::ThreadRetirementLane::ExitedInZone(retirement),
                             None,
                         )
                         .unwrap_or_else(|error| {
@@ -548,16 +566,6 @@ impl ThreadLedger {
                             "EL1 exit reaping failed: error={error:?}"
                         )
                     });
-                    state
-                        .tasks
-                        .get(&task_id)
-                        .unwrap_or_else(|| {
-                            carrick_fatal::carrick_fatal!("thread::ledger", "reaped exit lost task")
-                        })
-                        .thread_pool
-                        .published
-                        .lock()
-                        .retain(|(owned, _)| *owned != entry);
                     exited.push(context);
                     abi_count += 1;
                 }
@@ -646,7 +654,10 @@ impl ThreadLedger {
             let Ok(identity) = ThreadIdentity::reserve(kernel, &record.task) else {
                 return;
             };
-            if !record.thread_pool.push(kernel, &record.task, uid, identity) {
+            if !record
+                .thread_pool
+                .push(kernel, state, &record.task, uid, identity)
+            {
                 return;
             }
         }
@@ -860,6 +871,33 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_resource_failure_leaves_no_claimable_birth_or_identity() {
+        let (kernel, root) = bootstrap(9_694);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_695),
+                "resource-peer".into(),
+                None,
+            )
+            .unwrap();
+        let before = kernel.ids().counts();
+        let identity = super::ThreadIdentity::reserve(&kernel, root.task()).unwrap();
+        kernel.object_ids().exhaust_for_test();
+        let state = kernel.registry().settled().read();
+        let pool = &state.tasks.get(&root.task().key().id).unwrap().thread_pool;
+        assert!(!pool.push(&kernel, &state, root.task(), NsUid::ROOT, identity));
+        assert_eq!(
+            root.thread().control_lease().lifecycle().claim_any(),
+            Err(carrick_el1_abi::TransitionError::PoolEmpty)
+        );
+        assert_eq!(kernel.ids().counts(), before);
+        assert!(peer.exact_thread_is_live());
+        assert_eq!(peer.thread().control_lease().lifecycle().live(), 1);
+    }
+
+    #[test]
     fn lifecycle_host_membership_updates_only_its_process_live_count() {
         let (kernel, root) = bootstrap(9_690);
         let peer = kernel
@@ -1037,6 +1075,14 @@ mod tests {
                 None,
             )
             .unwrap();
+        let peer_sibling = kernel
+            .clone_thread(
+                &peer,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_683),
+                None,
+            )
+            .unwrap();
         let sibling = kernel
             .clone_thread(
                 &root,
@@ -1087,6 +1133,15 @@ mod tests {
         .unwrap();
         let tid = LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
         let held = kernel.context(root.task().key().id, tid).unwrap();
+        // A host retirement in another live process cannot consume the
+        // child's pre-issued retirement cell.
+        kernel.exit_thread(&peer_sibling, None).unwrap();
+        let retirement_capacity = kernel
+            .registry()
+            .settled()
+            .read()
+            .retired_threads
+            .capacity();
         page.try_exit().unwrap();
         page.begin_exit(entry).unwrap().commit().unwrap();
         assert_eq!(
@@ -1095,6 +1150,16 @@ mod tests {
             "ABI exit remained visible to a peer"
         );
         assert!(root.task().thread(tid).is_none());
+        assert_eq!(
+            kernel
+                .registry()
+                .settled()
+                .read()
+                .retired_threads
+                .capacity(),
+            retirement_capacity,
+            "EL1 exit allocated retirement storage after birth"
+        );
         assert_eq!(
             page.state(entry.index()),
             Some((entry.generation(), EntryState::Reaped))

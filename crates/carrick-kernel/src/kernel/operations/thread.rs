@@ -652,6 +652,7 @@ impl Kernel {
         let state = self.registry().settled().read();
         if state
             .retired_threads
+            .records()
             .iter()
             .any(|retired| retired._key == key)
         {
