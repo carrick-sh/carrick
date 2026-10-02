@@ -947,8 +947,8 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
             |pending, verified| {
                 let permit = mutation.host_alias_permit();
                 let plan = dispatcher.published_frame_grant_plan(&permit, pending.residency, carrick_abi::LinuxProtFlags::from_bits_truncate(pending.plan.2), verified)
-                    .ok_or_else(|| TrapError::Hypervisor(format!(
-                        "EL1 published grant {:?} no longer authenticates its armed faulting page at 0x{:x}",
+                    .map_err(|refusal| TrapError::Hypervisor(format!(
+                        "EL1 published grant {:?} cannot settle faulting page at 0x{:x}: {refusal:?}",
                         pending.txn.id, pending.fault_va
                     )))?;
                 dispatcher.commit_published_frame_grant(plan, pending.residency);
@@ -1039,8 +1039,8 @@ pub(super) fn settle_guest_grants_over(
             |pending, verified| {
                 let permit = mutation.host_alias_permit();
                 let plan = dispatcher.published_frame_grant_plan(&permit, pending.residency, carrick_abi::LinuxProtFlags::from_bits_truncate(pending.plan.2), verified)
-                    .ok_or_else(|| TrapError::Hypervisor(format!(
-                        "EL1 published copyout grant {:?} no longer authenticates its armed faulting page",
+                    .map_err(|refusal| TrapError::Hypervisor(format!(
+                        "EL1 published copyout grant {:?} cannot settle its faulting page: {refusal:?}",
                         pending.txn.id
                     )))?;
                 dispatcher.commit_published_frame_grant(plan, pending.residency);
