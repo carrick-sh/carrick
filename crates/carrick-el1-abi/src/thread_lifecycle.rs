@@ -503,10 +503,10 @@ impl LifecycleHatches {
         sigmask: true,
     };
 
-    /// Consult `lookup` once per hatch variable; exactly `0` (trimmed)
+    /// Consult `lookup` once per hatch variable; exactly `0`
     /// disables that service, anything else (or unset) leaves it on.
     pub fn from_lookup<S: AsRef<str>>(mut lookup: impl FnMut(&str) -> Option<S>) -> Self {
-        let mut on = |name: &str| lookup(name).is_none_or(|value| value.as_ref().trim() != "0");
+        let mut on = |name: &str| lookup(name).is_none_or(|value| value.as_ref() != "0");
         Self {
             threads: on(EL1_THREADS_HATCH_ENV),
             sigmask: on(EL1_SIGMASK_HATCH_ENV),
