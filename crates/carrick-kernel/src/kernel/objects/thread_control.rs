@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock, Weak};
 
 use carrick_el1_abi::{BlockedMask, LifecycleHatches, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_mem::HostVa;
+use carrick_host::host_mapping::{HostMappingKind, OwnedHostMapping};
 use parking_lot::Mutex;
 
 use super::{TaskKey, ThreadKey};
@@ -21,7 +22,78 @@ struct ControlPage {
 
 #[derive(Debug)]
 struct ControlBacking {
-    page: Box<ControlPage>,
+    page: SharedAbiPage<ControlPage>,
+}
+
+/// Owns the host VM object, as well as the Rust value's lifetime. The aligned
+/// ABI granule is the only range exposed; mmap slack and Arc metadata are not.
+#[derive(Debug)]
+struct SharedAbiPage<T: AbiPage> {
+    mapping: OwnedHostMapping,
+    offset: usize,
+    value: std::marker::PhantomData<T>,
+}
+
+/// Closed to this module's two ABI-only layouts. Host objects cannot be
+/// accidentally placed inside an EL1-published granule by a generic caller.
+trait AbiPage: Send + Sync {}
+impl AbiPage for ControlPage {}
+impl AbiPage for LifecycleBacking {}
+
+impl<T: AbiPage> SharedAbiPage<T> {
+    fn new(value: T) -> Self {
+        // Both concrete ABI pages are exactly one granule. Overallocate by one
+        // granule on hosts with smaller mmap alignment, without MAP_FIXED or a
+        // second allocation. The unused slack stays demand-zero.
+        const {
+            assert!(std::mem::size_of::<T>() == PAGE_BYTES);
+            assert!(std::mem::align_of::<T>() == PAGE_BYTES);
+        }
+        let mapping =
+            OwnedHostMapping::map_shared_anon(PAGE_BYTES * 2, HostMappingKind::PerMmKernelState)
+                .unwrap_or_else(|error| {
+                    carrick_fatal::carrick_fatal!(
+                        "thread::control",
+                        "cannot allocate shared ABI backing: {error}"
+                    )
+                });
+        let base = mapping.as_ptr().addr();
+        let offset = base.next_multiple_of(PAGE_BYTES) - base;
+        // SAFETY: one complete aligned granule lies within the mapping. This
+        // owner exclusively initializes it before publishing shared references.
+        unsafe { mapping.as_ptr().add(offset).cast::<T>().write(value) };
+        Self {
+            mapping,
+            offset,
+            value: std::marker::PhantomData,
+        }
+    }
+}
+
+// SAFETY: only the two synchronized ABI page types instantiate this private
+// owner. No mutable reference escapes initialization; mmap never host-COWs.
+unsafe impl<T: AbiPage> Send for SharedAbiPage<T> {}
+unsafe impl<T: AbiPage> Sync for SharedAbiPage<T> {}
+
+impl<T: AbiPage> Deref for SharedAbiPage<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: initialized aligned T stays live until this owner drops.
+        unsafe { &*self.mapping.as_ptr().add(self.offset).cast::<T>() }
+    }
+}
+
+impl<T: AbiPage> Drop for SharedAbiPage<T> {
+    fn drop(&mut self) {
+        // SAFETY: exclusive final ownership; drop the value before munmap.
+        unsafe {
+            self.mapping
+                .as_ptr()
+                .add(self.offset)
+                .cast::<T>()
+                .drop_in_place()
+        };
+    }
 }
 
 #[derive(Debug)]
@@ -40,11 +112,11 @@ struct LifecycleBacking {
 
 /// Pins a process's lifecycle page without retaining the task/kernel graph.
 #[derive(Clone, Debug)]
-pub struct ThreadLifecycleLease(Arc<LifecycleBacking>);
+pub struct ThreadLifecycleLease(Arc<SharedAbiPage<LifecycleBacking>>);
 
 impl ThreadLifecycleLease {
     pub fn backing_base(&self) -> HostVa {
-        HostVa(std::ptr::from_ref(self.0.as_ref()).addr())
+        HostVa(std::ptr::from_ref(&**self.0).addr())
     }
 
     pub const fn backing_len(&self) -> usize {
@@ -78,10 +150,10 @@ impl ThreadControlArena {
     pub(in crate::kernel) fn new(owner: TaskKey) -> Self {
         Self(Arc::new(Arena {
             owner,
-            lifecycle: ThreadLifecycleLease(Arc::new(LifecycleBacking {
+            lifecycle: ThreadLifecycleLease(Arc::new(SharedAbiPage::new(LifecycleBacking {
                 page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
                 padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
-            })),
+            }))),
             free: Mutex::new(Vec::new()),
         }))
     }
@@ -91,7 +163,7 @@ impl ThreadControlArena {
             let mut free = self.0.free.lock();
             if free.is_empty() {
                 let page = Arc::new(ControlBacking {
-                    page: Box::new(ControlPage {
+                    page: SharedAbiPage::new(ControlPage {
                         slots: [const { ThreadControlSlot::new() }; SLOTS],
                     }),
                 });
@@ -164,7 +236,7 @@ impl ThreadControlLease {
 
     /// Granule-aligned base of the control-only page this lease pins.
     pub fn backing_base(&self) -> HostVa {
-        HostVa(std::ptr::from_ref(self.allocation().page.page.as_ref()).addr())
+        HostVa(std::ptr::from_ref(&*self.allocation().page.page).addr())
     }
 
     pub const fn backing_len(&self) -> usize {
@@ -189,6 +261,77 @@ impl Deref for ThreadControlLease {
 mod tests {
     use super::*;
     use crate::kernel::ids::{LinuxTid, ObjectIdRegistry, TaskId};
+
+    mod serial_host {
+        use super::*;
+
+        #[test]
+        fn lifecycle_backing_keeps_one_vm_object_across_host_fork() {
+            let ids = ObjectIdRegistry::new();
+            let owner = TaskKey {
+                id: TaskId::from_abi_positive(100).unwrap(),
+                serial: ids.task_serial().unwrap(),
+            };
+            let key = ThreadKey {
+                tid: LinuxTid::from_abi_positive(101).unwrap(),
+                serial: ids.thread_serial().unwrap(),
+            };
+            let first = ThreadControlArena::new(owner);
+            let second = ThreadControlArena::new(owner);
+            let slot = first.allocate(key);
+            let other = second.allocate(key);
+            let page = slot.lifecycle();
+            let other_page = other.lifecycle();
+            let mut pipe = [-1; 2];
+            // SAFETY: valid output array; only the serial host lane forks/reaps.
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork failed");
+            if child == 0 {
+                // Only atomic ABI operations and async-signal-safe syscalls after
+                // fork: no allocator, Arc operations, locks or Rust destruction.
+                slot.init_blocked(BlockedMask(0x400));
+                page.close();
+                let byte = 1u8;
+                unsafe {
+                    libc::write(pipe[1], std::ptr::from_ref(&byte).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            let mut ready = libc::pollfd {
+                fd: pipe[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Bound the child witness without leaving an unreaped child on red.
+            let observed = unsafe { libc::poll(&mut ready, 1, 5000) };
+            if observed != 1 {
+                unsafe { libc::kill(child, libc::SIGKILL) };
+            }
+            let mut status = 0;
+            let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            assert_eq!(observed, 1, "child did not publish ABI writes");
+            assert_eq!(reaped, child);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert_eq!(
+                slot.blocked(),
+                BlockedMask(0x400),
+                "control backing split by host COW"
+            );
+            assert_eq!(
+                page.gate(),
+                carrick_el1_abi::GateState::Closed,
+                "lifecycle backing split by host COW"
+            );
+            assert_eq!(other.blocked(), BlockedMask(0));
+            assert_eq!(other_page.gate(), carrick_el1_abi::GateState::Open);
+        }
+    }
 
     #[test]
     fn equal_numeric_keys_do_not_cross_live_arena_authorities() {
