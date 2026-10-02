@@ -3316,6 +3316,70 @@ fn delegated_unused_first_touch_stock_is_the_roots_holes_under_its_grants() {
 }
 
 #[test]
+fn delegated_fork_materialized_drops_unconsumed_stock_provenance_only_in_child() {
+    use carrick_guest_mem::GuestVa;
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base + 2 * PAGE),
+        2 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base + 2 * PAGE, STOCK_WINDOW, |plan| {
+            assert!(plan.stock);
+            dispatcher.adopt_frame_grant_provenance(&plan);
+            let state = dispatcher
+                .deferred_anonymous_state(dispatcher.mm_authority().mm_id)
+                .unwrap();
+            state
+                .begin_pristine_materialization(GuestVa(plan.start()), plan.len() as usize)
+                .unwrap()
+                .unwrap()
+                .commit();
+            dispatcher.commit_resident_frame_grant(plan);
+        })
+        .unwrap();
+    let parent = dispatcher.mem();
+    let before = parent.lock().deferred_anonymous.snapshot();
+    let forked = parent.lock().fork_materialized();
+    assert!(forked.first_touch_stock.is_empty());
+    for (start, pages) in [(base, 2), (base + 4 * PAGE, 4)] {
+        assert!(
+            forked
+                .deferred_anonymous
+                .materialized_within(GuestVa(start), (pages * PAGE) as usize)
+                .is_empty(),
+            "a child cannot retain the parent's unconsumed Prepared stock"
+        );
+        forked
+            .deferred_anonymous
+            .adopt_pristine(GuestVa(start), (pages * PAGE) as usize)
+            .unwrap();
+        assert!(
+            forked
+                .deferred_anonymous
+                .covers_pristine(GuestVa(start), (pages * PAGE) as usize)
+        );
+    }
+    assert_eq!(
+        forked
+            .deferred_anonymous
+            .materialized_within(GuestVa(base + 2 * PAGE), (2 * PAGE) as usize),
+        vec![GuestVa(base + 2 * PAGE)..GuestVa(base + 4 * PAGE)],
+        "mapped backing is inherited"
+    );
+    assert_eq!(
+        parent.lock().deferred_anonymous.snapshot(),
+        before,
+        "the parent keeps its stock backing"
+    );
+    assert!(!parent.lock().first_touch_stock.is_empty());
+}
+
+#[test]
 fn delegated_fork_requires_stock_and_owed_returns_settled_before_snapshot() {
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
