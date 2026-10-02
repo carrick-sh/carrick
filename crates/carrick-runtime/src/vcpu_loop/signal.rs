@@ -79,6 +79,16 @@ pub(crate) fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
 /// `ESR_EL1`, for authenticating a possibly stale fault against the live
 /// stage-1 leaf. `None` for every other fault class (alignment, access-flag,
 /// address-size, external abort): those never resolve by retry.
+/// The stage-1 fault kind of an EL0 data or instruction abort's syndrome;
+/// `None` for any other exception class or fault status.
+pub(crate) fn el0_fault_kind(esr: u64) -> Option<carrick_mmu_core::aarch64::Stage1FaultKind> {
+    let ec = (esr >> 26) & 0x3f;
+    if !matches!(ec, 0x20 | 0x21 | 0x24 | 0x25) {
+        return None;
+    }
+    carrick_mmu_core::aarch64::Stage1FaultKind::from_fault_status(esr & 0x3f)
+}
+
 pub(crate) fn el0_fault_access(esr: u64) -> Option<carrick_mmu_core::aarch64::LeafAccess> {
     use carrick_mmu_core::aarch64::LeafAccess;
     const WNR: u64 = 1 << 6;
@@ -1007,6 +1017,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     engine: &mut E,
     address: u64,
     access: Option<carrick_mmu_core::aarch64::LeafAccess>,
+    fault_kind: Option<carrick_mmu_core::aarch64::Stage1FaultKind>,
     tid: carrick_kernel::kernel::LinuxTid,
     mutation: &mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
 ) -> Result<bool, TrapError> {
@@ -1346,12 +1357,12 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             }
         };
     }
-    let Some(access) = access else {
+    let (Some(access), Some(fault_kind)) = (access, fault_kind) else {
         first_touch.stale = FirstTouchStale::AccessUnknown;
         ring::rec_first_touch(&first_touch);
         return Ok(false);
     };
-    let retried = engine.resolve_stale_stage1_fault(address, access)?;
+    let retried = engine.resolve_stale_stage1_fault(address, access, fault_kind)?;
     if retried {
         crate::probes::hvpatch_stale_stage1_retry(address, access as u32, tid.raw());
         first_touch.stale = FirstTouchStale::Retried;

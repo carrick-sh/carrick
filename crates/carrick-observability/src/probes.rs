@@ -2485,6 +2485,8 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));",
             "fn hvpatch__stale__stage1__retry(_: u64, _: u32, _: i32) {}",
             "stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));",
+            "fn hvpatch__stale__stage1__fault(_: u64, _: u32, _: u32, _: u32) {}",
+            "stub!(hvpatch_stale_stage1_fault(far: u64, kind: u32, invalidated: bool, retries: u32));",
             "fn hvpatch__cow__runtime__bind(_: u64, _: u32, _: u64, _: i32, _: u32) {}",
             "stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));",
             "fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}",
@@ -5153,6 +5155,13 @@ mod real {
         /// of receiving SIGSEGV. Args: FAR, decoded access (0 read, 1 write,
         /// 2 execute), guest TID.
         fn hvpatch__stale__stage1__retry(_: u64, _: u32, _: i32) {}
+        /// The engine's decision for one stale EL0 stage-1 fault (the live
+        /// leaf permits the access). Args: FAR, fault kind from the status
+        /// code (0 translation, 1 access flag, 2 permission), whether it
+        /// invalidated the MM's TLB entries before the retry (one host
+        /// maintenance round trip), and the consecutive stale faults at this
+        /// FAR so far.
+        fn hvpatch__stale__stage1__fault(_: u64, _: u32, _: u32, _: u32) {}
         /// The MM-scoped frame-COW runtime binding (the authority a sparse
         /// first-touch publication quiesces through) was offered by a task.
         /// Args: mm, ASID, authority pointer (identifies the `Arc`), the
@@ -6490,6 +6499,15 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32) {
         carrick_usdt::hvpatch__stale__stage1__retry!(|| (far, access, tid));
+    }
+
+    pub fn hvpatch_stale_stage1_fault(far: u64, kind: u32, invalidated: bool, retries: u32) {
+        carrick_usdt::hvpatch__stale__stage1__fault!(|| (
+            far,
+            kind,
+            u32::from(invalidated),
+            retries
+        ));
     }
 
     /// The runtime delivered an EL0 data abort as a signal instead of
@@ -8841,6 +8859,7 @@ mod stub {
         let _ = event;
     }
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
+    stub!(hvpatch_stale_stage1_fault(far: u64, kind: u32, invalidated: bool, retries: u32));
     stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
     stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));

@@ -295,6 +295,93 @@ pub enum LeafAccess {
     Execute = 2,
 }
 
+/// What a stage-1 data or instruction abort's fault status code (`DFSC` /
+/// `IFSC`, ESR bits [5:0]) says the faulting walk found. The discriminants
+/// are the wire encoding of the `hvpatch__stale__stage1__fault` probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Stage1FaultKind {
+    /// Translation fault (0b0001LL): the walk met an invalid descriptor.
+    /// No TLB or walk cache holds a translation that faults this way.
+    Translation = 0,
+    /// Access flag fault (0b0010LL).
+    AccessFlag = 1,
+    /// Permission fault (0b0011LL): a valid translation, possibly a cached
+    /// one, denied the access.
+    Permission = 2,
+}
+
+impl Stage1FaultKind {
+    /// Decode a stage-1 fault status code; `None` for anything else.
+    pub const fn from_fault_status(status: u64) -> Option<Self> {
+        match status & 0x3c {
+            0x04 => Some(Self::Translation),
+            0x08 => Some(Self::AccessFlag),
+            0x0c => Some(Self::Permission),
+            _ => None,
+        }
+    }
+
+    /// Whether retrying a stale fault of this kind (the live leaf already
+    /// permits the access) needs this MM's TLB entries invalidated first,
+    /// given the consecutive stale faults at the same address so far
+    /// (`consecutive >= 1`).
+    ///
+    /// A translation fault means the walk met an invalid descriptor, and no
+    /// TLB or walk cache holds a translation that faults: the leaf became
+    /// valid after the walk (a sibling's commit raced the fault), so the
+    /// first retry needs no invalidation. Only a walk through a stale cached
+    /// table pointer would fault again at the same address; the second
+    /// consecutive stale fault there invalidates. A permission or
+    /// access-flag fault came from a valid translation that may be cached,
+    /// so it always invalidates.
+    pub const fn stale_retry_needs_invalidation(self, consecutive: u32) -> bool {
+        !matches!(self, Self::Translation) || consecutive > 1
+    }
+}
+
+#[cfg(test)]
+mod stage1_fault_kind_tests {
+    use super::Stage1FaultKind;
+
+    #[test]
+    fn decodes_the_three_stage1_fault_status_classes_at_every_level() {
+        for level in 0..4 {
+            assert_eq!(
+                Stage1FaultKind::from_fault_status(0x04 | level),
+                Some(Stage1FaultKind::Translation)
+            );
+            assert_eq!(
+                Stage1FaultKind::from_fault_status(0x08 | level),
+                Some(Stage1FaultKind::AccessFlag)
+            );
+            assert_eq!(
+                Stage1FaultKind::from_fault_status(0x0c | level),
+                Some(Stage1FaultKind::Permission)
+            );
+        }
+        // Address size, synchronous external abort, alignment: not stage-1
+        // descriptor faults.
+        for status in [0x00, 0x10, 0x21] {
+            assert_eq!(Stage1FaultKind::from_fault_status(status), None);
+        }
+    }
+
+    /// Contract `kernel.el1.task-load-entry` (no maintenance round trip a
+    /// task load did not need): a sibling's commit racing a translation
+    /// fault is retried without a TLB invalidation; a repeat at the same
+    /// address, or any permission/access-flag fault, still invalidates.
+    #[test]
+    fn only_a_repeated_translation_fault_or_a_cached_translation_invalidates() {
+        assert!(!Stage1FaultKind::Translation.stale_retry_needs_invalidation(1));
+        assert!(Stage1FaultKind::Translation.stale_retry_needs_invalidation(2));
+        for kind in [Stage1FaultKind::AccessFlag, Stage1FaultKind::Permission] {
+            assert!(kind.stale_retry_needs_invalidation(1));
+            assert!(kind.stale_retry_needs_invalidation(2));
+        }
+    }
+}
+
 /// Whether the hardware-visible terminal descriptor of a stage-1 walk lets EL0
 /// perform `access` WITHOUT faulting: valid, access flag set, EL0-accessible,
 /// writable for a write, and UXN clear for an instruction fetch. This is the
