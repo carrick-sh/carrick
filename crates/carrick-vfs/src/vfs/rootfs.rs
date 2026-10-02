@@ -183,11 +183,24 @@ impl RootFsVfs {
             &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
         ) -> Result<R, E>,
     ) -> Result<Result<R, E>, LinuxErrno> {
+        self.with_namespace_batch_precheck(paths, topology_change, |_| Ok(()), operation)
+    }
+
+    fn with_namespace_batch_precheck<R, E>(
+        &self,
+        paths: &[&str],
+        topology_change: bool,
+        check_first: impl FnOnce(&ResolvedParent) -> Result<(), LinuxErrno>,
+        operation: impl FnOnce(
+            &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
+        ) -> Result<R, E>,
+    ) -> Result<Result<R, E>, LinuxErrno> {
         let _archive = self
             .overlay
             .archive_mutation_gate()
             .map(crate::fs_backend::ArchiveMutationGate::mutation);
         let resolve_parents = || {
+            let mut check_first = Some(check_first);
             let mut parents: Vec<crate::vfs::namespace_mutation::AnchoredParent> =
                 Vec::with_capacity(paths.len());
             let mut resolved_parents: std::collections::HashMap<
@@ -223,6 +236,9 @@ impl RootFsVfs {
                 }
                 crate::probes::fs_op("path-role", "coordinator-admission", 0);
                 let resolved = self.resolved_parent(path)?;
+                if let Some(check) = check_first.take() {
+                    check(&resolved)?;
+                }
                 let identity = if let Some(ref fd) = resolved.parent_fd {
                     crate::vfs::namespace_mutation::NamespaceParentIdentity::Host(
                         self.namespace_mutations
@@ -702,72 +718,118 @@ impl RootFsVfs {
         to: &str,
         check_parent: impl FnOnce(&ResolvedParent) -> Result<(), LinuxErrno>,
     ) -> Result<(), LinuxErrno> {
-        self.with_namespace_batch(&[from, to], false, |permit| {
-            let src = permit.parent(from).ok_or(LINUX_ENOENT)?;
-            let dst = permit.parent(to).ok_or(LINUX_ENOENT)?;
-            let mut entry = self.admitted_entry_info(src, from).ok_or(LINUX_ENOENT)?;
-            if self.admitted_entry_info(dst, to).is_some() {
-                return Err(LINUX_EEXIST);
-            }
-            check_parent(dst)?;
-            if entry.kind == RootFsEntryKind::Directory {
-                return Err(carrick_abi::LINUX_EPERM);
-            }
-            if entry.in_rootfs && !entry.in_overlay {
-                let lower = self.rootfs.as_ref().ok_or(LINUX_ENOENT)?;
-                let lower_owner = lower
-                    .immutable_real_stat(from, false)
-                    .map(|stat| (stat.uid, stat.gid));
-                let metadata = lower
-                    .symlink_metadata(from)
-                    .map_err(crate::vfs::errno::rootfs_errno)?;
-                if metadata.kind == RootFsEntryKind::Symlink {
-                    let target = lower
-                        .read_link(from)
-                        .map_err(crate::vfs::errno::rootfs_errno)?;
-                    self.overlay
-                        .symlink(&target, from)
-                        .map_err(|_| LINUX_EROFS)?;
-                } else {
-                    let contents = lower
-                        .read_shared(from)
-                        .map_err(crate::vfs::errno::rootfs_errno)?;
-                    self.overlay
-                        .create_file_from_rootfs(from, contents, metadata.mode)
-                        .map_err(|_| LINUX_EROFS)?;
+        self.with_namespace_batch_precheck(
+            &[from, to],
+            false,
+            |source| {
+                // Source absence precedes validation of the target parent. This
+                // precheck uses the retained source capability; the identity is
+                // checked again under both parent reservations before publication.
+                // A shared parent is already resolved and needs no precheck.
+                if std::path::Path::new(from).parent() == std::path::Path::new(to).parent() {
+                    return Ok(());
                 }
-                if let Some((uid, gid)) = lower_owner {
-                    self.overlay
-                        .set_owner(from, Some(uid), Some(gid))
-                        .map_err(|_| LINUX_EROFS)?;
-                }
-                entry = self.admitted_entry_info(src, from).ok_or(LINUX_ENOENT)?;
-            }
-            let inode = entry.inode;
-            match self.overlay.hard_link_at(src, dst) {
-                Ok(()) => {
-                    self.dentry_cache.entry_created(to, inode);
-                    self.dentry_cache.inode_changed(from, inode);
-                    Ok(())
-                }
-                Err(crate::fs_backend::BackendError::Unsupported) => {
-                    let contents = self
+                if let Some(ref fd) = source.parent_fd {
+                    if self
                         .overlay
-                        .file_contents(from)
-                        .or_else(|| self.rootfs.as_ref().and_then(|r| r.read(from).ok()))
-                        .unwrap_or_default();
-                    match self.overlay.set_file_contents(to, contents) {
-                        Ok(()) => {
-                            self.dentry_cache.entry_created(to, inode);
-                            self.dentry_cache.inode_changed(from, inode);
-                            Ok(())
-                        }
-                        Err(_) => Err(LINUX_EROFS),
+                        .has_whiteout_in_dir(fd.as_raw_fd(), source.leaf.to_str().unwrap_or(""))
+                    {
+                        return Err(LINUX_ENOENT);
                     }
+                    #[cfg(any(test, feature = "test-support"))]
+                    crate::fs_backend::host::record_test_host_stat();
+                    let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+                    if unsafe {
+                        libc::fstatat(
+                            fd.as_raw_fd(),
+                            source.leaf.as_ptr(),
+                            &mut stat,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    } == 0
+                    {
+                        return Ok(());
+                    }
+                    return if self
+                        .dentry_cache
+                        .lower_has_entry(from, self.rootfs.as_ref())
+                    {
+                        Ok(())
+                    } else {
+                        Err(LINUX_ENOENT)
+                    };
                 }
-                Err(_) => Err(LINUX_EROFS),
-            }
-        })??;
+                self.admitted_entry_info(source, from)
+                    .map(|_| ())
+                    .ok_or(LINUX_ENOENT)
+            },
+            |permit| {
+                let src = permit.parent(from).ok_or(LINUX_ENOENT)?;
+                let dst = permit.parent(to).ok_or(LINUX_ENOENT)?;
+                let mut entry = self.admitted_entry_info(src, from).ok_or(LINUX_ENOENT)?;
+                if self.admitted_entry_info(dst, to).is_some() {
+                    return Err(LINUX_EEXIST);
+                }
+                check_parent(dst)?;
+                if entry.kind == RootFsEntryKind::Directory {
+                    return Err(carrick_abi::LINUX_EPERM);
+                }
+                if entry.in_rootfs && !entry.in_overlay {
+                    let lower = self.rootfs.as_ref().ok_or(LINUX_ENOENT)?;
+                    let lower_owner = lower
+                        .immutable_real_stat(from, false)
+                        .map(|stat| (stat.uid, stat.gid));
+                    let metadata = lower
+                        .symlink_metadata(from)
+                        .map_err(crate::vfs::errno::rootfs_errno)?;
+                    if metadata.kind == RootFsEntryKind::Symlink {
+                        let target = lower
+                            .read_link(from)
+                            .map_err(crate::vfs::errno::rootfs_errno)?;
+                        self.overlay
+                            .symlink(&target, from)
+                            .map_err(|_| LINUX_EROFS)?;
+                    } else {
+                        let contents = lower
+                            .read_shared(from)
+                            .map_err(crate::vfs::errno::rootfs_errno)?;
+                        self.overlay
+                            .create_file_from_rootfs(from, contents, metadata.mode)
+                            .map_err(|_| LINUX_EROFS)?;
+                    }
+                    if let Some((uid, gid)) = lower_owner {
+                        self.overlay
+                            .set_owner(from, Some(uid), Some(gid))
+                            .map_err(|_| LINUX_EROFS)?;
+                    }
+                    entry = self.admitted_entry_info(src, from).ok_or(LINUX_ENOENT)?;
+                }
+                let inode = entry.inode;
+                match self.overlay.hard_link_at(src, dst) {
+                    Ok(()) => {
+                        self.dentry_cache.entry_created(to, inode);
+                        self.dentry_cache.inode_changed(from, inode);
+                        Ok(())
+                    }
+                    Err(crate::fs_backend::BackendError::Unsupported) => {
+                        let contents = self
+                            .overlay
+                            .file_contents(from)
+                            .or_else(|| self.rootfs.as_ref().and_then(|r| r.read(from).ok()))
+                            .unwrap_or_default();
+                        match self.overlay.set_file_contents(to, contents) {
+                            Ok(()) => {
+                                self.dentry_cache.entry_created(to, inode);
+                                self.dentry_cache.inode_changed(from, inode);
+                                Ok(())
+                            }
+                            Err(_) => Err(LINUX_EROFS),
+                        }
+                    }
+                    Err(_) => Err(LINUX_EROFS),
+                }
+            },
+        )??;
         Ok(())
     }
 
