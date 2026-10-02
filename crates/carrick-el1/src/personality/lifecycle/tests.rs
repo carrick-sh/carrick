@@ -214,6 +214,18 @@ fn gettid_uses_each_live_process_immutable_projection() {
     }
 }
 
+#[test]
+fn exit_decline_census_names_the_authority_without_changing_it() {
+    let mut world = World::new(LifecycleHatches::ON);
+    let (action, _) = world.syscall(SYS_EXIT, &[0]);
+    assert_eq!(action, Action::Forward);
+    assert_eq!(
+        world.counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ExitNoEntry as usize]
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
 /// Host-memory user copies that fail on chosen addresses (a fault EL1 cannot
 /// serve through).
 #[derive(Default)]
@@ -886,6 +898,15 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
         let live = w.page().live();
         let action = w.call(&mut frame, SYS_EXIT, &[3]);
         assert_eq!(action, Action::Forward, "{label}");
+        assert_eq!(
+            w.counters
+                .lifecycle_declines
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            1,
+            "{label}: exactly one decline reason"
+        );
         assert_eq!(frame.x[0], 3, "{label}: the host exits with the status");
         assert_eq!(*word, CHILD_VISIBLE, "{label}: CLEARTID untouched");
         assert_eq!(w.page().state(0).unwrap().1, EntryState::Born, "{label}");

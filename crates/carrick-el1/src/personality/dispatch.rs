@@ -302,6 +302,13 @@ where
     // complete on its authoritative slot, then leave ServedWithWork; clone
     // and exit remain excluded from this exception.
     let host_work = cur_task.is_some_and(CurrentTask::has_pending_host_work);
+    let record_lifecycle_host_work = || match nr {
+        lifecycle::SYS_EXIT => counters
+            .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::ExitDispatchHostWork),
+        lifecycle::SYS_CLONE => counters
+            .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::CloneDispatchHostWork),
+        _ => {}
+    };
     let resumes_operation = zone.as_ref().is_some_and(|zone| {
         SlotId::from_index(slot)
             .and_then(|slot| zone.tables.slot(slot).current())
@@ -317,6 +324,7 @@ where
                 | lifecycle::SYS_SET_ROBUST_LIST
         );
     if host_work && !resumes_operation && !ipc_transfer && !lifecycle_setup {
+        record_lifecycle_host_work();
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }
@@ -447,6 +455,7 @@ where
     // The adapter declined a call admitted past pending host work (a
     // host-backed description, an unpublished table): the host runs it.
     if host_work && !lifecycle_setup {
+        record_lifecycle_host_work();
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }

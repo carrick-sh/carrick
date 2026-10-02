@@ -23,8 +23,8 @@ use super::sched::{ETIMEDOUT_RESULT, Sched, Served, ThreadCpu, UserWord};
 use crate::file::UserCopy;
 use carrick_el1_abi::{
     Action, AltStack, BlockedMask, BornRecord, Claim, Counters, CurrentTask, El1TaskId, EntryRef,
-    EntryState, GateState, ThreadControlSlot, ThreadCtx, ThreadIdentity, ThreadLifecyclePage,
-    TrapFrame,
+    EntryState, GateState, LifecycleDecline, ThreadControlSlot, ThreadCtx, ThreadIdentity,
+    ThreadLifecyclePage, TransitionError, TrapFrame,
 };
 use core::sync::atomic::Ordering;
 
@@ -142,7 +142,12 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
     user: &mut impl UserCopy,
 ) -> Option<Action> {
     let nr = frame.x[8] as usize;
-    let thread = venue.thread(task)?;
+    let thread = venue.thread(task).or_else(|| {
+        if nr == SYS_EXIT {
+            counters.record_lifecycle_decline(LifecycleDecline::ExitVenue);
+        }
+        None
+    })?;
     let orig_x0 = frame.x[0];
     let served = |frame: &mut TrapFrame, result: u64, work: bool| {
         frame.x[0] = result;
@@ -175,12 +180,15 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
             Some(served(frame, 0, false))
         }
         SYS_CLONE => {
-            let visible = serve_clone(sched.as_mut()?, frame, thread, venue, user)?;
+            let visible = serve_clone(sched.as_mut()?, frame, thread, venue, user, counters)?;
             Some(served(frame, u64::from(visible), false))
         }
         SYS_EXIT => {
-            let sched = sched.as_mut()?;
-            let outcome = serve_exit(sched, frame, thread, user)?;
+            let sched = sched.as_mut().or_else(|| {
+                counters.record_lifecycle_decline(LifecycleDecline::ExitScheduler);
+                None
+            })?;
+            let outcome = serve_exit(sched, frame, thread, user, counters)?;
             counters.served[nr].fetch_add(1, Ordering::Relaxed);
             Some(match outcome {
                 // The frame is the switched-in thread's, whose own syscall
@@ -404,6 +412,7 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
     thread: LifecycleThread<'_>,
     venue: &dyn LifecycleVenue,
     user: &mut impl UserCopy,
+    counters: &Counters,
 ) -> Option<u32> {
     let [flags, stack, parent_tid, tls, child_tid] =
         [frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4]];
@@ -428,7 +437,14 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
         child: TidOutput::capture(flag(CLONE_CHILD_SETTID, child_tid), user)?,
     };
 
-    let claimed = page.claim_any().ok()?;
+    let claimed = page
+        .claim_any()
+        .inspect_err(|error| {
+            if *error == TransitionError::PoolEmpty {
+                counters.record_lifecycle_decline(LifecycleDecline::ClonePoolEmpty);
+            }
+        })
+        .ok()?;
     let entry = claimed.entry();
     // Bound at the clone instant (director ruling 2): the caller's mask and
     // affinity as they are now.
@@ -523,54 +539,88 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
     frame: &mut TrapFrame,
     thread: LifecycleThread<'_>,
     user: &mut impl UserCopy,
+    counters: &Counters,
 ) -> Option<Served> {
     let (page, slot) = (thread.page, thread.slot);
-    if !page.serves_threads() || page.gate() != GateState::Open {
-        return None;
+    let decline = |reason| {
+        counters.record_lifecycle_decline(reason);
+        None
+    };
+    if !page.serves_threads() {
+        return decline(LifecycleDecline::ExitDisabled);
+    }
+    if page.gate() != GateState::Open {
+        return decline(LifecycleDecline::ExitGate);
     }
     // The leader holds no pool entry.
-    let entry = slot.entry()?;
+    let entry = slot.entry().or_else(|| {
+        counters.record_lifecycle_decline(LifecycleDecline::ExitNoEntry);
+        None
+    })?;
     if !matches!(
         page.state(entry.index()),
         Some((generation, EntryState::Born | EntryState::Published))
             if generation == entry.generation()
     ) {
-        return None;
+        return decline(LifecycleDecline::ExitEntryState);
     }
     // No robust-list walker exists yet (it will live in sched-core, shared
     // with the host lane): a registered list is walked by nobody here.
     if slot.robust_list().0 != 0 {
-        return None;
+        return decline(LifecycleDecline::ExitRobust);
     }
     // A pending signal is delivered (or re-targeted) by the host.
     if page.pending().load().0 != 0 || slot.pending().load().0 != 0 {
-        return None;
+        return decline(LifecycleDecline::ExitPending);
     }
     let task = sched.task;
     let mm = task.zone_mm.load(Ordering::Acquire);
     let (zone, zslot) = (sched.zone, sched.slot);
     // Only a record EL1 switched in: the thread its executor loaded (no
     // record, or the slot's home record) is the executor's to retire.
-    let record = zone.slot(zslot).current()?;
-    if mm == 0 || zone.slot(zslot).host_record() == Some(record) {
-        return None;
+    let record = zone.slot(zslot).current().or_else(|| {
+        counters.record_lifecycle_decline(LifecycleDecline::ExitNoCurrent);
+        None
+    })?;
+    if mm == 0 {
+        return decline(LifecycleDecline::ExitNoMm);
+    }
+    if zone.slot(zslot).host_record() == Some(record) {
+        return decline(LifecycleDecline::ExitHome);
     }
     let rec = zone.record(record);
-    if !matches!(rec.claim(), Claim::OnCpu { slot: owner, .. } if owner == zslot)
-        || rec.needs_host()
-        || rec.is_cancelled()
-        || rec.has_object_operation()
-        || rec.identity().tid != task.task_id.load(Ordering::Relaxed)
-    {
-        return None;
+    if !matches!(rec.claim(), Claim::OnCpu { slot: owner, .. } if owner == zslot) {
+        return decline(LifecycleDecline::ExitClaim);
     }
-    let admission = page.begin_exit(entry).ok()?;
+    if rec.needs_host() {
+        return decline(LifecycleDecline::ExitHostWork);
+    }
+    if rec.is_cancelled() {
+        return decline(LifecycleDecline::ExitCancelled);
+    }
+    if rec.has_object_operation() {
+        return decline(LifecycleDecline::ExitObjectOperation);
+    }
+    if rec.identity().tid != task.task_id.load(Ordering::Relaxed) {
+        return decline(LifecycleDecline::ExitIdentity);
+    }
+    let admission = page
+        .begin_exit(entry)
+        .inspect_err(|_| {
+            counters.record_lifecycle_decline(LifecycleDecline::ExitAdmission);
+        })
+        .ok()?;
     // n > 1 -> n - 1; the last thread exits on the host.
-    page.try_exit().ok()?;
+    page.try_exit()
+        .inspect_err(|_| {
+            counters.record_lifecycle_decline(LifecycleDecline::ExitLast);
+        })
+        .ok()?;
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = frame.x[0];
-        let woken = user.copy_out(clear_child_tid, &0u32.to_le_bytes())
+        let copied = user.copy_out(clear_child_tid, &0u32.to_le_bytes());
+        let woken = copied
             && sched
                 .wake_word(frame, mm, clear_child_tid, u32::MAX, 1)
                 .is_some();
@@ -579,7 +629,11 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
             // and waking are idempotent.
             frame.x[0] = status;
             let _ = page.thread_born();
-            return None;
+            return decline(if copied {
+                LifecycleDecline::ExitClearTidWake
+            } else {
+                LifecycleDecline::ExitClearTidCopyout
+            });
         }
     }
     // Checked above: the record holds no object operation (only its own

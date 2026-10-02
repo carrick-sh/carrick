@@ -2573,6 +2573,8 @@ pub struct Counters {
     pub exit_reasons: [AtomicU64; El1ExitReason::COUNT],
     /// Pipe/eventfd calls the EL1 adapter left for the host, by [`IpcLeave`].
     pub ipc_leaves: [AtomicU64; IpcLeave::COUNT],
+    /// Exact lifecycle declines; separate from the eventual host exit class.
+    pub lifecycle_declines: [AtomicU64; LifecycleDecline::COUNT],
 }
 
 impl Counters {
@@ -2584,6 +2586,7 @@ impl Counters {
             fault_taken: AtomicU64::new(0),
             exit_reasons: [const { AtomicU64::new(0) }; El1ExitReason::COUNT],
             ipc_leaves: [const { AtomicU64::new(0) }; IpcLeave::COUNT],
+            lifecycle_declines: [const { AtomicU64::new(0) }; LifecycleDecline::COUNT],
         }
     }
 
@@ -2613,7 +2616,18 @@ impl Counters {
                 Ordering::Relaxed,
             );
         }
+        for (target, source) in snapshot
+            .lifecycle_declines
+            .iter()
+            .zip(&self.lifecycle_declines)
+        {
+            target.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
         snapshot
+    }
+
+    pub fn record_lifecycle_decline(&self, reason: LifecycleDecline) {
+        self.lifecycle_declines[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -3857,7 +3871,7 @@ mod tests {
     fn test_counters_layout() {
         assert_eq!(
             core::mem::size_of::<Counters>(),
-            (1024 + 32 + 1 + El1ExitReason::COUNT + IpcLeave::COUNT) * 8
+            (1024 + 32 + 1 + El1ExitReason::COUNT + IpcLeave::COUNT + LifecycleDecline::COUNT) * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);
@@ -3886,8 +3900,13 @@ mod tests {
         counters.forwarded[30].store(40, Ordering::Relaxed);
         counters.irq_taken[2].store(8, Ordering::Relaxed);
         counters.exit_reasons[El1ExitReason::Service as usize].store(3, Ordering::Relaxed);
+        counters.record_lifecycle_decline(LifecycleDecline::ExitHome);
 
         let snap = counters.copy_snapshot();
+        assert_eq!(
+            snap.lifecycle_declines[LifecycleDecline::ExitHome as usize].load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(snap.fault_taken.load(Ordering::Relaxed), 5);
         assert_eq!(snap.served[10].load(Ordering::Relaxed), 20);
         assert_eq!(snap.forwarded[30].load(Ordering::Relaxed), 40);
