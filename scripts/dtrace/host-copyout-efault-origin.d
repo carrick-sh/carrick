@@ -21,8 +21,17 @@
  *     arg0 = guest VA, arg1 = length, arg2 = phase, arg3 = reason string.
  *     USDT probes follow forked children under the progeny predicate.
  *
- * (c) Perturbation: low; only failing copyouts take a probe body, and each
- *     takes one ustack().
+ *     Live-qualified on 2026-10-02: phases 9 (copyout commit failure),
+ *     15 (post-grant leaf permission), 18 (backing preparation declined)
+ *     and 21 (backend refusal reason) fired on the admitted cross-process
+ *     reader reduction. All 6,717 phase-18 declines matched phase-21
+ *     invalid backing requests: host copyout had no mailbox generation.
+ *     Phases 8, 10-12, 16, 19 and 20 name other source-defined refusal
+ *     branches; this qualification does not claim they fired.
+ *
+ * (c) Perturbation: failure-only, with one ustack() per event. Thousands
+ *     of repeated refusals can materially perturb a run; this profile
+ *     diagnoses origin and provides no uninstrumented timing evidence.
  *
  * Usage (keep the carrier alive briefly after the failure, or the stacks
  * cannot be symbolized once the process is gone):

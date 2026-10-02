@@ -216,13 +216,11 @@ impl SyscallDispatcher {
     pub fn el1_frame_grant_request(
         plan: &ResidentFrameGrantPlan<'_>,
         mm_key: u64,
-        request_generation: u64,
         fault_va: u64,
         access: u64,
     ) -> carrick_hal::El1FrameGrantRequest {
         carrick_hal::El1FrameGrantRequest {
             mm_key,
-            request_generation,
             fault_va,
             access,
             semantic_base: plan.start(),
@@ -317,6 +315,12 @@ impl SyscallDispatcher {
             El1FrameGrantPublication, El1FrameGrantPublished, El1FrameGrantRollback,
         };
         let Some(plan) = self.resident_frame_grant_plan(permit, cursor, piece) else {
+            carrick_observability::probes::guest_internal_write_fault(
+                cursor,
+                piece,
+                16,
+                "host copyout grant has no root plan",
+            );
             return Ok(None);
         };
         if !plan.root_owned() || plan.prot() & carrick_abi::LINUX_PROT_WRITE == 0 {
@@ -324,11 +328,17 @@ impl SyscallDispatcher {
         }
         let plan_end = plan.start().saturating_add(plan.len());
         self.adopt_frame_grant_provenance(&plan);
-        let request = Self::el1_frame_grant_request(&plan, mm_key, 0, cursor, 2);
+        let request = Self::el1_frame_grant_request(&plan, mm_key, cursor, 2);
         let Some(ready) = venue
             .prepare(request)
             .map_err(|error| format!("prepare host copyout grant: {error}"))?
         else {
+            carrick_observability::probes::guest_internal_write_fault(
+                cursor,
+                piece,
+                18,
+                "host copyout grant preparation declined",
+            );
             return Ok(None);
         };
         let rollback = El1FrameGrantRollback {
@@ -352,7 +362,13 @@ impl SyscallDispatcher {
             El1FrameGrantPublished::Submit(txn) => {
                 // EL1 refused or rolled back cleanly: nothing names the
                 // prepared backing, so it is undone and no grant applies.
-                if venue.apply_guest_publication(txn).is_err() {
+                if let Err(error) = venue.apply_guest_publication(txn) {
+                    carrick_observability::probes::guest_internal_write_fault(
+                        cursor,
+                        piece,
+                        19,
+                        &format!("host copyout guest publication: {error}"),
+                    );
                     venue
                         .roll_back(rollback)
                         .map_err(|undo| format!("roll back host copyout grant: {undo}"))?;
@@ -362,7 +378,14 @@ impl SyscallDispatcher {
                     .complete(rollback)
                     .map_err(|error| format!("complete host copyout grant: {error}"))?;
             }
-            El1FrameGrantPublished::Unsupported | El1FrameGrantPublished::Refused(_) => {
+            outcome
+            @ (El1FrameGrantPublished::Unsupported | El1FrameGrantPublished::Refused(_)) => {
+                carrick_observability::probes::guest_internal_write_fault(
+                    cursor,
+                    piece,
+                    20,
+                    &format!("host copyout publication: {outcome:?}"),
+                );
                 venue
                     .roll_back(rollback)
                     .map_err(|error| format!("roll back host copyout grant: {error}"))?;
@@ -396,18 +419,28 @@ impl SyscallDispatcher {
         )
     }
 
-    /// Whether a host read of `page` sees fresh zero: a readable page of a
-    /// root-owned live mapping that no one has touched, whose backing does
-    /// not exist yet. The caller has established that the page's live leaf
-    /// names no output at all.
-    pub fn host_read_sees_fresh_zero(&self, page: u64) -> bool {
+    /// Read-only access prevalidation for an untouched root-owned page.
+    /// The caller authenticates its live descriptor separately. A read sees
+    /// fresh zero only without live backing; a write must still grant or
+    /// commit prepared backing under mutation authority before publishing bytes.
+    pub fn host_untouched_page_permits(
+        &self,
+        page: u64,
+        access: carrick_mmu_core::aarch64::LeafAccess,
+    ) -> bool {
         let page = page_floor(page, self.linux_page_size());
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
         match mem.first_touch_owner(page) {
             FirstTouchOwner::Root(mapping, incarnation) => mem
                 .root_armed_prot(&mapping, incarnation, page)
-                .is_some_and(|prot| prot.contains(LinuxProtFlags::READ)),
+                .is_some_and(|prot| {
+                    prot.contains(match access {
+                        carrick_mmu_core::aarch64::LeafAccess::Read => LinuxProtFlags::READ,
+                        carrick_mmu_core::aarch64::LeafAccess::Write => LinuxProtFlags::WRITE,
+                        carrick_mmu_core::aarch64::LeafAccess::Execute => LinuxProtFlags::EXEC,
+                    })
+                }),
             FirstTouchOwner::Host | FirstTouchOwner::Unmapped => false,
         }
     }
