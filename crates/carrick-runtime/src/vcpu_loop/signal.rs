@@ -595,7 +595,6 @@ pub(super) struct PendingGuestGrant {
     /// re-derives the plan under the MM mutation guard and requires it
     /// unchanged before committing.
     pub(super) fault_va: u64,
-    pub(super) requested_len: u64,
     pub(super) plan: (u64, u64, u64),
     pub(super) residency: carrick_el1_abi::FrameGrantResidencyIdentity,
 }
@@ -905,7 +904,7 @@ pub(super) fn settle_guest_frame_grant(
     backend: &mut impl GuestGrantBackend,
     commit: impl FnOnce(
         &PendingGuestGrant,
-        carrick_mmu_core::aarch64::descriptor_txn::PageSpan,
+        &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
     ) -> Result<(), TrapError>,
 ) -> Result<GuestGrantSettlement, TrapError> {
     use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
@@ -913,7 +912,7 @@ pub(super) fn settle_guest_frame_grant(
         DescriptorOutcome::Applied(_) => {
             let verified = backend.verify(&pending.txn, receipt)?;
             backend.complete(pending.rollback())?;
-            commit(&pending, verified.resident())?;
+            commit(&pending, &verified)?;
             Ok(GuestGrantSettlement::Committed(verified.resident()))
         }
         DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
@@ -945,29 +944,13 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
             pending,
             &receipt,
             &mut EngineGrantBackend(&mut *engine),
-            |pending, _resident| {
+            |pending, verified| {
                 let permit = mutation.host_alias_permit();
-                let plan = dispatcher.resident_frame_grant_plan(
-                    &permit,
-                    pending.fault_va,
-                    pending.requested_len,
-                );
-                let current = plan
-                    .as_ref()
-                    .map(|plan| (plan.start(), plan.len(), plan.prot()));
-                // The arming may have moved while EL1 held the transaction
-                // (an adjacent mapping merged, a sibling committed other
-                // pages); only the faulting page commits, so it settles while
-                // that page is still armed with the published protection.
-                let plan = plan
-                    .filter(|plan| plan.covers_published(pending.plan))
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(format!(
-                            "EL1 published grant {:?} but its faulting page lost its arming: \
-                             fault 0x{:x}, published {:x?}, now {:x?}",
-                            pending.txn.id, pending.fault_va, pending.plan, current
-                        ))
-                    })?;
+                let plan = dispatcher.published_frame_grant_plan(&permit, pending.residency, carrick_abi::LinuxProtFlags::from_bits_truncate(pending.plan.2), verified)
+                    .ok_or_else(|| TrapError::Hypervisor(format!(
+                        "EL1 published grant {:?} no longer authenticates its armed faulting page at 0x{:x}",
+                        pending.txn.id, pending.fault_va
+                    )))?;
                 dispatcher.commit_published_frame_grant(plan, pending.residency);
                 Ok(())
             },
@@ -1053,17 +1036,13 @@ pub(super) fn settle_guest_grants_over(
             pending,
             &receipt,
             &mut VenueGrantBackend(&mut *venue),
-            |pending, _resident| {
+            |pending, verified| {
                 let permit = mutation.host_alias_permit();
-                let plan = dispatcher
-                    .resident_frame_grant_plan(&permit, pending.fault_va, pending.requested_len)
-                    .filter(|plan| (plan.start(), plan.len(), plan.prot()) == pending.plan)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(format!(
-                            "EL1 published grant {:?} but its first-touch plan changed",
-                            pending.txn.id
-                        ))
-                    })?;
+                let plan = dispatcher.published_frame_grant_plan(&permit, pending.residency, carrick_abi::LinuxProtFlags::from_bits_truncate(pending.plan.2), verified)
+                    .ok_or_else(|| TrapError::Hypervisor(format!(
+                        "EL1 published copyout grant {:?} no longer authenticates its armed faulting page",
+                        pending.txn.id
+                    )))?;
                 dispatcher.commit_published_frame_grant(plan, pending.residency);
                 Ok(())
             },
@@ -1324,7 +1303,6 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                 let pending = PendingGuestGrant {
                                     txn,
                                     fault_va: address,
-                                    requested_len: request.requested_len,
                                     plan: plan_shape,
                                     residency: residency_identity,
                                 };
@@ -2540,7 +2518,6 @@ mod first_touch_access_tests {
             mm_key: 7,
             request_generation: 11,
             fault_va: 0x4000_3123,
-            requested_len: carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
             access: crate::linux_abi::LINUX_PROT_WRITE,
         };
         let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
@@ -2931,7 +2908,7 @@ mod guest_descriptor_lane_tests {
                 &receipt,
                 &mut AuthorityBackend::new(authority),
                 |pending, resident| {
-                    commits.push((*pending, resident));
+                    commits.push((*pending, resident.resident()));
                     Ok(())
                 },
             )
@@ -3017,7 +2994,6 @@ mod guest_descriptor_lane_tests {
         let pending = PendingGuestGrant {
             txn,
             fault_va: fault,
-            requested_len: 0x20_0000,
             plan: (VA, 4 * 4096, 3),
             residency: residency(),
         };
@@ -3124,7 +3100,6 @@ mod guest_descriptor_lane_tests {
                 .prepare_guest_descriptor_txn(nz(MM), grant_op(fault))
                 .unwrap(),
             fault_va: fault,
-            requested_len: 0x20_0000,
             plan: (VA, 4 * 4096, 3),
             residency: residency(),
         };
@@ -3200,7 +3175,6 @@ mod guest_descriptor_lane_tests {
         let pending = PendingGuestGrant {
             txn,
             fault_va: VA,
-            requested_len: 0x20_0000,
             plan: (VA, 4 * 4096, 3),
             residency: residency(),
         };
@@ -3352,7 +3326,6 @@ mod guest_descriptor_lane_tests {
         let pending = PendingGuestGrant {
             txn,
             fault_va: VA,
-            requested_len: 0x20_0000,
             plan: (VA, 4 * 4096, 3),
             residency: residency(),
         };
@@ -3476,7 +3449,6 @@ mod guest_descriptor_lane_tests {
         PendingGuestGrant {
             txn,
             fault_va: fault,
-            requested_len: 0x20_0000,
             plan: (VA, 4 * 4096, 3),
             residency: FrameGrantResidencyIdentity {
                 physical_ipa: NEXT_IPA,
@@ -3591,7 +3563,7 @@ mod guest_descriptor_lane_tests {
                     log: &log,
                 },
                 |_, resident| {
-                    assert_eq!(resident, PageSpan::new(fault, 4096));
+                    assert_eq!(resident.resident(), PageSpan::new(fault, 4096));
                     log.borrow_mut().push(GrantEvent::Committed);
                     Ok(())
                 },
@@ -3699,7 +3671,6 @@ mod guest_descriptor_lane_tests {
         let pending_for = |txn| PendingGuestGrant {
             txn,
             fault_va: VA,
-            requested_len: 0x20_0000,
             plan: (VA, 4 * 4096, 3),
             residency: residency(),
         };
