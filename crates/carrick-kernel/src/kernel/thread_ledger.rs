@@ -605,6 +605,19 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_control_authority_survives_equal_keys_in_two_live_kernels() {
+        let (_first_kernel, first) = bootstrap(9_640);
+        let (_second_kernel, second) = bootstrap(9_640);
+        let first_slot = first.thread().control_lease();
+        let second_slot = second.thread().control_lease();
+        assert_eq!(first_slot.identity(), second_slot.identity());
+        assert!(first.task().owns_thread_control(&first_slot));
+        assert!(second.task().owns_thread_control(&second_slot));
+        assert!(!first.task().owns_thread_control(&second_slot));
+        assert!(!second.task().owns_thread_control(&first_slot));
+    }
+
+    #[test]
     fn lifecycle_adoption_retains_born_control_in_two_processes() {
         let (kernel, root) = bootstrap(9_630);
         let peer = kernel

@@ -75,6 +75,10 @@ impl ThreadControlArena {
             allocation: Some(allocation),
         }))
     }
+
+    pub(in crate::kernel) fn owns(&self, lease: &ThreadControlLease) -> bool {
+        Weak::ptr_eq(&lease.0.arena, &Arc::downgrade(&self.0))
+    }
 }
 
 #[derive(Debug)]
@@ -140,6 +144,28 @@ impl Deref for ThreadControlLease {
 mod tests {
     use super::*;
     use crate::kernel::ids::{LinuxTid, ObjectIdRegistry, TaskId};
+
+    #[test]
+    fn equal_numeric_keys_do_not_cross_live_arena_authorities() {
+        let ids = ObjectIdRegistry::new();
+        let owner = TaskKey {
+            id: TaskId::from_abi_positive(100).unwrap(),
+            serial: ids.task_serial().unwrap(),
+        };
+        let key = ThreadKey {
+            tid: LinuxTid::from_abi_positive(101).unwrap(),
+            serial: ids.thread_serial().unwrap(),
+        };
+        let first = ThreadControlArena::new(owner);
+        let second = ThreadControlArena::new(owner);
+        let first_slot = first.allocate(key);
+        let second_slot = second.allocate(key);
+        assert_eq!(first_slot.identity(), second_slot.identity());
+        assert!(first.owns(&first_slot));
+        assert!(second.owns(&second_slot));
+        assert!(!first.owns(&second_slot));
+        assert!(!second.owns(&first_slot));
+    }
 
     #[test]
     fn pins_delay_reuse_and_release_backing_after_arena_teardown() {

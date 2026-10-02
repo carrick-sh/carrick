@@ -843,6 +843,13 @@ impl Task {
         self.controls.allocate(key)
     }
 
+    pub(in crate::kernel) fn owns_thread_control(
+        &self,
+        control: &super::ThreadControlLease,
+    ) -> bool {
+        self.controls.owns(control)
+    }
+
     /// Mark this task as having run on an executor, returning `true` on first call.
     pub fn mark_first_run(&self) -> bool {
         !self.has_run.swap(true, Ordering::AcqRel)

@@ -2967,8 +2967,8 @@ impl Thread {
         control: super::ThreadControlLease,
         caller_affinity: CpuAffinity,
     ) -> ThreadRef {
-        let (owner, key) = control.identity();
-        if owner != task.key() {
+        let (_, key) = control.identity();
+        if !task.owns_thread_control(&control) {
             carrick_fatal!("thread::control", "adoption crossed control owner");
         }
         Arc::new(Thread {
