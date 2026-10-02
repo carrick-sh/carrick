@@ -274,10 +274,7 @@ impl HvfVmState {
         dst: &mut [u8],
     ) -> Result<(), MemoryError> {
         let length = dst.len();
-        // Admitted MMs use live descriptors, not the host protection mirror.
-        if self.range_no_access(address, length) {
-            return Err(MemoryError::OutOfBounds { address, length });
-        }
+        // PROT_NONE gated once in the default `GuestMemory::read_bytes`/`read_into`.
         let custody = self.carrier_vm_custody();
         let mut copied = 0usize;
         while copied < length {
@@ -900,7 +897,11 @@ impl HvfVmState {
             let mapping = self.mapping_for_range(lookup_address, chunk_len);
             let mapping = if let Some(mapping) = mapping {
                 mapping
-            } else if allow_pristine && !self.range_write_denied(chunk_address, chunk_len) {
+            } else if allow_pristine
+                && !self
+                    .protections
+                    .range_write_denied(chunk_address, chunk_len)
+            {
                 // Prevalidation may accept explicit pristine provenance. Actual
                 // writes still materialize and authenticate their physical owner.
                 // If publication won while the initial lookup ran, the pristine
@@ -938,7 +939,10 @@ impl HvfVmState {
                 return Err(MemoryError::OutOfBounds { address, length });
             };
             if require_guest_writable
-                && (!mapping.guest_writable || self.range_write_denied(chunk_address, chunk_len))
+                && (!mapping.guest_writable
+                    || self
+                        .protections
+                        .range_write_denied(chunk_address, chunk_len))
             {
                 carrick_observability::probes::guest_internal_write_fault(
                     chunk_address,
