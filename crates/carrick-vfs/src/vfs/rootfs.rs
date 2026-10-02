@@ -1657,7 +1657,7 @@ impl RootFsVfs {
         to: &str,
         no_replace: bool,
     ) -> Result<RenameOutcome, VfsError> {
-        self.rename_with_flags_and_publish(from, to, no_replace, || (), |(), outcome| outcome)
+        self.rename_with_flags_and_publish(from, to, no_replace, |_| (), |(), outcome| outcome)
     }
 
     pub fn rename_with_flags_and_publish<P, R>(
@@ -1665,7 +1665,7 @@ impl RootFsVfs {
         from: &str,
         to: &str,
         no_replace: bool,
-        prepare: impl FnOnce() -> P,
+        prepare: impl FnOnce(Option<RootFsEntryKind>) -> P,
         publish: impl FnOnce(P, RenameOutcome) -> R,
     ) -> Result<R, VfsError> {
         enum Attempt<R> {
@@ -1692,7 +1692,8 @@ impl RootFsVfs {
                 if changes_topology && !permit.topology_exclusive() {
                     return Ok::<Attempt<R>, VfsError>(Attempt::Upgrade);
                 }
-                let prepared = prepare.take().ok_or(LINUX_EINVAL)?();
+                let prepared =
+                    prepare.take().ok_or(LINUX_EINVAL)?(from_info.as_ref().map(|info| info.kind));
                 let outcome = self.rename_with_flags_admitted_info(
                     permit, from, to, no_replace, from_info, to_info,
                 )?;
@@ -4344,7 +4345,8 @@ mod tests {
                     "/tmp/first",
                     "/tmp/renamed",
                     false,
-                    || {
+                    |kind| {
+                        assert_eq!(kind, Some(RootFsEntryKind::File));
                         assert!(holder_vfs.lookup("/tmp/first").is_ok());
                         assert!(holder_vfs.lookup("/tmp/renamed").is_err());
                         prepared_tx.send(()).unwrap();

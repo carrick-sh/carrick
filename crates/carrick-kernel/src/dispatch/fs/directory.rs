@@ -427,14 +427,12 @@ impl<'a> FsView<'a> {
             &resolved_old,
             &resolved_new,
             no_replace,
-            || {
+            |source_kind| {
                 let (moved_executable, replaced_executable) =
                     self.executable_object_ids_for_rename(&resolved_old, &resolved_new);
                 let same_executable_object =
                     moved_executable.is_some() && moved_executable == replaced_executable;
-                let moved_directory = self
-                    .layered_metadata(&resolved_old)
-                    .is_ok_and(|metadata| metadata.kind == RootFsEntryKind::Directory);
+                let moved_directory = source_kind == Some(RootFsEntryKind::Directory);
                 let dnotify_rename_watched = !self.fs.dnotify_registry.lock().is_empty();
                 let moved_is_dir = if self.fs.inotify_registry.is_empty() && !dnotify_rename_watched
                 {
