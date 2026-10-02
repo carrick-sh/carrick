@@ -4778,6 +4778,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         &mut self,
         far: u64,
         access: carrick_mmu_core::aarch64::LeafAccess,
+        kind: carrick_mmu_core::aarch64::Stage1FaultKind,
     ) -> Result<bool, TrapError> {
         // Read the HARDWARE-visible leaf, never the software model: the model
         // is exactly what stopped naming this page when the sibling committed
@@ -4799,7 +4800,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 "stale stage-1 fault at {far:#x} retried {STALE_STAGE1_RETRY_BOUND} times: the live walk {walk:x?} permits {access:?} but the vCPU keeps faulting (a stage-1 leaf naming a frame stage-2 no longer maps)"
             )));
         }
-        self.run_stage1_maintenance()?;
+        let invalidate = kind.stale_retry_needs_invalidation(self.stale_stage1_retry.1);
+        carrick_observability::probes::hvpatch_stale_stage1_fault(
+            far,
+            kind as u32,
+            invalidate,
+            self.stale_stage1_retry.1,
+        );
+        if invalidate {
+            self.run_stage1_maintenance()?;
+        }
         Ok(true)
     }
 

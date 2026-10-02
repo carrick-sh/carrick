@@ -4291,6 +4291,7 @@ where
                                 engine,
                                 si_addr,
                                 fault_access,
+                                signal::el0_fault_kind(syndrome),
                                 faulting_tid,
                                 mutation,
                             )
@@ -4392,6 +4393,7 @@ where
                                 &self.kernel.dispatcher,
                                 engine,
                                 fault_addr,
+                                None,
                                 None,
                                 faulting_tid,
                                 mutation,
