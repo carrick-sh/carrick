@@ -36,15 +36,11 @@
 //!
 //! # Garbage collection
 //!
-//! The parked description holds one logical fd reference, exactly like an
-//! in-flight fd on Linux (a passed pipe writer keeps the pipe open until it
-//! is received and closed). If the message is never received — the
-//! receiving socket is closed with the message still queued — every read-end
-//! reference dies inside the kernel and the retained write end reports
-//! `POLLERR`/`POLLHUP` from `poll(2)`: that is the signal that nothing can
-//! ever claim the entry, and its reference is released. `gc` runs on every
-//! park/claim and on socket close, so an orphaned entry is collected at the
-//! next rights operation or socket close in the carrier.
+//! The parked description holds one logical fd reference (like an in-flight fd
+//! on Linux). If the message is never received and the socket closes, read ends
+//! die and the retained writer reports `POLLERR`/`POLLHUP` from `poll(2)`: that
+//! signals nothing can claim the entry, releasing its reference. `gc` runs on
+//! every park/claim and socket close to collect orphaned entries.
 //!
 //! # Scope
 //!
@@ -66,12 +62,14 @@ struct Parked {
     writer: OwnedFd,
 }
 
-/// `(st_dev, st_ino)` of a placeholder pipe, as reported by `fstat` of either
-/// end (or any dup of one).
+/// `(st_dev, st_ino, st_ctime)` of a placeholder pipe from `fstat` of either end.
+///
+/// Nanosecond creation timestamp keeps key identity unambiguous across allocations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct PlaceholderKey {
     dev: u64,
     ino: u64,
+    ctime: (i64, i64),
 }
 
 impl PlaceholderKey {
@@ -79,6 +77,7 @@ impl PlaceholderKey {
         Self {
             dev: st.st_dev as u64,
             ino: st.st_ino,
+            ctime: (st.st_ctime as i64, carrick_portable::stat_ctime_nsec(st)),
         }
     }
 
@@ -112,13 +111,14 @@ fn park(description: Arc<FileDescription>) -> Option<(PlaceholderKey, OwnedFd)> 
     description.retain_fd_ref();
     let mut vault = lock();
     collect(&mut vault);
-    vault.insert(
+    let prev = vault.insert(
         key,
         Parked {
             description,
             writer,
         },
     );
+    assert!(prev.is_none(), "vault key collision: entry already exists");
     Some((key, reader))
 }
 
@@ -473,5 +473,55 @@ mod tests {
         assert_eq!(description.fd_ref_count(), 1);
         batch.abort();
         assert_eq!(description.fd_ref_count(), 0);
+    }
+
+    #[test]
+    fn stale_placeholder_key_cannot_claim_recycled_pipe_allocation() {
+        let original = eventfd_description();
+        let (stale_key, reader) = park(Arc::clone(&original)).unwrap();
+        let claimed = claim(stale_key).unwrap();
+        claimed.release_fd_ref();
+        drop(reader);
+
+        // Allocate placeholder pipes until the kernel reuses the stale inode.
+        // The key must be unambiguous across pipe allocations so that stale_key
+        // can never claim a new entry parked under a recycled kernel inode.
+        let mut parked_entries = Vec::new();
+        for _ in 0..100 {
+            let next_desc = eventfd_description();
+            let (next_key, next_reader) = park(Arc::clone(&next_desc)).unwrap();
+            assert!(
+                claim(stale_key).is_none(),
+                "stale key must not claim a newly parked entry even if (dev, ino) was recycled"
+            );
+            parked_entries.push((next_key, next_reader, next_desc));
+        }
+        for (k, _r, d) in parked_entries {
+            let c = claim(k).unwrap();
+            assert!(Arc::ptr_eq(&c, &d));
+            c.release_fd_ref();
+        }
+    }
+
+    #[test]
+    fn concurrent_scm_rights_do_not_interfere() {
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for _ in 0..10 {
+                    match i % 3 {
+                        0 => red_until_step3_m4_rights_create_placeholder_per_message(),
+                        1 => red_until_step3_m4_cyclic_rights_survive_last_external_close(),
+                        _ => gc_releases_a_placeholder_nobody_can_receive_any_more(),
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
