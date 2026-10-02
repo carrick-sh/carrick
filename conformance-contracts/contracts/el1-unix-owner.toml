@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.el1.unix-owner"
+title = "Guest AF_UNIX queues and address registries have one owner"
+guest_surfaces = ["syscall:socketpair", "syscall:bind", "syscall:connect", "syscall:accept", "syscall:shutdown", "syscall:sendmsg", "syscall:recvmsg"]
+semantic_authority = ["man 7 unix", "man 2 socket", "man 2 shutdown"]
+fixture = "two live tables with connected streams and separate equal-address registries"
+scale_points = [1, 8, 64]
+rationale = "Guest stream bytes must not live in the host PureSocketState queue. Count scoped queued bytes at each scale, drain and verify payload and guest peer credentials. Separate registries must isolate equal abstract/pathname bytes. This does not prove namespace wiring, pathname permissions or AF_UNIX EL1 protocol ownership."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::net::unix_pure::tests::{red_until_step3_m4_stream_payloads_live_in_host_socket_state,m4_equal_address_bytes_are_isolated_by_registry_owner,socketpair_stream_round_trip,abstract_namespace_bind_connect,dgram_socket_round_trip,unix_stream_local_shut_rd_poll_mask_epollrdhup,unix_stream_final_close_keeps_existing_epipe_semantics}"
+
+[bindings.unresolved]
+embed_structural = "STREAM/DGRAM/SEQPACKET, namespace integration, ancillary truncation and cyclic reclamation require carrick-conformance-next two-process cutover bindings."
+docker = "No Docker in preparation; native arm64 AF_UNIX differential remains required."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

@@ -1572,6 +1572,111 @@ mod tests {
     use crate::network::interposer::HttpMock;
 
     #[test]
+    fn red_until_step3_m4_stream_payloads_live_in_host_socket_state() {
+        use crate::dispatch::fd_table::{
+            OpenDescription, OpenDescriptionBase, kernel_file_description,
+        };
+        use crate::kernel::ids::ObjectIdRegistry;
+        use crate::kernel::{FileSlotNumber, FileTable};
+        for pairs in [1, 8, 64] {
+            let ids = ObjectIdRegistry::new();
+            let sender = FileTable::new(ids.file_table_id().unwrap());
+            let receiver = FileTable::new(ids.file_table_id().unwrap());
+            let mut host_bytes = 0;
+            for index in 0..pairs {
+                let first = LinuxUcred {
+                    pid: 100,
+                    uid: 1000,
+                    gid: 1000,
+                };
+                let second = LinuxUcred {
+                    pid: 200,
+                    uid: 2000,
+                    gid: 2000,
+                };
+                let (left, right) = PureSocketInner::pair(LINUX_SOCK_STREAM, first, second);
+                for (table, socket) in [(&sender, &left), (&receiver, &right)] {
+                    let description = kernel_file_description(
+                        Arc::new(parking_lot::RwLock::new(OpenDescription::InMemorySocket {
+                            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                            socket: Arc::clone(socket),
+                        })),
+                        crate::linux_abi::LINUX_O_RDWR,
+                    );
+                    description.retain_fd_ref();
+                    table.install(
+                        FileSlotNumber::for_open_fd(index + 3).unwrap(),
+                        description,
+                        false,
+                    );
+                }
+                assert_eq!(right.peer_creds(), Ok(first));
+                assert_eq!(left.send_stream(b"payload", Vec::new()), Ok(7));
+                host_bytes += right.state.lock().stream_buf.len();
+                let mut received = [0; 7];
+                assert_eq!(right.recv_stream(&mut received, 0).unwrap().0, 7);
+                assert_eq!(&received, b"payload");
+                assert_eq!(right.state.lock().stream_buf.len(), 0);
+            }
+            assert_eq!(host_bytes, pairs as usize * 7);
+            let result = if host_bytes == 0 {
+                Ok(())
+            } else {
+                Err("guest stream payload remains in host PureSocketState queue")
+            };
+            assert_eq!(
+                result.expect_err("flips at M4 cutover"),
+                "guest stream payload remains in host PureSocketState queue"
+            );
+        }
+    }
+
+    #[test]
+    fn m4_equal_address_bytes_are_isolated_by_registry_owner() {
+        let first = UnixSocketRegistry::new();
+        let second = UnixSocketRegistry::new();
+        let creds = LinuxUcred {
+            pid: 100,
+            uid: 1000,
+            gid: 1000,
+        };
+        let left = PureSocketInner::new(LINUX_SOCK_DGRAM, creds);
+        let right = PureSocketInner::new(LINUX_SOCK_DGRAM, creds);
+        let name = b"same-abstract";
+        let path = "/same/path";
+        first
+            .register_abstract(name.to_vec(), Arc::clone(&left))
+            .unwrap();
+        second
+            .register_abstract(name.to_vec(), Arc::clone(&right))
+            .unwrap();
+        first
+            .register_pathname(path.to_owned(), Arc::clone(&left))
+            .unwrap();
+        second
+            .register_pathname(path.to_owned(), Arc::clone(&right))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.lookup_abstract(name).unwrap(), &left));
+        assert!(Arc::ptr_eq(&second.lookup_abstract(name).unwrap(), &right));
+        assert!(Arc::ptr_eq(&first.lookup_pathname(path).unwrap(), &left));
+        assert!(Arc::ptr_eq(&second.lookup_pathname(path).unwrap(), &right));
+        first.unregister_abstract(name);
+        first.unregister_pathname(path);
+        assert!(first.lookup_abstract(name).is_none());
+        assert!(first.lookup_pathname(path).is_none());
+        assert!(second.lookup_abstract(name).is_some());
+        assert!(second.lookup_pathname(path).is_some());
+        first
+            .register_abstract(name.to_vec(), Arc::clone(&right))
+            .unwrap();
+        first
+            .register_pathname(path.to_owned(), Arc::clone(&right))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.lookup_abstract(name).unwrap(), &right));
+        assert!(Arc::ptr_eq(&first.lookup_pathname(path).unwrap(), &right));
+    }
+
+    #[test]
     fn socketpair_stream_round_trip() {
         let creds1 = LinuxUcred {
             pid: 100,

@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.el1.unix-rights"
+title = "Guest rights retain exact descriptions without host placeholder transport"
+guest_surfaces = ["syscall:sendmsg", "syscall:recvmsg", "syscall:close"]
+semantic_authority = ["man 7 unix", "man 2 recvmsg"]
+fixture = "VM-free scoped two-owner seam; see M2-M5 witness ledger"
+scale_points = [1, 8, 64]
+rationale = "Two live tables send original descriptions through sender close and fd reuse. Receiver retains exact identity and independent CLOEXEC. At 1/8/64 messages guest transport must create zero host placeholders. Cyclic graphs and ancillary fault rollback require further bindings."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::net::scm_rights::tests::{red_until_step3_m4_rights_create_placeholder_per_message,a_dup_of_the_placeholder_claims_the_parked_description,gc_releases_a_placeholder_nobody_can_receive_any_more,abort_returns_the_references_of_an_unsent_batch}"
+
+[bindings.unresolved]
+embed_structural = "No EL0 execution in preparation. Cutover requires carrick-conformance-next bindings for the unresolved scenarios listed in the witness ledger."
+docker = "No Docker in preparation; native arm64 differential remains required at cutover."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20
