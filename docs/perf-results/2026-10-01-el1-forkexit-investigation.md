@@ -312,3 +312,34 @@ metadata allocator uses MAP_SHARED backing specifically to preserve the
 host/HVF alias across host COW. Stable Rust addresses alone do not prove
 that property. No unsafe retained-backing implementation for these kernel
 leases has been installed by this slice.
+
+### Final host-gate receipt for this partial slice
+
+On the committed source through `0f874d06f`, all of these completed with
+exit zero, with `CARGO_BUILD_JOBS=3` and builds serialized:
+
+- `just test-kernel` (`/tmp/forkexit-l4-lifecycle-page-test-kernel.log`);
+- `cargo test -p carrick-el1 --lib`: 181 passed
+  (`/tmp/forkexit-l4-retained-mapping-el1.log`);
+- `RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib`: 682 passed,
+  three ignored (`/tmp/forkexit-l4-retained-mapping-hvf.log`), followed by
+  the strengthened retained-mapping contract passing separately;
+- `cargo test -p carrick-kernel --lib lifecycle_`: 21 passed after adding
+  the process-scope assertions;
+- `just clippy` (`/tmp/forkexit-l4-clippy-final.log`);
+- `just lint-domains` (`/tmp/forkexit-l4-lint-domains-accepted.log`).
+
+The full domain gate initially exposed the unclassified immutable
+`LIFECYCLE_HATCHES` policy static, then stale K1 taxonomy positions. Both
+were fixed explicitly and committed. The final run passed; its compiler
+census remains the macOS subset, with off-host profiles reported pending.
+The taxonomy correction changed 47 line positions only, with no new,
+removed or reclassified authority sites.
+
+These receipts do not close L4. Step 1 still lacks runtime publication and
+an actual venue passed by `dispatch_syscall_with_ipc`; the shared host
+VM-object backing requirement remains unqualified for the kernel heap
+storage. ABI birth/exit settlement, conflicting-authority admission,
+host-adopted accounting, pending-signal integration and lifecycle teardown
+remain open. No signed acceptance was run, and no new fork-COW residual-exit
+receipt for this tree is claimed.
