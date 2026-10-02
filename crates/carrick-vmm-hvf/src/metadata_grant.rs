@@ -34,6 +34,8 @@ pub struct MetadataGrantStats {
 /// The range must remain allocated and at a stable address until this owner
 /// drops. It must contain only shared ABI data, permit concurrent atomic
 /// access, and be aligned and sized to the host's 16 KiB mapping granule.
+/// The host VM object must also remain stable while published (for example,
+/// MAP_SHARED backing); host COW must not replace the object mapped by HVF.
 pub unsafe trait RetainedMetadataBacking: std::fmt::Debug + Send + Sync {
     fn host_base(&self) -> carrick_guest_mem::HostVa;
     fn mapped_len(&self) -> usize;
