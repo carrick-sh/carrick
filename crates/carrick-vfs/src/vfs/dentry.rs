@@ -186,6 +186,9 @@ pub struct ResolvedDentry {
     pub dentry: PositiveDentry,
     pub canonical_path: String,
     pub parent_dir_fd: Option<Arc<OwnedFd>>,
+    /// Descriptor retained while resolving a directory, independent of later
+    /// eviction of its cache ID. This is an operation capability, not a pin.
+    pub upper_directory_fd: Option<Arc<OwnedFd>>,
     // A warm lookup clones this record on every open. Share the immutable
     // leaf bytes instead of allocating another CString for each clone.
     pub leaf_name_c: Arc<CString>,
@@ -780,12 +783,13 @@ impl DentryCache {
                     accessed: Arc::new(AtomicBool::new(true)),
                 },
                 canonical_path: "/".to_string(),
+                upper_directory_fd: upper_fd.clone(),
                 parent_dir_fd: None,
                 leaf_name_c: Arc::new(CString::new("/").map_err(|_| LINUX_ENOENT)?),
             });
         }
 
-        let (parent_id, leaf_name, path) = {
+        let (parent_id, leaf_name, path, upper_directory_fd) = {
             let dirs = self.dirs.read();
             let d = match dirs.get(&dir_id) {
                 Some(d) => {
@@ -795,7 +799,12 @@ impl DentryCache {
                 None => return Err(LINUX_EAGAIN),
             };
             let (parent_id, leaf_name) = d.parent.as_ref().ok_or(LINUX_ENOENT)?;
-            (*parent_id, leaf_name.clone(), d.path.clone())
+            (
+                *parent_id,
+                leaf_name.clone(),
+                d.path.clone(),
+                d.upper_dir_fd.clone(),
+            )
         };
 
         let leaf_parent_fd = {
@@ -817,6 +826,7 @@ impl DentryCache {
             dentry: node,
             canonical_path: path,
             parent_dir_fd: leaf_parent_fd,
+            upper_directory_fd,
             leaf_name_c: Arc::new(leaf_name_c),
         })
     }
@@ -1178,6 +1188,7 @@ impl DentryCache {
                         dentry: node,
                         canonical_path: leaf_path,
                         parent_dir_fd: leaf_parent_fd,
+                        upper_directory_fd: None,
                         leaf_name_c: Arc::new(leaf_name_c),
                     });
                 }
@@ -1238,6 +1249,7 @@ impl DentryCache {
                     return Ok(ResolvedDentry {
                         dentry: node,
                         canonical_path: dir.path.clone(),
+                        upper_directory_fd: dir.upper_dir_fd.clone(),
                         parent_dir_fd: leaf_parent_fd,
                         leaf_name_c: Arc::new(leaf_name_c),
                     });
@@ -1253,6 +1265,7 @@ impl DentryCache {
                     dentry: node,
                     canonical_path: leaf_path,
                     parent_dir_fd: leaf_parent_fd,
+                    upper_directory_fd: None,
                     leaf_name_c: Arc::new(leaf_name_c),
                 });
             } else {
@@ -2581,6 +2594,9 @@ impl DentryCache {
         let dir_id = resolved.dentry.id.ok_or(LINUX_ENOTDIR)?;
         if resolved.dentry.kind != RootFsEntryKind::Directory {
             return Err(LINUX_ENOTDIR);
+        }
+        if let Some(fd) = resolved.upper_directory_fd {
+            return Ok(fd);
         }
         self.get_or_open_dir_fd_by_id(dir_id, backend)
     }

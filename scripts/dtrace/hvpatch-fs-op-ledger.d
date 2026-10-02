@@ -3,7 +3,8 @@
  * lane, split into host-kernel time and carrick userspace time?
  *
  * (a) WHAT IT MEASURES. For every guest syscall whose name is in the fs set
- *     below (openat, close, unlinkat, newfstatat, mkdirat, renameat,
+ *     below (openat, close, unlinkat, linkat, newfstatat, mkdirat,
+ *     renameat, renameat2,
  *     fstat, faccessat, readlinkat, getdents64, statx, mmap, munmap), keyed by name:
  *       @wall        quantize of the service window (syscall-entry -> -return)
  *       @wall_sum    total window ns
@@ -43,6 +44,10 @@
  * counters and the target-exit ABI are requalified by each retained capture;
  * nanoseconds remain perturbed diagnostic values, never acceptance timing.
  *
+ * 2026-10-02: include linkat and renameat2 in the same operation-window
+ * census. In particular RENAME_EXCHANGE/NOREPLACE must not disappear into
+ * outside-window totals merely because their syscall spelling differs.
+ *
  * Usage:
  *   carrick trace -s scripts/dtrace/hvpatch-fs-op-ledger.d -- run ... (auto-sudo)
  *   sudo dtrace -q -s scripts/dtrace/hvpatch-fs-op-ledger.d 60 -c "<command>"
@@ -69,6 +74,7 @@ carrick*:::syscall-entry
 	self->fs = (this->name == "openat" || this->name == "close" ||
 	    this->name == "unlinkat" || this->name == "newfstatat" ||
 	    this->name == "mkdirat" || this->name == "renameat" ||
+	    this->name == "renameat2" || this->name == "linkat" ||
 	    this->name == "fstat" || this->name == "faccessat" ||
 	    this->name == "readlinkat" || this->name == "getdents64" ||
 	    this->name == "statx" || this->name == "mmap" ||
