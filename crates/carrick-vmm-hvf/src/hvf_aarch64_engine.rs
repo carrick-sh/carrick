@@ -3563,10 +3563,10 @@ mod task_only_materializer_tests {
 
         let trap = include_str!("trap.rs");
         let sibling_prepare = trap
-            .split("pub(crate) fn sibling(")
+            .split("fn shared_mm_projection(")
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) fn process(").next())
-            .expect("task-only sibling preparation");
+            .expect("task-only shared-MM preparation used by sibling and vfork");
         assert!(sibling_prepare.contains("cow_authority: _"));
         assert!(sibling_prepare.contains("cow_identity: _"));
         assert!(!sibling_prepare.contains("cow_authority,"));
