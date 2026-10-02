@@ -14,14 +14,15 @@ carrick_flags = ["--fs", "host"]
 name = "thread-spawn"
 ecosystem = "node"
 image = "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0"
-cmd = ["-e", "const {Worker}=require(\"node:worker_threads\"); (async()=>{const start=process.hrtime.bigint(); for(let i=0;i<1000;i++){await new Promise((resolve,reject)=>{const w=new Worker(\"\",{eval:true});w.on(\"error\",reject);w.on(\"exit\",code=>code===0?resolve():reject(new Error(`exit ${code}`)));});} console.log(\"impact_window_ns=\"+(process.hrtime.bigint()-start));})().catch(e=>{console.error(e);process.exitCode=1;});"]
+cmd = ["/opt/nodejs-conformance/bin/node24", "-e", "const {Worker}=require(\"node:worker_threads\"); (async()=>{const start=process.hrtime.bigint(); for(let i=0;i<1000;i++){await new Promise((resolve,reject)=>{const w=new Worker(\"\",{eval:true});w.on(\"error\",reject);w.on(\"exit\",code=>code===0?resolve():reject(new Error(`exit ${code}`)));});} console.log(\"impact_window_ns=\"+(process.hrtime.bigint()-start));})().catch(e=>{console.error(e);process.exitCode=1;});"]
 verdict = "shell"
 tier = "full"
 weight = "heavy"
 timeout_s = 300
 carrick_flags = ["--fs", "host"]
 [suite.entrypoint]
-both = "/opt/nodejs-conformance/bin/node24"
+# Begin cmd with the executable so Carrick does not parse Node's -e as host env.
+both = ""
 
 [[suite]]
 name = "fork-exec"
