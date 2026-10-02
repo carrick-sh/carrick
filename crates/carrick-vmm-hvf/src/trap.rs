@@ -3065,6 +3065,15 @@ pub struct ProcessSpec {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ProcessSpec {
+    pub(crate) fn thread_services(&self) -> HvpatchThreadServices {
+        HvpatchThreadServices {
+            vm: self.vm.clone(),
+            mailbox_slots: self.mailbox_slots.clone(),
+            syscall_transport: self.syscall_transport,
+            carrier_foreign_mm_transport: self.carrier_foreign_mm_transport.clone(),
+        }
+    }
+
     pub(crate) fn new(
         vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
         plan: ProcessSpecPlan,
@@ -3132,6 +3141,38 @@ impl ProcessSpec {
         self.mappings = plan.mappings;
         self.inventory_mappings = plan.inventory_mappings;
         result
+    }
+}
+
+/// Carrier service handles, with no vCPU, mailbox claim or pthread identity.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+pub(crate) struct HvpatchThreadServices {
+    vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    syscall_transport: HvfSyscallTransport,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchThreadServices {
+    pub(crate) fn sibling(&self, task: &HvfTaskState) -> ThreadSpec {
+        ThreadSpec {
+            vm: self.vm.clone(),
+            mappings: task
+                .mappings
+                .iter()
+                .map(ThreadMappingDesc::from_region)
+                .collect(),
+            mm_access: task.mm_access.clone(),
+            carrier_foreign_mm_transport: self.carrier_foreign_mm_transport.clone(),
+            mailbox_slots: self.mailbox_slots.clone(),
+            syscall_transport: self.syscall_transport,
+            persistent_vm_lifecycle: true,
+            mm_root_slot: task.mm_root_slot,
+            container_root: task.container_root,
+            cow_authority: task.cow_authority.clone(),
+            cow_identity: task.cow_identity,
+        }
     }
 }
 

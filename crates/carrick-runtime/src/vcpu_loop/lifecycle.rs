@@ -103,6 +103,18 @@ pub(super) trait HvpatchCloneBackendOps<M: threads::CloneTidMemory> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn bind_activate_child<M: threads::CloneTidMemory, O: HvpatchCloneBackendOps<M>>(
+    ops: &mut O,
+    backend: &mut O::Backend,
+    token: carrick_hal::HvpatchChildKernelToken,
+    after_bind: impl FnOnce() -> Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
+    ops.bind_child_kernel(backend, token)?;
+    after_bind()?;
+    ops.activate_child(backend)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type HvpatchProcessPreparation<P> = (
     P,
     carrick_hal::threaded::GuestCpuState,

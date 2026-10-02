@@ -7,6 +7,17 @@ use super::objects::{TaskKey, ThreadKey};
 
 /// Installed by the execution lane for one exact process, never the carrier.
 pub trait ThreadBirthAdoptionFactory: fmt::Debug + Send + Sync {
+    fn executable_births(&self) -> bool {
+        false
+    }
+    fn adopt_first_host_entry(
+        &self,
+        _context: &super::KernelContext,
+        _reservation: ThreadBirthAdoptionReservation,
+        _frame: &carrick_el1_abi::ThreadCtx,
+    ) -> Result<(), String> {
+        Err("execution lane has no born-thread adoption binding".into())
+    }
     fn owner(&self) -> TaskKey;
     fn reserve(&self, thread: ThreadKey) -> Option<ThreadBirthAdoptionReservation>;
 }

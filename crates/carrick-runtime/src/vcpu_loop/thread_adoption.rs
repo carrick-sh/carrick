@@ -12,6 +12,53 @@ use carrick_kernel::kernel::{KernelContext, TaskKey, ThreadKey};
 use super::binding::InjectedExecutionLeaseSlot;
 use super::*;
 
+/// Resolves Send service tokens only under their exact process/MM authority.
+struct OwnedProcessBirthTemplate<T> {
+    owner: TaskKey,
+    mm: carrick_kernel::kernel::MmId,
+    graph: Weak<carrick_kernel::kernel::Kernel>,
+    resource: parking_lot::Mutex<T>,
+}
+impl<T> OwnedProcessBirthTemplate<T> {
+    fn new(context: &KernelContext, resource: T) -> Self {
+        Self {
+            owner: context.task().key(),
+            mm: context.shared().mm().id(),
+            graph: Arc::downgrade(context.kernel()),
+            resource: parking_lot::Mutex::new(resource),
+        }
+    }
+    fn with_authority<R>(
+        &self,
+        owner: TaskKey,
+        mm: carrick_kernel::kernel::MmId,
+        graph: &Arc<carrick_kernel::kernel::Kernel>,
+        resolve: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        if owner != self.owner
+            || mm != self.mm
+            || !Weak::ptr_eq(&self.graph, &Arc::downgrade(graph))
+        {
+            return None;
+        }
+        Some(resolve(&mut self.resource.lock()))
+    }
+
+    #[cfg(test)]
+    fn with_owner<R>(
+        &self,
+        context: &KernelContext,
+        resolve: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        self.with_authority(
+            context.task().key(),
+            context.shared().mm().id(),
+            context.kernel(),
+            resolve,
+        )
+    }
+}
+
 /// EL0 state comes from the born record; MM/system state belongs to its process.
 #[derive(Clone)]
 struct ProcessThreadCpuTemplate {
@@ -112,6 +159,13 @@ pub(super) enum ThreadAdoptionOrigin {
 pub(super) struct ProcessThreadAdoptionFactory<E: ThreadedEngine> {
     owner: TaskKey,
     cpu_template: Option<ProcessThreadCpuTemplate>,
+    backend_template: Option<
+        Arc<
+            OwnedProcessBirthTemplate<
+                carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate,
+            >,
+        >,
+    >,
     kernel: Weak<KernelState>,
     task: Weak<carrick_kernel::kernel::objects::Task>,
     registry: Arc<ThreadRegistry>,
@@ -138,12 +192,16 @@ struct ReservedThreadRuntime<E: ThreadedEngine> {
     injected_lease: Arc<InjectedExecutionLeaseSlot>,
     origin: ThreadAdoptionOrigin,
     cpu: Option<ProcessThreadCpuReservation>,
+    backend: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>,
+    cow: Option<(Arc<memory::KernelFrameCowAuthority>, std::num::NonZeroU64)>,
     submission: carrick_kernel::kernel::scheduler::ProcessBirthSubmission,
 }
 
 pub(super) struct AdoptedThreadRuntime<E: ThreadedEngine> {
     pub(super) kernel: Kernel,
     pub(super) cpu: Option<carrick_kernel::kernel::objects::MigratableTaskState>,
+    pub(super) backend: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>,
+    pub(super) cow: Option<(Arc<memory::KernelFrameCowAuthority>, std::num::NonZeroU64)>,
     pub(super) state: ThreadRuntimeState<E>,
     pub(super) injected_lease: Arc<InjectedExecutionLeaseSlot>,
     pub(super) submission: carrick_kernel::kernel::scheduler::ProcessBirthSubmission,
@@ -182,10 +240,21 @@ where
         Ok(self)
     }
 
+    pub(super) fn with_backend_template(
+        mut self,
+        context: &KernelContext,
+        template: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate>,
+    ) -> Self {
+        self.backend_template =
+            template.map(|template| Arc::new(OwnedProcessBirthTemplate::new(context, template)));
+        self
+    }
+
     pub(super) fn capture(kernel: &Kernel, state: &ThreadRuntimeState<E>) -> Option<Self> {
         Some(Self {
             owner: kernel.hvpatch_process.as_ref()?.task_key(),
             cpu_template: None,
+            backend_template: None,
             kernel: Arc::downgrade(kernel),
             task: Arc::downgrade(&state.kernel_thread.as_ref()?.task()?),
             registry: state.registry.clone(),
@@ -204,6 +273,18 @@ impl<E: ThreadedEngine + 'static> ThreadBirthAdoptionFactory for ProcessThreadAd
 where
     E::SiblingSpec: 'static,
 {
+    fn executable_births(&self) -> bool {
+        self.backend_template.is_some() && self.cpu_template.is_some()
+    }
+    fn adopt_first_host_entry(
+        &self,
+        context: &KernelContext,
+        reservation: ThreadBirthAdoptionReservation,
+        frame: &carrick_el1_abi::ThreadCtx,
+    ) -> Result<(), String> {
+        activate_born_thread::<E>(context, reservation, frame).map_err(|error| error.to_string())
+    }
+
     fn owner(&self) -> TaskKey {
         self.owner
     }
@@ -243,6 +324,65 @@ where
             .continuation_services(process.kernel_graph())
             .0;
         let submission = scheduler.reserve_process_birth(&task, thread).ok()?;
+        let backend = match &self.backend_template {
+            Some(template) => Some(template.with_authority(
+                task.key(),
+                task.shared().mm().id(),
+                process.kernel_graph(),
+                |template| {
+                    let GuestCpuState::Aarch64V1(cpu) = &self.cpu_template.as_ref()?.cpu.cpu else {
+                        return None;
+                    };
+                    let identity =
+                        carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity {
+                            task_serial: self.owner.serial.raw(),
+                            thread_serial: thread.serial.raw(),
+                            execution_generation:
+                                carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
+                            linux_pid: process.pid(),
+                            linux_tid: thread.tid.raw(),
+                            asid: (cpu.ttbr0 >> 48) as u16,
+                        };
+                    template
+                        .reserve(
+                            identity,
+                            kernel
+                                .hvpatch_runtime
+                                .as_ref()?
+                                .carrier_tasks(process.kernel_graph()),
+                        )
+                        .ok()
+                },
+            )??),
+            None => None,
+        };
+        let cow = match &backend {
+            Some(backend) => {
+                let GuestCpuState::Aarch64V1(cpu) = &self.cpu_template.as_ref()?.cpu.cpu else {
+                    return None;
+                };
+                let mm = task.shared().mm().id();
+                Some((
+                    Arc::new(memory::KernelFrameCowAuthority {
+                        runtime: Arc::downgrade(&kernel),
+                        deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(mm),
+                        kernel: process.kernel_graph().clone(),
+                        mm,
+                        owner_inventory: backend.frame_cow_owner_inventory(),
+                        tid: ThreadId::from_kernel_thread_identity(thread.tid.raw()),
+                        identity: carrick_hal::FrameCowIdentity {
+                            linux_pid: process.pid(),
+                            linux_tid: thread.tid.raw(),
+                            mm: mm.raw(),
+                            asid: (cpu.ttbr0 >> 48) as u16,
+                        },
+                        pt_quiesce: kernel.dispatcher.pt_quiesce(),
+                    }),
+                    memory::reserve_child_cow_authority_identity().ok()?,
+                ))
+            }
+            None => None,
+        };
         let mut state = Vec::new();
         state.try_reserve_exact(1).ok()?;
         let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
@@ -273,6 +413,8 @@ where
                 state,
                 injected_lease,
                 origin,
+                backend,
+                cow,
                 cpu: self
                     .cpu_template
                     .as_ref()
@@ -354,11 +496,92 @@ where
     };
     Ok(AdoptedThreadRuntime {
         kernel: reserved.kernel,
+        backend: reserved.backend,
+        cow: reserved.cow,
         cpu,
         state,
         injected_lease: reserved.injected_lease,
         submission: reserved.submission,
     })
+}
+
+fn activate_born_thread<E: ThreadedEngine + 'static>(
+    context: &KernelContext,
+    reservation: ThreadBirthAdoptionReservation,
+    frame: &carrick_el1_abi::ThreadCtx,
+) -> Result<(), TrapError>
+where
+    E::SiblingSpec: 'static,
+{
+    let mut adopted = adopt_thread_runtime::<E>(reservation, context, Some(frame))?;
+    let cpu = adopted
+        .cpu
+        .take()
+        .ok_or_else(|| TrapError::Hypervisor("born adoption lost CPU custody".into()))?;
+    let mut backend = adopted
+        .backend
+        .take()
+        .ok_or_else(|| TrapError::Hypervisor("born adoption lost backend custody".into()))?;
+    let (cow, authority_id) = adopted
+        .cow
+        .take()
+        .ok_or_else(|| TrapError::Hypervisor("born adoption lost COW custody".into()))?;
+    let runtime = adopted
+        .kernel
+        .hvpatch_runtime
+        .as_ref()
+        .ok_or_else(|| TrapError::Hypervisor("born adoption lost directory".into()))?
+        .clone();
+    let scheduler = runtime.continuation_services(context.kernel()).0;
+    let generation = scheduler
+        .publish_initial_task_state_gated(context.thread(), cpu.clone())
+        .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+    let token = cow
+        .issue_reserved_hvpatch_child_token(context, authority_id)
+        .map_err(TrapError::Hypervisor)?;
+    lifecycle::bind_activate_child::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine, _>(
+        &mut lifecycle::ProductionHvpatchCloneBackendOps,
+        &mut backend,
+        token,
+        || Ok(()),
+    )
+    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+    let tid = ThreadId::from_kernel_thread_identity(context.thread().key().tid.raw());
+    adopted
+        .state
+        .registry
+        .register_child_with_tid(tid, context.thread().control_slot().clear_child_tid());
+    let threads = adopted.state.threads.clone();
+    let mut logical = binding::prepare_hvpatch_logical_job(binding::HvpatchLogicalJobInput {
+        kernel: adopted.kernel,
+        state: adopted.state,
+        task_backend: executor::HvpatchTaskEngineBindingState::task_only(backend),
+        context: context.retain_exact(),
+        cpu,
+        generation,
+        injected_lease: adopted.injected_lease,
+        bootstrap_process_child: None,
+        bootstrap_thread_child: false,
+    })?;
+    let dormant = runtime.persistent_bindings().prepare_submission(
+        &scheduler,
+        executor::HvpatchSubmissionShape::ProcessBirth(adopted.submission),
+        None,
+        context.thread().clone(),
+        generation,
+        logical.binding.clone(),
+    )?;
+    threads::enroll_persistent_process_member(&threads, &logical.terminal_settlement);
+    let gate = context
+        .thread()
+        .take_opened_start_gate(generation)
+        .ok_or_else(|| TrapError::Hypervisor("born adoption lost start proof".into()))?;
+    logical.install_start_gate(gate)?;
+    dormant.activate(
+        &scheduler,
+        context.thread().clone(),
+        logical.activation_proof()?,
+    )
 }
 
 #[cfg(test)]
@@ -419,6 +642,13 @@ mod tests {
         let owner_cpu = executor::tests::task_state(&owner, 1_001);
         let peer_cpu = executor::tests::task_state(&peer, 2_002);
         let template = ProcessThreadCpuTemplate::capture(&owner, owner_cpu.clone()).unwrap();
+        let backend = OwnedProcessBirthTemplate::new(&owner, 17_u64);
+        assert_eq!(backend.with_owner(&owner, |value| *value), Some(17));
+        assert!(
+            backend.with_owner(&peer, |value| *value).is_none(),
+            "a live peer must not resolve another process's backend token"
+        );
+        assert_eq!(backend.with_owner(&owner, |value| *value), Some(17));
         let mut frame = carrick_el1_abi::ThreadCtx::ZERO;
         frame.x = std::array::from_fn(|i| 9_000 + i as u64);
         frame.pc = 0x1010;

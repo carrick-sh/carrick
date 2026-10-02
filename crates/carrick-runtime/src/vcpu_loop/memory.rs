@@ -128,6 +128,20 @@ pub(crate) struct KernelFrameCowAuthority {
     pub(crate) pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
 }
 
+pub(crate) fn reserve_child_cow_authority_identity() -> Result<std::num::NonZeroU64, String> {
+    static NEXT_AUTHORITY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let raw = NEXT_AUTHORITY_ID
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| current.checked_add(1),
+        )
+        .map_err(|_| "child COW authority identity exhausted".to_owned())?;
+    let authority_identity = std::num::NonZeroU64::new(raw)
+        .ok_or_else(|| "child COW authority identity is zero".to_owned())?;
+    Ok(authority_identity)
+}
+
 impl KernelFrameCowAuthority {
     #[allow(dead_code)] // consumed by the HVPatch child publication slice
     pub(crate) fn issue_hvpatch_child_token(
@@ -140,17 +154,15 @@ impl KernelFrameCowAuthority {
         {
             return Err("child token identity does not match Kernel COW authority".to_owned());
         }
-        static NEXT_AUTHORITY_ID: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
-        let raw = NEXT_AUTHORITY_ID
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |current| current.checked_add(1),
-            )
-            .map_err(|_| "child COW authority identity exhausted".to_owned())?;
-        let authority_identity = std::num::NonZeroU64::new(raw)
-            .ok_or_else(|| "child COW authority identity is zero".to_owned())?;
+        let authority_identity = reserve_child_cow_authority_identity()?;
+        self.issue_reserved_hvpatch_child_token(context, authority_identity)
+    }
+
+    pub(crate) fn issue_reserved_hvpatch_child_token(
+        self: Arc<Self>,
+        context: &carrick_kernel::kernel::KernelContext,
+        authority_identity: std::num::NonZeroU64,
+    ) -> Result<carrick_hal::HvpatchChildKernelToken, String> {
         let identity = self.identity;
         let authority: Arc<dyn carrick_hal::FrameCowAuthority> = self;
         context

@@ -299,6 +299,13 @@ impl ThreadIdentityPool {
         }) else {
             return false;
         };
+        if adoption.is_some()
+            && task
+                .thread_adoption_factory()
+                .is_some_and(|factory| factory.executable_births())
+        {
+            control.register_birth_entry(entry);
+        }
         entries.push_back(PooledThreadIdentity {
             entry,
             control,
@@ -646,6 +653,24 @@ impl ThreadLedger {
                     exited.push(context);
                     abi_count += 1;
                 }
+                if let Some(record) = state.tasks.get(&task_id)
+                    && record
+                        .task
+                        .thread_adoption_factory()
+                        .is_some_and(|factory| factory.executable_births())
+                    && let Some(thread) = record.task.threads().into_iter().next()
+                    && thread.control_lease().lifecycle().serves_threads()
+                {
+                    let context = KernelContext::from_parts(
+                        kernel.clone(),
+                        record.task.clone(),
+                        thread.clone(),
+                        record.task.shared(),
+                        thread.resources(),
+                        record.revision,
+                    );
+                    self.replenish(&kernel, &state, &context);
+                }
             }
         }
         self.pending.fetch_sub(count, Ordering::AcqRel);
@@ -904,6 +929,87 @@ impl Kernel {
     /// same settlement body through the registry's settled view.
     pub fn settle_thread_ledger(&self) {
         let _ = self.registry().settled();
+    }
+
+    pub fn prepare_executable_thread_births(&self, context: &KernelContext) {
+        if !context
+            .thread()
+            .control_lease()
+            .lifecycle()
+            .serves_threads()
+        {
+            return;
+        }
+        if context
+            .task()
+            .thread_adoption_factory()
+            .is_none_or(|factory| !factory.executable_births())
+        {
+            return;
+        }
+        let state = self.registry().settled().read();
+        let Some(record) = state
+            .tasks
+            .get(&context.task().key().id)
+            .filter(|record| record.task.key() == context.task().key())
+        else {
+            return;
+        };
+        {
+            let mut entries = record.thread_pool.entries.lock();
+            entries.retain(|entry| {
+                entry.adoption.is_some() || entry.page().revoke(entry.entry).is_err()
+            });
+        }
+        self.registry()
+            .thread_ledger()
+            .replenish(self, &state, context);
+    }
+
+    /// Release inactive capacity only after every carrier executor has joined.
+    /// # Safety
+    /// No executor may access or resume any lifecycle record in this kernel.
+    pub unsafe fn release_thread_birth_capacity_after_executors_stop(&self) {
+        let state = self.registry().settled().read();
+        for record in state.tasks.values() {
+            let mut entries = record.thread_pool.entries.lock();
+            for entry in entries.iter() {
+                entry.page().close();
+            }
+            entries.clear();
+            for published in record.thread_pool.published.lock().iter_mut() {
+                published.control.lifecycle().close();
+                drop(published.adoption.take());
+            }
+        }
+    }
+
+    pub fn adopt_born_thread_at_first_entry(
+        self: &Arc<Self>,
+        key: ThreadKey,
+        frame: &carrick_el1_abi::ThreadCtx,
+    ) -> Result<bool, String> {
+        let Some(thread) = self.exact_thread_for_scheduler(key) else {
+            return Ok(false);
+        };
+        if thread.execution_state().generation().is_some() {
+            return Ok(false);
+        }
+        let task = thread.task().ok_or("born thread lost task")?;
+        let context = self
+            .context(task.key().id, key.tid)
+            .map_err(|error| error.to_string())?;
+        if context.thread().key() != key {
+            return Err("born first entry changed identity".into());
+        }
+        let Some(reservation) = self.take_thread_birth_adoption(task.key(), key) else {
+            return Ok(false);
+        };
+        let factory = task
+            .thread_adoption_factory()
+            .ok_or("born thread lost adoption factory")?;
+        factory.adopt_first_host_entry(&context, reservation, frame)?;
+        Ok(true)
     }
 
     /// Consume only the born thread's exact process-owned first-entry capacity.
