@@ -1094,7 +1094,7 @@ where
             ]),
         );
         let cause = match handback {
-            Some(Handback::Signal) => Some(match reserved {
+            Some(Handback::Signal | Handback::GroupStop) => Some(match reserved {
                 // What the signal will do decides the interruption: a handler
                 // (its SA_RESTART), a default stop (man 7 signal: some calls
                 // fail with EINTR after SIGCONT, others continue), or nothing.
@@ -1120,12 +1120,12 @@ where
                         }
                     }
                 }
+                None if handback == Some(Handback::GroupStop) => host_ipc::IpcCause::Stop,
                 None => host_ipc::IpcCause::Signal { restart: false },
             }),
             // The deadline of a timed park (an epoll wait) the host kept
             // after it settled the slot.
             Some(Handback::Timeout) => Some(host_ipc::IpcCause::Timeout),
-            Some(Handback::GroupStop) => Some(host_ipc::IpcCause::Stop),
             // A control quantum for a job-control stop is a stop; the rest
             // (exec/exit drain, quiesce) never interrupt a call.
             Some(Handback::Control) if self.job_control_stopped() => Some(host_ipc::IpcCause::Stop),
