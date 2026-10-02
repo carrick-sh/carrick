@@ -1145,6 +1145,26 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
         return Ok(true);
     }
+    if dispatcher.el1_returns_owed() {
+        let context = dispatcher.capture_kernel_context(tid).map_err(|error| {
+            TrapError::Hypervisor(format!("capture fault backing settlement context: {error}"))
+        })?;
+        let permit = mutation.host_alias_permit();
+        if context.shared().mm().id() != permit.mm() {
+            return Err(TrapError::Hypervisor(
+                "fault backing settlement context names another MM".to_owned(),
+            ));
+        }
+        dispatcher
+            .with_kernel_resources(&context, || {
+                dispatcher.reconcile_el1_deferred_returns(&permit, engine)
+            })
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "settle EL1 predecessor backing before first touch: {error:?}"
+                ))
+            })?;
+    }
     if !el1_frame_grants_enabled() {
         cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
     }
