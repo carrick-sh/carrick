@@ -8,7 +8,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 fn retire_anonymous_mapping_backing(
     dispatcher: &MemView<'_>,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     length: u64,
     length_usize: usize,
