@@ -6176,12 +6176,38 @@ impl FsBackend for HostFsBackend {
             .file_name()
             .and_then(cstring_from_osstr)
             .ok_or(BackendError::Invalid)?;
+        self.hard_link_at(
+            &crate::vfs::rootfs::ResolvedParent {
+                parent_fd: Some(src_parent_fd),
+                leaf: src_leaf,
+                rel: NormalizedRelPath::from_normalized_str(
+                    src_norm.to_str().ok_or(BackendError::Invalid)?,
+                ),
+            },
+            &crate::vfs::rootfs::ResolvedParent {
+                parent_fd: Some(dst_parent_fd),
+                leaf: dst_leaf,
+                rel: NormalizedRelPath::from_normalized_str(
+                    dst_norm.to_str().ok_or(BackendError::Invalid)?,
+                ),
+            },
+        )
+    }
+
+    fn hard_link_at(
+        &self,
+        src: &crate::vfs::rootfs::ResolvedParent,
+        dst: &crate::vfs::rootfs::ResolvedParent,
+    ) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
+        let src_parent = src.parent_fd.as_ref().ok_or(BackendError::Invalid)?;
+        let dst_parent = dst.parent_fd.as_ref().ok_or(BackendError::Invalid)?;
         let rc = unsafe {
             libc::linkat(
-                src_parent_fd.as_raw_fd(),
-                src_leaf.as_ptr(),
-                dst_parent_fd.as_raw_fd(),
-                dst_leaf.as_ptr(),
+                src_parent.as_raw_fd(),
+                src.leaf.as_ptr(),
+                dst_parent.as_raw_fd(),
+                dst.leaf.as_ptr(),
                 0,
             )
         };
@@ -6189,9 +6215,9 @@ impl FsBackend for HostFsBackend {
             return Err(BackendError::Io);
         }
         self.propagate_marker_dir(
-            src_parent_fd.as_raw_fd(),
-            dst_parent_fd.as_raw_fd(),
-            dst_rel,
+            src_parent.as_raw_fd(),
+            dst_parent.as_raw_fd(),
+            dst.rel.as_path(),
         );
         self.coherence.bump_generation();
         Ok(())

@@ -1043,6 +1043,18 @@ pub trait FsBackend: Send + Sync {
         Err(BackendError::Unsupported)
     }
 
+    /// Link using the parent capabilities held by namespace admission.
+    fn hard_link_at(
+        &self,
+        src: &crate::vfs::rootfs::ResolvedParent,
+        dst: &crate::vfs::rootfs::ResolvedParent,
+    ) -> Result<(), BackendError> {
+        self.hard_link(
+            src.rel.as_path().to_str().ok_or(BackendError::Invalid)?,
+            dst.rel.as_path().to_str().ok_or(BackendError::Invalid)?,
+        )
+    }
+
     /// Set the permission bits (low 0o7777) of `path`. Default: unsupported.
     fn set_mode(&self, _path: &str, _mode: u32) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)

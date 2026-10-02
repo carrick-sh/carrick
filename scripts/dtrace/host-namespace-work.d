@@ -18,6 +18,8 @@
 #pragma D option strsize=128
 BEGIN
 {
+    self->active = 0;
+    self->host_active = 0;
     seen = 0; errors = 0; code = -1; bounded = 0; seconds = 0;
     printf("NSWORK1|header|program_sha256=/* CARRICK_NSWORK_PROGRAM_SHA256 */\n");
 }
