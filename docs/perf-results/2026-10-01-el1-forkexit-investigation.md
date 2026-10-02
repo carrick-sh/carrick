@@ -343,3 +343,80 @@ storage. ABI birth/exit settlement, conflicting-authority admission,
 host-adopted accounting, pending-signal integration and lifecycle teardown
 remain open. No signed acceptance was run, and no new fork-COW residual-exit
 receipt for this tree is claimed.
+
+### Shared host VM-object backing prerequisite (forkexit-sol)
+
+The control-slot and lifecycle-page allocations now reuse
+`carrick_host::host_mapping::OwnedHostMapping` with `MAP_SHARED` anonymous
+backing. The mapping owner contains the aligned ABI value; Arc metadata,
+allocator state and free-list bookkeeping remain outside the published
+16 KiB granule. A module-private `AbiPage` bound permits only the control and
+lifecycle layouts. Existing leases retain this exact allocation and continue
+to delay slot reuse until the final pin drops. No snapshot or second signal
+storage was introduced.
+
+The cheapest capable reducer is
+`kernel::objects::thread_control::tests::serial_host::lifecycle_backing_keeps_one_vm_object_across_host_fork`,
+under `kernel.el1.thread-lifecycle`. It holds two live arenas with equal
+numeric keys and forks the host. The child performs only atomic ABI writes
+and async-signal-safe syscalls before `_exit`; the parent bounds publication
+with a five-second poll, reaps its exact child and checks both shared writes
+and isolation of the other arena. Before the fix the control mask assertion
+failed: parent read 0 after child stored 1024. Red command (the initial test
+was named directly under `tests`, before moving into `serial_host`):
+
+```sh
+CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib serial_host_lifecycle_backing_keeps_one_vm_object_across_host_fork > /tmp/forkexit-sol-vm-object-red.log 2>&1
+```
+
+The focused green command selected all four backing contracts (all passed):
+
+```sh
+CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib thread_control::tests > /tmp/forkexit-sol-vm-object-green.log 2>&1
+```
+
+This qualifies host-fork aliasing; it does not demonstrate a live HVF
+publication of these leases. The allocation reserves 32 KiB host virtual
+space to accommodate hosts with mmap alignment smaller than 16 KiB, using
+one mapping per ABI page and touching only the aligned 16 KiB value. The
+unused slack is not exposed to EL1. Mapping failure is currently a carrier
+fault in the existing infallible constructors, like the replaced allocation
+failure; guest-visible fallible admission is not implemented by this slice.
+The existing refill abort fingerprint was explicitly rebound after reviewing
+its unchanged invariant and the backing-constructor substitution.
+
+Step 1 remains partial: runtime publication, mapping retirement ownership
+and the production `LifecycleVenue` are still absent. ABI Born/ExitedInZone
+settlement, settle-before-context/membership, conflicting-authority closing,
+pending signals, host-adopted accounting and teardown remain outstanding.
+No signed acceptance, spawn-slope improvement, fork-storm result or fork-COW
+residual-exit result is claimed for this slice. No Docker was run.
+
+The final typed backing passed `CARGO_BUILD_JOBS=3 just test-kernel`
+(`/tmp/forkexit-sol-vm-object-test-kernel.log`), including 2,337 kernel library
+tests, one ignored, and the semantics suites. The serial-host placement check
+and runtime abort shard check passed. `CARGO_BUILD_JOBS=3 just test` failed
+(`/tmp/forkexit-sol-vm-object-test.log`) in two unchanged MMU-core tests:
+`debug_walk_host_pages_matches_the_per_page_walk` and
+`debug_walk_host_pages_resolves_each_arena_once_however_many_pages`, each
+unwrapping `UnresolvedArena(65536)`. `git diff --exit-code work/land-i --
+crates/carrick-mmu-core` is empty; that crate has no kernel dependency (its
+only dev dependency is `carrick-mem`). This is source/dependency attribution,
+not a pre-change execution receipt or a waiver. The full host gate remains
+red and was not retried. Its early failure also prevented the later kernel
+serial-host recipe from running, so the backing witness is checked separately.
+
+Director ruling after the failed host gate: both MMU-core failures are
+pre-existing on `work/land-i`; landing I2 contains the isolation-fixture fix.
+They are not a lifecycle-slice blocker. This confirmation does not turn the
+recorded `just test` exit into a pass; no I2 merge was made here.
+
+The final typed backing's separately selected serial host-fork contract
+passed (one selected test):
+`CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib
+lifecycle_backing_keeps_one_vm_object_across_host_fork`, with output in
+`/tmp/forkexit-sol-vm-object-final-serial.log`.
+The serial HVF library gate also passed: 682 tests, three ignored,
+`CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib`
+(`/tmp/forkexit-sol-vm-object-hvf.log`). These are host-library receipts,
+not signed guest service acceptance.
