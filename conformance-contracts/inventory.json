@@ -800,7 +800,8 @@
       "contracts": [
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.files.path-mutation",
-        "kernel.el1.zone-entry-at-open"
+        "kernel.el1.zone-entry-at-open",
+        "kernel.vfs.host-namespace-mutation-work"
       ],
       "claims": [],
       "uncovered_behaviors": [
