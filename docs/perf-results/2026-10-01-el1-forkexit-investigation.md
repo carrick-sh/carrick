@@ -235,3 +235,16 @@ gates, exit settlement and carrier teardown still need integration. The
 arena currently retains free pages until the task drops; guest mapping
 retirement has not been implemented or verified. Signed acceptance and the
 full clippy/domain gates remain outstanding for this checkpoint.
+
+The storage/adoption checkpoint passed `CARGO_BUILD_JOBS=3 just test-kernel`.
+Review then found that numeric task keys can repeat across kernel instances.
+The equal-key arena contract failed under the original key comparison.
+Adoption now checks the issuing arena's retained authority; a two-live-kernel
+contract uses identical numeric task/thread keys and rejects both cross-owner
+leases. The final `just test-kernel` run also exited zero, including 2,337
+kernel-lib tests, one ignored, and the semantics suites. Logs are
+`/tmp/forkexit-l4-control-test-kernel.log` and
+`/tmp/forkexit-l4-control-owner-test-kernel.log`.
+The final `CARGO_BUILD_JOBS=3 cargo test -p carrick-el1-abi -p carrick-el1 --lib`
+also exited zero: 107 ABI tests and 181 EL1 tests. Its log is
+`/tmp/forkexit-l4-control-el1-libs.log`.
