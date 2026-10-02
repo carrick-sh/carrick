@@ -3,6 +3,7 @@
 //! Chains each subsystem module's routing table into a single resolution
 //! mechanism for claimed syscalls, separating ordinary and MM-mutation routes.
 
+use carrick_abi::syscall::nr;
 use carrick_guest_mem::CurrentMmMemory;
 
 use super::dispatcher::SyscallDispatcher;
@@ -184,9 +185,14 @@ impl SyscallDispatcher {
         let handler = resolve_handler(ctx.request.number.raw())?;
         let canonical_nr = ctx.request.number.raw();
         let outcome = resources::with_captured_resources(ctx.kernel, || {
-            if matches!(canonical_nr, 35 | 37 | 38 | 56 | 276) {
+            if matches!(
+                ctx.request.number,
+                nr::UNLINKAT | nr::LINKAT | nr::RENAMEAT | nr::OPENAT | nr::RENAMEAT2
+            ) {
                 // Qualify zero path-visit aggregates: the measured request
                 // reached the instrumented dispatcher, even on a cache hit.
+                // fs_op's lazy USDT closure evaluates its payload only when
+                // the probe is enabled.
                 carrick_observability::probes::fs_op("path-census:armed", "", 0);
             }
             handler(self, &mut ctx)
