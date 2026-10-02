@@ -666,3 +666,11 @@ contracts = ["kernel.mm.carrier-window-isolation"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/identity_page.rs"
 contracts = ["kernel.mm.carrier-window-isolation"]
+
+[[surfaces]]
+path = "crates/carrick-fd-core/src/tests.rs"
+contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects/ipc.rs"
+contracts = ["kernel.el1.fd-single-owner", "kernel.el1.ipc-fd-authority"]

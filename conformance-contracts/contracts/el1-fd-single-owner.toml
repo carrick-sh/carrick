@@ -1,0 +1,25 @@
+schema_version = 1
+id = "kernel.el1.fd-single-owner"
+title = "EL1 descriptor authority has one writer and no host slot selection"
+guest_surfaces = ["kernel:filetable", "syscall:close", "syscall:dup2", "syscall:clone", "syscall:execve"]
+semantic_authority = ["man 2 fork", "man 2 clone", "man 2 dup", "man 2 execve"]
+fixture = "kernel:two live FileTables with shared IPC publication and bare stdio"
+scale_points = [65, 4096, 65536]
+rationale = "Shared authority mutations must be visible to every observer. Host custody must not select numeric descriptors. Flips at M1 cutover: red_until_step3_m1_one_table_writer and red_until_step3_m1_no_host_slot_selection. Each gate asserts the exact current failure using expect_err; unexpected green fails. Invert both to positive assertions in the same commit deleting the old writer. No production cutover is authorized by these tests."
+
+# These bindings enforce typed fixture assertions directly (slot reads, bitmap
+# levels and incarnation identity), not fabricated WorkMetric observations.
+# The pre-existing fork.filetable WorkObservation budgets remain unchanged.
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel::kernel::objects::ipc::tests::{red_until_step3_m1_one_table_writer,red_until_step3_m1_no_host_slot_selection}"
+
+[bindings.unresolved]
+embed_structural = "Signed EL0 ownership witness is required after Phase B and step-2 memory land. VM-free publication tests do not prove guest execution or carrier isolation."
+docker = "Linux man pages define semantics; host-owner deletion is Carrick architecture. Signed/native differential remains open."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

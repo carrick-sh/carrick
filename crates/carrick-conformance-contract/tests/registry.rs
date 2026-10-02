@@ -219,3 +219,20 @@ fn contract_ids_reject_empty_or_non_lowercase_segments() {
         "kernel.futex-wake"
     );
 }
+
+#[test]
+fn m1_descriptor_authorities_are_registered_with_explicit_open_layers() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    for id in ["kernel.el1.ipc-fd-authority", "kernel.el1.fd-single-owner"] {
+        let contract = registry.require(id).expect("M1 contract");
+        assert_eq!(contract.scale_points, [65, 4096, 65536]);
+        assert!(contract.bindings.vm_free.is_some());
+        assert!(
+            contract
+                .bindings
+                .unresolved
+                .contains_key("embed_structural")
+        );
+        assert!(contract.bindings.unresolved.contains_key("docker"));
+    }
+}
