@@ -43,6 +43,44 @@ use carrick_mmu_core::aarch64::{
 
 pub use crate::stage1_authority::{ShareState, Stage1Authority, Stage1Editor};
 
+/// The publication boundary whose live descriptors a trace observes.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum El1MappingLeafPhase {
+    GrantPreparation,
+    GrantSubmitted,
+    HostGrantPublished,
+    ReceiptApplied,
+    ReceiptSettled,
+    BeforeUnmap,
+    AfterUnmap,
+}
+
+/// Sample the focused page and its neighbour under the caller's exact-MM
+/// authority. Disabled probes do not walk descriptors or build diagnostic data.
+pub fn trace_el1_mapping_leafs(
+    engine: &impl ThreadedEngine,
+    phase: El1MappingLeafPhase,
+    mm: u64,
+    span: carrick_mmu_core::aarch64::descriptor_txn::PageSpan,
+    focus: u64,
+) {
+    let page = focus & !0xfff;
+    for va in [Some(page), page.checked_add(0x1000)].into_iter().flatten() {
+        if !span.contains(va) {
+            continue;
+        }
+        carrick_observability::probes::el1_mapping_leaf(|| {
+            let live = engine
+                .diagnostic_fault_page_tables(va)
+                .map_or(0, |(_, walk)| {
+                    carrick_mmu_core::aarch64::terminal_descriptor(walk)
+                });
+            (phase as u32, mm, va, span.len, live)
+        });
+    }
+}
+
 use crate::vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, FrameCowWriteIntent};
 
 /// HVPatch installs this scoped-ASID routine into the existing EL1 maintenance
@@ -3761,6 +3799,14 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        let span = carrick_mmu_core::aarch64::descriptor_txn::PageSpan::new(address, len as u64);
+        trace_el1_mapping_leafs(
+            self,
+            El1MappingLeafPhase::BeforeUnmap,
+            self.mm_generation,
+            span,
+            address,
+        );
         // Teardown the checked stage-1 path and flush stale translations first.
         // Only then retire process-shared backend lookup metadata. If the page-
         // table/TLBI operation fails, the alias registry remains an exact owner
@@ -3781,6 +3827,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             MemoryError::HostMap(format!("retire backend mapping after munmap: {error}"))
         })?;
         self.set_unmapped(address, len, true);
+        trace_el1_mapping_leafs(
+            self,
+            El1MappingLeafPhase::AfterUnmap,
+            self.mm_generation,
+            span,
+            address,
+        );
         Ok(())
     }
 
@@ -4702,8 +4755,29 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             writable: grant.permissions & 2 != 0,
             executable: grant.permissions & 4 != 0,
         };
+        let span = carrick_mmu_core::aarch64::descriptor_txn::PageSpan::new(
+            grant.semantic_base,
+            grant.len,
+        );
+        trace_el1_mapping_leafs(
+            self,
+            El1MappingLeafPhase::GrantPreparation,
+            grant.mm_key,
+            span,
+            grant.fault_va,
+        );
         if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
-            return guest_frame_grant_submission(&self.page_tables, grant, publication);
+            let result = guest_frame_grant_submission(&self.page_tables, grant, publication);
+            if matches!(result, Ok(El1FrameGrantPublished::Submit(_))) {
+                trace_el1_mapping_leafs(
+                    self,
+                    El1MappingLeafPhase::GrantSubmitted,
+                    grant.mm_key,
+                    span,
+                    grant.fault_va,
+                );
+            }
+            return result;
         }
         let size = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
         self.pt_edit_and_flush_after_adopting(grant.semantic_base, size, |editor| {
@@ -4740,6 +4814,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })
         })
         .map_err(|error| memory_error_to_trap_error(error, "publish EL1 frame grant on host"))?;
+        trace_el1_mapping_leafs(
+            self,
+            El1MappingLeafPhase::HostGrantPublished,
+            grant.mm_key,
+            span,
+            grant.fault_va,
+        );
         Ok(El1FrameGrantPublished::OnHost)
     }
 
