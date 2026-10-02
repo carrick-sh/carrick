@@ -7772,6 +7772,62 @@ pub(crate) struct ProjectedForkMapping {
     pub(crate) plan: ForkMappingPlan,
 }
 
+/// Carrick-owned windows have no Linux VMA. Their explicit domain, rather
+/// than an absent projection row, authorizes inheritance across a copied MM.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForkCarrickWindow {
+    KernelControl,
+    El1Kernel,
+    DynamicMetadata,
+    Ipc,
+    ClockVdso,
+    Sigreturn,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ForkCarrickWindow {
+    pub(crate) fn containing(start: u64, end: u64) -> Option<Self> {
+        use carrick_mem::memory::*;
+        let windows = [
+            (
+                Self::KernelControl,
+                LINUX_KERNEL_REGION_BASE,
+                LINUX_KERNEL_REGION_SIZE,
+            ),
+            (
+                Self::El1Kernel,
+                LINUX_EL1_KERNEL_BASE,
+                LINUX_EL1_KERNEL_SIZE,
+            ),
+            (
+                Self::DynamicMetadata,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
+            ),
+            (
+                Self::Ipc,
+                carrick_el1_abi::EL1_IPC_BASE,
+                carrick_el1_abi::EL1_IPC_SIZE,
+            ),
+            (
+                Self::ClockVdso,
+                carrick_mem::vdso::LINUX_VVAR_BASE,
+                LINUX_EL0_CLOCK_STUB_BASE + LINUX_EL0_CLOCK_STUB_SIZE
+                    - carrick_mem::vdso::LINUX_VVAR_BASE,
+            ),
+            (
+                Self::Sigreturn,
+                LINUX_SIGRETURN_TRAMPOLINE_BASE,
+                LINUX_SIGRETURN_TRAMPOLINE_SIZE,
+            ),
+        ];
+        windows.into_iter().find_map(|(kind, base, size)| {
+            (start < end && start >= base && end <= base + size).then_some(kind)
+        })
+    }
+}
+
 /// Partition one coarse physical mapping into the semantic spans the child may
 /// inherit. Every retained descriptor keeps the original physical owner and
 /// generation; only its guest VA/IPA/host window changes. Omitted spans produce
@@ -7797,67 +7853,46 @@ pub(crate) fn projected_fork_mappings(
         }]);
     }
 
-    if ranges.is_empty() {
+    if ForkCarrickWindow::containing(mapping.start, mapping.end).is_some() {
         return Ok(vec![ProjectedForkMapping {
             mapping: mapping.clone(),
             plan: ForkMappingPlan::preserved(base),
         }]);
     }
 
-    let mut omitted: Vec<(u64, u64)> = ranges
-        .iter()
-        .filter(|range| range.disposition == carrick_hal::ForkLeafDisposition::Omit)
-        .filter_map(|range| {
-            let start = range.va.max(mapping.start);
-            let end = range.va.saturating_add(range.len).min(mapping.end);
-            (start < end).then_some((start, end))
-        })
-        .collect();
-    omitted.sort_unstable_by_key(|range| range.0);
-    let mut merged_omitted: Vec<(u64, u64)> = Vec::with_capacity(omitted.len());
-    for (start, end) in omitted {
-        if let Some(last) = merged_omitted.last_mut()
-            && start <= last.1
+    // The kernel plan is total over live guest VMAs. A physical boot owner
+    // is not a semantic VMA: gaps (including returned first-touch stock)
+    // must never publish a child alias or authenticate a retired output.
+    // semantic_slice retains the exact physical owner for each live alias;
+    // the process planner deduplicates that owner's inventory separately.
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    let first = ranges.partition_point(|range| range.va.saturating_add(range.len) <= mapping.start);
+    for range in &ranges[first..] {
+        if range.va >= mapping.end {
+            break;
+        }
+        if range.disposition == carrick_hal::ForkLeafDisposition::Omit {
+            continue;
+        }
+        let start = range.va.max(mapping.start);
+        let end = range.va.saturating_add(range.len).min(mapping.end);
+        if start >= end {
+            continue;
+        }
+        if let Some(last) = spans.last_mut()
+            && last.1 == start
         {
-            last.1 = last.1.max(end);
+            last.1 = end;
         } else {
-            merged_omitted.push((start, end));
+            spans.push((start, end));
         }
     }
-
-    if merged_omitted.is_empty() {
-        return Ok(vec![ProjectedForkMapping {
-            mapping: mapping.clone(),
-            plan: projected_fork_mapping_disposition(mapping, shares_mm, ranges),
-        }]);
-    }
-    if merged_omitted.len() == 1 && merged_omitted[0] == (mapping.start, mapping.end) {
-        return Ok(Vec::new());
-    }
-
-    let mut retained = Vec::new();
-    let mut cursor = mapping.start;
-    for (omit_start, omit_end) in merged_omitted {
-        if cursor < omit_start {
-            let projected = mapping.semantic_slice(cursor, omit_start).ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "fork semantic projection 0x{cursor:x}..0x{omit_start:x} escapes mapping 0x{:x}..0x{:x}",
-                    mapping.start, mapping.end
-                ))
-            })?;
-            let plan = projected_fork_mapping_disposition(&projected, false, ranges);
-            retained.push(ProjectedForkMapping {
-                mapping: projected,
-                plan,
-            });
-        }
-        cursor = cursor.max(omit_end);
-    }
-    if cursor < mapping.end {
-        let projected = mapping.semantic_slice(cursor, mapping.end).ok_or_else(|| {
+    let mut retained = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        let projected = mapping.semantic_slice(start, end).ok_or_else(|| {
             TrapError::Hypervisor(format!(
-                "fork semantic projection 0x{cursor:x}..0x{:x} escapes mapping 0x{:x}..0x{:x}",
-                mapping.end, mapping.start, mapping.end
+                "fork semantic projection 0x{start:x}..0x{end:x} escapes mapping 0x{:x}..0x{:x}",
+                mapping.start, mapping.end
             ))
         })?;
         let plan = projected_fork_mapping_disposition(&projected, false, ranges);
@@ -7865,16 +7900,6 @@ pub(crate) fn projected_fork_mappings(
             mapping: projected,
             plan,
         });
-    }
-    if retained.iter().any(|mapping| {
-        matches!(
-            mapping.plan,
-            ForkMappingPlan::Omit | ForkMappingPlan::PartialOmit
-        )
-    }) {
-        return Err(TrapError::Hypervisor(
-            "fork semantic projection retained an omitted child span".to_owned(),
-        ));
     }
     Ok(retained)
 }
