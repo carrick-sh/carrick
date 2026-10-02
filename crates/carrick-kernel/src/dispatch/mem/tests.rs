@@ -241,12 +241,14 @@ impl CurrentMmMemory for CountingMmapMemory {}
 pub struct Stage1MmapMemory {
     inner: CountingMmapMemory,
     page_tables: carrick_mmu_core::aarch64::PageTableManager,
+    new_mapping: Option<(u64, usize)>,
 }
 
 impl Stage1MmapMemory {
     pub(crate) fn new(base: u64, len: usize) -> Self {
         Self {
             inner: CountingMmapMemory::new(base, len),
+            new_mapping: None,
             page_tables: carrick_mmu_core::aarch64::PageTableManager::new(
                 carrick_mem::memory::stage1_hvpatch_page_tables(),
                 carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
@@ -261,6 +263,27 @@ impl Stage1MmapMemory {
 }
 
 impl GuestMemory for Stage1MmapMemory {
+    fn supports_lazy_anonymous_mmap(&self) -> bool {
+        self.inner.defer_anon
+    }
+
+    fn set_mapping_protection(
+        &mut self,
+        address: u64,
+        len: usize,
+        _no_access: bool,
+        _no_write: bool,
+    ) {
+        self.new_mapping = Some((address, len));
+    }
+
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.page_tables
+            .unmap_aliased(address, len, None)
+            .map_err(|error| MemoryError::HostMap(format!("stage-1 retirement: {error:?}")))?;
+        self.inner.unmap_range(address, len)
+    }
+
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         self.inner.read_bytes_raw(address, length)
     }
@@ -274,6 +297,11 @@ impl GuestMemory for Stage1MmapMemory {
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        if self.new_mapping.take() == Some((address, len)) {
+            self.page_tables
+                .clear_retired_for_new_mapping(address, len, None)
+                .map_err(|error| MemoryError::HostMap(format!("stage-1 vacancy: {error:?}")))?;
+        }
         let flags = LinuxProtFlags::from_bits_retain(prot);
         let executable = flags.contains(LinuxProtFlags::EXEC);
         let changed = if flags.contains(LinuxProtFlags::WRITE) {
@@ -291,6 +319,72 @@ impl GuestMemory for Stage1MmapMemory {
 }
 
 impl CurrentMmMemory for Stage1MmapMemory {}
+
+#[test]
+fn fixed_prot_none_retires_prepared_private_backing_before_publication() {
+    use carrick_mmu_core::aarch64::{
+        El1PrivateLeafState, GuestLeafPublication, el1_private_leaf_state,
+    };
+    let dispatcher = SyscallDispatcher::new();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
+    let reporter = CompatReporter::default();
+    let base = LINUX_MMAP_BASE;
+    let mut memory = Stage1MmapMemory::new(base, 4 * LINUX_PAGE_SIZE as usize);
+    memory.inner.defer_anon = true;
+    memory
+        .page_tables
+        .publish_private_pages(
+            GuestLeafPublication {
+                va: base,
+                ipa: carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000,
+                len: 4 * LINUX_PAGE_SIZE,
+                writable: true,
+                executable: false,
+            },
+            base,
+            None,
+        )
+        .unwrap();
+    let target = base + LINUX_PAGE_SIZE;
+    assert_eq!(
+        el1_private_leaf_state(memory.terminal_descriptor(target)),
+        El1PrivateLeafState::Prepared
+    );
+    let neighbor = memory.terminal_descriptor(target + LINUX_PAGE_SIZE);
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            222,
+            SyscallArgs([
+                target,
+                LINUX_PAGE_SIZE,
+                0,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                u64::MAX,
+                0,
+            ]),
+        ),
+    );
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned {
+            value: target as i64
+        }
+    );
+    assert_eq!(
+        *memory.inner.unmap_log.borrow(),
+        vec![(target, LINUX_PAGE_SIZE as usize)]
+    );
+    assert_eq!(memory.page_tables.translate_retained_output(target), None);
+    assert_eq!(
+        memory.terminal_descriptor(target + LINUX_PAGE_SIZE),
+        neighbor
+    );
+}
 
 struct ConcurrentExecMemory(CountingMmapMemory);
 
