@@ -81,6 +81,8 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just check-matrix` | Drift gate: matrix == fresh render of `baseline.jsonl` (deterministic, no run). |
 | `just kvm-smoke` / `just kvm-smoke-lima` | KVM smoke (`/dev/kvm`, lima from macOS). |
 | `just install-hooks` | Install git hooks (once per clone). |
+| `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
+| `just lease MODE +CMD` | Run command under host flock lease (carrick shared, docker exclusive). |
 
 **Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and
 [`Cargo.toml`](Cargo.toml). CI uses moving `@stable`, which can flag lints
@@ -400,6 +402,7 @@ verification, acceptance.
 - **Never `git merge --ff-only` inside a worktree** (merges its own branch).
   Rebase there, fast-forward from main, reconcile inventories on the CLEAN
   merged tree, `just lint-domains`.
+- **Workers run `just accept`** (receipt path in the final report) before reporting done.
 
 ## Commits, hooks & CI
 

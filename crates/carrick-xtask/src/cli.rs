@@ -56,6 +56,33 @@ pub enum Commands {
         about = "Validate probe inventory coverage against baseline"
     )]
     ProbeCoverage(ProbeCoverageArgs),
+
+    #[command(
+        name = "host-lease",
+        about = "Run command under machine-global host lease flock (carrick shared, docker exclusive)"
+    )]
+    HostLease(HostLeaseArgs),
+
+    #[command(about = "Run the host and/or signed landing gate and output a JSON receipt")]
+    Accept(crate::accept::AcceptArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct HostLeaseArgs {
+    #[arg(
+        long,
+        value_enum,
+        help = "Lock mode: carrick (shared) or docker (exclusive)"
+    )]
+    pub mode: crate::host_lease::HostLeaseMode,
+
+    #[arg(
+        trailing_var_arg = true,
+        required = true,
+        allow_hyphen_values = true,
+        help = "Command and arguments to run under the host lease"
+    )]
+    pub command: Vec<OsString>,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -116,6 +143,10 @@ pub enum CliError {
     RegenerateContracts(#[from] crate::ledger_merge::RegenerateError),
     #[error("provision error: {0}")]
     Provision(#[from] crate::provision::ProvisionError),
+    #[error("host lease error: {0}")]
+    HostLease(#[from] crate::host_lease::HostLeaseError),
+    #[error("accept error: {0}")]
+    Accept(#[from] crate::accept::AcceptError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -302,6 +333,14 @@ where
                     source: e,
                 })?;
             }
+            Ok(())
+        }
+        Commands::HostLease(args) => {
+            let exit_code = crate::host_lease::run_command(args.mode, &args.command)?;
+            std::process::exit(exit_code);
+        }
+        Commands::Accept(args) => {
+            crate::accept::run(cli.root.as_deref(), args)?;
             Ok(())
         }
     }

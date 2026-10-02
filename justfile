@@ -87,6 +87,14 @@ carrier-topology-gate *ARGS: build
 xtask *ARGS:
     cargo run --locked -p carrick-xtask -- {{ARGS}}
 
+# Run a command under the host flock lease (carrick shared, docker exclusive).
+lease MODE +CMD:
+    cargo run --locked -p carrick-xtask -- host-lease --mode {{MODE}} -- {{CMD}}
+
+# Run the host and/or signed landing gate (no Docker).
+accept *ARGS:
+    cargo run --locked -p carrick-xtask -- accept {{ARGS}}
+
 # Provision fresh-worktree guest artifacts before signed execution.
 land-provision *ARGS:
     just --justfile {{justfile()}} xtask provision {{ARGS}}
