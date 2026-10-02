@@ -207,6 +207,7 @@ trap cleanup EXIT
 # Build carrick-embed's immutable static guest fixtures (local musl
 # cross-compiles, no Docker) before any signed HVF test process is started.
 if [ "$pkg" = "carrick-embed" ]; then
+    scripts/build-linux-fixtures.sh
     scripts/build-embed-interceptor-probe.sh
     scripts/build-embed-zone-readers.sh
     scripts/build-embed-icache-reuse.sh

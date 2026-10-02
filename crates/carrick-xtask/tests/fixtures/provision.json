@@ -1,0 +1,57 @@
+{
+  "schema": "carrick.provisioning.v1",
+  "schema_version": 1,
+  "source_head": "f669d41081dced4d9bc427182bfa52a6d0e84569",
+  "dirty_inputs": false,
+  "rustc_identity": {
+    "release": "1.96.0",
+    "commit_hash": "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96",
+    "host": "aarch64-apple-darwin",
+    "raw": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2\n"
+  },
+  "targets": [
+    "aarch64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu"
+  ],
+  "libc": [
+    "musl",
+    "gnu"
+  ],
+  "build_scripts": [
+    {
+      "path": "scripts/build-linux-fixtures.sh",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "sources": [
+    {
+      "path": "fixtures/linux-aarch64-hello/src/main.rs",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "manifests": [
+    {
+      "path": "fixtures/linux-aarch64-hello/Cargo.toml",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "lockfiles": [
+    {
+      "path": "fixtures/linux-aarch64-hello/Cargo.lock",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "commands": [
+    {
+      "program": "scripts/build-linux-fixtures.sh",
+      "argv": [],
+      "exit_status": 0
+    }
+  ],
+  "executables": [
+    {
+      "path": "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}
