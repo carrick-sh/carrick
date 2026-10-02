@@ -417,3 +417,36 @@ Final signed build, census and semantic logs are
 Docker-oracle/paired ecosystem gates owned by the director remain outside
 this scoped signed closure. No review-ready/all-tests-green claim is made
 while the required full host recipe is red.
+
+## Post-review ABI marker correction and rebased host closure
+
+Rebased onto `26dfd3c3f` (SCM_RIGHTS test fix). Source commit `42b6c4af6`
+replaces the marker's raw syscall numbers with the existing typed
+`carrick_abi::syscall::nr::{UNLINKAT, LINKAT, RENAMEAT, OPENAT, RENAMEAT2}`
+constants used by filesystem routing. No handler or census set changed.
+
+The existing `fs_op` wrapper places the PID lookup and payload inside the
+USDT closure. Inspection of `usdt-impl` 0.6.0's macOS linker generator
+confirms the is-enabled check precedes payload construction. Disabled
+tracing retains the guard check but performs no PID lookup or payload
+construction; no additional guard was necessary.
+
+Clean-tree reconciliation preserved all 616 reviewed authority rows and
+classifications, refreshed the macOS compiler capture, and rebound four
+K1 operation positions in `89c9a81f3`. On that clean tree all requested
+commands exited zero, with `CARGO_BUILD_JOBS=3 RUSTC_WRAPPER=`:
+
+- `just test-kernel`: `/tmp/stage2a-marker-kernel.log`.
+- Full `just test`: `/tmp/stage2a-marker-test.log`; the unchanged
+  `hostfs_teardown_retires_large_tree_before_recursive_cleanup` passed.
+- `just clippy`: `/tmp/stage2a-marker-clippy.log`.
+- `just lint-domains`: `/tmp/stage2a-marker-lint.log`; the existing six
+  foreign-host compiler profiles remain pending, as reported by the gate.
+- `just check-layering`: `/tmp/stage2a-marker-layering.log`.
+
+The earlier full-host failure above remains historical evidence and did
+not recur in this required full rerun. No retry, deadline change or skip
+was added. Per the director's review, no new signed run was required for
+this census-marker-only correction. The retained signed receipts still
+identify their original tested artifact/source, not this rebased HEAD.
+Docker-oracle and paired ecosystem acceptance remain director-owned.
