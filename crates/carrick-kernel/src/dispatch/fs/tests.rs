@@ -2560,6 +2560,33 @@ mod serial_host {
     /// ENOENT, new name opens), each unlink removes the name.
     #[cfg(target_os = "macos")]
     #[test]
+    fn namespace_linkat_preserves_source_error_priority() {
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::write(scratch.path().join("notdir"), b"x").unwrap();
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        memory.write_bytes(0x4000, b"/missing-source\0").unwrap();
+        for (target, dirfd) in [("/notdir/target", LINUX_AT_FDCWD), ("target", 999)] {
+            memory
+                .write_bytes(0x4100, format!("{target}\0").as_bytes())
+                .unwrap();
+            assert_eq!(
+                lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    37,
+                    [LINUX_AT_FDCWD, 0x4000, dirfd, 0x4100, 0, 0]
+                ),
+                -i64::from(LINUX_ENOENT.get()),
+                "missing source must precede target validation: {target}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn namespace_linkat_path_visit_budget() {
         let scratch = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(scratch.path().join("a/b/c/d")).unwrap();

@@ -1090,24 +1090,25 @@ impl<'a> FsView<'a> {
             // publication instead of doing dispatcher preflight path walks.
             if anon_fd_candidate.is_none() && !old.is_empty() {
                 let source = this.resolve_at_path(olddirfd, &old)?;
-                let target = this.resolve_at_path(newdirfd, &new_path)?;
-                if flags & LINUX_AT_SYMLINK_FOLLOW == 0
-                    && this.fs.vfs_mounts.resolve(&source).is_none()
-                    && this.fs.vfs_mounts.resolve(&target).is_none()
-                    && !this.is_synthetic_virtual_path(cx.kernel, &source)
-                    && !this.is_synthetic_virtual_path(cx.kernel, &target)
-                {
-                    let result = this.fs.rootfs_vfs.link_with_parent_check(
-                        &source, &target, |parent| this.may_write_admitted_parent(parent),
-                    );
-                    return Ok(match result {
-                        Ok(()) => {
-                            this.dnotify_child(cx.kernel, &target, LinuxDnotifyMask::CREATE);
-                            crate::el1_inotify::invalidate_name_cache_all();
-                            DispatchOutcome::Returned { value: 0 }
-                        }
-                        Err(errno) => DispatchOutcome::errno(errno),
-                    });
+                if let Ok(target) = this.resolve_at_path(newdirfd, &new_path) {
+                    if flags & LINUX_AT_SYMLINK_FOLLOW == 0
+                        && this.fs.vfs_mounts.resolve(&source).is_none()
+                        && this.fs.vfs_mounts.resolve(&target).is_none()
+                        && !this.is_synthetic_virtual_path(cx.kernel, &source)
+                        && !this.is_synthetic_virtual_path(cx.kernel, &target)
+                    {
+                        let result = this.fs.rootfs_vfs.link_with_parent_check(
+                            &source, &target, |parent| this.may_write_admitted_parent(parent),
+                        );
+                        return Ok(match result {
+                            Ok(()) => {
+                                this.dnotify_child(cx.kernel, &target, LinuxDnotifyMask::CREATE);
+                                crate::el1_inotify::invalidate_name_cache_all();
+                                DispatchOutcome::Returned { value: 0 }
+                            }
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        });
+                    }
                 }
             }
             let mut source_kind = None;
