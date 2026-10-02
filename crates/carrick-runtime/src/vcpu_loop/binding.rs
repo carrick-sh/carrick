@@ -1815,7 +1815,7 @@ where
     pub(super) fn spawn_persistent_hvpatch_clone_thread<M, O>(
         &mut self,
         memory: &mut M,
-        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        _control: &mut executor::HvpatchQuantumControl<'_, '_>,
         parent_context: &carrick_kernel::kernel::KernelContext,
         request: HvpatchCloneThreadRequest,
         retry_prepared: Option<carrick_kernel::kernel::PreparedThreadClone>,
@@ -2333,26 +2333,10 @@ where
                 return Err(RuntimeError::Trap(error));
             }
         };
-        let (grant_thread, grant_generation) = match control.current_submission_key() {
-            Ok(key) => key,
-            Err(error) => {
-                self.rollback_published_hvpatch_clone(
-                    memory,
-                    &child_context,
-                    generation,
-                    tid,
-                    &tid_outputs,
-                    Some(logical),
-                    false,
-                );
-                return Err(RuntimeError::Trap(error));
-            }
-        };
-        let dormant = match control.prepare_hvpatch_submission(
-            runtime.persistent_bindings(),
-            executor::HvpatchSubmissionShape::SameTaskSibling {
-                grant: (grant_thread, grant_generation),
-            },
+        let dormant = match runtime.persistent_bindings().prepare_submission(
+            &runtime.continuation_services(child_context.kernel()).0,
+            executor::HvpatchSubmissionShape::ProcessBirth(child_runtime.submission),
+            None,
             Arc::clone(child_context.thread()),
             generation,
             Arc::clone(&logical.binding),

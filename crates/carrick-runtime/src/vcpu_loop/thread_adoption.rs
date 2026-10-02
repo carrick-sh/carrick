@@ -20,6 +20,7 @@ pub(super) enum ThreadAdoptionOrigin {
 pub(super) struct ProcessThreadAdoptionFactory<E: ThreadedEngine> {
     owner: TaskKey,
     kernel: Weak<KernelState>,
+    task: Weak<carrick_kernel::kernel::objects::Task>,
     registry: Arc<ThreadRegistry>,
     futex: Arc<FutexTable>,
     platform_futex: Arc<dyn PlatformFutex>,
@@ -43,12 +44,14 @@ struct ReservedThreadRuntime<E: ThreadedEngine> {
     state: Vec<ThreadRuntimeState<E>>,
     injected_lease: Arc<InjectedExecutionLeaseSlot>,
     origin: ThreadAdoptionOrigin,
+    submission: carrick_kernel::kernel::scheduler::ProcessBirthSubmission,
 }
 
 pub(super) struct AdoptedThreadRuntime<E: ThreadedEngine> {
     pub(super) kernel: Kernel,
     pub(super) state: ThreadRuntimeState<E>,
     pub(super) injected_lease: Arc<InjectedExecutionLeaseSlot>,
+    pub(super) submission: carrick_kernel::kernel::scheduler::ProcessBirthSubmission,
 }
 
 impl<E: ThreadedEngine + 'static> ProcessThreadAdoptionFactory<E>
@@ -59,6 +62,7 @@ where
         Some(Self {
             owner: kernel.hvpatch_process.as_ref()?.task_key(),
             kernel: Arc::downgrade(kernel),
+            task: Arc::downgrade(&state.kernel_thread.as_ref()?.task()?),
             registry: state.registry.clone(),
             futex: state.futex.clone(),
             platform_futex: state.platform_futex.clone(),
@@ -98,6 +102,16 @@ where
         if process.task_key() != self.owner || kernel.process_exiting() {
             return None;
         }
+        let task = self.task.upgrade()?;
+        if task.key() != self.owner {
+            return None;
+        }
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()?
+            .continuation_services(process.kernel_graph())
+            .0;
+        let submission = scheduler.reserve_process_birth(&task, thread).ok()?;
         let mut state = Vec::new();
         state.try_reserve_exact(1).ok()?;
         let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
@@ -128,6 +142,7 @@ where
                 state,
                 injected_lease,
                 origin,
+                submission,
             },
         ))
     }
@@ -196,6 +211,7 @@ where
         kernel: reserved.kernel,
         state,
         injected_lease: reserved.injected_lease,
+        submission: reserved.submission,
     })
 }
 
