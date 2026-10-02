@@ -3065,7 +3065,7 @@ impl HvfTaskState {
     /// where the guest may write, under the same undo journal, live-backing
     /// authentication and stage-1 maintenance as a COW publication. The leaf
     /// keeps naming `old_ipa`.
-    fn reuse_sole_owner_cow_in_place(
+    pub(super) fn reuse_sole_owner_cow_in_place(
         &mut self,
         span: CowArmedSpan,
         old_ipa: u64,
@@ -3092,6 +3092,16 @@ impl HvfTaskState {
                     ))
                 },
                 |manager| -> Result<(), TrapError> {
+                    let resolver = self.page_table_resolver(manager.base(), Some(page_table_host));
+                    // Exact-MM exclusion covers the live hierarchy and its neighbors.
+                    // Adopt before opening undo so rollback starts from EL1's publication.
+                    unsafe {
+                        manager.manager.adopt_live_tables_for_range(
+                            &resolver, span_start, (span_end - span_start) as usize,
+                        )
+                    }.map_err(|error| TrapError::Hypervisor(format!(
+                        "adopt live HVPatch sole-owner COW leaves: {error:?}"
+                    )))?;
                     manager.begin_undo().map_err(|error| match error {
                         carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
                             TrapError::MetadataAllocation
