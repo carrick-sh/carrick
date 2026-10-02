@@ -25,6 +25,25 @@ pub(super) struct PublishedFrameGrant {
     pub(super) ready: carrick_hal::El1FrameGrantReady,
 }
 
+pub(super) fn frame_grant_local_lease_is_current(
+    lease: (u64, u64, u64),
+    mut aliases: impl Iterator<Item = (u64, u64, u64)>,
+) -> bool {
+    aliases.any(|alias| alias == lease)
+}
+
+pub(super) fn frame_grant_predecessors_are_accounted_for(
+    replaced: &std::collections::BTreeSet<(u64, u64)>,
+    retired: &std::collections::BTreeSet<(u64, u64)>,
+    retained: &std::collections::BTreeSet<(u64, u64)>,
+    has_inventory: bool,
+) -> bool {
+    (retired.is_empty() || has_inventory)
+        && replaced
+            .iter()
+            .all(|lease| retired.contains(lease) || retained.contains(lease))
+}
+
 pub(super) fn frame_grant_request_is_valid(
     identity: carrick_hal::FrameCowIdentity,
     request: carrick_hal::El1FrameGrantRequest,
@@ -549,6 +568,42 @@ fn file_view_allocation_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_physical_owner_without_an_mm_alias_is_not_a_grant_predecessor() {
+        let lease = (0x8000, 16384, 7);
+        assert!(!frame_grant_local_lease_is_current(
+            lease,
+            std::iter::empty()
+        ));
+        assert!(!frame_grant_local_lease_is_current(
+            lease,
+            [(0x8000, 16384, 8)].into_iter()
+        ));
+        assert!(frame_grant_local_lease_is_current(
+            lease,
+            [lease].into_iter()
+        ));
+    }
+
+    #[test]
+    fn partial_frame_grant_keeps_authenticated_predecessor_fragments() {
+        use std::collections::BTreeSet;
+        let replaced = BTreeSet::from([(0x8000, 16384)]);
+        let none = BTreeSet::new();
+        assert!(frame_grant_predecessors_are_accounted_for(
+            &replaced, &none, &replaced, false,
+        ));
+        assert!(!frame_grant_predecessors_are_accounted_for(
+            &replaced, &none, &none, false,
+        ));
+        assert!(frame_grant_predecessors_are_accounted_for(
+            &replaced, &replaced, &none, true,
+        ));
+        assert!(!frame_grant_predecessors_are_accounted_for(
+            &replaced, &replaced, &none, false,
+        ));
+    }
 
     #[test]
     fn frame_grant_backend_accepts_copyout_without_a_mailbox_claim() {
