@@ -128,7 +128,10 @@ impl ThreadIdentityPool {
         let mut index = 0;
         while index < entries.len() {
             let candidate = &entries[index];
-            if candidate.state() == EntryState::Born {
+            if matches!(
+                candidate.state(),
+                EntryState::Born | EntryState::ExitedInZone
+            ) {
                 let born = candidate
                     .page()
                     .born_record(candidate.entry)
@@ -342,6 +345,7 @@ impl ThreadLedger {
         let count = births.len();
         let mut published = Vec::with_capacity(count);
         let mut abi_count = 0;
+        let mut exited = Vec::new();
         {
             let mut state = lock.write();
             for birth in births {
@@ -434,12 +438,16 @@ impl ThreadLedger {
                                     "ABI birth publication failed: error={error}"
                                 )
                             });
-                        control.lifecycle().publish(entry).unwrap_or_else(|error| {
-                            carrick_fatal::carrick_fatal!(
+                        match control.lifecycle().publish(entry) {
+                            Ok(())
+                            | Err(carrick_el1_abi::TransitionError::WrongState(
+                                EntryState::ExitedInZone,
+                            )) => {}
+                            Err(error) => carrick_fatal::carrick_fatal!(
                                 "thread::ledger",
                                 "ABI birth state failed: error={error:?}"
-                            )
-                        });
+                            ),
+                        }
                         state
                             .tasks
                             .get(&task_id)
@@ -464,6 +472,71 @@ impl ThreadLedger {
                         );
                     }
                 }
+                let exits: Vec<_> = state
+                    .tasks
+                    .get(&task_id)
+                    .unwrap_or_else(|| {
+                        carrick_fatal::carrick_fatal!("thread::ledger", "exit task disappeared")
+                    })
+                    .thread_pool
+                    .published
+                    .lock()
+                    .iter()
+                    .filter(|(entry, control)| {
+                        control.lifecycle().state(entry.index())
+                            == Some((entry.generation(), EntryState::ExitedInZone))
+                    })
+                    .cloned()
+                    .collect();
+                for (entry, control) in exits {
+                    let record = state.tasks.get(&task_id).unwrap_or_else(|| {
+                        carrick_fatal::carrick_fatal!("thread::ledger", "exit lost task")
+                    });
+                    let thread = record
+                        .task
+                        .thread(control.identity().1.tid)
+                        .filter(|thread| thread.key() == control.identity().1)
+                        .unwrap_or_else(|| {
+                            carrick_fatal::carrick_fatal!(
+                                "thread::ledger",
+                                "exit lost exact thread"
+                            )
+                        });
+                    let context = KernelContext::from_parts(
+                        kernel.clone(),
+                        record.task.clone(),
+                        thread.clone(),
+                        record.task.shared(),
+                        thread.resources(),
+                        record.revision,
+                    );
+                    kernel
+                        .retire_thread_in_registry(&context, &mut state, None)
+                        .unwrap_or_else(|error| {
+                            carrick_fatal::carrick_fatal!(
+                                "thread::ledger",
+                                "EL1 graph exit failed: error={error}"
+                            )
+                        });
+                    control.lifecycle().reap(entry).unwrap_or_else(|error| {
+                        carrick_fatal::carrick_fatal!(
+                            "thread::ledger",
+                            "EL1 exit reaping failed: error={error:?}"
+                        )
+                    });
+                    state
+                        .tasks
+                        .get(&task_id)
+                        .unwrap_or_else(|| {
+                            carrick_fatal::carrick_fatal!("thread::ledger", "reaped exit lost task")
+                        })
+                        .thread_pool
+                        .published
+                        .lock()
+                        .retain(|(owned, _)| *owned != entry);
+                    exited.push(context);
+                    abi_count += 1;
+                }
             }
         }
         self.pending.fetch_sub(count, Ordering::AcqRel);
@@ -483,6 +556,11 @@ impl ThreadLedger {
         // lane that runs it adopts it from the registry by `ThreadKey`.
         for publication in published {
             drop(publication.finish());
+        }
+        for context in exited {
+            context
+                .kernel()
+                .finish_thread_retirement(&context, &context.resources().files());
         }
     }
 
@@ -876,6 +954,89 @@ mod tests {
             page.state(entry.index()),
             Some((entry.generation(), EntryState::Published))
         );
+        drop(sibling);
+    }
+
+    #[test]
+    fn lifecycle_abi_exit_retires_exact_identity_before_a_peer_observes_membership() {
+        let (kernel, root) = bootstrap(9_680);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_681),
+                "exit-observer".into(),
+                None,
+            )
+            .unwrap();
+        let sibling = kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_682),
+                None,
+            )
+            .unwrap();
+        let page = root.thread().control_lease().lifecycle();
+        let claim = page.claim_any().unwrap();
+        let entry = claim.entry();
+        let identity = page.identity(entry).unwrap();
+        let control = {
+            let state = kernel.registry().settled().read();
+            state
+                .tasks
+                .get(&root.task().key().id)
+                .unwrap()
+                .thread_pool
+                .entries
+                .lock()
+                .iter()
+                .find(|candidate| candidate.entry == entry)
+                .unwrap()
+                .control
+                .clone()
+        };
+        control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+        page.thread_born().unwrap();
+        page.record_born(
+            claim,
+            carrick_el1_abi::BornRecord {
+                caller_task: carrick_el1_abi::El1TaskId::from_linux_tid(
+                    root.thread().key().tid.raw(),
+                )
+                .raw(),
+                caller_serial: root.thread().key().serial.raw(),
+                clone_flags: (LinuxCloneFlags::THREAD
+                    | LinuxCloneFlags::SIGHAND
+                    | LinuxCloneFlags::VM)
+                    .bits(),
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+        let tid = LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
+        let held = kernel.context(root.task().key().id, tid).unwrap();
+        page.try_exit().unwrap();
+        page.exit_in_zone(entry).unwrap();
+        assert_eq!(
+            peer.kernel().live_task_for_thread(None, tid),
+            None,
+            "ABI exit remained visible to a peer"
+        );
+        assert!(root.task().thread(tid).is_none());
+        assert_eq!(
+            page.state(entry.index()),
+            Some((entry.generation(), EntryState::Reaped))
+        );
+        assert!(
+            kernel.ids().is_reserved_number(tid.raw()),
+            "captured identity was released early"
+        );
+        drop(held);
+        kernel.sweep_retired_threads();
+        assert!(!kernel.ids().is_reserved_number(tid.raw()));
+        assert!(peer.exact_thread_is_live());
         drop(sibling);
     }
 

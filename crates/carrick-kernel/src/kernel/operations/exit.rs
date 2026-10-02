@@ -16,8 +16,9 @@ use super::{
     ensure_task_unreserved, next_revision,
 };
 use crate::kernel::core::{
-    FileCloseDisposition, FileCloseEvent, Kernel, KernelContext, RetiredThreadRecord,
-    TaskExitSubscriber, TaskRecord, TaskRevision, VforkReleaseReason, ZombieRecord,
+    FileCloseDisposition, FileCloseEvent, Kernel, KernelContext, RegistryState,
+    RetiredThreadRecord, TaskExitSubscriber, TaskRecord, TaskRevision, VforkReleaseReason,
+    ZombieRecord,
 };
 use crate::kernel::ids::{FileTableId, LinuxTid, TaskId};
 use crate::kernel::objects::{
@@ -270,7 +271,20 @@ impl Kernel {
 
         let files = context.resources.files();
         let mut state = self.registry().settled().write();
-        ensure_task_unreserved(&state, context.task.key().id)?;
+        let next = self.retire_thread_in_registry(context, &mut state, failpoint)?;
+        drop(state);
+        self.finish_thread_retirement(context, &files);
+        Ok(next)
+    }
+
+    /// The one graph retirement body for a host exit or a settled EL1 exit.
+    pub(in crate::kernel) fn retire_thread_in_registry(
+        &self,
+        context: &KernelContext,
+        state: &mut RegistryState,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<TaskRevision, KernelOperationError> {
+        ensure_task_unreserved(state, context.task.key().id)?;
         let record = state
             .tasks
             .get(&context.task.key().id)
@@ -331,7 +345,15 @@ impl Kernel {
                 _claim: claim,
             });
         }
-        drop(state);
+        Ok(next)
+    }
+
+    pub(in crate::kernel) fn finish_thread_retirement(
+        &self,
+        context: &KernelContext,
+        files: &Arc<FileTable>,
+    ) {
+        let tid = context.thread().key().tid;
         // A pending process-directed signal this thread was to receive goes to
         // a sibling now: wake them so a parked wait re-examines the queue.
         if context.shared().pending_signals().received_by(
@@ -357,8 +379,7 @@ impl Kernel {
                 );
             }
         }
-        self.retire_file_table_if_unreferenced(&files);
-        Ok(next)
+        self.retire_file_table_if_unreferenced(files);
     }
 
     /// Reserve every task identity and revision touched by exit publication.
