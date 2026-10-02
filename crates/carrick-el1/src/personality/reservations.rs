@@ -3145,18 +3145,18 @@ mod tests {
         );
     }
 
-    /// Documents (does not bless) decoder behavior that differs from the host
-    /// dispatcher: unknown PROT bits on mmap and a misaligned offset on an
-    /// anonymous mmap are EINVAL here, while host `mmap.rs` ignores both. The
-    /// Docker oracle decides which answer is Linux before either changes.
+    /// mmap ignores protection bits outside its vocabulary: the committed
+    /// memflagmatrix oracle records mmap_invalid_prot_result=success. Keep
+    /// that route separate from mprotect unknown-bit validation and the
+    /// existing anonymous-offset validation.
     #[test]
-    fn reservation_decoder_prot_and_anonymous_offset_current_behavior() {
+    fn reservation_decoder_prot_and_anonymous_offset_linux_routes() {
         let table = table();
         let mut g = admitted(&table, 0, 17);
         assert_eq!(
             decide(&mut g, 222, [0, 4096, 3 | (1 << 28), 0x22, u64::MAX, 0]),
-            AnonymousRouteKind::Return(-22),
-            "unknown mmap prot bit"
+            AnonymousRouteKind::Forward,
+            "unknown mmap prot bits retain host mmap decoding"
         );
         assert_eq!(
             decide(&mut g, 222, [0, 4096, 3, 0x22, u64::MAX, 0x800]),
