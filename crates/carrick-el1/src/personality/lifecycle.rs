@@ -550,6 +550,7 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
     {
         return None;
     }
+    let admission = page.begin_exit(entry).ok()?;
     // n > 1 -> n - 1; the last thread exits on the host.
     page.try_exit().ok()?;
     let clear_child_tid = slot.clear_child_tid();
@@ -574,7 +575,7 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
         record,
         &carrick_sched_core::BoundedSpin(carrick_el1_abi::EL1_GUEST_LOCK_SPINS),
     );
-    if page.exit_in_zone(entry).is_err() {
+    if admission.commit().is_err() {
         // Unreachable (checked above; only this thread leaves Born or
         // Published that way): the host must look at this process.
         task.mark_pending_host_work();
