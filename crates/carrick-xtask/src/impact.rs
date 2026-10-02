@@ -50,9 +50,12 @@ pub struct Measurement {
     pub out: PathBuf,
     #[arg(long, default_value_t = 10)]
     pub samples: usize,
-    /// Repeat to select workloads; defaults to all three. One excluded warm-up.
+    /// Repeat to select workloads; defaults to all declared workloads. One excluded warm-up.
     #[arg(long)]
     pub workload: Vec<String>,
+    /// Override creation count for spawn-loop and thread-spawn smoke runs.
+    #[arg(long)]
+    pub operations: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
@@ -61,6 +64,10 @@ pub struct Sample {
     pub warmup: bool,
     pub wall_s: f64,
     pub child_cpu_s: Option<f64>,
+    #[serde(default)]
+    pub per_op_s: Option<f64>,
+    #[serde(default)]
+    pub guest_window_s: Option<f64>,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cleanup_ok: bool,
@@ -71,7 +78,33 @@ pub struct WorkloadReceipt {
     pub image_digest: String,
     pub command: Vec<String>,
     pub declaration_sha256: String,
+    #[serde(default)]
+    pub window: Option<Window>,
     pub samples: Vec<Sample>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Window {
+    pub operations: u64,
+    pub prefix: String,
+}
+fn parse_window(output: &str, window: &Window) -> Result<f64> {
+    let values = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(&window.prefix))
+        .collect::<Vec<_>>();
+    if values.len() != 1 || window.operations == 0 {
+        return Err("missing or duplicate guest timing window".into());
+    }
+    let ns: u64 = values[0].parse()?;
+    if ns == 0 {
+        return Err("empty guest timing window".into());
+    }
+    Ok(ns as f64 / 1e9 / window.operations as f64)
+}
+fn windows(root: &Path) -> Result<BTreeMap<String, Window>> {
+    Ok(serde_json::from_slice(&fs::read(
+        root.join("scripts/perf/manifests/impact-windows.json"),
+    )?)?)
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -104,14 +137,26 @@ struct Output {
     timed_out: bool,
 }
 trait Runner {
-    fn execute(&mut self, args: &[String], run_id: Option<&str>, timeout: u64) -> Result<Output>;
+    fn execute(
+        &mut self,
+        args: &[String],
+        run_id: Option<&str>,
+        timeout: u64,
+        env: &[(String, String)],
+    ) -> Result<Output>;
 }
 struct SystemRunner {
     root: PathBuf,
     sequence: usize,
 }
 impl Runner for SystemRunner {
-    fn execute(&mut self, args: &[String], run_id: Option<&str>, timeout: u64) -> Result<Output> {
+    fn execute(
+        &mut self,
+        args: &[String],
+        run_id: Option<&str>,
+        timeout: u64,
+        env: &[(String, String)],
+    ) -> Result<Output> {
         self.sequence += 1;
         let dir = self.root.join("target/impact-logs");
         fs::create_dir_all(&dir)?;
@@ -128,6 +173,7 @@ impl Runner for SystemRunner {
         if let Some(id) = run_id {
             command.env("CARRICK_RUN_ID", id);
         }
+        command.envs(env.iter().cloned());
         let cpu_before = child_cpu()?;
         let start = Instant::now();
         let mut child = command.spawn()?;
@@ -183,7 +229,7 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).into()).collect()
 }
 fn checked(runner: &mut impl Runner, args: &[String]) -> Result<String> {
-    let output = runner.execute(args, None, 30)?;
+    let output = runner.execute(args, None, 30, &[])?;
     if output.code != Some(0) || output.timed_out {
         return Err(format!("{}: {}", args.join(" "), output.stderr).into());
     }
@@ -195,6 +241,7 @@ fn guard(runner: &mut impl Runner, phase: &str, images: &[String]) -> Result<()>
             &strings(&["pgrep", "-f", "(^carrick:|^[^ ]*/carrick( |$))"]),
             None,
             30,
+            &[],
         )?;
         match output.code {
             Some(1) => {}
@@ -211,6 +258,7 @@ fn guard(runner: &mut impl Runner, phase: &str, images: &[String]) -> Result<()>
             ]),
             None,
             30,
+            &[],
         )?;
         match output.code {
             Some(1) => {}
@@ -277,7 +325,14 @@ fn workloads(root: &Path) -> Result<Vec<Suite>> {
     trivial.cmd = strings(&["/bin/true"]);
     trivial.carrick_flags.clear();
     trivial.name = "true".into();
-    Ok(vec![trivial, startup, worker])
+    let mut result = vec![trivial, startup, worker];
+    result.extend(
+        Manifest::from_toml(&fs::read_to_string(
+            root.join("scripts/perf/manifests/impact-creations.toml"),
+        )?)?
+        .suite,
+    );
+    Ok(result)
 }
 // Resolve an immutable native-arm64 manifest without invoking Docker. Launches
 // use this digest, so a stale local tag can never substitute different bytes.
@@ -414,6 +469,7 @@ fn provenance(runner: &mut impl Runner, path: &Path) -> Result<Artifact> {
         &strings(&["/usr/bin/codesign", "-d", "--verbose=4", bin]),
         None,
         30,
+        &[],
     )?;
     if signing.code != Some(0) {
         return Err("codesign inspection failed".into());
@@ -428,6 +484,7 @@ fn provenance(runner: &mut impl Runner, path: &Path) -> Result<Artifact> {
         &strings(&["/usr/bin/codesign", "-d", "--entitlements", ":-", bin]),
         None,
         30,
+        &[],
     )?;
     if entitlement.code != Some(0) {
         return Err("entitlement inspection failed".into());
@@ -477,6 +534,23 @@ fn measure(
         return Err("samples must be positive".into());
     }
     let mut suites = workloads(root)?;
+    let mut windows = windows(root)?;
+    if let Some(n) = args.operations {
+        if n == 0 {
+            return Err("operations must be positive".into());
+        }
+        for suite in &mut suites {
+            if matches!(suite.name.as_str(), "spawn-loop" | "thread-spawn") {
+                for arg in &mut suite.cmd {
+                    *arg = arg.replace("1000", &n.to_string());
+                }
+                windows
+                    .get_mut(&suite.name)
+                    .ok_or("missing window")?
+                    .operations = n;
+            }
+        }
+    }
     // A workload subset cannot permit another campaign's Docker phase.
     let images = suites.iter().map(|s| s.image.clone()).collect::<Vec<_>>();
     if !args.workload.is_empty() {
@@ -529,7 +603,23 @@ fn measure(
     save(&args.out, &receipt)?;
     let measurement = (|| -> Result<()> {
         for mut suite in suites {
-            let declaration_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&suite)?));
+            let probe_hash = if suite.name == "fork-exec" {
+                let path = root.join(
+                    "conformance-probes/target/aarch64-unknown-linux-musl/release/perf_fork_exec",
+                );
+                suite.bind_mounts = vec![format!("{}:/tmp/impact-fork-exec:ro", path.display())];
+                Some(format!("{:x}", Sha256::digest(fs::read(path)?)))
+            } else {
+                None
+            };
+            let declaration_sha256 = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&(
+                    &suite,
+                    windows.get(&suite.name),
+                    probe_hash
+                ))?)
+            );
             let image = suite.image.clone();
             let digest = image_digest(runner, &image)?;
             suite.image = pinned(&image, &digest);
@@ -540,6 +630,7 @@ fn measure(
                     image_digest: digest.clone(),
                     command: suite.cmd.clone(),
                     declaration_sha256,
+                    window: windows.get(&suite.name).cloned(),
                     samples: vec![],
                 },
             );
@@ -551,7 +642,7 @@ fn measure(
                 } else {
                     argv::docker_argv(&suite, &id, argv::DockerPlatform::LinuxArm64)
                 };
-                let output = runner.execute(&argv, Some(&id), suite.timeout_s);
+                let output = execute_workload(runner, &suite, phase, &argv, &id);
                 let cleanup = if phase == "carrick" {
                     checked(
                         runner,
@@ -567,16 +658,25 @@ fn measure(
                     checked(runner, &strings(&["docker", "rm", "-f", &id]))
                 };
                 let output = output?;
-                let sample = Sample {
-                    run_id: id,
-                    argv,
-                    warmup: index == 0,
-                    wall_s: output.wall,
-                    child_cpu_s: output.cpu,
-                    exit_code: output.code,
-                    timed_out: output.timed_out,
-                    cleanup_ok: cleanup.is_ok(),
-                };
+                let per_op = windows
+                    .get(&suite.name)
+                    .map(|window| parse_window(&output.stdout, window))
+                    .transpose();
+                let sample =
+                    Sample {
+                        run_id: id,
+                        argv,
+                        warmup: index == 0,
+                        wall_s: output.wall,
+                        child_cpu_s: output.cpu,
+                        per_op_s: per_op.as_ref().ok().copied().flatten(),
+                        guest_window_s: per_op.as_ref().ok().copied().flatten().and_then(|v| {
+                            windows.get(&suite.name).map(|w| v * w.operations as f64)
+                        }),
+                        exit_code: output.code,
+                        timed_out: output.timed_out,
+                        cleanup_ok: cleanup.is_ok(),
+                    };
                 let ok = valid_sample(&sample);
                 receipt
                     .workloads
@@ -585,6 +685,7 @@ fn measure(
                     .samples
                     .push(sample);
                 save(&args.out, &receipt)?;
+                per_op?;
                 if !ok {
                     return Err(
                         format!("{} sample failed or cleanup incomplete", suite.name).into(),
@@ -608,6 +709,23 @@ fn measure(
     save(&args.out, &receipt)?;
     measurement
 }
+fn execute_workload(
+    runner: &mut impl Runner,
+    suite: &Suite,
+    phase: &str,
+    argv: &[String],
+    id: &str,
+) -> Result<Output> {
+    let env = if phase == "carrick" {
+        suite
+            .registry_host()
+            .map(|host| vec![("CARRICK_INSECURE_REGISTRIES".into(), host.into())])
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+    runner.execute(argv, Some(id), suite.timeout_s, &env)
+}
 fn valid_sample(s: &Sample) -> bool {
     s.exit_code == Some(0)
         && !s.timed_out
@@ -624,6 +742,10 @@ fn stats(r: &Receipt, w: &WorkloadReceipt) -> Option<(f64, f64, f64)> {
         || !w.samples.first()?.warmup
         || w.samples.iter().skip(1).any(|s| s.warmup)
         || !w.samples.iter().all(valid_sample)
+        || (w.window.is_some()
+            && w.samples
+                .iter()
+                .any(|s| !s.per_op_s.is_some_and(|v| v.is_finite() && v > 0.0)))
     {
         return None;
     }
@@ -649,10 +771,17 @@ fn digest_valid(d: &str) -> bool {
 /// Never returns a performance-dependent exit status; invalid evidence has no ratios.
 pub fn report(base: &Receipt, candidate: &Receipt, docker: &Receipt) -> String {
     let mut text = String::from(
-        "# Landing impact\n\nMedian wall seconds [min–max]; one excluded warm-up. Fixed samples, no retries. Child CPU is host child-process CPU (Docker client CPU, not container CPU). Performance is report-only. A controlled single-variable campaign on a quiet host is required for claims; this report does not prove host quietness.\n\n| workload | base | candidate | Docker | base/Docker | candidate/Docker | 2x objective |\n|---|---|---|---|---|---|---|\n",
+        "# Landing impact\n\nMedian wall seconds [min–max]; one excluded warm-up. Fixed samples, no retries. Child CPU is host child-process CPU (Docker client CPU, not container CPU). Performance is report-only. A controlled single-variable campaign on a quiet host is required for claims; this report does not prove host quietness.\n\n| workload | base | candidate | Docker | base/Docker | candidate/Docker | per-op seconds base / candidate / Docker | per-op ratios base / candidate | 2x objective |\n|---|---|---|---|---|---|---|---|---|\n",
     );
     let mut warnings = String::new();
-    for name in ["true", "node-startup", "node-core-worker-message-port"] {
+    for name in [
+        "true",
+        "node-startup",
+        "node-core-worker-message-port",
+        "spawn-loop",
+        "thread-spawn",
+        "fork-exec",
+    ] {
         let row = (|| {
             if base.phase != "carrick"
                 || candidate.phase != "carrick"
@@ -667,7 +796,8 @@ pub fn report(base: &Receipt, candidate: &Receipt, docker: &Receipt) -> String {
             let b = base.workloads.get(name)?;
             let c = candidate.workloads.get(name)?;
             let d = docker.workloads.get(name)?;
-            if !digest_valid(&b.image_digest)
+            if (matches!(name, "spawn-loop" | "thread-spawn" | "fork-exec") && c.window.is_none())
+                || !digest_valid(&b.image_digest)
                 || b.image_digest != c.image_digest
                 || c.image_digest != d.image_digest
                 || b.image != c.image
@@ -675,22 +805,53 @@ pub fn report(base: &Receipt, candidate: &Receipt, docker: &Receipt) -> String {
                 || b.declaration_sha256.is_empty()
                 || b.declaration_sha256 != c.declaration_sha256
                 || c.declaration_sha256 != d.declaration_sha256
+                || b.window != c.window
+                || c.window != d.window
                 || b.command != c.command
                 || c.command != d.command
             {
                 return None;
             }
-            Some((stats(base, b)?, stats(candidate, c)?, stats(docker, d)?))
+            let wall_stats = (stats(base, b)?, stats(candidate, c)?, stats(docker, d)?);
+            let per_op = if c.window.is_some() {
+                let median = |w: &WorkloadReceipt| {
+                    let mut values = w
+                        .samples
+                        .iter()
+                        .skip(1)
+                        .filter_map(|s| s.per_op_s)
+                        .collect::<Vec<_>>();
+                    values.sort_by(f64::total_cmp);
+                    let n = values.len();
+                    (values[(n - 1) / 2] + values[n / 2]) / 2.0
+                };
+                Some((median(b), median(c), median(d)))
+            } else {
+                None
+            };
+            Some((wall_stats.0, wall_stats.1, wall_stats.2, per_op))
         })();
-        if let Some((b, c, d)) = row {
-            text.push_str(&format!("| {name} | {:.6} [{:.6}–{:.6}] | {:.6} [{:.6}–{:.6}] | {:.6} [{:.6}–{:.6}] | {:.3}x | {:.3}x | {} |\n", b.0,b.1,b.2,c.0,c.1,c.2,d.0,d.1,d.2,b.0/d.0,c.0/d.0,if c.0/d.0 <= 2.0 { "met" } else { "over" }));
+        if let Some((b, c, d, per_op)) = row {
+            let (objective, costs) = if let Some((pb, pc, pd)) = per_op {
+                (
+                    pc / pd,
+                    format!(
+                        "{pb:.9} / {pc:.9} / {pd:.9} | {:.3}x / {:.3}x",
+                        pb / pd,
+                        pc / pd
+                    ),
+                )
+            } else {
+                (c.0 / d.0, "— | —".into())
+            };
+            text.push_str(&format!("| {name} | {:.6} [{:.6}–{:.6}] | {:.6} [{:.6}–{:.6}] | {:.6} [{:.6}–{:.6}] | {:.3}x | {:.3}x | {costs} | {} |\n", b.0,b.1,b.2,c.0,c.1,c.2,d.0,d.1,d.2,b.0/d.0,c.0/d.0,if objective <= 2.0 { "met" } else { "over" }));
             if c.0 > b.0 * 1.15 {
                 warnings.push_str(&format!(
                     "\nWARNING: {name} candidate median is more than 15% slower than base.\n\n"
                 ));
             }
         } else {
-            text.push_str(&format!("| {name} | INCOMPLETE: missing, failed, stale or mismatched evidence | — | — | — | — | INCOMPLETE |\n"));
+            text.push_str(&format!("| {name} | INCOMPLETE: missing, failed, stale or mismatched evidence | — | — | — | — | — | — | INCOMPLETE |\n"));
         }
     }
     text.push_str(&warnings);
@@ -753,10 +914,18 @@ mod tests {
     struct Fake {
         outputs: VecDeque<Output>,
         commands: Vec<Vec<String>>,
+        envs: Vec<Vec<(String, String)>>,
     }
     impl Runner for Fake {
-        fn execute(&mut self, args: &[String], _: Option<&str>, _: u64) -> Result<Output> {
+        fn execute(
+            &mut self,
+            args: &[String],
+            _: Option<&str>,
+            _: u64,
+            env: &[(String, String)],
+        ) -> Result<Output> {
             self.commands.push(args.to_vec());
+            self.envs.push(env.to_vec());
             self.outputs
                 .pop_front()
                 .ok_or_else(|| "unexpected command".into())
@@ -766,6 +935,7 @@ mod tests {
         Fake {
             outputs: outputs.into(),
             commands: vec![],
+            envs: vec![],
         }
     }
     fn fixture(phase: &str, wall: f64) -> Receipt {
@@ -775,6 +945,8 @@ mod tests {
             warmup: false,
             wall_s: wall,
             child_cpu_s: Some(0.1),
+            per_op_s: None,
+            guest_window_s: None,
             exit_code: Some(0),
             timed_out: false,
             cleanup_ok: true,
@@ -786,6 +958,7 @@ mod tests {
             image_digest: format!("sha256:{}", "a".repeat(64)),
             command: vec!["cmd".into()],
             declaration_sha256: "declaration".into(),
+            window: None,
             samples: vec![warmup, sample],
         };
         Receipt {
@@ -811,6 +984,110 @@ mod tests {
         }
     }
     #[test]
+    fn digest_launch_sets_registry_environment() -> Result<()> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut suite = workloads(&root)?[1].clone();
+        suite.image = pinned(&suite.image, &format!("sha256:{}", "a".repeat(64)));
+        let mut runner = fake(vec![
+            Output::default(),
+            Output::default(),
+            Output::default(),
+        ]);
+        let argv = argv::carrick_argv(&suite, "artifact", "id");
+        execute_workload(&mut runner, &suite, "carrick", &argv, "id")?;
+        assert_eq!(
+            runner.envs[0],
+            vec![(
+                "CARRICK_INSECURE_REGISTRIES".into(),
+                "localhost:5005".into()
+            )]
+        );
+        execute_workload(&mut runner, &suite, "docker", &argv, "id")?;
+        assert!(runner.envs[1].is_empty());
+        suite.image = "ubuntu:24.04".into();
+        execute_workload(&mut runner, &suite, "carrick", &argv, "id")?;
+        assert!(runner.envs[2].is_empty());
+        Ok(())
+    }
+    #[test]
+    fn fake_creation_launches_parse_declared_windows() -> Result<()> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let windows = windows(&root)?;
+        for suite in workloads(&root)?
+            .iter()
+            .filter(|s| windows.contains_key(&s.name))
+        {
+            let window = &windows[&suite.name];
+            let mut runner = fake(vec![Output {
+                code: Some(0),
+                stdout: format!("{}1000000000\n", window.prefix),
+                wall: 9.0,
+                cpu: Some(0.1),
+                ..Output::default()
+            }]);
+            let argv = argv::carrick_argv(suite, "artifact", "unique-id");
+            let output = execute_workload(&mut runner, suite, "carrick", &argv, "unique-id")?;
+            assert_eq!(
+                parse_window(&output.stdout, window)?,
+                1.0 / window.operations as f64
+            );
+            assert_eq!(runner.commands[0], argv);
+            assert_eq!(output.wall, 9.0);
+        }
+        Ok(())
+    }
+    #[test]
+    fn guest_windows_fail_closed_and_drive_objective() -> Result<()> {
+        let window = Window {
+            operations: 1000,
+            prefix: "impact_window_ns=".into(),
+        };
+        assert_eq!(
+            parse_window("noise\nimpact_window_ns=2000000000\n", &window)?,
+            0.002
+        );
+        for output in [
+            "",
+            "impact_window_ns=0",
+            "impact_window_ns=-1",
+            "impact_window_ns=NaN",
+            "impact_window_ns=1\nimpact_window_ns=2",
+        ] {
+            assert!(parse_window(output, &window).is_err());
+        }
+        let mut base = fixture("carrick", 1.0);
+        let mut candidate = fixture("carrick", 1.0);
+        let mut docker = fixture("docker", 1.0);
+        for (r, cost) in [
+            (&mut base, 0.001),
+            (&mut candidate, 0.003),
+            (&mut docker, 0.001),
+        ] {
+            let mut w = r.workloads["true"].clone();
+            w.window = Some(window.clone());
+            for s in &mut w.samples {
+                s.per_op_s = Some(cost);
+            }
+            r.workloads.insert("spawn-loop".into(), w);
+        }
+        let text = report(&base, &candidate, &docker);
+        assert!(text.lines().any(|line| line.starts_with("| spawn-loop")
+            && line.contains("3.000x")
+            && line.contains("over")));
+        candidate
+            .workloads
+            .get_mut("spawn-loop")
+            .expect("fixture")
+            .samples[1]
+            .per_op_s = None;
+        assert!(
+            report(&base, &candidate, &docker)
+                .lines()
+                .any(|line| line.starts_with("| spawn-loop") && line.contains("INCOMPLETE"))
+        );
+        Ok(())
+    }
+    #[test]
     fn harness_argv_parity() -> Result<()> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let workloads = workloads(&root)?;
@@ -824,7 +1101,7 @@ mod tests {
             ..Output::default()
         }]);
         let planned = argv::carrick_argv(worker, "artifact", "id");
-        runner.execute(&planned, Some("id"), 300)?;
+        runner.execute(&planned, Some("id"), 300, &[])?;
         assert_eq!(
             runner.commands[0],
             argv::carrick_argv(suite, "artifact", "id")
@@ -883,6 +1160,7 @@ mod tests {
             out: output.path().join("receipt.json"),
             samples: 1,
             workload: vec!["true".into()],
+            operations: None,
         };
         let error = measure(&root, &mut runner, "carrick", None, &args).expect_err("must refuse");
         assert!(
@@ -912,6 +1190,7 @@ mod tests {
             out: output.path().join("receipt.json"),
             samples: 1,
             workload: vec!["true".into()],
+            operations: None,
         };
         let error = measure(&root, &mut runner, "docker", None, &args)
             .expect_err("emulated ARM64 must be refused");
