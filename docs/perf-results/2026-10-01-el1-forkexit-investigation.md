@@ -811,3 +811,50 @@ exact carrier metadata retirement, pending-birth kernel lifetime and
 teardown proof remain open. Credentials/affinity at claim require those
 guards before production admission. No signed tests, cached probes, hatch
 comparison, or Docker ran on this checkpoint; spawn slope is not green.
+
+
+### Phase B reserve-before-birth checkpoint (2026-10-02)
+
+Four implementation commits reserve credential identity (`251355f17`),
+retirement arena custody (`93fa75abc`), and exact-task revision headroom
+(`cd7244e7d`) before a pool entry becomes claimable, then consume the same
+retirement custody for a host-adopted ABI thread (`b1eb9b52c`). Resource
+failure leaves no claimable entry; the existing host clone fallback remains.
+This is not production birth admission or Phase B acceptance.
+
+Red receipts: allocator exhaustion after stocking aborted birth preparation;
+retirement increased capacity from zero to one after an ABI exit; ordinary
+revision advances consumed reserved headroom; a host-adopted ABI exit failed
+with `RevisionExhausted` despite its owned retirement credit. Their fixed
+contracts pass, including two live processes, peer host retirement, captured
+identity retention, and a before-publication failpoint. Latest lifecycle
+suite: 33 passed. Revision-capacity suite: two passed.
+
+`CARGO_BUILD_JOBS=3 just test-kernel`, `CARGO_BUILD_JOBS=3 just test`, and
+`CARGO_BUILD_JOBS=3 just clippy` pass on the implementation above. The host
+suite includes 155 serial kernel tests, 669 runtime tests (eight ignored),
+and 684 serial HVF library tests (three ignored). Logs:
+`/tmp/phaseb-reserved-custody-{test-kernel,test,clippy}.log`,
+`/tmp/phaseb-revision-{red,final,lifecycle}.log`, and
+`/tmp/phaseb-host-adopted-{red,final}.log`.
+
+The reconciler retained the same 599 host-authority rows and digest.
+`5c9ac7e4e` rebinds only positions/source head; normalized JSON preserves
+all classifications and budgets. `31a83d7f8` gives individual rationales to
+eleven true revision/retirement custody invariants. `just lint-domains`
+failed with 35 missing classifications before that review; the final abort
+checker still fails with 24. Remaining settlement errors have not been
+blanket-classified. Logs:
+`/tmp/phaseb-reserved-custody-{reconcile,lint-domains,aborts-final}.log`.
+
+Production `GuestLifecycleVenue::born_slot` still returns `None`.
+Runtime adoption capacity is not reserved: an ABI birth still lacks an
+execution generation and binding at its first host entry. The next change
+must factor the host/ABI origins through one exact-TaskKey process-owned
+adoption routine and reserve its capacity before stocking. Do not borrow
+the driver job or its mm projection. Conflicting-authority admission guards,
+carrier metadata retirement, pending-birth KernelArc lifetime and teardown
+remain open; credentials/affinity at claim are not yet protected by those
+guards. No signed acceptance, cached libc probes, hatch comparison, or
+Docker ran at this checkpoint. Spawn slope is not green. Main remained
+`4c4d06b4c345550da68b4b8cd44dfd8f6e53457b`, so no rebase was needed.
