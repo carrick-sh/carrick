@@ -2297,6 +2297,181 @@ fn delegated_carrier_exhaustion_returns_enomem_without_handback_and_recovers() {
 }
 
 #[test]
+fn delegated_host_brk_uses_secured_metadata_when_the_shared_pool_is_empty() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut count = 0;
+    loop {
+        match root.guest_mmap(
+            Placement::Fixed(LINUX_MMAP_BASE + count * 2 * PAGE),
+            PAGE,
+            READ,
+        ) {
+            Ok(_) => count += 1,
+            Err(Refusal::MetadataRequired) => break,
+            Err(other) => panic!("unexpected refusal {other:?}"),
+        }
+    }
+    let heap = dispatcher.mem().lock().layout.heap_base;
+    let mut memory = CountingMmapMemory::new(heap, (4 * PAGE) as usize);
+    assert_eq!(
+        root.lock().host_reserve(),
+        carrick_el1::memory::reservations::HOST_RESERVE
+    );
+    assert_eq!(
+        returned(call(&mut dispatcher, &mut memory, SYS_BRK, [0; 6])) as u64,
+        heap
+    );
+    for pages in [1, 2, 1, 0] {
+        let wanted = heap + pages * PAGE;
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_BRK,
+                [wanted, 0, 0, 0, 0, 0]
+            )) as u64,
+            wanted
+        );
+        assert_eq!(dispatcher.mem().lock().program_break(), wanted);
+        assert!(dispatcher.mem().lock().host_arena().is_none());
+    }
+}
+
+#[test]
+fn delegated_host_mremap_uses_secured_metadata_when_the_shared_pool_is_empty() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let address = LINUX_MMAP_BASE;
+    root.guest_mmap(
+        Placement::Fixed(address),
+        2 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let mut count = 0;
+    loop {
+        match root.guest_mmap(
+            Placement::Fixed(address + (128 + count * 2) * PAGE),
+            PAGE,
+            READ,
+        ) {
+            Ok(_) => count += 1,
+            Err(Refusal::MetadataRequired) => break,
+            Err(other) => panic!("unexpected refusal {other:?}"),
+        }
+    }
+    let mut memory = arena_memory();
+    memory.write_bytes(address, b"preserved").unwrap();
+    assert_eq!(
+        root.lock().host_reserve(),
+        carrick_el1::memory::reservations::HOST_RESERVE
+    );
+    assert_eq!(
+        returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [address, 2 * PAGE, 3 * PAGE, 0, 0]
+        )) as u64,
+        address
+    );
+    assert_eq!(memory.read_bytes(address, 9).unwrap(), b"preserved");
+    assert_eq!(
+        root.node(address),
+        Some((address, address + 3 * PAGE, true, ANON_FLAGS))
+    );
+}
+
+#[test]
+fn delegated_brk_capacity_refusal_returns_old_break_and_recovers() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let carrier = Carrier::new();
+    let mm = carrier.publish(&dispatcher);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    dispatcher
+        .install_reservation_provider(Arc::new(UnavailableProvider {
+            carrier: carrier.clone(),
+            requests: requests.clone(),
+        }))
+        .unwrap();
+    assert_eq!(
+        admit(&dispatcher, El1AdmissionOrigin::Bind, true),
+        Ok(El1Admission::Delegated)
+    );
+    let root = Root { carrier, mm };
+    let far = LINUX_MMAP_BASE + 128 * PAGE;
+    let mut count = 0;
+    loop {
+        match root.guest_mmap(Placement::Fixed(far + count * 2 * PAGE), PAGE, READ) {
+            Ok(_) => count += 1,
+            Err(Refusal::MetadataRequired) => break,
+            Err(other) => panic!("unexpected refusal {other:?}"),
+        }
+    }
+    // Fault injection: consume the private reserve through mock completed
+    // host proposals as well. Every node is a consistent fresh root mapping;
+    // this fixture has no descriptors or physical backing to transfer.
+    {
+        let mut model = root.lock();
+        model.begin_host_proposal().unwrap();
+        for index in 0..carrick_el1::memory::reservations::HOST_RESERVE {
+            let decision = model
+                .mmap(
+                    Placement::Fixed(far + (count + u64::from(index)) * 2 * PAGE),
+                    PAGE,
+                    READ,
+                )
+                .unwrap();
+            commit(&mut model, decision);
+        }
+        assert_eq!(model.host_reserve(), 0);
+    }
+    let heap = dispatcher.mem().lock().layout.heap_base;
+    let mut memory = CountingMmapMemory::new(heap, (2 * PAGE) as usize);
+    assert_eq!(
+        returned(call(&mut dispatcher, &mut memory, SYS_BRK, [0; 6])) as u64,
+        heap
+    );
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a break query needs no metadata"
+    );
+    let rows = proc_rows(&dispatcher);
+    let generation = root.lock().generation();
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_BRK,
+            [heap + PAGE, 0, 0, 0, 0, 0]
+        )) as u64,
+        heap
+    );
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "capacity is tried before refusing growth"
+    );
+    assert_eq!(root.lock().generation(), generation);
+    assert_eq!(proc_rows(&dispatcher), rows);
+    assert_eq!(memory.protect_calls.get(), 0);
+    assert!(dispatcher.mem().lock().host_arena().is_none());
+    root.guest_munmap(far, 8 * PAGE);
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_BRK,
+            [heap + PAGE, 0, 0, 0, 0, 0]
+        )) as u64,
+        heap + PAGE
+    );
+    assert!(root.node(heap).unwrap().2);
+    assert!(dispatcher.mem().lock().host_arena().is_none());
+}
+
+#[test]
 fn delegated_initial_reserve_refusal_leaves_the_mm_unadmitted() {
     let parent = SyscallDispatcher::new();
     let root = Root::admit(&parent);
