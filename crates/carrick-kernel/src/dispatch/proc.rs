@@ -933,7 +933,7 @@ impl<'a> ProcView<'a> {
     /// Returns 0 on success, EFAULT/EINVAL on a bad program.
     fn install_seccomp_filter<M: CurrentMmMemory>(
         &self,
-        task: &crate::kernel::Task,
+        context: &crate::kernel::KernelContext,
         memory: &mut M,
         fprog_ptr: u64,
     ) -> DispatchOutcome {
@@ -967,13 +967,21 @@ impl<'a> ProcView<'a> {
         };
         let no_new_privs = self.proc.lock().no_new_privs;
         if !no_new_privs
-            && !task
+            && !context
+                .task()
                 .caps()
                 .has_effective(crate::namespace::process::CAP_SYS_ADMIN)
         {
             return DispatchOutcome::errno(LINUX_EACCES);
         }
-        match self.seccomp.install(prog) {
+        let installation = match context
+            .kernel()
+            .with_seccomp_admission(context, || self.seccomp.install(prog))
+        {
+            Ok(installation) => installation,
+            Err(_) => return DispatchOutcome::errno(LINUX_EAGAIN),
+        };
+        match installation {
             Ok(()) => {
                 if let Err(err) = self.disable_syscall_fast_paths(memory) {
                     return DispatchOutcome::errno(err);
@@ -1008,8 +1016,21 @@ impl<'a> ProcView<'a> {
         Ok(())
     }
 
-    fn install_seccomp_strict<M: CurrentMmMemory>(&self, memory: &mut M) -> DispatchOutcome {
-        self.seccomp.install_strict();
+    fn install_seccomp_strict<M: CurrentMmMemory>(
+        &self,
+        context: &crate::kernel::KernelContext,
+        memory: &mut M,
+    ) -> DispatchOutcome {
+        if context
+            .kernel()
+            .with_seccomp_admission(context, || {
+                self.seccomp.install_strict();
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .is_err()
+        {
+            return DispatchOutcome::errno(LINUX_EAGAIN);
+        }
         if let Err(err) = self.disable_syscall_fast_paths(memory) {
             return DispatchOutcome::errno(err);
         }
@@ -1409,11 +1430,11 @@ impl<'a> ProcView<'a> {
             match operation as u32 {
                 crate::seccomp::SECCOMP_SET_MODE_FILTER => {
                     cx.kernel.kernel().fd_ceiling().disable();
-                    Ok(this.install_seccomp_filter(cx.kernel.task(), &mut *cx.memory, args.0))
+                    Ok(this.install_seccomp_filter(&cx.kernel, &mut *cx.memory, args.0))
                 }
                 crate::seccomp::SECCOMP_SET_MODE_STRICT => {
                     cx.kernel.kernel().fd_ceiling().disable();
-                    Ok(this.install_seccomp_strict(&mut *cx.memory))
+                    Ok(this.install_seccomp_strict(&cx.kernel, &mut *cx.memory))
                 }
                 _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
@@ -1692,11 +1713,11 @@ impl<'a> ProcView<'a> {
                 LINUX_PR_SET_SECCOMP => match arg2 {
                     LINUX_SECCOMP_MODE_FILTER => {
                         cx.kernel.kernel().fd_ceiling().disable();
-                        this.install_seccomp_filter(cx.kernel.task(), memory, arg3)
+                        this.install_seccomp_filter(&cx.kernel, memory, arg3)
                     }
                     LINUX_SECCOMP_MODE_STRICT => {
                         cx.kernel.kernel().fd_ceiling().disable();
-                        this.install_seccomp_strict(memory)
+                        this.install_seccomp_strict(&cx.kernel, memory)
                     },
                     _ => DispatchOutcome::errno(LINUX_EINVAL),
                 },
