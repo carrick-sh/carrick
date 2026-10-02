@@ -28,8 +28,22 @@ pub struct MetadataGrantStats {
     pub inline_hvc_traps: u64,
 }
 
+/// Storage published read/write to EL1 without copying it.
+///
+/// # Safety
+/// The range must remain allocated and at a stable address until this owner
+/// drops. It must contain only shared ABI data, permit concurrent atomic
+/// access, and be aligned and sized to the host's 16 KiB mapping granule.
+pub unsafe trait RetainedMetadataBacking: std::fmt::Debug + Send + Sync {
+    fn host_base(&self) -> carrick_guest_mem::HostVa;
+    fn mapped_len(&self) -> usize;
+}
+
 #[derive(Debug)]
-struct MetadataBacking(OwnedHostMapping);
+enum MetadataBacking {
+    Allocated(OwnedHostMapping),
+    Retained(Arc<dyn RetainedMetadataBacking>),
+}
 // SAFETY: this wrapper shares only ownership and raw addresses, never Rust
 // references to the bytes. All access requires the metadata consumer's locks;
 // the final Arc drops the mapping after every pin has released ownership.
@@ -37,10 +51,16 @@ unsafe impl Send for MetadataBacking {}
 unsafe impl Sync for MetadataBacking {}
 impl MetadataBacking {
     fn as_ptr(&self) -> *mut u8 {
-        self.0.as_ptr()
+        match self {
+            Self::Allocated(mapping) => mapping.as_ptr(),
+            Self::Retained(owner) => owner.host_base().0 as *mut u8,
+        }
     }
     fn len(&self) -> usize {
-        self.0.len()
+        match self {
+            Self::Allocated(mapping) => mapping.len(),
+            Self::Retained(owner) => owner.mapped_len(),
+        }
     }
 }
 
@@ -52,6 +72,16 @@ struct GrantedSlotRecord {
     num_slots: usize,
     token: u64,
     generation: u64,
+}
+
+// SAFETY: each variant owns stable, synchronized storage for its entire lifetime.
+unsafe impl RetainedMetadataBacking for MetadataBacking {
+    fn host_base(&self) -> carrick_guest_mem::HostVa {
+        carrick_guest_mem::HostVa(self.as_ptr() as usize)
+    }
+    fn mapped_len(&self) -> usize {
+        self.len()
+    }
 }
 
 /// A pin retains the exact mapping even after VM teardown removes its grant
@@ -95,6 +125,7 @@ impl MetadataExtentResolver for HostMetadataExtentResolver<'_> {
 
 /// Exact carrier control mapping and dynamic-extent resolver lifetime.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
 pub struct CarrierMetadataAccess {
     carrier: Arc<crate::trap::PersistentCarrierMappings>,
     generation: crate::trap::CarrierVmGeneration,
@@ -112,6 +143,34 @@ impl CarrierMetadataAccess {
         Some(access)
     }
 
+    /// Map the existing ABI storage into the carrier's EL1-only metadata
+    /// aperture. Stage-1 already covers this aperture; stage-2 publication and
+    /// its inventory entry commit together before the extent is returned.
+    pub fn map_retained(
+        &self,
+        backing: Arc<dyn RetainedMetadataBacking>,
+    ) -> Result<RetainedMetadataMapping, MetadataResolutionError> {
+        let extent = metadata_aperture(&self.carrier.custody)
+            .lock()
+            .install_retained_using(
+                &self.carrier.custody,
+                self.generation,
+                backing,
+                |spec| unsafe {
+                    crate::trap::inventory_hv_vm_map(
+                        spec.host_addr as *mut std::ffi::c_void,
+                        spec.ipa,
+                        spec.len,
+                        spec.perms,
+                    )
+                },
+            )?;
+        Ok(RetainedMetadataMapping {
+            access: self.clone(),
+            extent,
+        })
+    }
+
     /// The returned address is borrowed from this retained carrier mapping.
     pub fn region(&self) -> Result<core::ptr::NonNull<u8>, MetadataResolutionError> {
         if self.carrier.custody.live_generation() != Some(self.generation) {
@@ -123,6 +182,53 @@ impl CarrierMetadataAccess {
                 carrick_el1_abi::EL1_REGION_SIZE as usize,
             )
             .ok_or(MetadataResolutionError::StaleOwner)
+    }
+}
+
+/// Authority to retire one retained mapping in its exact carrier. Dropping
+/// this handle cannot release live backing: custody keeps it through VM
+/// destruction. Consumers pin the extent while any EL1 reference can reach it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct RetainedMetadataMapping {
+    access: CarrierMetadataAccess,
+    extent: MetadataExtent,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl RetainedMetadataMapping {
+    pub fn pin(&self) -> Result<HostMetadataExtentPin, MetadataResolutionError> {
+        self.access.pin(self.extent)
+    }
+
+    /// Pins exclude retirement; failed unmaps keep the mapping and its backing
+    /// available for another retirement attempt.
+    pub fn try_retire(self) -> Result<(), Self> {
+        let status =
+            if request_has_live_vm(&self.access.carrier.custody, Some(self.access.generation)) {
+                metadata_aperture(&self.access.carrier.custody)
+                    .lock()
+                    .retire_retained_using(self.extent, self.access.generation.0, |record| {
+                        retire_metadata_record_using(
+                            &self.access.carrier.custody,
+                            record.identity,
+                            |ipa, len| {
+                                let rc = unsafe { crate::trap::inventory_hv_vm_unmap(ipa, len) };
+                                if rc == 0 {
+                                    Ok(())
+                                } else {
+                                    Err(crate::trap::CarrierStage2BackendError::HvReturn(rc as u32))
+                                }
+                            },
+                        )
+                    })
+            } else {
+                METADATA_GRANT_ERR_DENIED
+            };
+        if status == METADATA_GRANT_SUCCESS {
+            Ok(())
+        } else {
+            Err(self)
+        }
     }
 }
 
@@ -154,6 +260,65 @@ impl HostApertureState {
             occupied_bitmap: [0; 2],
             slots: [const { None }; MAX_DYNAMIC_EXTENT_SLOTS],
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn install_retained_using(
+        &mut self,
+        custody: &crate::trap::CarrierVmCustody,
+        generation: crate::trap::CarrierVmGeneration,
+        backing: Arc<dyn RetainedMetadataBacking>,
+        map: impl FnOnce(crate::trap::CarrierStage2RecordSpec) -> i32,
+    ) -> Result<MetadataExtent, MetadataResolutionError> {
+        let len = backing.mapped_len();
+        let host = backing.host_base().0;
+        if len == 0
+            || len > EL1_DYNAMIC_METADATA_SIZE as usize
+            || !len.is_multiple_of(16384)
+            || host == 0
+            || !host.is_multiple_of(16384)
+            || host.checked_add(len).is_none()
+        {
+            return Err(MetadataResolutionError::InvalidExtent);
+        }
+        if !request_has_live_vm(custody, Some(generation)) {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        let token = reserve_metadata_token(&NEXT_TOKEN).ok_or(MetadataResolutionError::Busy)?;
+        let count = len.div_ceil(EL1_DYNAMIC_METADATA_EXTENT_SIZE);
+        let slot = self
+            .find_and_reserve_slots(count)
+            .ok_or(MetadataResolutionError::Busy)?;
+        let ipa = EL1_DYNAMIC_METADATA_BASE + (slot * EL1_DYNAMIC_METADATA_EXTENT_SIZE) as u64;
+        let spec = crate::trap::CarrierStage2RecordSpec {
+            vm_generation: generation,
+            ipa,
+            len,
+            host_addr: host,
+            mapped: true,
+            backend_map_installed: true,
+            release_ipa: false,
+            perms: 3,
+            logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                id: token,
+                generation: token,
+            }),
+        };
+        let identity = match publish_metadata_mapping_using(custody, spec, || map(spec)) {
+            Ok(identity) => identity,
+            Err(_) => {
+                self.unreserve_slots(slot, count);
+                return Err(MetadataResolutionError::Busy);
+            }
+        };
+        self.slots[slot] = Some(GrantedSlotRecord {
+            backing: Arc::new(MetadataBacking::Retained(backing)),
+            identity,
+            num_slots: count,
+            token,
+            generation: generation.0,
+        });
+        MetadataExtent::new(ipa, len as u64, token).ok_or(MetadataResolutionError::InvalidExtent)
     }
 
     fn pin_extent(
@@ -188,6 +353,54 @@ impl HostApertureState {
     }
 
     fn return_extent_using(
+        &mut self,
+        slot: usize,
+        size: usize,
+        token: u64,
+        generation: u64,
+        unmap: impl FnOnce(&GrantedSlotRecord) -> bool,
+    ) -> u64 {
+        if self
+            .slots
+            .get(slot)
+            .and_then(Option::as_ref)
+            .is_some_and(|record| matches!(record.backing.as_ref(), MetadataBacking::Retained(_)))
+        {
+            return METADATA_GRANT_ERR_DENIED;
+        }
+        self.retire_extent_using(slot, size, token, generation, unmap)
+    }
+
+    fn retire_retained_using(
+        &mut self,
+        extent: MetadataExtent,
+        generation: u64,
+        unmap: impl FnOnce(&GrantedSlotRecord) -> bool,
+    ) -> u64 {
+        let Some(offset) = extent.base().checked_sub(EL1_DYNAMIC_METADATA_BASE) else {
+            return METADATA_GRANT_ERR_INVALID;
+        };
+        if !offset.is_multiple_of(EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64) {
+            return METADATA_GRANT_ERR_INVALID;
+        }
+        let Ok(slot) = usize::try_from(offset / EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64) else {
+            return METADATA_GRANT_ERR_INVALID;
+        };
+        if !self
+            .slots
+            .get(slot)
+            .and_then(Option::as_ref)
+            .is_some_and(|record| matches!(record.backing.as_ref(), MetadataBacking::Retained(_)))
+        {
+            return METADATA_GRANT_ERR_NOT_FOUND;
+        }
+        let Ok(size) = usize::try_from(extent.len()) else {
+            return METADATA_GRANT_ERR_INVALID;
+        };
+        self.retire_extent_using(slot, size, extent.token(), generation, unmap)
+    }
+
+    fn retire_extent_using(
         &mut self,
         slot: usize,
         size: usize,
@@ -495,7 +708,7 @@ fn service_metadata_operation(
             }
         };
         state.slots[slot_idx] = Some(GrantedSlotRecord {
-            backing: Arc::new(MetadataBacking(backing)),
+            backing: Arc::new(MetadataBacking::Allocated(backing)),
             identity,
             num_slots,
             token,
@@ -655,7 +868,7 @@ mod tests {
         state.reserve_slots(0, 1);
         state.slots[0] = Some(GrantedSlotRecord {
             identity: test_record(&custody, generation, &backing, 19),
-            backing: Arc::new(MetadataBacking(backing)),
+            backing: Arc::new(MetadataBacking::Allocated(backing)),
             num_slots: 1,
             token: 19,
             generation: generation.0,
@@ -755,7 +968,7 @@ mod tests {
             assert_eq!(aperture.find_and_reserve_slots(1), Some(0));
             aperture.slots[0] = Some(GrantedSlotRecord {
                 identity: test_record(&custody, first, &backing, 91),
-                backing: Arc::new(MetadataBacking(backing)),
+                backing: Arc::new(MetadataBacking::Allocated(backing)),
                 num_slots: 1,
                 token: 91,
                 generation: first.0,
@@ -819,7 +1032,7 @@ mod tests {
         unsafe { ptr.write(0xa5) };
         state.slots[slot] = Some(GrantedSlotRecord {
             identity: test_record(&custody, generation, &backing, 7),
-            backing: Arc::new(MetadataBacking(backing)),
+            backing: Arc::new(MetadataBacking::Allocated(backing)),
             num_slots: 2,
             token: 7,
             generation: 1,
@@ -938,6 +1151,95 @@ mod tests {
         let aperture = metadata_aperture(&custody).lock();
         assert!(aperture.slots.iter().all(Option::is_none));
         assert!(aperture.occupied_bitmap.iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn retained_lifecycle_mapping_keeps_one_backing_and_exact_carrier() {
+        let first = crate::trap::CarrierVmCustody::new();
+        let second = crate::trap::CarrierVmCustody::new();
+        let a = first.begin_create().unwrap();
+        first.commit_create(a).unwrap();
+        let b = second.begin_create().unwrap();
+        second.commit_create(b).unwrap();
+        let backing = Arc::new(MetadataBacking::Allocated(
+            allocate_metadata_backing(16384).unwrap(),
+        ));
+        let weak = Arc::downgrade(&backing);
+        let host = backing.as_ptr();
+        let mut state = metadata_aperture(&first).lock();
+        assert!(
+            state
+                .install_retained_using(&first, a, backing.clone(), |_| -1)
+                .is_err()
+        );
+        assert!(first.stage2_record_identities().is_empty());
+        assert!(state.occupied_bitmap.iter().all(|bits| *bits == 0));
+        let extent = state
+            .install_retained_using(&first, a, backing.clone(), |spec| {
+                assert_eq!(spec.host_addr, host as usize);
+                assert_eq!(spec.len, 16384);
+                0
+            })
+            .unwrap();
+        drop(backing);
+        let pin = state.pin_extent(extent, a.0).unwrap();
+        assert_eq!(pin.host_base().as_ptr(), host);
+        let other = Arc::new(MetadataBacking::Allocated(
+            allocate_metadata_backing(16384).unwrap(),
+        ));
+        let other_weak = Arc::downgrade(&other);
+        let other_extent = metadata_aperture(&second)
+            .lock()
+            .install_retained_using(&second, b, other, |_| 0)
+            .unwrap();
+        assert_eq!(extent.base(), other_extent.base());
+        assert_ne!(extent.token(), other_extent.token());
+        assert!(
+            metadata_aperture(&second)
+                .lock()
+                .pin_extent(extent, b.0)
+                .is_err()
+        );
+        assert_eq!(
+            state.return_extent_using(0, 16384, extent.token(), a.0, |_| panic!(
+                "guest cannot release lifecycle backing"
+            )),
+            METADATA_GRANT_ERR_DENIED
+        );
+        assert_eq!(
+            state.retire_retained_using(extent, a.0, |_| panic!("pin excludes retirement")),
+            METADATA_GRANT_ERR_DENIED
+        );
+        drop(pin);
+        assert_eq!(
+            state.retire_retained_using(extent, a.0, |_| false),
+            METADATA_GRANT_ERR_DENIED
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "failed unmap released live backing"
+        );
+        assert_eq!(
+            state.retire_retained_using(extent, a.0, |record| retire_metadata_record_using(
+                &first,
+                record.identity,
+                |_, _| Ok(())
+            )),
+            METADATA_GRANT_SUCCESS
+        );
+        assert!(weak.upgrade().is_none());
+        assert!(first.stage2_record_identities().is_empty());
+        assert!(other_weak.upgrade().is_some());
+        let surviving_pin = metadata_aperture(&second)
+            .lock()
+            .pin_extent(other_extent, b.0)
+            .unwrap();
+        second.begin_destroy(b).unwrap();
+        second.commit_destroy(b).unwrap();
+        assert!(other_weak.upgrade().is_some());
+        drop(surviving_pin);
+        assert!(other_weak.upgrade().is_none());
     }
 
     #[test]

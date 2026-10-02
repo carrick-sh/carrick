@@ -1,9 +1,9 @@
 //! Control-only backing retained by the thread and every execution-lane pin.
 
 use std::ops::Deref;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 
-use carrick_el1_abi::{BlockedMask, ThreadControlSlot};
+use carrick_el1_abi::{BlockedMask, LifecycleHatches, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_mem::HostVa;
 use parking_lot::Mutex;
 
@@ -30,9 +30,42 @@ struct FreeSlot {
     index: usize,
 }
 
+/// The complete mapping granule contains only shared ABI bytes.
+#[repr(C, align(16384))]
+#[derive(Debug)]
+struct LifecycleBacking {
+    page: ThreadLifecyclePage,
+    padding: [u8; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
+}
+
+/// Pins a process's lifecycle page without retaining the task/kernel graph.
+#[derive(Clone, Debug)]
+pub struct ThreadLifecycleLease(Arc<LifecycleBacking>);
+
+impl ThreadLifecycleLease {
+    pub fn backing_base(&self) -> HostVa {
+        HostVa(std::ptr::from_ref(self.0.as_ref()).addr())
+    }
+
+    pub const fn backing_len(&self) -> usize {
+        PAGE_BYTES
+    }
+}
+
+impl Deref for ThreadLifecycleLease {
+    type Target = ThreadLifecyclePage;
+    fn deref(&self) -> &Self::Target {
+        &self.0.page
+    }
+}
+
+static LIFECYCLE_HATCHES: LazyLock<LifecycleHatches> =
+    LazyLock::new(|| LifecycleHatches::from_lookup(|name| std::env::var(name).ok()));
+
 #[derive(Debug)]
 struct Arena {
     owner: TaskKey,
+    lifecycle: ThreadLifecycleLease,
     free: Mutex<Vec<FreeSlot>>,
 }
 
@@ -45,6 +78,10 @@ impl ThreadControlArena {
     pub(in crate::kernel) fn new(owner: TaskKey) -> Self {
         Self(Arc::new(Arena {
             owner,
+            lifecycle: ThreadLifecycleLease(Arc::new(LifecycleBacking {
+                page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
+                padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
+            })),
             free: Mutex::new(Vec::new()),
         }))
     }
@@ -72,6 +109,7 @@ impl ThreadControlArena {
             owner: self.0.owner,
             thread,
             arena: Arc::downgrade(&self.0),
+            lifecycle: self.0.lifecycle.clone(),
             allocation: Some(allocation),
         }))
     }
@@ -86,6 +124,7 @@ struct Lease {
     owner: TaskKey,
     thread: ThreadKey,
     arena: Weak<Arena>,
+    lifecycle: ThreadLifecycleLease,
     allocation: Option<FreeSlot>,
 }
 
@@ -115,6 +154,12 @@ impl ThreadControlLease {
 
     pub fn identity(&self) -> (TaskKey, ThreadKey) {
         (self.0.owner, self.0.thread)
+    }
+
+    /// Same process authority for every slot issued by this arena. Numeric
+    /// task keys, including equal keys in distinct kernels, cannot alias it.
+    pub fn lifecycle(&self) -> ThreadLifecycleLease {
+        self.0.lifecycle.clone()
     }
 
     /// Granule-aligned base of the control-only page this lease pins.
@@ -165,6 +210,24 @@ mod tests {
         assert!(second.owns(&second_slot));
         assert!(!first.owns(&second_slot));
         assert!(!second.owns(&first_slot));
+        let first_page = first_slot.lifecycle();
+        let second_page = second_slot.lifecycle();
+        assert_ne!(first_page.backing_base(), second_page.backing_base());
+        assert_eq!(first_page.backing_base().0 % PAGE_BYTES, 0);
+        assert_eq!(first_page.backing_len(), PAGE_BYTES);
+        first_page.close();
+        assert_eq!(
+            first_slot.lifecycle().gate(),
+            carrick_el1_abi::GateState::Closed
+        );
+        assert_eq!(second_page.gate(), carrick_el1_abi::GateState::Open);
+        let another = first.allocate(key);
+        assert_eq!(
+            another.lifecycle().backing_base(),
+            first_page.backing_base()
+        );
+        drop(first);
+        assert_eq!(first_page.gate(), carrick_el1_abi::GateState::Closed);
     }
 
     #[test]

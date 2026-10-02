@@ -248,3 +248,46 @@ kernel-lib tests, one ignored, and the semantics suites. Logs are
 The final `CARGO_BUILD_JOBS=3 cargo test -p carrick-el1-abi -p carrick-el1 --lib`
 also exited zero: 107 ABI tests and 181 EL1 tests. Its log is
 `/tmp/forkexit-l4-control-el1-libs.log`.
+
+### Retained metadata mapping and lifecycle-page storage
+
+The metadata aperture previously accepted only backing it allocated itself.
+`CarrierMetadataAccess::map_retained` now maps retained ABI-only storage
+without copying it, through the existing carrier stage-2 publication and
+inventory transaction. It returns a carrier-bound retirement authority;
+metadata extent pins exclude retirement, guest metadata returns cannot free
+retained backing, and a failed unmap preserves both backing and aperture
+reservation. VM destruction removes the mapping while outstanding host pins
+continue to retain its bytes. The existing fixed EL1-only stage-1 aperture is
+reused; no anonymous mmap or MAP_FIXED serving path is changed.
+
+Every task control arena now owns one granule-aligned lifecycle page, shared
+by its control leases. The page contains only shared ABI bytes and padding;
+the Arc header and host bookkeeping remain outside the mapped granule. The
+hatches are read once using the existing exact-zero parser. Equal numeric
+keys in two live arenas do not share their lifecycle gate or page.
+
+Both new API contracts first failed to compile because these operations did
+not exist; these were missing-API reds, not behavioral assertion failures.
+The focused kernel contracts subsequently passed. The full `just test-kernel`
+gate passed (2,337 library tests, one ignored, plus semantics suites). The
+serial HVF library gate passed with 682 tests and three ignored. The mapping
+contract populates equal aperture addresses in two live carriers and checks
+exact tokens, failed publication rollback, guest-return rejection, pinned
+retirement refusal, failed-unmap retention and independent owner release.
+
+This is still a partial step 1. The runtime has not installed these mappings
+for threads and `dispatch_syscall_with_ipc` still passes no lifecycle venue.
+No guest lifecycle service has been activated by this slice. Next is the
+runtime mapping owner and the exact thread/record binding used by the real
+EL1 venue; then ABI birth/exit settlement before context and membership,
+conflicting-authority admission, and process/carrier teardown. Pending-signal
+summary and host-adopted live-thread accounting must be connected before
+opening that venue. Signed acceptance remains unrun on this tree.
+
+The retained mapper currently reserves aperture space in the existing
+512 KiB allocation units even for a 16 KiB backing; it maps only the actual
+backing bytes. This spends virtual aperture capacity, not extra RAM. A caller
+that drops retirement authority without retiring keeps the backing in
+carrier custody until VM destruction. Runtime ownership must explicitly
+retire these mappings after revoking guest references.
