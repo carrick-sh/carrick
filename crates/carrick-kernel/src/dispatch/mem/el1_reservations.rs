@@ -365,7 +365,10 @@ impl MemView<'_> {
             ttbr1,
             brk_current,
             mmap_next,
-            crate::kernel::ReservationLimits { address, data },
+            crate::kernel::mm_occupancy::ReservationRootPublication {
+                limits: crate::kernel::ReservationLimits { address, data },
+                provider: authority.reservation_provider_for_publication(),
+            },
         )
     }
 }

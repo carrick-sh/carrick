@@ -631,6 +631,20 @@ pub(crate) fn trim_core_file_mappings_for_range(
         return;
     };
     if disjoint {
+        // Most anonymous arena edits are wholly below the file segments.
+        // Sorted disjoint endpoints prove that in constant work, including
+        // when predecessor retirement and publication both trim this range.
+        if mappings.first().is_none_or(|mapping| {
+            #[cfg(test)]
+            super::count_core_file_mapping_visit();
+            end <= mapping.start
+        }) || mappings.last().is_some_and(|mapping| {
+            #[cfg(test)]
+            super::count_core_file_mapping_visit();
+            start >= mapping.end
+        }) {
+            return;
+        }
         let first = mappings.partition_point(|mapping| {
             #[cfg(test)]
             super::count_core_file_mapping_visit();

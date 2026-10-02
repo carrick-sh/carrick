@@ -772,6 +772,8 @@ pub struct AddressSpacePublication {
     index: SpaceIndex,
     mm: MmId,
     fence: MmFence,
+    reservation_provider:
+        Option<Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
 }
 
 impl std::fmt::Debug for AddressSpacePublication {
@@ -822,6 +824,12 @@ pub fn is_address_space_published(mm: MmId) -> bool {
     crate::el1_zone::zone().is_some_and(|zone| zone.spaces.find(mm.raw()).is_some())
 }
 
+/// Root admission and final settlement share this exact carrier authority.
+pub struct ReservationRootPublication {
+    pub limits: ReservationLimits,
+    pub provider: Option<Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
+}
+
 /// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, with initial
 /// `brk_current` and `mmap_next` layout anchors for guest EL1 to install and
 /// the publishing process's `limits` for its reservation root.
@@ -832,7 +840,7 @@ pub fn publish_address_space_with_layout(
     ttbr1: u64,
     brk_current: u64,
     mmap_next: u64,
-    limits: ReservationLimits,
+    root: ReservationRootPublication,
 ) -> Option<AddressSpacePublication> {
     if !switching_enabled() {
         return None;
@@ -851,7 +859,8 @@ pub fn publish_address_space_with_layout(
         Anchors {
             brk_current,
             mmap_next,
-            limits,
+            limits: root.limits,
+            reservation_provider: root.provider,
         },
     )
 }
@@ -877,6 +886,7 @@ fn publish_in(
                 address: u64::MAX,
                 data: u64::MAX,
             },
+            reservation_provider: None,
         },
     )
 }
@@ -886,6 +896,8 @@ struct Anchors {
     brk_current: u64,
     mmap_next: u64,
     limits: ReservationLimits,
+    reservation_provider:
+        Option<Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
 }
 
 fn publish_in_with_layout(
@@ -900,6 +912,7 @@ fn publish_in_with_layout(
         brk_current,
         mmap_next,
         limits,
+        reservation_provider,
     } = anchors;
     let spaces = tables.spaces;
     let _serial = SPACES_LOCK.lock();
@@ -951,7 +964,7 @@ fn publish_in_with_layout(
     // Bound while closed: a pause in force now raises the gate before it
     // opens, and every later pause raises it before its occupancy scan.
     if !fence.bind_mirror(Arc::new(SpaceGate { tables, index })) {
-        retire_reservation_root(tables, index, mm);
+        retire_reservation_root(tables, index, mm, reservation_provider.as_ref());
         spaces.free(index);
         return None;
     }
@@ -961,6 +974,7 @@ fn publish_in_with_layout(
         index,
         mm,
         fence: Arc::clone(fence),
+        reservation_provider,
     })
 }
 
@@ -973,7 +987,12 @@ impl AddressSpacePublication {
         }
         self.close();
         drain_space(self.tables.occupancy, self.mm);
-        retire_reservation_root(self.tables, self.index, self.mm);
+        retire_reservation_root(
+            self.tables,
+            self.index,
+            self.mm,
+            self.reservation_provider.as_ref(),
+        );
     }
     /// No EL1 install of the space from now on (its ASID starts retiring).
     pub fn close(&self) {
@@ -1029,13 +1048,23 @@ impl Drop for AddressSpacePublication {
             settlement.release(&excluded);
         }
         drain_space(self.tables.occupancy, self.mm);
-        retire_reservation_root(self.tables, self.index, self.mm);
+        retire_reservation_root(
+            self.tables,
+            self.index,
+            self.mm,
+            self.reservation_provider.as_ref(),
+        );
         let _serial = SPACES_LOCK.lock();
         self.tables.spaces.free(self.index);
     }
 }
 
-fn retire_reservation_root(tables: SpaceTables, index: carrick_sched_core::SpaceIndex, mm: MmId) {
+fn retire_reservation_root(
+    tables: SpaceTables,
+    index: carrick_sched_core::SpaceIndex,
+    mm: MmId,
+    provider: Option<&Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
+) {
     if !tables.zone {
         return;
     }
@@ -1048,12 +1077,16 @@ fn retire_reservation_root(tables: SpaceTables, index: carrick_sched_core::Space
     };
     // The space is closed and drained: EL1 journals no return again, and
     // the owed extents' frames retire with the MM's own inventory.
-    match table
-        .lock(index.index(), key)
-        .and_then(crate::dispatch::mem::el1_reservations::settle_final_root)
-        .map(|_| ())
-    {
-        Ok(()) | Err(Refusal::Stale) => {}
+    let settled = match provider {
+        Some(provider) => provider.prepare().and_then(|view| {
+            crate::dispatch::mem::el1_reservations::settle_final_root(view.lock(key)?)
+        }),
+        None => table
+            .lock(index.index(), key)
+            .and_then(crate::dispatch::mem::el1_reservations::settle_final_root),
+    };
+    match settled {
+        Ok(_) | Err(Refusal::Stale) => {}
         Err(_) => carrick_fatal!(
             "kernel::mm_occupancy",
             "reservation authority remains busy at final MM settlement"
