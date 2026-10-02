@@ -673,3 +673,93 @@ backend work and without changing the stage-2 inventory or occupancy bitmap
 is admission decline, not fork identity rollback: the thread remains owned
 and runnable through its ordinary host continuation. Signed Phase A gates
 remain outstanding.
+
+### Phase A review checkpoint (2026-10-02)
+
+Rebased onto landing J (`75111e814`). Capacity and bounded exhaustion are
+committed as `56238b41e` and `ebdc9625f`; `6c696dab6` puts the slab's host
+concurrency guarantee on its storage owner rather than the page wrapper.
+Clippy first rejected the missing slab Send/Sync contract, then passed;
+the lifecycle ownership suite passed all 24 tests after that correction.
+Inventories were reconciled on clean source checkpoints, with 599 unchanged
+host-authority rows. No probe counts or exclusions were edited.
+
+The final signed source checkpoint is `26cfd5380`. Full EL1 command:
+`CARGO_BUILD_JOBS=3 CARRICK_RUN_ID=forkexit-sol-j-final-el1-20261001-01
+./scripts/test-signed.sh carrick-embed el1_ --nocapture`.
+It completed with **74 passed and exactly the known six failures**:
+anonymous reservations, concurrent delegated VMA operations, delegated
+MAP_FIXED over COW, fork-COW, ptrace traceclone, and spawn-slope. This is
+**not an all-green suite**. Raw log: `/tmp/forkexit-sol-j-final-el1.log`.
+The entitlement negative control passed and both scoped process censuses
+were zero. The preserved `2026-10-02-el1-forkexit-el1-partial-receipt.jsonl`
+is an in-flight receipt snapshot through the scheduler executable, not a
+complete or successful script receipt; the failing script removes its
+temporary receipt. The raw log supplies the completed verdicts.
+
+Default-on spawn, for 128 / 512 / 2048 added threads:
+
+| call | served | forwarded |
+| --- | --- | --- |
+| mask | 525 / 2061 / 8205 | 0 / 0 / 0 |
+| altstack | 387 / 1539 / 6147 | 0 / 0 / 0 |
+| exit | 0 / 0 / 0 | 131 / 514 / 2074 |
+
+The 128-to-512 slopes are mask **0.0000**, altstack **0.0000**, exit
+**0.9974**. Exit intentionally remains forwarded for Phase B. Fork-storm
+passed (16 forks, 251 storm spawns, bad=0, each child census=1). Default-on
+two-process MM occupancy passed in **774 ms**, with eight writers and 150
+forks per process, no edit/torn/snapshot/child/join failures, no mprotect
+errors, and zero alias-retirement restarts. Earlier focused post-J MM
+occupancy passed in 723 ms; the first full suite passed in 1036 ms. These
+are separate runs, not a controlled performance comparison to main's 651 ms.
+
+The final exact opt-outs (`CARRICK_EL1_SIGMASK=0 CARRICK_EL1_THREADS=0`)
+were checked with the same signed spawn command, run ID
+`forkexit-sol-j-final-hatch-20261001-01`. All three calls were served zero
+times. Mask forwards were 525 / 2061 / 8207, altstack 387 / 1539 / 6147,
+exit 130 / 515 / 2066. Slopes were **4.0000 / 3.0000 / 1.0026**, restoring
+the old forwarding shape. All guest semantic predicates were true; the
+existing exit budget assertion failed as expected. Raw log:
+`/tmp/forkexit-sol-j-final-hatch.log`. Negative control and scoped cleanup
+passed. Its failed script also did not publish a complete receipt.
+Post-run identity supplement (before any further embed signing): SHA-256
+`d9b49cef150f483a0c102d1e6b4e6a69a6aa002ce66bfde296765e35fd20df2e`,
+CDHash `53e8a576a991a34d0a5ae35d4f798525072c4b59`; hypervisor entitlement
+and `__dof_carrick` present. This supplements the raw result, not a complete
+script execution receipt.
+
+Fork-COW remains red: pages=16 had 3442 exits against ceiling 144.
+Residual classes were canceled=256, idle=286, kick=96, syscall=2543,
+metadata=0, maintenance=261, fault=0, other=0. Both parent and child verified
+320 pages successfully. Exact forwarded syscall attribution is in the
+final full-suite raw log; this is a residual-cost receipt, not COW closure.
+
+Both libc executables for the 30 cached names matching
+`sigaltstack|sigprocmask|sigmask|signal|thread` were freshly built locally.
+Signed `generic_probe_shard_` with that derived filter completed **60 unique
+rows (30 musl, 30 GNU), all MATCH**, with empty mismatch baselines, all
+three shards green, negative control green, and scoped cleanup zero.
+Final run ID: `forkexit-sol-j-final-probes-20261001-01`; raw log:
+`/tmp/forkexit-sol-j-final-probes.log`; complete receipt:
+`2026-10-02-el1-forkexit-probes-receipt.jsonl`. By the director's explicit
+mailbox revision, **manythreads, execfromthread, vforkexecthread are
+director-run**, excluded from this worker's acceptance; they still require
+both-libc landing-oracle verification. No Docker was run by this worker.
+
+Host commands passed with `CARGO_BUILD_JOBS=3`: `just test-kernel`,
+`just test`, `RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib`
+(684 passed, three existing ignored), `just clippy`, clean-tree
+`just reconcile-inventories`, and `just lint-domains`. Logs are
+`/tmp/forkexit-sol-j-{test-kernel,test,hvf-lib,clippy-green,reconcile-green,
+lint-domains}.log`. The host-authority gate explicitly covers the macOS
+subset; Linux/FreeBSD/NetBSD profiles remain pending, not silently green.
+The first three host commands preceded the trait-only slab correction;
+24 lifecycle contracts and clippy passed after it, and both signed gates
+were rebuilt and rerun after it. Inventories and final lint followed the
+clean corrected source. No budgets, retries, concurrency or deadlines
+were changed.
+
+Phase A is ready for review under the revised acceptance, with the known
+six still red. Phase B settlement, admission closing and exact per-thread
+teardown are not implemented or accepted by this checkpoint.
