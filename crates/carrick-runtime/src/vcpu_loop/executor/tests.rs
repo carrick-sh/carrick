@@ -331,6 +331,7 @@ enum BackendEventKind {
     Destroy,
     Load,
     Save,
+    SaveComplete,
     Run,
     Audit,
     Invalidate,
@@ -1103,6 +1104,11 @@ impl PersistentExecutor for FakeExecutor {
             }
             _ => {}
         }
+        self.factory.record(
+            BackendEventKind::SaveComplete,
+            self.id,
+            Some((thread, generation)),
+        );
         Ok(SavedRunnable::new(lease))
     }
 
@@ -3988,13 +3994,29 @@ fn persistent_save_restores_worker_controls_after_task_snapshot_before_detach() 
 #[test]
 fn task_migrates_between_workers_only_after_complete_save_and_unbind() {
     let (kernel, context) = bootstrap(14_015);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(2)),
+    ));
     let factory = Arc::new(FakeFactory::default());
-    let mut steps = vec![Step::Yield; 20];
-    steps.push(Step::Exit);
-    factory.install(&context, FakeBinding::new(15, steps));
+    let entered = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let binding = FakeBinding::new(15, [Step::Yield, Step::Exit]);
+    *binding.entered.lock() = Some(Arc::clone(&entered));
+    *binding.resume.lock() = Some(Arc::clone(&resume));
+    factory.install(&context, binding);
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
     let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
     let authority = enqueue_root(&scheduler, &context, publish(&context, 15));
+    // Worker A owns the live task. Its yield must settle before worker B
+    // can claim it; affinity makes that handoff mandatory, not probabilistic.
+    entered.wait();
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    resume.wait();
     drop(authority);
     pool.shutdown().expect("clean migration shutdown");
     let events = factory.events.lock();
@@ -4020,6 +4042,7 @@ fn task_migrates_between_workers_only_after_complete_save_and_unbind() {
             > 1,
         "the real two-worker run must exercise migration"
     );
+    assert_eq!(loads.len(), 2, "one controlled handoff");
     for window in loads.windows(2) {
         if window[0].1.executor == window[1].1.executor {
             continue;
@@ -4027,7 +4050,27 @@ fn task_migrates_between_workers_only_after_complete_save_and_unbind() {
         assert!(
             task_events[window[0].0 + 1..window[1].0]
                 .iter()
-                .any(|event| event.kind == BackendEventKind::Save)
+                .any(|event| event.kind == BackendEventKind::SaveComplete)
+        );
+        let previous_load = events
+            .iter()
+            .position(|event| std::ptr::eq(event, *window[0].1))
+            .unwrap();
+        let next_load = events
+            .iter()
+            .position(|event| std::ptr::eq(event, *window[1].1))
+            .unwrap();
+        let complete = events[previous_load + 1..next_load]
+            .iter()
+            .position(|event| event.kind == BackendEventKind::SaveComplete)
+            .expect("complete save before migration");
+        assert!(
+            events[previous_load + 2 + complete..next_load]
+                .iter()
+                .any(|event| {
+                    event.kind == BackendEventKind::Audit && event.executor == window[0].1.executor
+                }),
+            "source worker unbound and audited before migration"
         );
     }
     assert!(factory.concurrent_loads.lock().is_empty());
