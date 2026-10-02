@@ -3856,6 +3856,14 @@
       "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
       "classification": "config_debug",
       "rationale": "Cached value of the CARRICK_EL1_EPOLL bisection hatch in crates/carrick-kernel/src/dispatch/net/epoll_zone.rs; read once, immutable for the carrier's life."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
+      "symbol": "LIFECYCLE_HATCHES",
+      "fingerprint": "9e8626c33b7c47d779db3d34727f9d84c827089895d32d058e9285a8e449b3e6",
+      "classification": "config_debug",
+      "rationale": "Immutable process-wide operator policy, read once using the exact-zero lifecycle hatches. It stores only service-enable booleans; lifecycle pages, identities, gates, pending signals and control slots remain owned by each task arena. Equal-key live-kernel contracts verify that this policy cache does not merge process state."
     }
   ]
 }
