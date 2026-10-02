@@ -408,4 +408,3 @@ fn refresh_base_refuses_to_drop_unreviewed_row() {
         "refreshing base must refuse to drop an unreviewed row"
     );
 }
-

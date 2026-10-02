@@ -2822,114 +2822,114 @@ fn probe_campaign_dir(target: &str, exec_backend: Option<&str>) -> PathBuf {
 /// against the oracle. `probeinit` is the direct-ELF container init shim —
 /// under the injection transport it would fork/exec ITSELF at `/tmp/p`.
 const PROBE_HELPERS: &[&str] = &["probeinit"];
-/// Every probe source on disk, counted independently of
-/// `probe-inventory.json` so the two cannot drift together. Bump this ONLY
-/// alongside a deliberate probe addition, naming it.
-///
-/// 455 -> 459 on 2026-08-19 for four probes that earlier work added with
-/// inventory rows but without this second guard, which left the closure probe
-/// gate unable to run at all: `memfdsecret` and `uffdpolicy` (`51f0697ea`),
-/// `newmountapi` (`b6217325e`), and `overlaysymlink` (`4fb68d5fa`). The gating
-/// row count therefore moved from 858 to 866 — 433 conformance sources under
-/// arm64 musl AND GNU. `waitidsiuid` and `mqnotifycrossproc` (`301ac30a9`)
-/// move the source denominator from 459 to 461 and the gating rows from 866 to
-/// 870 — 435 conformance sources under both libc variants. `sigstopjobcontrol`
-/// (the job-control port's red-first probe: a SIGSTOPped child must make NO
-/// progress before SIGCONT) moves the denominator from 461 to 462 and the
-/// gating rows from 870 to 872 — 436 conformance sources under both variants.
-/// `sharedanonfutexfork` (the anon-`MAP_SHARED` cross-fork futex reducer
-/// behind futexforkrequeue's all-waiters-ETIMEDOUT shape: fork children must
-/// share one wait queue with the parent on a shared anonymous word) moves the
-/// denominator from 462 to 463 and the gating rows from 872 to 874 — 437
-/// conformance sources under both variants. `forkstackstorm` (the fork-storm
-/// stack-COW integrity reducer that pinned the teardown-ordering defect and
-/// the false refault-livelock detector) and `tlsswitch` (TPIDR_EL0/stack
-/// sentinel/TLS-tid integrity across executor multiplexing, regression cover
-/// for the migrating stack-smash family) move the denominator from 463 to 465
-/// and the gating rows from 874 to 878 — 439 conformance sources under both
-/// variants.
-/// `bridge_dns_epoll_wake` (a datagram the bridge DNS gateway answers
-/// in-process must make the socket EPOLLIN-ready and wake a thread already
-/// parked in `epoll_wait`) moves the denominator from 465 to 466 and the
-/// gating rows from 878 to 880 — 440 conformance sources under both
-/// variants; it runs under the dedicated `conformance_bridge_dns_epoll_wake`
-/// runner, so the generic set stays at 419.
-/// `rlimitnproc` (fork past a soft `RLIMIT_NPROC` must return `EAGAIN` for a
-/// non-root real uid) moves it again from 466 to 467 and the gating rows from
-/// 880 to 882 — it uses the `generic` runner, so the generic set goes 419 to
-/// 420 while the dedicated set stays at 21.
-/// `rlimitasdata` (mmap/brk growth past a soft `RLIMIT_AS`/`RLIMIT_DATA` must
-/// return `ENOMEM`) moves it from 467 to 468 and the gating rows from 882 to
-/// 884 — also `generic`, so the generic set goes 420 to 421.
-///
-/// `clocksettimevdso` (a guest `clock_settime` must move the vDSO's realtime
-/// word too, so vDSO and syscall CLOCK_REALTIME agree afterwards) moves it
-/// from 468 to 469 and the gating rows from 884 to 886 — `generic`, so the
-/// generic set goes 421 to 422.
-///
-/// `container_gate` (Gate B of the embed program: two containers in ONE
-/// carrier, sequential then concurrent, each pid 1 with its own rootfs,
-/// hostname and /proc; dedicated runner `conformance_container_gate`) moves
-/// the denominator from 469 to 470 and the gating rows from 886 to 888 — 444
-/// conformance sources (422 generic, 22 dedicated).
-///
-/// `vfs_mount_rw` (VFS injection read/write/readdir and cross-mount boundary semantics;
-/// generic runner) moves the denominator from 470 to 471 and the gating rows from
-/// 888 to 890 — 445 conformance sources (423 generic, 22 dedicated).
-///
-/// Three probes then land together, each written against a 471 denominator in
-/// its own branch because the branches were cut from the same base:
-/// `budget_two_proc` (Phase G fault injection and resource budget two-process
-/// differential invariants), `mock_network_socket` (Phase H network mocking
-/// socket semantics) and `shared_buffer_mmap` (Phase I shared-memory zero-copy
-/// and cross-task futex), all generic runners. All three exist after the
-/// merges, so the denominator moves 471 -> 474 and the gating rows 890 -> 896
-/// — 448 conformance sources (426 generic, 22 dedicated). Counted from the
-/// tree, never from any one branch's arithmetic.
-///
-/// `pathflagmatrix`, `memflagmatrix`, and `netflagmatrix` add table-driven,
-/// exact-oracle coverage for path, memory, and socket flag/error interactions.
-/// `pidtaskdomain` (guest pids are one namespace domain across fork, wait
-/// and signals) and `fileaccessmode` (open access mode is authoritative for
-/// `F_GETFL`, `mprotect` ceilings on file-backed maps, and `MAP_SHARED`
-/// write admission) are both `generic`.
-/// `memfdsharedcoherence` (a memfd is one inode: stores through a
-/// `MAP_SHARED` mapping, `pwrite` on any fd, and a forked child's writes all
-/// observe the same bytes) and `mmapprivatefiletrack` (a clean `MAP_PRIVATE`
-/// page keeps tracking the file; a dirtied page keeps its private copy) are
-/// both `generic`, moving the denominator from 493 to 495.
-/// `futexcheckpointexit` (a sibling's exit landing on a parent parked in a
-/// cross-process `FUTEX_WAIT` must not release the wait — the `ltp-pause01`
-/// checkpoint shape) is `generic`, moving the denominator from 495 to 496.
-/// `forkreadexitcow` (a forked child's first copy-on-write store, taken inside
-/// `read(2)` on an inherited descriptor, must not deadlock against a sibling's
-/// process retirement — the `ltp-fork07` shape) is `generic`, moving the
-/// denominator from 496 to 497.
-/// `pipemass` (a process may hold as many pipes as `RLIMIT_NOFILE` allows and
-/// the last slot still serves a regular-file open, a poll and a byte round
-/// trip — the `ltp-pipe06` shape) is `generic`, moving the denominator from
-/// 497 to 498.
-/// `streamdestmatrix` adds connected-stream destination and peername coverage;
-/// `forkprotectexec` adds child `mprotect` execute-permission changes over
-/// inherited COW pages; `fifoopenmatrix` adds the FIFO open
-/// handshake/EINTR/SA_RESTART matrix.
-/// `mmapanonreuse` proves that partial and whole anonymous arena reuse never
-/// exposes stale bytes.
-/// `statfslifetime`, `syslogstate`, `tty0state`, and `packetv3state` add
-/// filesystem ownership, syslog capability and argument semantics, console
-/// descriptor semantics, and TPACKET_V3 packet socket state coverage. They are
-/// `generic`. `mqueueworkerprogress` and `procexeidentity` add execution-capacity
-/// and retained-executable coverage. `fdceiling` adds the carrier descriptor
-/// ceiling boundary matrix. `writeseek` and `inotifywrite` cover write/seek
-/// costs and write-completion notifications. `inotifywakethread` covers a
-/// waiter woken by a sibling thread's write. `clockcoarsevdso` covers the
-/// vDSO COARSE clocks and vDSO/syscall `clock_getres` agreement.
-/// `brkbeyondbreak` covers the unmapped heap past the break, before and after
-/// execve. `childrusage` covers wait4/RUSAGE_CHILDREN CPU usage of reaped
-/// children. The seven `epollzone*` probes (`close`, `eintr`, `mixed`,
-/// `pingpong`, `sigmask`, `timeout`, `trigger`) cover the in-zone epoll
-/// served in EL1. Conformance, performance, and helper sources are tracked
-/// in the probe inventory and gated across both libc lanes.
+// Every probe source on disk, counted independently of
+// `probe-inventory.json` so the two cannot drift together. Bump this ONLY
+// alongside a deliberate probe addition, naming it.
+//
+// 455 -> 459 on 2026-08-19 for four probes that earlier work added with
+// inventory rows but without this second guard, which left the closure probe
+// gate unable to run at all: `memfdsecret` and `uffdpolicy` (`51f0697ea`),
+// `newmountapi` (`b6217325e`), and `overlaysymlink` (`4fb68d5fa`). The gating
+// row count therefore moved from 858 to 866 — 433 conformance sources under
+// arm64 musl AND GNU. `waitidsiuid` and `mqnotifycrossproc` (`301ac30a9`)
+// move the source denominator from 459 to 461 and the gating rows from 866 to
+// 870 — 435 conformance sources under both libc variants. `sigstopjobcontrol`
+// (the job-control port's red-first probe: a SIGSTOPped child must make NO
+// progress before SIGCONT) moves the denominator from 461 to 462 and the
+// gating rows from 870 to 872 — 436 conformance sources under both variants.
+// `sharedanonfutexfork` (the anon-`MAP_SHARED` cross-fork futex reducer
+// behind futexforkrequeue's all-waiters-ETIMEDOUT shape: fork children must
+// share one wait queue with the parent on a shared anonymous word) moves the
+// denominator from 462 to 463 and the gating rows from 872 to 874 — 437
+// conformance sources under both variants. `forkstackstorm` (the fork-storm
+// stack-COW integrity reducer that pinned the teardown-ordering defect and
+// the false refault-livelock detector) and `tlsswitch` (TPIDR_EL0/stack
+// sentinel/TLS-tid integrity across executor multiplexing, regression cover
+// for the migrating stack-smash family) move the denominator from 463 to 465
+// and the gating rows from 874 to 878 — 439 conformance sources under both
+// variants.
+// `bridge_dns_epoll_wake` (a datagram the bridge DNS gateway answers
+// in-process must make the socket EPOLLIN-ready and wake a thread already
+// parked in `epoll_wait`) moves the denominator from 465 to 466 and the
+// gating rows from 878 to 880 — 440 conformance sources under both
+// variants; it runs under the dedicated `conformance_bridge_dns_epoll_wake`
+// runner, so the generic set stays at 419.
+// `rlimitnproc` (fork past a soft `RLIMIT_NPROC` must return `EAGAIN` for a
+// non-root real uid) moves it again from 466 to 467 and the gating rows from
+// 880 to 882 — it uses the `generic` runner, so the generic set goes 419 to
+// 420 while the dedicated set stays at 21.
+// `rlimitasdata` (mmap/brk growth past a soft `RLIMIT_AS`/`RLIMIT_DATA` must
+// return `ENOMEM`) moves it from 467 to 468 and the gating rows from 882 to
+// 884 — also `generic`, so the generic set goes 420 to 421.
+//
+// `clocksettimevdso` (a guest `clock_settime` must move the vDSO's realtime
+// word too, so vDSO and syscall CLOCK_REALTIME agree afterwards) moves it
+// from 468 to 469 and the gating rows from 884 to 886 — `generic`, so the
+// generic set goes 421 to 422.
+//
+// `container_gate` (Gate B of the embed program: two containers in ONE
+// carrier, sequential then concurrent, each pid 1 with its own rootfs,
+// hostname and /proc; dedicated runner `conformance_container_gate`) moves
+// the denominator from 469 to 470 and the gating rows from 886 to 888 — 444
+// conformance sources (422 generic, 22 dedicated).
+//
+// `vfs_mount_rw` (VFS injection read/write/readdir and cross-mount boundary semantics;
+// generic runner) moves the denominator from 470 to 471 and the gating rows from
+// 888 to 890 — 445 conformance sources (423 generic, 22 dedicated).
+//
+// Three probes then land together, each written against a 471 denominator in
+// its own branch because the branches were cut from the same base:
+// `budget_two_proc` (Phase G fault injection and resource budget two-process
+// differential invariants), `mock_network_socket` (Phase H network mocking
+// socket semantics) and `shared_buffer_mmap` (Phase I shared-memory zero-copy
+// and cross-task futex), all generic runners. All three exist after the
+// merges, so the denominator moves 471 -> 474 and the gating rows 890 -> 896
+// — 448 conformance sources (426 generic, 22 dedicated). Counted from the
+// tree, never from any one branch's arithmetic.
+//
+// `pathflagmatrix`, `memflagmatrix`, and `netflagmatrix` add table-driven,
+// exact-oracle coverage for path, memory, and socket flag/error interactions.
+// `pidtaskdomain` (guest pids are one namespace domain across fork, wait
+// and signals) and `fileaccessmode` (open access mode is authoritative for
+// `F_GETFL`, `mprotect` ceilings on file-backed maps, and `MAP_SHARED`
+// write admission) are both `generic`.
+// `memfdsharedcoherence` (a memfd is one inode: stores through a
+// `MAP_SHARED` mapping, `pwrite` on any fd, and a forked child's writes all
+// observe the same bytes) and `mmapprivatefiletrack` (a clean `MAP_PRIVATE`
+// page keeps tracking the file; a dirtied page keeps its private copy) are
+// both `generic`, moving the denominator from 493 to 495.
+// `futexcheckpointexit` (a sibling's exit landing on a parent parked in a
+// cross-process `FUTEX_WAIT` must not release the wait — the `ltp-pause01`
+// checkpoint shape) is `generic`, moving the denominator from 495 to 496.
+// `forkreadexitcow` (a forked child's first copy-on-write store, taken inside
+// `read(2)` on an inherited descriptor, must not deadlock against a sibling's
+// process retirement — the `ltp-fork07` shape) is `generic`, moving the
+// denominator from 496 to 497.
+// `pipemass` (a process may hold as many pipes as `RLIMIT_NOFILE` allows and
+// the last slot still serves a regular-file open, a poll and a byte round
+// trip — the `ltp-pipe06` shape) is `generic`, moving the denominator from
+// 497 to 498.
+// `streamdestmatrix` adds connected-stream destination and peername coverage;
+// `forkprotectexec` adds child `mprotect` execute-permission changes over
+// inherited COW pages; `fifoopenmatrix` adds the FIFO open
+// handshake/EINTR/SA_RESTART matrix.
+// `mmapanonreuse` proves that partial and whole anonymous arena reuse never
+// exposes stale bytes.
+// `statfslifetime`, `syslogstate`, `tty0state`, and `packetv3state` add
+// filesystem ownership, syslog capability and argument semantics, console
+// descriptor semantics, and TPACKET_V3 packet socket state coverage. They are
+// `generic`. `mqueueworkerprogress` and `procexeidentity` add execution-capacity
+// and retained-executable coverage. `fdceiling` adds the carrier descriptor
+// ceiling boundary matrix. `writeseek` and `inotifywrite` cover write/seek
+// costs and write-completion notifications. `inotifywakethread` covers a
+// waiter woken by a sibling thread's write. `clockcoarsevdso` covers the
+// vDSO COARSE clocks and vDSO/syscall `clock_getres` agreement.
+// `brkbeyondbreak` covers the unmapped heap past the break, before and after
+// execve. `childrusage` covers wait4/RUSAGE_CHILDREN CPU usage of reaped
+// children. The seven `epollzone*` probes (`close`, `eintr`, `mixed`,
+// `pingpong`, `sigmask`, `timeout`, `trigger`) cover the in-zone epoll
+// served in EL1. Conformance, performance, and helper sources are tracked
+// in the probe inventory and gated across both libc lanes.
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
