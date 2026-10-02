@@ -1070,13 +1070,21 @@ impl MemState {
         let layout = self.layout;
         let brk = self.program_break();
         let mut mappings = Vec::new();
+        let mut stock_holes = Vec::new();
         let generation = delegated
             .root
             .with_root(|model| {
                 model.observe_mappings(&mut |mapping| mappings.push(mapping))?;
+                for span in &self.first_touch_stock {
+                    stock_holes.extend(super::fault::root_holes(model, *span)?);
+                }
                 Ok(model.generation())
             })
             .unwrap_or_else(|refusal| broken_root("a fork observation", refusal));
+        // A cloned provenance ledger is not authority to inherit the parent's
+        // unconsumed backing. Mapped pieces keep their fork snapshot; holes
+        // must obtain the child's own zero-backed grant when later mapped.
+        forked.retire_stale_first_touch(&stock_holes);
         let arena_start = layout.mmap_base;
         let arena_end = arena_start.saturating_add(layout.mmap_size);
         let mut mmap_next = arena_start;
