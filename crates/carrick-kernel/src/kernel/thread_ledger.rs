@@ -94,6 +94,49 @@ impl Drop for BirthAdmissionGuard {
     }
 }
 
+impl Kernel {
+    /// Hold exact-process birth admission across a seccomp authority change.
+    /// Failed installations restore admission; successful ones permanently
+    /// decline lifecycle service and release unused pre-filter capacity.
+    pub(crate) fn with_seccomp_admission<T, E>(
+        &self,
+        context: &KernelContext,
+        install: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, KernelOperationError> {
+        let _admission = BirthAdmissionGuard::acquire(context.task())?;
+        {
+            // Consume every birth completed before the close before the new
+            // filter can become authoritative.
+            let state = self.registry().settled().read();
+            super::operations::ensure_task_unreserved(&state, context.task().key().id)?;
+            state
+                .tasks
+                .get(&context.task().key().id)
+                .filter(|record| record.task.key() == context.task().key())
+                .ok_or(KernelOperationError::UnknownTask(context.task().key().id))?;
+        }
+        let result = install();
+        if result.is_err() {
+            return Ok(result);
+        }
+        context
+            .task()
+            .shared()
+            .pending_signals()
+            .lifecycle_lease()
+            .close();
+        let state = self.registry().settled().read();
+        if let Some(record) = state
+            .tasks
+            .get(&context.task().key().id)
+            .filter(|record| record.task.key() == context.task().key())
+        {
+            record.thread_pool.revoke_unused();
+        }
+        Ok(result)
+    }
+}
+
 /// Standing entries per multi-threaded task when the pool is on. Four covers
 /// the common libc/Go worker fan-out without reserving a visible gap in the
 /// tid space for a single-threaded process: a pool is primed only after the
@@ -1154,6 +1197,10 @@ mod tests {
     fn lifecycle_ptrace_admission_declines_in_flight_birth_in_only_its_owner() {
         birth_conflict_scope("ptrace");
     }
+    #[test]
+    fn lifecycle_seccomp_admission_declines_in_flight_birth_in_only_its_owner() {
+        birth_conflict_scope("seccomp");
+    }
     fn birth_conflict_scope(operation: &str) {
         let (kernel, root) = bootstrap(9_810);
         let peer = kernel
@@ -1197,6 +1244,12 @@ mod tests {
                 Err(KernelOperationError::LifecycleAdmissionBusy(_))
             )),
             "ptrace" => assert!(!kernel.claim_ptrace_traceme(&current)),
+            "seccomp" => assert!(matches!(
+                kernel.with_seccomp_admission::<(), ()>(&current, || panic!(
+                    "filter must not install while birth is claimed"
+                )),
+                Err(KernelOperationError::LifecycleAdmissionBusy(_))
+            )),
             _ => unreachable!(),
         }
         let other_claim = root_page.claim_any().unwrap();
@@ -1251,6 +1304,44 @@ mod tests {
             "ptrace" => {
                 assert!(kernel.claim_ptrace_traceme(&current));
                 assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
+            }
+            "seccomp" => {
+                assert!(
+                    kernel
+                        .with_seccomp_admission(&current, || Err::<(), ()>(()))
+                        .unwrap()
+                        .is_err()
+                );
+                assert_eq!(page.gate(), carrick_el1_abi::GateState::Open);
+                assert!(
+                    kernel
+                        .with_seccomp_admission(&current, || {
+                            assert_eq!(page.gate(), carrick_el1_abi::GateState::ForkClosing);
+                            assert_eq!(root_page.gate(), carrick_el1_abi::GateState::Open);
+                            Ok::<(), ()>(())
+                        })
+                        .unwrap()
+                        .is_ok()
+                );
+                assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
+                assert!(page.claim_any().is_err());
+                let filtered = kernel
+                    .context(current.task().key().id, current.thread().key().tid)
+                    .unwrap();
+                let child = kernel
+                    .fork_task(
+                        &filtered,
+                        fork_plan(),
+                        ThreadId::synthetic_for_tests(9_814),
+                        "filtered-child".into(),
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    child.thread().control_lease().lifecycle().gate(),
+                    carrick_el1_abi::GateState::Closed,
+                    "a fork must not reopen inherited filter authority"
+                );
             }
             _ => unreachable!(),
         }

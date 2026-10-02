@@ -217,7 +217,13 @@ impl ThreadLifecycleLease {
     }
 
     pub(in crate::kernel) fn for_fork(&self) -> Self {
-        Self::in_pool(self.0.pool.clone(), self.1.clone())
+        let child = Self::in_pool(self.0.pool.clone(), self.1.clone());
+        // Terminal exclusion includes inherited seccomp authority. Temporary
+        // fork/exec custody belongs to the parent and is not inherited.
+        if self.gate() == carrick_el1_abi::GateState::Closed {
+            child.close();
+        }
+        child
     }
 
     fn in_pool(
