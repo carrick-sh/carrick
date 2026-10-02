@@ -11556,18 +11556,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/dispatcher.rs:743 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/dispatcher.rs:748 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
     "review_id": "HA-000497",
     "source": {
-      "byte_end": 33597,
-      "byte_start": 33581,
+      "byte_end": 33805,
+      "byte_start": 33789,
       "column": 32,
       "column_end": 48,
       "column_start": 32,
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 743,
-      "line_end": 743,
-      "line_start": 743
+      "line": 748,
+      "line_end": 748,
+      "line_start": 748
     }
   },
   {
