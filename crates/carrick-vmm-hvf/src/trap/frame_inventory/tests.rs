@@ -6470,9 +6470,19 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
 
     let disjoint_omits = [
         carrick_hal::ForkProjectionRange {
+            va: coarse.start,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Preserve,
+        },
+        carrick_hal::ForkProjectionRange {
             va: coarse.start + leaf,
             len: leaf,
             disposition: carrick_hal::ForkLeafDisposition::Omit,
+        },
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start + 2 * leaf,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Preserve,
         },
         carrick_hal::ForkProjectionRange {
             va: coarse.start + 3 * leaf,
@@ -6500,37 +6510,12 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
                 == ForkMappingPlan::preserved(ForkMappingDisposition::SharedFrameReadOnly)
     }));
 
-    let unsorted_overlapping_omits = [
-        carrick_hal::ForkProjectionRange {
-            va: coarse.start + 2 * leaf,
-            len: leaf,
-            disposition: carrick_hal::ForkLeafDisposition::Omit,
-        },
-        carrick_hal::ForkProjectionRange {
-            va: coarse.start + leaf,
-            len: 2 * leaf,
-            disposition: carrick_hal::ForkLeafDisposition::Omit,
-        },
-    ];
-    let projected = projected_fork_mappings(&coarse, false, &unsorted_overlapping_omits)
-        .expect("unsorted overlapping omitted leaves");
-    assert_eq!(
-        projected
-            .iter()
-            .map(|segment| (segment.mapping.start, segment.mapping.end))
-            .collect::<Vec<_>>(),
-        vec![
-            (coarse.start, coarse.start + leaf),
-            (coarse.start + 3 * leaf, coarse.end),
-        ],
-        "projection must normalize overlapping Omit ranges before slicing",
+    // Absence from the complete plan is absence, not an implicit Preserve.
+    assert!(
+        projected_fork_mappings(&coarse, false, &[])
+            .unwrap()
+            .is_empty()
     );
-    assert!(projected.iter().all(|segment| {
-        segment.mapping.physical_ipa == coarse.physical_ipa
-            && segment.mapping.owner_generation == coarse.owner_generation
-            && segment.plan
-                == ForkMappingPlan::preserved(ForkMappingDisposition::SharedFrameReadOnly)
-    }));
 
     let shared_mm = projected_fork_mappings(&coarse, true, &mixed)
         .expect("CLONE_VM projection must remain shared");
