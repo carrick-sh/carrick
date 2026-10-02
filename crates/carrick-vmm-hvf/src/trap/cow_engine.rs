@@ -1391,11 +1391,20 @@ impl HvfVmState {
         &mut self,
         request: carrick_hal::El1FrameGrantRequest,
     ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+        let decline = |reason: &'static str| {
+            carrick_observability::probes::guest_internal_write_fault(
+                request.semantic_base,
+                request.len,
+                21,
+                reason,
+            );
+            Ok(None)
+        };
         let Some(identity) = self.cow_identity else {
-            return Ok(None);
+            return decline("frame grant lacks exact identity");
         };
         if !sparse_materialization::frame_grant_request_is_valid(identity, request) {
-            return Ok(None);
+            return decline("frame grant request is invalid");
         }
         let publication = sparse_materialization::PublicationContext::for_local(
             std::sync::Arc::clone(&self.mm_access),
@@ -1437,7 +1446,7 @@ impl HvfVmState {
             !mapping.is_dynamic_alias || mapping.sharing != GuestMappingSharing::Private
         });
         if forbidden_alias || forbidden_mapping {
-            return Ok(None);
+            return decline("frame grant overlaps forbidden backing");
         }
         // A replacement retires an old owner. The host lane folds that
         // retirement into the grant's own inventory commit, so Ready names the
@@ -1453,18 +1462,18 @@ impl HvfVmState {
                 .lock()
                 .overlaps(request.semantic_base, request.len)
         {
-            return Ok(None);
+            return decline("frame grant overlaps a pending replacement");
         }
         let Some(deferred_state) = self.deferred_anonymous_state() else {
-            return Ok(None);
+            return decline("frame grant lacks deferred provenance");
         };
         let transition = match deferred_state.begin_pristine_materialization(
             carrick_guest_mem::GuestVa(request.semantic_base),
             semantic_len,
         ) {
             Ok(Some(transition)) => transition,
-            Ok(None) => return Ok(None),
-            Err(_) => return Ok(None),
+            Ok(None) => return decline("frame grant provenance is not pristine"),
+            Err(_) => return decline("frame grant provenance transition refused"),
         };
         let replacement_leases: std::collections::BTreeSet<_> = aliases
             .iter()
@@ -1485,7 +1494,7 @@ impl HvfVmState {
                     .iter()
                     .all(|lease| planned.planned_leases.contains(lease))
             {
-                return Ok(None);
+                return decline("frame grant predecessor retirement is incomplete");
             }
             Some(planned)
         };
@@ -1552,7 +1561,7 @@ impl HvfVmState {
                         published.alias,
                         &registry,
                     )?;
-                    return Ok(None);
+                    return decline("frame grant replacement ledger overlaps");
                 }
             }
         }

@@ -41,7 +41,6 @@ pub(super) fn frame_grant_request_is_valid(
     identity.mm != 0
         && identity.asid != 0
         && request.mm_key == identity.mm
-        && request.request_generation != 0
         && request.semantic_base.is_multiple_of(4096)
         && request.len != 0
         && request.len <= carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
@@ -552,6 +551,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn frame_grant_backend_accepts_copyout_without_a_mailbox_claim() {
+        let identity = carrick_hal::FrameCowIdentity {
+            linux_pid: 7,
+            linux_tid: 8,
+            mm: 9,
+            asid: 10,
+        };
+        let request = carrick_hal::El1FrameGrantRequest {
+            mm_key: 9,
+            fault_va: 0x4000,
+            access: 2,
+            semantic_base: 0x4000,
+            len: 4096,
+            permissions: 3,
+        };
+        assert!(frame_grant_request_is_valid(identity, request));
+    }
+
+    #[test]
     fn frame_grant_backend_accepts_only_one_exact_coherent_mm_span() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let identity = carrick_hal::FrameCowIdentity {
@@ -562,7 +580,6 @@ mod tests {
         };
         let request = carrick_hal::El1FrameGrantRequest {
             mm_key: identity.mm,
-            request_generation: 11,
             fault_va: 0x4000_4123,
             access: 2,
             semantic_base: 0x4000_0000,
@@ -573,10 +590,6 @@ mod tests {
         for invalid in [
             carrick_hal::El1FrameGrantRequest {
                 mm_key: 12,
-                ..request
-            },
-            carrick_hal::El1FrameGrantRequest {
-                request_generation: 0,
                 ..request
             },
             carrick_hal::El1FrameGrantRequest {

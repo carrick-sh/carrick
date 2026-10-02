@@ -2707,14 +2707,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let page_left = (0x1000 - (va & 0xfff)) as usize;
         let len = total_len.checked_sub(offset)?.min(page_left);
         let (_, walk) = self.diagnostic_fault_page_tables(va)?;
-        if !carrick_mmu_core::aarch64::terminal_descriptor_is_absent(
-            carrick_mmu_core::aarch64::terminal_descriptor(walk),
-        ) {
+        if !host_buffer_leaf_has_no_live_output(carrick_mmu_core::aarch64::terminal_descriptor(
+            walk,
+        )) {
             return None;
         }
         self.vm
             .frame_cow_authority()?
-            .host_read_sees_fresh_zero(va & !0xfff)
+            .host_untouched_page_permits(va & !0xfff, carrick_mmu_core::aarch64::LeafAccess::Read)
             .ok()?
             .then_some(len)
     }
@@ -2747,7 +2747,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     engine
                         .diagnostic_fault_page_tables(page)
                         .map(|(_, walk)| carrick_mmu_core::aarch64::terminal_descriptor(walk))
-                        .is_some_and(carrick_mmu_core::aarch64::terminal_descriptor_is_absent)
+                        .is_some_and(host_buffer_leaf_has_no_live_output)
                 },
                 |engine, start, len| {
                     authority
@@ -2780,6 +2780,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     )
                 })
             {
+                carrick_observability::probes::guest_internal_write_fault(
+                    page,
+                    4096,
+                    15,
+                    &format!(
+                        "copyout leaf after grant: live={live:x?} checked={checked} prepared={prepared}"
+                    ),
+                );
                 return Err(MemoryError::OutOfBounds { address, length });
             }
             if prepared {
@@ -2863,9 +2871,43 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     }
 }
 
-/// Serve the absent pages of a host copyout of `[address, end)`: one
-/// `grant` call per maximal contiguous run of pages `is_absent` names,
-/// never one per page, and never a second call for a run already asked.
+/// This observation grants no access: the exact-MM root must authenticate
+/// the current incarnation before a retired output can be reused.
+fn host_buffer_leaf_has_no_live_output(leaf: u64) -> bool {
+    carrick_mmu_core::aarch64::terminal_descriptor_is_absent(leaf)
+        || carrick_mmu_core::aarch64::terminal_descriptor_is_retired(leaf)
+}
+
+fn prevalidate_host_write_page(
+    live: Option<u64>,
+    backend: impl FnOnce() -> bool,
+    untouched_root: impl FnOnce() -> bool,
+) -> bool {
+    if live.is_some_and(|leaf| {
+        host_buffer_leaf_has_no_live_output(leaf)
+            || (carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private(leaf)
+                && carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(
+                    leaf,
+                    carrick_mmu_core::aarch64::LeafAccess::Write,
+                ))
+    }) && untouched_root()
+    {
+        return true;
+    }
+    if live.is_some_and(carrick_mmu_core::aarch64::terminal_descriptor_is_retired) {
+        return false;
+    }
+    backend()
+        && live.is_none_or(|leaf| {
+            carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(
+                leaf,
+                carrick_mmu_core::aarch64::LeafAccess::Write,
+            )
+        })
+}
+
+/// Serve unbacked copyout pages with one grant per maximal contiguous run,
+/// including its last partial page, never another call for a run already asked.
 fn serve_absent_copyout_runs<C: ?Sized, E>(
     ctx: &mut C,
     address: u64,
@@ -3195,14 +3237,28 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 length: bytes.len(),
             });
         }
-        self.commit_prepared_host_write(address, bytes.len(), true)?;
+        let report_fault = |phase, error: MemoryError| {
+            carrick_observability::probes::guest_internal_write_fault(
+                address,
+                bytes.len() as u64,
+                phase,
+                &error.to_string(),
+            );
+            error
+        };
+        self.commit_prepared_host_write(address, bytes.len(), true)
+            .map_err(|error| report_fault(9, error))?;
         let length = bytes.len();
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::GuestVisible)?;
+            let (va, ipa, chunk_len) = self
+                .syscall_buffer_chunk(address, copied, length)
+                .map_err(|error| report_fault(10, error))?;
+            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::GuestVisible)
+                .map_err(|error| report_fault(11, error))?;
             self.vm
-                .translated_write(va, ipa.raw(), &bytes[copied..copied + chunk_len])?;
+                .translated_write(va, ipa.raw(), &bytes[copied..copied + chunk_len])
+                .map_err(|error| report_fault(12, error))?;
             copied += chunk_len;
         }
         Ok(())
@@ -3241,28 +3297,44 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        if !self.vm.guest_range_is_writable(address, length) {
+        let Some(end) = address.checked_add(length as u64) else {
             return false;
-        }
-        if self
-            .vm
-            .protections()
-            .is_some_and(|p| p.range_write_denied(address, length))
-        {
-            carrick_observability::probes::guest_internal_write_fault(
-                address,
-                length as u64,
-                5,
-                "guest write protection denies range",
-            );
-            return false;
-        }
-        if !self.el1_private_range_permits(
-            address,
-            length,
-            carrick_mmu_core::aarch64::LeafAccess::Write,
-        ) {
-            return false;
+        };
+        let mut cursor = address;
+        while cursor < end {
+            let len = (end - cursor).min(4096 - (cursor & 4095)) as usize;
+            let live = self
+                .diagnostic_fault_page_tables(cursor)
+                .map(|(_, walk)| carrick_mmu_core::aarch64::terminal_descriptor(walk));
+            if !prevalidate_host_write_page(
+                live,
+                || {
+                    self.vm.guest_range_is_writable(cursor, len)
+                        && !self
+                            .vm
+                            .protections()
+                            .is_some_and(|p| p.range_write_denied(cursor, len))
+                },
+                || {
+                    self.vm.frame_cow_authority().is_some_and(|authority| {
+                        authority
+                            .host_untouched_page_permits(
+                                cursor & !4095,
+                                carrick_mmu_core::aarch64::LeafAccess::Write,
+                            )
+                            .unwrap_or(false)
+                    })
+                },
+            ) {
+                carrick_observability::probes::guest_internal_write_fault(
+                    cursor,
+                    len as u64,
+                    8,
+                    &format!("root copyout prevalidation refused: live={live:x?}"),
+                );
+                return false;
+            }
+            cursor += len as u64;
         }
         true
     }
@@ -5848,6 +5920,35 @@ unsafe impl<V: Aarch64Vmm> Send for Aarch64EngineCore<V> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_root_copyout_prevalidation_needs_no_host_mapping() {
+        for leaf in [0, (1_u64 << 55) | 0x8000] {
+            assert!(prevalidate_host_write_page(Some(leaf), || false, || true));
+            assert!(!prevalidate_host_write_page(Some(leaf), || false, || false));
+        }
+    }
+
+    #[test]
+    fn prepared_root_copyout_prevalidation_keeps_the_leaf_permission_ceiling() {
+        let prepared = (1_u64 << 56) | 0x8000 | (1 << 10) | (1 << 6);
+        assert!(prevalidate_host_write_page(
+            Some(prepared),
+            || false,
+            || true
+        ));
+        assert!(!prevalidate_host_write_page(
+            Some(prepared | (1 << 7)),
+            || false,
+            || true
+        ));
+        assert!(!prevalidate_host_write_page(Some(1), || false, || true));
+        assert!(!prevalidate_host_write_page(
+            Some((1_u64 << 55) | 0x8000),
+            || true,
+            || false
+        ));
+    }
 
     /// Budget: a host copyout calls the grant service once per maximal
     /// contiguous absent run, whatever the run's length, and never for a

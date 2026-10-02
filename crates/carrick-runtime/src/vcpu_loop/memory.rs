@@ -327,15 +327,15 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .map_err(|error| Box::new(std::io::Error::other(error)) as _)
     }
 
-    fn host_read_sees_fresh_zero(
+    fn host_untouched_page_permits(
         &self,
         page: u64,
+        access: carrick_mmu_core::aarch64::LeafAccess,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let runtime = self
-            .runtime
-            .upgrade()
-            .ok_or_else(|| std::io::Error::other("host zero read lost its exact runtime"))?;
-        Ok(runtime.dispatcher.host_read_sees_fresh_zero(page))
+        let runtime = self.runtime.upgrade().ok_or_else(|| {
+            std::io::Error::other("host buffer prevalidation lost its exact runtime")
+        })?;
+        Ok(runtime.dispatcher.host_untouched_page_permits(page, access))
     }
 
     fn deferred_anonymous_state(&self) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
