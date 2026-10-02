@@ -818,6 +818,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.creation-native-path",
         "kernel.el1.epoll-zone",
         "kernel.el1.fd-single-owner",
         "kernel.el1.files.cross-process-readers",
@@ -851,6 +852,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.creation-native-path",
         "kernel.el1.epoll-zone",
         "kernel.el1.ipc-lifecycle",
         "kernel.el1.ipc-two-process"
@@ -945,6 +947,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.creation-native-path",
         "kernel.el1.epoll-zone",
         "kernel.el1.files",
         "kernel.el1.files.cross-process-readers",
@@ -1097,6 +1100,7 @@
       "handler": "network",
       "authority": "host",
       "contracts": [
+        "kernel.el1.creation-native-path",
         "kernel.el1.poll-select-owner"
       ],
       "claims": [],
@@ -1367,6 +1371,7 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.creation-native-path",
         "kernel.el1.thread-lifecycle"
       ],
       "claims": [],
@@ -1384,6 +1389,7 @@
       "contracts": [
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-retirement",
+        "kernel.el1.creation-native-path",
         "kernel.el1.deferred-handback-identity",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
@@ -1446,6 +1452,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.creation-native-path",
         "kernel.el1.deferred-handback-identity",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
@@ -3075,6 +3082,7 @@
         "kernel.el1.anonymous-permissions",
         "kernel.el1.anonymous-retirement",
         "kernel.el1.delegated-root-fork",
+        "kernel.el1.mm-exclusive-owner",
         "kernel.el1.zone-entry-at-open",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
@@ -3157,12 +3165,14 @@
         "kernel.credentials.birth-admission",
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
+        "kernel.el1.creation-native-path",
         "kernel.el1.delegated-root-fork",
         "kernel.el1.fd-single-owner",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.fork-cow",
         "kernel.el1.guest-run-queue",
         "kernel.el1.ipc-two-process",
+        "kernel.el1.mm-exclusive-owner",
         "kernel.el1.thread-lifecycle",
         "kernel.fork.filetable",
         "kernel.fork.mappings",
@@ -3185,6 +3195,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.creation-native-path",
         "kernel.el1.fd-single-owner",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
@@ -3219,6 +3230,7 @@
         "kernel.el1.delegated-root-fork",
         "kernel.el1.fault-entry",
         "kernel.el1.ipc-fd-authority",
+        "kernel.el1.mm-exclusive-owner",
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
         "kernel.mm.address-space-occupancy",
@@ -3285,6 +3297,7 @@
         "kernel.el1.anonymous-permissions",
         "kernel.el1.delegated-root-fork",
         "kernel.el1.fault-entry",
+        "kernel.el1.mm-exclusive-owner",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.current-read-reuse",
         "kernel.mm.metadata-refusal",
@@ -3536,6 +3549,7 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.creation-native-path",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.guest-run-queue",
         "kernel.fork.stage1-image",
