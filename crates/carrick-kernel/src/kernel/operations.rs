@@ -310,6 +310,9 @@ impl TaskSetReservation {
             state.reservations.remove(task_id);
         }
         self.active = false;
+        // Conflicting authority is committed. Release birth custody before
+        // reservation subscribers can attempt their next host operation.
+        drop(self.birth_admission.take());
         // Publication is DEFERRED to the returned token: reservation-change
         // subscribers run synchronously in `publish_reservation_change`, and
         // a subscriber's wake path takes the registry lock shared
@@ -354,6 +357,7 @@ impl Drop for TaskSetReservation {
             }
         }
         drop(state);
+        drop(self.birth_admission.take());
         if changed {
             self.kernel.publish_reservation_change();
         }

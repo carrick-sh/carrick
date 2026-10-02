@@ -1258,6 +1258,43 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_reservation_release_precedes_credential_wake_in_two_processes() {
+        let (kernel, root) = bootstrap(9_820);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_821),
+                "release-peer".into(),
+                None,
+            )
+            .unwrap();
+        let reservation = kernel
+            .reserve_fork(&root, fork_plan(), "release-owner".into(), None)
+            .unwrap();
+        let exact = root.retain_exact();
+        let updating = kernel.clone();
+        let peer_page = peer.thread().control_lease().lifecycle().clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let _subscription = kernel.subscribe_reservation_change(
+            kernel.reservation_epoch(),
+            Arc::new(move || {
+                let result = updating.update_credentials(&exact, |_| {}).map(|_| ());
+                sent.send((result, peer_page.gate())).unwrap();
+            }),
+        );
+        drop(reservation);
+        let (result, peer_gate) = received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "reservation wake must already own released birth admission: {result:?}"
+        );
+        assert_eq!(peer_gate, carrick_el1_abi::GateState::Open);
+    }
+
+    #[test]
     fn lifecycle_exec_admission_retires_only_its_process_birth_capacity() {
         let (kernel, root) = bootstrap(9_798);
         let peer = kernel
