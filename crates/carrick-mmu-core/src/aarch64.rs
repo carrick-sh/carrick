@@ -9293,11 +9293,19 @@ mod tests {
                 );
             }
 
-            for (name, va) in [
-                ("user text", 0x0040_0000),
-                ("mmap", LINUX_MMAP_BASE),
-                ("shared aperture", LINUX_SHARED_FILE_BASE),
-            ] {
+            // The shared aperture is sealed PROT_NONE in a fresh image
+            // (`kernel.mm.carrier-window-isolation`): invalid, output kept.
+            let aperture_leaf = walk_leaf(LINUX_SHARED_FILE_BASE);
+            assert_eq!(
+                aperture_leaf & VALID,
+                0,
+                "{image_name}: shared aperture must start invalid"
+            );
+            assert_ne!(
+                aperture_leaf, 0,
+                "{image_name}: shared aperture keeps its output"
+            );
+            for (name, va) in [("user text", 0x0040_0000), ("mmap", LINUX_MMAP_BASE)] {
                 let leaf = walk_leaf(va);
                 assert_ne!(
                     leaf & VALID,
