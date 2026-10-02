@@ -7923,6 +7923,10 @@ mod real {
     }
 
     /// Live descriptor observation evaluated only with a listening consumer.
+    #[allow(
+        clippy::redundant_closure,
+        reason = "the USDT proc macro requires a closure expression, not an FnOnce value"
+    )]
     pub fn el1_mapping_leaf(emit: impl FnOnce() -> (u32, u64, u64, u64, u64)) {
         carrick_usdt::el1__mapping__leaf!(|| emit());
     }
