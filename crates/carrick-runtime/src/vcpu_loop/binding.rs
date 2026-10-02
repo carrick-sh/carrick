@@ -3407,6 +3407,56 @@ where
         // EL1 still holds on-CPU mid-operation, and a suspension unloads it
         // (the reload then finds the slot still holding it).
         if !engine.el1_operation_suspended() {
+            // Exec/exit can force a blocked vfork parent runnable solely so it can
+            // retire its exact logical result. Do not resume the old continuation
+            // or touch guest state after that terminal ownership transition.
+            // This also precedes execution admission: the terminal owner freezes
+            // sibling registration while waiting for these logical jobs to end.
+            let exec_finish = thread_should_finish_for_exec_replacement(
+                &self.state.registry,
+                self.state.this_tid,
+            );
+            if !self.phase.is_terminal_transition()
+                && (self.kernel.process_exiting() || exec_finish)
+            {
+                self.state.trace_hvpatch_thread_terminal(
+                    carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop,
+                    i32::from(self.kernel.process_exiting()),
+                );
+                match self
+                    .state
+                    .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps)
+                {
+                    // The drain path always finishes ThreadDone: the terminal
+                    // owner or exec survivor owns the task's end, so a
+                    // registry-derived process-exit claim is discarded here
+                    // exactly as it always was.
+                    threads::PersistentThreadExitDisposition::Done(_) => {
+                        return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                    }
+                    threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
+                        // Ownership passed: on this drain path the thread is
+                        // here BECAUSE an exec replacement or the process
+                        // terminal is retiring it — the Busy holder is (or is
+                        // superseded by) the very transaction that retires this
+                        // thread's kernel row. Its own exit_thread is redundant,
+                        // and parking for the holder STRANDS: the retirement
+                        // makes every registry-addressed wake UnknownThread
+                        // (measured live — parks at observed_epoch with three
+                        // later publishes, final wake Err(UnknownThread), 10/12
+                        // teardown hangs). Finish; the owner retires the row.
+                        let _ = observed_epoch;
+                        if !self.state.thread_exit_withdrawn {
+                            let _ = self
+                                .state
+                                .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                            self.state.thread_exit_withdrawn = true;
+                        }
+                        return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                    }
+                }
+            }
+
             if self.state.guest_execution.is_none() {
                 drop(self.registration_wait.take());
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3518,54 +3568,6 @@ where
                             .then(|| participation.publish_address_space(ttbr0, ttbr1))
                             .flatten()
                     });
-                }
-            }
-
-            // Exec/exit can force a blocked vfork parent runnable solely so it can
-            // retire its exact logical result. Do not resume the old continuation
-            // or touch guest state after that terminal ownership transition.
-            let exec_finish = thread_should_finish_for_exec_replacement(
-                &self.state.registry,
-                self.state.this_tid,
-            );
-            if !self.phase.is_terminal_transition()
-                && (self.kernel.process_exiting() || exec_finish)
-            {
-                self.state.trace_hvpatch_thread_terminal(
-                    carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop,
-                    i32::from(self.kernel.process_exiting()),
-                );
-                match self
-                    .state
-                    .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps)
-                {
-                    // The drain path always finishes ThreadDone: the terminal
-                    // owner or exec survivor owns the task's end, so a
-                    // registry-derived process-exit claim is discarded here
-                    // exactly as it always was.
-                    threads::PersistentThreadExitDisposition::Done(_) => {
-                        return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
-                    }
-                    threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
-                        // Ownership passed: on this drain path the thread is
-                        // here BECAUSE an exec replacement or the process
-                        // terminal is retiring it — the Busy holder is (or is
-                        // superseded by) the very transaction that retires this
-                        // thread's kernel row. Its own exit_thread is redundant,
-                        // and parking for the holder STRANDS: the retirement
-                        // makes every registry-addressed wake UnknownThread
-                        // (measured live — parks at observed_epoch with three
-                        // later publishes, final wake Err(UnknownThread), 10/12
-                        // teardown hangs). Finish; the owner retires the row.
-                        let _ = observed_epoch;
-                        if !self.state.thread_exit_withdrawn {
-                            let _ = self
-                                .state
-                                .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
-                            self.state.thread_exit_withdrawn = true;
-                        }
-                        return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
-                    }
                 }
             }
 
@@ -7830,6 +7832,13 @@ mod tests {
         assert!(
             terminal < phase,
             "a forced vfork wake must exit before ResumeBlocked"
+        );
+        let registration = poll
+            .find("enter_mm_executor_then_register(")
+            .expect("execution registration admission");
+        assert!(
+            terminal < registration,
+            "a draining sibling must finish before registration behind the terminal owner's freeze"
         );
     }
 
