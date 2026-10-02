@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.el1.creation-native-path"
+title = "Creation workloads are born in the EL1 task and memory owners"
+guest_surfaces = ["syscall:clone", "syscall:exit", "syscall:exit_group", "syscall:wait4", "syscall:execve", "syscall:futex", "syscall:ppoll", "syscall:pipe2", "syscall:close", "syscall:write"]
+semantic_authority = ["man 2 clone and fork: task identity and private memory compose atomically", "man 2 execve: failure leaves the previous image coherent", "man 2 wait4: child exit status and SIGCHLD publication are ordered"]
+fixture = "Existing spawn-loop/thread-spawn/fork-exec and 20-round fork-COW workloads; no reduced replacement fixture"
+scale_points = [16, 64, 256]
+rationale = "The 18 service IDs enumerated in the native ownership plan have zero per-operation semantic host forwarding for wholly in-zone operands. Loader bytes and physical extent capacity remain true backend crossings. Keep kernel.el1.fork-cow absolute exit ceilings and slopes unchanged; no subtracting startup. Extent/granule/watermark/retention numbers are owned by kernel.el1.elastic-frame-extents, not duplicated here."
+
+[bindings.unresolved]
+vm_free = "N2 needs one composed task/fd/pipe/signal/wait owner binding exhausting default slots, with partial writes, robust death, signals and fork/exec rollback. N0 has no creation-path runner."
+embed_structural = "Bind the existing creation fixtures and all 18 IDs with exact operation/MM incarnations and argument census, no unknown or dropped exits; preserve fork-COW ceilings."
+docker = "Native arm64 same-image creation workload semantics and uninstrumented <=2x timings remain required."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 0
+per_unit = 0
+layers = ["vm-free", "embed-structural"]
+rationale = "Measured wholly in-zone operations forward no Linux semantic dispatch to the host. Startup and true physical backend work are separately recorded; this is not a weakened total-exit ceiling. This new metric binding remains open."
