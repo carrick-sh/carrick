@@ -16286,7 +16286,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "line": 2068,
+      "line": 2073,
       "categories": [
         "mapping"
       ],
@@ -19616,7 +19616,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 120,
+      "line": 121,
       "categories": [
         "mapping"
       ],
@@ -19625,7 +19625,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 160,
+      "line": 161,
       "categories": [
         "mapping"
       ],
@@ -20526,7 +20526,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "line": 197,
+      "line": 205,
       "categories": [
         "table_guard"
       ],
