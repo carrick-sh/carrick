@@ -4057,7 +4057,7 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                         &receipt
                     )
-                    .is_none()
+                    .is_err()
             );
             let mut wrong_mm = grant;
             wrong_mm.mm_key += 1;
@@ -4069,7 +4069,7 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                         &receipt
                     )
-                    .is_none()
+                    .is_err()
             );
         },
     );
@@ -4085,7 +4085,7 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                         &receipt
                     )
-                    .is_none(),
+                    .is_err(),
                 "a reprotected page cannot settle its old publication"
             );
         },
