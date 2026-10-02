@@ -2107,19 +2107,23 @@ impl HostFsBackend {
 
     /// Fd-centric fast path for the guest's own file open (`open_raw_fd`),
     /// sibling of [`HostFsBackend::fast_open_contained`]: ONE `openat` with
-    /// the REAL access mode replaces the probe stack (resolve_following's
-    /// per-component `symlink_metadata` walk plus the RW-then-RO double
-    /// cap-std walk) for the common regular-file case, and the returned fd is
-    /// the fd actually served to the guest. Restricted by the callers to
-    /// non-creating, non-truncating opens — creating opens keep the full
-    /// cap-std path per the sandbox rationale in
+    /// the REAL access mode replaces the `resolve_following` leaf pre-stat
+    /// for the common regular-file case, and the returned fd is
+    /// the fd actually served to the guest. Truncating opens require a proven
+    /// parent before the destructive open; creating opens keep the contained
+    /// parent-creation path per the sandbox rationale in
     /// docs/fs-host-capstd-amplification.md.
     ///
     /// Unlike the `O_EVTONLY` probes, this IS the guest's open: a regular
     /// file's atime advances exactly as a real `open(2)`+read would, which is
     /// the faithful behavior for a served open.
     #[cfg(target_os = "macos")]
-    pub(crate) fn fast_open_for_guest(&self, rel: &Path, write: bool) -> FastGuestOpen {
+    pub(crate) fn fast_open_for_guest(
+        &self,
+        rel: &Path,
+        write: bool,
+        trunc: bool,
+    ) -> FastGuestOpen {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
         if !self.fast_fs {
@@ -2141,6 +2145,11 @@ impl HostFsBackend {
         let (dir_fd, rel_c, proven) = match &namei {
             Ok((parent_fd, name_c)) => (parent_fd.as_raw_fd(), name_c, true),
             Err(errno) => {
+                // Truncation must never precede containment validation. Without
+                // a proven parent, use the contained resolver before opening.
+                if trunc {
+                    return FastGuestOpen::Fallback;
+                }
                 if let Some(refused) = host_open_refusal(*errno) {
                     return FastGuestOpen::Refused(refused);
                 }
@@ -2168,7 +2177,13 @@ impl HostFsBackend {
         // open for it. A write request failing with its real access mode lets
         // the slow path produce the exact error/None it does today.
         let accmode = if write { libc::O_RDWR } else { libc::O_RDONLY };
-        let raw = match self.openat_for_guest(dir_fd, rel_c, accmode | base, 0) {
+        // A destructive open must reject a host-normalized spelling before
+        // changing bytes. Ordinary opens can validate the returned handle.
+        if trunc && !self.name_matches_on_disk(rel) {
+            return FastGuestOpen::Fallback;
+        }
+        let trunc_flag = if trunc { libc::O_TRUNC } else { 0 };
+        let raw = match self.openat_for_guest(dir_fd, rel_c, accmode | base | trunc_flag, 0) {
             Ok(raw) => raw,
             Err(libc::ELOOP) => return FastGuestOpen::SymlinkLeaf,
             Err(libc::ENOENT) if !write => return FastGuestOpen::Missing,
@@ -2196,7 +2211,7 @@ impl HostFsBackend {
         }
         // Byte-exact leaf-name guard against macOS's normalizing VFS, exactly
         // as `lookup`/`metadata` do; ASCII names exit for free.
-        if !self.name_matches_on_disk(rel) {
+        if !trunc && !self.name_matches_on_disk(rel) {
             return FastGuestOpen::Fallback;
         }
         let typ = st.st_mode as u32 & libc::S_IFMT as u32;
@@ -2394,7 +2409,7 @@ impl HostFsBackend {
             let Some(rel) = Self::rel_path(&normalized) else {
                 return ImmutableHostFileOpen::Fallback;
             };
-            match self.fast_open_for_guest(rel, false) {
+            match self.fast_open_for_guest(rel, false, false) {
                 FastGuestOpen::Served {
                     fd,
                     stat,
@@ -5706,18 +5721,16 @@ impl FsBackend for HostFsBackend {
     }
 
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> HostFdOpen<i32> {
-        // Fd-centric fast path for the common non-creating, non-truncating
+        // Fd-centric fast path for the common non-creating
         // open: ONE kernel-resolved openat with the real access mode replaces
-        // the resolve_following walk + double cap-std open. Creating and
-        // truncating opens keep the full cap-std path (sandboxed parent
-        // creation, exact O_TRUNC semantics).
+        // the resolve_following pre-stat. Truncation uses the same contained
+        // primitive; creating opens retain sandboxed parent creation.
         #[cfg(target_os = "macos")]
         if !create
-            && !trunc
             && let Some(normalized) = normalize(path)
             && let Some(rel) = Self::rel_path(&normalized)
         {
-            match self.fast_open_for_guest(rel, write) {
+            match self.fast_open_for_guest(rel, write, trunc) {
                 FastGuestOpen::Served { fd, .. } => {
                     use std::os::fd::IntoRawFd;
                     return HostFdOpen::Served(fd.into_raw_fd());
@@ -5839,11 +5852,10 @@ impl FsBackend for HostFsBackend {
         // served open needs no separate lookup/metadata walk at all.
         #[cfg(target_os = "macos")]
         if !create
-            && !trunc
             && let Some(normalized) = normalize(path)
             && let Some(rel) = Self::rel_path(&normalized)
         {
-            match self.fast_open_for_guest(rel, write) {
+            match self.fast_open_for_guest(rel, write, trunc) {
                 FastGuestOpen::Served { fd, stat, kind } => {
                     if kind != RootFsEntryKind::File {
                         // This API serves regular files only (the dispatcher

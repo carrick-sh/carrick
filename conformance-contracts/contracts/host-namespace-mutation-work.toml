@@ -1,19 +1,21 @@
 schema_version = 1
 id = "kernel.vfs.host-namespace-mutation-work"
-title = "Host namespace mutation work bounds"
+title = "Host namespace mutation and open work bounds"
 guest_surfaces = [
   "syscall:renameat2",
   "syscall:unlinkat",
   "syscall:rename",
   "syscall:unlink",
+  "syscall:openat",
 ]
 semantic_authority = [
   "man 2 renameat2",
   "man 2 unlinkat",
+  "man 2 openat",
 ]
 fixture = "carrick-vfs::serial_host::test_namespace_mutation_work"
 scale_points = [1, 8, 32, 128]
-rationale = "Mutating namespace operations (renameat2, unlinkat) operate under an admitted namespace permit that resolves and holds parent directory descriptors. Admitted operations must not repeat host directory opens or whole-path walks from root. Warm parent operations must issue 0 host openat calls and at most bounded host backend/stat calls proportional to the admitted parent and leaf checks."
+rationale = "Mutating namespace operations (renameat2, unlinkat) operate under an admitted namespace permit that resolves and holds parent directory descriptors. Admitted operations must not repeat host directory opens or whole-path walks from root. Warm mutations issue 0 host opens; each regular-file openat performs one real backend open with independent description offset. The open fixture measures writable and truncating opens with 0/128 unrelated parents and bounds metadata/identity calls by 3*n. Cache ownership is unchanged."
 
 [bindings]
 vm_free = "carrick-vfs::serial_host::test_namespace_mutation_work"

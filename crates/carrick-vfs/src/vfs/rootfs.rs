@@ -2853,6 +2853,91 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         #[test]
+        fn test_namespace_open_work() {
+            use crate::fs_backend::host::{
+                reset_test_host_openat_count, reset_test_host_parent_fstat_count,
+                reset_test_host_stat_count, test_host_openat_count, test_host_parent_fstat_count,
+                test_host_stat_count,
+            };
+            use std::os::fd::FromRawFd;
+
+            // Population is independent of the queried parent and operation count.
+            // Keep all returned descriptions alive to catch reuse/dup masquerading
+            // as an open: each description must have its own offset.
+            for population in [0, 128] {
+                for n in [1usize, 8, 32, 128] {
+                    for trunc in [false, true] {
+                        let upper = tempfile::tempdir().unwrap();
+                        std::fs::create_dir_all(upper.path().join("deep/nested/dir")).unwrap();
+                        std::fs::write(upper.path().join("deep/nested/dir/file"), b"payload")
+                            .unwrap();
+                        for i in 0..population {
+                            std::fs::create_dir(upper.path().join(format!("unrelated_{i}")))
+                                .unwrap();
+                        }
+                        let mut vfs = RootFsVfs::new();
+                        vfs.set_overlay(Box::new(HostFsBackend::from_path(upper.path()).unwrap()));
+                        let path = "/deep/nested/dir/file";
+                        vfs.resolved_parent(path).unwrap();
+                        let warm = vfs
+                            .open_for_dispatch(path, false, false, false, true)
+                            .unwrap();
+                        if let OpenDispatchResult::HostFile { host_fd, .. } = warm {
+                            // SAFETY: the dispatch result transfers a newly owned fd.
+                            drop(unsafe { OwnedFd::from_raw_fd(host_fd) });
+                        } else {
+                            panic!("host fixture did not perform a backend open");
+                        }
+                        reset_test_host_openat_count();
+                        reset_test_host_stat_count();
+                        reset_test_host_parent_fstat_count();
+                        vfs.dentry_cache.reset_host_open_count();
+                        let mut descriptions = Vec::new();
+                        for _ in 0..n {
+                            let result = vfs
+                                .open_for_dispatch(path, false, false, trunc, true)
+                                .unwrap();
+                            let OpenDispatchResult::HostFile {
+                                host_fd, metadata, ..
+                            } = result
+                            else {
+                                panic!("host open returned cached bytes");
+                            };
+                            assert_eq!(metadata.size, if trunc { 0 } else { 7 });
+                            // SAFETY: each result transfers ownership to this fixture.
+                            descriptions.push(unsafe { OwnedFd::from_raw_fd(host_fd) });
+                        }
+                        let opens = test_host_openat_count();
+                        let stats = test_host_stat_count();
+                        let parent_stats = test_host_parent_fstat_count();
+                        let parent_opens = vfs.dentry_cache.host_open_count();
+                        eprintln!(
+                            "OPEN_CENSUS population={population} n={n} trunc={trunc} opens={opens} stats={stats} parent_stats={parent_stats} parent_opens={parent_opens}"
+                        );
+                        assert_eq!(opens, n as u64, "one real backend open per request");
+                        assert_eq!(parent_opens, 0, "warm parent must remain anchored");
+                        assert!(
+                            stats + parent_stats <= 3 * n as u64,
+                            "open must not pre-stat the leaf before its real backend open"
+                        );
+                        for fd in &descriptions {
+                            // SAFETY: retained descriptors are live regular files.
+                            assert_eq!(
+                                unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
+                                0
+                            );
+                            assert_eq!(
+                                unsafe { libc::lseek(fd.as_raw_fd(), 1, libc::SEEK_SET) },
+                                1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
         fn test_namespace_mutation_work() {
             use crate::fs_backend::host::{
                 reset_test_host_openat_count, reset_test_host_parent_fstat_count,
@@ -3227,6 +3312,7 @@ mod tests {
                     );
                 }
             }
+            test_namespace_open_work();
         }
     }
 

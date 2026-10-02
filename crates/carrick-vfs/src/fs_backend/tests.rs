@@ -1074,7 +1074,7 @@ fn host_fast_open_serves_regular_file_fd_centrically() {
         .unwrap();
     b.set_mode("/dir/file.txt", 0o640).unwrap();
 
-    match b.fast_open_for_guest(Path::new("dir/file.txt"), false) {
+    match b.fast_open_for_guest(Path::new("dir/file.txt"), false, false) {
         FastGuestOpen::Served { fd, stat, kind } => {
             use std::os::fd::AsRawFd;
             assert_eq!(kind, RootFsEntryKind::File);
@@ -1119,7 +1119,7 @@ fn host_fast_open_symlink_leaf_falls_back_to_resolving_path() {
     b.symlink("/data/target.txt", "/link").unwrap();
 
     assert!(matches!(
-        b.fast_open_for_guest(Path::new("link"), false),
+        b.fast_open_for_guest(Path::new("link"), false, false),
         FastGuestOpen::SymlinkLeaf
     ));
     let fd = b
@@ -1139,7 +1139,7 @@ fn host_fast_open_fifo_routes_to_nonblocking_open() {
     b.create_fifo("/f", 0o600).unwrap();
 
     assert!(matches!(
-        b.fast_open_for_guest(Path::new("f"), false),
+        b.fast_open_for_guest(Path::new("f"), false, false),
         FastGuestOpen::Fifo
     ));
     // A read open of a writer-less FIFO must return immediately with a
@@ -1190,7 +1190,7 @@ fn host_fast_open_containment_failure_falls_back_without_serving() {
     // and the slow path refuses the escape as before.
     b.symlink(outside.path().to_str().unwrap(), "/esc").unwrap();
     assert!(matches!(
-        b.fast_open_for_guest(Path::new("esc/leak.txt"), false),
+        b.fast_open_for_guest(Path::new("esc/leak.txt"), false, false),
         FastGuestOpen::Fallback
     ));
     assert!(
@@ -1198,6 +1198,43 @@ fn host_fast_open_containment_failure_falls_back_without_serving() {
             .served()
             .is_none()
     );
+    assert!(matches!(
+        b.fast_open_for_guest(Path::new("esc/leak.txt"), true, true),
+        FastGuestOpen::Fallback
+    ));
+    assert!(
+        b.open_raw_fd("/esc/leak.txt", true, false, true)
+            .served()
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("leak.txt")).unwrap(),
+        b"host bytes"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn host_truncating_open_reroots_leaf_symlink_and_returns_empty_metadata() {
+    use std::os::fd::FromRawFd;
+
+    let (b, _scratch) = host_backend();
+    b.set_file_contents("/dir/file", b"payload".to_vec())
+        .unwrap();
+    b.symlink("/dir/file", "/link").unwrap();
+    assert!(matches!(
+        b.fast_open_for_guest(Path::new("link"), true, true),
+        FastGuestOpen::SymlinkLeaf
+    ));
+    assert_eq!(b.file_contents("/dir/file").unwrap(), b"payload");
+    let (fd, metadata) = b
+        .open_raw_fd_with_metadata("/link", true, false, true)
+        .served()
+        .unwrap();
+    // SAFETY: the backend transfers this descriptor to the caller.
+    let _fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    assert_eq!(metadata.size, 0);
+    assert!(b.file_contents("/dir/file").unwrap().is_empty());
 }
 
 #[cfg(target_os = "macos")]
@@ -1211,7 +1248,7 @@ fn host_fast_open_rejects_unicode_aliased_name() {
     // (absent) file" — the fast path must refuse to serve it and defer
     // to the slow path's existing semantics.
     assert!(matches!(
-        b.fast_open_for_guest(Path::new("cafe\u{301}.txt"), false),
+        b.fast_open_for_guest(Path::new("cafe\u{301}.txt"), false, false),
         FastGuestOpen::Fallback
     ));
 }

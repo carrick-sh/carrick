@@ -20,7 +20,7 @@ pub struct NamespaceMutationCoordinator {
 /// Inode identities already read for live parent dirfds.
 ///
 /// A descriptor's device/inode cannot change while it is open, so a parent
-/// dirfd admitted once needs no second `fstat` on the revalidation pass or on
+/// dirfd admitted once needs no second `fstat` on
 /// any later transaction that resolves the same cached descriptor. Entries are
 /// keyed by the descriptor's `Arc` allocation and hold a `Weak` to it: the
 /// weak reference keeps that allocation from being reused, so an address match
@@ -80,8 +80,8 @@ impl NamespaceMutationPermit<'_> {
     }
 }
 
-/// Releases reservations on resolver errors, callback errors, unwinding and
-/// revalidation, not merely on the successful publication path.
+/// Releases reservations on callback errors and unwinding, not merely on the
+/// successful publication path. Resolution happens before reservation.
 struct ParentReservation<'a> {
     coordinator: &'a NamespaceMutationCoordinator,
     parents: Vec<NamespaceParentIdentity>,
@@ -163,32 +163,32 @@ impl NamespaceMutationCoordinator {
     pub fn with_parents<R, ResolveError, OperationError>(
         &self,
         topology_change: bool,
-        resolve_parents: impl Fn() -> Result<Vec<AnchoredParent>, ResolveError>,
+        resolve_parents: impl FnOnce() -> Result<Vec<AnchoredParent>, ResolveError>,
         operation: impl FnOnce(&NamespaceMutationPermit<'_>) -> Result<R, OperationError>,
     ) -> Result<Result<R, OperationError>, ResolveError> {
         // Keep both lexical guards alive through callback publication. Exactly
         // one is present; no guard is acquired by the other branch.
         let _topology_read = (!topology_change).then(|| self.topology.read());
         let _topology_write = topology_change.then(|| self.topology.write());
-        loop {
-            let first = resolve_parents()?;
-            let reservation =
-                self.reserve(first.iter().map(|parent| parent.identity.clone()).collect());
-            let revalidated = resolve_parents()?;
-            // Compare path-to-parent mappings, not a sorted identity set: two
-            // paths can exchange parents while retaining the same lock set.
-            if !same_anchors(&first, &revalidated) {
-                drop(reservation);
-                continue;
-            }
-            let result = operation(&NamespaceMutationPermit {
-                anchors: revalidated,
-                topology_exclusive: topology_change,
-                _authority: std::marker::PhantomData,
-            });
-            drop(reservation);
-            return Ok(result);
-        }
+        // Topology admission precedes resolution and spans reservation waiting
+        // through physical/cache publication. Admitted directory and symlink
+        // changes require its exclusive side, so waiting for these parent
+        // reservations cannot change their path-to-parent mappings. Retain the
+        // resolved capabilities instead of resolving the same paths again.
+        let anchors = resolve_parents()?;
+        let reservation = self.reserve(
+            anchors
+                .iter()
+                .map(|parent| parent.identity.clone())
+                .collect(),
+        );
+        let result = operation(&NamespaceMutationPermit {
+            anchors,
+            topology_exclusive: topology_change,
+            _authority: std::marker::PhantomData,
+        });
+        drop(reservation);
+        Ok(result)
     }
 
     pub fn with_archive<R>(&self, operation: impl FnOnce(&NamespaceMutationPermit<'_>) -> R) -> R {
@@ -199,16 +199,6 @@ impl NamespaceMutationCoordinator {
             _authority: std::marker::PhantomData,
         })
     }
-}
-
-fn same_anchors(first: &[AnchoredParent], second: &[AnchoredParent]) -> bool {
-    first.len() == second.len()
-        && first.iter().zip(second).all(|(first, second)| {
-            first.path == second.path
-                && first.identity == second.identity
-                && first.resolved.leaf == second.resolved.leaf
-                && first.resolved.rel == second.resolved.rel
-        })
 }
 
 #[cfg(test)]
@@ -359,28 +349,55 @@ mod tests {
     }
 
     #[test]
-    fn changed_parent_mapping_revalidates_even_when_identity_set_matches() {
+    fn admitted_parent_resolution_is_once_per_operation() {
         let coordinator = NamespaceMutationCoordinator::default();
         let resolves = Cell::new(0);
+        for n in [1, 8, 32, 128] {
+            resolves.set(0);
+            for _ in 0..n {
+                coordinator
+                    .with_parents(
+                        false,
+                        || {
+                            assert!(coordinator.topology.try_write().is_none());
+                            resolves.set(resolves.get() + 1);
+                            Ok::<_, ()>(anchors(&[1, 2]))
+                        },
+                        |_| {
+                            assert!(coordinator.topology.try_write().is_none());
+                            Ok::<_, ()>(())
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(resolves.get(), n);
+        }
+    }
+
+    #[test]
+    fn exclusive_topology_admission_spans_resolution_and_publication() {
+        let coordinator = NamespaceMutationCoordinator::default();
         coordinator
             .with_parents(
-                false,
+                true,
                 || {
-                    let n = resolves.get();
-                    resolves.set(n + 1);
-                    Ok::<_, ()>(anchors(if n == 0 { &[1, 2] } else { &[2, 1] }))
+                    assert!(coordinator.topology.try_read().is_none());
+                    Ok::<_, ()>(anchors(&[1, 2]))
                 },
                 |permit| {
+                    assert!(coordinator.topology.try_read().is_none());
+                    assert!(permit.topology_exclusive());
                     assert_eq!(
                         permit.anchors[0].identity,
-                        NamespaceParentIdentity::Host(InodeIdentity::new(1, 2))
+                        NamespaceParentIdentity::Host(InodeIdentity::new(1, 1))
                     );
                     Ok::<_, ()>(())
                 },
             )
             .unwrap()
             .unwrap();
-        assert_eq!(resolves.get(), 4);
+        assert!(coordinator.topology.try_write().is_some());
         assert!(coordinator.state.lock().held.is_empty());
     }
 
@@ -392,11 +409,7 @@ mod tests {
             false,
             || {
                 calls.set(calls.get() + 1);
-                if calls.get() == 2 {
-                    Err(())
-                } else {
-                    Ok(anchors(&[1]))
-                }
+                Err::<Vec<AnchoredParent>, _>(())
             },
             |_| Ok::<_, ()>(()),
         );
@@ -423,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn second_resolution_capability_lives_through_publication() {
+    fn admitted_resolution_capability_lives_through_publication() {
         let coordinator = NamespaceMutationCoordinator::default();
         let latest = std::cell::RefCell::new(std::sync::Weak::new());
         coordinator
