@@ -1016,6 +1016,14 @@ mod host_pipe_read_pin_tests {
     /// slice over it.
     #[test]
     fn host_pipe_read_uses_raw_pointer_not_slice() {
+        // Enforce the destination API independently of the wrapper: restoring
+        // the old slice-taking helper must fail to compile this contract.
+        let _raw_read: fn(
+            *mut u8,
+            usize,
+            HostPipeReadTarget<'_>,
+        )
+            -> Result<DispatchOutcome, super::super::outcome::DispatchError> = read_host_pipe_raw;
         // Create a host pipe and pre-fill the write end with known data.
         let mut fds = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
