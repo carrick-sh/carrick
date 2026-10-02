@@ -36,6 +36,30 @@ pub struct ThreadResources {
     credentials: Arc<Credentials>,
 }
 
+/// Resources reserved before an EL1 identity becomes claimable. EL1 only
+/// admits clones sharing files and fs; the independent credentials identity
+/// is issued here and its values bind from the caller at claim settlement.
+#[derive(Debug)]
+pub(in crate::kernel) struct ReservedThreadResources {
+    credentials: crate::kernel::ids::CredentialsId,
+}
+
+impl ReservedThreadResources {
+    pub(in crate::kernel) fn reserve(ids: &ObjectIdRegistry) -> Result<Self, ObjectIdError> {
+        Ok(Self {
+            credentials: ids.credentials_id()?,
+        })
+    }
+
+    pub(in crate::kernel) fn bind_shared(self, caller: &ThreadResources) -> Arc<ThreadResources> {
+        Arc::new(ThreadResources::new(
+            caller.files(),
+            caller.fs_context(),
+            Arc::new(Credentials::for_copy(self.credentials, &caller.credentials)),
+        ))
+    }
+}
+
 impl ThreadResources {
     pub fn new(
         files: Arc<FileTable>,

@@ -41,6 +41,7 @@ pub use self::signal::{
     is_default_ignore_signal, is_default_stop_signal,
 };
 pub(in crate::kernel) use self::task::PreparedThreadSet;
+pub(in crate::kernel) use self::task::ReservedThreadResources;
 pub use self::task::{
     DumpableMode, ProcessKeyrings, RlimitSet, Task, TaskIdentity, TaskLifecycle,
     TaskParticipantError, TaskRef, TaskWakeEnrollment, TaskWakeSubscription, TaskWaker,
