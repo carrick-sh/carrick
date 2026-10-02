@@ -2587,6 +2587,44 @@ mod serial_host {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn namespace_rename_directory_symlink_keeps_executable_display() {
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::create_dir(scratch.path().join("real")).unwrap();
+        std::fs::write(scratch.path().join("real/app"), b"elf").unwrap();
+        std::os::unix::fs::symlink("real", scratch.path().join("alias")).unwrap();
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let executable = crate::dispatch::executable_authority::ExecSource::shared(
+            std::sync::Arc::from(&b"elf"[..]),
+            carrick_vfs::fs_backend::fresh_file_object_id(),
+            "/alias/app".into(),
+            0o755,
+            carrick_abi::NsUid::ROOT,
+            carrick_abi::NsGid::ROOT,
+        )
+        .into_current(&dispatcher.fs.executable_authorities);
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        memory.write_bytes(0x4000, b"/alias\0").unwrap();
+        memory.write_bytes(0x4100, b"/moved-alias\0").unwrap();
+        assert_eq!(
+            lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                38,
+                [LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4100, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(executable.display_path(), "/moved-alias/app");
+        assert_eq!(
+            std::fs::read_link(scratch.path().join("moved-alias")).unwrap(),
+            std::path::Path::new("real")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn namespace_linkat_path_visit_budget() {
         let scratch = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(scratch.path().join("a/b/c/d")).unwrap();
@@ -2800,7 +2838,7 @@ mod serial_host {
         assert_eq!(open_creat, (7 + debug_open_checks) * N, "{report}");
         assert_eq!(unlink, 3 * N, "{report}");
         assert_eq!(rename_same, 5 * N, "{report}");
-        assert_eq!(rename_cross, 7 * N, "{report}");
+        assert_eq!(rename_cross, 6 * N, "{report}");
     }
 
     #[cfg(target_os = "macos")]
