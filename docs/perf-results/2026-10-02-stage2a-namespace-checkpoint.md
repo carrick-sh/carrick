@@ -52,8 +52,8 @@ same/unrelated parents, hardlink no-op, NOREPLACE, exchange, lower-layer
 copy-up/whiteout, archive rollback, unlink-open and directory rename; exact
 host-call/path-visit measurements; signed structural binding and both-libc
 namespace/path probes; reviewed retirement of superseded admitted/trusted
-paths; clean-tree inventory/lint verification; and the director's oracle,
-native macOS control and paired ecosystem campaign.
+paths; and the director's oracle, native macOS control and paired ecosystem
+campaign.
 
 ## Coordinator resolution deletion
 
@@ -75,4 +75,8 @@ Verification so far: final `just test-kernel` and `just fmt-check` passed;
 the final VFS suite passed all 305 tests after the coordinator deletion. The first broad
 `just test` stopped on the intentional 256-versus-128 red. The subsequent full
 `just test` passed, including the parallel/serial VFS partition and the host
-runtime/platform suites. No signed acceptance is implied by these results.
+runtime/platform suites. `just clippy` and final `just lint-domains` passed.
+Line-pinned inventories were reconciled from clean `c0625ee89` and committed
+as `e5119a26a`; contract inventory drift was refreshed in `eae032131` before
+rerunning lint. The host-authority gate explicitly retains pending Linux,
+FreeBSD and NetBSD compiler profiles. No signed acceptance is implied.
