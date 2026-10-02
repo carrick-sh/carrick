@@ -113,6 +113,45 @@ enum HostVenue {
     Reserved(ReservationRange),
 }
 
+/// Metadata that one forwarded operation needs before touching its backend.
+#[derive(Clone, Copy)]
+pub(in crate::dispatch) enum HostMetadataNeed {
+    Mapping,
+    Retire(ReservationRange),
+    Break(GuestVa),
+}
+
+impl HostMetadataNeed {
+    fn nodes(self, model: &mut Reservations<'_>) -> u32 {
+        match self {
+            Self::Mapping => carrick_el1::memory::reservations::HOST_RESERVE,
+            Self::Retire(range) => model.retire_nodes_needed(range),
+            Self::Break(requested) => {
+                let requested = requested.raw();
+                let layout = model.layout();
+                if requested == 0
+                    || requested < layout.heap.start()
+                    || requested > layout.heap.end()
+                {
+                    return 0;
+                }
+                let Some(old_end) = model.brk_current().checked_add(4095).map(|end| end & !4095)
+                else {
+                    return 0;
+                };
+                let Some(new_end) = requested.checked_add(4095).map(|end| end & !4095) else {
+                    return 0;
+                };
+                let Some(range) = ReservationRange::new(old_end.min(new_end), old_end.max(new_end))
+                else {
+                    return 0;
+                };
+                model.retire_nodes_needed(range) + u32::from(new_end > old_end)
+            }
+        }
+    }
+}
+
 /// A root refusal where the host already committed backend work, or where
 /// the MM permit and the host queue exclude every contender: the root is the
 /// only owner, so answering from anything else would be a second authority.
@@ -1312,7 +1351,7 @@ fn edit_range(address: u64, length: u64, page_size: u64) -> Option<ReservationRa
 impl MemView<'_> {
     /// One root step with the host's current limits and the charges of
     /// everything the root does not hold pushed first.
-    pub(in crate::dispatch) fn with_charged_root<R>(
+    fn with_charged_root<R>(
         &self,
         mem: &MemState,
         root: &DelegatedRoot,
@@ -1337,34 +1376,59 @@ impl MemView<'_> {
         })
     }
 
+    /// The only charged proposal entry: every host-forwarded operation gets
+    /// its secured reserve before the caller can create a pending proposal.
+    pub(in crate::dispatch) fn with_charged_host_proposal<R>(
+        &self,
+        mem: &MemState,
+        root: &DelegatedRoot,
+        step: impl FnOnce(&mut Reservations<'_>) -> Result<R, Refusal>,
+    ) -> Result<R, Refusal> {
+        self.with_charged_root(mem, root, |model| {
+            model.begin_host_proposal()?;
+            step(model)
+        })
+    }
+
+    /// Refresh limits without exposing an unlicensed proposal-capable root.
+    pub(in crate::dispatch) fn refresh_root_charges(
+        &self,
+        mem: &MemState,
+        root: &DelegatedRoot,
+    ) -> Result<(), Refusal> {
+        self.with_charged_root(mem, root, |_| Ok(()))
+    }
+
     /// Before a host mapping syscall of a delegated MM does any work: secure
     /// the root nodes its host commits (mirrors, demotions, placeholders)
     /// may net consume after the backend work. `munmap` needs only the
     /// splits at its two ends, so a process can always unmap whole mappings
-    /// (and so refill the reserve) at exhaustion; every other mapping
-    /// syscall needs the full `HOST_RESERVE` bound. `Some(ENOMEM)` is the
+    /// (and so refill the reserve) at exhaustion. `brk` needs its exact cuts
+    /// and growth slot; other mappings need the full `HOST_RESERVE` bound.
+    /// `Some(ENOMEM)` is the
     /// syscall's answer when the node pool is exhausted (the map-count
     /// limit), given before anything changed. No-op in host setup.
     pub(in crate::dispatch) fn secure_host_venue_metadata(
         &self,
-        munmap: Option<ReservationRange>,
+        need: HostMetadataNeed,
     ) -> Result<Option<LinuxErrno>, DispatchError> {
         let Some(root) = self.mem().lock().delegated_root().cloned() else {
             return Ok(None);
         };
         let secure = || {
             root.with_root(|model| {
-                let needed = match munmap {
-                    Some(range) => model.retire_nodes_needed(range),
-                    None => carrick_el1::memory::reservations::HOST_RESERVE,
-                };
-                model.secure_host_nodes(needed)
+                let needed = need.nodes(model);
+                if needed == 0 && matches!(need, HostMetadataNeed::Break(_)) {
+                    Ok(())
+                } else {
+                    model.secure_host_nodes(needed)
+                }
             })
         };
         let secured = match secure() {
             Err(Refusal::MetadataRequired) => {
-                // The failed proposal held no committed edit. No MemState,
-                // root or MM permit is retained across carrier allocation.
+                // The failed proposal held no committed edit. No MemState
+                // or root lock is retained across carrier allocation.
                 match root.provision_metadata() {
                     Ok(()) => {}
                     // A real capacity request has now failed. Linux also
@@ -1404,10 +1468,7 @@ impl MemView<'_> {
         root: &DelegatedRoot,
         step: impl FnOnce(&mut Reservations<'_>) -> Result<Decision, Refusal>,
     ) -> Result<Result<ReservationRequest, Refusal>, DispatchError> {
-        match self.with_charged_root(mem, root, |model| {
-            model.begin_host_proposal()?;
-            step(model)
-        }) {
+        match self.with_charged_host_proposal(mem, root, step) {
             Ok(Decision::Work(request)) => {
                 mem.open_venue(HostVenue::Proposal(request));
                 Ok(Ok(request))
@@ -1922,8 +1983,9 @@ impl MemView<'_> {
         let proposed = {
             let authority = self.mem();
             let mut mem = authority.lock();
-            match self.with_charged_root(&mem, root, |model| model.mremap(source, new_size, target))
-            {
+            match self.with_charged_host_proposal(&mem, root, |model| {
+                model.mremap(source, new_size, target)
+            }) {
                 Ok(Decision::Work(request)) => {
                     mem.open_venue(HostVenue::Proposal(request));
                     if request.operation != ReservationOperation::Retire {
