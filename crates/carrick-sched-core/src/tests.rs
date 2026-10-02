@@ -1193,6 +1193,44 @@ fn idle_executors_adopt_born_records_from_two_live_process_queues() {
     }
 }
 
+#[test]
+fn queued_births_wake_cold_executors_for_both_live_processes() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 0);
+    host_publish(&zone, OTHER, MM + 1, Some(1), 0);
+    zone.enter_guest(SLOT);
+    zone.enter_guest(OTHER);
+    for (victim, mm, thief, cpu, tid) in [
+        (SLOT, MM, SlotId::new(10), 2, 40),
+        (OTHER, MM + 1, SlotId::new(11), 3, 50),
+    ] {
+        let born = zone
+            .alloc_record(ThreadIdentity {
+                mm,
+                generation: 0,
+                lifecycle_page: 0x1000 + mm * 4096,
+                control_slot: 0x2000 + mm * 4096,
+                ..identity(tid)
+            })
+            .unwrap();
+        zone.requeue_preempted(victim, born);
+        host_publish(&zone, thief, 0, Some(cpu), 0);
+        zone.enter_guest(thief);
+        zone.enter_idle(thief, true);
+        let mut effects = WakeEffects::default();
+        assert_eq!(
+            zone.migrate_queued(victim, &mut effects),
+            1,
+            "a born thread must wake pre-reserved cold execution capacity"
+        );
+        assert!(effects.sgi_slots().any(|slot| slot == thief));
+        assert_eq!(zone.take_service_head(thief).unwrap().id, born);
+        assert_eq!(zone.record(born).identity().mm, mm);
+        assert_eq!(zone.runnable_head(victim), None);
+        zone.leave_guest(thief, &HostWait);
+    }
+}
+
 /// A service thread the host placed on a stopped slot (its vCPU out of the
 /// guest, its executor on the host) must not wait there for an executor that
 /// may not come back to that vCPU: an idle vCPU takes it onto its own queue
