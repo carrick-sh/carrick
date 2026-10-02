@@ -1,0 +1,23 @@
+schema_version = 1
+id = "kernel.el1.elastic-frame-extents"
+title = "One elastic extent service for first-touch, private COW and table capacity"
+guest_surfaces = ["fault:first-touch", "fault:permission", "kernel:frame-inventory", "kernel:stage1-mmu"]
+semantic_authority = ["man 2 mmap and fork: independent private bytes and zero provenance", "man 2 munmap: partial retirement must preserve live neighboring pages", "man 2 mmap: allocation refusal leaves existing mappings intact"]
+fixture = "unit:step2_m1 extent receipts and exact-owner custody; future signed burst/idle"
+scale_points = [16, 64, 256]
+rationale = "Proposed M1 policy: guest pages 4096 bytes; host compounds 16384 bytes; extent 1048576 bytes = existing 64-compound per-MM probe quota times the host granule, below the 2097152-byte frame-request maximum. Low watermark 16384 bytes (one compound), high watermark 1048576 bytes (one extent); refill only on crossing below low, at most one outstanding request per exact MM generation, with at most 256 outstanding requests carrier-wide (EL1_STACK_SLOTS, one slot-local mailbox each). One extent is requested per refill; quota refusal is exact ENOMEM and releases execution capacity. At service/scheduler settlement retain at most one wholly free extent (1048576 bytes); retain partially live extents until all frame references, COW readers, copyout pins and table leases retire. Incoming uncommitted capacity is bounded by one extent; arbitrary concurrent frees may create additional pending returns, all still charged until authenticated unmap completion. The retained-free bound applies after successful scheduler/service settlement, not during a failed return. A quota below one extent refuses admission rather than shrinking granules. These are implementation requirements, not current behavior."
+
+[bindings]
+vm_free = "carrick-el1-abi::cow_grants::step2_m1_tests::step2_m1_cross_owner_grant_and_return_are_rejected; carrick-el1-abi::cow_grants::step2_m1_tests::red_until_step2_m1_cross_carrier_return_authenticates_owner_generation; carrick-el1-abi::cow_grants::step2_m1_tests::red_until_step2_m1_cross_carrier_completion_authenticates_owner_generation; carrick-el1-abi::cow_grants::step2_m1_tests::step2_m1_duplicate_completion_is_rejected; carrick-el1-abi::cow_grants::step2_m1_tests::step2_m1_in_flight_compound_cannot_be_returned; carrick-el1-abi::cow_grants::step2_m1_tests::red_until_step2_m1_extent_publication_replaces_compound_records"
+
+[bindings.unresolved]
+embed_structural = "Burst/idle 16/64/256 guest pages: fresh stage-2 host maps <= ceil(pages*4096/1048576)+1 (one warm reserve); retained wholly-free bytes <=1048576 after scheduler settlement. Existing receipt red counts protocol grants, not actual host maps. Signed concurrent touch/COW/return binding still required."
+vm_free_structural = "Partial host-unmap failure and reader/pin/table retention need extent-return production API; current compound claim exclusion test does not prove partial-unmap rollback. Single-flight owner watermark and retained-free observations remain unbound."
+docker = "Same-source private-memory isolation and partial munmap Linux oracle required at implementation acceptance; no Docker run in preparation."
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "host_mapping_allocations"
+maximum = 2
+layers = ["embed-structural"]
+rationale = "For 16/64/256 4 KiB pages each burst fits one 1 MiB extent; at most that extent plus one warm reserve may require fresh maps. The general bound is ceil(pages*4096/1048576)+1; it must be exercised above one extent at implementation acceptance. This budget is unbound until the signed extent census exists."

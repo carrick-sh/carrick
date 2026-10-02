@@ -1,0 +1,23 @@
+schema_version = 1
+id = "kernel.el1.mm-exclusive-owner"
+title = "An admitted MM has one semantic owner and generation-pinned readers"
+guest_surfaces = ["syscall:mmap", "syscall:munmap", "syscall:mprotect", "syscall:clone", "kernel:stage1-mmu", "kernel:frame-inventory"]
+semantic_authority = ["man 2 mmap: anonymous replacement has zero bytes and independent permissions", "man 2 fork: private writes remain isolated", "man 2 process_vm_readv: inaccessible memory returns EFAULT after any completed prefix"]
+fixture = "N0 production admission red reduction; full two-MM UserTransfer/Fork/Capacity experiment remains open"
+scale_points = [16, 64, 256]
+rationale = "Exclusive ownership forbids host semantic protection, COW, VMA projection and predecessor selection after admission. Range operations visit the affected leaves plus tree height, not unrelated VMA population (16/512 nodes). Capacity policy is defined only by kernel.el1.elastic-frame-extents: 4 KiB pages, 16 KiB compounds, 1 MiB extents, 16 KiB low and 1 MiB high watermarks, one pending extent per MM generation and at most one wholly free retained extent after settlement. These are requirements, not green observations. No lock spans host I/O."
+
+[bindings]
+vm_free = "carrick-el1::native_ownership_tests::red_until_n1_production_admission_retains_host_semantic_venue"
+
+[bindings.unresolved]
+vm_free_structural = "N0 reduction proves the host proposal venue remains callable after real admission (known red), stale fault-plan rejection and exact-MM rejection using actual reservation/MMU code. It does not yet emit WorkObservation or exercise transfers, fork, COW, physical pins, partial compounds, capacity or stopped-target service. New API compiler fence and range-work instrumentation remain open."
+embed_structural = "N1 must bind the sealed handle to production observer/copyout/fork/exec paths, with stale-TLBI negative control and exact artifact identity."
+docker = "Native arm64 same-source byte/errno/private-isolation differential remains required for N1, not run in N0."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "fork_projection_rows_visited"
+value = 0
+layers = ["vm-free", "embed-structural"]
+rationale = "An admitted Fork obtains no host VMA/reference snapshot. EL1 alone traverses its live tree and frame references. This metric is unbound by the current N0 reduction."
