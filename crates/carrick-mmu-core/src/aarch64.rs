@@ -7542,13 +7542,18 @@ mod tests {
         let log = exec_log(&mgr, va);
         let sync = |mgr: &mut PageTableManager| unsafe { mgr.sync_to_host(&log) }.expect("sync");
 
-        mgr.set_rw(va, 0x1000, false, None).unwrap();
+        // Alias installation publishes data access first; the vCPU loop's
+        // protect_range subsequently adds EXEC to this non-identity output.
+        let alias_output = LINUX_MMAP_BASE + 0x80_0000;
+        mgr.map_aliased(va, alias_output, 0x1000, UserLeafAccess::READ_WRITE, None)
+            .unwrap();
         sync(&mut mgr);
         assert!(log.calls.borrow().is_empty(), "data-only page announced");
 
         mgr.set_rw(va, 0x1000, true, None).unwrap();
         sync(&mut mgr);
         let output = mgr.translate(va).unwrap();
+        assert_eq!(output, alias_output, "EXEC must preserve the alias output");
         {
             let calls = log.calls.borrow();
             assert_eq!(calls.len(), 1, "{calls:x?}");
