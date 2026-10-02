@@ -14,4 +14,5 @@ pub use personality::dispatch::*;
 pub use personality::{file, inotify, sched};
 
 #[cfg(test)]
+#[path = "personality/native_ownership_tests.rs"]
 mod native_ownership_tests;
