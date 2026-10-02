@@ -108,6 +108,21 @@ impl PreparedHostReservations for View {
     }
 }
 struct Provider(Carrier);
+/// Carrier backing unavailable, rather than a Linux map-count limit.
+struct UnavailableProvider {
+    carrier: Carrier,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl HostReservationProvider for UnavailableProvider {
+    fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
+        Ok(Box::new(View(self.carrier.clone())))
+    }
+    fn provision_metadata(&self, _mm: ReservationMm) -> Result<(), Refusal> {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(Refusal::MetadataRequired)
+    }
+}
 impl HostReservationProvider for Provider {
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
         Ok(Box::new(View(self.0.clone())))
@@ -2191,6 +2206,133 @@ fn host_rows_and_mirror(
         )
         .unwrap();
     (rows, mirror)
+}
+
+#[test]
+fn delegated_carrier_exhaustion_returns_enomem_without_handback_and_recovers() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let carrier = Carrier::new();
+    let mm = carrier.publish(&dispatcher);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    dispatcher
+        .install_reservation_provider(Arc::new(UnavailableProvider {
+            carrier: carrier.clone(),
+            requests: requests.clone(),
+        }))
+        .unwrap();
+    assert_eq!(
+        admit(&dispatcher, El1AdmissionOrigin::Bind, true),
+        Ok(El1Admission::Delegated)
+    );
+    let root = Root { carrier, mm };
+    let far = LINUX_MMAP_BASE + 128 * PAGE;
+    let mut count = 0;
+    loop {
+        match root.guest_mmap(Placement::Fixed(far + count * 2 * PAGE), PAGE, READ) {
+            Ok(_) => count += 1,
+            Err(Refusal::MetadataRequired) => break,
+            Err(other) => panic!("unexpected refusal {other:?}"),
+        }
+    }
+    assert!(count > 1000, "the bootstrap pool was genuinely consumed");
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, (64 * PAGE) as usize);
+    let mut refused = None;
+    for index in 0..20 {
+        let address = LINUX_MMAP_BASE + (index * 2 + 1) * PAGE;
+        let rows = proc_rows(&dispatcher);
+        let generation = root.lock().generation();
+        let backing_calls = memory.zero_backing_calls.get();
+        let protection_calls = memory.protect_calls.get();
+        let outcome = host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            address,
+            PAGE,
+            RW,
+            ANON | LINUX_MAP_FIXED,
+            -1,
+        );
+        if outcome == DispatchOutcome::errno(LINUX_ENOMEM) {
+            assert_eq!(proc_rows(&dispatcher), rows);
+            assert_eq!(root.lock().generation(), generation);
+            assert_eq!(memory.zero_backing_calls.get(), backing_calls);
+            assert_eq!(memory.protect_calls.get(), protection_calls);
+            refused = Some(address);
+            break;
+        }
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: address as i64
+            }
+        );
+        assert!(root.node(address).unwrap().2, "placement stays root-owned");
+    }
+    let refused = refused.expect("unavailable carrier capacity answers Linux ENOMEM");
+    assert!(requests.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert!(
+        dispatcher.mem().lock().host_arena().is_none(),
+        "no handback"
+    );
+    assert!(root.lock().is_admitted());
+    // Whole-run retirement returns nodes without requesting new capacity.
+    // The still-admitted MM then serves the same failed request from the root.
+    root.guest_munmap(far, 16 * PAGE);
+    assert_eq!(
+        host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            refused,
+            PAGE,
+            RW,
+            ANON | LINUX_MAP_FIXED,
+            -1
+        ),
+        DispatchOutcome::Returned {
+            value: refused as i64
+        }
+    );
+    assert!(root.node(refused).unwrap().2);
+    assert!(dispatcher.mem().lock().host_arena().is_none());
+}
+
+#[test]
+fn delegated_initial_reserve_refusal_leaves_the_mm_unadmitted() {
+    let parent = SyscallDispatcher::new();
+    let root = Root::admit(&parent);
+    let far = LINUX_MMAP_BASE + 128 * PAGE;
+    let mut count = 0;
+    loop {
+        match root.guest_mmap(Placement::Fixed(far + count * 2 * PAGE), PAGE, READ) {
+            Ok(_) => count += 1,
+            Err(Refusal::MetadataRequired) => break,
+            Err(other) => panic!("unexpected refusal {other:?}"),
+        }
+    }
+    // A partial reserve cannot license admission. It must return all four
+    // nodes to the already-admitted MM when its import declines.
+    root.guest_munmap(far, 8 * PAGE);
+    let child = SyscallDispatcher::new();
+    let child_mm = root.carrier.publish(&child);
+    child
+        .install_reservation_provider(Arc::new(Provider(root.carrier.clone())))
+        .unwrap();
+    let before = proc_rows(&child);
+    assert_eq!(
+        admit(&child, El1AdmissionOrigin::Bind, true),
+        Err(Refusal::MetadataRequired)
+    );
+    assert!(child.mem().lock().host_arena().is_some());
+    assert!(
+        !root
+            .carrier
+            .table
+            .lock(root.carrier.slot(child_mm).unwrap(), child_mm)
+            .unwrap()
+            .is_admitted()
+    );
+    assert_eq!(proc_rows(&child), before);
+    assert_eq!(root.guest_mmap(Placement::Fixed(far), PAGE, READ), Ok(far));
 }
 
 #[test]
