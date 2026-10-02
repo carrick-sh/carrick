@@ -5623,10 +5623,75 @@ mod tests {
         ));
     }
 
+    // This fixture has no host signal producer. NullHostSignalBridge is not
+    // isolated: it reads the carrier-global pending slots and xsignal ring,
+    // where parallel ring_drain tests briefly publish SIGUSR1. Keep all guest
+    // signal state real, but make the absent host ingress explicit. Unexpected
+    // host operations fail closed instead of supplying partial semantics.
+    #[derive(Debug)]
+    struct NoHostSignalIngress;
+    #[allow(clippy::panic)]
+    impl carrick_hal::HostSignalBridge for NoHostSignalIngress {
+        fn has_unblocked_pending_for(&self, _: i32, _: SigBlockMask) -> bool {
+            false
+        }
+        fn take_pending_for(&self, _: i32) -> i32 {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn take_pending_in_for(&self, _: i32, _: SigSet) -> i32 {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn publish_pending_for(&self, _: i32, _: i32) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn publish_process_signal(&self, _: i32) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn last_sender_for(&self, _: i32) -> i32 {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn raise_for_self(&self, _: i32) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn wake_all_waiters(&self) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn ensure_host_handler(&self, _: i32) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn set_host_ignore(&self, _: i32) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn set_host_default(&self, _: i32) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn reset_routed_handlers_after_execve(&self, _: SigSet) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn xsig_enqueue(&self, _: i32, _: i32, _: i32, _: i32, _: u32, _: i64, _: i32) -> bool {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn xsig_nudge(&self, _: i32) {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn xsig_drain_for_self(&self) -> Vec<(i32, i32, i32, u32, i64, i32)> {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn host_to_linux_signum(&self, _: i32) -> i32 {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+        fn linux_to_host_signum(&self, _: i32) -> i32 {
+            panic!("unexpected host signal operation in sigsuspend fixture")
+        }
+    }
+
     #[test]
     fn rt_sigsuspend_releases_dispatch_before_waiting() {
         const MASK_PTR: u64 = 0x1000;
-        let d = SyscallDispatcher::new();
+        let d = SyscallDispatcher::with_bridges(super::super::CarrierBridges {
+            host_signal: Arc::new(NoHostSignalIngress),
+            timers: Arc::new(carrick_hal::NullGuestTimerBridge::default()),
+        });
         let context = d.capture_one_task_context().unwrap();
         let tid = context.thread().registry_id();
         let registry = crate::thread::ThreadRegistry::new(tid);
