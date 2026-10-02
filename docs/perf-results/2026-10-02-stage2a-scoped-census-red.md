@@ -171,3 +171,32 @@ After removing direct admission, all 46 serial VFS tests and the exact
 dispatcher namespace host-call budget pass; workspace clippy passes. The earlier
 full `just test` run failed only the cross-parent budget before that removal.
 Fresh signed acceptance and the final before/after table remain pending.
+
+### Retention follow-up signed result (still red)
+
+Fresh signed artifact from `7229d1e` has SHA-256
+`d5cc09dfd830410d4fd032816469a54ed385ff1600a2a06431d5f8c1c73350b0`.
+Identity receipts, raw trace, and eight exact observations are retained in
+`target/el1-host-namespace/scoped-census-retention/`. Run
+`stage2a-retention-7229d1e-1-0-same` completed both Linux actors; scoped cleanup
+reported zero remaining processes. No events were dropped. At scale 1,
+population 0, same parents, the observations are:
+
+| Actor | Operation | Before 7bb filesystem calls / path visits / opens | After retention calls / visits / opens |
+| --- | --- | --- | --- |
+| 3 | renameat | 8 / 7 / 0 | 8 / 7 / 0 |
+| 3 | unlinkat | 4 / 7 / 0 | 4 / 7 / 0 |
+| 3 | linkat | 28 / 14 / 5 | 8 / 14 / 0 |
+| 3 | openat | 6 / 0 / 0 | 6 / 0 / 0 |
+| 4 | renameat | 9 / 4 / 0 | 8 / 4 / 0 |
+| 4 | unlinkat | 4 / 7 / 0 | 4 / 7 / 0 |
+| 4 | linkat | 16 / 11 / 5 | 8 / 8 / 0 |
+| 4 | openat | 6 / 0 / 0 | 6 / 0 / 0 |
+
+The opens column counts mutation parent opens; each openat separately made one
+real backend open. This compares two completed captures with different task
+interleavings, not a controlled CPU ratio. All linkat visits were dentry-stage
+visits (zero host-parent and host-leaf visits). Actor 3 still exceeds 8 visits:
+dispatch source/target/parent checks and coordinator admission need a single
+contained transaction without removing permission or errno checks. The full
+16-case after table and final both-libc gate remain unexecuted on this artifact.
