@@ -1002,6 +1002,8 @@ fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
                 file_table: 1,
                 generation: 1,
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             })
             .unwrap();
         let guard = zone.object_wait(key, &Spin).unwrap();

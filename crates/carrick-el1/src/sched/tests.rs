@@ -47,6 +47,8 @@ fn identity(tid: u64) -> ThreadIdentity {
         file_table: 5,
         generation: 1,
         affinity: 0,
+        lifecycle_page: 0,
+        control_slot: 0,
     }
 }
 
@@ -1027,15 +1029,28 @@ fn publish_space(zone: &ZoneTables, mm: u64, ttbr: u64) -> carrick_sched_core::S
 /// guest: it is queued, ready at EL0, on a slot in the guest that may run it
 /// (here the only one, `SLOT`).
 fn queue_foreign(zone: &ZoneTables, tid: u64, mm: u64, uaddr: u64, ctx: ThreadCtx) -> RecordId {
+    queue_foreign_binding(
+        zone,
+        ThreadIdentity {
+            mm,
+            ..identity(tid)
+        },
+        uaddr,
+        ctx,
+    )
+}
+
+fn queue_foreign_binding(
+    zone: &ZoneTables,
+    binding: ThreadIdentity,
+    uaddr: u64,
+    ctx: ThreadCtx,
+) -> RecordId {
+    let mm = binding.mm;
     let guard = zone
         .lock(ZoneTables::bucket_of(mm, uaddr), &HostWait)
         .unwrap();
-    let record = zone
-        .alloc_record(ThreadIdentity {
-            mm,
-            ..identity(tid)
-        })
-        .unwrap();
+    let record = zone.alloc_record(binding).unwrap();
     // SAFETY: freshly allocated and unpublished.
     unsafe { *zone.record(record).ctx_mut() = ctx };
     let seq = zone.next_seq(record);
@@ -1073,8 +1088,19 @@ fn a_futex_wait_switches_the_vcpu_to_another_process_in_guest() {
     let a_word = AtomicU32::new(0);
     let b_word = AtomicU32::new(0);
     let (a_addr, b_addr) = (a_word.as_ptr() as u64, b_word.as_ptr() as u64);
-    let b = queue_foreign(&zone, 202, OTHER_MM, b_addr, thread_ctx(0xB, b_addr));
+    let b = queue_foreign_binding(
+        &zone,
+        ThreadIdentity {
+            mm: OTHER_MM,
+            lifecycle_page: 0x40000,
+            control_slot: 0x50000,
+            ..identity(202)
+        },
+        b_addr,
+        thread_ctx(0xB, b_addr),
+    );
     let task = task_for(101);
+    task.publish_lifecycle(0x10000, 0x20000);
     let (mut frame, mut cpu) = live(0xA, a_addr, FUTEX_WAIT_PRIVATE, 0);
     cpu.ttbr = (TTBR_MM, TTBR_MM);
 
@@ -1090,6 +1116,8 @@ fn a_futex_wait_switches_the_vcpu_to_another_process_in_guest() {
     assert_eq!(zone.slot(SLOT).mm(), MM, "the executor still has A loaded");
     assert_eq!(task.zone_mm.load(Ordering::Relaxed), OTHER_MM);
     assert_eq!(task.task_id.load(Ordering::Relaxed), 202);
+    assert_eq!(task.lifecycle_page.load(Ordering::Acquire), 0x40000);
+    assert_eq!(task.control_slot.load(Ordering::Acquire), 0x50000);
     assert_eq!(zone.counters.el1_space_switches.load(Ordering::Relaxed), 1);
 
     // A is woken from another vCPU of its process (here the host) onto its
@@ -1116,6 +1144,8 @@ fn a_futex_wait_switches_the_vcpu_to_another_process_in_guest() {
     assert_eq!(cpu.ttbr, (TTBR_MM, TTBR_MM));
     assert_eq!(zone.installed_space(SLOT), MM);
     assert_eq!(task.zone_mm.load(Ordering::Relaxed), MM);
+    assert_eq!(task.lifecycle_page.load(Ordering::Acquire), 0x10000);
+    assert_eq!(task.control_slot.load(Ordering::Acquire), 0x20000);
     assert_eq!(zone.counters.el1_space_switches.load(Ordering::Relaxed), 2);
     assert!(
         cpu.asid_invalidations.is_empty(),

@@ -521,6 +521,8 @@ where
                 .map(|(_, generation)| generation.raw())
                 .unwrap_or(0),
             affinity: context.thread().affinity().words()[0],
+            lifecycle_page: 0,
+            control_slot: 0,
         };
         let parked = {
             let Some(guard) = zone.lock(ZoneTables::bucket_of(mm, uaddr), &HostLockWait) else {
@@ -911,6 +913,8 @@ where
                 .map(|(_, generation)| generation.raw())
                 .unwrap_or(0),
             affinity: context.thread().affinity().words()[0],
+            lifecycle_page: 0,
+            control_slot: 0,
         };
         let state = engine.snapshot_guest_state_for_publication()?;
         // Resume at the SVC with the original call's registers.
@@ -1364,6 +1368,8 @@ mod ipc_tests {
                 file_table: 5,
                 generation: 1,
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             })
             .unwrap();
         let guard = zone.object_wait(key, &HostLockWait).unwrap();

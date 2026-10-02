@@ -62,6 +62,8 @@ pub mod executor;
 mod fd_ceiling;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod reservations;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod thread_lifecycle;
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 

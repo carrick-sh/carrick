@@ -597,6 +597,8 @@ mod host_tests {
             file_table: 99,
             generation: 1,
             affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
         })
         .unwrap()
     }
@@ -634,6 +636,8 @@ mod host_tests {
                 file_table: 202,
                 generation: 1,
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             })
             .unwrap();
         let guard = zone.object_wait(key(1), &SpinForever).unwrap();
@@ -769,6 +773,8 @@ mod host_tests {
                     file_table: 99,
                     generation: 1,
                     affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
                 },
             )
             .unwrap();
@@ -937,6 +943,8 @@ mod host_tests {
                     file_table: 99,
                     generation: 1,
                     affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
                 },
             )
             .unwrap();

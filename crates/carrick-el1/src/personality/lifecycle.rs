@@ -244,9 +244,10 @@ fn serve_sigprocmask(
     };
     let (prev, pending) = thread
         .slot
-        .store_blocked_then_read_pending(new, thread.page.pending());
-    let deliverable = pending.0 & !new.0;
-    let newly_blocked = pending.0 & new.0 & !prev.0;
+        .store_blocked_then_read_pending(new, thread.slot.pending());
+    let pending = pending.0 | thread.page.pending().load().0;
+    let deliverable = pending & !new.0;
+    let newly_blocked = pending & new.0 & !prev.0;
     Some(deliverable | newly_blocked != 0)
 }
 
@@ -442,6 +443,8 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
         // The host binds the child's execution generation at adoption.
         generation: 0,
         affinity,
+        lifecycle_page: 0,
+        control_slot: 0,
     }) else {
         // Exhausted: the identity goes back to the pool, the host clones.
         let _ = page.unclaim(claimed);
@@ -526,7 +529,7 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
         return None;
     }
     // A pending signal is delivered (or re-targeted) by the host.
-    if page.pending().load().0 != 0 {
+    if page.pending().load().0 != 0 || slot.pending().load().0 != 0 {
         return None;
     }
     let task = sched.task;
@@ -582,3 +585,54 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
 #[cfg(test)]
 #[path = "lifecycle/tests.rs"]
 mod tests;
+
+/// Production venue: addresses are EL1-only retained metadata, carried with
+/// exact scheduler identity across parks and switches.
+pub struct GuestLifecycleVenue;
+
+#[cfg(target_os = "none")]
+impl LifecycleVenue for GuestLifecycleVenue {
+    fn thread(&self, task: &CurrentTask) -> Option<LifecycleThread<'_>> {
+        let page = task.lifecycle_page.load(Ordering::Acquire);
+        let slot = task.control_slot.load(Ordering::Acquire);
+        let contains = |address: u64, len: usize| {
+            address >= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                && address.checked_add(len as u64).is_some_and(|end| {
+                    end <= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                        + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
+                })
+        };
+        if !page.is_multiple_of(16384)
+            || !slot.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
+            || !contains(page, core::mem::size_of::<ThreadLifecyclePage>())
+            || !contains(slot, core::mem::size_of::<ThreadControlSlot>())
+        {
+            return None;
+        }
+        // SAFETY: only the runtime publishes these EL1-only addresses; its
+        // carrier owner pins both allocations across every zone record.
+        Some(unsafe {
+            LifecycleThread {
+                page: &*(page as *const ThreadLifecyclePage),
+                slot: &*(slot as *const ThreadControlSlot),
+            }
+        })
+    }
+    fn born_slot(
+        &self,
+        _page: &ThreadLifecyclePage,
+        _entry: EntryRef,
+    ) -> Option<&ThreadControlSlot> {
+        None
+    }
+}
+
+#[cfg(target_os = "none")]
+pub fn guest_venue() -> Option<&'static dyn LifecycleVenue> {
+    static VENUE: GuestLifecycleVenue = GuestLifecycleVenue;
+    Some(&VENUE)
+}
+#[cfg(not(target_os = "none"))]
+pub fn guest_venue() -> Option<&'static dyn LifecycleVenue> {
+    None
+}

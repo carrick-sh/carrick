@@ -944,6 +944,8 @@ mod tests {
             file_table: tid,
             generation: 1,
             affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
         }
     }
 

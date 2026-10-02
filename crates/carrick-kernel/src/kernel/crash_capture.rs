@@ -512,6 +512,8 @@ mod tests {
                 file_table: 0,
                 generation: 0,
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             };
             let record = zone.alloc_record(identity).expect("record");
             // SAFETY: freshly allocated by this call; nothing else may touch

@@ -12,7 +12,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 
 use carrick_abi::keyring::KeySerial;
 use carrick_abi::{LinuxGuestAbi, LinuxSigaltstack, SigSet};
-use carrick_el1_abi::{AltStack, BlockedMask, PendingSignals, PendingSummary, ThreadControlSlot};
+use carrick_el1_abi::{AltStack, BlockedMask, PendingSignals, ThreadControlSlot};
 use carrick_fatal::carrick_fatal;
 use carrick_hal::threaded::GuestCpuState;
 use carrick_hal::{CpuAffinity, ThreadId};
@@ -638,6 +638,14 @@ impl ThreadExecutionLease {
             .map(|thread| thread.resources().files().id())
     }
 
+    /// The exact live thread's ABI backing, retained independently of its graph.
+    pub fn control_lease(&self) -> Option<super::ThreadControlLease> {
+        self.owner
+            .upgrade()
+            .filter(|thread| thread.key() == self.owner_key)
+            .map(|thread| thread.control_lease())
+    }
+
     /// The leased thread's CPU affinity as a mask of guest CPUs 0-63 (0 when
     /// the thread is gone), for the in-guest scheduler's placement.
     pub fn affinity_mask(&self) -> u64 {
@@ -841,9 +849,6 @@ pub struct Thread {
     task: Weak<Task>,
     resources: ArcSwap<ThreadResources>,
     pub(in crate::kernel) signal_state: Mutex<ThreadSignalState>,
-    /// Thread-directed pending summary: the host lane's instance of the
-    /// shared Dekker partner of the blocked mask (see `control`).
-    signal_pending: PendingSummary,
     /// The only storage of this thread's blocked mask, `sigaltstack` and
     /// robust-list head (L2 ABI slot). Allocated with the thread, freed when
     /// the last `Arc<Thread>` drops at reap.
@@ -2696,7 +2701,7 @@ impl Thread {
     }
 
     pub fn may_have_pending_signals(&self) -> bool {
-        self.signal_pending.load().0 != 0
+        self.control.pending().load().0 != 0
     }
 
     /// Pin the authoritative slot across execution-lane publication and retirement.
@@ -2709,9 +2714,9 @@ impl Thread {
         &self.control
     }
 
-    /// Current blocked mask (plain read; the owner's or diagnostic view).
+    /// Current blocked mask, ordered after process-pending publication.
     pub fn blocked_mask(&self) -> SigSet {
-        SigSet::from_raw(self.control.blocked().0)
+        SigSet::from_raw(self.control.blocked_after_pending_publication().0)
     }
 
     /// Masker half of the Dekker pair: install `new`, then read the pending
@@ -2720,7 +2725,7 @@ impl Thread {
     pub fn store_blocked(&self, new: SigSet) -> (SigSet, SigSet) {
         let (old, pending) = self
             .control
-            .store_blocked_then_read_pending(BlockedMask(new.raw()), &self.signal_pending);
+            .store_blocked_then_read_pending(BlockedMask(new.raw()), self.control.pending());
         (SigSet::from_raw(old.0), SigSet::from_raw(pending.0))
     }
 
@@ -2729,14 +2734,15 @@ impl Thread {
     /// is the sender's to deliver; a blocked one is the masker's to find.
     pub fn post_pending_read_blocked(&self, bits: SigSet) -> SigSet {
         let blocked = self
-            .signal_pending
+            .control
+            .pending()
             .post_then_read_blocked(PendingSignals(bits.raw()), &self.control);
         SigSet::from_raw(blocked.0)
     }
 
     /// Retire `bits` from the pending summary (delivery consumed them).
     pub fn clear_pending_summary(&self, bits: SigSet) {
-        self.signal_pending.clear(PendingSignals(bits.raw()));
+        self.control.pending().clear(PendingSignals(bits.raw()));
     }
 
     /// Current `sigaltstack`; `None` is disabled.
@@ -2811,7 +2817,7 @@ impl Thread {
     pub(in crate::kernel) fn publish_signal_state(&self, state: &ThreadSignalState) {
         self.publish_pending(state.pending());
         self.revision.publish();
-        debug_assert_eq!(self.signal_pending.load().0, state.pending().raw());
+        debug_assert_eq!(self.control.pending().load().0, state.pending().raw());
     }
 
     /// Make the summary equal `pending`. Newly pending bits are posted first
@@ -2819,7 +2825,7 @@ impl Thread {
     /// lock-free reader never sees a still-pending signal missing. Only
     /// callers holding `signal_state` write the summary.
     fn publish_pending(&self, pending: SigSet) {
-        let current = self.signal_pending.load().0;
+        let current = self.control.pending().load().0;
         let added = pending.raw() & !current;
         let removed = current & !pending.raw();
         if added != 0 {
@@ -2934,7 +2940,6 @@ impl Thread {
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::default()),
-            signal_pending: PendingSummary::new(),
             control: Self::new_control(task, key, &ThreadSignalState::default()),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
@@ -2978,7 +2983,6 @@ impl Thread {
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::default()),
-            signal_pending: PendingSummary::new(),
             control,
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
@@ -3012,7 +3016,6 @@ impl Thread {
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(Self::live_state(seed)),
-            signal_pending: PendingSummary::new(),
             control: Self::new_control(task, key, seed),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
@@ -3045,7 +3048,6 @@ impl Thread {
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(Self::live_state(seed)),
-            signal_pending: PendingSummary::new(),
             control: Self::new_control(task, key, seed),
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),

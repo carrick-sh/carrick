@@ -5878,6 +5878,8 @@ mod tests {
                 file_table: 1,
                 generation: 1,
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             })
             .unwrap();
         let captured_record = zone.record_ref(id);
@@ -8566,6 +8568,8 @@ mod tests {
                 file_table: 1,
                 generation: 1,
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             })
             .unwrap();
         let placed = zone
@@ -9566,6 +9570,8 @@ mod tests {
                 file_table: 0,
                 generation: running.generation().raw(),
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             };
             let record_id = zone.alloc_record(identity).unwrap();
             let seq = zone.next_seq(record_id);

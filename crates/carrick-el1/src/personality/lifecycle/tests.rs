@@ -485,13 +485,57 @@ fn clone_tid_copy_faults_restore_the_preimages_and_forward() {
 const SIGUSR1_BIT: u64 = 1 << 9; // signal 10
 
 #[test]
+fn lifecycle_setup_completes_once_before_pending_host_work() {
+    for nr in [SYS_RT_SIGPROCMASK, SYS_SIGALTSTACK, SYS_SET_ROBUST_LIST] {
+        let mut w = World::new(LifecycleHatches::ON);
+        w.task().mark_pending_host_work();
+        let args: &[u64] = match nr {
+            SYS_RT_SIGPROCMASK => &[0, 0, 0, 8],
+            SYS_SIGALTSTACK => &[0, 0],
+            _ => &[0x1234, 24],
+        };
+        let (action, _) = w.syscall(nr, args);
+        assert_eq!(action, Action::ServedWithWork, "syscall {nr}");
+        assert_eq!(w.served(nr), 1);
+        assert_eq!(w.forwarded(nr), 0);
+    }
+}
+
+#[test]
 fn sigprocmask_unblocking_a_pending_signal_serves_with_work() {
     let mut w = World::new(LifecycleHatches::ON);
     let slot = w.venue.leader_slot();
     slot.init_blocked(BlockedMask(SIGUSR1_BIT | 1));
     // A sender posted SIGUSR1 and saw it blocked: it left it pending.
     let seen = w
-        .page()
+        .venue
+        .leader_slot()
+        .pending()
+        .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
+    assert_ne!(seen.0 & SIGUSR1_BIT, 0);
+    let set = Box::new(SIGUSR1_BIT);
+    let old = Box::new(0_u64);
+    let (action, frame) = w.syscall(
+        SYS_RT_SIGPROCMASK,
+        &[SIG_UNBLOCK, addr(&*set), addr(&*old), 8],
+    );
+    assert_eq!(action, Action::ServedWithWork);
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(*old, SIGUSR1_BIT | 1);
+    assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
+    assert_eq!(w.task().served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
+}
+
+#[test]
+fn sigprocmask_unblocking_a_process_pending_signal_serves_with_work() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let slot = w.venue.leader_slot();
+    slot.init_blocked(BlockedMask(SIGUSR1_BIT | 1));
+    // A sender posted SIGUSR1 and saw it blocked: it left it pending.
+    let seen = w
+        .venue
+        .page
         .pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
     assert_ne!(seen.0 & SIGUSR1_BIT, 0);
@@ -534,7 +578,8 @@ fn sigprocmask_serves_block_setmask_and_query() {
     // Blocking a pending signal re-targets it: the host must look.
     let mut w = World::new(LifecycleHatches::ON);
     let _ = w
-        .page()
+        .venue
+        .leader_slot()
         .pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), w.venue.leader_slot());
     let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_BLOCK, addr(&*set), 0, 8]);
@@ -604,8 +649,22 @@ fn sigprocmask_forwards_errors_aliases_and_closed_services() {
 /// thread unblocking it never both miss each other.
 #[test]
 fn sigprocmask_dekker_storm_loses_no_signal() {
+    run_sigprocmask_dekker_storm(false);
+}
+
+#[test]
+fn sigprocmask_process_dekker_storm_loses_no_signal() {
+    run_sigprocmask_dekker_storm(true);
+}
+
+fn run_sigprocmask_dekker_storm(process: bool) {
     const ROUNDS: usize = 20_000;
     let venue = Venue::new(LifecycleHatches::ON);
+    let summary = if process {
+        venue.page.pending()
+    } else {
+        venue.leader_slot().pending()
+    };
     let (start, end) = (Barrier::new(2), Barrier::new(2));
     let (saw_blocked, works) = std::thread::scope(|scope| {
         let sender = scope.spawn(|| {
@@ -613,14 +672,16 @@ fn sigprocmask_dekker_storm_loses_no_signal() {
             for _ in 0..ROUNDS {
                 venue.leader_slot().init_blocked(BlockedMask(SIGUSR1_BIT));
                 start.wait();
-                let blocked = venue
-                    .page
-                    .pending()
-                    .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), venue.leader_slot());
+                let blocked = if process {
+                    summary.replace_from_locked_queue(PendingSignals(SIGUSR1_BIT));
+                    venue.leader_slot().blocked_after_pending_publication()
+                } else {
+                    summary.post_then_read_blocked(PendingSignals(SIGUSR1_BIT), venue.leader_slot())
+                };
                 saw_blocked.push(blocked.0 & SIGUSR1_BIT != 0);
                 end.wait();
                 end.wait();
-                venue.page.pending().clear(PendingSignals(SIGUSR1_BIT));
+                summary.clear(PendingSignals(SIGUSR1_BIT));
             }
             saw_blocked
         });
