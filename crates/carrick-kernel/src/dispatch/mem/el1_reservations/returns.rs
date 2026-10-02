@@ -67,6 +67,21 @@ pub(crate) fn settle_final_root(mut model: Reservations<'_>) -> Result<usize, Re
 }
 
 impl MemView<'_> {
+    pub(in crate::dispatch) fn fork_backing_is_unsettled(&self) -> bool {
+        let authority = self.mem();
+        let mem = authority.lock();
+        if !mem.first_touch_stock.is_empty() {
+            return true;
+        }
+        let Some(root) = mem.delegated_root() else {
+            return false;
+        };
+        root.with_root(|model| Ok(owed_returns(model).1.is_some()))
+            .unwrap_or_else(|refusal| {
+                super::super::anonymous::broken_root("a fork settlement observation", refusal)
+            })
+    }
+
     /// Take this MM's unused first-touch stock: the root holes still under
     /// the stock-holding grants recorded at their commit. Work is
     /// proportional to those spans: an MM that holds none pays one check.

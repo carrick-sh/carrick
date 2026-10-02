@@ -1080,6 +1080,20 @@ where
                 engine,
                 &parent_mutation,
             );
+        }
+        if !shares_mm {
+            let permit = parent_mutation.host_alias_permit();
+            if let Err(error) = kernel
+                .dispatcher
+                .reconcile_el1_deferred_returns(&permit, memory)
+            {
+                tracing::warn!(?error, "fork could not settle EL1 stock and owed returns");
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
+            }
+        }
+        if (memory as &dyn std::any::Any).is::<E>() {
             // Fork can arm COW and repoint both committed and still-prepared
             // leaves. No pre-fork grant may authorize a later guest commit.
             if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
