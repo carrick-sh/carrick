@@ -688,5 +688,5 @@ path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
 contracts = ["x86.run-elf.poll"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/native_ownership_tests.rs"
+path = "crates/carrick-el1/src/personality/native_ownership_tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner"]
