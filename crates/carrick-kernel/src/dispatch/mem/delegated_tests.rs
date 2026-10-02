@@ -2398,6 +2398,34 @@ fn delegated_served_mprotect_and_munmap_read_back_as_linux_rows() {
     twin.same("restore shared page again", arena);
 }
 
+#[test]
+fn delegated_proc_maps_omits_hidden_arena_backing() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let layout = dispatcher.mem().lock().layout;
+    dispatcher.mem().lock().address_space_regions = Some(vec![ProcMapsEntry {
+        start: layout.mmap_base,
+        end: layout.mmap_base + layout.mmap_size,
+        read: true,
+        write: true,
+        execute: true,
+        sharing: carrick_vfs::ProcMapSharing::Private,
+        path: "hidden arena backing".to_owned(),
+    }]);
+    let start = root
+        .guest_mmap(
+            Placement::Anywhere,
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    let rows = dispatcher.mem().lock().proc_regions().unwrap();
+    assert_eq!(rows.len(), 1, "only Linux VMAs belong in proc maps");
+    assert_eq!((rows[0].start, rows[0].end), (start, start + 2 * PAGE));
+    assert!(rows[0].read && rows[0].write && !rows[0].execute);
+    assert!(rows[0].path.is_empty());
+}
+
 /// After a fork both MMs see the pre-fork region: an mprotect and restore of
 /// one page must leave ONE row in the parent (root rows) and in the child
 /// (host-setup rows).

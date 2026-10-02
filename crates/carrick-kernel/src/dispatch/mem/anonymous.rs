@@ -549,7 +549,7 @@ impl MemState {
             .address_space_regions
             .iter()
             .flatten()
-            .filter(|map| !super::boot_region_is_hidden_heap_backing(map, layout))
+            .filter(|map| !super::boot_region_is_hidden_reservation(map, layout))
             .chain(self.dynamic_maps.iter())
             .cloned()
             .collect();
