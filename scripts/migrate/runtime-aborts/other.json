@@ -574,6 +574,17 @@
       "rationale": "An EL1-editor exclusion registration is dropped on a thread that never registered it. The witness that lets engine code store to guest-owned descriptors is thread-bound by construction; a release elsewhere means the exclusion's ownership crossed threads and the registering thread may still mint witnesses after its gate was lowered, so continuing could let the host race a guest EL1 editor. Added 2026-10-01 (s3-t2 A').",
       "sink": "fatal",
       "domain": "hal::el1_editor_exclusion"
+    },
+    {
+      "file": "crates/carrick-aarch64/src/descriptor_drain.rs",
+      "function": "<EngineGrantVenue<'_,E> as carrick_hal::threaded::El1FrameGrantVenue>::apply_guest_publication",
+      "ordinal_in_function": 1,
+      "fingerprint": "77fe39477ceb5e099f6ecb2df8e254d1dfff634cdb489bdc12e739b29cd7b6d4",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_copyout_grant",
+      "rationale": "EL1 applied part of a host copyout's frame-grant transaction and its receipt cannot be settled: the grant's backing is live in some leaves and absent in others, so it can be neither rolled back nor committed, and the copyout would write through an unknown translation state.",
+      "sink": "fatal",
+      "domain": "hvpatch::host_copyout_grant"
     }
   ]
 }
