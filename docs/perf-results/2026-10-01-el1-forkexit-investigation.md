@@ -649,3 +649,27 @@ The old distinct-backing assertion for fork siblings now requires distinct
 page/slot addresses within the shared slab; gate, mask and final-owner
 independence remain asserted. Exhaustion behavior and signed default-on
 acceptance are not yet verified.
+
+### Exhaustion must leave a host-served continuation
+
+The publication-boundary contract forced `MetadataResolutionError::Busy`
+and failed red with `Err(Busy)` instead of `Ok(HostServed)`
+(`/tmp/forkexit-sol-j-exhaustion-red.log`). Propagating resource pressure
+as an executor-load error could strand guest progress rather than decline
+this optional venue.
+
+Publication now revokes any previous page/slot binding before one resolution
+attempt. `Busy` returns `HostServed` with both addresses zero, so the loaded
+thread continues on the existing host syscall path. No retry, wait or poll
+is introduced; stale-owner and invalid-extent failures still propagate.
+Thread pins are retained only after both backing resolutions succeed.
+
+The runtime owner suite passed all three tests, including the exact one-
+attempt budget and zero-binding assertion
+(`/tmp/forkexit-sol-j-exhaustion-green.log`). The VMM quota contract filled
+all 128 slab slots, then required refusal of the next request before any
+backend work and without changing the stage-2 inventory or occupancy bitmap
+(`/tmp/forkexit-sol-j-quota-green.log`, one test passed). The selected outcome
+is admission decline, not fork identity rollback: the thread remains owned
+and runnable through its ordinary host continuation. Signed Phase A gates
+remain outstanding.

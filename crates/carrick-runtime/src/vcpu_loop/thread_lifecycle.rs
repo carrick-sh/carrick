@@ -18,6 +18,28 @@ fn publish_for_page<R>(
     (page.serves_threads() || page.serves_sigmask()).then(publish)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LifecyclePublication {
+    Published,
+    HostServed,
+}
+
+fn publish_resolved(
+    task: &CurrentTask,
+    resolve: impl FnOnce() -> Result<(u64, u64), carrick_el1_abi::MetadataResolutionError>,
+) -> Result<LifecyclePublication, carrick_el1_abi::MetadataResolutionError> {
+    task.publish_lifecycle(0, 0);
+    let (page, control) = match resolve() {
+        Ok(binding) => binding,
+        Err(carrick_el1_abi::MetadataResolutionError::Busy) => {
+            return Ok(LifecyclePublication::HostServed);
+        }
+        Err(error) => return Err(error),
+    };
+    task.publish_lifecycle(page, control);
+    Ok(LifecyclePublication::Published)
+}
+
 #[derive(Debug)]
 struct ControlBacking(ThreadControlLease);
 // SAFETY: the lease retains a MAP_SHARED slab containing only ABI granules.
@@ -107,19 +129,13 @@ impl CarrierLifecycleMappings {
         &self,
         slot: usize,
         control: ThreadControlLease,
-    ) -> Result<(), carrick_el1_abi::MetadataResolutionError> {
+    ) -> Result<LifecyclePublication, carrick_el1_abi::MetadataResolutionError> {
         if slot >= carrick_el1_abi::EL1_STACK_SLOTS as usize {
             return Err(carrick_el1_abi::MetadataResolutionError::InvalidExtent);
         }
         let lifecycle = control.lifecycle();
         publish_for_page(&lifecycle, || {
             let region = self.access.region()?;
-            let mut state = self.state.lock();
-            let page = self.map(&mut state, Arc::new(LifecycleBacking(control.lifecycle())))?;
-            let page_offset = lifecycle.page_address().raw() - lifecycle.backing_base().raw();
-            let base = self.map(&mut state, Arc::new(ControlBacking(control.clone())))?;
-            let offset = control.slot_address().raw() - control.backing_base().raw();
-            state.retain_thread(control);
             // SAFETY: the exact carrier access retains the region and both mapped
             // ABI owners. The executor publishes before entering this slot's EL0.
             let task = unsafe {
@@ -129,10 +145,17 @@ impl CarrierLifecycleMappings {
                     .cast::<CurrentTask>()
                     .add(slot)
             };
-            task.publish_lifecycle(page.raw() + page_offset as u64, base.raw() + offset as u64);
-            Ok(())
+            publish_resolved(task, || {
+                let mut state = self.state.lock();
+                let page = self.map(&mut state, Arc::new(LifecycleBacking(control.lifecycle())))?;
+                let page_offset = lifecycle.page_address().raw() - lifecycle.backing_base().raw();
+                let base = self.map(&mut state, Arc::new(ControlBacking(control.clone())))?;
+                let offset = control.slot_address().raw() - control.backing_base().raw();
+                state.retain_thread(control);
+                Ok((page.raw() + page_offset as u64, base.raw() + offset as u64))
+            })
         })
-        .unwrap_or(Ok(()))
+        .unwrap_or(Ok(LifecyclePublication::HostServed))
     }
 }
 
@@ -156,6 +179,28 @@ impl Drop for CarrierLifecycleMappings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_publication_declines_once_and_keeps_the_thread_host_served() {
+        let task = CurrentTask::new();
+        task.publish_lifecycle(0x1000, 0x2000);
+        let attempts = std::cell::Cell::new(0);
+        let outcome = publish_resolved(&task, || {
+            attempts.set(attempts.get() + 1);
+            Err(carrick_el1_abi::MetadataResolutionError::Busy)
+        });
+        assert_eq!(outcome, Ok(LifecyclePublication::HostServed));
+        assert_eq!(attempts.get(), 1, "exhaustion retried publication");
+        assert_eq!(
+            task.lifecycle_page
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            task.control_slot.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
 
     #[test]
     fn both_hatches_off_publish_no_carrier_mappings() {

@@ -1157,6 +1157,36 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn retained_slab_exhaustion_refuses_without_backend_work() {
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let mut aperture = metadata_aperture(&custody).lock();
+        for _ in 0..MAX_DYNAMIC_EXTENT_SLOTS {
+            let backing = Arc::new(MetadataBacking::Allocated(
+                allocate_metadata_backing(EL1_DYNAMIC_METADATA_EXTENT_SIZE).unwrap(),
+            ));
+            aperture
+                .install_retained_using(&custody, generation, backing, |_| 0)
+                .unwrap();
+        }
+        let before = custody.stage2_record_identities();
+        let occupied = aperture.occupied_bitmap;
+        let backing = Arc::new(MetadataBacking::Allocated(
+            allocate_metadata_backing(EL1_DYNAMIC_METADATA_EXTENT_SIZE).unwrap(),
+        ));
+        assert_eq!(
+            aperture.install_retained_using(&custody, generation, backing, |_| {
+                panic!("exhaustion must decline before backend publication")
+            }),
+            Err(MetadataResolutionError::Busy)
+        );
+        assert_eq!(custody.stage2_record_identities(), before);
+        assert_eq!(aperture.occupied_bitmap, occupied);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn retained_lifecycle_mapping_keeps_one_backing_and_exact_carrier() {
         let first = crate::trap::CarrierVmCustody::new();
         let second = crate::trap::CarrierVmCustody::new();
