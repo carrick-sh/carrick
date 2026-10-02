@@ -2516,6 +2516,7 @@ mod first_touch_access_tests {
     fn frame_grant_claim_requires_the_exact_mm_fault_and_access() {
         let request = carrick_el1_abi::FrameGrantRequest {
             mm_key: 7,
+            requested_len: carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
             request_generation: 11,
             fault_va: 0x4000_3123,
             access: crate::linux_abi::LINUX_PROT_WRITE,
