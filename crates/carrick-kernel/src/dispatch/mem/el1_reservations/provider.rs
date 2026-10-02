@@ -10,6 +10,14 @@ pub trait HostReservationProvider: Send + Sync {
     /// Called before taking an MM permit. Return MetadataRequired if the
     /// existing metadata service must provision storage before resubmission.
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal>;
+
+    /// Service a capacity refusal after releasing MM metadata/root guards.
+    /// Providers without an elastic carrier authority decline the request.
+    /// `Limit` requires a Linux resource-limit authority; missing carrier
+    /// storage remains `MetadataRequired`, never a manufactured Linux ENOMEM.
+    fn provision_metadata(&self, _mm: ReservationMm) -> Result<(), Refusal> {
+        Err(Refusal::MetadataRequired)
+    }
 }
 
 /// How a host thread waits for a held reservation root: spin briefly, then
@@ -122,6 +130,9 @@ pub(in crate::dispatch) struct DelegatedRoot {
 }
 
 impl DelegatedRoot {
+    pub(in crate::dispatch) fn provision_metadata(&self) -> Result<(), Refusal> {
+        self.provider.provision_metadata(self.mm)
+    }
     /// One host-venue step on the exact admitted root. The root guard lives
     /// only for `step`: no host backend service ever runs under it.
     pub(in crate::dispatch) fn with_root<R>(
@@ -194,6 +205,11 @@ impl DelegatedRoot {
 }
 
 impl DispatchMmAuthority {
+    pub(in crate::dispatch) fn reservation_provider_for_publication(
+        &self,
+    ) -> Option<Arc<dyn HostReservationProvider>> {
+        self.reservation_provider.lock().provider.clone()
+    }
     /// Runtime installs its carrier/VM-generation-bound provider before the
     /// first address-space publication. Installation is one-shot; a fork/exec
     /// successor inherits the same carrier provider, not a parent root handle.
