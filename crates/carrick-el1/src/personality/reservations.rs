@@ -2202,6 +2202,12 @@ impl Reservations<'_> {
             .generation
             .checked_add(1)
             .ok_or(Refusal::Stale)?;
+        // Admission must not publish a child that cannot forward even one
+        // host request. This reserve remains private across the copy.
+        if let Err(reason) = child.secure_host_nodes(HOST_RESERVE) {
+            child.drain_host_reserve();
+            return Err(reason);
+        }
         let mut list = CopyList::default();
         if let Err(reason) = self.copy_in_order(self.state().tree, &mut list) {
             let mut id = list.head;
@@ -2210,6 +2216,7 @@ impl Reservations<'_> {
                 self.table.release(id, self.banks);
                 id = next;
             }
+            child.drain_host_reserve();
             return Err(reason);
         }
         let mut cursor = list.head;
@@ -2298,6 +2305,10 @@ impl Reservations<'_> {
         if self.state().admitted {
             return Err(Refusal::Stale);
         }
+        if let Err(reason) = self.secure_host_nodes(HOST_RESERVE) {
+            self.drain_host_reserve();
+            return Err(reason);
+        }
         self.state_mut().admitted = true;
         self.mark_admitted();
         Ok(())
@@ -2321,6 +2332,7 @@ impl Reservations<'_> {
         }
         self.release_tree(self.state().tree);
         self.state_mut().tree = 0;
+        self.drain_host_reserve();
         Ok(())
     }
     /// Called after final-MM descriptor/backing settlement, never sibling exit.
@@ -2532,7 +2544,8 @@ mod tests {
         table.publish(0, mm, layout()).unwrap();
         let mut model = table.lock(0, mm).unwrap();
         model.finish_import().unwrap();
-        for page in 0..NODES {
+        assert_eq!(model.host_reserve(), HOST_RESERVE);
+        for page in 0..NODES - HOST_RESERVE as usize {
             let decision = model
                 .mmap(
                     Placement::Fixed(0x100000 + page as u64 * 8192),
@@ -2814,7 +2827,8 @@ mod tests {
             assert_eq!(complete(&mut g, d), 0x100000 + i * 4096);
         }
         assert_eq!(g.read(g.state().tree).height, 1);
-        assert!(table.allocated.load(Ordering::Relaxed) <= 4);
+        // Admission's private forwarding reserve is not tree churn.
+        assert!(table.allocated.load(Ordering::Relaxed) - g.host_reserve() <= 4);
         let d = g
             .munmap(ReservationRange::new(0x100000, 0x300000).unwrap())
             .unwrap();
@@ -4040,6 +4054,50 @@ mod tests {
             g.work = 0;
             assert_eq!(g.charges().bytes, count * 0x1000);
             assert_eq!(g.work, 1);
+        }
+    }
+
+    #[test]
+    fn reservation_admission_secures_one_forwarding_request() {
+        let table = table();
+        let mut g = admitted(&table, 0, 13);
+        assert_eq!(g.host_reserve(), HOST_RESERVE);
+        let child_mm = ReservationMm::new(14).unwrap();
+        table.publish(1, child_mm, layout()).unwrap();
+        let mut child = table.lock(1, child_mm).unwrap();
+        g.clone_into(&mut child).unwrap();
+        assert_eq!(child.host_reserve(), HOST_RESERVE);
+        g.retire().unwrap();
+        child.retire().unwrap();
+        let _reused_parent = admitted(&table, 0, 15);
+        let _reused_child = admitted(&table, 1, 16);
+        assert_eq!(table.allocated.load(Ordering::Relaxed), 2 * HOST_RESERVE);
+    }
+
+    #[test]
+    fn reservation_failed_admission_returns_import_and_reserve_nodes() {
+        let table = table();
+        let mm = ReservationMm::new(13).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut g = table.lock(0, mm).unwrap();
+        for page in 0..NODES {
+            g.import_with(
+                range(0x100000 + page as u64 * 8192, 0x101000 + page as u64 * 8192),
+                ReservationProtection::READ_WRITE,
+                ReservationNodeFlags::ANONYMOUS_PRIVATE,
+            )
+            .unwrap();
+        }
+        assert_eq!(g.finish_import(), Err(Refusal::MetadataRequired));
+        assert!(!g.is_admitted());
+        assert_eq!(g.host_reserve(), 0);
+        g.abort_import().unwrap();
+        let nodes: Vec<_> = (0..NODES)
+            .map(|_| g.pool_node().expect("every imported node returned"))
+            .collect();
+        assert_eq!(g.pool_node(), Err(Refusal::MetadataRequired));
+        for node in nodes {
+            table.release(node, g.banks);
         }
     }
 

@@ -230,6 +230,20 @@ timing, and full promotion remain open for the integration director.
 
 ## Delegated anonymous root contracts
 
+`kernel.mm.delegated-metadata-capacity` covers shared reservation metadata
+pressure. Linux authority: `mmap(2)` ENOMEM when kernel mapping metadata cannot
+be allocated. Admission first secures the existing eight-node forwarding
+reserve; failure leaves the MM unadmitted and returns all imported/reserved
+nodes. After admission, a bounded capacity-service failure answers ENOMEM
+without changing the VMA, backing, or generation and without handing the MM
+back to a host arena. A later request succeeds when retirement returns metadata
+capacity. VM-free bindings: `reservation_admission_secures_one_forwarding_request`,
+`reservation_failed_admission_returns_import_and_reserve_nodes`,
+`delegated_initial_reserve_refusal_leaves_the_mm_unadmitted`, and
+`delegated_carrier_exhaustion_returns_enomem_without_handback_and_recovers`.
+The retained-bank signed binding remains
+`el1_reservation_metadata_grows_beyond_bootstrap`.
+
 `kernel.mm.delegated-residency` covers `mincore(2)` and first-touch planning
 on an MM whose EL1 anonymous root is admitted. Linux authority: `man 2 mincore`,
 `man 2 munmap`: a new anonymous mapping holds none of the pages a previous
