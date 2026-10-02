@@ -529,3 +529,90 @@ No post-I2 signed test or full requested gate is claimed. Resume with the
 ABI pool/ledger authority before enabling `born_slot`; then settle before
 context resolution and membership observers, close admission, and implement
 exact retirement. No build or guest is left running by this checkpoint.
+
+## Phase A promotion attempt on I2
+
+The director split L4 promotion: first land setup serving with exit forwarded,
+then attribute residual setup forwards and finish guest exit. The current
+checkpoint is **not review-ready**. The new MM-occupancy watchdog failure is
+outside the director's known six and blocks promotion.
+
+On clean `2cdaaaede`, the signed hatch run used both
+`CARRICK_EL1_SIGMASK=0 CARRICK_EL1_THREADS=0`, run ID
+`forkexit-sol-phase-a-hatch-20261001-01`. All three workloads passed their
+guest semantic lines. Served lifecycle counts were zero. At 128/512/2048
+threads, forwards were exit 128/514/2053, mask 525/2061/8205 and altstack
+387/1539/6147. First-interval slopes were exit 1.0052, mask 4.0000 and
+altstack 3.0000. The test exited 1 on the unchanged exit-slope assertion;
+the director accepted pre-venue hatch shape. Negative control and scoped
+cleanup passed. Log: `/tmp/forkexit-sol-phase-a-hatch.log`. An execution-time
+partial receipt was saved at
+`/tmp/forkexit-sol-phase-a-hatch-artifacts.snapshot.jsonl`: executable SHA256
+`d51be72f679cde3f2b80b2ed81d30c1fc8982f3a6f6593a41aa08fb440fead45`,
+CDHash `0f02b84145bf38cf21d1c2eb760010ce9a292092`, LC_UUID
+`C219A5AA-4FD5-31B9-A4E9-FD61C53EE7FB`; entitlement and DOF were present.
+This failed invocation does not publish a complete canonical receipt.
+
+The default-on full `el1_` invocation, run ID
+`forkexit-sol-phase-a-el1-20261001-01`, exited 1. Five tests first failed
+before guest launch because Linux fixtures had not been built. The missing
+prerequisite was subsequently repaired with
+`CARGO_BUILD_JOBS=3 ./scripts/build-linux-fixtures.sh` (exit 0, no Docker).
+Four known memory reds ran, then `el1_sched_mm_occupancy_two_processes`
+hit its unchanged 240-second watchdog. Later lifecycle tests did not run.
+This incomplete batch cannot establish known-six closure. Full log:
+`/tmp/forkexit-sol-phase-a-el1.log`.
+
+The director requested three isolated default-on and three isolated hatch-off
+MM-occupancy attempts as attribution, not retries for acceptance. All six
+hit the unchanged 240-second watchdog; negative controls passed and scoped
+cleanup reported zero. Run IDs are
+`forkexit-sol-phase-a-mm-{on,off}-20261001-{01,02,03}`, logs
+`/tmp/forkexit-sol-phase-a-mm-{on,off}-{01,02,03}.log`. The third off attempt
+included a bounded 60-second stage-2 inventory USDT trace and is instrumented.
+
+Two live LLDB captures of the original full-run carrier found an executor in
+Hypervisor `find_range_bounds_containing` through `hv_vm_map`, preparing a
+sparse first-touch page. Other executors were parked. Logs and modified-memory
+core are `/tmp/forkexit-sol-phase-a-mm-occupancy-{stacks,core}.log` and
+`/tmp/forkexit-sol-phase-a-mm-occupancy.core`. Attach perturbation applies.
+The saved core omits framework code pages, so core disassembly was unavailable.
+Watchdog post-mortem reported kernel authority busy, not a coherent empty graph.
+
+The third off carrier (PID 27162) emitted 123520 successful stage-2 maps and
+123342 unmaps during the bounded trace, including 128 metadata-aperture maps.
+Replaying exact `(IPA,length)` keys leaves 178 keys. This is an edge census,
+not HVF's internal region count: partial overlaps and remaps require care.
+No DTrace drops were reported. Raw trace:
+`/tmp/forkexit-sol-phase-a-mm-off-03-stage2.raw`; durable source:
+`scripts/dtrace/hvpatch-global-frame-stage2-inventory.d`. The director's
+region-count-growth hypothesis remains unconfirmed.
+
+The off attempts still published retained lifecycle/control mappings. The
+director identified this as incomplete hatch scope and authorized a
+no-publication comparison. A cheap runtime contract failed red with
+`disabled venue reached carrier publication`, then passed after publication
+was gated on the retained page's existing hatch bits. Both hatches off now
+skip carrier access, mapping, pin retention and binding publication; an
+enabled service still uses the authoritative backing. Focused logs:
+`/tmp/forkexit-sol-phase-a-hatch-publication-{red,green}.log`.
+Signed no-publication attribution and default-on root-cause repair remain
+outstanding. No Phase A host-gate or both-libc semantics closure is claimed.
+
+The signed no-publication comparison passed under trace in 1360 ms, then
+passed uninstrumented in 1147 ms, both with 150 forks and eight writers in
+each process and all semantic predicates true. Run IDs:
+`forkexit-sol-phase-a-mm-no-publication-20261001-{01,02}`; logs:
+`/tmp/forkexit-sol-phase-a-mm-no-publication{,-untraced}.log`; complete
+script receipts were saved to the corresponding `/tmp/*-artifacts.jsonl`.
+The trace emitted 1587 maps and 1571 unmaps (PID 62600), with peak 59 exact
+range keys, versus peak 179 with publication. Raw trace:
+`/tmp/forkexit-sol-phase-a-mm-no-publication-stage2.raw`.
+
+A concrete capacity lead supersedes speculation about native lookup cost:
+`install_retained_using` reserves a 512 KiB aperture slot for each retained
+16 KiB granule. There are exactly 128 slots; the stalled capture emitted
+exactly 128 metadata maps. A 600-granule retained population uses 9.375 MiB
+of actual backing within the existing 64 MiB aperture, but the current
+allocator cannot admit it. Red-first capacity proof and repair are next;
+the publication-disabled passes do not confer default-on acceptance.

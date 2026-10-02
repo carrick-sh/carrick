@@ -11,6 +11,13 @@ use carrick_vmm_hvf::metadata_grant::{
 };
 use parking_lot::Mutex;
 
+fn publish_for_page<R>(
+    page: &carrick_el1_abi::ThreadLifecyclePage,
+    publish: impl FnOnce() -> R,
+) -> Option<R> {
+    (page.serves_threads() || page.serves_sigmask()).then(publish)
+}
+
 #[derive(Debug)]
 struct ControlBacking(ThreadControlLease);
 // SAFETY: the lease retains one MAP_SHARED granule of atomic ABI-only slots.
@@ -104,23 +111,27 @@ impl CarrierLifecycleMappings {
         if slot >= carrick_el1_abi::EL1_STACK_SLOTS as usize {
             return Err(carrick_el1_abi::MetadataResolutionError::InvalidExtent);
         }
-        let region = self.access.region()?;
-        let mut state = self.state.lock();
-        let page = self.map(&mut state, Arc::new(LifecycleBacking(control.lifecycle())))?;
-        let base = self.map(&mut state, Arc::new(ControlBacking(control.clone())))?;
-        let offset = control.slot_address().raw() - control.backing_base().raw();
-        state.retain_thread(control);
-        // SAFETY: the exact carrier access retains the region and both mapped
-        // ABI owners. The executor publishes before entering this slot's EL0.
-        let task = unsafe {
-            &*region
-                .as_ptr()
-                .add(carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
-                .cast::<CurrentTask>()
-                .add(slot)
-        };
-        task.publish_lifecycle(page.raw(), base.raw() + offset as u64);
-        Ok(())
+        let lifecycle = control.lifecycle();
+        publish_for_page(&lifecycle, || {
+            let region = self.access.region()?;
+            let mut state = self.state.lock();
+            let page = self.map(&mut state, Arc::new(LifecycleBacking(control.lifecycle())))?;
+            let base = self.map(&mut state, Arc::new(ControlBacking(control.clone())))?;
+            let offset = control.slot_address().raw() - control.backing_base().raw();
+            state.retain_thread(control);
+            // SAFETY: the exact carrier access retains the region and both mapped
+            // ABI owners. The executor publishes before entering this slot's EL0.
+            let task = unsafe {
+                &*region
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
+                    .cast::<CurrentTask>()
+                    .add(slot)
+            };
+            task.publish_lifecycle(page.raw(), base.raw() + offset as u64);
+            Ok(())
+        })
+        .unwrap_or(Ok(()))
     }
 }
 
@@ -144,6 +155,28 @@ impl Drop for CarrierLifecycleMappings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_hatches_off_publish_no_carrier_mappings() {
+        let page =
+            carrick_el1_abi::ThreadLifecyclePage::with_hatches(carrick_el1_abi::LifecycleHatches {
+                threads: false,
+                sigmask: false,
+            });
+        let maps = std::cell::Cell::new(0);
+        let result = publish_for_page(&page, || {
+            maps.set(maps.get() + 1);
+        });
+        assert!(
+            result.is_none(),
+            "disabled venue reached carrier publication"
+        );
+        assert_eq!(
+            maps.get(),
+            0,
+            "disabled venue paid stage-2 publication work"
+        );
+    }
 
     fn context() -> carrick_kernel::kernel::KernelContext {
         let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
