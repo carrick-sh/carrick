@@ -45,7 +45,7 @@ pub(super) struct BirthAdmissionGuard {
 }
 
 impl BirthAdmissionGuard {
-    pub(super) fn acquire(task: &TaskRef) -> Result<Self, KernelOperationError> {
+    pub(super) fn acquire(task: &super::objects::Task) -> Result<Self, KernelOperationError> {
         let page = task.shared().pending_signals().lifecycle_lease();
         if !page.serves_threads() || page.gate() == carrick_el1_abi::GateState::Closed {
             return Ok(Self { page: None });
@@ -1122,6 +1122,92 @@ mod tests {
 
     fn fork_plan() -> ClonePlan {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
+    }
+
+    #[test]
+    fn lifecycle_fork_admission_declines_in_flight_birth_in_only_its_owner() {
+        birth_conflict_scope("fork");
+    }
+    #[test]
+    fn lifecycle_credentials_admission_declines_in_flight_birth_in_only_its_owner() {
+        birth_conflict_scope("credentials");
+    }
+    #[test]
+    fn lifecycle_ptrace_admission_declines_in_flight_birth_in_only_its_owner() {
+        birth_conflict_scope("ptrace");
+    }
+    fn birth_conflict_scope(operation: &str) {
+        let (kernel, root) = bootstrap(9_810);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_811),
+                "scope-peer".into(),
+                None,
+            )
+            .unwrap();
+        kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_812),
+                None,
+            )
+            .unwrap();
+        kernel
+            .clone_thread(
+                &peer,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_813),
+                None,
+            )
+            .unwrap();
+        let page = peer.thread().control_lease().lifecycle();
+        let root_page = root.thread().control_lease().lifecycle();
+        let claim = page.claim_any().unwrap();
+        let current = kernel
+            .context(peer.task().key().id, peer.thread().key().tid)
+            .unwrap();
+        match operation {
+            "fork" => assert!(matches!(
+                kernel.reserve_fork(&current, fork_plan(), "conflict".into(), None),
+                Err(KernelOperationError::TaskBusy(_))
+            )),
+            "credentials" => assert!(matches!(
+                kernel.update_credentials(&current, |_| {}),
+                Err(KernelOperationError::TaskBusy(_))
+            )),
+            "ptrace" => assert!(!kernel.claim_ptrace_traceme(&current)),
+            _ => unreachable!(),
+        }
+        let other_claim = root_page.claim_any().unwrap();
+        root_page.unclaim(other_claim).unwrap();
+        page.unclaim(claim).unwrap();
+        match operation {
+            "fork" => {
+                let reserved = kernel
+                    .reserve_fork(&current, fork_plan(), "allowed".into(), None)
+                    .unwrap();
+                assert_eq!(page.gate(), carrick_el1_abi::GateState::ForkClosing);
+                assert_eq!(root_page.gate(), carrick_el1_abi::GateState::Open);
+                drop(reserved);
+                assert_eq!(page.gate(), carrick_el1_abi::GateState::Open);
+            }
+            "credentials" => {
+                kernel.update_credentials(&current, |_| {}).unwrap();
+                assert!(
+                    page.claim_any().is_err(),
+                    "old credential credits must retire"
+                );
+            }
+            "ptrace" => {
+                assert!(kernel.claim_ptrace_traceme(&current));
+                assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(root_page.gate(), carrick_el1_abi::GateState::Open);
     }
 
     #[test]

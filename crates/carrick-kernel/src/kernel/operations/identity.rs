@@ -211,6 +211,8 @@ impl Kernel {
         if !Arc::ptr_eq(self, &context.kernel) {
             return Err(KernelOperationError::ForeignContext);
         }
+        let _birth_admission =
+            super::super::thread_ledger::BirthAdmissionGuard::acquire(context.task())?;
         let task_id = context.task.key().id;
         let mut update = Some(update);
         loop {
@@ -252,6 +254,8 @@ impl Kernel {
             // publication generation for this association.
             let revision = record.revision;
             let task = Arc::clone(&record.task);
+            // Reserved uid credits and runtime cells belong to the pre-change authority.
+            record.thread_pool.revoke_unused();
             thread.replace_resources(Arc::clone(&resources));
             if thread.key().tid == LinuxTid::for_task_leader(task_id) {
                 task.replace_process_credentials(resources.credentials());

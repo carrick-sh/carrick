@@ -262,6 +262,7 @@ pub(super) struct TaskSetReservation {
     task_ids: Vec<TaskId>,
     transaction: KernelTransactionId,
     active: bool,
+    birth_admission: Option<super::thread_ledger::BirthAdmissionGuard>,
 }
 
 impl TaskSetReservation {
@@ -284,6 +285,7 @@ impl TaskSetReservation {
             task_ids,
             transaction,
             active: true,
+            birth_admission: None,
         })
     }
 
@@ -810,6 +812,7 @@ impl Kernel {
         if plan.task() != CloneTaskMode::NewTask {
             return Err(KernelOperationError::ExpectedNewTask);
         }
+        let birth_admission = super::thread_ledger::BirthAdmissionGuard::acquire(parent.task())?;
         let transaction = self.object_ids().transaction_id()?;
         let (caller_revision, child_parent_task, child_parent_revision, operation) = {
             let mut state = self.registry().settled().write();
@@ -875,12 +878,13 @@ impl Kernel {
                     (Arc::clone(&parent_record.task), parent_record.revision)
                 }
             };
-            let operation = TaskSetReservation::acquired(
+            let mut operation = TaskSetReservation::acquired(
                 self,
                 &mut state,
                 vec![parent.task.key().id, child_parent_task.key().id],
                 transaction,
             )?;
+            operation.birth_admission = Some(birth_admission);
             (
                 caller_revision,
                 child_parent_task,
