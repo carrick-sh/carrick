@@ -1713,7 +1713,7 @@ mod tests {
                 &spaces,
                 &table,
                 &counters,
-                &mut lazy,
+                &mut Editor::over(RangeBacking::Retired),
                 SYS_MMAP,
                 mmap_fixed(ARENA + 0x1000, 0x1000),
             );
