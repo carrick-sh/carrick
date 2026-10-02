@@ -29,7 +29,10 @@ use crate::kernel::objects::{
 #[derive(Debug)]
 pub(in crate::kernel) enum ThreadRetirementLane {
     Host,
-    ExitedInZone(crate::kernel::thread_retirement::RetirementReservation),
+    ExitedInZone {
+        storage: crate::kernel::thread_retirement::RetirementReservation,
+        revisions: crate::kernel::revision_capacity::RevisionReservation,
+    },
 }
 
 /// Exit publication token whose fallible topology and revision checks have
@@ -294,7 +297,7 @@ impl Kernel {
         &self,
         context: &KernelContext,
         state: &mut RegistryState,
-        lane: ThreadRetirementLane,
+        mut lane: ThreadRetirementLane,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<TaskRevision, KernelOperationError> {
         ensure_task_unreserved(state, context.task.key().id)?;
@@ -323,7 +326,12 @@ impl Kernel {
         {
             return Err(KernelOperationError::UnknownThread(tid));
         }
-        let next = next_revision(record.revision)?;
+        let next = match &mut lane {
+            ThreadRetirementLane::Host => next_revision(&record.task, record.revision)?,
+            ThreadRetirementLane::ExitedInZone { revisions, .. } => record
+                .task
+                .consume_thread_revision(revisions, record.revision),
+        };
         if matches!(lane, ThreadRetirementLane::Host) {
             state
                 .retired_threads
@@ -370,8 +378,8 @@ impl Kernel {
             };
             match lane {
                 ThreadRetirementLane::Host => state.retired_threads.push(retired),
-                ThreadRetirementLane::ExitedInZone(reservation) => {
-                    state.retired_threads.push_reserved(reservation, retired)
+                ThreadRetirementLane::ExitedInZone { storage, .. } => {
+                    state.retired_threads.push_reserved(storage, retired)
                 }
             }
         }
@@ -572,7 +580,7 @@ impl Kernel {
                 }
                 affected_revisions.insert(
                     child_key.id,
-                    (child.revision, next_revision(child.revision)?),
+                    (child.revision, next_revision(&child.task, child.revision)?),
                 );
             } else if state
                 .zombies
@@ -605,7 +613,7 @@ impl Kernel {
                 adopter_key.id,
                 (
                     adopter_record.revision,
-                    next_revision(adopter_record.revision)?,
+                    next_revision(&adopter_record.task, adopter_record.revision)?,
                 ),
             );
             let mut prepared = adopter_record.task.children_set();
@@ -631,7 +639,7 @@ impl Kernel {
                 parent_key.id,
                 (
                     parent_record.revision,
-                    next_revision(parent_record.revision)?,
+                    next_revision(&parent_record.task, parent_record.revision)?,
                 ),
             );
             let mut prepared = parent_record.task.children_set();

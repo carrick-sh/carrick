@@ -100,6 +100,7 @@ struct PooledThreadIdentity {
     identity: ThreadIdentity,
     birth_resources: super::objects::ReservedThreadResources,
     retirement: super::thread_retirement::RetirementReservation,
+    revisions: super::revision_capacity::RevisionReservation,
 }
 
 impl PooledThreadIdentity {
@@ -125,6 +126,7 @@ pub(crate) struct ThreadIdentityPool {
             EntryRef,
             super::objects::ThreadControlLease,
             super::thread_retirement::RetirementReservation,
+            super::revision_capacity::RevisionReservation,
         )>,
     >,
 }
@@ -222,6 +224,12 @@ impl ThreadIdentityPool {
         let Ok(retirement) = state.retired_threads.reserve() else {
             return false;
         };
+        let Some(record) = state.tasks.get(&task.key().id) else {
+            return false;
+        };
+        let Some(revisions) = task.reserve_thread_revisions(record.revision) else {
+            return false;
+        };
         let control = task.allocate_thread_control(identity.key);
         let page = control.lifecycle();
         let visible_tid = identity
@@ -250,6 +258,7 @@ impl ThreadIdentityPool {
             identity,
             birth_resources,
             retirement,
+            revisions,
         });
         true
     }
@@ -438,7 +447,7 @@ impl ThreadLedger {
                         );
                         let control = pooled.control.clone();
                         let entry = pooled.entry;
-                        let (pooled, birth) = born.remove(index);
+                        let (mut pooled, birth) = born.remove(index);
                         *self.in_flight.lock().entry(pooled.credit).or_default() += 1;
                         let claimed = ClaimedThreadIdentity {
                             identity: pooled.identity,
@@ -462,7 +471,10 @@ impl ThreadLedger {
                                 )
                             });
                         let publication = prepared
-                            .publish_reserved(&mut state, PublicationLane::Settle)
+                            .publish_reserved(
+                                &mut state,
+                                PublicationLane::AbiBorn(&mut pooled.revisions),
+                            )
                             .unwrap_or_else(|error| {
                                 carrick_fatal::carrick_fatal!(
                                     "thread::ledger",
@@ -491,7 +503,7 @@ impl ThreadLedger {
                             .thread_pool
                             .published
                             .lock()
-                            .push((entry, control, pooled.retirement));
+                            .push((entry, control, pooled.retirement, pooled.revisions));
                         published.push(publication);
                         abi_count += 1;
                         progress = true;
@@ -515,7 +527,7 @@ impl ThreadLedger {
                     let mut owned = pool.published.lock();
                     let mut index = 0;
                     while index < owned.len() {
-                        let (entry, control, _) = &owned[index];
+                        let (entry, control, _, _) = &owned[index];
                         if control.lifecycle().state(entry.index())
                             == Some((entry.generation(), EntryState::ExitedInZone))
                         {
@@ -525,7 +537,7 @@ impl ThreadLedger {
                         }
                     }
                 }
-                for (entry, control, retirement) in exits {
+                for (entry, control, retirement, revisions) in exits {
                     let record = state.tasks.get(&task_id).unwrap_or_else(|| {
                         carrick_fatal::carrick_fatal!("thread::ledger", "exit lost task")
                     });
@@ -551,7 +563,10 @@ impl ThreadLedger {
                         .retire_thread_in_registry(
                             &context,
                             &mut state,
-                            super::operations::exit::ThreadRetirementLane::ExitedInZone(retirement),
+                            super::operations::exit::ThreadRetirementLane::ExitedInZone {
+                                storage: retirement,
+                                revisions,
+                            },
                             None,
                         )
                         .unwrap_or_else(|error| {
@@ -972,15 +987,20 @@ mod tests {
 
     #[test]
     fn lifecycle_abi_birth_is_resolved_by_a_second_process() {
-        abi_birth_observed_by_peer(false);
+        abi_birth_observed_by_peer(false, false);
     }
 
     #[test]
     fn lifecycle_abi_birth_uses_reserved_resources_after_allocator_exhaustion() {
-        abi_birth_observed_by_peer(true);
+        abi_birth_observed_by_peer(true, false);
     }
 
-    fn abi_birth_observed_by_peer(exhaust_ids: bool) {
+    #[test]
+    fn lifecycle_abi_birth_uses_revision_headroom_reserved_from_host_mutations() {
+        abi_birth_observed_by_peer(false, true);
+    }
+
+    fn abi_birth_observed_by_peer(exhaust_ids: bool, exhaust_revisions: bool) {
         let (kernel, root) = bootstrap(9_670);
         let peer = kernel
             .fork_task(
@@ -999,6 +1019,15 @@ mod tests {
                 None,
             )
             .unwrap();
+        if exhaust_revisions {
+            let current = kernel
+                .context(root.task().key().id, root.thread().key().tid)
+                .unwrap();
+            root.task()
+                .exhaust_unreserved_revisions_for_test(current.revision());
+            assert!(root.task().next_revision(current.revision()).is_none());
+            assert!(peer.task().next_revision(peer.revision()).is_some());
+        }
         let page = root.thread().control_lease().lifecycle();
         let claim = page.claim_any().unwrap();
         let entry = claim.entry();

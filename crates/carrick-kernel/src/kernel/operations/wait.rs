@@ -492,7 +492,7 @@ impl Kernel {
                 let parent_revision = state
                     .tasks
                     .get(&parent_id)
-                    .map(|record| next_revision(record.revision))
+                    .map(|record| next_revision(&record.task, record.revision))
                     .transpose()?
                     .ok_or(KernelOperationError::UnknownTask(parent_id))?;
                 state.zombies.remove(&id);

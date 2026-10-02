@@ -398,7 +398,7 @@ impl Kernel {
             Some(namespace_visible_task_id(&target)?)
         };
 
-        let published_revision = next_revision(target_revision)?;
+        let published_revision = next_revision(&target, target_revision)?;
         if !group_exists {
             let Some(namespace_id) = target_namespace_id else {
                 carrick_fatal!(
@@ -474,7 +474,7 @@ impl Kernel {
         if target.object.session() != session {
             return Err(KernelOperationError::CrossSessionProcessGroup);
         }
-        let published_revision = next_revision(revision)?;
+        let published_revision = next_revision(&task, revision)?;
 
         remove_group_member(&mut state, old_group, session, task.key());
         if let Some(target) = state.process_groups.get_mut(&target_group) {
@@ -547,7 +547,7 @@ impl Kernel {
         {
             return Err(KernelOperationError::TaskChangedBeforeCommit);
         }
-        let published_revision = next_revision(current_revision)?;
+        let published_revision = next_revision(&current, current_revision)?;
         if state.process_groups.contains_key(&group_id) {
             return Err(KernelOperationError::ProcessGroupExists(group_id));
         }
@@ -647,7 +647,7 @@ impl Kernel {
         {
             return Err(KernelOperationError::TaskChangedBeforeCommit);
         }
-        let published_revision = next_revision(current_revision)?;
+        let published_revision = next_revision(&current, current_revision)?;
         // setsid(2): "EPERM — The process group ID of any process equals the
         // PID of the calling process." The leader check above only sees the
         // caller's OWN membership; a group it created and then left keeps
