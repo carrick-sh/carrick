@@ -1091,10 +1091,11 @@ where
         }
         if !shares_mm {
             let permit = parent_mutation.host_alias_permit();
-            if let Err(error) = kernel
-                .dispatcher
-                .reconcile_el1_deferred_returns(&permit, memory)
-            {
+            if let Err(error) = kernel.dispatcher.with_kernel_resources(parent_context, || {
+                kernel
+                    .dispatcher
+                    .reconcile_el1_deferred_returns(&permit, memory)
+            }) {
                 tracing::warn!(?error, "fork could not settle EL1 stock and owed returns");
                 return Ok(PreparedInProcessFork::Complete(Some(
                     crate::linux_abi::LINUX_EAGAIN.guest_retval(),
