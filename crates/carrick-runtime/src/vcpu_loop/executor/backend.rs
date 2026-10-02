@@ -27,6 +27,7 @@ pub use residency::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvpatchPersistentExecutorFactory {
     authority: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPersistentExecutorFactoryAuthority,
+    lifecycle_mappings: Option<Arc<crate::vcpu_loop::thread_lifecycle::CarrierLifecycleMappings>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -34,7 +35,13 @@ impl HvpatchPersistentExecutorFactory {
     pub(crate) fn new(
         authority: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPersistentExecutorFactoryAuthority,
     ) -> Self {
-        Self { authority }
+        let lifecycle_mappings = authority.reservation_metadata_access().map(|access| {
+            Arc::new(crate::vcpu_loop::thread_lifecycle::CarrierLifecycleMappings::new(access))
+        });
+        Self {
+            authority,
+            lifecycle_mappings,
+        }
     }
 }
 
@@ -65,6 +72,8 @@ pub(crate) struct HvpatchPersistentExecutor {
     resident_task: Option<HvpatchResidentTaskRecord>,
     /// The guest CPU the executor is bound to, as last noted.
     bound_cpu: Option<u32>,
+    // Released after the vCPU and every resident guest reference.
+    lifecycle_mappings: Option<Arc<crate::vcpu_loop::thread_lifecycle::CarrierLifecycleMappings>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -403,6 +412,7 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
         let owner_thread_port = current_owner_thread_port();
         Ok(HvpatchPersistentExecutor {
             executor_id: executor,
+            lifecycle_mappings: self.lifecycle_mappings.clone(),
             lifecycle: Some(lifecycle),
             vcpu: Some(vcpu),
             current: None,
@@ -762,6 +772,16 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             carrick_kernel::el1_delegation::publish_current_task(
                 slot, task_id, generation, file_table,
             );
+            if let Some(mappings) = &self.lifecycle_mappings {
+                let control = task.lease().control_lease().ok_or_else(|| {
+                    TrapError::Hypervisor("loaded thread lost lifecycle backing".into())
+                })?;
+                mappings.publish(slot, control).map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "lifecycle metadata publication failed: {error:?}"
+                    ))
+                })?;
+            }
             publish_zone_slot(
                 slot,
                 self.raw_vcpu_id,

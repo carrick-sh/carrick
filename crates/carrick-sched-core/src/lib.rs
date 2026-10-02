@@ -464,6 +464,9 @@ pub struct ThreadIdentity {
     /// The guest CPUs the thread may run on, one bit per CPU (CPU 0 = bit 0;
     /// 0 means any): EL1 queues it only on a slot bound to an allowed CPU.
     pub affinity: u64,
+    /// Carrier-retained EL1 lifecycle binding, restored with thread identity.
+    pub lifecycle_page: u64,
+    pub control_slot: u64,
 }
 
 /// A deferred request belongs to one non-wrapping record incarnation.
@@ -536,6 +539,8 @@ pub struct ZoneRecord {
     mm: AtomicU64,
     file_table: AtomicU64,
     generation: AtomicU64,
+    lifecycle_page: AtomicU64,
+    control_slot: AtomicU64,
     /// The syscall return value to apply when woken (0, or a waitv index).
     result: AtomicU64,
     handback: AtomicU32,
@@ -588,6 +593,8 @@ impl ZoneRecord {
             file_table: self.file_table.load(Ordering::Relaxed),
             generation: self.generation.load(Ordering::Relaxed),
             affinity: self.affinity.load(Ordering::Relaxed),
+            lifecycle_page: self.lifecycle_page.load(Ordering::Relaxed),
+            control_slot: self.control_slot.load(Ordering::Relaxed),
         }
     }
 
@@ -692,6 +699,9 @@ impl ZoneRecord {
         self.file_table.store(id.file_table, Ordering::Relaxed);
         self.generation.store(id.generation, Ordering::Relaxed);
         self.affinity.store(id.affinity, Ordering::Relaxed);
+        self.lifecycle_page
+            .store(id.lifecycle_page, Ordering::Relaxed);
+        self.control_slot.store(id.control_slot, Ordering::Relaxed);
     }
 
     /// Whether the thread may run on a slot bound to guest CPU `cpu_plus_one`

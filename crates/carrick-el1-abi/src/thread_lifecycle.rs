@@ -275,6 +275,10 @@ impl PendingSummary {
         self.0.fetch_or(bits.0, Ordering::SeqCst);
         BlockedMask(target.blocked.load(Ordering::SeqCst))
     }
+    /// Publish the exact summary while the queue's owner holds its mutation lock.
+    pub fn replace_from_locked_queue(&self, pending: PendingSignals) {
+        self.0.store(pending.0, Ordering::SeqCst);
+    }
     /// Consume `bits` (delivery). Monotone clear, `SeqCst`.
     pub fn clear(&self, bits: PendingSignals) {
         self.0.fetch_and(!bits.0, Ordering::SeqCst);
@@ -332,6 +336,7 @@ pub struct ThreadControlSlot {
     /// The pool entry this thread was born into ([`EntryRef::pack`]); 0 for
     /// a thread that holds none (the leader).
     entry: AtomicU64,
+    pending: PendingSummary,
 }
 
 impl ThreadControlSlot {
@@ -346,6 +351,7 @@ impl ThreadControlSlot {
             robust_head: AtomicU64::new(0),
             clear_child_tid: AtomicU64::new(0),
             entry: AtomicU64::new(0),
+            pending: PendingSummary::new(),
         }
     }
 
@@ -362,7 +368,12 @@ impl ThreadControlSlot {
         self.reset(blocked, 0, None);
     }
 
+    pub fn pending(&self) -> &PendingSummary {
+        &self.pending
+    }
+
     fn reset(&self, blocked: BlockedMask, clear_child_tid: u64, entry: Option<EntryRef>) {
+        self.pending.clear(PendingSignals(u64::MAX));
         self.blocked.store(blocked.0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
         let seq = self.alt_seq.load(Ordering::Relaxed);
@@ -414,6 +425,12 @@ impl ThreadControlSlot {
     /// diagnostics.
     pub fn blocked(&self) -> BlockedMask {
         BlockedMask(self.blocked.load(Ordering::Relaxed))
+    }
+
+    /// Recipient selection after process-pending publication: the sender's
+    /// second half of the mask/pending ordering pair.
+    pub fn blocked_after_pending_publication(&self) -> BlockedMask {
+        BlockedMask(self.blocked.load(Ordering::SeqCst))
     }
 
     /// Seed the mask before the thread is visible (claim time). No pending
@@ -528,7 +545,7 @@ impl LifecycleHatches {
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
     }
 }
-const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 64);
+const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 128);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 impl ThreadLifecyclePage {
@@ -883,7 +900,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 15] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 16] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     THREAD_POOL_ENTRIES as u64,
     core::mem::size_of::<ThreadLifecyclePage>() as u64,
@@ -898,11 +915,31 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 15] = [
     core::mem::offset_of!(ThreadControlSlot, robust_head) as u64,
     core::mem::offset_of!(ThreadControlSlot, clear_child_tid) as u64,
     core::mem::offset_of!(ThreadControlSlot, entry) as u64,
+    core::mem::offset_of!(ThreadControlSlot, pending) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, serving) as u64,
 ];
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_pending_is_owned_by_the_exact_thread_slot() {
+        let first = ThreadControlSlot::new();
+        let second = ThreadControlSlot::new();
+        first.init_blocked(BlockedMask(0x400));
+        let _ = first
+            .pending()
+            .post_then_read_blocked(PendingSignals(0x400), &first);
+        assert_eq!(first.pending().load(), PendingSignals(0x400));
+        assert_eq!(second.pending().load(), PendingSignals(0));
+        assert_eq!(
+            first
+                .store_blocked_then_read_pending(BlockedMask(0), first.pending())
+                .1,
+            PendingSignals(0x400)
+        );
+        first.reset_for_host_birth(BlockedMask(0));
+        assert_eq!(first.pending().load(), PendingSignals(0));
+    }
     extern crate std;
     use super::*;
     use std::sync::Arc;

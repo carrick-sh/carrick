@@ -115,6 +115,13 @@ struct LifecycleBacking {
 pub struct ThreadLifecycleLease(Arc<SharedAbiPage<LifecycleBacking>>);
 
 impl ThreadLifecycleLease {
+    pub(in crate::kernel) fn new() -> Self {
+        Self(Arc::new(SharedAbiPage::new(LifecycleBacking {
+            page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
+            padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
+        })))
+    }
+
     pub fn backing_base(&self) -> HostVa {
         HostVa(std::ptr::from_ref(&**self.0).addr())
     }
@@ -147,13 +154,18 @@ struct Arena {
 pub(in crate::kernel) struct ThreadControlArena(Arc<Arena>);
 
 impl ThreadControlArena {
+    #[cfg(test)]
     pub(in crate::kernel) fn new(owner: TaskKey) -> Self {
+        Self::with_lifecycle(owner, ThreadLifecycleLease::new())
+    }
+
+    pub(in crate::kernel) fn with_lifecycle(
+        owner: TaskKey,
+        lifecycle: ThreadLifecycleLease,
+    ) -> Self {
         Self(Arc::new(Arena {
             owner,
-            lifecycle: ThreadLifecycleLease(Arc::new(SharedAbiPage::new(LifecycleBacking {
-                page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
-                padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
-            }))),
+            lifecycle,
             free: Mutex::new(Vec::new()),
         }))
     }

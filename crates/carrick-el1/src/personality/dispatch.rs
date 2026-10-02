@@ -247,7 +247,7 @@ where
         name_cache,
         zone,
         ipc,
-        None,
+        lifecycle::guest_venue(),
         cache_lookup,
     )
 }
@@ -298,7 +298,9 @@ where
     // for one pending at entry; a call that would block parks in the zone
     // and the vCPU leaves at once (`Idle`), so the host settles the parked
     // thread and a pending signal interrupts it before it sleeps. Nothing
-    // else is served past pending work.
+    // else is served past pending work. Nonblocking lifecycle setup may also
+    // complete on its authoritative slot, then leave ServedWithWork; clone
+    // and exit remain excluded from this exception.
     let host_work = cur_task.is_some_and(CurrentTask::has_pending_host_work);
     let resumes_operation = zone.as_ref().is_some_and(|zone| {
         SlotId::from_index(slot)
@@ -307,7 +309,14 @@ where
     });
     let ipc_transfer =
         matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE | ipc::SYS_EPOLL_PWAIT) && ipc.is_some();
-    if host_work && !resumes_operation && !ipc_transfer {
+    let lifecycle_setup = lifecycle.is_some()
+        && matches!(
+            nr,
+            lifecycle::SYS_RT_SIGPROCMASK
+                | lifecycle::SYS_SIGALTSTACK
+                | lifecycle::SYS_SET_ROBUST_LIST
+        );
+    if host_work && !resumes_operation && !ipc_transfer && !lifecycle_setup {
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }
@@ -437,7 +446,7 @@ where
     }
     // The adapter declined a call admitted past pending host work (a
     // host-backed description, an unpublished table): the host runs it.
-    if host_work {
+    if host_work && !lifecycle_setup {
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }

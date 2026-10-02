@@ -8,7 +8,6 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -327,10 +326,10 @@ impl PendingQueue {
 /// Task-directed pending-signal authority. The hint is an index published from
 /// the queue while locked; `false` proves empty and `true` requires locked
 /// revalidation.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TaskPendingSignals {
     queue: Mutex<TaskPendingQueue>,
-    pending_hint: AtomicU64,
+    lifecycle: super::ThreadLifecycleLease,
     revision: ObjectRevision,
 }
 
@@ -426,8 +425,14 @@ impl TaskRecipientSnapshot {
     }
 }
 
+impl Default for TaskPendingSignals {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskPendingSignals {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             queue: Mutex::new(TaskPendingQueue {
                 queue: PendingQueue {
@@ -437,9 +442,13 @@ impl TaskPendingSignals {
                 },
                 named_recipients: BTreeMap::new(),
             }),
-            pending_hint: AtomicU64::new(0),
+            lifecycle: super::ThreadLifecycleLease::new(),
             revision: ObjectRevision::new(),
         }
+    }
+
+    pub(crate) fn lifecycle_lease(&self) -> super::ThreadLifecycleLease {
+        self.lifecycle.clone()
     }
 
     pub fn pending_count(&self) -> usize {
@@ -451,7 +460,7 @@ impl TaskPendingSignals {
     }
 
     pub fn may_be_nonempty(&self) -> bool {
-        self.pending_hint.load(Ordering::Acquire) != 0
+        self.lifecycle.pending().load().0 != 0
     }
 
     pub fn present(&self) -> SigSet {
@@ -539,13 +548,11 @@ impl TaskPendingSignals {
     }
 
     fn publish_queue(&self, queue: &PendingQueue) {
-        self.pending_hint
-            .store(queue.present().raw(), Ordering::Release);
+        self.lifecycle
+            .pending()
+            .replace_from_locked_queue(carrick_el1_abi::PendingSignals(queue.present().raw()));
         self.revision.publish();
-        debug_assert_eq!(
-            self.pending_hint.load(Ordering::Relaxed),
-            queue.present().raw()
-        );
+        debug_assert_eq!(self.lifecycle.pending().load().0, queue.present().raw());
     }
 }
 
@@ -1413,6 +1420,18 @@ impl SignalAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_pending_summary_is_the_retained_lifecycle_page() {
+        let pending = TaskPendingSignals::new();
+        let page = pending.lifecycle_lease();
+        let signal = LinuxSignal::for_signal_number(10).unwrap();
+        pending.enqueue_standard(signal, None);
+        assert_eq!(page.pending().load().0, SigSet::EMPTY.with(10).raw());
+        pending.take_lowest_in(SigSet::EMPTY.with(10)).unwrap();
+        assert_eq!(page.pending().load().0, 0);
+    }
+
     use crate::kernel::container::{Container, LaunchContext, RunId};
     use crate::kernel::ids::{ChildExitSignal, LinuxTid, ObjectIdRegistry, TaskId};
     use crate::kernel::objects::{

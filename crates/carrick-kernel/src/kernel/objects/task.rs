@@ -803,7 +803,10 @@ impl Task {
     ) -> Self {
         Self {
             key,
-            controls: super::thread_control::ThreadControlArena::new(key),
+            controls: super::thread_control::ThreadControlArena::with_lifecycle(
+                key,
+                shared.pending_signals().lifecycle_lease(),
+            ),
             parent: Mutex::new(parent),
             children: Mutex::new(BTreeSet::new()),
             ptrace_tracees: Mutex::new(BTreeSet::new()),

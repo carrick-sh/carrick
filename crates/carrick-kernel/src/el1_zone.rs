@@ -564,6 +564,8 @@ pub fn place_service(
         file_table: 0,
         generation: generation.raw(),
         affinity,
+        lifecycle_page: 0,
+        control_slot: 0,
     };
     let Ok(record) = zone.alloc_host_runnable(identity) else {
         return false;
@@ -834,6 +836,8 @@ mod tests {
             file_table: 1,
             generation: 1,
             affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
         }
     }
 

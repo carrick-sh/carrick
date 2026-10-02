@@ -446,3 +446,68 @@ the gate. The work is committed as `bb3842530` (backing prerequisite) and
 Resume at obligation 1's runtime retained-mapping owner/adapters and actual
 venue publication. This checkpoint does not implement any guest lifecycle
 service. Obligations 2–4 and all signed L4 acceptance remain uncompleted.
+
+## Carrier venue wiring checkpoint (continuation after `6a3cad8db`)
+
+The carrier factory now retains the process lifecycle page and actual control
+backing through its metadata aperture. An executor publishes both addresses
+before entering EL0; zone identity carries them across cross-process switches.
+The mapping owner pins exact arena-qualified slots, independently of the kernel
+object graph, and its executor reference drops after the vCPU fields. The real
+EL1 venue reads those bindings. The existing exact `CARRICK_EL1_SIGMASK=0` and
+`CARRICK_EL1_THREADS=0` hatches remain the only service opt-outs.
+
+The thread pending summary moved onto its control slot. The process pending
+summary moved onto the retained lifecycle page, with the process queue owning
+publication; there is no second host hint. Process sender recipient-mask reads
+and guest mask-store/pending reads use the same sequentially consistent ordering.
+Nonblocking setup can complete once with pending host work and return
+`ServedWithWork`; clone and exit still decline at that boundary.
+
+The first requested signed diagnostic ran before the pending-work correction:
+`CARGO_BUILD_JOBS=3 CARRICK_RUN_ID=forkexit-sol-venue-spawn-20261001-01
+./scripts/test-signed.sh carrick-embed el1_thread_lifecycle_spawn_slope --nocapture`.
+Log: `/tmp/forkexit-sol-venue-spawn-20261001-01.log`. Source HEAD was `6a3cad8db`
+plus the uncommitted wiring slice. All three parent/child workloads completed,
+but the test **failed** its exit-slope assertion, as expected with guest pool
+publication and exit settlement still absent. Counts are served / forwarded:
+
+| Added threads | clone | exit | mask | altstack |
+|---:|---:|---:|---:|---:|
+| 128 | 0 / 129 | 0 / 130 | 397 / 128 | 328 / 59 |
+| 512 | 0 / 513 | 0 / 521 | 1612 / 449 | 1393 / 146 |
+| 2048 | 0 / 2051 | 0 / 2079 | 6427 / 1778 | 5509 / 638 |
+
+First interval forward slopes: exit 1.0182, mask 0.8359, altstack 0.2266.
+The negative entitlement control passed and scoped cleanup found zero processes.
+The failed script does not publish its JSON receipt: the existing canonical
+receipt remains an older run and cannot be cited for this diagnostic. A later
+read of the unchanged test executable (no subsequent signed build) found SHA256
+`519930aa9a0a23b590eea3597f7870f393b6b8b17b39ab5f140f2b3ee4ed041e`, CDHash
+`8a06a08a9c1761fb6e3a88cf65e382aa1e0386f2`, LC_UUID
+`F589211C-6852-3408-A9ED-E30545D401DD`, hypervisor entitlement and DOF present.
+This supplements the diagnostic; it is not an execution-time receipt or green
+acceptance. I2 subsequently landed on main and the director requested a rebase
+before any signed acceptance run.
+
+Red-first contracts caught missing binding revocation, missing per-slot pending
+storage, arena-qualified pin retention, a cross-process switch retaining A's
+binding while running B, pending-work forwarding setup, and process-pending
+unblock returning `Served` rather than `ServedWithWork`. Logs are under
+`/tmp/forkexit-sol-{venue-binding,control-pending,venue-owner,venue-switch,
+setup-work,process-pending,process-mask}-{red,green}.log` (individual names vary).
+The ABI/scheduler/EL1 lib suite, hook instruction tests and focused owner test
+passed. Final broader gates and post-rebase signed results remain outstanding.
+
+This checkpoint enables per-thread setup, not guest births or exits. The real
+venue's `born_slot` deliberately declines until the kernel pool entries and
+ledger share their ABI authority. Mapping pins currently last until carrier
+teardown; exact per-thread retirement and backing reclamation remain obligation
+4. Admission closure for conflicting host authority remains obligation 3.
+
+Final pre-rebase wiring validation: ABI 109, scheduler core 88 and EL1 184
+lib tests passed; kernel signal-object tests 10 passed; hook instruction tests
+12 passed; the runtime arena-owner contract passed. The targeted all-targets
+clippy command for runtime, EL1, memory and kernel exited zero
+(`/tmp/forkexit-sol-venue-clippy.log`). These are focused wiring receipts,
+not closure of the signed lifecycle contract or the full requested gates.

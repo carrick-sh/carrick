@@ -78,6 +78,8 @@ fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
         file_table: task.file_table.load(Ordering::Relaxed),
         generation: task.generation.load(Ordering::Relaxed),
         affinity,
+        lifecycle_page: task.lifecycle_page.load(Ordering::Acquire),
+        control_slot: task.control_slot.load(Ordering::Acquire),
     }
 }
 
@@ -88,6 +90,7 @@ fn publish_identity(task: &CurrentTask, id: ThreadIdentity) {
     task.thread_serial.store(id.serial, Ordering::Relaxed);
     task.file_table.store(id.file_table, Ordering::Relaxed);
     task.zone_mm.store(id.mm, Ordering::Relaxed);
+    task.publish_lifecycle(id.lifecycle_page, id.control_slot);
     task.generation.store(id.generation, Ordering::Release);
 }
 

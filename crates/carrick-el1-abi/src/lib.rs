@@ -419,6 +419,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, served_with_work) as u64,
         core::mem::offset_of!(CurrentTask, zone_mm) as u64,
         core::mem::offset_of!(CurrentTask, thread_serial) as u64,
+        core::mem::offset_of!(CurrentTask, lifecycle_page) as u64,
+        core::mem::offset_of!(CurrentTask, control_slot) as u64,
         core::mem::size_of::<MetadataGrantMailbox>() as u64,
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
         FRAME_GRANT_PROTOCOL_VERSION,
@@ -676,7 +678,14 @@ pub struct CurrentTask {
     /// The host's serial of the loaded thread (with `task_id`, the exact
     /// kernel thread a parked record names).
     pub thread_serial: AtomicU64,
+    /// EL1-only metadata addresses retained by the exact carrier.
+    pub lifecycle_page: AtomicU64,
+    pub control_slot: AtomicU64,
+    _stride_padding: [u64; 6],
 }
+
+pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 7;
+const _: () = assert!(core::mem::size_of::<CurrentTask>() == 1 << CURRENT_TASK_STRIDE_SHIFT);
 
 impl CurrentTask {
     pub const fn new() -> Self {
@@ -690,7 +699,16 @@ impl CurrentTask {
             served_with_work: AtomicU32::new(0),
             zone_mm: AtomicU64::new(0),
             thread_serial: AtomicU64::new(0),
+            lifecycle_page: AtomicU64::new(0),
+            control_slot: AtomicU64::new(0),
+            _stride_padding: [0; 6],
         }
+    }
+
+    /// Publication belongs to the loaded task, never to the executor itself.
+    pub fn publish_lifecycle(&self, page: u64, slot: u64) {
+        self.control_slot.store(slot, Ordering::Relaxed);
+        self.lifecycle_page.store(page, Ordering::Release);
     }
 
     #[inline]
@@ -704,6 +722,7 @@ impl CurrentTask {
         self.served_with_work.store(0, Ordering::Release);
         self.zone_mm.store(0, Ordering::Release);
         self.thread_serial.store(0, Ordering::Release);
+        self.publish_lifecycle(0, 0);
     }
 
     #[inline]
@@ -2939,6 +2958,7 @@ pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
     task.generation.store(0, Ordering::Relaxed);
     task.file_table.store(0, Ordering::Relaxed);
     task.thread_serial.store(0, Ordering::Relaxed);
+    task.publish_lifecycle(0, 0);
     task.served_with_work.store(0, Ordering::Relaxed);
     task.zone_mm.store(0, Ordering::Release);
     let frame = el1_slot_frame_va(slot);
@@ -3731,6 +3751,16 @@ impl Default for InotifyNameCache {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn lifecycle_mapping_binding_is_revoked_on_task_clear() {
+        let task = CurrentTask::new();
+        task.publish_lifecycle(0x10000, 0x20000);
+        assert_eq!(task.lifecycle_page.load(Ordering::Acquire), 0x10000);
+        assert_eq!(task.control_slot.load(Ordering::Acquire), 0x20000);
+        task.clear();
+        assert_eq!(task.lifecycle_page.load(Ordering::Acquire), 0);
+        assert_eq!(task.control_slot.load(Ordering::Acquire), 0);
+    }
+    #[test]
     fn only_a_commit_owed_call_replays_and_a_drain_never_downgrades_it() {
         let task = CurrentTask::new();
         // A plain served call that left because a drain blocked: complete,
@@ -3890,7 +3920,7 @@ mod tests {
 
     #[test]
     fn test_current_task_layout() {
-        assert_eq!(core::mem::size_of::<CurrentTask>(), 64);
+        assert_eq!(core::mem::size_of::<CurrentTask>(), 128);
         assert_eq!(core::mem::align_of::<CurrentTask>(), 8);
         assert_eq!(core::mem::offset_of!(CurrentTask, generation), 0);
         assert_eq!(core::mem::offset_of!(CurrentTask, task_id), 8);
@@ -3999,7 +4029,7 @@ mod tests {
     #[test]
     fn test_pending_host_work_helpers() {
         extern crate std;
-        let mut arena = std::vec![0u8; EL1_CURRENT_TASKS_OFFSET as usize + 256 * 64];
+        let mut arena = std::vec![0u8; EL1_CURRENT_TASKS_OFFSET as usize + 256 * core::mem::size_of::<CurrentTask>()];
         let ptr = arena.as_mut_ptr() as usize;
         record_el1_region_host_ptr(ptr);
         assert_eq!(get_el1_region_host_ptr(), ptr);
@@ -4011,15 +4041,19 @@ mod tests {
             publications_after[HostWorkPublishReason::DirectSlot as usize],
             publications_before[HostWorkPublishReason::DirectSlot as usize] + 1
         );
-        let task_5 =
-            unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 5 * 64) as *const CurrentTask) };
+        let task_5 = unsafe {
+            &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 5 * core::mem::size_of::<CurrentTask>())
+                as *const CurrentTask)
+        };
         assert!(task_5.has_pending_host_work());
 
         clear_pending_host_work(5);
         assert!(!task_5.has_pending_host_work());
 
-        let task_6 =
-            unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 6 * 64) as *const CurrentTask) };
+        let task_6 = unsafe {
+            &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 6 * core::mem::size_of::<CurrentTask>())
+                as *const CurrentTask)
+        };
         task_6.task_id.store(43, Ordering::Relaxed);
 
         task_5.task_id.store(42, Ordering::Relaxed);
@@ -4038,8 +4072,10 @@ mod tests {
 
         task_5.clear_pending_host_work();
         task_6.clear_pending_host_work();
-        let task_7 =
-            unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 7 * 64) as *const CurrentTask) };
+        let task_7 = unsafe {
+            &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 7 * core::mem::size_of::<CurrentTask>())
+                as *const CurrentTask)
+        };
         task_7.file_table.store(200, Ordering::Relaxed);
         // task_7 has task_id = 0 (no task running)
         assert_eq!(task_7.task_id.load(Ordering::Relaxed), 0);

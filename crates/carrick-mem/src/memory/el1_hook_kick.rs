@@ -33,7 +33,7 @@ const GUEST_ELR: u64 = 0x4000_1000;
 const SLOT: u64 = 3;
 /// The mailbox capture's offset in the test page; reaching it is a host exit.
 const CAPTURE: usize = 0x800;
-/// `CurrentTask` is 64 bytes (`lsl #6` in the hook); `pending_host_work` at 40.
+/// `CurrentTask` is 128 bytes (`lsl #7` in the hook); `pending_host_work` at 40.
 const PENDING_HOST_WORK: u64 = 40;
 const SERVED_WITH_WORK: u64 = 44;
 /// A syscall's syndrome (EC 0x15), stale in `ESR_EL1` when an IRQ is taken.
@@ -190,11 +190,15 @@ impl Machine {
     }
 
     fn pending_host_work_addr() -> u64 {
-        carrick_el1_abi::EL1_CURRENT_TASKS_BASE + SLOT * 64 + PENDING_HOST_WORK
+        carrick_el1_abi::EL1_CURRENT_TASKS_BASE
+            + SLOT * core::mem::size_of::<carrick_el1_abi::CurrentTask>() as u64
+            + PENDING_HOST_WORK
     }
 
     fn served_with_work_addr() -> u64 {
-        carrick_el1_abi::EL1_CURRENT_TASKS_BASE + SLOT * 64 + SERVED_WITH_WORK
+        carrick_el1_abi::EL1_CURRENT_TASKS_BASE
+            + SLOT * core::mem::size_of::<carrick_el1_abi::CurrentTask>() as u64
+            + SERVED_WITH_WORK
     }
 
     fn read(&self, addr: u64) -> u64 {
