@@ -1,5 +1,6 @@
 # M2–M5 contract preparation (no cutover)
 
+Baseline: `1047fefdc7cf6ee99faca70c90bf94b2e5e854d4`.
 Production behavior is unchanged. No Docker, signed execution, EL0 delivery,
 runtime ratio or migration acceptance is claimed. Known-red gates execute
 normally and use exact `expect_err` reasons; unexpected green fails. At
@@ -110,3 +111,40 @@ No ownership assertion is ignored or should-panic. No budget is relaxed.
 Initial fixture checks caught insufficient descriptor backing and a private
 module import; both were corrected. Neither is Linux red evidence. No new
 Linux-semantics bug was reproduced, so no production fix is included.
+
+## Verification receipt
+
+With `CARGO_BUILD_JOBS=3`, foreground, on committed fixture sources:
+
+- `just test-kernel`: exit 0; ABI 109, fd-core 32, kernel 2354 passed;
+  one pre-existing ignored kernel test, 155 serial-host filtered tests.
+  All kernel-semantics suites completed. All five new known-red gates and
+  the registry-isolation positive test executed.
+- `just clippy`: exit 0, workspace/all targets with `-D warnings`.
+- `just lint-domains`: exit 0. Host-authority census is the existing macOS
+  subset; Linux/FreeBSD/NetBSD compiler profiles remain pending. The exact
+  97 production raw-lock-site gate passed; no production owner retired.
+- `just check-inventory`: exit 0; 338 syscall rows, support classifications
+  unchanged. Associations include the five new contract descriptors.
+- `just fmt` and `git diff --check`: exit 0.
+
+The first `just reconcile-inventories` refused three new SCM fixture table
+guards. They are explicitly classified `test_or_definition` / `inspect_misc`
+under `red_until_step3_m4_rights_create_placeholder_per_message`; taxonomy
+rebinding and the full domain gate then pass. Production category counts and
+compiler capture row hash are unchanged. Capture source-head is refreshed.
+The read-only final review found no blocking defect in this partial groundwork
+and confirmed the missing coverage prevents full cutover readiness.
+
+Milestone commits: M2 `98ed6ae2c`, M3 `49cb164c4`, M4 `525cb6ebc`,
+M5 `b1b5b007d`. Inventory reconciliation: `9a34d6937`.
+
+Fixture source SHA-256 (after all Rust edits):
+
+```
+8228b79c5235a50831aa13474e24c9d654c6cb382640263ec777e34b1102a600  crates/carrick-kernel/src/dispatch/fs/pipe.rs
+dea04f5175d27233bcc4b0cec9b625681495ccb02a0b524173f5f5f01d96e649  crates/carrick-kernel/src/dispatch/net/epoll_zone.rs
+6fb32aecd9bbd588387d383f9cf085ee4e556fe19ec0f9c7b630935ef6316462  crates/carrick-kernel/src/dispatch/net/scm_rights.rs
+d24c1ee0735def7a60c2352751854a1678151f5414903cad0ab26edf95254d24  crates/carrick-kernel/src/dispatch/net/unix_pure.rs
+a401dc5beb024894ad54fe0a3c51e65381356c62d03bcfefeaca49f0d988f287  crates/carrick-kernel/src/kernel/objects/signal.rs
+```
