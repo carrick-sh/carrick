@@ -1,5 +1,6 @@
 //! Process-owned runtime state reserved before either lane publishes a thread.
 
+use carrick_hal::threaded::GuestCpuState;
 use std::fmt;
 use std::sync::{Arc, Weak};
 
@@ -11,6 +12,97 @@ use carrick_kernel::kernel::{KernelContext, TaskKey, ThreadKey};
 use super::binding::InjectedExecutionLeaseSlot;
 use super::*;
 
+/// EL0 state comes from the born record; MM/system state belongs to its process.
+#[derive(Clone)]
+struct ProcessThreadCpuTemplate {
+    owner: TaskKey,
+    graph: Weak<carrick_kernel::kernel::Kernel>,
+    cpu: carrick_kernel::kernel::objects::MigratableTaskState,
+}
+
+impl ProcessThreadCpuTemplate {
+    fn capture(
+        context: &KernelContext,
+        cpu: carrick_kernel::kernel::objects::MigratableTaskState,
+    ) -> Result<Self, TrapError> {
+        if cpu.mm != context.shared().mm().id() {
+            return Err(TrapError::Hypervisor(
+                "birth CPU template has a foreign MM".into(),
+            ));
+        }
+        Ok(Self {
+            owner: context.task().key(),
+            graph: Arc::downgrade(context.kernel()),
+            cpu,
+        })
+    }
+
+    fn reserve(&self) -> ProcessThreadCpuReservation {
+        let mut cpu = self.cpu.clone();
+        if let GuestCpuState::Aarch64V1(registers) = &mut cpu.cpu {
+            *registers = Arc::new((**registers).clone());
+        }
+        ProcessThreadCpuReservation {
+            owner: self.owner,
+            graph: self.graph.clone(),
+            cpu,
+        }
+    }
+}
+
+struct ProcessThreadCpuReservation {
+    owner: TaskKey,
+    graph: Weak<carrick_kernel::kernel::Kernel>,
+    cpu: carrick_kernel::kernel::objects::MigratableTaskState,
+}
+
+impl ProcessThreadCpuReservation {
+    fn for_born(
+        mut self,
+        context: &KernelContext,
+        frame: &carrick_el1_abi::ThreadCtx,
+    ) -> Result<carrick_kernel::kernel::objects::MigratableTaskState, TrapError> {
+        if context.task().key() != self.owner
+            || !Weak::ptr_eq(&self.graph, &Arc::downgrade(context.kernel()))
+            || context.shared().mm().id() != self.cpu.mm
+        {
+            return Err(TrapError::Hypervisor(
+                "birth CPU template rejected a foreign process".into(),
+            ));
+        }
+        let GuestCpuState::Aarch64V1(registers) = &mut self.cpu.cpu else {
+            return Err(TrapError::Hypervisor(
+                "birth CPU template has another architecture".into(),
+            ));
+        };
+        let registers = Arc::get_mut(registers).ok_or_else(|| {
+            TrapError::Hypervisor("birth CPU reservation lost exclusive custody".into())
+        })?;
+        registers.gprs = frame.x;
+        registers.pc = frame.pc;
+        registers.pstate = frame.pstate;
+        registers.trap_pc = frame.pc;
+        registers.trap_pstate = frame.pstate;
+        registers.elr_el1 = frame.pc;
+        registers.spsr_el1 = frame.pstate;
+        registers.sp_el0 = frame.sp_el0;
+        registers.tpidr_el0 = frame.tpidr_el0;
+        registers.tpidrro_el0 = frame.tpidrro_el0;
+        registers.contextidr_el1 = frame.contextidr_el1;
+        registers.vregs = frame.v;
+        registers.fpsr = frame.fpsr as u32;
+        registers.fpcr = frame.fpcr as u32;
+        registers.last_fault_esr = 0;
+        registers.last_exit_class = 0;
+        registers.last_syscall_orig_x0 = 0;
+        registers.is_forked_child = false;
+        registers.last_syscall_nr = None;
+        registers.syscall_continuation = None;
+        registers.pending_resume_pc = None;
+        Ok(self.cpu)
+    }
+}
+
 pub(super) enum ThreadAdoptionOrigin {
     HostClone(PreparedSyscall),
     AbiBorn,
@@ -19,6 +111,7 @@ pub(super) enum ThreadAdoptionOrigin {
 /// Shared process resources, not a running job, backend or executor lease.
 pub(super) struct ProcessThreadAdoptionFactory<E: ThreadedEngine> {
     owner: TaskKey,
+    cpu_template: Option<ProcessThreadCpuTemplate>,
     kernel: Weak<KernelState>,
     task: Weak<carrick_kernel::kernel::objects::Task>,
     registry: Arc<ThreadRegistry>,
@@ -44,11 +137,13 @@ struct ReservedThreadRuntime<E: ThreadedEngine> {
     state: Vec<ThreadRuntimeState<E>>,
     injected_lease: Arc<InjectedExecutionLeaseSlot>,
     origin: ThreadAdoptionOrigin,
+    cpu: Option<ProcessThreadCpuReservation>,
     submission: carrick_kernel::kernel::scheduler::ProcessBirthSubmission,
 }
 
 pub(super) struct AdoptedThreadRuntime<E: ThreadedEngine> {
     pub(super) kernel: Kernel,
+    pub(super) cpu: Option<carrick_kernel::kernel::objects::MigratableTaskState>,
     pub(super) state: ThreadRuntimeState<E>,
     pub(super) injected_lease: Arc<InjectedExecutionLeaseSlot>,
     pub(super) submission: carrick_kernel::kernel::scheduler::ProcessBirthSubmission,
@@ -58,9 +153,39 @@ impl<E: ThreadedEngine + 'static> ProcessThreadAdoptionFactory<E>
 where
     E::SiblingSpec: 'static,
 {
+    pub(super) fn with_cpu_template(
+        mut self,
+        context: &KernelContext,
+        cpu: carrick_kernel::kernel::objects::MigratableTaskState,
+    ) -> Result<Self, TrapError> {
+        let kernel = self
+            .kernel
+            .upgrade()
+            .ok_or_else(|| TrapError::Hypervisor("birth CPU factory lost its owner".into()))?;
+        if context.task().key() != self.owner
+            || !Arc::ptr_eq(
+                context.kernel(),
+                kernel
+                    .hvpatch_process
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("birth CPU factory lost its process".into())
+                    })?
+                    .kernel_graph(),
+            )
+        {
+            return Err(TrapError::Hypervisor(
+                "birth factory rejected a foreign CPU owner".into(),
+            ));
+        }
+        self.cpu_template = Some(ProcessThreadCpuTemplate::capture(context, cpu)?);
+        Ok(self)
+    }
+
     pub(super) fn capture(kernel: &Kernel, state: &ThreadRuntimeState<E>) -> Option<Self> {
         Some(Self {
             owner: kernel.hvpatch_process.as_ref()?.task_key(),
+            cpu_template: None,
             kernel: Arc::downgrade(kernel),
             task: Arc::downgrade(&state.kernel_thread.as_ref()?.task()?),
             registry: state.registry.clone(),
@@ -142,6 +267,10 @@ where
                 state,
                 injected_lease,
                 origin,
+                cpu: self
+                    .cpu_template
+                    .as_ref()
+                    .map(ProcessThreadCpuTemplate::reserve),
                 submission,
             },
         ))
@@ -166,6 +295,7 @@ where
 pub(super) fn adopt_thread_runtime<E: ThreadedEngine + 'static>(
     reservation: ThreadBirthAdoptionReservation,
     context: &KernelContext,
+    frame: Option<&carrick_el1_abi::ThreadCtx>,
 ) -> Result<AdoptedThreadRuntime<E>, TrapError>
 where
     E::SiblingSpec: 'static,
@@ -197,6 +327,15 @@ where
     })?;
     state.kernel_thread = Some(context.thread().clone());
     state.service_kernel_context = Some(context.retain_exact());
+    let cpu = match (reserved.cpu.take(), frame) {
+        (Some(cpu), Some(frame)) => Some(cpu.for_born(context, frame)?),
+        (None, None) => None,
+        _ => {
+            return Err(TrapError::Hypervisor(
+                "birth adoption requires its reserved CPU and first-entry frame".into(),
+            ));
+        }
+    };
     state.syscall_completion = match reserved.origin {
         ThreadAdoptionOrigin::HostClone(syscall) => {
             SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
@@ -209,6 +348,7 @@ where
     };
     Ok(AdoptedThreadRuntime {
         kernel: reserved.kernel,
+        cpu,
         state,
         injected_lease: reserved.injected_lease,
         submission: reserved.submission,
@@ -246,6 +386,159 @@ mod tests {
     }
 
     #[test]
+    fn born_cpu_template_keeps_own_mm_and_complete_el0_frame_with_two_live_processes() {
+        let (_, owner_scheduler, _, owner, _, _) =
+            test_carrier_graph_with_dispatcher!(72_493, SyscallDispatcher::new());
+        let peer =
+            owner
+                .kernel()
+                .reserve_fork(
+                    &owner,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
+                    .unwrap(),
+                    "cpu-template-peer".into(),
+                    None,
+                )
+                .unwrap()
+                .prepare_reference(ThreadId::synthetic_for_tests(72_494))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .start_child()
+                .unwrap()
+                .into_parts()
+                .0;
+        let owner_cpu = executor::tests::task_state(&owner, 1_001);
+        let peer_cpu = executor::tests::task_state(&peer, 2_002);
+        let template = ProcessThreadCpuTemplate::capture(&owner, owner_cpu.clone()).unwrap();
+        let mut frame = carrick_el1_abi::ThreadCtx::ZERO;
+        frame.x = std::array::from_fn(|i| 9_000 + i as u64);
+        frame.pc = 0x1010;
+        frame.pstate = 0x2000;
+        frame.sp_el0 = 0x3030;
+        frame.tpidr_el0 = 0x4040;
+        frame.tpidrro_el0 = 0x5050;
+        frame.contextidr_el1 = 0x6060;
+        frame.v = std::array::from_fn(|i| 7_000 + i as u128);
+        frame.fpsr = 0x80;
+        frame.fpcr = 0x90;
+        let reserved_cpu = template.reserve();
+        let GuestCpuState::Aarch64V1(reserved_registers) = &reserved_cpu.cpu.cpu else {
+            panic!("architecture");
+        };
+        let reserved_address = Arc::as_ptr(reserved_registers);
+        assert_eq!(Arc::strong_count(reserved_registers), 1);
+        let born = reserved_cpu.for_born(&owner, &frame).unwrap();
+        let GuestCpuState::Aarch64V1(cpu) = &born.cpu else {
+            panic!("architecture");
+        };
+        assert_eq!(
+            Arc::as_ptr(cpu),
+            reserved_address,
+            "post-birth frame merge must consume the pre-owned CPU allocation"
+        );
+        let GuestCpuState::Aarch64V1(own) = &owner_cpu.cpu else {
+            panic!("architecture");
+        };
+        let GuestCpuState::Aarch64V1(driver) = &peer_cpu.cpu else {
+            panic!("architecture");
+        };
+        assert_eq!(
+            cpu.gprs, frame.x,
+            "first entry must use the born frame, not the template thread's registers"
+        );
+        assert_eq!(
+            (cpu.pc, cpu.pstate, cpu.sp_el0),
+            (frame.pc, frame.pstate, frame.sp_el0)
+        );
+        assert_eq!(
+            (cpu.tpidr_el0, cpu.tpidrro_el0, cpu.contextidr_el1),
+            (frame.tpidr_el0, frame.tpidrro_el0, frame.contextidr_el1)
+        );
+        assert_eq!(cpu.vregs, frame.v);
+        assert_eq!((cpu.fpsr, cpu.fpcr), (frame.fpsr as u32, frame.fpcr as u32));
+        assert_eq!(
+            (cpu.ttbr0, cpu.ttbr1, cpu.tcr),
+            (own.ttbr0, own.ttbr1, own.tcr)
+        );
+        assert_ne!(cpu.ttbr0, driver.ttbr0);
+        assert!(template.reserve().for_born(&peer, &frame).is_err());
+        assert!(ProcessThreadCpuTemplate::capture(&owner, peer_cpu).is_err());
+        assert!(owner.exact_thread_is_live() && peer.exact_thread_is_live());
+        owner_scheduler.close();
+    }
+
+    #[test]
+    fn shared_adoption_consumes_born_cpu_capacity_for_the_exact_new_thread() {
+        let (_, scheduler, kernel, owner, _, _) =
+            test_carrier_graph_with_dispatcher!(72_495, SyscallDispatcher::new());
+        let owner_state = state(&kernel, &owner, 1_005);
+        let source = executor::tests::task_state(&owner, 1_005);
+        let factory = ProcessThreadAdoptionFactory::capture(&kernel, &owner_state)
+            .unwrap()
+            .with_cpu_template(&owner, source.clone())
+            .unwrap();
+        let prepared = owner
+            .kernel()
+            .reserve_thread_clone(
+                &owner,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        let ticket = factory.reserve(prepared.key()).unwrap();
+        let born = prepared
+            .prepare(ThreadId::synthetic_for_tests(72_496))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        let mut frame = carrick_el1_abi::ThreadCtx::ZERO;
+        frame.pc = 0x4040;
+        frame.sp_el0 = 0x8080;
+        frame.x[8] = 172;
+        frame.contextidr_el1 = born.thread().key().tid.raw() as u64;
+        let adopted =
+            adopt_thread_runtime::<CrashCaptureTestEngine>(ticket, &born, Some(&frame)).unwrap();
+        assert_eq!(
+            adopted.state.kernel_thread.as_ref().unwrap().key(),
+            born.thread().key()
+        );
+        assert!(matches!(
+            adopted.state.syscall_completion,
+            SyscallCompletionOwnership::Idle
+        ));
+        let cpu = adopted.cpu.as_ref().unwrap();
+        let GuestCpuState::Aarch64V1(registers) = &cpu.cpu else {
+            panic!("architecture");
+        };
+        assert_eq!(registers.pc, frame.pc);
+        assert_eq!(registers.gprs[8], 172);
+        assert_eq!(
+            registers.contextidr_el1,
+            born.thread().key().tid.raw() as u64
+        );
+        assert_eq!(cpu.mm, source.mm);
+        assert!(
+            adopted
+                .submission
+                .activate(&scheduler, born.thread())
+                .is_err(),
+            "binding generation has not been published yet"
+        );
+        scheduler.close();
+    }
+
+    #[test]
     fn abi_runtime_adoption_uses_its_process_capacity_with_two_live_processes() {
         let (_, owner_scheduler, owner_kernel, owner, _, _) =
             test_carrier_graph_with_dispatcher!(72_491, SyscallDispatcher::new());
@@ -255,7 +548,8 @@ mod tests {
         let peer_state = state(&peer_kernel, &peer, 2_002);
         let factory = ProcessThreadAdoptionFactory::capture(&owner_kernel, &owner_state).unwrap();
         let reservation = factory.reserve(owner.thread().key()).unwrap();
-        let adopted = adopt_thread_runtime::<CrashCaptureTestEngine>(reservation, &owner).unwrap();
+        let adopted =
+            adopt_thread_runtime::<CrashCaptureTestEngine>(reservation, &owner, None).unwrap();
         assert!(Arc::ptr_eq(&adopted.kernel, &owner_kernel));
         assert!(Arc::ptr_eq(&adopted.state.registry, &owner_state.registry));
         assert!(Arc::ptr_eq(&adopted.state.futex, &owner_state.futex));
@@ -271,7 +565,7 @@ mod tests {
             SyscallCompletionOwnership::Idle
         ));
         let reservation = factory.reserve(owner.thread().key()).unwrap();
-        assert!(adopt_thread_runtime::<CrashCaptureTestEngine>(reservation, &peer).is_err());
+        assert!(adopt_thread_runtime::<CrashCaptureTestEngine>(reservation, &peer, None).is_err());
         assert!(owner.exact_thread_is_live());
         assert!(peer.exact_thread_is_live());
         owner_scheduler.close();
