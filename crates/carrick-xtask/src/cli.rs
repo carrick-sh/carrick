@@ -23,6 +23,9 @@ pub enum Commands {
     #[command(about = "Display repository information as JSON")]
     Info,
 
+    #[command(about = "Per-landing Carrick vs native Docker receipts")]
+    Impact(crate::impact::ImpactArgs),
+
     #[command(about = "Three-way merge of schema-aware classification ledgers")]
     LedgerMerge {
         #[arg(long, help = "Repo-relative path of the ledger being merged")]
@@ -76,6 +79,8 @@ pub struct RepoInfo {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("impact: {0}")]
+    Impact(String),
     #[error("{0}")]
     Clap(#[from] clap::Error),
 
@@ -190,6 +195,8 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
+        Commands::Impact(args) => crate::impact::run(cli.root.as_deref(), args.action)
+            .map_err(|e| CliError::Impact(e.to_string())),
         Commands::Info => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             let json = serde_json::to_string_pretty(&info)?;

@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "phase": "carrick",
+  "head": "75111e814ddd2e675fe49086529279153eac4405",
+  "run_id": "impact-46209-1790922152874092000",
+  "measured_runs": 2,
+  "warmup_policy": "one excluded warm-up per workload; fixed measured run count",
+  "artifact": {
+    "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-impact/target/release/carrick",
+    "sha256": "ffcb47dfe99dd5e33b7e1570c005031af25ac55573765df3febb0accee79ba2b",
+    "cdhash": "723344c984d4f48b9cd9369a008c26e86f329ecf",
+    "lc_uuid": "23AB70CB-36DE-3743-B804-5B94DA5E7339",
+    "entitlement": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+    "dof_present": true
+  },
+  "errors": [],
+  "workloads": {
+    "true": {
+      "image": "ubuntu:24.04",
+      "image_digest": "sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+      "command": [
+        "/bin/true"
+      ],
+      "declaration_sha256": "d2e319ddfec0fa571f7f5a5bbb9df1caf71b0f54456086662c4bd711bc3e1037",
+      "samples": [
+        {
+          "run_id": "impact-46209-1790922152874092000-true-0",
+          "argv": [
+            "/Volumes/CaseSensitive/carrick/.worktrees/wt-impact/target/release/carrick",
+            "run",
+            "--name",
+            "impact-46209-1790922152874092000-true-0",
+            "--max-traps",
+            "18446744073709551615",
+            "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+            "/bin/true"
+          ],
+          "warmup": true,
+          "wall_s": 2.323762375,
+          "child_cpu_s": 0.892142,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_ok": true
+        },
+        {
+          "run_id": "impact-46209-1790922152874092000-true-1",
+          "argv": [
+            "/Volumes/CaseSensitive/carrick/.worktrees/wt-impact/target/release/carrick",
+            "run",
+            "--name",
+            "impact-46209-1790922152874092000-true-1",
+            "--max-traps",
+            "18446744073709551615",
+            "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+            "/bin/true"
+          ],
+          "warmup": false,
+          "wall_s": 0.044878541,
+          "child_cpu_s": 0.03603400000000012,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_ok": true
+        },
+        {
+          "run_id": "impact-46209-1790922152874092000-true-2",
+          "argv": [
+            "/Volumes/CaseSensitive/carrick/.worktrees/wt-impact/target/release/carrick",
+            "run",
+            "--name",
+            "impact-46209-1790922152874092000-true-2",
+            "--max-traps",
+            "18446744073709551615",
+            "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+            "/bin/true"
+          ],
+          "warmup": false,
+          "wall_s": 0.0453785,
+          "child_cpu_s": 0.03548399999999985,
+          "exit_code": 0,
+          "timed_out": false,
+          "cleanup_ok": true
+        }
+      ]
+    }
+  }
+}

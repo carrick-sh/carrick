@@ -1024,7 +1024,9 @@ dependencies = [
 name = "carrick-xtask"
 version = "0.1.0"
 dependencies = [
+ "carrick-conformance",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

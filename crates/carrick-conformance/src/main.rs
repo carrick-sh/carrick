@@ -10,6 +10,7 @@
 //! Invariants: identical trailing argv to both engines; carrick‖docker never
 //! overlap (two-phase); every kill is SCOPED to one run-id (no unscoped reap).
 
+mod argv;
 mod closure;
 mod engine;
 mod generate;
