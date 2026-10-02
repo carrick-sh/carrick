@@ -420,3 +420,17 @@ The serial HVF library gate also passed: 682 tests, three ignored,
 `CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib`
 (`/tmp/forkexit-sol-vm-object-hvf.log`). These are host-library receipts,
 not signed guest service acceptance.
+
+`CARGO_BUILD_JOBS=3 just clippy` passed on `bb3842530`
+(`/tmp/forkexit-sol-vm-object-clippy.log`). Clean-tree inventory reconciliation
+refused the K1 operation inventory because the new backing owner adds 11
+mapping-keyword scanner hits (mapping count 1484 to 1495). Review compared
+rows without positions: all 11 additions are in `thread_control.rs`, solely
+the `SharedAbiPage` owner field, its initialization/dereference/drop access,
+and accompanying mapping/alignment safety comments; zero rows were removed.
+They are internal anonymous ABI backing, not file-description, fd-table,
+stream or epoll authority. No K1 callsite taxonomy authority row changed.
+The operation inventory was refreshed after that explicit classification;
+the macOS compiler capture changed only its source-head receipt, with all
+596 authority rows unchanged. This is an intentional mapping-site addition,
+not a mechanical position-only refresh.
