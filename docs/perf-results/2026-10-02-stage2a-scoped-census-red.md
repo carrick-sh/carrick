@@ -139,3 +139,35 @@ Those limitations must not be mistaken for an exhaustive lexical-work bound.
 | 128 | 0 | unrelated | 2071/2073/1807 | 1098/1100/1792 | 1617/1619/4289 | 1536/1538/0 | 61 |
 | 128 | 128 | same | 2049/2494/1627 | 1024/1710/1753 | 1546/2179/4109 | 1536/1536/0 | 5 |
 | 128 | 128 | unrelated | 2107/2114/1831 | 1043/1050/1792 | 1691/1702/4278 | 1536/1536/0 | 80 |
+
+## Signed binding and census-driven follow-up
+
+`host-namespace-work` now launches the fixture through the public
+`carrick-embed` Carrier via `carrick debug host-namespace-work`; the trace
+profile writes eight EmbedStructural observations, one per actor and operation.
+Both executable hashes are checked before and after capture. The reader requires
+matching operation, host-entry/return, and arming counts, a real backend open
+per openat, and complete successful task execution. The contract retains the
+8*n filesystem-call budget and adds 8*n owned path visits and zero warm mutation
+host opens. Raw synchronization calls are retained separately.
+
+This binding was red on f5dd42c3d: linkat made 11 path visits at n=1 (budget 8).
+Removing the repeated source-kind resolution in dispatch reduced that work.
+The next signed capture on 7bb0180ad remained red under concurrent invalidation:
+actor 3 linkat made 28 filesystem calls, 14 path visits, and five host opens;
+actor 4 made 16 calls, 11 visits, and five opens. Both tasks completed. These
+are architectural failures, not incomplete captures or retry candidates.
+
+The follow-up retains bounded, already-owned unpinned directory capabilities
+when upper names expire. Every rediscovered name still requires fresh physical
+identity checks; immutable lower capabilities and absence facts survive only
+at the same lower path. A moved merged directory rebinds its lower view.
+An attempted direct cached-parent admission increased the exact cross-parent
+rename cost from seven to eight host calls in the dispatcher budget test and
+was removed. Admission still uses its existing contained walk. Ownership
+remains in the original caches. Red-first host tests observed two
+reopens for unpinned and merged lower parents, then zero after this change.
+After removing direct admission, all 46 serial VFS tests and the exact
+dispatcher namespace host-call budget pass; workspace clippy passes. The earlier
+full `just test` run failed only the cross-parent budget before that removal.
+Fresh signed acceptance and the final before/after table remain pending.
