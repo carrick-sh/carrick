@@ -3078,6 +3078,127 @@
       "domain": "thread::control"
     },
     {
+      "file": "crates/carrick-kernel/src/kernel/revision_capacity.rs",
+      "function": "<RevisionReservation as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "2468284094eb4b7ae7ee2291ce77ce5b62fca408be6cfaf0f29548e70f1cf314",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::revision",
+      "rationale": "Releasing the remaining credits of an unconsumed unique lease cannot exceed its task budget; underflow proves duplicate release or corrupted custody.",
+      "sink": "fatal",
+      "domain": "thread::revision"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/revision_capacity.rs",
+      "function": "RevisionReservation::consume",
+      "ordinal_in_function": 1,
+      "fingerprint": "eb49aad1ad6699b262fc0b89de17323b8726faad5080fc25b8d450c38e3572d7",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::revision",
+      "rationale": "The unique revision lease was consumed by another exact task or after both owned credits were consumed; accepting it would spend another task generation capacity.",
+      "sink": "fatal",
+      "domain": "thread::revision"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/revision_capacity.rs",
+      "function": "RevisionReservation::consume",
+      "ordinal_in_function": 2,
+      "fingerprint": "0f444cc3d9325d9748375b446deb42f258dfe6009d45e843b136f57c5ec9361c",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::revision",
+      "rationale": "Ordinary task advances account for all standing leases. A preissued credit overflowing its ceiling proves a publisher bypassed that task-owned quota; resource exhaustion itself is declined before stocking.",
+      "sink": "fatal",
+      "domain": "thread::revision"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/revision_capacity.rs",
+      "function": "RevisionReservation::consume",
+      "ordinal_in_function": 3,
+      "fingerprint": "32531e084f4edd862c190de54465eda23ecbeb9bf9a9992fee659ab6070a0f3f",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::revision",
+      "rationale": "A live unique lease has a corresponding reserved credit under the same budget lock. Missing credit means internal lease accounting corruption, not resource exhaustion.",
+      "sink": "fatal",
+      "domain": "thread::revision"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/thread_retirement.rs",
+      "function": "<RetirementReservation as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "132ff99465ce1ff409df4109928b98e64b7074a892a099987bcaf0b3aa6cb913",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::retirement",
+      "rationale": "An active unique lease can only release its own Reserved cell. Any other state proves duplicate consumption or reuse and freeing it would release unrelated backing.",
+      "sink": "fatal",
+      "domain": "thread::retirement"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/thread_retirement.rs",
+      "function": "RetiredRecords<'_>::iter",
+      "ordinal_in_function": 1,
+      "fingerprint": "b31e0fa84f12d7c0a7ac5b783cc79f093b92dddb301f6a1e8e4ede0bae41969f",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::retirement",
+      "rationale": "The arena lock protects both retired indices and cells. An indexed non-retired cell proves internal census corruption and could release a live thread identity early.",
+      "sink": "fatal",
+      "domain": "thread::retirement"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/thread_retirement.rs",
+      "function": "RetiredThreads::push",
+      "ordinal_in_function": 1,
+      "fingerprint": "ab4fd2bc33f0be0686fc4e9545ab3e7522cad1c84d0637c44bf1358eb513779c",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::retirement",
+      "rationale": "Host storage growth successfully inserted a vacant cell under the arena lock. A missing free index afterward is bookkeeping corruption, not a recoverable allocation failure.",
+      "sink": "fatal",
+      "domain": "thread::retirement"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/thread_retirement.rs",
+      "function": "RetiredThreads::push_reserved",
+      "ordinal_in_function": 1,
+      "fingerprint": "a434617ef12ef935279bb2136ae948c005eca682e391954332489cd489c002f6",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::retirement",
+      "rationale": "A retirement cell lease names one exact registry arena. Cross-arena consumption would retire an unrelated identity and cannot be lowered to a guest errno.",
+      "sink": "fatal",
+      "domain": "thread::retirement"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/thread_retirement.rs",
+      "function": "RetiredThreads::push_reserved",
+      "ordinal_in_function": 2,
+      "fingerprint": "41ae588e2a9d6d9d413bf917e9b662b27c83310a6143f5fd6f9b71e65007d82b",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::retirement",
+      "rationale": "The noncloneable cell lease still owns its Reserved cell until consumption. A different state means its cell was reused or consumed without transferring custody.",
+      "sink": "fatal",
+      "domain": "thread::retirement"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/thread_retirement.rs",
+      "function": "RetiredThreads::reserve",
+      "ordinal_in_function": 1,
+      "fingerprint": "207d765b5df291c57a98fbe23e917485e11937b2d0f6b61ff056696da40e27ab",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::retirement",
+      "rationale": "Fallible storage growth returned success and populated a vacant cell under the same lock. An empty free index then proves arena bookkeeping corruption; allocation failure returns before admission.",
+      "sink": "fatal",
+      "domain": "thread::retirement"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/thread_retirement.rs",
+      "function": "RetiredThreads::retain",
+      "ordinal_in_function": 1,
+      "fingerprint": "ebdec805a4b3cf0800d097af0e5ce979e90abe24d1c4881cfb1429f98757adfe",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::retirement",
+      "rationale": "The retired index and cells are read under one arena lock. A non-retired indexed cell proves internal census corruption during identity reclamation.",
+      "sink": "fatal",
+      "domain": "thread::retirement"
+    },
+    {
       "file": "crates/carrick-kernel/src/el1_zone.rs",
       "function": "<MetadataCompletionWake as carrick_el1_abi::MetadataCompletionWake>::publish_and_wake",
       "ordinal_in_function": 1,
