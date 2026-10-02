@@ -1094,31 +1094,20 @@ where
             ]),
         );
         let cause = match handback {
-            Some(Handback::Signal | Handback::GroupStop) => Some(match reserved {
+            Some(kind @ (Handback::Signal | Handback::GroupStop)) => Some(match reserved {
                 // What the signal will do decides the interruption: a handler
                 // (its SA_RESTART), a default stop (man 7 signal: some calls
                 // fail with EINTR after SIGCONT, others continue), or nothing.
                 Some(signal) => {
                     let action = signal.action();
-                    match carrick_kernel::kernel::evaluate_signal_delivery_action(
-                        signal.signum(),
-                        action,
-                    ) {
-                        carrick_kernel::kernel::SignalDeliveryAction::Handler { .. } => {
-                            host_ipc::IpcCause::Signal {
-                                restart: action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0,
-                            }
-                        }
-                        carrick_kernel::kernel::SignalDeliveryAction::Stop => {
-                            host_ipc::IpcCause::Stop
-                        }
-                        carrick_kernel::kernel::SignalDeliveryAction::Ignore => {
-                            host_ipc::IpcCause::Control
-                        }
-                        carrick_kernel::kernel::SignalDeliveryAction::Terminate => {
-                            host_ipc::IpcCause::Signal { restart: false }
-                        }
-                    }
+                    ipc_signal_cause(
+                        kind,
+                        carrick_kernel::kernel::evaluate_signal_delivery_action(
+                            signal.signum(),
+                            action,
+                        ),
+                        action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0,
+                    )
                 }
                 None if handback == Some(Handback::GroupStop) => host_ipc::IpcCause::Stop,
                 None => host_ipc::IpcCause::Signal { restart: false },
@@ -1204,6 +1193,22 @@ where
     }
 }
 
+/// Preserve a caught handler's policy without losing the owned stop reason.
+fn ipc_signal_cause(
+    handback: Handback,
+    action: carrick_kernel::kernel::SignalDeliveryAction,
+    restart: bool,
+) -> host_ipc::IpcCause {
+    use carrick_kernel::kernel::SignalDeliveryAction;
+    match action {
+        SignalDeliveryAction::Handler { .. } => host_ipc::IpcCause::Signal { restart },
+        SignalDeliveryAction::Stop => host_ipc::IpcCause::Stop,
+        SignalDeliveryAction::Ignore if handback == Handback::GroupStop => host_ipc::IpcCause::Stop,
+        SignalDeliveryAction::Ignore => host_ipc::IpcCause::Control,
+        SignalDeliveryAction::Terminate => host_ipc::IpcCause::Signal { restart: false },
+    }
+}
+
 #[cfg(test)]
 mod ipc_tests {
     //! Host-level bindings for kernel.el1.ipc-continuation at the runtime
@@ -1213,6 +1218,29 @@ mod ipc_tests {
     use carrick_el1_abi::ipc::{EventMode, IpcOperation, IpcRegion};
     use carrick_kernel::dispatch::SyscallDispatcher;
     use std::alloc::Layout;
+
+    #[test]
+    fn ignored_signal_preserves_zone_group_stop_interruption() {
+        use carrick_kernel::kernel::SignalDeliveryAction;
+        assert_eq!(
+            ipc_signal_cause(Handback::GroupStop, SignalDeliveryAction::Ignore, false),
+            host_ipc::IpcCause::Stop,
+        );
+        assert_eq!(
+            ipc_signal_cause(Handback::Signal, SignalDeliveryAction::Ignore, false),
+            host_ipc::IpcCause::Control,
+        );
+        for restart in [false, true] {
+            assert_eq!(
+                ipc_signal_cause(
+                    Handback::GroupStop,
+                    SignalDeliveryAction::Handler { address: 0x1000 },
+                    restart,
+                ),
+                host_ipc::IpcCause::Signal { restart },
+            );
+        }
+    }
 
     fn dispatcher_and_context() -> (
         SyscallDispatcher,
