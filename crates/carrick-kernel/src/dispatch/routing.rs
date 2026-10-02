@@ -240,7 +240,17 @@ impl SyscallDispatcher {
             }
         }
         if let Some(errno) = self.secure_host_venue_metadata(&ctx.request) {
-            return Some(errno.map(DispatchOutcome::errno));
+            return Some(errno.and_then(|errno| {
+                if ctx.request.number == carrick_abi::syscall::nr::BRK {
+                    // Linux's raw brk ABI reports allocation failure with the
+                    // unchanged break; libc translates that to ENOMEM.
+                    Ok(DispatchOutcome::returned_u64(
+                        self.mem().lock().program_break(),
+                    )?)
+                } else {
+                    Ok(DispatchOutcome::errno(errno))
+                }
+            }));
         }
         Some(resources::with_captured_resources(ctx.kernel, || {
             handler(self, &mut ctx)
@@ -255,18 +265,21 @@ impl SyscallDispatcher {
         request: &SyscallRequest,
     ) -> Option<Result<carrick_abi::LinuxErrno, DispatchError>> {
         let number = request.number.raw();
-        if !mm_mutation_may_mirror(number) {
+        let brk = request.number == carrick_abi::syscall::nr::BRK;
+        if !brk && !mm_mutation_may_mirror(number) {
             return None;
         }
         let view = self.mem_view();
-        let munmap = if number == MUNMAP {
+        let need = if brk {
+            mem::anonymous::HostMetadataNeed::Break(carrick_guest_mem::GuestVa(request.args.0[0]))
+        } else if number == MUNMAP {
             let [address, length, ..] = request.args.0;
             // A malformed range fails the syscall's own validation first.
-            Some(view.munmap_edit_range(address, length)?)
+            mem::anonymous::HostMetadataNeed::Retire(view.munmap_edit_range(address, length)?)
         } else {
-            None
+            mem::anonymous::HostMetadataNeed::Mapping
         };
-        view.secure_host_venue_metadata(munmap).transpose()
+        view.secure_host_venue_metadata(need).transpose()
     }
 
     /// Focused unit-test boundary for mutation handlers. Production callers
