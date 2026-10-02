@@ -372,7 +372,7 @@ fn repoint_inherited_invalid_alias(
         El1PrivateLeafState, el1_private_leaf_state, terminal_descriptor,
         terminal_descriptor_is_retired,
     };
-    if !eligible || page_tables.translate(start).is_some() {
+    if !eligible {
         return Ok(false);
     }
     let private_state = |tables: &carrick_mmu_core::aarch64::PageTableManager, va| {
@@ -381,19 +381,6 @@ fn repoint_inherited_invalid_alias(
     let is_retired = |tables: &carrick_mmu_core::aarch64::PageTableManager, va| {
         terminal_descriptor_is_retired(terminal_descriptor(tables.debug_walk(va)))
     };
-    if private_state(page_tables, start) == El1PrivateLeafState::Malformed {
-        return Err(carrick_mmu_core::aarch64::PageTableError::BadAddress);
-    }
-    let Some(retained) = page_tables.translate_retained_output(start) else {
-        return Ok(false);
-    };
-    if retained == current_ipa
-        && !is_retired(page_tables, start)
-        && (private_state(page_tables, start) != El1PrivateLeafState::Prepared
-            || inventory_covers_compound(align_down(retained, CowArmedRanges::COMPOUND_SIZE)))
-    {
-        return Ok(false);
-    }
     const PAGE: u64 = 4 * 1024;
     const COMPOUND: u64 = CowArmedRanges::COMPOUND_SIZE;
     let pages = (len as u64).div_ceil(PAGE);
@@ -1917,6 +1904,53 @@ mod tests {
             .expect("clear an inaccessible retired child leaf")
         );
         assert_eq!(child.translate_retained_output(va + 2 * 4096), None);
+    }
+
+    #[test]
+    fn fork_checks_retired_neighbors_after_an_authenticated_prepared_leaf() {
+        use carrick_mmu_core::aarch64::GuestLeafPublication;
+        let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        tables.declare_offline_private_image();
+        let va = crate::memory::LINUX_MMAP_BASE + 0x80_0000;
+        let ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0xa0_0000;
+        tables
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va,
+                    ipa,
+                    len: 4 * 4096,
+                    writable: true,
+                    executable: false,
+                },
+                va,
+                None,
+            )
+            .unwrap();
+        tables.invalidate(va + 2 * 4096, 4096, None).unwrap();
+        assert!(
+            repoint_inherited_invalid_alias(
+                &mut tables,
+                va + 4096,
+                ipa + 4096,
+                3 * 4096,
+                true,
+                |compound| compound == ipa,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            tables.translate_retained_output(va + 4096),
+            Some(ipa + 4096)
+        );
+        assert_eq!(tables.translate_retained_output(va + 2 * 4096), None);
+        assert_eq!(
+            tables.translate_retained_output(va + 3 * 4096),
+            Some(ipa + 3 * 4096)
+        );
     }
 
     #[test]
