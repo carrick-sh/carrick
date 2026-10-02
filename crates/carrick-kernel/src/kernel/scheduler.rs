@@ -3853,6 +3853,9 @@ impl Scheduler {
     /// wait becomes ready and the thread runnable (or, if it is still
     /// running and about to settle, kicked so it settles promptly).
     pub fn publish_zone_handback(&self, record: carrick_el1_abi::RecordRef) {
+        if crate::el1_zone::route_first_entry_handback(record) {
+            return;
+        }
         // A service record no vCPU slot would take: its thread's held row
         // goes to a host run queue instead, where any executor claims it.
         if let Some((thread, generation)) = crate::el1_zone::take_unplaced_service(record) {
