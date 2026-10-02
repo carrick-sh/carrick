@@ -273,6 +273,11 @@ impl Kernel {
     /// `ptrace_tracer` is the authority; the tracer's tracee set is the index
     /// its `wait` and exit consult.
     fn bind_ptrace_tracer(&self, tracee: &Task, tracer: TaskKey) -> bool {
+        let Ok(_birth_admission) =
+            super::super::thread_ledger::BirthAdmissionGuard::acquire(tracee)
+        else {
+            return false;
+        };
         let tracer_task = {
             let state = self.registry().settled().read();
             let Some(record) = state.tasks.get(&tracer.id) else {
@@ -286,6 +291,17 @@ impl Kernel {
         self.fd_ceiling().disable();
         if !tracee.claim_ptrace_tracer(tracer) {
             return false;
+        }
+        tracee.shared().pending_signals().lifecycle_lease().close();
+        {
+            let state = self.registry().settled().read();
+            if let Some(record) = state
+                .tasks
+                .get(&tracee.key().id)
+                .filter(|record| record.task.key() == tracee.key())
+            {
+                record.thread_pool.revoke_unused();
+            }
         }
         tracer_task.add_ptrace_tracee(tracee.key());
         true
