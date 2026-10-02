@@ -2293,6 +2293,7 @@ where
         let child_runtime = match super::thread_adoption::adopt_thread_runtime::<E>(
             child_runtime_reservation,
             &child_context,
+            None,
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -2313,7 +2314,7 @@ where
             state: child_runtime.state,
             task_backend: ops.make_binding_state(task_backend),
             context: child_context.retain_exact(),
-            cpu: task_state,
+            cpu: child_runtime.cpu.unwrap_or(task_state),
             generation,
             injected_lease: child_runtime.injected_lease,
             bootstrap_process_child: None,
@@ -5270,7 +5271,8 @@ where
     let factory = super::thread_adoption::ProcessThreadAdoptionFactory::capture(&kernel, &state)
         .ok_or_else(|| {
             TrapError::Hypervisor("thread adoption factory has no owner process".into())
-        })?;
+        })?
+        .with_cpu_template(&context, cpu.clone())?;
     context
         .task()
         .install_thread_adoption_factory(Arc::new(factory))
