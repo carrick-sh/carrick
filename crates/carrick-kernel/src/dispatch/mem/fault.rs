@@ -811,6 +811,22 @@ pub struct ResidentFaultPlan<'permit> {
     pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
+/// Why a verified publication cannot settle against this MM's current facts.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublishedFrameGrantRefusal {
+    ReceiptShape,
+    Identity,
+    PublicationProtection,
+    BusFault,
+    ReturnOwed,
+    HostUnarmed,
+    Unmapped,
+    ProtectionChanged {
+        published: LinuxProtFlags,
+        current: LinuxProtFlags,
+    },
+}
+
 /// Owns alias exclusion from a bulk first-touch lookup through host backing
 /// preparation and fault-page residency publication.
 pub struct ResidentFrameGrantPlan<'permit> {
@@ -1188,10 +1204,15 @@ impl<'a> MemView<'a> {
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
-    ) -> Option<ResidentFrameGrantPlan<'permit>> {
-        let (publication, backing) = receipt.prepared_backing()?;
+    ) -> Result<ResidentFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
+        let (publication, backing) = receipt
+            .prepared_backing()
+            .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?;
         let resident = receipt.resident();
-        let end = publication.va.checked_add(publication.len)?;
+        let end = publication
+            .va
+            .checked_add(publication.len)
+            .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?;
         if grant.mm_key != permit.mm().raw()
             || receipt.id().mm_key.get() != grant.mm_key
             || (publication.va, publication.ipa, publication.len)
@@ -1209,23 +1230,27 @@ impl<'a> MemView<'a> {
             )
             || resident.len != self.linux_page_size()
             || resident.va < publication.va
-            || resident.end()? > end
+            || resident
+                .end()
+                .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?
+                > end
         {
-            return None;
+            return Err(PublishedFrameGrantRefusal::Identity);
         }
         if protection.is_empty()
             || protection.contains(LinuxProtFlags::WRITE) != publication.writable
             || protection.contains(LinuxProtFlags::EXEC) != publication.executable
         {
-            return None;
+            return Err(PublishedFrameGrantRefusal::PublicationProtection);
         }
         let exclusion = self.begin_host_alias_dispatch(permit);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        if bus_fault_contains(&mem.bus_fault_ranges, resident.va)
-            || mem.root_owes_backing_at(resident.va)
-        {
-            return None;
+        if bus_fault_contains(&mem.bus_fault_ranges, resident.va) {
+            return Err(PublishedFrameGrantRefusal::BusFault);
+        }
+        if mem.root_owes_backing_at(resident.va) {
+            return Err(PublishedFrameGrantRefusal::ReturnOwed);
         }
         // The authenticated publication is not a fresh allocation. EL1's
         // residency reconciliation may already have committed this page.
@@ -1234,11 +1259,19 @@ impl<'a> MemView<'a> {
                 LinuxProtFlags::from_bits_truncate(mapping.protection.bits()),
                 true,
             ),
-            FirstTouchOwner::Host => (mem.resident_fault_ranges.prot_for_page(resident.va)?, false),
-            FirstTouchOwner::Unmapped => return None,
+            FirstTouchOwner::Host => (
+                mem.resident_fault_ranges
+                    .prot_for_page(resident.va)
+                    .ok_or(PublishedFrameGrantRefusal::HostUnarmed)?,
+                false,
+            ),
+            FirstTouchOwner::Unmapped => return Err(PublishedFrameGrantRefusal::Unmapped),
         };
         if prot != protection {
-            return None;
+            return Err(PublishedFrameGrantRefusal::ProtectionChanged {
+                published: protection,
+                current: prot,
+            });
         }
         let stock = root_owned
             && mem.delegated_root().is_some_and(|root| {
@@ -1251,7 +1284,7 @@ impl<'a> MemView<'a> {
                         .is_empty()
                 })
             });
-        Some(ResidentFrameGrantPlan {
+        Ok(ResidentFrameGrantPlan {
             root_owned,
             stock,
             fault_page: resident.va,
