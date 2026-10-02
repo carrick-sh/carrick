@@ -133,23 +133,38 @@ impl ThreadCloneReservation {
             self.plan,
             self.kernel.object_ids(),
         )?);
+        let prepared = self.prepare_with_resources(registry_id, resources);
+        check_failpoint(
+            prepared.reservation.failpoint,
+            KernelFailpoint::AfterObjects,
+        )?;
+        check_failpoint(
+            prepared.reservation.failpoint,
+            KernelFailpoint::AfterBackendPrepare,
+        )?;
+        Ok(prepared)
+    }
+
+    fn prepare_with_resources(
+        self,
+        registry_id: ThreadId,
+        resources: Arc<ThreadResources>,
+    ) -> PreparedThreadClone {
         let thread = self.task.prepare_clone_thread(
             registry_id,
             Arc::clone(&resources),
             self.seed.control.clone(),
             self.seed.affinity,
         );
-        check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
-        check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
         let (start_wait, start_release) = ChildStartWait::pair();
-        Ok(PreparedThreadClone {
+        PreparedThreadClone {
             reservation: self,
             thread,
             resources,
             publication: None,
             start_wait: Some(start_wait),
             start_release,
-        })
+        }
     }
 }
 
@@ -473,6 +488,7 @@ impl Kernel {
         parent: &KernelContext,
         mut identity: ClaimedThreadIdentity,
         born: carrick_el1_abi::BornRecord,
+        resources: crate::kernel::objects::ReservedThreadResources,
     ) -> Result<PreparedThreadClone, KernelOperationError> {
         let flags = carrick_abi::LinuxCloneFlags::from_bits(born.clone_flags)
             .ok_or(KernelOperationError::ExpectedThreadGroup)?;
@@ -481,12 +497,17 @@ impl Kernel {
         if plan.task() != CloneTaskMode::JoinThreadGroup {
             return Err(KernelOperationError::ExpectedThreadGroup);
         }
+        if plan.files() != crate::kernel::clone_plan::CloneObjectMode::Share
+            || plan.fs_context() != crate::kernel::clone_plan::CloneObjectMode::Share
+        {
+            return Err(KernelOperationError::ExpectedThreadGroup);
+        }
         let control = identity
             .control
             .take()
             .ok_or(KernelOperationError::StaleContext)?;
         let registry_id = ThreadId::from_kernel_thread_identity(identity.identity.key.tid.raw());
-        ThreadCloneReservation {
+        Ok(ThreadCloneReservation {
             kernel: self.clone(),
             task: parent.task().clone(),
             caller: parent.thread().clone(),
@@ -500,7 +521,7 @@ impl Kernel {
             identity,
             failpoint: None,
         }
-        .prepare(registry_id)
+        .prepare_with_resources(registry_id, resources.bind_shared(parent.resources())))
     }
     /// Resolve one live Linux tid to its owning task, optionally requiring an
     /// exact tgid. Kernel-lane `tkill` uses the global form; `tgkill` supplies

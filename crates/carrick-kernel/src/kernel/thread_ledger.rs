@@ -98,6 +98,7 @@ struct PooledThreadIdentity {
     /// The real uid this entry's `RLIMIT_NPROC` credit is charged to.
     credit: NsUid,
     identity: ThreadIdentity,
+    birth_resources: super::objects::ReservedThreadResources,
 }
 
 impl PooledThreadIdentity {
@@ -198,7 +199,18 @@ impl ThreadIdentityPool {
         revoked
     }
 
-    fn push(&self, task: &TaskRef, credit: NsUid, identity: ThreadIdentity) -> bool {
+    fn push(
+        &self,
+        kernel: &Kernel,
+        task: &TaskRef,
+        credit: NsUid,
+        identity: ThreadIdentity,
+    ) -> bool {
+        let Ok(birth_resources) =
+            super::objects::ReservedThreadResources::reserve(kernel.object_ids())
+        else {
+            return false;
+        };
         let control = task.allocate_thread_control(identity.key);
         let page = control.lifecycle();
         let visible_tid = identity
@@ -225,6 +237,7 @@ impl ThreadIdentityPool {
             control,
             credit,
             identity,
+            birth_resources,
         });
         true
     }
@@ -424,7 +437,12 @@ impl ThreadLedger {
                             control: Some(control.clone()),
                         };
                         let prepared = kernel
-                            .prepare_abi_thread_birth(&parent, claimed, birth)
+                            .prepare_abi_thread_birth(
+                                &parent,
+                                claimed,
+                                birth,
+                                pooled.birth_resources,
+                            )
                             .unwrap_or_else(|error| {
                                 carrick_fatal::carrick_fatal!(
                                     "thread::ledger",
@@ -628,7 +646,7 @@ impl ThreadLedger {
             let Ok(identity) = ThreadIdentity::reserve(kernel, &record.task) else {
                 return;
             };
-            if !record.thread_pool.push(&record.task, uid, identity) {
+            if !record.thread_pool.push(kernel, &record.task, uid, identity) {
                 return;
             }
         }
@@ -916,6 +934,15 @@ mod tests {
 
     #[test]
     fn lifecycle_abi_birth_is_resolved_by_a_second_process() {
+        abi_birth_observed_by_peer(false);
+    }
+
+    #[test]
+    fn lifecycle_abi_birth_uses_reserved_resources_after_allocator_exhaustion() {
+        abi_birth_observed_by_peer(true);
+    }
+
+    fn abi_birth_observed_by_peer(exhaust_ids: bool) {
         let (kernel, root) = bootstrap(9_670);
         let peer = kernel
             .fork_task(
@@ -954,6 +981,9 @@ mod tests {
                 .clone()
         };
         control.reset_for_birth(carrick_el1_abi::BlockedMask(0x400), 0x8000, entry);
+        if exhaust_ids {
+            kernel.object_ids().exhaust_for_test();
+        }
         page.thread_born().unwrap();
         page.record_born(
             claim,
@@ -965,7 +995,9 @@ mod tests {
                 caller_serial: root.thread().key().serial.raw(),
                 clone_flags: (LinuxCloneFlags::THREAD
                     | LinuxCloneFlags::SIGHAND
-                    | LinuxCloneFlags::VM)
+                    | LinuxCloneFlags::VM
+                    | LinuxCloneFlags::FS
+                    | LinuxCloneFlags::FILES)
                     .bits(),
                 clear_child_tid: 0x8000,
                 blocked: carrick_el1_abi::BlockedMask(0x400),
@@ -1044,7 +1076,9 @@ mod tests {
                 caller_serial: root.thread().key().serial.raw(),
                 clone_flags: (LinuxCloneFlags::THREAD
                     | LinuxCloneFlags::SIGHAND
-                    | LinuxCloneFlags::VM)
+                    | LinuxCloneFlags::VM
+                    | LinuxCloneFlags::FS
+                    | LinuxCloneFlags::FILES)
                     .bits(),
                 clear_child_tid: 0,
                 blocked: carrick_el1_abi::BlockedMask(0),

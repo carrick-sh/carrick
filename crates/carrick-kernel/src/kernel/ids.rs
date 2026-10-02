@@ -248,6 +248,11 @@ impl ObjectIdRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::kernel) fn exhaust_for_test(&self) {
+        self.next.store(u64::MAX, Ordering::Relaxed);
+    }
+
     fn allocate(&self) -> Result<NonZeroU64, ObjectIdError> {
         let raw = self
             .next
