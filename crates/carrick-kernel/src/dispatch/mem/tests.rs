@@ -406,6 +406,11 @@ fn fresh_writable_retires_prepared_private_backing_before_publication() {
     anonymous_mapping_retires_prepared_backing(0, LINUX_PROT_READ | LINUX_PROT_WRITE);
 }
 
+#[test]
+fn populated_prot_none_retires_prepared_private_backing_before_publication() {
+    anonymous_mapping_retires_prepared_backing(LinuxMmapFlags::POPULATE.bits(), 0);
+}
+
 struct ConcurrentExecMemory(CountingMmapMemory);
 
 impl GuestMemory for ConcurrentExecMemory {
