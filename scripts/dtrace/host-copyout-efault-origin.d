@@ -26,6 +26,9 @@
  *     and 21 (backend refusal reason) fired on the admitted cross-process
  *     reader reduction. All 6,717 phase-18 declines matched phase-21
  *     invalid backing requests: host copyout had no mailbox generation.
+ *     Phase 22 was also live-qualified: remaining predecessor refusals
+ *     named no registered MM aliases and only local rows whose physical
+ *     owners remained alive. Local rows did not authenticate MM ownership.
  *     Phases 8, 10-12, 16, 19 and 20 name other source-defined refusal
  *     branches; this qualification does not claim they fired.
  *
