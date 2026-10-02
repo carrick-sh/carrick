@@ -26,21 +26,33 @@
 //!
 //! # The placeholder
 //!
-//! A fresh host `pipe()`. The READ end travels in the host message; the WRITE
-//! end stays here. Every dup reports the same tuple. Holding the write end
-//! keeps the object alive so a live key is never reused.
+//! A fresh host `pipe()`. Its READ end travels in the host message (Darwin
+//! dups it into the receiver like any passed fd); its WRITE end stays here.
+//! The key is the pipe's `(st_dev, st_ino)` plus its nanosecond creation
+//! time: XNU stats a pipe by object identity, so every dup of the read end —
+//! the one in flight, the one the receiver gets — reports the same triple.
+//! Holding the write end keeps the kernel object alive for as long as the
+//! entry exists, so a live key can never be reused by another pipe; the
+//! creation time also keeps a key from a closed pipe from matching a later
+//! pipe that XNU allocates at the same address.
 //!
 //! # Garbage collection
 //!
-//! The parked description holds one logical fd reference. If the socket closes
-//! unread, read ends die and the writer reports `POLLERR`/`POLLHUP` from `poll`:
-//! that signals nothing can claim the entry, releasing it. `gc` runs on every
-//! park/claim and socket close to collect orphaned entries.
+//! The parked description holds one logical fd reference, exactly like an
+//! in-flight fd on Linux (a passed pipe writer keeps the pipe open until it
+//! is received and closed). If the message is never received — the
+//! receiving socket is closed with the message still queued — every read-end
+//! reference dies inside the kernel and the retained write end reports
+//! `POLLERR`/`POLLHUP` from `poll(2)`: that is the signal that nothing can
+//! ever claim the entry, and its reference is released. `gc` runs on every
+//! park/claim and on socket close, so an orphaned entry is collected at the
+//! next rights operation or socket close in the carrier.
 //!
 //! # Scope
 //!
-//! CARRIER-scoped: placeholder keys are host identities unique per carrier;
-//! messages may cross guest process boundaries inside one carrier.
+//! This registry is CARRIER-scoped on purpose: the placeholder keys are host
+//! kernel identities, unique per carrier, and a message may cross guest
+//! process boundaries inside one carrier. It is not per-Linux-process state.
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -57,8 +69,11 @@ struct Parked {
     writer: OwnedFd,
 }
 
-/// `(st_dev, st_ino, st_ctime)` of a placeholder pipe from `fstat` of either end.
-/// Nanosecond creation timestamp keeps key identity unambiguous across allocations.
+/// `(st_dev, st_ino, st_ctime)` of a placeholder pipe, as reported by `fstat`
+/// of either end (or any dup of one).
+///
+/// The nanosecond creation time keeps the key unambiguous across pipe
+/// allocations that reuse an inode.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct PlaceholderKey {
     dev: u64,
