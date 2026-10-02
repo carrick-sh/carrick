@@ -1002,7 +1002,11 @@ mod tests {
             owner_generation: 13,
             inventory_revision: 14,
         };
-        let slot = table.publish(identity).unwrap();
+        table.publish(identity).unwrap();
+        // A host-served TLS/guard mapping can replace another page in this
+        // bulk grant. The unchanged prepared leaf must still commit on its
+        // first fault, without a grant refusal and a second host fault.
+        table.retire_overlapping(mm, base + 2 * 4096, 4096);
         let task = CurrentTask::new();
         task.zone_mm.store(mm, Ordering::Release);
         let tasks = [task];
@@ -1027,7 +1031,7 @@ mod tests {
             Action::Served
         );
         assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_1000)]);
-        assert_eq!(table.committed_words(slot, identity).unwrap()[0], 0b10);
+        assert!(table.is_guest_committed(mm, va));
         assert!(!mailbox.has_guest_work());
     }
 
