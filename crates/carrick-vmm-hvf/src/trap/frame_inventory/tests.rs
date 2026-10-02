@@ -483,6 +483,8 @@ fn register_carrier_lease(mut lease: GlobalFrameStage2Lease, host_addr: usize) -
 
 enum TestFrameMappingCount {
     Exact(usize),
+    /// The Kernel population per frame, as the test moves it.
+    PerFrame(std::sync::Arc<PerFrameKernel>),
     ExactButMappingNotLive(usize),
     SnapshotThenInterleave(Box<dyn Fn() + Send + Sync>),
     Error,
@@ -529,6 +531,7 @@ impl carrick_hal::FrameCowAuthority for TestFrameMappingCount {
     ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             Self::Exact(count) | Self::ExactButMappingNotLive(count) => Ok(Some(*count)),
+            Self::PerFrame(kernel) => Ok(kernel.counts.lock().get(&_frame).copied()),
             Self::SnapshotThenInterleave(interleave) => {
                 // The kernel snapshot sees only the retiring MM. A sibling
                 // already has a staged backend reference, then publishes its
@@ -541,6 +544,14 @@ impl carrick_hal::FrameCowAuthority for TestFrameMappingCount {
             ))),
         }
     }
+}
+
+/// A Kernel frame population the test moves by hand; a frame it no longer
+/// lists is one the Kernel retired. It refuses every commit: settlement
+/// publishes nothing to the Kernel.
+#[derive(Debug, Default)]
+struct PerFrameKernel {
+    counts: parking_lot::Mutex<std::collections::BTreeMap<carrick_hal::FrameId, usize>>,
 }
 
 fn exec_mapping_for_order(guest_start: u64, mapped_size: u64) -> GuestMapping {
