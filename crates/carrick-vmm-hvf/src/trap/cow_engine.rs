@@ -1433,6 +1433,9 @@ impl HvfVmState {
                     alias.owner_generation,
                 )
         });
+        // Local rows can outlive this MM's alias while a sibling keeps the
+        // physical owner alive. Global generation authenticates the frame,
+        // not this MM's ownership: only its selected alias makes a predecessor.
         let overlapping_mappings: Vec<_> = self
             .mappings
             .iter()
@@ -1440,6 +1443,20 @@ impl HvfVmState {
                 mapping.start < end
                     && mapping.end > request.semantic_base
                     && global_frame_region_owner_matches_in(self.custody(), mapping)
+                    && sparse_materialization::frame_grant_local_lease_is_current(
+                        (
+                            mapping.physical_ipa,
+                            mapping.physical_size as u64,
+                            mapping.owner_generation,
+                        ),
+                        aliases.iter().map(|(_, alias)| {
+                            (
+                                alias.physical_ipa,
+                                alias.physical_size as u64,
+                                alias.owner_generation,
+                            )
+                        }),
+                    )
             })
             .collect();
         let forbidden_mapping = overlapping_mappings.iter().any(|mapping| {
@@ -1489,11 +1506,41 @@ impl HvfVmState {
         } else {
             let planned =
                 self.plan_process_alias_retirement(request.semantic_base, semantic_len)?;
-            if planned.inventory.is_none()
-                || !replacement_leases
-                    .iter()
-                    .all(|lease| planned.planned_leases.contains(lease))
-            {
+            // A subrange replacement clips registry rows, not physical leases.
+            // Authenticated fragments outside this span keep their old lease;
+            // only leases with no survivor need an inventory retirement.
+            let retained = planned
+                .read_rows
+                .iter()
+                .filter(|row| {
+                    row.start < request.semantic_base
+                        || row.start.saturating_add(row.size as u64) > end
+                })
+                .map(|row| (row.physical_ipa, row.physical_size as u64))
+                .collect();
+            if !sparse_materialization::frame_grant_predecessors_are_accounted_for(
+                &replacement_leases,
+                &planned.planned_leases,
+                &retained,
+                planned.inventory.is_some(),
+            ) {
+                carrick_observability::probes::guest_internal_write_fault(
+                    request.semantic_base,
+                    request.len,
+                    22,
+                    &format!(
+                        "replacement leases={replacement_leases:x?} retired={:x?} retained={retained:x?} inventory={} aliases={} local={} rows={:?}",
+                        planned.planned_leases,
+                        planned.inventory.is_some(),
+                        aliases.len(),
+                        overlapping_mappings.len(),
+                        planned
+                            .read_rows
+                            .iter()
+                            .map(compact_alias_row)
+                            .collect::<Vec<_>>()
+                    ),
+                );
                 return decline("frame grant predecessor retirement is incomplete");
             }
             Some(planned)
