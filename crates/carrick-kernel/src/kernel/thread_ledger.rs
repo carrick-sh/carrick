@@ -121,17 +121,30 @@ impl PooledThreadIdentity {
 #[derive(Debug, Default)]
 pub(crate) struct ThreadIdentityPool {
     entries: Mutex<VecDeque<PooledThreadIdentity>>,
-    published: Mutex<
-        Vec<(
-            EntryRef,
-            super::objects::ThreadControlLease,
-            super::thread_retirement::RetirementReservation,
-            super::revision_capacity::RevisionReservation,
-        )>,
-    >,
+    published: Mutex<Vec<PublishedAbiThread>>,
+}
+
+/// Unique custody transferred from birth settlement to either retirement lane.
+#[derive(Debug)]
+pub(in crate::kernel) struct PublishedAbiThread {
+    pub(in crate::kernel) entry: EntryRef,
+    pub(in crate::kernel) control: super::objects::ThreadControlLease,
+    pub(in crate::kernel) storage: super::thread_retirement::RetirementReservation,
+    pub(in crate::kernel) revisions: super::revision_capacity::RevisionReservation,
 }
 
 impl ThreadIdentityPool {
+    pub(in crate::kernel) fn take_published(
+        &self,
+        key: super::objects::ThreadKey,
+    ) -> Option<PublishedAbiThread> {
+        let mut published = self.published.lock();
+        let index = published
+            .iter()
+            .position(|owned| owned.control.identity().1 == key)?;
+        Some(published.swap_remove(index))
+    }
+
     fn take_births(&self) -> Vec<(PooledThreadIdentity, carrick_el1_abi::BornRecord)> {
         let mut entries = self.entries.lock();
         let mut births = Vec::new();
@@ -503,7 +516,12 @@ impl ThreadLedger {
                             .thread_pool
                             .published
                             .lock()
-                            .push((entry, control, pooled.retirement, pooled.revisions));
+                            .push(PublishedAbiThread {
+                                entry,
+                                control,
+                                storage: pooled.retirement,
+                                revisions: pooled.revisions,
+                            });
                         published.push(publication);
                         abi_count += 1;
                         progress = true;
@@ -527,7 +545,7 @@ impl ThreadLedger {
                     let mut owned = pool.published.lock();
                     let mut index = 0;
                     while index < owned.len() {
-                        let (entry, control, _, _) = &owned[index];
+                        let PublishedAbiThread { entry, control, .. } = &owned[index];
                         if control.lifecycle().state(entry.index())
                             == Some((entry.generation(), EntryState::ExitedInZone))
                         {
@@ -537,7 +555,13 @@ impl ThreadLedger {
                         }
                     }
                 }
-                for (entry, control, retirement, revisions) in exits {
+                for PublishedAbiThread {
+                    entry,
+                    control,
+                    storage: retirement,
+                    revisions,
+                } in exits
+                {
                     let record = state.tasks.get(&task_id).unwrap_or_else(|| {
                         carrick_fatal::carrick_fatal!("thread::ledger", "exit lost task")
                     });
@@ -987,20 +1011,25 @@ mod tests {
 
     #[test]
     fn lifecycle_abi_birth_is_resolved_by_a_second_process() {
-        abi_birth_observed_by_peer(false, false);
+        abi_birth_observed_by_peer(false, false, false);
     }
 
     #[test]
     fn lifecycle_abi_birth_uses_reserved_resources_after_allocator_exhaustion() {
-        abi_birth_observed_by_peer(true, false);
+        abi_birth_observed_by_peer(true, false, false);
     }
 
     #[test]
     fn lifecycle_abi_birth_uses_revision_headroom_reserved_from_host_mutations() {
-        abi_birth_observed_by_peer(false, true);
+        abi_birth_observed_by_peer(false, true, false);
     }
 
-    fn abi_birth_observed_by_peer(exhaust_ids: bool, exhaust_revisions: bool) {
+    #[test]
+    fn lifecycle_host_adopted_abi_exit_consumes_exact_reserved_custody() {
+        abi_birth_observed_by_peer(false, true, true);
+    }
+
+    fn abi_birth_observed_by_peer(exhaust_ids: bool, exhaust_revisions: bool, host_exit: bool) {
         let (kernel, root) = bootstrap(9_670);
         let peer = kernel
             .fork_task(
@@ -1089,6 +1118,31 @@ mod tests {
             page.state(entry.index()),
             Some((entry.generation(), EntryState::Published))
         );
+        if host_exit {
+            assert!(
+                kernel
+                    .exit_thread(
+                        &adopted,
+                        Some(crate::kernel::operations::KernelFailpoint::BeforePublish)
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                page.state(entry.index()),
+                Some((entry.generation(), EntryState::Published))
+            );
+            kernel
+                .exit_thread(&adopted, None)
+                .expect("host exit uses reserved ABI retirement");
+            assert_eq!(
+                page.state(entry.index()),
+                Some((entry.generation(), EntryState::Reaped))
+            );
+            assert_eq!(page.live(), 2);
+            assert!(peer.exact_thread_is_live());
+            assert_eq!(peer.thread().control_lease().lifecycle().live(), 1);
+            assert_eq!(peer.kernel().live_task_for_thread(None, tid), None);
+        }
         drop(sibling);
     }
 

@@ -1050,6 +1050,17 @@ impl ThreadLifecyclePage {
         Ok(admission)
     }
 
+    /// Canonical host retirement of an adopted birth. The host owns execution
+    /// and has already decremented the live census; no EL1 activity is owed.
+    pub fn retire_published(&self, r: EntryRef) -> Result<(), TransitionError> {
+        self.transition(
+            r,
+            &[EntryState::Published],
+            EntryState::Reaped,
+            Ordering::AcqRel,
+        )
+    }
+
     /// Host settle folded the exit: `ExitedInZone -> Reaped`.
     pub fn reap(&self, r: EntryRef) -> Result<(), TransitionError> {
         self.transition(
