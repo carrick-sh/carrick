@@ -1094,3 +1094,56 @@ release build in `/tmp/phaseb-gettid-5ac2f1f55-artifact.txt`: SHA-256
 CDHash `805d402281012cb89c2e14655ad282ed7f41b2a8`, LC_UUID
 `32E03C1C-BD77-3E35-BD40-1591FCDE169B`; hypervisor entitlement and
 `__dof_carrick` were present. This is failure provenance, not acceptance.
+
+### 2026-10-02: exact decline census, budgets still red
+
+Rebased source `315a494d1c5b961bf79461039e80f7dc6bad0a0d` adds exact
+exit-decline counters, the fixture's numeric spawn errno witness, and
+four typed host-clone EAGAIN producer markers. The original one-spawn
+failure remains unresolved: the new signed focused run and one LLDB
+producer diagnostic both completed all three semantic scales without it.
+The producer breakpoint resolved but was never hit; this does not prove
+that the intermittent failure is fixed.
+
+Signed run `phaseb-producer-spawn-20261002-1630` measured:
+
+| threads | clone served/forwarded | exit served/forwarded | exit declines |
+| --- | --- | --- | --- |
+| 128 | 92/37 | 0/128 | NoEntry 36, NoCurrent 92 |
+| 512 | 336/177 | 0/512 | NoEntry 175, NoCurrent 334, dispatch host work 3 |
+| 2048 | 1356/693 | 0/2050 | NoEntry 681, NoCurrent 1350, venue 2, dispatch host work 17 |
+
+Clone slopes are 0.3646 and 0.3359; exit slopes are 1.0000 and 1.0013.
+Sigmask and altstack forwarding remains zero. `ClonePoolEmpty` is zero
+at all these scales, while clone dispatch host work is 3/12/27. Thus
+pool exhaustion does not account for the remaining spawn forwards;
+the other clone-decline fences still need attribution. Forwarded
+munmap is 257/1027/4107, mmap 284/1122/4487 and mprotect 257/1025/4097.
+Log: `/tmp/phaseb-producer-signed-spawn.log`. Both scoped cleanup IDs
+report zero; negative entitlement control passes. The budget fails.
+
+Full signed `el1_` run `phaseb-producer-full-20261002-1600` is incomplete
+acceptance evidence. Occupancy passed (150 forks per process, eight
+writers, 921 edits and no errors); exec storm passed four rounds. Fork
+storm stalled with executors in HVF idle waits. A real core and matching
+executable were retained as `/tmp/phaseb-producer-forkstorm-315a494d1.core`
+and `/tmp/phaseb-producer-el1_sched-315a494d1`. Core capture left the
+process stopped after detach; it was explicitly continued, then the
+watchdog fired. Its wall timing is debugger-perturbed, not acceptance.
+The post-mortem shows root blocked on ChildState (generation 767), and
+draining tid 1052 blocked on HostWait (generation 2) without a continuation;
+the scheduler has no queued work or residency. The teardown orphan is
+unresolved. Later cleanup raced the inotify contract, so it cannot supply
+a no-new-red census. The separate inotify09 probe completed TPASS in
+5.85 s. Reader and spawn cases in the killed scheduler executable did not
+run. Final scoped cleanup reports zero processes.
+
+The failed runners publish no acceptance receipt. The focused tested
+artifact was captured directly: SHA-256
+`57bc02d3d28eb223144dfc35f7771bbbdc1f67157f20197a76e2f4547afbe7a2`,
+CDHash `3aa1b20e329586fe13e1876eb28d7c5c7bc58772`, LC_UUID
+`F0A56C7D-6C34-3351-B21B-5042CA929339`; hypervisor entitlement and
+`__dof_carrick` are present. Re-signing changed identity from the saved
+core executable (SHA-256
+`8085ddd797131e2ab6c4b5d28039ee0691a7c22ba7c7229ec4ba44e8f7b14ef4`).
+These are failure receipts, not lifecycle acceptance.
