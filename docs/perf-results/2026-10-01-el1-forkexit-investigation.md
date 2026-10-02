@@ -858,3 +858,64 @@ remain open; credentials/affinity at claim are not yet protected by those
 guards. No signed acceptance, cached libc probes, hatch comparison, or
 Docker ran at this checkpoint. Spawn slope is not green. Main remained
 `4c4d06b4c345550da68b4b8cd44dfd8f6e53457b`, so no rebase was needed.
+
+### Phase B process adoption capacity checkpoint (2026-10-02)
+
+The next three commits reserve exact-process adoption capacity
+(`0d1be206d`), share the typed-origin runtime constructor with host clone
+(`35012b995`), and reserve scheduler submission before birth (`c170a75dd`).
+These are the rebased names of `8ac07311f`, `c78d00a70`, and `ef4694b17`.
+Main moved to `e59eec4e4` during verification with four documentation-only
+commits. Rebase completed cleanly; range-diff reports all nineteen branch
+commits unchanged.
+
+Pool stocking now obtains the process factory's non-cloneable ticket before
+publishing a reserved identity. Capacity failure declines stocking. The
+ticket owns a runtime cell, injected execution-lease slot, process lifetime
+and exact first-generation submission grant. The shared constructor checks
+exact task/thread and kernel ownership, then installs either the host clone
+completion token or ABI-origin idle completion. Host clone consumes its own
+pre-birth grant through the existing dormant-binding publication; it no
+longer borrows a running sibling's submission grant.
+
+Red-first contracts cover refusal before stocking in one of two live
+processes and scheduler reservation before birth. Fixed scope contracts
+also reject peer consumption and admission after scheduler closing. The
+nine host clone/process lifecycle tests and runtime constructor scope test
+pass. `just test-kernel`, `just test`, and workspace `just clippy` pass on
+`ef4694b17`; host receipts include 670 runtime tests (eight ignored) and
+684 serial HVF library tests (three ignored). An exploratory parallel
+runtime invocation failed on carrier counts and a global vfork test hook;
+both failures reproduced on its parent. The prescribed serial runtime
+lane passed. No concurrency, timeout or budget was changed.
+
+The full signed `carrick-embed el1_ --nocapture` run on `ef4694b17` reports
+exactly the known six failures and no new reds. The scheduler executable
+reports 46 passed and six failed. Two-process occupancy and fork-storm
+pass. Spawn slope remains red: clone `0.9974`, exit `1.0026`, sigmask and
+sigaltstack `0.0000`. Run id:
+`phaseb-adoption-20261002-ef4694b17-el1`; both it and its `-cli` scope have
+zero remaining processes. The signed scheduler artifact SHA-256 is
+`256d87cf1837ba397af6287a55d40cdae6527dee4976ea530052c244a7bd6e71`,
+CDHash `fa45cb25a65273d63c7369c484b4eadbb474aa95`; entitlement, UUID and
+DOF commands are retained in `/tmp/phaseb-process-adoption-artifact.json`.
+These are pre-rebase receipts, not post-rebase signed acceptance.
+After rebase, the nine runtime lifecycle tests pass on `c170a75dd`;
+log `/tmp/phaseb-process-adoption-post-rebase.log`.
+
+Logs: `/tmp/phaseb-process-adoption-{test-kernel,host-test,clippy,
+lint-domains,signed-el1,cleanup}.log` and
+`/tmp/phaseb-process-submission-{red,green-final,runtime,scope,
+callgraph,runtime-serial,parent-runtime-all,aborts}.log`.
+Lint-domains and the abort checker still fail on 24 unclassified sites;
+no blanket classifications were added.
+
+This is still incomplete implementation, not Phase B acceptance. The
+ticket is stored with published ABI custody and has an exact consume API,
+but the first host-entry hook does not consume it yet. Its runtime state
+has no lazy task-only backend binding or execution generation. Building
+the process-owned MM/backend template is the next implementation task,
+not an external blocker. Production `born_slot` still returns `None`.
+Pending-ticket kernel lifetime, conflicting-authority admission guards,
+exact carrier metadata retirement and teardown remain open. Cached libc
+probes and the hatch comparison have not run; no Docker ran.
