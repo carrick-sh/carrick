@@ -5770,6 +5770,7 @@ mod real {
         /// that page's live terminal descriptor (0 when no walk). The caller
         /// usually lowers the refusal to EFAULT.
         fn guest__internal__read__fault(_: u64, _: u64, _: u32, _: u64) {}
+        fn el1__mapping__leaf(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Fires inside rt_sigreturn/restore. `saved_pc` is the PC about to be
         /// restored into ELR_EL1, `sp` the SP_EL0 the frame was read from,
         /// `magic` the frame magic read back. A corrupted `saved_pc` or `magic`
@@ -7921,6 +7922,11 @@ mod real {
         carrick_usdt::guest__internal__read__fault!(|| (page, length, phase, live_descriptor));
     }
 
+    /// Live descriptor observation evaluated only with a listening consumer.
+    pub fn el1_mapping_leaf(emit: impl FnOnce() -> (u32, u64, u64, u64, u64)) {
+        carrick_usdt::el1__mapping__leaf!(|| emit());
+    }
+
     pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
         carrick_usdt::signal__restore!(|| (saved_pc, sp, magic));
     }
@@ -9065,6 +9071,9 @@ mod stub {
     stub!(guest_internal_write_fault(address: u64, length: u64, phase: u32, error: &str));
     stub!(hvpatch_exec_publication(output: u64, len: u64, invalidations: u32));
     stub!(guest_internal_read_fault(page: u64, length: u64, phase: u32, live_descriptor: u64));
+    pub fn el1_mapping_leaf(emit: impl FnOnce() -> (u32, u64, u64, u64, u64)) {
+        let _ = emit;
+    }
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
     stub!(kick_in_kernel(pc: u64, el: u32));
     stub!(vcpu_kick(vcpu: u64, valid: i32, rc: i32));
