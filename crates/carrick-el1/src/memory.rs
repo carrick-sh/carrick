@@ -189,7 +189,9 @@ pub fn decide_anonymous_syscall(
                 return ReservationDisposition::Forward;
             }
             let Some(prot) = ReservationProtection::from_bits(frame.x[2]) else {
-                return ReservationDisposition::Return(-EINVAL);
+                // mmap accepts protection bits beyond the reservation ABI;
+                // the host Linux decoder owns that interpretation.
+                return ReservationDisposition::Forward;
             };
             if !frame.x[5].is_multiple_of(PAGE_SIZE) {
                 return ReservationDisposition::Return(-EINVAL);
@@ -1364,6 +1366,24 @@ mod tests {
             let mut owed = Vec::new();
             model.observe_deferred_returns(&mut |entry| owed.push(entry));
             owed
+        }
+
+        #[test]
+        fn mmap_unrepresented_protection_preserves_host_linux_decoder() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, _) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [0, 0x1000, 1 << 28, ANON, u64::MAX, 0],
+            );
+            assert_eq!(route, DelegatedAnonymous::Forward);
+            assert!(editor.calls.is_empty());
         }
 
         #[test]
