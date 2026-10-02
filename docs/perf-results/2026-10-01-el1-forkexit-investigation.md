@@ -520,3 +520,12 @@ type, page index, cached lookup/result, insertion, lifetime comment, draining
 iteration and retirement call. These are private anonymous lifecycle metadata,
 not file-description or host-fd authority. No existing row was retired or
 reclassified. The compiler capture still has all 596 authority rows unchanged.
+
+`CARGO_BUILD_JOBS=3 just reconcile-inventories` subsequently exited zero on
+clean `399a6b9c6` (`/tmp/forkexit-sol-i2-reconcile-final.log`): 596 unchanged
+compiler authority rows, zero inventory position changes, K1 taxonomy and
+all four abort shards passed. Only the compiler source-head receipt changed.
+No post-I2 signed test or full requested gate is claimed. Resume with the
+ABI pool/ledger authority before enabling `born_slot`; then settle before
+context resolution and membership observers, close admission, and implement
+exact retirement. No build or guest is left running by this checkpoint.
