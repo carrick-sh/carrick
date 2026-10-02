@@ -587,10 +587,11 @@ mod tests {
         }
         let first = root.thread().control_lease();
         let second = peer.thread().control_lease();
-        assert_ne!(first.backing_base(), second.backing_base());
+        assert_eq!(first.backing_base(), second.backing_base());
+        assert_ne!(first.slot_address(), second.slot_address());
         assert_ne!(
-            first.lifecycle().backing_base(),
-            second.lifecycle().backing_base()
+            first.lifecycle().page_address(),
+            second.lifecycle().page_address()
         );
         first.lifecycle().close();
         assert_eq!(

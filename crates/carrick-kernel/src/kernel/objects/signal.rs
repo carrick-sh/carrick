@@ -433,6 +433,14 @@ impl Default for TaskPendingSignals {
 
 impl TaskPendingSignals {
     pub fn new() -> Self {
+        Self::with_lifecycle(super::ThreadLifecycleLease::new())
+    }
+
+    pub(crate) fn for_fork(&self) -> Self {
+        Self::with_lifecycle(self.lifecycle.for_fork())
+    }
+
+    fn with_lifecycle(lifecycle: super::ThreadLifecycleLease) -> Self {
         Self {
             queue: Mutex::new(TaskPendingQueue {
                 queue: PendingQueue {
@@ -442,7 +450,7 @@ impl TaskPendingSignals {
                 },
                 named_recipients: BTreeMap::new(),
             }),
-            lifecycle: super::ThreadLifecycleLease::new(),
+            lifecycle,
             revision: ObjectRevision::new(),
         }
     }

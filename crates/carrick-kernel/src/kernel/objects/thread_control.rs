@@ -11,7 +11,68 @@ use parking_lot::Mutex;
 use super::{TaskKey, ThreadKey};
 
 const PAGE_BYTES: usize = 16 * 1024;
+const SLAB_BYTES: usize = 512 * 1024;
+const SLAB_GRANULES: usize = SLAB_BYTES / PAGE_BYTES;
 const SLOTS: usize = PAGE_BYTES / std::mem::size_of::<ThreadControlSlot>();
+
+#[derive(Debug, Default)]
+struct AbiPagePool {
+    slabs: Mutex<Vec<Weak<AbiSlab>>>,
+}
+
+#[derive(Debug)]
+struct AbiSlab {
+    mapping: OwnedHostMapping,
+    offset: usize,
+    occupied: Mutex<u32>,
+}
+
+impl AbiSlab {
+    fn base(&self) -> *mut u8 {
+        // SAFETY: the aligned slab lies inside the overallocated mapping.
+        unsafe { self.mapping.as_ptr().add(self.offset) }
+    }
+
+    fn claim(&self) -> Option<usize> {
+        let mut occupied = self.occupied.lock();
+        let index = (!*occupied).trailing_zeros() as usize;
+        if index == SLAB_GRANULES {
+            return None;
+        }
+        *occupied |= 1 << index;
+        Some(index)
+    }
+}
+
+impl AbiPagePool {
+    fn allocate(self: &Arc<Self>) -> (Arc<AbiSlab>, usize) {
+        let mut slabs = self.slabs.lock();
+        slabs.retain(|slab| slab.strong_count() != 0);
+        for slab in slabs.iter().filter_map(Weak::upgrade) {
+            if let Some(index) = slab.claim() {
+                return (slab, index);
+            }
+        }
+        let mapping = OwnedHostMapping::map_shared_anon(
+            SLAB_BYTES + PAGE_BYTES,
+            HostMappingKind::PerMmKernelState,
+        )
+        .unwrap_or_else(|error| {
+            carrick_fatal::carrick_fatal!(
+                "thread::control",
+                "cannot allocate shared ABI slab: {error}"
+            )
+        });
+        let base = mapping.as_ptr().addr();
+        let slab = Arc::new(AbiSlab {
+            mapping,
+            offset: base.next_multiple_of(PAGE_BYTES) - base,
+            occupied: Mutex::new(1),
+        });
+        slabs.push(Arc::downgrade(&slab));
+        (slab, 0)
+    }
+}
 
 /// Contains no allocator metadata, pointers, locks or host-only thread state.
 #[repr(C, align(16384))]
@@ -25,12 +86,14 @@ struct ControlBacking {
     page: SharedAbiPage<ControlPage>,
 }
 
-/// Owns the host VM object, as well as the Rust value's lifetime. The aligned
-/// ABI granule is the only range exposed; mmap slack and Arc metadata are not.
+/// Owns one ABI granule and shares its slab's host VM object. Slabs contain
+/// only the two closed ABI layouts and free bytes; allocator and Arc metadata
+/// remain outside the exposed range.
 #[derive(Debug)]
 struct SharedAbiPage<T: AbiPage> {
-    mapping: OwnedHostMapping,
-    offset: usize,
+    slab: Arc<AbiSlab>,
+    index: usize,
+    pool: Arc<AbiPagePool>,
     value: std::marker::PhantomData<T>,
 }
 
@@ -41,30 +104,20 @@ impl AbiPage for ControlPage {}
 impl AbiPage for LifecycleBacking {}
 
 impl<T: AbiPage> SharedAbiPage<T> {
-    fn new(value: T) -> Self {
-        // Both concrete ABI pages are exactly one granule. Overallocate by one
-        // granule on hosts with smaller mmap alignment, without MAP_FIXED or a
-        // second allocation. The unused slack stays demand-zero.
+    fn new(value: T, pool: Arc<AbiPagePool>) -> Self {
+        // Both concrete ABI pages occupy exactly one claimed slab granule.
         const {
             assert!(std::mem::size_of::<T>() == PAGE_BYTES);
             assert!(std::mem::align_of::<T>() == PAGE_BYTES);
         }
-        let mapping =
-            OwnedHostMapping::map_shared_anon(PAGE_BYTES * 2, HostMappingKind::PerMmKernelState)
-                .unwrap_or_else(|error| {
-                    carrick_fatal::carrick_fatal!(
-                        "thread::control",
-                        "cannot allocate shared ABI backing: {error}"
-                    )
-                });
-        let base = mapping.as_ptr().addr();
-        let offset = base.next_multiple_of(PAGE_BYTES) - base;
+        let (slab, index) = pool.allocate();
         // SAFETY: one complete aligned granule lies within the mapping. This
         // owner exclusively initializes it before publishing shared references.
-        unsafe { mapping.as_ptr().add(offset).cast::<T>().write(value) };
+        unsafe { slab.base().add(index * PAGE_BYTES).cast::<T>().write(value) };
         Self {
-            mapping,
-            offset,
+            slab,
+            index,
+            pool,
             value: std::marker::PhantomData,
         }
     }
@@ -79,20 +132,21 @@ impl<T: AbiPage> Deref for SharedAbiPage<T> {
     type Target = T;
     fn deref(&self) -> &T {
         // SAFETY: initialized aligned T stays live until this owner drops.
-        unsafe { &*self.mapping.as_ptr().add(self.offset).cast::<T>() }
+        unsafe { &*self.slab.base().add(self.index * PAGE_BYTES).cast::<T>() }
     }
 }
 
 impl<T: AbiPage> Drop for SharedAbiPage<T> {
     fn drop(&mut self) {
-        // SAFETY: exclusive final ownership; drop the value before munmap.
+        // SAFETY: exclusive final ownership; drop before publishing vacancy.
         unsafe {
-            self.mapping
-                .as_ptr()
-                .add(self.offset)
+            self.slab
+                .base()
+                .add(self.index * PAGE_BYTES)
                 .cast::<T>()
                 .drop_in_place()
         };
+        *self.slab.occupied.lock() &= !(1 << self.index);
     }
 }
 
@@ -116,18 +170,33 @@ pub struct ThreadLifecycleLease(Arc<SharedAbiPage<LifecycleBacking>>);
 
 impl ThreadLifecycleLease {
     pub(in crate::kernel) fn new() -> Self {
-        Self(Arc::new(SharedAbiPage::new(LifecycleBacking {
-            page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
-            padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
-        })))
+        Self::in_pool(Arc::new(AbiPagePool::default()))
+    }
+
+    pub(in crate::kernel) fn for_fork(&self) -> Self {
+        Self::in_pool(self.0.pool.clone())
+    }
+
+    fn in_pool(pool: Arc<AbiPagePool>) -> Self {
+        Self(Arc::new(SharedAbiPage::new(
+            LifecycleBacking {
+                page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
+                padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
+            },
+            pool,
+        )))
     }
 
     pub fn backing_base(&self) -> HostVa {
-        HostVa(std::ptr::from_ref(&**self.0).addr())
+        HostVa(self.0.slab.base().addr())
     }
 
     pub const fn backing_len(&self) -> usize {
-        PAGE_BYTES
+        SLAB_BYTES
+    }
+
+    pub fn page_address(&self) -> HostVa {
+        HostVa(std::ptr::from_ref(&**self.0).addr())
     }
 }
 
@@ -175,9 +244,12 @@ impl ThreadControlArena {
             let mut free = self.0.free.lock();
             if free.is_empty() {
                 let page = Arc::new(ControlBacking {
-                    page: SharedAbiPage::new(ControlPage {
-                        slots: [const { ThreadControlSlot::new() }; SLOTS],
-                    }),
+                    page: SharedAbiPage::new(
+                        ControlPage {
+                            slots: [const { ThreadControlSlot::new() }; SLOTS],
+                        },
+                        self.0.lifecycle.0.pool.clone(),
+                    ),
                 });
                 free.extend((0..SLOTS).map(|index| FreeSlot {
                     page: Arc::clone(&page),
@@ -248,11 +320,11 @@ impl ThreadControlLease {
 
     /// Granule-aligned base of the control-only page this lease pins.
     pub fn backing_base(&self) -> HostVa {
-        HostVa(std::ptr::from_ref(&*self.allocation().page.page).addr())
+        HostVa(self.allocation().page.page.slab.base().addr())
     }
 
     pub const fn backing_len(&self) -> usize {
-        PAGE_BYTES
+        SLAB_BYTES
     }
 
     pub fn slot_address(&self) -> HostVa {
@@ -369,7 +441,7 @@ mod tests {
         let second_page = second_slot.lifecycle();
         assert_ne!(first_page.backing_base(), second_page.backing_base());
         assert_eq!(first_page.backing_base().0 % PAGE_BYTES, 0);
-        assert_eq!(first_page.backing_len(), PAGE_BYTES);
+        assert_eq!(first_page.backing_len(), SLAB_BYTES);
         first_page.close();
         assert_eq!(
             first_slot.lifecycle().gate(),
@@ -450,6 +522,6 @@ mod tests {
             assert!(addresses.insert(slot.slot_address().raw()));
             pages.insert(slot.backing_base().raw());
         }
-        assert_eq!(pages.len(), 3);
+        assert_eq!(pages.len(), 1);
     }
 }

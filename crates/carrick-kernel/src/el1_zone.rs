@@ -877,6 +877,8 @@ mod tests {
                 file_table: 1,
                 generation: 1,
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             })
             .unwrap();
         let lane = ObjectWaitKey::new(1, 1).unwrap();
@@ -895,6 +897,8 @@ mod tests {
                 file_table: 1,
                 generation: 1,
                 affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
             })
             .unwrap();
         let foreign_record = zone.alloc_record(identity(153_902)).unwrap();

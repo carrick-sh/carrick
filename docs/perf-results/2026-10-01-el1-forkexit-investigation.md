@@ -616,3 +616,36 @@ exactly 128 metadata maps. A 600-granule retained population uses 9.375 MiB
 of actual backing within the existing 64 MiB aperture, but the current
 allocator cannot admit it. Red-first capacity proof and repair are next;
 the publication-disabled passes do not confer default-on acceptance.
+
+### Resume after landing J: slab capacity
+
+Rebased onto `75111e814`; the retained checkpoint is `3ea3cda16`.
+Conflicts were inventory counts/source-head receipts; product code merged.
+Two new landing-J test identities needed zero lifecycle/control bindings to
+compile against this branch's extended ABI.
+
+The original VM-free mapping diagnostic failed at retained granule 128 with
+`Busy` (`/tmp/forkexit-sol-j-capacity-red.log`). That diagnostic allocated
+600 unrelated host mappings: those cannot become one physical slab without
+splitting or copying authoritative storage. The architectural contract now
+uses actual kernel fork ownership: 300 live children retain 600 distinct
+lifecycle/control granules. It failed with **600 backing regions** against
+the **19-slab** ceiling (`/tmp/forkexit-sol-j-slab-red.log`).
+
+Authoritative ABI allocation now uses 512 KiB shared slabs with 32 claimed
+16 KiB granules. Fork descendants share the storage pool, not lifecycle or
+signal authority; independent roots retain independent pools. Granules are
+released only with their final page owner and reused with fresh ABI values.
+The carrier maps each slab once, publishes exact page/slot offsets, and keys
+thread pins by lifecycle-page identity rather than shared backing identity.
+There is no copied guest control view. The contract also drops one child and
+requires reuse of both released addresses with an open gate and empty mask.
+
+Focused green commands (all `CARGO_BUILD_JOBS=3`): kernel `--lib lifecycle_`
+under `RUST_TEST_THREADS=1` (24 tests), kernel `--lib thread_control::tests`
+under `RUST_TEST_THREADS=1` (4 tests), runtime `--lib thread_lifecycle::tests`
+(2 tests). Logs: `/tmp/forkexit-sol-j-{capacity-kernel,control,owner}-green.log`.
+The old distinct-backing assertion for fork siblings now requires distinct
+page/slot addresses within the shared slab; gate, mask and final-owner
+independence remain asserted. Exhaustion behavior and signed default-on
+acceptance are not yet verified.
