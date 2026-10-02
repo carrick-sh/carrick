@@ -31,6 +31,27 @@ const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
 const PAGE_SIZE: u64 = 4096;
 
+/// Exact mmap protection vocabulary qualified by the memflagmatrix oracle.
+/// Other unrepresented bits retain the existing refusal; mprotect is separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MmapProtectionRoute {
+    Reservation(carrick_el1_abi::ReservationProtection),
+    HostIgnoredBit,
+    Invalid,
+}
+
+impl MmapProtectionRoute {
+    fn decode(bits: u64) -> Self {
+        if let Some(protection) = carrick_el1_abi::ReservationProtection::from_bits(bits) {
+            Self::Reservation(protection)
+        } else if bits == 1 << 28 {
+            Self::HostIgnoredBit
+        } else {
+            Self::Invalid
+        }
+    }
+}
+
 /// Decision before T2's descriptor/backing service. `Work` retains the exact
 /// originating frame identity; it must survive the host boundary as an owned
 /// continuation, never as a request to replay the Linux syscall.
@@ -188,10 +209,10 @@ pub fn decide_anonymous_syscall(
             {
                 return ReservationDisposition::Forward;
             }
-            let Some(prot) = ReservationProtection::from_bits(frame.x[2]) else {
-                // mmap accepts protection bits beyond the reservation ABI;
-                // the host Linux decoder owns that interpretation.
-                return ReservationDisposition::Forward;
+            let prot = match MmapProtectionRoute::decode(frame.x[2]) {
+                MmapProtectionRoute::Reservation(protection) => protection,
+                MmapProtectionRoute::HostIgnoredBit => return ReservationDisposition::Forward,
+                MmapProtectionRoute::Invalid => return ReservationDisposition::Return(-EINVAL),
             };
             if !frame.x[5].is_multiple_of(PAGE_SIZE) {
                 return ReservationDisposition::Return(-EINVAL);
@@ -1370,6 +1391,20 @@ mod tests {
 
         #[test]
         fn mmap_unrepresented_protection_preserves_host_linux_decoder() {
+            assert_eq!(
+                MmapProtectionRoute::decode(1 << 28),
+                MmapProtectionRoute::HostIgnoredBit
+            );
+            assert_eq!(
+                MmapProtectionRoute::decode(1 << 27),
+                MmapProtectionRoute::Invalid
+            );
+            for bits in 0..8 {
+                assert!(matches!(
+                    MmapProtectionRoute::decode(bits),
+                    MmapProtectionRoute::Reservation(_)
+                ));
+            }
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let delegated = mm(&spaces, &table, 17, true);
             let mut editor = Editor::over(RangeBacking::Empty);
