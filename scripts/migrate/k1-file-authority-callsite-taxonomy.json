@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "counts": {
-    "inspect_misc": 165,
+    "inspect_misc": 166,
     "lifecycle": 40,
     "create_install": 73,
     "slot_description_mutation": 27,
@@ -2919,6 +2919,17 @@
       "text": ".write_open_files()",
       "scope_kind": "test_or_definition",
       "enclosing_function": "red_until_step3_m4_rights_create_placeholder_per_message",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
+      "line": 383,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".write_open_files()",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "red_until_step3_m4_cyclic_rights_survive_last_external_close",
       "migration_family": "inspect_misc"
     },
     {

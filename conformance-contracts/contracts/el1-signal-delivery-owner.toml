@@ -5,7 +5,7 @@ guest_surfaces = ["signal:asynchronous-delivery", "syscall:rt_sigreturn", "sysca
 semantic_authority = ["man 7 signal", "man 2 sigaction", "man 2 sigreturn"]
 fixture = "VM-free scoped two-owner seam; see M2-M5 witness ledger"
 scale_points = [1, 8, 32, 128]
-rationale = "Two live tasks with separate containers retain independent realtime queues. Clearing shared pending summary leaves host payload authority; this preparation witness does not treat summary clear as a valid delivery transaction. FIFO and lifecycle reducers remain positive semantic requirements. Exact routing population work and EL0 frames remain unresolved."
+rationale = "Two live tasks with separate containers retain independent realtime queues. Clearing shared pending summary leaves host payload authority; this preparation witness does not treat summary clear as a valid delivery transaction. FIFO and lifecycle reducers remain positive semantic requirements. Exact routing population work and EL1 frame ownership remain unresolved; signed EL0 frame semantics are bound separately."
 structural_budgets = []
 
 [bindings]
@@ -14,7 +14,7 @@ vm_free = "carrick-kernel::dispatch::signal::tests::{m5_two_process_exact_thread
 embed = "carrick-conformance-next::probes_shard_0::m5_el0_nested_altstack_and_fault_frame_bindings; carrick-embed::el1_sched::el1_sched_pstate_seen_by_the_guest_is_unchanged"
 
 [bindings.unresolved]
-embed_structural = "No EL0 execution in preparation. Cutover requires carrick-conformance-next bindings for the unresolved scenarios listed in the witness ledger."
+embed_structural = "Signed EL0 frame and PSTATE semantic bindings pass. EL1 ownership, malformed sigreturn and the remaining scenarios listed in the witness ledger remain unresolved."
 docker = "No Docker in preparation; native arm64 differential remains required at cutover."
 
 [runtime_ratio]
