@@ -12815,3 +12815,69 @@ mod guest_cow {
         );
     }
 }
+
+#[test]
+fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        790,
+        0x9a01_7900_0000,
+        0x9b01_7900_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Host,
+    );
+    let tables = fixture.installed.state.page_tables_authority();
+    tables.replace_manager(tables.snapshot_image());
+    let walk = tables.with_manager(|m| m.debug_walk(TEST_VA)).unwrap();
+    let offset =
+        (walk[2] & 0x0000_ffff_ffff_f000) - fixture.root_key.0 + ((TEST_VA >> 12) & 511) * 8;
+    assert!(offset + 8 <= fixture.root_key.1);
+    unsafe {
+        *(fixture.root_host as *mut u8)
+            .add(offset as usize)
+            .cast::<u64>() |= 1;
+    }
+    struct Flush;
+    impl carrick_aarch64::vmm::Stage1Services for Flush {
+        fn flush(&mut self) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn publish(
+            &mut self,
+            _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            carrick_aarch64::vmm::GuestPublishError,
+        > {
+            panic!("host reuse must not publish a guest transaction")
+        }
+    }
+    let owners = owner_keys();
+    fixture
+        .task
+        .reuse_sole_owner_cow_in_place(
+            CowArmedSpan {
+                va: TEST_VA,
+                len: OWNER_LEN,
+                executable: false,
+                kernel_only: false,
+            },
+            0x9b01_7900_0000,
+            fixture.root_host as *mut u8,
+            false,
+            &mut Flush,
+        )
+        .expect("reuse must adopt live leaves before authenticating its edit");
+    assert_eq!(owner_keys(), owners, "sole-owner reuse allocates no frame");
+    assert_eq!(
+        tables.with_manager(|m| m.translate(TEST_VA)),
+        Some(Some(0x9b01_7900_0000))
+    );
+    assert_eq!(
+        tables.with_manager(|m| m.debug_walk(TEST_VA)[3] & (3 << 6)),
+        Some(3 << 6)
+    );
+}
