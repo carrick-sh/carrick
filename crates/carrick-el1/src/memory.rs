@@ -31,23 +31,20 @@ const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
 const PAGE_SIZE: u64 = 4096;
 
-/// Exact mmap protection vocabulary qualified by the memflagmatrix oracle.
-/// Other unrepresented bits retain the existing refusal; mprotect is separate.
+/// Keep mmap protection outside EL1's vocabulary on the host decode route.
+/// The memflagmatrix oracle records ignored bits; mprotect is separate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MmapProtectionRoute {
     Reservation(carrick_el1_abi::ReservationProtection),
-    HostIgnoredBit,
-    Invalid,
+    HostUnrepresentedBits,
 }
 
 impl MmapProtectionRoute {
     fn decode(bits: u64) -> Self {
         if let Some(protection) = carrick_el1_abi::ReservationProtection::from_bits(bits) {
             Self::Reservation(protection)
-        } else if bits == 1 << 28 {
-            Self::HostIgnoredBit
         } else {
-            Self::Invalid
+            Self::HostUnrepresentedBits
         }
     }
 }
@@ -211,8 +208,9 @@ pub fn decide_anonymous_syscall(
             }
             let prot = match MmapProtectionRoute::decode(frame.x[2]) {
                 MmapProtectionRoute::Reservation(protection) => protection,
-                MmapProtectionRoute::HostIgnoredBit => return ReservationDisposition::Forward,
-                MmapProtectionRoute::Invalid => return ReservationDisposition::Return(-EINVAL),
+                MmapProtectionRoute::HostUnrepresentedBits => {
+                    return ReservationDisposition::Forward;
+                }
             };
             if !frame.x[5].is_multiple_of(PAGE_SIZE) {
                 return ReservationDisposition::Return(-EINVAL);
@@ -1393,11 +1391,11 @@ mod tests {
         fn mmap_unrepresented_protection_preserves_host_linux_decoder() {
             assert_eq!(
                 MmapProtectionRoute::decode(1 << 28),
-                MmapProtectionRoute::HostIgnoredBit
+                MmapProtectionRoute::HostUnrepresentedBits
             );
             assert_eq!(
                 MmapProtectionRoute::decode(1 << 27),
-                MmapProtectionRoute::Invalid
+                MmapProtectionRoute::HostUnrepresentedBits
             );
             for bits in 0..8 {
                 assert!(matches!(
