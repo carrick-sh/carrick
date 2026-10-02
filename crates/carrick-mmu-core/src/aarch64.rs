@@ -5579,6 +5579,44 @@ impl PageTableManager {
         }
     }
 
+    /// Clear an absent semantic VA span in an offline fork image. Unlike
+    /// lease retirement, no output survives: the child's inventory separately
+    /// retains every physical owner needed by its live aliases. Covering
+    /// terminals are cleared whole; only boundary blocks need splitting.
+    pub fn clear_offline_fork_range(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
+        if self.is_live()
+            || !self.offline_private_image
+            || len == 0
+            || !va.is_multiple_of(PT_PAGE)
+            || !len.is_multiple_of(PT_PAGE as usize)
+        {
+            return Err(PageTableError::BadAddress);
+        }
+        let end = va
+            .checked_add(len as u64)
+            .ok_or(PageTableError::BadAddress)?;
+        if descriptor_txn::copy_window::overlaps_cow_copy_window(va, len as u64) {
+            return Err(PageTableError::CarrickOwnedWindow);
+        }
+        let mut current = va;
+        while current < end {
+            let (location, level) = self.leaf_offset(current, false, None)?;
+            let descriptor = self.read_desc(location)?;
+            let (span, mask) = Self::level_span(level);
+            let start = current & mask;
+            let next = start.checked_add(span).ok_or(PageTableError::BadAddress)?;
+            if descriptor == 0 {
+                current = next.min(end);
+            } else if current == start && next <= end || level == 3 {
+                self.write_desc(location, 0)?;
+                current = next.min(end);
+            } else {
+                self.split_block(location, level, None)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Remove EL1-private authority from an invalid file BUS tail. The output
     /// remains recorded for the owning stage-2 lease, but no EL1 permission or
     /// prepared-backing decision may use it after the file fault is published.
