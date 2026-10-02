@@ -6,15 +6,20 @@ use carrick_el1::memory::reservations::{
     Refusal, Reservations, ResolvedReservationNodes, SharedReservations,
 };
 use carrick_el1_abi::ReservationMm;
+use carrick_guest_mem::HostVa;
+use carrick_host::host_mapping::{HostMappingKind, OwnedHostMapping};
 use carrick_kernel::dispatch::mem::el1_reservations::{
     HostReservationProvider, PreparedHostReservations,
 };
-use carrick_vmm_hvf::metadata_grant::{CarrierMetadataAccess, HostMetadataExtentPin};
+use carrick_vmm_hvf::metadata_grant::{
+    CarrierMetadataAccess, HostMetadataExtentPin, RetainedMetadataBacking,
+};
 use parking_lot::Mutex;
 
 pub(super) struct CarrierReservations {
     access: Arc<CarrierMetadataAccess>,
     prepared: Mutex<Option<Arc<Prepared>>>,
+    capacity: Mutex<()>,
 }
 
 impl CarrierReservations {
@@ -22,7 +27,24 @@ impl CarrierReservations {
         Self {
             access: Arc::new(access),
             prepared: Mutex::new(None),
+            capacity: Mutex::new(()),
         }
+    }
+}
+
+#[derive(Debug)]
+struct ReservationBankBacking(OwnedHostMapping);
+// SAFETY: only shared ABI nodes inhabit this stable MAP_SHARED allocation.
+// Access is serialized by reservation root locks and atomic pool operations;
+// the carrier retains the owner until VM destruction.
+unsafe impl Send for ReservationBankBacking {}
+unsafe impl Sync for ReservationBankBacking {}
+unsafe impl RetainedMetadataBacking for ReservationBankBacking {
+    fn host_base(&self) -> HostVa {
+        HostVa(self.0.as_ptr() as usize)
+    }
+    fn mapped_len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -51,6 +73,38 @@ fn table(access: &CarrierMetadataAccess) -> Result<&SharedReservations, Refusal>
 }
 
 impl HostReservationProvider for CarrierReservations {
+    fn provision_metadata(&self, mm: ReservationMm) -> Result<(), Refusal> {
+        // Carrier capacity publication is serialized outside all MM locks.
+        let _capacity = self.capacity.lock();
+        let view = self.prepare()?;
+        let mut root = view.lock(mm)?;
+        match root.secure_host_nodes(carrick_el1::memory::reservations::HOST_RESERVE) {
+            Ok(()) => return Ok(()),
+            Err(Refusal::MetadataRequired) => {}
+            Err(refusal) => return Err(refusal),
+        }
+        let table = table(&self.access)?;
+        let generation = table.storage_generation();
+        drop(root);
+        drop(view);
+        let bytes = SharedReservations::metadata_bank_layout().size();
+        let bytes = bytes.next_multiple_of(16 * 1024);
+        let backing = OwnedHostMapping::map_shared_anon(bytes, HostMappingKind::SharedAnon)
+            .map_err(|_| Refusal::MetadataRequired)?;
+        let mapping = self
+            .access
+            .map_retained(Arc::new(ReservationBankBacking(backing)))
+            .map_err(|_| Refusal::MetadataRequired)?;
+        let result = mapping
+            .pin()
+            .map_err(|_| Refusal::Stale)
+            .and_then(|pin| table.provision_metadata(&pin, generation));
+        if result.is_err() {
+            let _ = mapping.try_retire();
+        }
+        result
+    }
+
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
         let table = table(&self.access)?;
         let generation = table.storage_generation();
