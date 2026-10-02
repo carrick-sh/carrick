@@ -291,3 +291,24 @@ backing bytes. This spends virtual aperture capacity, not extra RAM. A caller
 that drops retirement authority without retiring keeps the backing in
 carrier custody until VM destruction. Runtime ownership must explicitly
 retire these mappings after revoking guest references.
+
+The mapping slice is committed as `2ff87dafc`. `CARGO_BUILD_JOBS=3 just
+clippy` passed on that source snapshot. The abort inventory then reported
+three missing classifications from the prior control-ownership foundations:
+`Thread::prepare_clone`, `ThreadControlArena::allocate`, and
+`ThreadControlLease::allocation`. These are internal ownership/allocation
+invariant failures, not guest resource refusals; explicit carrier-fault
+rationales were added without changing a debt ceiling. The abort checker
+subsequently passed all four shards. Additional process-level assertions
+exercise page separation and gate isolation in two live forked tasks, equal
+numeric keys in two live kernels, and shared process-page identity at clone
+claim.
+The strengthened `cargo test -p carrick-kernel --lib lifecycle_` run passed
+all 21 selected tests (`/tmp/forkexit-l4-process-page-contracts.log`).
+
+Before runtime publication, the existing Box/Arc-allocated kernel backing
+also needs qualification against the host VM-object lifetime: the current
+metadata allocator uses MAP_SHARED backing specifically to preserve the
+host/HVF alias across host COW. Stable Rust addresses alone do not prove
+that property. No unsafe retained-backing implementation for these kernel
+leases has been installed by this slice.

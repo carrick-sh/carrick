@@ -588,6 +588,19 @@ mod tests {
         let first = root.thread().control_lease();
         let second = peer.thread().control_lease();
         assert_ne!(first.backing_base(), second.backing_base());
+        assert_ne!(
+            first.lifecycle().backing_base(),
+            second.lifecycle().backing_base()
+        );
+        first.lifecycle().close();
+        assert_eq!(
+            root.thread().control_lease().lifecycle().gate(),
+            carrick_el1_abi::GateState::Closed
+        );
+        assert_eq!(
+            peer.thread().control_lease().lifecycle().gate(),
+            carrick_el1_abi::GateState::Open
+        );
         first.init_blocked(carrick_el1_abi::BlockedMask(0x400));
         assert_eq!(root.thread().blocked_mask().raw(), 0x400);
         assert_eq!(peer.thread().blocked_mask(), carrick_abi::SigSet::EMPTY);
@@ -615,6 +628,10 @@ mod tests {
         assert!(second.task().owns_thread_control(&second_slot));
         assert!(!first.task().owns_thread_control(&second_slot));
         assert!(!second.task().owns_thread_control(&first_slot));
+        assert_ne!(
+            first_slot.lifecycle().backing_base(),
+            second_slot.lifecycle().backing_base()
+        );
     }
 
     #[test]
@@ -634,6 +651,10 @@ mod tests {
                 .reserve_thread_clone(parent, thread_plan(), None)
                 .unwrap();
             let born = claim.control_lease();
+            assert_eq!(
+                born.lifecycle().backing_base(),
+                parent.thread().control_lease().lifecycle().backing_base()
+            );
             let mask = carrick_el1_abi::BlockedMask(1 << (10 + index));
             let stack = carrick_el1_abi::AltStack {
                 sp: 0x40000,
