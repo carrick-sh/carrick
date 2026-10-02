@@ -931,13 +931,34 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
     };
     let mm_key = mutation.host_alias_permit().mm().raw();
     GUEST_GRANT_LEDGER.settle_ready(slots, mm_key, |pending, receipt| {
+        // Receipt settlement is delayed; a sibling may already have changed
+        // this published leaf's permissions. Authenticate the retained output
+        // and live access before completing any accounting. The MM guard
+        // excludes descriptor edits across this observation and settlement.
+        let page = pending.fault_va & !4095;
+        let mut live_protection = None;
+        if let Some(ipa) = page.checked_sub(pending.residency.semantic_base)
+            .and_then(|offset| pending.residency.physical_ipa.checked_add(offset))
+        {
+            engine.live_el1_grant_pages(&[(page, ipa)], &mut |_, prot| live_protection = Some(prot));
+        }
         settle_guest_frame_grant(
             pending,
             &receipt,
             &mut EngineGrantBackend(&mut *engine),
             |pending, verified| {
                 let permit = mutation.host_alias_permit();
-                let plan = dispatcher.published_frame_grant_plan(&permit, pending.residency, carrick_abi::LinuxProtFlags::from_bits_truncate(pending.plan.2), verified)
+                let protection = carrick_abi::LinuxProtFlags::from_bits_truncate(pending.plan.2);
+                let classified = dispatcher.published_frame_grant_plan(&permit, pending.residency, protection, verified);
+                let classified = match (classified, live_protection) {
+                    (Err(carrick_kernel::dispatch::mem::fault::PublishedFrameGrantRefusal::ProtectionChanged { .. }), Some(live_protection))
+                        => dispatcher.reprotected_frame_grant_plan(
+                            &permit, pending.residency, protection, verified,
+                            live_protection,
+                        ),
+                    (result, _) => result,
+                };
+                let plan = classified
                     .map_err(|refusal| TrapError::Hypervisor(format!(
                         "EL1 published grant {:?} cannot settle faulting page at 0x{:x}: {refusal:?}",
                         pending.txn.id, pending.fault_va
@@ -1506,7 +1527,7 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
         }
         // One live-root read and one resolution per table arena for the
         // whole grant (`ThreadedEngine::live_el1_grant_pages`).
-        engine.live_el1_grant_pages(&pages, &mut |page| {
+        engine.live_el1_grant_pages(&pages, &mut |page, _protection| {
             let _ = dispatcher.reconcile_el1_resident_page(mutation, page);
         });
         let _ = table.ack_dirty(slot, identity);

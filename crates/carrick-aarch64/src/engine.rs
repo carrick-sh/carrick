@@ -4726,7 +4726,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })
     }
 
-    fn live_el1_grant_pages(&self, pages: &[(u64, u64)], resident: &mut dyn FnMut(u64)) {
+    fn live_el1_grant_pages(
+        &self,
+        pages: &[(u64, u64)],
+        resident: &mut dyn FnMut(u64, carrick_abi::LinuxProtFlags),
+    ) {
         if self.process_asid.is_none() || pages.is_empty() {
             return;
         }
@@ -4766,7 +4770,21 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                             == carrick_mmu_core::aarch64::El1PrivateLeafState::Resident
                             && leaf & 0x0000_FFFF_FFFF_F000 == expected_ipa
                         {
-                            resident(va);
+                            use carrick_abi::LinuxProtFlags as P;
+                            use carrick_mmu_core::aarch64::{
+                                LeafAccess, terminal_descriptor_permits_el0,
+                            };
+                            let mut protection = P::empty();
+                            for (access, flag) in [
+                                (LeafAccess::Read, P::READ),
+                                (LeafAccess::Write, P::WRITE),
+                                (LeafAccess::Execute, P::EXEC),
+                            ] {
+                                if terminal_descriptor_permits_el0(leaf, access) {
+                                    protection.insert(flag);
+                                }
+                            }
+                            resident(va, protection);
                         }
                     },
                 );
