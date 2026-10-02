@@ -7781,6 +7781,7 @@ pub(crate) enum ForkCarrickWindow {
     KernelControl,
     El1Kernel,
     DynamicMetadata,
+    PrivateOverlay,
     Ipc,
     ClockVdso,
     Sigreturn,
@@ -7805,6 +7806,11 @@ impl ForkCarrickWindow {
                 Self::DynamicMetadata,
                 carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
                 carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
+            ),
+            (
+                Self::PrivateOverlay,
+                LINUX_PRIVATE_OVERLAY_BASE,
+                LINUX_PRIVATE_OVERLAY_SIZE,
             ),
             (
                 Self::Ipc,
