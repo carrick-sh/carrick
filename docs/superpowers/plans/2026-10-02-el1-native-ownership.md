@@ -412,9 +412,9 @@ delayed transfer completion, physical pin balance, extent capacity crossing,
 stopped-target/default-slot progress, or compiler fence is proved here.
 Each remains mandatory before the N0 experiment can pass. The two new
 contracts register these unresolved bindings explicitly. Physical policy is
-reused byte-for-byte from step2-prep's
-`el1-elastic-frame-extents.toml`; its sibling test bindings are not claimed
-executed by this worktree.
+reused from step2-prep's
+`el1-elastic-frame-extents.toml`; only its absent sibling test bindings are
+reclassified as unresolved, rather than claiming they exist or ran here.
 
 Section 6's reject/rethink list: stopped-target EL0/worker requirement,
 host snapshot dependency at fork, host page-table pause at lease drain,
