@@ -6686,11 +6686,9 @@ mod guest_memory;
 pub(crate) use guest_memory::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
-    /// Host-editor permission bookkeeping; admitted descriptor lanes use live PTEs.
-    pub(crate) fn protections_ref(&self) -> Option<&MemoryProtections> {
-        (self.page_tables_authority().live_descriptor_owner()
-            != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest)
-            .then_some(&self.protections)
+    /// The process-wide PROT_NONE bookkeeping (the engine's EFAULT gate).
+    pub(crate) fn protections_ref(&self) -> &MemoryProtections {
+        &self.protections
     }
 
     /// A `Send`/`Sync` kick handle for THIS thread's live vCPU. The engine's
