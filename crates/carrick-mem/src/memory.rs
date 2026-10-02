@@ -3785,7 +3785,10 @@ pub fn stage1_hvpatch_page_tables() -> Vec<u8> {
             let mut word = [0_u8; 8];
             word.copy_from_slice(raw);
             let descriptor = u64::from_le_bytes(word);
-            if descriptor & 1 == 0 {
+            // An empty slot has no translation to scope. An invalid slot that
+            // retains its output (a sealed window, the heap) is re-validated
+            // in place later and must already carry nG, like every leaf.
+            if descriptor == 0 {
                 continue;
             }
             if level < 3 && descriptor & 0b11 == TABLE_OR_PAGE {
