@@ -2751,7 +2751,7 @@
       "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
       "function": "retire_reservation_root",
       "ordinal_in_function": 1,
-      "fingerprint": "c10db61ff2f1ea2eb97dc5e6699bd0a8b1e76b3e657e80be63f5a96de3a2acbe",
+      "fingerprint": "c54ab5b35b4484e3042b3818a1f012c985edab1fca304986095860ab3fa00e10",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::mm_occupancy",
       "rationale": "Final-MM settlement follows admission closure and occupant drain; a surviving reservation guard or pending descriptor/backing receipt means completion ownership was lost. Reusing the root would expose a stale reservation generation or free metadata still owned by an unfinished transaction. Ordinary proposal refusal is handled before settlement.",
