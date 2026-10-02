@@ -849,7 +849,10 @@ fn settle_vacated(
         let Some(rec) = zone.live(record) else {
             continue;
         };
-        if rec.handback() == Some(Handback::Service) {
+        if rec.handback() == Some(Handback::Service) || rec.is_unadopted_birth() {
+            // A Born thread has reserved first-entry capacity, but no host
+            // continuation yet. Even a Resumed handback must reach an
+            // executor for activation rather than publish a continuation wake.
             // A service record stands for its thread's held host row, which
             // only the scheduler sees: placing it from host ownership is
             // invisible to any claimant.
@@ -1252,6 +1255,50 @@ mod tests {
             zone.live(replacement).unwrap().claim(),
             Claim::Parked { seq }
         );
+    }
+
+    #[test]
+    fn deferred_born_handbacks_reach_executors_for_two_live_processes() {
+        let zone = heap_zone();
+        let mut records = Vec::new();
+        for (cpu, mm) in [(0, 7), (1, 8)] {
+            let slot = SlotId::new(cpu);
+            zone.drive(slot, u64::from(cpu) + 1);
+            zone.publish_slot(slot, 0, Some(u32::from(cpu)), 0);
+            zone.enter_guest(slot);
+            zone.enter_idle(slot, true);
+            let id = zone
+                .alloc_record(ThreadIdentity {
+                    mm,
+                    generation: 0,
+                    affinity: 1 << cpu,
+                    lifecycle_page: 0x1000 + mm * 4096,
+                    control_slot: 0x2000 + mm * 4096,
+                    ..identity(mm)
+                })
+                .unwrap();
+            let record = zone.record_ref(id);
+            zone.publish_park(id, zone.next_seq(id));
+            zone.claim_for_host(record, None, Handback::Resumed, &HostLockWait);
+            records.push(record);
+        }
+        let mut published = Vec::new();
+        settle_vacated(
+            &zone,
+            None,
+            records.clone(),
+            Vec::new(),
+            &mut |record| published.push(record),
+            &mut |_| {},
+        );
+        assert!(
+            published.is_empty(),
+            "a Born thread has no host continuation to wake"
+        );
+        for (cpu, record) in records.iter().enumerate() {
+            let slot = SlotId::new(cpu as u8);
+            assert_eq!(zone.take_service_head(slot), Some(*record));
+        }
     }
 
     #[test]

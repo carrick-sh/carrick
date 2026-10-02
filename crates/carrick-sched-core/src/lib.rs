@@ -636,7 +636,7 @@ impl ZoneRecord {
     /// thread at EL0, it leaves the vCPU for the executor instead.
     /// A lifecycle birth has committed owned inactive execution capacity,
     /// but no execution generation until its first executor activation.
-    fn is_unadopted_birth(&self) -> bool {
+    pub fn is_unadopted_birth(&self) -> bool {
         self.generation.load(Ordering::Relaxed) == 0
             && self.lifecycle_page.load(Ordering::Relaxed) != 0
             && self.control_slot.load(Ordering::Relaxed) != 0
@@ -3187,7 +3187,7 @@ impl ZoneTables {
         let Claim::Host { seq } = rec.claim() else {
             return None;
         };
-        let service = rec.needs_host();
+        let service = rec.needs_host() || rec.is_unadopted_birth();
         if let Some(home) = rec.home() {
             // The host believes its thread runs on its home slot: only that
             // slot may run it, and only while it is in the guest.
