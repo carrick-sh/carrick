@@ -916,6 +916,12 @@ pub(super) fn settle_guest_frame_grant(
             Ok(GuestGrantSettlement::Committed(verified.resident()))
         }
         DescriptorOutcome::Refused(refusal) | DescriptorOutcome::RolledBack(refusal) => {
+            carrick_observability::probes::guest_internal_write_fault(
+                pending.residency.semantic_base,
+                pending.residency.len,
+                24,
+                &format!("EL1 frame-grant descriptor receipt refused: {refusal:?}"),
+            );
             // Settlement returns the grants of a refused transaction and
             // reports it as not applied, which is the expected answer here.
             let _ = backend.verify(&pending.txn, receipt);
@@ -940,6 +946,13 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
     };
     let mm_key = mutation.host_alias_permit().mm().raw();
     GUEST_GRANT_LEDGER.settle_ready(slots, mm_key, |pending, receipt| {
+        use carrick_aarch64::engine::{El1MappingLeafPhase, trace_el1_mapping_leafs};
+        let span = carrick_mmu_core::aarch64::descriptor_txn::PageSpan::new(
+            pending.residency.semantic_base, pending.residency.len,
+        );
+        if matches!(receipt.outcome, carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)) {
+            trace_el1_mapping_leafs(engine, El1MappingLeafPhase::ReceiptApplied, mm_key, span, pending.fault_va);
+        }
         // Receipt settlement is delayed; a sibling may already have changed
         // this published leaf's permissions. Authenticate the retained output
         // and live access before completing any accounting. The MM guard
@@ -951,7 +964,7 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
         {
             engine.live_el1_grant_pages(&[(page, ipa)], &mut |_, prot| live_protection = Some(prot));
         }
-        settle_guest_frame_grant(
+        let settled = settle_guest_frame_grant(
             pending,
             &receipt,
             &mut EngineGrantBackend(&mut *engine),
@@ -975,7 +988,11 @@ pub(super) fn settle_guest_frame_grants<E: ThreadedEngine>(
                 dispatcher.commit_published_frame_grant(plan, pending.residency);
                 Ok(())
             },
-        )
+        )?;
+        if matches!(settled, GuestGrantSettlement::Committed(_)) {
+            trace_el1_mapping_leafs(engine, El1MappingLeafPhase::ReceiptSettled, mm_key, span, pending.fault_va);
+        }
+        Ok::<_, TrapError>(settled)
     })?;
     Ok(())
 }
