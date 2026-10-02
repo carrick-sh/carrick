@@ -83,6 +83,10 @@ run *ARGS: build
 carrier-topology-gate *ARGS: build
     python3 scripts/conformance/carrier-topology-gate.py {{ARGS}}
 
+# Run the Carrick xtask maintenance tool.
+xtask *ARGS:
+    cargo run --locked -p carrick-xtask -- {{ARGS}}
+
 # Fast unsigned debug build (cannot run a guest — for compile-checking only).
 check *ARGS:
     cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
