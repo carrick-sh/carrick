@@ -728,6 +728,12 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         (_, RangeBacking::Foreign, _) => {
             return refuse(pending, &mut model, backing.foreign.leave());
         }
+        // The root refused overlapping proposals while this retirement was
+        // owed. Reaching Prepare means the host acknowledged its stage-2 and
+        // inventory return. A retained invalid retired terminal exposes no
+        // bytes: keep it invalid and publish only the fresh lazy reservation.
+        // First touch obtains new zero backing under the new incarnation.
+        (Prepare, RangeBacking::Retired, None) => None,
         (_, RangeBacking::Retired, _) => {
             return refuse(pending, &mut model, Leave::BackingRetired);
         }
@@ -1708,18 +1714,23 @@ mod tests {
                 root(&spaces, &table, &task).acknowledge_deferred_returns(owed.sequence),
                 Ok(1)
             );
+            let mut returned_backing = Editor::over(RangeBacking::Retired);
             let (route, address) = syscall(
                 &task,
                 &spaces,
                 &table,
                 &counters,
-                &mut Editor::over(RangeBacking::Retired),
+                &mut returned_backing,
                 SYS_MMAP,
                 mmap_fixed(ARENA + 0x1000, 0x1000),
             );
             assert_eq!(
                 (route, address as u64),
                 (DelegatedAnonymous::Served, ARENA + 0x1000)
+            );
+            assert_eq!(
+                returned_backing.calls,
+                vec![Call::Probe(task.ttbr0, ARENA + 0x1000, 0x1000)]
             );
             assert!(owed_returns(&root(&spaces, &table, &task)).is_empty());
         }
