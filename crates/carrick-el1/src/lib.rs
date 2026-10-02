@@ -26,3 +26,6 @@ pub use fault::dispatch_fault;
 pub use personality::dispatch::*;
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub use personality::{file, inotify, sched};
+
+#[cfg(test)]
+mod native_ownership_tests;

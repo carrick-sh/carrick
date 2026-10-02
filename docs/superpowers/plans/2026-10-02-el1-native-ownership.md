@@ -360,6 +360,72 @@ there to reject this commitment before that port. Core extractions can land
 on the host first only if they replace the previous implementation, not add
 V2 models. Maintain personality/substrate separation and compiler inventories.
 
+### N0 preparation receipt (partial, 2026-10-02)
+
+This worktree is based on admission `690383cc8`, not main. The director
+reports that its experimental internal-window read gate will be reverted;
+this reduction does not exercise that gate. Rebase and reverify before
+integration. Internal bootstrap windows require a distinct typed intent,
+not user-transfer permission.
+
+The production-path known-red witness is
+`carrick-el1::native_ownership_tests::red_until_n1_production_admission_retains_host_semantic_venue`.
+It publishes two AddressSpaces entries, imports and admits real reservation
+roots with `finish_import`, then drives production
+`serve_delegated_anonymous` through map/retire/remap at the same VA in each
+MM. The descriptor probe reads actual live, resolver-backed
+`carrick-mmu-core::PageTableManager` tables using
+`classify_stage1_range`; no VMA or table model is substituted. Backing is
+zeroed primary-table custody only; physical data extent service is unbound.
+
+| Pages | Primary unrelated nodes | Peer unrelated nodes | Table reads per MM | Primary/peer authentication node reads | Accepted host proposals per MM | Descriptor probes per MM |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16 | 16 | 16 | 3 | 5 / 5 | 1 | 3 |
+| 16 | 512 | 16 | 3 | 10 / 5 | 1 | 3 |
+| 64 | 16 | 16 | 3 | 5 / 5 | 1 | 3 |
+| 64 | 512 | 16 | 3 | 10 / 5 | 1 | 3 |
+| 256 | 16 | 16 | 3 | 5 / 5 | 1 | 3 |
+| 256 | 512 | 16 | 3 | 10 / 5 | 1 | 3 |
+
+Table reads cover three lazy-only operations, each skipping an absent root
+terminal. Node reads cover new fault-plan creation and cross-MM plan
+rejection, not the complete operation transaction. Descriptor probes are
+EL1-route callbacks, **not host semantic callbacks**. The accepted
+`begin_host_proposal` is separately counted as an actual surviving host
+semantic venue. Exclusive-owner assertion returns
+`red_until_n1_host_semantic_venue_survives_admission` and is checked with
+`expect_err`. Old fault plans fail authentication after retire/remap;
+cross-MM plans also fail. Those two semantics are green already and are not
+fabricated stale-generation reds.
+
+An initial attempt at **two 512-node roots** failed import with
+`MetadataRequired` in the current bootstrap pool. The committed reduction
+keeps the peer at 16 unrelated nodes and labels that population explicitly.
+This does not prove elastic metadata capacity, and no capacity or node budget
+was increased to conceal the failure.
+
+**Experiment verdict: incomplete; current exclusive ownership is red.**
+This is production admission evidence, not the replacement architecture or
+N0 completion. No sealed handle, UserTransfer, data copyout, protection
+mirror/projection witness, fork/child write, partial 16 KiB compound reuse,
+delayed transfer completion, physical pin balance, extent capacity crossing,
+stopped-target/default-slot progress, or compiler fence is proved here.
+Each remains mandatory before the N0 experiment can pass. The two new
+contracts register these unresolved bindings explicitly. Physical policy is
+reused byte-for-byte from step2-prep's
+`el1-elastic-frame-extents.toml`; its sibling test bindings are not claimed
+executed by this worktree.
+
+Section 6's reject/rethink list: stopped-target EL0/worker requirement,
+host snapshot dependency at fork, host page-table pause at lease drain,
+semantic VA/predecessor capacity validation, and MM lock across host I/O
+are all **unmeasured**, not passed. Total-exit/workload thesis is also
+unmeasured. This receipt therefore permits neither owner cutover promotion
+nor a claim that the early disproof experiment accepts the design.
+
+`just accept` remains the explicit tooling blocker described below. No
+signed guest or Docker execution belongs to this preparation receipt.
+
 ### In-flight disposition
 
 | Work | Recommendation |
