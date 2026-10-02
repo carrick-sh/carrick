@@ -3958,6 +3958,20 @@ fn delegated_admission_releases_host_marks_over_the_roots_holes() {
 
 #[test]
 fn delegated_published_grant_settles_after_backing_leaves_pristine() {
+    published_grant_settlement(None);
+}
+
+#[test]
+fn delegated_published_grant_settles_after_guest_retirement_without_reviving_residency() {
+    published_grant_settlement(Some(0));
+}
+
+#[test]
+fn delegated_published_grant_does_not_republish_stock_retired_beside_the_fault() {
+    published_grant_settlement(Some(1));
+}
+
+fn published_grant_settlement(retired_page: Option<u64>) {
     use carrick_guest_mem::GuestVa;
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
@@ -4094,13 +4108,58 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
     dispatcher
         .with_resident_fault_plan_for_test(fault, |plan| dispatcher.commit_resident_fault(plan))
         .expect("EL1's live-page reconciliation can precede receipt settlement");
+    if let Some(page) = retired_page {
+        let retired = fault + page * PAGE;
+        let range = ReservationRange::new(retired, retired + PAGE).unwrap();
+        let mut model = root.lock();
+        let Decision::Work(request) = model.munmap(range).unwrap() else {
+            panic!("a guest retirement needs a descriptor step")
+        };
+        let slot = model.reserve_return(range).unwrap();
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        model.complete_deferring_return(completion, slot).unwrap();
+        assert!(model.mapping(retired).is_none());
+    }
     crate::dispatch::mm_mutation::test_support::with_permit(
         dispatcher.mm_mutation_coordinator(),
         |permit| {
             let plan = dispatcher.published_frame_grant_plan(permit, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt)
                 .expect("a verified publication settles after physical preparation and residency reconciliation");
-            assert_eq!((plan.start(), plan.len()), (start, len));
-            dispatcher.commit_resident_frame_grant(plan);
+            assert_eq!(
+                matches!(plan, PublishedFrameGrantPlan::Retired(_)),
+                retired_page.is_some()
+            );
+            if let PublishedFrameGrantPlan::Resident(ref resident) = plan {
+                assert_eq!((resident.start(), resident.len()), (start, len));
+            }
+            let residency_before = dispatcher.mem().lock().resident.ranges();
+            dispatcher.commit_published_frame_grant(plan, grant);
+            if let Some(page) = retired_page {
+                assert_eq!(
+                    dispatcher.mem().lock().resident.ranges(),
+                    residency_before,
+                    "receipt settlement must not revive retired residency"
+                );
+                assert!(root.lock().mapping(fault + page * PAGE).is_none());
+                let mut returns = Vec::new();
+                root.lock()
+                    .observe_deferred_returns(&mut |owed| returns.push(owed));
+                assert_eq!(
+                    returns.len(),
+                    1,
+                    "the return remains owed until the backend receipt"
+                );
+            }
         },
     );
     assert!(
@@ -4108,10 +4167,11 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
             .with_resident_fault_plan_for_test(fault, |_| ())
             .is_none()
     );
-    assert!(
+    assert_eq!(
         dispatcher
             .with_resident_fault_plan_for_test(fault + PAGE, |_| ())
-            .is_some()
+            .is_some(),
+        retired_page != Some(1)
     );
     assert!(!dispatcher.mem().lock().first_touch_stock.is_empty());
 }
