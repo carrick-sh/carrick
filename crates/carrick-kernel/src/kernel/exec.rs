@@ -22,11 +22,15 @@ struct ExecReservation {
     task: TaskKey,
     transaction: KernelTransactionId,
     active: bool,
+    birth_admission: Option<super::thread_ledger::BirthAdmissionGuard>,
 }
 
 impl ExecReservation {
     fn commit(&mut self) {
         self.active = false;
+        if let Some(admission) = &mut self.birth_admission {
+            admission.keep_closed();
+        }
     }
 }
 
@@ -375,19 +379,31 @@ impl Kernel {
         replacement_registry_id: Option<ThreadId>,
         failpoint: Option<KernelFailpoint>,
         transaction: KernelTransactionId,
-        revision: TaskRevision,
+        _revision: TaskRevision,
     ) -> Result<PreparedExec, ExecError> {
         let reservation = ExecReservation {
             kernel: self.clone(),
             task: context.task.key(),
             transaction,
             active: true,
+            birth_admission: None,
         };
         let mut guard = ExecOperationGuard {
             reservation: Some(reservation),
             drain: None,
             no_return: false,
         };
+        let admission = super::thread_ledger::BirthAdmissionGuard::acquire(context.task())
+            .map_err(|_| ExecError::TaskBusy)?;
+        if let Some(reservation) = &mut guard.reservation {
+            reservation.birth_admission = Some(admission);
+        }
+        // A claimant that won before close is now fully recorded. Settle it
+        // before taking the exec sibling snapshot and its topology revision.
+        let settled = self
+            .context(context.task().key().id, context.thread().key().tid)
+            .map_err(|_| ExecError::CallerExited)?;
+        let revision = settled.revision();
         check_exec_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
 
         // Stop every sibling before observing the shared file authority. A
@@ -540,6 +556,9 @@ impl Kernel {
         debug_assert_eq!(record.task.key(), prepared.task);
         debug_assert_eq!(record.revision, prepared.revision);
 
+        // The predecessor image is quiesced and admission is still closed.
+        record.thread_pool.revoke_unused();
+        record.task.clear_thread_adoption_factory();
         prepared
             .old_caller
             .transfer_runner_to(&prepared.replacement)?;

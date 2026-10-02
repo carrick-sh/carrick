@@ -38,6 +38,44 @@ use super::operations::thread::{PreparedThreadClone, PublicationLane};
 use super::registry::{RegistryLock, ThreadReservation};
 use crate::namespace::pid::PreparedNamespaceIdentity;
 
+/// Exact-task admission custody while a host operation owns conflicting state.
+#[derive(Debug)]
+pub(super) struct BirthAdmissionGuard {
+    page: Option<super::objects::ThreadLifecycleLease>,
+}
+
+impl BirthAdmissionGuard {
+    pub(super) fn acquire(task: &TaskRef) -> Result<Self, KernelOperationError> {
+        let page = task.shared().pending_signals().lifecycle_lease();
+        if !page.serves_threads() || page.gate() == carrick_el1_abi::GateState::Closed {
+            return Ok(Self { page: None });
+        }
+        page.close_for_fork()
+            .map_err(|_| KernelOperationError::TaskBusy(task.key().id))?;
+        let guard = Self { page: Some(page) };
+        if guard
+            .page
+            .as_ref()
+            .is_some_and(|page| page.claimed_count() != 0)
+        {
+            return Err(KernelOperationError::TaskBusy(task.key().id));
+        }
+        Ok(guard)
+    }
+
+    pub(super) fn keep_closed(&mut self) {
+        self.page.take();
+    }
+}
+
+impl Drop for BirthAdmissionGuard {
+    fn drop(&mut self) {
+        if let Some(page) = self.page.take() {
+            let _ = page.reopen_after_fork();
+        }
+    }
+}
+
 /// Standing entries per multi-threaded task when the pool is on. Four covers
 /// the common libc/Go worker fan-out without reserving a visible gap in the
 /// tid space for a single-threaded process: a pool is primed only after the
@@ -136,6 +174,12 @@ pub(in crate::kernel) struct PublishedAbiThread {
 }
 
 impl ThreadIdentityPool {
+    pub(super) fn revoke_unused(&self) {
+        self.entries
+            .lock()
+            .retain(|entry| entry.page().revoke(entry.entry).is_err());
+    }
+
     fn take_adoption(
         &self,
         key: super::objects::ThreadKey,
@@ -733,7 +777,10 @@ impl ThreadLedger {
         publisher: &KernelContext,
     ) {
         let depth = self.pool_depth();
-        if depth == 0 {
+        if depth == 0
+            || publisher.thread().control_lease().lifecycle().gate()
+                != carrick_el1_abi::GateState::Open
+        {
             return;
         }
         let Some(record) = state.tasks.get(&publisher.task().key().id) else {
@@ -961,6 +1008,12 @@ impl Kernel {
                 entry.adoption.is_some() || entry.page().revoke(entry.entry).is_err()
             });
         }
+        // Only a newly installed executable factory can reopen post-exec custody.
+        let _ = context
+            .thread()
+            .control_lease()
+            .lifecycle()
+            .reopen_after_fork();
         self.registry()
             .thread_ledger()
             .replenish(self, &state, context);
@@ -1069,6 +1122,65 @@ mod tests {
 
     fn fork_plan() -> ClonePlan {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
+    }
+
+    #[test]
+    fn lifecycle_exec_admission_retires_only_its_process_birth_capacity() {
+        let (kernel, root) = bootstrap(9_798);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_799),
+                "exec-peer".into(),
+                None,
+            )
+            .unwrap();
+        kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_800),
+                None,
+            )
+            .unwrap();
+        kernel
+            .clone_thread(
+                &peer,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_801),
+                None,
+            )
+            .unwrap();
+        let page = root.thread().control_lease().lifecycle();
+        let peer_page = peer.thread().control_lease().lifecycle();
+        let claim = page.claim_any().unwrap();
+        let current = kernel
+            .context(root.task().key().id, root.thread().key().tid)
+            .unwrap();
+        assert!(
+            matches!(
+                kernel.prepare_exec(&current, None),
+                Err(crate::kernel::ExecError::TaskBusy)
+            ),
+            "exec must not take MM authority from an in-flight ABI birth"
+        );
+        let peer_claim = peer_page.claim_any().unwrap();
+        peer_page.unclaim(peer_claim).unwrap();
+        page.unclaim(claim).unwrap();
+        let prepared = kernel.prepare_exec(&current, None).unwrap();
+        assert_eq!(page.gate(), carrick_el1_abi::GateState::ForkClosing);
+        assert!(page.claim_any().is_err());
+        let peer_claim = peer_page.claim_any().unwrap();
+        peer_page.unclaim(peer_claim).unwrap();
+        let committed = kernel.commit_exec(prepared, None).unwrap();
+        assert_ne!(committed.shared().mm().id(), current.shared().mm().id());
+        assert_eq!(
+            page.claim_any(),
+            Err(carrick_el1_abi::TransitionError::PoolEmpty),
+            "old executable capacity must be revoked before MM replacement"
+        );
+        assert_eq!(peer_page.gate(), carrick_el1_abi::GateState::Open);
     }
 
     #[test]
