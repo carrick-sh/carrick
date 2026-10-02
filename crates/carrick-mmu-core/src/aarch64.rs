@@ -1136,13 +1136,8 @@ fn pt_desc_for(asid_scoped_leaves: bool, op: PtOp, base_pa: u64, level: usize) -
         PtOp::Retire => base | (flags & !VALID) | scope | SW_RETIRED,
         PtOp::ReadWrite { exec } => base | flags | uxn(exec) | scope,
         PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec) | scope,
-        PtOp::ForkReadOnly => {
-            // Fork arming is a permission restriction, not a remap: a
-            // PROT_NONE descriptor must remain invalid while gaining nG so
-            // a later mprotect-to-write still inherits ASID scoping. An
-            // absent leaf has no execute state to preserve; arm it NX.
-            base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | UXN
-        }
+        // Fork restricts an existing output; it never constructs one.
+        PtOp::ForkReadOnly => 0,
         PtOp::KernelReadOnly { exec } => base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec) | scope,
     }
 }
@@ -1197,7 +1192,7 @@ pub(crate) fn pt_terminal_edit(
             // — which rebuilds it from scratch. Writing anything into it
             // would turn "no output recorded" into a descriptor that a
             // later in-place edit or split treats as carrying one.
-            PtOp::Invalidate | PtOp::Retire if empty => true,
+            PtOp::Invalidate | PtOp::Retire | PtOp::ForkReadOnly if empty => true,
             // A speculative EL1 grant leaf has no live EL0 write
             // permission to revoke at fork. Keep its current AP as
             // Linux intent until first touch publishes the page under
@@ -12860,7 +12855,7 @@ mod tests {
             .unwrap();
         let block_va = LINUX_MMAP_BASE + 4 * TWO_MIB;
         image
-            .set_rw(block_va, 2 * TWO_MIB as usize, false, None)
+            .set_rw(block_va, 3 * TWO_MIB as usize, false, None)
             .unwrap();
         image.declare_live_hardware_image();
         // (va, len, kernel_only, executable)
@@ -12868,7 +12863,12 @@ mod tests {
             (grant_va, 4 * PT_PAGE, false, false),
             (block_va, TWO_MIB, false, false),
             (block_va + TWO_MIB + 3 * PT_PAGE, 5 * PT_PAGE, false, false),
-            (block_va + TWO_MIB + 64 * PT_PAGE, 2 * PT_PAGE, true, false),
+            (
+                block_va + 2 * TWO_MIB + 64 * PT_PAGE,
+                2 * PT_PAGE,
+                true,
+                false,
+            ),
             (
                 LINUX_MMAP_BASE + 16 * TWO_MIB + PT_PAGE,
                 3 * PT_PAGE,
@@ -13854,6 +13854,23 @@ mod tests {
                 .provision_cow_copy_window(None)
                 .expect("reprovision a provisioned image");
             assert_eq!(window_leaves(&scoped), expected, "idempotent");
+        }
+    }
+    #[test]
+    fn fork_restriction_never_synthesizes_output_for_absent_terminals() {
+        for level in 1..=3 {
+            for asid_scoped in [false, true] {
+                for rule in [
+                    TerminalRule::pt(PtOp::ForkReadOnly),
+                    TerminalRule::fork_arm(true),
+                ] {
+                    assert_eq!(
+                        terminal_rule_edit(asid_scoped, rule, 0, level, 0x6002_e4e000),
+                        Ok(None),
+                        "fork cannot turn an absent terminal into an identity output at level {level}"
+                    );
+                }
+            }
         }
     }
 }
