@@ -93,7 +93,7 @@ lease MODE +CMD:
 
 # Run the host and/or signed landing gate (no Docker).
 accept *ARGS:
-    cargo run --locked -p carrick-xtask -- accept {{ARGS}}
+    cargo run --locked -p carrick-xtask -- accept --profile no-docker {{ARGS}}
 
 # Provision fresh-worktree guest artifacts before signed execution.
 land-provision *ARGS:
@@ -699,40 +699,7 @@ check-kernel-portable:
 # the probe gate, the LTP file/inotify set and the inotify09 screen, with no
 # rebuild or re-sign in between (re-signing changes the artifact).
 el1-gate: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    bin=target/release/carrick
-    head=$(git rev-parse --short HEAD)
-    out=target/el1-gate/$head
-    mkdir -p "$out"
-    sha=$(shasum -a 256 "$bin" | cut -d' ' -f1)
-    {
-      echo "head $head"
-      echo "sha256 $sha"
-      codesign -dvvv "$bin" 2>&1 | grep -i 'CDHash='
-      otool -l "$bin" | grep -A2 LC_UUID | grep uuid
-      codesign -d --entitlements - "$bin" 2>/dev/null | grep -a -o 'com.apple.security.hypervisor' || { echo "missing hypervisor entitlement"; exit 1; }
-      otool -l "$bin" | grep -q __dof_carrick || { echo "missing __dof_carrick"; exit 1; }
-      echo "dof present"
-    } | tee "$out/artifact.txt"
-    for t in aarch64-unknown-linux-musl aarch64-unknown-linux-gnu; do
-      [ -d "conformance-probes/target/$t/release" ] || { echo "probe binaries missing for $t: run scripts/build-probes.sh (Docker) or copy conformance-probes/target/$t from a checkout that has them"; exit 1; }
-    done
-    step() { local name=$1; shift; "$@" > "$out/$name.log" 2>&1 || { echo "el1-gate: step $name failed; tail of $out/$name.log:"; tail -40 "$out/$name.log"; exit 1; }; }
-    step el1-embed ./scripts/test-signed.sh carrick-embed el1_
-    step probes just --no-deps conformance-probes
-    suites=$(grep -oE 'name = "ltp-(inotify|fanotify|read|write|lseek|pread|pwrite|fstat|stat|dup|close|open|fsync|ftruncate|truncate|creat)[0-9a-z_]*"' scripts/conformance/suites.toml | sed 's/name = //; s/"//g; s/^/--suite /' | tr '\n' ' ')
-    step ltp cargo run -q -p carrick-conformance -- --tier full $suites --jsonl "$out/ltp.jsonl"
-    for mode in 1 0; do
-      start=$(python3 -c 'import time;print(time.time())')
-      CARRICK_RUN_ID=el1-gate-$mode CARRICK_EL1=$mode "$bin" run --rm localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/inotify09 > "$out/inotify09-$mode.out" 2> "$out/inotify09-$mode.err" < /dev/null
-      end=$(python3 -c 'import time;print(time.time())')
-      grep -aq TPASS "$out/inotify09-$mode.out" "$out/inotify09-$mode.err" || { echo "inotify09 EL1=$mode did not TPASS"; exit 1; }
-      python3 -c "print('inotify09 EL1=$mode wall', round($end-$start, 2))" | tee -a "$out/artifact.txt"
-    done
-    now=$(shasum -a 256 "$bin" | cut -d' ' -f1)
-    [ "$now" = "$sha" ] || { echo "binary changed during the gate"; exit 1; }
-    echo "el1-gate: green on $sha ($out)"
+    cargo run --locked -p carrick-xtask -- accept --phase signed --profile full
 
 conformance-probes: build
     #!/usr/bin/env bash
