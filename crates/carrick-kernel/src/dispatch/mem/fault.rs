@@ -482,14 +482,16 @@ impl MemState {
         pieces
     }
 
-    /// The protection a first touch of root-owned `page` publishes, or
-    /// `None` when it is already resident or inaccessible.
     fn root_owes_backing_at(&self, page: u64) -> bool {
+        self.root_owes_backing_within(page, page.saturating_add(1))
+    }
+
+    fn root_owes_backing_within(&self, start: u64, end: u64) -> bool {
         self.delegated_root().is_some_and(|root| {
             root.with_root(|model| {
                 let mut overlaps = false;
                 model.observe_deferred_returns(&mut |entry| {
-                    overlaps |= entry.range.start() <= page && page < entry.range.end();
+                    overlaps |= entry.range.start() < end && start < entry.range.end();
                 });
                 Ok(overlaps)
             })
@@ -818,13 +820,31 @@ pub enum PublishedFrameGrantRefusal {
     Identity,
     PublicationProtection,
     BusFault,
-    ReturnOwed,
     HostUnarmed,
     Unmapped,
     ProtectionChanged {
         published: LinuxProtFlags,
         current: LinuxProtFlags,
     },
+}
+
+/// The authenticated grant is either still resident or already owed back.
+pub enum PublishedFrameGrantPlan<'permit> {
+    Resident(ResidentFrameGrantPlan<'permit>),
+    Retired(RetiredFrameGrantPlan<'permit>),
+}
+
+/// An applied grant overtaken by an EL1 retirement. It carries accounting
+/// authority only; it cannot publish residency for the retired page.
+pub struct RetiredFrameGrantPlan<'permit> {
+    span: ReservationRange,
+    exclusion: super::HostAliasDispatchGuard<'permit>,
+}
+
+impl<'permit> From<ResidentFrameGrantPlan<'permit>> for PublishedFrameGrantPlan<'permit> {
+    fn from(plan: ResidentFrameGrantPlan<'permit>) -> Self {
+        Self::Resident(plan)
+    }
 }
 
 /// Owns alias exclusion from a bulk first-touch lookup through host backing
@@ -1204,7 +1224,7 @@ impl<'a> MemView<'a> {
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
-    ) -> Result<ResidentFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
+    ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
         let (publication, backing) = receipt
             .prepared_backing()
             .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?;
@@ -1249,8 +1269,12 @@ impl<'a> MemView<'a> {
         if bus_fault_contains(&mem.bus_fault_ranges, resident.va) {
             return Err(PublishedFrameGrantRefusal::BusFault);
         }
-        if mem.root_owes_backing_at(resident.va) {
-            return Err(PublishedFrameGrantRefusal::ReturnOwed);
+        if mem.root_owes_backing_within(publication.va, end) {
+            return Ok(PublishedFrameGrantPlan::Retired(RetiredFrameGrantPlan {
+                span: ReservationRange::new(publication.va, end)
+                    .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?,
+                exclusion,
+            }));
         }
         // The authenticated publication is not a fresh allocation. EL1's
         // residency reconciliation may already have committed this page.
@@ -1284,7 +1308,7 @@ impl<'a> MemView<'a> {
                         .is_empty()
                 })
             });
-        Ok(ResidentFrameGrantPlan {
+        Ok(PublishedFrameGrantPlan::Resident(ResidentFrameGrantPlan {
             root_owned,
             stock,
             fault_page: resident.va,
@@ -1292,7 +1316,7 @@ impl<'a> MemView<'a> {
             len: publication.len,
             prot: prot.bits(),
             exclusion,
-        })
+        }))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1346,6 +1370,29 @@ impl<'a> MemView<'a> {
         let mut mem = mem_authority_33.lock();
         mem.record_resident(range);
         mem.resident_fault_ranges.disarm(range);
+    }
+
+    /// Settle accounting without reviving a page EL1 already retired.
+    /// Returns whether the live grant residency record may be published.
+    pub(crate) fn commit_published_frame_grant(&self, plan: PublishedFrameGrantPlan<'_>) -> bool {
+        match plan {
+            PublishedFrameGrantPlan::Resident(plan) => {
+                self.commit_resident_frame_grant(plan);
+                true
+            }
+            PublishedFrameGrantPlan::Retired(plan) => {
+                if !self.owns_host_alias_dispatch(&plan.exclusion) {
+                    carrick_fatal!(
+                        "dispatch::resident_frame_grant",
+                        "caller lacks host alias dispatch exclusion during retired grant settlement"
+                    );
+                }
+                // The owed journal returns the retired pages. The stock
+                // list returns every remaining hole in this exact grant.
+                self.mem().lock().first_touch_stock.push(plan.span);
+                false
+            }
+        }
     }
 
     pub(crate) fn commit_resident_frame_grant(&self, plan: ResidentFrameGrantPlan<'_>) {
