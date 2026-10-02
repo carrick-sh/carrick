@@ -362,11 +362,14 @@ V2 models. Maintain personality/substrate separation and compiler inventories.
 
 ### N0 preparation receipt (partial, 2026-10-02)
 
-This worktree is based on admission `690383cc8`, not main. The director
-reports that its experimental internal-window read gate will be reverted;
-this reduction does not exercise that gate. Rebase and reverify before
-integration. Internal bootstrap windows require a distinct typed intent,
-not user-transfer permission.
+Initial reduction ran on admission `690383cc8`, not main. The director froze
+admission at `1cf7568e1` without acceptance and requested rebasing onto that
+base, which reverts the experimental internal-window read gate. This reduction
+does not exercise that gate. Internal bootstrap windows require a distinct
+typed intent, not user-transfer permission. The two registrations preserve
+N1/N2 red groups from the director's `admission-final/s3t3-narrow-report.md`;
+those signed observations are external evidence, with unproved causes and no
+GNU coverage, not a receipt for N0's executable.
 
 The production-path known-red witness is
 `carrick-el1::native_ownership_tests::red_until_n1_production_admission_retains_host_semantic_venue`.
