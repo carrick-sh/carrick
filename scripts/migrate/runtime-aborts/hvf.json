@@ -874,17 +874,6 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "function": "HvfVmState::try_commit_process_alias_retirement",
-      "ordinal_in_function": 4,
-      "fingerprint": "01b3f0e769642447c147922ddb0326a92967cd6a5aa1509976035a2e31724e2b",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing alias retirement backend inventory lease failed in the local frame inventory ledger.",
-      "sink": "fatal",
-      "domain": "hvpatch::frame_inventory"
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::materialize_retired_reuse",
       "ordinal_in_function": 3,
       "fingerprint": "c25bd496f76bf83927f822e4250c722633485c62666b07db430a1c9a26584c47",
@@ -2499,6 +2488,17 @@
       "rationale": "The host is about to build a fork child from, or host-COW, the MM's frames after the exclusion that settles EL1 COW completions; a completion still pending means settlement missed this MM, and building from the host's stale view would inherit or retire a frame while a live leaf names another one.",
       "sink": "fatal",
       "domain": "hvpatch::guest_cow"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
+      "function": "HvfVmState::apply_inventory_lease_retirement",
+      "ordinal_in_function": 1,
+      "fingerprint": "2a9af99a58406176f45d321b9f44c6248679ff56a2101d8d80358505837aaee3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "After the Kernel applied a lease retirement, committing it to the backend frame inventory ledger failed; the two authorities disagree and cannot be reconciled. Moved from try_commit_process_alias_retirement when the Kernel apply and backend commit became one step.",
+      "sink": "fatal",
+      "domain": "hvpatch::frame_inventory"
     }
   ]
 }
