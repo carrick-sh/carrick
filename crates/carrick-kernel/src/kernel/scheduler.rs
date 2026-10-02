@@ -2027,6 +2027,46 @@ impl Drop for WakeAdmission {
     }
 }
 
+/// Process-owned first-generation capacity, without a running-thread grant.
+pub struct ProcessBirthSubmission {
+    owner: TaskKey,
+    authority: SubmissionAuthority,
+}
+
+impl std::fmt::Debug for ProcessBirthSubmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessBirthSubmission")
+            .field("owner", &self.owner)
+            .field("thread", &self.authority.thread_key())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProcessBirthSubmission {
+    pub fn activate(
+        self,
+        scheduler: &Scheduler,
+        thread: &Arc<Thread>,
+    ) -> Result<SubmissionAuthority, Self> {
+        if thread.task_key() != self.owner
+            || thread.key() != self.authority.thread_key()
+            || thread.execution_state().generation() != Some(self.authority.generation())
+            || !Weak::ptr_eq(&self.authority.kernel, &Arc::downgrade(&scheduler.kernel))
+            || !Weak::ptr_eq(
+                &self.authority.queue,
+                &Arc::downgrade(&scheduler.queue.inner),
+            )
+            || scheduler
+                .kernel
+                .exact_thread_for_scheduler(thread.key())
+                .is_none_or(|live| !Arc::ptr_eq(&live, thread))
+        {
+            return Err(self);
+        }
+        Ok(self.authority)
+    }
+}
+
 /// Queue authority retained by an exact active generation. New roots may be
 /// admitted only while open; descendants of this retained authority may be
 /// admitted while closing so recursive fork publication cannot be stranded.
@@ -3649,6 +3689,28 @@ impl Scheduler {
             })
             .unwrap_or(Err(RunQueueError::AuthorityMismatch))
             .map_err(Into::into)
+    }
+
+    /// Reserve a first-generation submission before the thread is born.
+    pub fn reserve_process_birth(
+        &self,
+        owner: &super::objects::TaskRef,
+        thread: ThreadKey,
+    ) -> Result<ProcessBirthSubmission, RunQueueError> {
+        if owner.lifecycle() != super::objects::TaskLifecycle::Live {
+            return Err(RunQueueError::SubmissionRejected);
+        }
+        let authority = self.queue.admit_root(
+            &self.kernel,
+            QueueKey {
+                thread,
+                generation: ExecutionGeneration::INITIAL,
+            },
+        )?;
+        Ok(ProcessBirthSubmission {
+            owner: owner.key(),
+            authority,
+        })
     }
 
     pub fn admit_process_root(
@@ -5664,6 +5726,58 @@ mod tests {
                 None,
             )
             .expect("fork process child")
+    }
+
+    #[test]
+    fn process_birth_submission_is_reserved_before_birth_and_cannot_adopt_a_peer() {
+        let (kernel, root) = bootstrap(12_497);
+        let peer = process_child(&kernel, &root, 9_497, "birth-submission-peer");
+        let peer_sibling = sibling(&kernel, &peer, 9_498);
+        let scheduler = Scheduler::new(kernel.clone());
+        let reservation = kernel
+            .reserve_thread_clone(
+                &root,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        let submission = scheduler
+            .reserve_process_birth(root.task(), reservation.key())
+            .expect("process owner reserves submission before Born");
+        let child = reservation
+            .prepare(ThreadId::synthetic_for_tests(9_499))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        let generation = scheduler
+            .publish_initial_task_state_gated(child.thread(), task_state(&child, 501))
+            .unwrap();
+        assert_eq!(generation, super::ExecutionGeneration::INITIAL);
+        let submission = submission
+            .activate(&scheduler, peer_sibling.thread())
+            .expect_err("peer cannot consume owner submission");
+        let authority = submission
+            .activate(&scheduler, child.thread())
+            .expect("exact birth consumes its process grant without a driver grant");
+        assert_eq!(authority.thread_key(), child.thread().key());
+        assert_eq!(scheduler.queued_len(), 0);
+        assert!(root.exact_thread_is_live());
+        assert!(peer.exact_thread_is_live());
+        scheduler.close();
+        assert!(
+            scheduler
+                .reserve_process_birth(peer.task(), peer_sibling.thread().key())
+                .is_err(),
+            "closing cannot admit another birth capacity"
+        );
+        drop(authority);
+        scheduler.wait_closed();
     }
 
     fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {

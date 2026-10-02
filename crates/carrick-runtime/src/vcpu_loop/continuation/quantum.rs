@@ -1399,8 +1399,8 @@ mod tests {
         );
         for required in [
             "ops.prepare",
-            "HvpatchSubmissionShape::SameTaskSibling",
-            "prepare_hvpatch_submission",
+            "HvpatchSubmissionShape::ProcessBirth",
+            "prepare_submission",
             "take_opened_start_gate",
             "dormant.activate",
         ] {

@@ -671,6 +671,13 @@ impl HvpatchTaskBindingDirectory {
             ));
         }
         let authority = match (shape, grant_authority) {
+            (HvpatchSubmissionShape::ProcessBirth(reservation), None) => {
+                reservation.activate(scheduler, &thread).map_err(|_| {
+                    TrapError::Hypervisor(
+                        "process birth submission rejected its exact thread".to_owned(),
+                    )
+                })?
+            }
             (HvpatchSubmissionShape::Root, None) => scheduler
                 .admit_process_root(key.0, key.1)
                 .map_err(|error| TrapError::Hypervisor(error.to_string()))?,
@@ -785,13 +792,14 @@ impl HvpatchTaskBindingDirectory {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 // Root is production-wired in this slice. The other shapes are intentionally
 // prepared now so the subsequent fork/clone conversion cannot fall back to a
 // generic descendant edge while it replaces the compatibility materializers.
 #[allow(dead_code)]
 pub(crate) enum HvpatchSubmissionShape {
     Root,
+    ProcessBirth(carrick_kernel::kernel::scheduler::ProcessBirthSubmission),
     Descendant {
         grant: (ThreadKey, ExecutionGeneration),
     },
