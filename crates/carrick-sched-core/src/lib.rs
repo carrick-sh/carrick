@@ -634,6 +634,14 @@ impl ZoneRecord {
     /// Whether resuming it needs its executor ([`Handback::Service`]), or
     /// the host asked for it back while EL1 held it: EL1 never runs such a
     /// thread at EL0, it leaves the vCPU for the executor instead.
+    /// A lifecycle birth has committed owned inactive execution capacity,
+    /// but no execution generation until its first executor activation.
+    fn is_unadopted_birth(&self) -> bool {
+        self.generation.load(Ordering::Relaxed) == 0
+            && self.lifecycle_page.load(Ordering::Relaxed) != 0
+            && self.control_slot.load(Ordering::Relaxed) != 0
+    }
+
     pub fn needs_host(&self) -> bool {
         self.handback() == Some(Handback::Service)
             || self.host_wanted()
@@ -3103,7 +3111,9 @@ impl ZoneTables {
                 // Keep work with a victim in the guest if the thief would
                 // need its executor, whether for service or a foreign
                 // address space: moving it would only create a host exit.
-                || (!victim_stopped && self.needs_executor(thief, rec))
+                || (!victim_stopped
+                    && self.needs_executor(thief, rec)
+                    && !(rec.is_unadopted_birth() && !self.executor_has_task(thief)))
                 || !rec.allows_cpu(cpu)
             {
                 continue;

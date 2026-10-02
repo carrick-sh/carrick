@@ -1152,6 +1152,47 @@ fn stealing_takes_only_what_the_thief_may_run() {
     assert_eq!(zone.counters.foreign_adoptions.load(Ordering::Relaxed), 0);
 }
 
+/// Two live process queues must activate reserved born capacity on cold
+/// executors instead of serializing compute siblings on their parent's CPU.
+#[test]
+fn idle_executors_adopt_born_records_from_two_live_process_queues() {
+    let zone = zone();
+    for (victim, mm, thief, cpu, tid) in [
+        (SLOT, MM, SlotId::new(10), 0, 40),
+        (OTHER, MM + 1, SlotId::new(11), 1, 50),
+    ] {
+        host_publish(&zone, victim, mm, Some(cpu), 0);
+        zone.enter_guest(victim);
+        let born = zone
+            .alloc_record(ThreadIdentity {
+                mm,
+                generation: 0,
+                lifecycle_page: 0x1000 + mm * 4096,
+                control_slot: 0x2000 + mm * 4096,
+                ..identity(tid)
+            })
+            .unwrap();
+        zone.requeue_preempted(victim, born);
+        host_publish(&zone, thief, 0, Some(cpu + 2), 0);
+        zone.enter_guest(thief);
+        assert!(!zone.enter_idle(thief, false));
+        assert_eq!(
+            zone.steal(thief),
+            None,
+            "cold adoption belongs to the executor"
+        );
+        assert_eq!(
+            zone.runnable_head(thief),
+            Some(born),
+            "pre-reserved birth must reach idle execution capacity"
+        );
+        assert_eq!(zone.take_service_head(thief).unwrap().id, born);
+        assert_eq!(zone.record(born).identity().mm, mm);
+        assert_eq!(zone.record(born).identity().generation, 0);
+        assert_eq!(zone.runnable_head(victim), None);
+    }
+}
+
 /// A service thread the host placed on a stopped slot (its vCPU out of the
 /// guest, its executor on the host) must not wait there for an executor that
 /// may not come back to that vCPU: an idle vCPU takes it onto its own queue
