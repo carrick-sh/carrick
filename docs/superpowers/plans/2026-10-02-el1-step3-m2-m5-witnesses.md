@@ -180,3 +180,25 @@ zero/finite/infinite deadlines, atomic enrollment signal-arrival race, and
 ready/timeout/EINTR/cancel restoration through ppoll/pselect/epoll_pwait.
 Inherited continuation signal/timeout reducers remain registered elsewhere;
 this new ready path does not claim their entire mixed-set composition.
+
+### M4 cyclic rights — flips at M4 cutover
+
+`dispatch::net::scm_rights::tests::red_until_step3_m4_cyclic_rights_survive_last_external_close`
+uses actual host socketpair/sendmsg placeholder transport with two live tables.
+Each receiving socket has a queued placeholder retaining its own description.
+After both sender-side placeholder handles and both table aliases close,
+`gc` retains exactly 2/16/128 descriptions at 1/8/64 cycles. Exact failure:
+`SCM vault cannot collect queued socket-description cycles`. The test claims
+both scoped keys before releasing either description for bounded cleanup;
+no cross-test global count or scan budget is inferred.
+
+This reproduces a main reclamation defect: socket descriptions retained by
+unreachable in-flight rights keep their own host receive queues alive, so the
+placeholder writer never reports HUP and the vault's orphan collector cannot
+break the cycle. No production fix is included. Reproduction command:
+`CARGO_BUILD_JOBS=3 cargo test -p carrick-kernel --lib m4_cyclic -- --nocapture`.
+
+Remaining M4: deterministic collector work budgets/historical VAULT visits,
+ancillary truncation/fault rollback, all backing-kind flags/cursor/EOF lifetime,
+SEQPACKET/message options and actual namespace/host-peer boundary bindings.
+The cycle witness is cutover input, not proof that a collector exists.
