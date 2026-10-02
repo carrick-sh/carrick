@@ -87,6 +87,10 @@ carrier-topology-gate *ARGS: build
 xtask *ARGS:
     cargo run --locked -p carrick-xtask -- {{ARGS}}
 
+# Provision fresh-worktree guest artifacts before signed execution.
+land-provision *ARGS:
+    just --justfile {{justfile()}} xtask provision {{ARGS}}
+
 # Fast unsigned debug build (cannot run a guest — for compile-checking only).
 check *ARGS:
     cargo build -p carrick-cli {{_platform_features}} {{ARGS}}

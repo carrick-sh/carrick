@@ -43,6 +43,8 @@ pub enum Commands {
         #[arg(long, help = "Path to repository root")]
         root: Option<PathBuf>,
     },
+    #[command(about = "Provision guest artifacts before signed execution")]
+    Provision(crate::provision::ProvisionArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +86,8 @@ pub enum CliError {
 
     #[error("ledger contract regeneration error: {0}")]
     RegenerateContracts(#[from] crate::ledger_merge::RegenerateError),
+    #[error("provision error: {0}")]
+    Provision(#[from] crate::provision::ProvisionError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -246,6 +250,10 @@ where
                 path: PathBuf::from("stdout"),
                 source: e,
             })?;
+            Ok(())
+        }
+        Commands::Provision(args) => {
+            crate::provision::run(cli.root.as_deref(), args.action, writer)?;
             Ok(())
         }
     }
