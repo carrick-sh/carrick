@@ -31,8 +31,12 @@ parking_lot.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+[build-dependencies]
+carrick-xtask = { path = "../carrick-xtask" }
+
 [dev-dependencies]
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+carrick-xtask = { path = "../carrick-xtask" }
 libc.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

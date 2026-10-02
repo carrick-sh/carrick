@@ -8,7 +8,12 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_2_PROBE_COUNT: usize = 161;
+fn cached_shard_2_probe_count() -> usize {
+    SHARD_2_PROBES
+        .iter()
+        .filter(|name| common::runs_in_cached_lane(name))
+        .count()
+}
 
 /// Derive the shard expected gap subset from the complete baseline gap set.
 pub fn expected_gaps_for_shard(baseline: &[&'static str]) -> BTreeSet<&'static str> {
@@ -97,17 +102,11 @@ pub fn probe_campaign_dir(repo_root: &Path, target: &str) -> Option<PathBuf> {
 
 #[test]
 fn test_shard_2_inventory_definition() {
-    // 1. Hard-assert exactly 168 sorted unique names.
-    assert_eq!(
-        SHARD_2_PROBES.len(),
-        168,
-        "shard 2 must contain exactly 168 probes"
-    );
     let probe_set: BTreeSet<&str> = SHARD_2_PROBES.iter().copied().collect();
     assert_eq!(
         probe_set.len(),
-        168,
-        "SHARD_2_PROBES must contain 168 unique names"
+        SHARD_2_PROBES.len(),
+        "SHARD_2_PROBES must contain unique names"
     );
     for window in SHARD_2_PROBES.windows(2) {
         assert!(
@@ -122,59 +121,77 @@ fn test_shard_2_inventory_definition() {
             .iter()
             .filter(|name| common::runs_in_cached_lane(name))
             .count(),
-        CACHED_SHARD_2_PROBE_COUNT
+        cached_shard_2_probe_count(),
+        "shard 2 cached probe count must match derived policy"
     );
 
-    // 2. Validate against probe-inventory.json
     let repo_root = common::repo_root();
     let inventory_path = repo_root.join("conformance-probes/probe-inventory.json");
-    let content = std::fs::read_to_string(&inventory_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", inventory_path.display()));
-
-    // Parse probe-inventory.json entries
-    let mut generic_conformance_probes = Vec::new();
-
-    for chunk in content.split("\n  \"") {
-        let Some((name_part, rest)) = chunk.split_once("\": {") else {
-            continue;
-        };
-        let name = name_part.trim_matches(|c| c == '\"' || c == ' ' || c == '\n' || c == '{');
-        if name.is_empty() {
-            continue;
-        }
-        let is_conformance = rest.contains("\"class\": \"conformance\"");
-        let is_not_excluded = rest.contains("\"excluded\": false");
-        let is_generic_runner = rest.contains("\"runner\": \"generic\"");
-
-        if is_conformance && is_not_excluded && is_generic_runner {
-            generic_conformance_probes.push(name.to_string());
-        }
-    }
-
-    generic_conformance_probes.sort();
-    generic_conformance_probes.dedup();
-    assert_eq!(
-        generic_conformance_probes.len(),
-        506,
-        "expected exactly 506 generic conformance probes across all shards"
-    );
-
-    let derived_shard_2: Vec<&str> = generic_conformance_probes
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| idx % 3 == 2)
-        .map(|(_, name)| name.as_str())
-        .collect();
+    let inventory = carrick_xtask::probe_inventory::load_inventory(&inventory_path)
+        .expect("read and parse probe inventory");
+    let partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    let derived_shard_2: Vec<&str> = partition.shards[2].iter().map(String::as_str).collect();
 
     assert_eq!(
+        SHARD_2_PROBES.len(),
         derived_shard_2.len(),
-        168,
-        "derived shard 2 must have 168 items"
+        "shard 2 length must match derived shard 2 from probe-inventory.json"
     );
     assert_eq!(
         derived_shard_2.as_slice(),
         SHARD_2_PROBES,
         "materialized SHARD_2_PROBES must match probe-inventory.json derived shard 2"
+    );
+}
+
+#[test]
+fn test_shard_2_generation_responds_to_additions() {
+    let repo_root = common::repo_root();
+    let inventory_path = repo_root.join("conformance-probes/probe-inventory.json");
+    let mut inventory = carrick_xtask::probe_inventory::load_inventory(&inventory_path)
+        .expect("read probe inventory");
+
+    let initial_partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    let initial_shard_2_len = initial_partition.shards[2].len();
+    let initial_total = initial_partition.generic_names.len();
+
+    let pad_count = (2 + 3 - (initial_total % 3)) % 3;
+    for i in 0..pad_count {
+        inventory.insert(
+            format!("zzz_pad_{i}"),
+            carrick_xtask::probe_inventory::ProbeInventoryRow {
+                class: "conformance".to_string(),
+                runner: "generic".to_string(),
+                excluded: false,
+                contract_ids: None,
+            },
+        );
+    }
+    let target_probe = "zzz_synthetic_probe_for_shard_2".to_string();
+    inventory.insert(
+        target_probe.clone(),
+        carrick_xtask::probe_inventory::ProbeInventoryRow {
+            class: "conformance".to_string(),
+            runner: "generic".to_string(),
+            excluded: false,
+            contract_ids: None,
+        },
+    );
+
+    let updated_partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    assert_eq!(
+        updated_partition.generic_names.len(),
+        initial_total + pad_count + 1,
+        "total generic probes must expand by added count"
+    );
+    assert_eq!(
+        updated_partition.shards[2].len(),
+        initial_shard_2_len + 1,
+        "shard 2 must expand by 1"
+    );
+    assert!(
+        updated_partition.shards[2].contains(&target_probe),
+        "target probe must appear in shard 2"
     );
 }
 

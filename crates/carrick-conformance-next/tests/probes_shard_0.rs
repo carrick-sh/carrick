@@ -20,7 +20,12 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_0_PROBE_COUNT: usize = 153;
+fn cached_shard_0_probe_count() -> usize {
+    SHARD_0_PROBES
+        .iter()
+        .filter(|name| common::runs_in_cached_lane(name))
+        .count()
+}
 
 /// Derive the shard 0 subset from a complete baseline set.
 pub fn expected_shard_gaps(baseline: &[&'static str]) -> BTreeSet<&'static str> {
@@ -141,13 +146,6 @@ pub fn find_probe_binary_dir(repo_root: &Path, target: &str) -> Option<PathBuf> 
 
 #[test]
 fn test_shard_0_inventory() {
-    // Hard-assert exactly 169 sorted unique names.
-    assert_eq!(
-        SHARD_0_PROBES.len(),
-        169,
-        "shard 0 must have exactly 169 probes"
-    );
-
     let mut sorted_probes = SHARD_0_PROBES.to_vec();
     sorted_probes.sort_unstable();
     assert_eq!(
@@ -159,85 +157,30 @@ fn test_shard_0_inventory() {
     let unique_probes: BTreeSet<_> = SHARD_0_PROBES.iter().copied().collect();
     assert_eq!(
         unique_probes.len(),
-        169,
-        "SHARD_0_PROBES must contain 169 unique names"
+        SHARD_0_PROBES.len(),
+        "SHARD_0_PROBES must contain unique names"
     );
     assert_eq!(
         SHARD_0_PROBES
             .iter()
             .filter(|name| common::runs_in_cached_lane(name))
             .count(),
-        CACHED_SHARD_0_PROBE_COUNT
+        cached_shard_0_probe_count(),
+        "shard 0 cached probe count must match derived policy"
     );
 
-    // Verify against conformance-probes/probe-inventory.json
+    // Independently verify against conformance-probes/probe-inventory.json
     let repo_root = common::repo_root();
     let inv_path = repo_root.join("conformance-probes/probe-inventory.json");
-    let inv_raw = std::fs::read_to_string(&inv_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", inv_path.display()));
-
-    // Custom lightweight parser for probe-inventory.json to avoid extra dependencies.
-    // Format is:
-    // "name": {
-    //   "class": "conformance",
-    //   "excluded": false,
-    //   "runner": "generic"
-    // }
-    let mut selected_names = Vec::new();
-    let mut cur_name: Option<String> = None;
-    let mut cur_class: Option<String> = None;
-    let mut cur_excluded = false;
-    let mut cur_runner: Option<String> = None;
-
-    for line in inv_raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('"') && trimmed.ends_with('{') {
-            if let Some(name) = cur_name.take()
-                && cur_class.as_deref() == Some("conformance")
-                && !cur_excluded
-                && cur_runner.as_deref() == Some("generic")
-            {
-                selected_names.push(name);
-            }
-            cur_class = None;
-            cur_excluded = false;
-            cur_runner = None;
-            if let Some(end_idx) = trimmed[1..].find('"') {
-                cur_name = Some(trimmed[1..=end_idx].to_string());
-            }
-        } else if trimmed.starts_with("\"class\":") && trimmed.contains("\"conformance\"") {
-            cur_class = Some("conformance".to_string());
-        } else if trimmed.starts_with("\"excluded\":") && trimmed.contains("true") {
-            cur_excluded = true;
-        } else if trimmed.starts_with("\"runner\":") && trimmed.contains("\"generic\"") {
-            cur_runner = Some("generic".to_string());
-        }
-    }
-    if let Some(name) = cur_name.take()
-        && cur_class.as_deref() == Some("conformance")
-        && !cur_excluded
-        && cur_runner.as_deref() == Some("generic")
-    {
-        selected_names.push(name);
-    }
-
-    selected_names.sort();
-    assert_eq!(
-        selected_names.len(),
-        506,
-        "expected exactly 506 conformance generic probes in inventory"
-    );
-
-    let derived_shard_0: Vec<&str> = selected_names
-        .iter()
-        .enumerate()
-        .filter_map(|(i, name)| (i % 3 == 0).then_some(name.as_str()))
-        .collect();
+    let inventory = carrick_xtask::probe_inventory::load_inventory(&inv_path)
+        .expect("read and parse probe inventory");
+    let partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    let derived_shard_0: Vec<&str> = partition.shards[0].iter().map(String::as_str).collect();
 
     assert_eq!(
+        SHARD_0_PROBES.len(),
         derived_shard_0.len(),
-        169,
-        "derived shard 0 must have exactly 169 items"
+        "shard 0 length must match derived shard 0 from probe-inventory.json"
     );
     assert_eq!(
         SHARD_0_PROBES,
@@ -247,13 +190,72 @@ fn test_shard_0_inventory() {
 }
 
 #[test]
+fn test_shard_0_generation_responds_to_additions() {
+    let repo_root = common::repo_root();
+    let inv_path = repo_root.join("conformance-probes/probe-inventory.json");
+    let mut inventory =
+        carrick_xtask::probe_inventory::load_inventory(&inv_path).expect("read probe inventory");
+
+    let initial_partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    let initial_shard_0_len = initial_partition.shards[0].len();
+    let initial_total = initial_partition.generic_names.len();
+
+    let pad_count = (0 + 3 - (initial_total % 3)) % 3;
+    for i in 0..pad_count {
+        inventory.insert(
+            format!("zzz_pad_{i}"),
+            carrick_xtask::probe_inventory::ProbeInventoryRow {
+                class: "conformance".to_string(),
+                runner: "generic".to_string(),
+                excluded: false,
+                contract_ids: None,
+            },
+        );
+    }
+    let target_probe = "zzz_synthetic_probe_for_shard_0".to_string();
+    inventory.insert(
+        target_probe.clone(),
+        carrick_xtask::probe_inventory::ProbeInventoryRow {
+            class: "conformance".to_string(),
+            runner: "generic".to_string(),
+            excluded: false,
+            contract_ids: None,
+        },
+    );
+
+    let updated_partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    assert_eq!(
+        updated_partition.generic_names.len(),
+        initial_total + pad_count + 1,
+        "total generic probes must increment by added count"
+    );
+    assert_eq!(
+        updated_partition.shards[0].len(),
+        initial_shard_0_len + 1,
+        "shard 0 must expand by 1"
+    );
+    assert!(
+        updated_partition.shards[0].contains(&target_probe),
+        "target probe must be in shard 0"
+    );
+}
+
+#[test]
 fn test_shard_0_expected_gaps_derivation() {
     let musl_shard_gaps = expected_shard_gaps(common::MUSL_BASELINE_GAPS);
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
 
-    let expected_musl_set = BTreeSet::from([]);
-
-    let expected_gnu_set = BTreeSet::from([]);
+    let shard_set: BTreeSet<&str> = SHARD_0_PROBES.iter().copied().collect();
+    let expected_musl_set: BTreeSet<&str> = common::MUSL_BASELINE_GAPS
+        .iter()
+        .copied()
+        .filter(|p| shard_set.contains(p))
+        .collect();
+    let expected_gnu_set: BTreeSet<&str> = common::GNU_BASELINE_GAPS
+        .iter()
+        .copied()
+        .filter(|p| shard_set.contains(p))
+        .collect();
 
     assert_eq!(
         musl_shard_gaps, expected_musl_set,

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::command::{self, CommandError};
+use crate::probe_coverage::{self, CoverageError};
 
 #[derive(Parser, Debug)]
 #[command(name = "carrick-xtask", about = "Carrick xtask maintenance tool")]
@@ -43,8 +44,27 @@ pub enum Commands {
         #[arg(long, help = "Path to repository root")]
         root: Option<PathBuf>,
     },
+
     #[command(about = "Provision guest artifacts before signed execution")]
     Provision(crate::provision::ProvisionArgs),
+
+    #[command(
+        name = "probe-coverage",
+        about = "Validate probe inventory coverage against baseline"
+    )]
+    ProbeCoverage(ProbeCoverageArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ProbeCoverageArgs {
+    #[arg(long, help = "Base commit to validate coverage against")]
+    pub base: Option<String>,
+
+    #[arg(
+        long,
+        help = "Refresh conformance-probes/coverage-base.json to current HEAD and inventory"
+    )]
+    pub refresh_base: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +81,9 @@ pub enum CliError {
 
     #[error("command error: {0}")]
     Command(#[from] CommandError),
+
+    #[error("coverage error: {0}")]
+    Coverage(#[from] CoverageError),
 
     #[error("git is unavailable: {0}")]
     GitUnavailable(std::io::Error),
@@ -254,6 +277,24 @@ where
         }
         Commands::Provision(args) => {
             crate::provision::run(cli.root.as_deref(), args.action, writer)?;
+            Ok(())
+        }
+        Commands::ProbeCoverage(args) => {
+            if args.refresh_base {
+                probe_coverage::refresh_coverage_base(cli.root.as_deref())?;
+                writeln!(writer, "probe-coverage: baseline refreshed").map_err(|e| {
+                    CliError::Io {
+                        path: PathBuf::from("stdout"),
+                        source: e,
+                    }
+                })?;
+            } else {
+                probe_coverage::run_probe_coverage(cli.root.as_deref(), args.base.as_deref())?;
+                writeln!(writer, "probe-coverage: ok").map_err(|e| CliError::Io {
+                    path: PathBuf::from("stdout"),
+                    source: e,
+                })?;
+            }
             Ok(())
         }
     }

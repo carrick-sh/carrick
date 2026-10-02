@@ -1,0 +1,21 @@
+{
+  "schema": "carrick-probe-coverage-base-v1",
+  "base_head": "0123456789abcdef0123456789abcdef01234567",
+  "probes": {
+    "sample_probe_1": {
+      "class": "conformance",
+      "runner": "generic",
+      "excluded": false
+    },
+    "sample_probe_2": {
+      "class": "performance",
+      "runner": "generic",
+      "excluded": false
+    },
+    "sample_probe_3": {
+      "class": "conformance",
+      "runner": "bridge_tcp_peer",
+      "excluded": false
+    }
+  }
+}
