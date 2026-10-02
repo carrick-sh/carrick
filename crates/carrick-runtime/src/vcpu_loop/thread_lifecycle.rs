@@ -20,7 +20,7 @@ fn publish_for_page<R>(
 
 #[derive(Debug)]
 struct ControlBacking(ThreadControlLease);
-// SAFETY: the lease retains one MAP_SHARED granule of atomic ABI-only slots.
+// SAFETY: the lease retains a MAP_SHARED slab containing only ABI granules.
 unsafe impl RetainedMetadataBacking for ControlBacking {
     fn host_base(&self) -> HostVa {
         self.0.backing_base()
@@ -32,7 +32,7 @@ unsafe impl RetainedMetadataBacking for ControlBacking {
 
 #[derive(Debug)]
 struct LifecycleBacking(ThreadLifecycleLease);
-// SAFETY: the lease retains one MAP_SHARED granule containing only lifecycle ABI.
+// SAFETY: the lease retains a MAP_SHARED slab containing only ABI granules.
 unsafe impl RetainedMetadataBacking for LifecycleBacking {
     fn host_base(&self) -> HostVa {
         self.0.backing_base()
@@ -57,7 +57,7 @@ impl State {
     fn retain_thread(&mut self, control: ThreadControlLease) {
         self.threads.insert(
             (
-                control.lifecycle().backing_base().raw(),
+                control.lifecycle().page_address().raw(),
                 control.identity().1,
             ),
             control,
@@ -116,6 +116,7 @@ impl CarrierLifecycleMappings {
             let region = self.access.region()?;
             let mut state = self.state.lock();
             let page = self.map(&mut state, Arc::new(LifecycleBacking(control.lifecycle())))?;
+            let page_offset = lifecycle.page_address().raw() - lifecycle.backing_base().raw();
             let base = self.map(&mut state, Arc::new(ControlBacking(control.clone())))?;
             let offset = control.slot_address().raw() - control.backing_base().raw();
             state.retain_thread(control);
@@ -128,7 +129,7 @@ impl CarrierLifecycleMappings {
                     .cast::<CurrentTask>()
                     .add(slot)
             };
-            task.publish_lifecycle(page.raw(), base.raw() + offset as u64);
+            task.publish_lifecycle(page.raw() + page_offset as u64, base.raw() + offset as u64);
             Ok(())
         })
         .unwrap_or(Ok(()))

@@ -402,7 +402,11 @@ impl TaskShared {
                 Arc::new(Sighand::for_fork_copy(ids.sighand_id()?, &parent.sighand))
             }
         };
-        Ok(Self::new(mm, sighand))
+        Ok(Self {
+            mm,
+            sighand,
+            pending_signals: Arc::new(parent.pending_signals.for_fork()),
+        })
     }
 
     #[cfg(test)]
@@ -623,6 +627,69 @@ mod tests {
         ids: ObjectIdRegistry,
         task: TaskRef,
         _leader: crate::kernel::objects::ThreadRef,
+    }
+
+    #[test]
+    fn lifecycle_fork_population_shares_slabs_without_sharing_authority() {
+        const PROCESSES: usize = 300;
+        const GRANULES_PER_SLAB: usize = 32;
+        let fixture = Fixture::new();
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap();
+        let mut population = Vec::new();
+        let mut slabs = std::collections::BTreeSet::new();
+        let mut addresses = std::collections::BTreeSet::new();
+        for index in 0..PROCESSES {
+            let shared =
+                TaskShared::for_new_task_reference(&fixture.task.shared(), plan, &fixture.ids)
+                    .unwrap();
+            let lifecycle = shared.pending_signals().lifecycle_lease();
+            let id = TaskId::for_root_bootstrap(101 + index as i32).unwrap();
+            let arena = super::super::thread_control::ThreadControlArena::with_lifecycle(
+                TaskKey {
+                    id,
+                    serial: fixture.ids.task_serial().unwrap(),
+                },
+                lifecycle.clone(),
+            );
+            let control = arena.allocate(ThreadKey {
+                tid: LinuxTid::for_task_leader(id),
+                serial: fixture.ids.thread_serial().unwrap(),
+            });
+            slabs.insert(lifecycle.backing_base().raw());
+            slabs.insert(control.backing_base().raw());
+            assert!(addresses.insert(std::ptr::from_ref(&*lifecycle).addr()));
+            assert!(addresses.insert(control.slot_address().raw()));
+            population.push((shared, control));
+        }
+        assert!(
+            slabs.len() <= (PROCESSES * 2 + 1).div_ceil(GRANULES_PER_SLAB),
+            "600 ABI granules require {} stage-2 regions instead of shared slabs",
+            slabs.len()
+        );
+        population[0].1.lifecycle().close();
+        population[0]
+            .1
+            .init_blocked(carrick_el1_abi::BlockedMask(0x400));
+        for (_, control) in &population[1..] {
+            assert_eq!(control.lifecycle().gate(), carrick_el1_abi::GateState::Open);
+            assert_eq!(control.blocked().0, 0);
+        }
+        let released = population.remove(0);
+        let old_page = std::ptr::from_ref(&*released.1.lifecycle()).addr();
+        let old_control = released.1.slot_address();
+        drop(released);
+        let replacement =
+            TaskShared::for_new_task_reference(&fixture.task.shared(), plan, &fixture.ids).unwrap();
+        let lifecycle = replacement.pending_signals().lifecycle_lease();
+        let arena = super::super::thread_control::ThreadControlArena::with_lifecycle(
+            fixture.task.key(),
+            lifecycle.clone(),
+        );
+        let control = arena.allocate(fixture._leader.key());
+        assert_eq!(std::ptr::from_ref(&*lifecycle).addr(), old_page);
+        assert_eq!(control.slot_address(), old_control);
+        assert_eq!(lifecycle.gate(), carrick_el1_abi::GateState::Open);
+        assert_eq!(control.blocked().0, 0);
     }
 
     impl Fixture {
