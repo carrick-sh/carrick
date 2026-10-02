@@ -85,10 +85,23 @@ carrick*:::syscall-entry
 	 * from an open of an existing entry and is ledgered under its own key. */
 	this->args = (uint64_t *)copyin(arg2, 48);
 	this->creat = (this->name == "openat" && (this->args[2] & 0x40) != 0) ? 1 : 0;
+	/* The bounded namespace fixture uses positive dirfds only in its measured
+	 * phase. Loader/setup use AT_FDCWD. Keep full totals beside this scope. */
+	self->namespace = self->fs && (int32_t)this->args[0] >= 0 &&
+	    (this->name == "renameat" || this->name == "renameat2" ||
+	    this->name == "unlinkat" || this->name == "linkat" ||
+	    this->name == "openat");
 	self->guest = self->fs ? (this->creat ? "openat(O_CREAT)" : this->name) : "";
 	self->t0 = self->fs ? timestamp : 0;
 	self->n = 0;
 	self->kern = 0;
+}
+
+carrick*:::syscall-return
+/(pid == $target || progenyof($target)) && self->fs && self->namespace/
+{
+	@namespace_calls[self->guest] = count();
+	@namespace_host[self->guest] = sum(self->n);
 }
 
 carrick*:::syscall-return
@@ -106,6 +119,12 @@ carrick*:::syscall-return
 	self->t0 = 0;
 	self->n = 0;
 	self->kern = 0;
+}
+
+syscall:::entry
+/(pid == $target || progenyof($target)) && self->fs && self->namespace/
+{
+	@namespace_fn[self->guest, probefunc] = count();
 }
 
 syscall:::entry
@@ -159,6 +178,10 @@ tick-1s
 dtrace:::END
 {
 	printf("FSLEDGER|summary|entries=%d|returns=%d|errors=%d|seen=%d|code=%d|bounded=%d\n", fs_entries, fs_returns, errors, seen, code, bounded);
+	printf("section=namespace-scoped\n");
+	printa("namespace_guest=%s calls=%@d\n", @namespace_calls);
+	printa("namespace_guest=%s host_calls=%@d\n", @namespace_host);
+	printa("namespace_guest=%s host=%s count=%@d\n", @namespace_fn);
 	printf("section=calls\n");
 	printa("guest=%s calls=%@d\n", @calls);
 	printf("section=wall-vs-kernel-ns\n");

@@ -1682,6 +1682,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "perf_namespace_scale": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "perf_net_tcp_rr": {
     "class": "performance",
     "excluded": false,

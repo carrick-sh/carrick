@@ -109,6 +109,7 @@ pub enum ExampleError {
 pub struct ScriptedBackend {
     bridges: CarrierBridges,
     fs_backend: Option<Box<dyn carrick_vfs::fs_backend::FsBackend>>,
+    rootfs_layer: Option<carrick_vfs::rootfs::RootFs>,
 }
 
 impl Default for ScriptedBackend {
@@ -127,12 +128,20 @@ impl ScriptedBackend {
                 timers: Arc::new(NullGuestTimerBridge::default()),
             },
             fs_backend: None,
+            rootfs_layer: None,
         }
     }
 
     /// Configure a custom filesystem backend (e.g. [`carrick_vfs::fs_backend::HostFsBackend`]).
     pub fn with_fs_backend(mut self, fs: Box<dyn carrick_vfs::fs_backend::FsBackend>) -> Self {
         self.fs_backend = Some(fs);
+        self
+    }
+
+    /// Install an immutable lower beneath the writable backend through the
+    /// same dispatcher surface used by a carrier.
+    pub fn with_rootfs_layer(mut self, rootfs: carrick_vfs::rootfs::RootFs) -> Self {
+        self.rootfs_layer = Some(rootfs);
         self
     }
 
@@ -178,6 +187,9 @@ impl ScriptedBackend {
         let mut dispatcher = SyscallDispatcher::with_bridges(self.bridges);
         if let Some(fs) = self.fs_backend {
             dispatcher.set_fs_backend(fs);
+        }
+        if let Some(rootfs) = self.rootfs_layer {
+            dispatcher.set_rootfs_layer(rootfs);
         }
         dispatcher.bind_hvpatch_process(Arc::clone(&process) as Arc<dyn CarrierProcess>);
         if let Some(failure) = process.take_bind_failure() {
@@ -417,6 +429,41 @@ impl Task {
                 return Ok(0);
             }
             match step {
+                Step::ArchiveImportRollback { destination, bytes } => {
+                    use carrick_kernel::kernel::control::{
+                        ArchiveCapability, ArchiveControlError, ArchiveRequest, ArchiveRuntime,
+                        ControlNonce, MAX_ARCHIVE_CHUNK_BYTES,
+                    };
+                    if bytes.is_empty() {
+                        return Err(ExampleError::Script(
+                            "rollback fixture has no archive".into(),
+                        ));
+                    }
+                    let authority = self.dispatcher.lock().archive_authority();
+                    let runtime = ArchiveRuntime::new(authority, 1);
+                    let capability = ArchiveCapability::from(
+                        ControlNonce::fresh().map_err(|e| ExampleError::Script(e.to_string()))?,
+                    );
+                    let request = ArchiveRequest::new(destination.clone())
+                        .map_err(|e| ExampleError::Script(e.to_string()))?;
+                    runtime
+                        .begin_write(capability, request)
+                        .map_err(|e| ExampleError::Script(e.to_string()))?;
+                    let chunks = bytes.chunks(MAX_ARCHIVE_CHUNK_BYTES).collect::<Vec<_>>();
+                    for (index, chunk) in chunks.iter().enumerate() {
+                        let last = index + 1 == chunks.len();
+                        let result = runtime.write_chunk(capability, chunk.to_vec(), last);
+                        if last {
+                            if !matches!(result, Err(ArchiveControlError::Filesystem(_))) {
+                                return Err(ExampleError::Script(format!(
+                                    "archive expected late filesystem failure: {result:?}"
+                                )));
+                            }
+                        } else {
+                            result.map_err(|e| ExampleError::Script(e.to_string()))?;
+                        }
+                    }
+                }
                 Step::ChildMarker(_) => {
                     return Err(ExampleError::Script(
                         "child_marker without a preceding fork or clone".to_owned(),

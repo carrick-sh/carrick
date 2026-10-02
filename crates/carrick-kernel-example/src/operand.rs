@@ -280,6 +280,14 @@ impl Syscall {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// Apply an archive through the carrier control authority and require a
+    /// late filesystem failure. Subsequent syscalls must verify rollback.
+    ArchiveImportRollback {
+        /// Guest-absolute destination directory.
+        destination: String,
+        /// Complete tar payload, including a late failing entry.
+        bytes: Vec<u8>,
+    },
     /// Issue a syscall.
     Sys(Syscall),
     /// The script the child of the preceding fork runs.
