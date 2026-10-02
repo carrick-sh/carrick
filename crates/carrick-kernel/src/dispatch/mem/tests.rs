@@ -69,6 +69,8 @@ pub struct CountingMmapMemory {
     pub(crate) defer_anon: bool,
     pub(crate) discard_anon: bool,
     pub(crate) fail_protect_non_zero: Cell<bool>,
+    fail_protect_zero: Cell<bool>,
+    concurrent_exec_protection: bool,
     pub(crate) base: u64,
     pub(crate) bytes: Vec<u8>,
     pub(crate) write_calls: Cell<usize>,
@@ -126,6 +128,8 @@ impl CountingMmapMemory {
             defer_anon: false,
             discard_anon: false,
             fail_protect_non_zero: Cell::new(false),
+            fail_protect_zero: Cell::new(false),
+            concurrent_exec_protection: false,
             base,
             bytes: vec![0u8; len],
             write_calls: Cell::new(0),
@@ -147,10 +151,6 @@ impl CountingMmapMemory {
     pub(crate) fn with_defer_anon(mut self, defer: bool) -> Self {
         self.defer_anon = defer;
         self
-    }
-
-    pub(crate) fn set_fail_protect_non_zero(&self, fail: bool) {
-        self.fail_protect_non_zero.set(fail);
     }
 
     pub(crate) fn range_offset(&self, address: u64, length: usize) -> Result<usize, MemoryError> {
@@ -224,10 +224,16 @@ impl GuestMemory for CountingMmapMemory {
         Ok(())
     }
 
+    fn supports_concurrent_exec_protection(&self) -> bool {
+        self.concurrent_exec_protection
+    }
+
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.protect_calls.set(self.protect_calls.get() + 1);
         self.protect_log.borrow_mut().push((address, len, prot));
-        if prot != 0 && self.fail_protect_non_zero.get() {
+        if (prot != 0 && self.fail_protect_non_zero.get())
+            || (prot == 0 && self.fail_protect_zero.get())
+        {
             return Err(MemoryError::HostMap(format!(
                 "injected protection failure at {address:#x}+{len:#x}"
             )));
@@ -6241,7 +6247,7 @@ fn large_vma_mmap_host_alias_transaction_abort_rollback() {
 }
 
 #[test]
-fn large_vma_mmap_reserve_fresh_error_rollback() {
+fn large_vma_mmap_protection_failure_rolls_back_after_predecessor_retirement() {
     const SYS_MMAP: u64 = 222;
     const SYS_MUNMAP: u64 = 215;
 
@@ -6270,25 +6276,17 @@ fn large_vma_mmap_reserve_fresh_error_rollback() {
         "zero-length reserve_fresh must return an error"
     );
 
-    // 2. Actual-path post-reservation failure and rollback during mmap dispatch:
-    // Arm resident fault range at `base` so `commit_mmap_locked_range` will invoke
-    // `populate_resident_range` -> `protect_range(base, len, PROT_READ | PROT_WRITE)`.
+    // 2. MAP_FIXED retires the predecessor's fault plan. Failure must be
+    // injected at the successor's protection publication, not by expecting
+    // its PROT_NONE mapping to populate the predecessor's writable pages.
     dispatcher.track_resident_fault_range(
         base,
         LINUX_PAGE_SIZE,
         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
     );
 
-    // Inject failure for non-zero protect_range calls (e.g. resident fault populate).
-    memory.set_fail_protect_non_zero(true);
-
-    // Dispatch mmap with MAP_LOCKED and PROT_NONE.
-    // In SyscallDispatcher::mmap:
-    // - prepare_mmap_locked_range succeeds.
-    // - memory.protect_range(base, len, 0) succeeds (prot is 0).
-    // - reserve_fresh(base, len) succeeds and publishes pristine deferred range.
-    // - commit_mmap_locked_range -> populate_resident_range -> protect_range(base, len, RW) fails.
-    // - The rollback path executes mark_range_unmapped and deferred_anonymous.retire.
+    memory.concurrent_exec_protection = true;
+    memory.fail_protect_zero.set(true);
     let protect_calls_before = memory.protect_calls.get();
     let fail_outcome = dispatcher
         .dispatch(
@@ -6315,19 +6313,19 @@ fn large_vma_mmap_reserve_fresh_error_rollback() {
     assert_eq!(
         fail_outcome,
         DispatchOutcome::errno(carrick_abi::LINUX_ENOMEM),
-        "populate_resident_range error must return LINUX_ENOMEM"
+        "successor protection publication failure must return LINUX_ENOMEM"
     );
     assert!(
         memory.protect_calls.get() > protect_calls_before,
-        "protect_range must be invoked during commit_mmap_locked_range populate"
+        "the successor must attempt protection publication"
     );
     assert!(
         memory
             .protect_log
             .borrow()
             .iter()
-            .any(|&(addr, len, prot)| addr == base && len == LINUX_PAGE_SIZE as usize && prot != 0),
-        "failed reservation must have attempted non-zero protection publication during commit_mmap_locked_range"
+            .any(|&(addr, len, prot)| addr == base && len == LINUX_PAGE_SIZE as usize && prot == 0),
+        "the successor must publish PROT_NONE"
     );
 
     // Verify complete rollback of deferred anonymous interval, locked ranges, and metadata.
@@ -6360,7 +6358,7 @@ fn large_vma_mmap_reserve_fresh_error_rollback() {
 
     // 3. Allocator reuse / clean subsequent mapping:
     // With fault injection disabled, the exact same address can be mapped and unmapped cleanly.
-    memory.set_fail_protect_non_zero(false);
+    memory.fail_protect_zero.set(false);
     let ok_outcome = dispatcher
         .dispatch(
             &context,
