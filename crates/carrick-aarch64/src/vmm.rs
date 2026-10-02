@@ -151,17 +151,12 @@ pub struct Aarch64VcpuSnapshot {
     /// restore it — vDSO cpu-id / rseq read it. KVM does not use it (left 0).
     pub tpidrro_el0: u64,
     /// TPIDR_EL1 — carrick's per-vCPU scratch. HVF's syscall shim uses it only
-    /// transiently to preserve x16 while checking ESR_EL1; the fast `gettid`
-    /// path stores the guest tid in CONTEXTIDR_EL1 instead. (On KVM TPIDR_EL1
+    /// transiently to preserve x16 while checking ESR_EL1. (On KVM TPIDR_EL1
     /// backs the syscall-frame `saved_x9` stash; the snapshot carries it so a
     /// reclaim/fork round-trips that too.)
     pub tpidr_el1: u64,
-    /// CONTEXTIDR_EL1 — the guest-visible tid that HVF's EL1 `gettid` fast path
-    /// returns without a VM exit. `hv_vcpu_create` zeroes it, so a task loaded
-    /// onto another executor's vCPU that does not restore
-    /// this reads 0 and sends every later `gettid` down the handler's degrade
-    /// branch to the host — silently, since the host still returns the correct
-    /// tid, so only the cost changes. KVM does not use it (left 0).
+    /// Architectural CONTEXTIDR_EL1, retained across CPU migration. Linux
+    /// identity is published through the typed lifecycle control slot.
     pub contextidr_el1: u64,
     /// ACTLR_EL1 — incl. EnTSO (Rosetta `prctl(PR_SET_MEM_MODEL, TSO)`). Restored
     /// across fork/clone/reclaim so a rebuilt vCPU keeps hardware x86 TSO. KVM has
@@ -343,14 +338,9 @@ pub trait Aarch64Vcpu {
         Ok(())
     }
 
-    /// Stamp the guest-visible thread id into the per-thread scratch sysreg the
-    /// EL1-vector `gettid` fast path reads, so `gettid(2)` is serviced at EL1
-    /// without a host trap. DEFAULT `Ok(())` (no-op) ⟹ this backend has no
-    /// in-guest `gettid` fast path and the dispatcher services `gettid` on the
-    /// host trap. Genuinely per-VMM: HVF stamps `TPIDR_EL1` (its `hvc` vehicle
-    /// leaves that sysreg free); KVM CANNOT — its sentinel vehicle already uses
-    /// `TPIDR_EL1` as the live-x9 stash (see [`Self::get_saved_x9`]), so it keeps
-    /// the no-op and traps `gettid` to the host.
+    /// Publish packed namespace-visible process/thread identity for the EL0
+    /// vDSO when the backend supports it. EL1 identity belongs to the lifecycle
+    /// venue, independently of this physical-vCPU register publication.
     fn stamp_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
         let _ = tid;
         Ok(())

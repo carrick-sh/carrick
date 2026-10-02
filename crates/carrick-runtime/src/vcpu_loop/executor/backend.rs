@@ -794,6 +794,16 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 let control = task.lease().control_lease().ok_or_else(|| {
                     TrapError::Hypervisor("loaded thread lost lifecycle backing".into())
                 })?;
+                if control.visible_tid().is_none() {
+                    let tid = task.lease().visible_tid().ok_or_else(|| {
+                        TrapError::Hypervisor("loaded thread lost namespace identity".into())
+                    })?;
+                    if !control.publish_visible_tid(tid) {
+                        return Err(TrapError::Hypervisor(
+                            "loaded thread changed lifecycle identity".into(),
+                        ));
+                    }
+                }
                 mappings.publish(slot, control).map_err(|error| {
                     TrapError::Hypervisor(format!(
                         "lifecycle metadata publication failed: {error:?}"

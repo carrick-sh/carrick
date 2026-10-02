@@ -33,6 +33,7 @@ pub const SYS_EXIT: usize = 93;
 pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const SYS_SIGALTSTACK: usize = 132;
 pub const SYS_RT_SIGPROCMASK: usize = 135;
+pub const SYS_GETTID: usize = 178;
 pub const SYS_CLONE: usize = 220;
 
 // clone(2) flags.
@@ -120,7 +121,12 @@ pub struct LifecycleThread<'a> {
 pub const fn is_lifecycle_syscall(nr: usize) -> bool {
     matches!(
         nr,
-        SYS_EXIT | SYS_SET_ROBUST_LIST | SYS_SIGALTSTACK | SYS_RT_SIGPROCMASK | SYS_CLONE
+        SYS_EXIT
+            | SYS_SET_ROBUST_LIST
+            | SYS_SIGALTSTACK
+            | SYS_RT_SIGPROCMASK
+            | SYS_GETTID
+            | SYS_CLONE
     )
 }
 
@@ -149,6 +155,12 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
         }
     };
     match nr {
+        SYS_GETTID => {
+            if !thread.page.serves_threads() {
+                return None;
+            }
+            Some(served(frame, u64::from(thread.slot.visible_tid()?), false))
+        }
         SYS_RT_SIGPROCMASK => {
             let work = serve_sigprocmask(frame, thread, user)?;
             Some(served(frame, 0, work))
@@ -435,6 +447,10 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
         let _ = page.unclaim(claimed);
         return None;
     };
+    if !child_slot.publish_visible_tid(identity.visible_tid) {
+        let _ = page.unclaim(claimed);
+        return None;
+    }
     let Ok(record) = zone.alloc_record(ThreadIdentity {
         tid: El1TaskId::from_linux_tid(identity.tid as i32).raw(),
         serial: identity.thread_serial,
@@ -478,10 +494,8 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
     if flags & CLONE_SETTLS != 0 {
         ctx.tpidr_el0 = tls;
     }
-    // The EL1 gettid word and the EL0 read-only thread pointer, when the
-    // host stamps them (`stamp_ns_visible_guest_tid`): the child's own tid.
-    if ctx.contextidr_el1 != 0 {
-        ctx.contextidr_el1 = u64::from(identity.visible_tid);
+    // Preserve the process half of the EL0 vDSO identity and publish the child.
+    if ctx.tpidrro_el0 != 0 {
         ctx.tpidrro_el0 = (ctx.tpidrro_el0 & !0xffff_ffff) | u64::from(identity.visible_tid);
     }
     child_slot.reset_for_birth(blocked, clear_child_tid, entry);

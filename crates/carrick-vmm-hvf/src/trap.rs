@@ -7705,15 +7705,8 @@ impl HvfInner {
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.core.tpidr_el0)
             .map_err(hvf_error)?;
-        // TPIDRRO_EL0 (guest-readable thread ptr), TPIDR_EL1 (the shim's x16
-        // scratch) and CONTEXTIDR_EL1 (carrick's fast-`gettid` tid stamp) are all
-        // zeroed by hv_vcpu_create, so a rebuilt vCPU (fork/clone or a
-        // destroy/recreate reclaim) must restore each. CONTEXTIDR_EL1 is the one
-        // that is guest-VISIBLE through `gettid`: miss it and the EL1 handler
-        // reads 0 and degrades to a host round trip for the rest of the thread's
-        // life. (The tid lived in TPIDR_EL1 before it was moved here to free that
-        // register as the scratch; restoring only TPIDR_EL1 preserved a value that
-        // means nothing across a park and dropped the one that does.)
+        // Restore the architectural thread-pointer and scratch registers.
+        // Linux gettid identity comes from the lifecycle control slot.
         vcpu.set_sys_reg(SysReg::TPIDRRO_EL0, snap.core.tpidrro_el0)
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::TPIDR_EL1, snap.core.tpidr_el1)

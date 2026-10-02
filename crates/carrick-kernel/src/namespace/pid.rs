@@ -841,9 +841,17 @@ pub fn kernel_to_ns_for(context: &crate::kernel::KernelContext, internal_id: u32
 /// mapping is an invariant failure; returning zero would publish a TID Linux
 /// can never assign and could be mistaken for a successful fast-path stamp.
 pub fn ns_visible_guest_tid(context: &crate::kernel::KernelContext) -> Option<u32> {
-    u32::try_from(context.thread().key().tid.raw())
-        .ok()
-        .and_then(|tid| kernel_to_ns_for(context, tid))
+    ns_visible_thread_tid(context.thread())
+}
+
+/// Resolve through the exact thread's owning task, including outside dispatch.
+pub fn ns_visible_thread_tid(thread: &crate::kernel::objects::ThreadRef) -> Option<u32> {
+    let tid = u32::try_from(thread.key().tid.raw()).ok()?;
+    let task = thread.task()?;
+    match task.pid_ns_region() {
+        Some(region) => region.host_to_ns(tid),
+        None => Some(tid),
+    }
 }
 
 pub(crate) fn ns_to_kernel_for(

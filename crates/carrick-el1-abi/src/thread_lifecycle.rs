@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 4;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 5;
 
 /// One retained notification authority for a kernel graph's thread ledger.
 #[repr(C, align(16))]
@@ -428,6 +428,8 @@ impl AltStack {
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct ThreadControlSlot {
+    /// Namespace-visible identity, published before this incarnation is runnable.
+    visible_tid: AtomicU32,
     blocked: AtomicU64,
     /// Even = stable, odd = write in progress.
     alt_seq: AtomicU64,
@@ -447,6 +449,7 @@ pub struct ThreadControlSlot {
 impl ThreadControlSlot {
     pub const fn new() -> Self {
         Self {
+            visible_tid: AtomicU32::new(0),
             blocked: AtomicU64::new(0),
             alt_seq: AtomicU64::new(0),
             alt_sp: AtomicU64::new(0),
@@ -470,7 +473,23 @@ impl ThreadControlSlot {
 
     /// Initialise an exclusively retained host-born slot before publication.
     pub fn reset_for_host_birth(&self, blocked: BlockedMask) {
+        self.visible_tid.store(0, Ordering::Relaxed);
         self.reset(blocked, 0, None);
+    }
+
+    /// Publish once for this exclusively reserved slot incarnation. Repeated
+    /// publication of the same identity is harmless; replacement is rejected.
+    pub fn publish_visible_tid(&self, tid: u32) -> bool {
+        tid != 0
+            && self
+                .visible_tid
+                .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                .map_or_else(|current| current == tid, |_| true)
+    }
+
+    pub fn visible_tid(&self) -> Option<u32> {
+        let tid = self.visible_tid.load(Ordering::Acquire);
+        (tid != 0).then_some(tid)
     }
 
     pub fn pending(&self) -> &PendingSummary {
@@ -1145,7 +1164,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 20] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 21] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::size_of::<ThreadLedgerActivity>() as u64,
     core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
@@ -1160,6 +1179,7 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 20] = [
     core::mem::offset_of!(ThreadLifecyclePage, entries) as u64,
     core::mem::size_of::<PoolEntry>() as u64,
     core::mem::size_of::<ThreadControlSlot>() as u64,
+    core::mem::offset_of!(ThreadControlSlot, visible_tid) as u64,
     core::mem::offset_of!(ThreadControlSlot, alt_seq) as u64,
     core::mem::offset_of!(ThreadControlSlot, robust_head) as u64,
     core::mem::offset_of!(ThreadControlSlot, clear_child_tid) as u64,
@@ -1543,6 +1563,27 @@ mod tests {
         assert_eq!(p.state(5).unwrap().1, EntryState::Reserved);
         p.reopen_after_fork().unwrap();
         assert_eq!(p.claim_any().map(|c| c.entry()), Ok(r5));
+    }
+
+    #[test]
+    fn visible_tid_belongs_to_each_live_slot_and_survives_birth() {
+        let first = ThreadControlSlot::new();
+        let second = ThreadControlSlot::new();
+        assert_eq!(first.visible_tid(), None);
+        assert!(!first.publish_visible_tid(0));
+        assert!(first.publish_visible_tid(41));
+        assert!(second.publish_visible_tid(73));
+        assert!(first.publish_visible_tid(41));
+        assert!(!first.publish_visible_tid(73));
+        let page = ThreadLifecyclePage::new();
+        let entry = page.stock(0, ident(1)).unwrap();
+        first.reset_for_birth(BlockedMask(0), 0, entry);
+        assert_eq!(first.visible_tid(), Some(41));
+        assert_eq!(second.visible_tid(), Some(73));
+        first.reset_for_host_birth(BlockedMask(0));
+        assert_eq!(first.visible_tid(), None);
+        assert_eq!(second.visible_tid(), Some(73));
+        assert!(first.publish_visible_tid(91));
     }
 
     #[test]

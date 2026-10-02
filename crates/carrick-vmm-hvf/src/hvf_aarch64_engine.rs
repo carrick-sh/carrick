@@ -532,7 +532,6 @@ enum HvfVcpuBacking {
 /// executor. A staged vCPU cannot run, be kicked into, or carry a syscall.
 pub struct HvfAarch64Vcpu {
     backing: HvfVcpuBacking,
-    tidstamp_debug: Option<bool>,
 }
 
 fn staged_error(operation: &str) -> TrapError {
@@ -555,14 +554,12 @@ impl HvfAarch64Vcpu {
                 mailbox,
                 ran: false,
             }),
-            tidstamp_debug: None,
         }
     }
 
     pub(crate) fn staged(cpu: crate::staged_cpu::StagedCpu) -> Self {
         Self {
             backing: HvfVcpuBacking::Staged(Box::new(parking_lot::Mutex::new(cpu))),
-            tidstamp_debug: None,
         }
     }
 
@@ -929,35 +926,13 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
                 return Ok(());
             }
         };
-        // HVF's `gettid` fast path reads CONTEXTIDR_EL1 (serviced at EL1, no
-        // host trap), leaving TPIDR_EL1 free as the syscall-shim scratch that
-        // preserves x16 while checking ESR_EL1.
-        // Smart island fast paths at EL0 read TPIDRRO_EL0, which holds packed
-        // (pid << 32) | tid for zero-exit getpid and gettid.
-        let tid = packed & 0xffff_ffff;
-        let result = live
-            .inner
-            .set_sys_reg(SysReg::CONTEXTIDR_EL1, tid)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()));
+        // EL0 vDSO identity. EL1 reads only the typed lifecycle control slot.
         live.inner
             .set_sys_reg(SysReg::TPIDRRO_EL0, packed)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-
-        if std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some() {
-            let back = live.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
-            let back_ro = live.inner.get_sys_reg(SysReg::TPIDRRO_EL0);
-            eprintln!(
-                "[TIDSTAMP] set CONTEXTIDR_EL1={tid} -> readback={back:?} TPIDRRO_EL0={packed:#x} -> readback={back_ro:?} set_ok={}",
-                result.is_ok()
-            );
-        }
-        result
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
-        let tidstamp_debug = *self
-            .tidstamp_debug
-            .get_or_insert_with(|| std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some());
         let live = match &mut self.backing {
             HvfVcpuBacking::Live(live) => live,
             HvfVcpuBacking::Staged(_) => return Err(staged_error("hv_vcpu_run")),
@@ -972,14 +947,6 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
             &live.custody,
             live.vm_generation,
         );
-        if tidstamp_debug {
-            use applevisor::prelude::SysReg;
-            // Does the tid stamp SURVIVE a run/trap round trip? The stamp itself
-            // reads back fine immediately after `set_sys_reg`, so if the EL1
-            // `gettid` fast path is degrading, this is where it would show.
-            let back = live.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
-            eprintln!("[TIDSTAMP] after run: CONTEXTIDR_EL1={back:?}");
-        }
         exit
     }
 

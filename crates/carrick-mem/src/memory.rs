@@ -292,8 +292,8 @@ const _: () = assert!(
 );
 // Carrick's per-process identity data page. The EL1 syscall-shim vector
 // dispatcher (`el1_vectors_bytes_shim`) reads pid from here to service
-// getpid directly at EL1 — no VM exit. (gettid is read from CONTEXTIDR_EL1;
-// clock syscalls are served via the vDSO and dispatch, not the EL1 shim.) It sits
+// getpid directly at EL1 — no VM exit. Thread identity belongs to the typed
+// lifecycle venue; clock syscalls use the vDSO and dispatch. This page sits
 // immediately past the EL1 maintenance trampoline, still inside the kernel
 // hole's first 2 MiB block, so it inherits the kernel-only (AP=00) block
 // mapping: the EL1 stub can read it under PSTATE.PAN=1, and guest EL0 cannot.
@@ -451,12 +451,6 @@ pub const EL1_SHIM_SYSCALL_NOMINAL_NS: u64 = 75;
 // Linux aarch64 syscalls serviced by the EL1 per-process fast path. Per-thread
 // credentials must trap through the captured KernelContext dispatch path.
 pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[(172, IDENTITY_OFF_PID)];
-/// Linux aarch64 `gettid` (178). Unlike the per-process identity reads it is
-/// per-thread, so the EL1 fast path reads it from `CONTEXTIDR_EL1` — which carrick
-/// sets per vCPU to that thread's guest-visible tid — instead of the shared
-/// identity page. (`CONTEXTIDR_EL1` is otherwise unused by carrick; the guest
-/// uses `TPIDR_EL0` for TLS.)
-pub const GETTID_NR: u16 = 178;
 // The identity page must stay inside the kernel hole's first 2 MiB block so it
 // inherits the kernel-only (AP=00) block mapping from `stage1_identity_page_tables`.
 const _: () = assert!(
@@ -536,14 +530,9 @@ const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 const AARCH64_SVC0_OPCODE: u32 = 0xd400_0001;
 // AArch64 `nop` opcode, used as trampoline page padding.
 const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
-// AArch64 `mrs x0, CONTEXTIDR_EL1` (CONTEXTIDR_EL1 = S3_0_C13_C0_1). The
-// shim's gettid handler reads the per-vCPU thread id carrick stamps into
-// CONTEXTIDR_EL1.
-const AARCH64_MRS_X0_CONTEXTIDR_EL1_OPCODE: u32 = 0xd538_d020;
 // AArch64 `msr TPIDR_EL1, x16` / `mrs x16, TPIDR_EL1`. The syscall shim uses
 // TPIDR_EL1 as an EL1-private scratch slot to preserve x16 while it checks
-// ESR_EL1. The gettid fast path uses CONTEXTIDR_EL1 so these roles do not
-// collide.
+// ESR_EL1.
 const AARCH64_MSR_TPIDR_EL1_X16_OPCODE: u32 = 0xd518_d090;
 const AARCH64_MRS_TPIDR_EL1_X16_OPCODE: u32 = 0xd538_d090;
 // AArch64 `mrs x16, ESR_EL1`, `lsr x16, x16, #26`, and `cmp x16, #0x15`
@@ -4576,7 +4565,6 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     // Handlers go in the nop tail right after the 16-slot (2 KiB) vector table.
     const HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE; // 0x800
     const PAGE_HANDLER_LEN: usize = 14 * 4;
-    const GETTID_HANDLER_LEN: usize = 15 * 4;
     const FSTAT_CEILING_COUNTED_HANDLER_LEN: usize = 26 * 4;
     let base = LINUX_IDENTITY_PAGE_BASE;
     let (lo, mid, hi) = (
@@ -4594,8 +4582,7 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     let mut cursor = dispatch;
     const ESR_GUARD_LEN: usize = 6 * 4;
     let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
-    let fallthrough =
-        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + ceiling_syscalls) * 8;
+    let fallthrough = dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + ceiling_syscalls) * 8;
     put(&mut bytes, cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
     put(&mut bytes, cursor + 4, AARCH64_MRS_ESR_EL1_X16_OPCODE);
     put(&mut bytes, cursor + 8, AARCH64_LSR_X16_X16_26_OPCODE);
@@ -4653,19 +4640,7 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
         put(&mut bytes, handler + 48, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
         put(&mut bytes, handler + 52, AARCH64_ERET_OPCODE);
     }
-    // gettid (178): per-thread, so read the vCPU's CONTEXTIDR_EL1 (the runtime
-    // stamps it with this thread's guest-visible tid) instead of the shared page.
-    // Its handler sits right after the page handlers.
-    let gettid_handler = HANDLER_BASE + IDENTITY_SYSCALLS.len() * PAGE_HANDLER_LEN;
-    put(&mut bytes, cursor, enc_cmp_x8_imm(GETTID_NR));
-    put(
-        &mut bytes,
-        cursor + 4,
-        enc_beq((cursor + 4) as u64, gettid_handler as u64),
-    );
-    cursor += 8;
-
-    let fstat_handler = gettid_handler + GETTID_HANDLER_LEN;
+    let fstat_handler = HANDLER_BASE + IDENTITY_SYSCALLS.len() * PAGE_HANDLER_LEN;
     if fd_ceiling {
         // fstat(80) and close(57) are argument-bearing, so they have their own guard that preserves
         // x0..x5 on every host-dispatch fallback.  Unlike the identity entries they
@@ -4686,63 +4661,8 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
         );
         cursor += 8;
     }
-    // The fallthrough trap lands here once the gettid/lseek cmp/b.eq is placed.
+    // The fallthrough trap lands after the guarded process and fd dispatch.
     debug_assert_eq!(fallthrough, cursor);
-    // gettid handler: read CONTEXTIDR_EL1; if it is 0 (unstamped — a tid is
-    // never 0) trap normally instead of returning a wrong 0; otherwise eret with
-    // the tid.
-    put(&mut bytes, gettid_handler, enc_movz_x0(lo, 0));
-    put(&mut bytes, gettid_handler + 4, enc_movk_x0(mid, 1));
-    put(&mut bytes, gettid_handler + 8, enc_movk_x0(hi, 2));
-    put(
-        &mut bytes,
-        gettid_handler + 12,
-        enc_ldr_w0_x0(IDENTITY_OFF_SHIM_ENABLED),
-    );
-    put(
-        &mut bytes,
-        gettid_handler + 16,
-        enc_cbz_x0((gettid_handler + 16) as u64, fallthrough as u64),
-    );
-    // Count the serviced syscall (x16 scratch, re-restored below — see the
-    // page handlers). The unstamped-CONTEXTIDR degrade path below still traps
-    // to the host AFTER counting, so that rare path is charged twice (counter
-    // + real dispatch time) — a µs-scale over-approximation on a path whose
-    // whole point is to stay correct, not fast.
-    put(&mut bytes, gettid_handler + 20, enc_movz_x0(lo, 0));
-    put(&mut bytes, gettid_handler + 24, enc_movk_x0(mid, 1));
-    put(&mut bytes, gettid_handler + 28, enc_movk_x0(hi, 2));
-    put(
-        &mut bytes,
-        gettid_handler + 32,
-        enc_ldr_xt_xn(16, 0, IDENTITY_OFF_SHIM_SYSCALLS),
-    );
-    put(
-        &mut bytes,
-        gettid_handler + 36,
-        enc_add_xd_xn_imm(16, 16, 1),
-    );
-    put(
-        &mut bytes,
-        gettid_handler + 40,
-        enc_str_xt_xn(16, 0, IDENTITY_OFF_SHIM_SYSCALLS),
-    );
-    put(
-        &mut bytes,
-        gettid_handler + 44,
-        AARCH64_MRS_TPIDR_EL1_X16_OPCODE,
-    );
-    put(
-        &mut bytes,
-        gettid_handler + 48,
-        AARCH64_MRS_X0_CONTEXTIDR_EL1_OPCODE,
-    );
-    put(
-        &mut bytes,
-        gettid_handler + 52,
-        enc_cbz_x0((gettid_handler + 52) as u64, fallthrough as u64),
-    );
-    put(&mut bytes, gettid_handler + 56, AARCH64_ERET_OPCODE);
 
     if fd_ceiling {
         write_fstat_ceiling_handler(&mut bytes, fstat_handler, fallthrough, true);
@@ -4758,7 +4678,7 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
         if fd_ceiling {
             fstat_handler + FSTAT_CEILING_COUNTED_HANDLER_LEN
         } else {
-            gettid_handler + GETTID_HANDLER_LEN
+            fstat_handler
         } <= MAILBOX_HANDLER_OFFSET,
         "shim handlers overrun into the mailbox handler region"
     );
@@ -5396,7 +5316,7 @@ fn el1_vectors_bytes_mailbox_with_layout(
     let mailbox_entry = if identity_fast_path {
         const ESR_GUARD_LEN: usize = 6 * 4;
         let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
-        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + ceiling_syscalls) * 8
+        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + ceiling_syscalls) * 8
     } else {
         dispatch
     };
@@ -5949,7 +5869,7 @@ pub fn el1_vectors_bytes_mailbox_clock(
         const ESR_GUARD_LEN: usize = 6 * 4;
         let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
         let mailbox_entry =
-            dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + ceiling_syscalls) * 8;
+            dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + ceiling_syscalls) * 8;
         el1_clock::install(&mut bytes, mailbox_entry);
     }
     bytes
@@ -8315,7 +8235,6 @@ mod el1_shim_tests {
         );
     }
     const HVC3: u32 = 0xD400_0062; // hvc #3 — fail-loud unexpected-EL1 trap
-    const MRS_CONTEXTIDR_EL1_X0: u32 = 0xD538_D020; // mrs x0, CONTEXTIDR_EL1
 
     #[test]
     fn fstat_ceiling_guard_is_emitted_only_for_opt_in_legacy_and_mailbox_vectors() {
@@ -8400,61 +8319,25 @@ mod el1_shim_tests {
     }
 
     #[test]
-    fn fd_ceiling_shim_gettid_erets_before_fstat_handler() {
-        let bytes = el1_vectors_bytes_shim_fd_ceiling();
-        let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
-        let gettid = (dispatch..dispatch + AARCH64_VECTOR_SLOT_SIZE)
-            .step_by(4)
-            .find_map(|pc| {
-                (decode_cmp_x8(rd_u32(&bytes, pc)) == Some(GETTID_NR)).then(|| {
-                    decode_beq(rd_u32(&bytes, pc + 4), pc + 4)
-                        .expect("gettid comparison must branch to its handler")
-                })
-            })
-            .expect("gettid comparison missing");
-        let fstat = fstat_handler(&bytes, dispatch);
-
-        assert_eq!(
-            rd_u32(&bytes, gettid + 56),
-            ERET,
-            "gettid must return its CONTEXTIDR value before entering the fstat ceiling guard"
-        );
-        assert!(
-            gettid + 60 <= fstat,
-            "gettid's 60-byte handler must not overlap fstat: gettid={gettid:#x} fstat={fstat:#x}"
-        );
-
-        // A valid tid may exceed the fd ceiling. The emitted fast path must
-        // still return it directly; falling through here would reinterpret the
-        // tid as fstat's fd and turn it into -EBADF.
-        let contextidr = 96_u64;
-        let fd_ceiling = 8_u32;
-        assert!(contextidr > u64::from(fd_ceiling));
-        assert_eq!(rd_u32(&bytes, gettid + 48), MRS_CONTEXTIDR_EL1_X0);
-        assert_eq!(
-            decode_cbz_x0(rd_u32(&bytes, gettid + 52), gettid + 52),
-            Some(
-                (dispatch..dispatch + AARCH64_VECTOR_SLOT_SIZE)
-                    .step_by(4)
-                    .find(|&pc| rd_u32(&bytes, pc) == HVC2)
-                    .expect("host fallthrough missing")
-            )
-        );
-        assert_ne!(
-            contextidr, 0,
-            "stamped gettid must not take the cbz fallback"
-        );
+    fn legacy_vectors_forward_gettid_to_the_typed_venue() {
+        for bytes in [
+            el1_vectors_bytes_shim(),
+            el1_vectors_bytes_shim_fd_ceiling(),
+        ] {
+            assert!(!bytes.chunks_exact(4).any(|word| {
+                let opcode = u32::from_le_bytes(word.try_into().unwrap());
+                decode_cmp_x8(opcode) == Some(178) || opcode == 0xd538_d020
+            }));
+        }
     }
 
     /// The shim dispatcher must service EXACTLY the per-process identity syscalls
-    /// (each via a page-read handler) plus `gettid` (via a per-vCPU TPIDR_EL1
-    /// read), and fall through to `hvc #2` for everything else.
+    /// (each via a page-read handler), and forward everything else to `hvc #2`.
     #[test]
-    fn shim_dispatches_identity_and_gettid() {
+    fn shim_dispatches_only_process_identity() {
         let bytes = el1_vectors_bytes_shim();
         let mut pc = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
         let mut page_seen: Vec<(u16, u64)> = Vec::new();
-        let mut sysreg_seen: Vec<u16> = Vec::new();
         assert_eq!(
             rd_u32(&bytes, pc),
             AARCH64_MSR_TPIDR_EL1_X16_OPCODE,
@@ -8524,38 +8407,7 @@ mod el1_shim_tests {
                 "disabled handler guard must branch to the host-trap fallthrough"
             );
 
-            if nr == GETTID_NR {
-                // gettid: after the enabled guard, count the serviced syscall,
-                // re-restore x16, read CONTEXTIDR_EL1, then trap normally if it
-                // is 0 (unstamped — a tid is never 0).
-                assert_counter_bump(&bytes, target + 32);
-                assert_eq!(
-                    rd_u32(&bytes, target + 44),
-                    AARCH64_MRS_TPIDR_EL1_X16_OPCODE,
-                    "gettid must re-restore guest x16 before the sysreg read"
-                );
-                assert_eq!(
-                    rd_u32(&bytes, target + 48),
-                    MRS_CONTEXTIDR_EL1_X0,
-                    "gettid must read CONTEXTIDR_EL1 after the enabled guard"
-                );
-                // The cbz traps normally if CONTEXTIDR_EL1 is unstamped (0) — a
-                // tid is never 0 — so a missed per-vCPU stamp degrades to a
-                // correct trap, not a wrong gettid==0.
-                let guard = decode_cbz_x0(rd_u32(&bytes, target + 52), target + 52)
-                    .expect("gettid handler must guard with `cbz x0, <fallthrough>`");
-                assert_eq!(
-                    rd_u32(&bytes, guard),
-                    HVC2,
-                    "gettid cbz must branch to the host-trap fallthrough"
-                );
-                assert_eq!(
-                    rd_u32(&bytes, target + 56),
-                    ERET,
-                    "gettid handler must eret after the guard"
-                );
-                sysreg_seen.push(nr);
-            } else {
+            {
                 // page read: after the enabled guard, movz/movk/movk rebuild
                 // the page base in x0, then ldr the syscall's identity field.
                 let (lo, hw0) =
@@ -8599,11 +8451,6 @@ mod el1_shim_tests {
                 .into_iter()
                 .all(|nr| !page_seen.iter().any(|(seen, _)| *seen == nr)),
             "per-thread credential syscalls must trap through Kernel dispatch"
-        );
-        assert_eq!(
-            sysreg_seen,
-            vec![GETTID_NR],
-            "gettid must be serviced via a CONTEXTIDR_EL1 read"
         );
     }
 

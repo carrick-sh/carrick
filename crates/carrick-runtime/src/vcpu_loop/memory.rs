@@ -724,9 +724,9 @@ pub(crate) fn core_file_mappings_from_address_space(
         .collect()
 }
 
-/// Stamp the EL1 `gettid` fast-path register with the NAMESPACE-visible tid.
+/// Stamp the EL0 vDSO's packed namespace-visible process/thread identity.
 ///
-/// The guest reads this register in userspace with no vm exit and compares it
+/// The guest reads this register in userspace with no VM exit and compares it
 /// against a namespace-translated `getpid`, so publishing the raw kernel-graph
 /// tid here is what let a leader observe `gettid() != getpid()`. See
 /// [`carrick_kernel::namespace::pid::ns_visible_guest_tid`].

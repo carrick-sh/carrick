@@ -200,6 +200,20 @@ fn addr<T>(value: &T) -> u64 {
     value as *const T as u64
 }
 
+#[test]
+fn gettid_uses_each_live_process_immutable_projection() {
+    let mut first = World::new(LifecycleHatches::ON);
+    let mut second = World::new(LifecycleHatches::ON);
+    assert!(first.venue.leader_slot().publish_visible_tid(41));
+    assert!(second.venue.leader_slot().publish_visible_tid(73));
+    for (world, expected) in [(&mut first, 41), (&mut second, 73)] {
+        let (action, frame) = world.syscall(178, &[]);
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0], expected);
+        assert_eq!(world.forwarded(178), 0);
+    }
+}
+
 /// Host-memory user copies that fail on chosen addresses (a fault EL1 cannot
 /// serve through).
 #[derive(Default)]
@@ -312,7 +326,8 @@ fn clone_serves_libc_and_go_thread_flag_sets_and_queues_the_child() {
         assert_eq!(ctx.sp_el0, CHILD_STACK);
         let settls = flags & CLONE_SETTLS != 0;
         assert_eq!(ctx.tpidr_el0, if settls { CHILD_TLS } else { 0x1111_0000 });
-        assert_eq!(ctx.contextidr_el1, u64::from(CHILD_VISIBLE));
+        assert_eq!(ctx.contextidr_el1, PARENT_TID);
+        assert_eq!(w.venue.child_slot(2).visible_tid(), Some(CHILD_VISIBLE));
         assert_eq!(
             ctx.tpidrro_el0,
             (PARENT_TID << 32) | u64::from(CHILD_VISIBLE)

@@ -190,18 +190,20 @@ fn two_process(name: &str, body: &dyn Fn(&Role) -> bool) -> i32 {
             libc::close(p2c[1]);
             libc::close(c2p[0]);
         }
+        let identity_ok = gettid() == current_pid();
         let ok = body(&Role {
             name: "child",
             peer: unsafe { libc::getppid() },
             rd: p2c[0],
             wr: c2p[1],
         });
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        unsafe { libc::_exit(if ok && identity_ok { 0 } else { 1 }) };
     }
     unsafe {
         libc::close(p2c[0]);
         libc::close(c2p[1]);
     }
+    let identity_ok = gettid() == current_pid();
     let parent_ok = body(&Role {
         name: "parent",
         peer: pid,
@@ -209,7 +211,7 @@ fn two_process(name: &str, body: &dyn Fn(&Role) -> bool) -> i32 {
         wr: p2c[1],
     });
     let child_ok = reap(pid, Duration::from_secs(120)) == Some(0);
-    let ok = parent_ok && child_ok;
+    let ok = parent_ok && child_ok && identity_ok;
     println!("{name} summary parent_ok={parent_ok} child_ok={child_ok} ok={ok}");
     if ok { 0 } else { 1 }
 }
@@ -1244,7 +1246,7 @@ pub fn exec_storm(rounds: usize, argv0: &str) -> i32 {
 /// pid.
 pub fn exec_storm_child() -> i32 {
     let ids = task_ids().unwrap_or_default();
-    let ok = ids.len() == 1 && ids[0] == current_pid();
+    let ok = ids.len() == 1 && ids[0] == current_pid() && gettid() == current_pid();
     println!("exec-storm-child tasks={ids:?} ok={ok}");
     if ok { 0 } else { 3 }
 }

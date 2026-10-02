@@ -13,7 +13,7 @@ workspace = true
 
 [features]
 # Guest-side syscall shim (forwarded to carrick-runtime). The base shim
-# (getpid/gettid, answered guest-side from the identity page / CONTEXTIDR_EL1)
+# (getpid, answered guest-side from the identity page)
 # is default ON. (Clock syscalls are served via the vDSO and dispatch, not
 # the EL1 shim.) Build with `--no-default-features` for the legacy trap-only
 # vector path.
