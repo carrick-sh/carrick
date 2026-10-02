@@ -25,6 +25,13 @@ use crate::kernel::objects::{
     FileTable, LinuxWaitStatus, Mm, TaskKey, TaskLifecycle, TaskParticipantError, Zombie,
 };
 
+/// Which authority already removed the departing thread from the ABI census.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::kernel) enum ThreadRetirementLane {
+    Host,
+    ExitedInZone,
+}
+
 /// Exit publication token whose fallible topology and revision checks have
 /// completed. Dropping it leaves the task graph unchanged and releases every
 /// affected identity reservation.
@@ -271,7 +278,12 @@ impl Kernel {
 
         let files = context.resources.files();
         let mut state = self.registry().settled().write();
-        let next = self.retire_thread_in_registry(context, &mut state, failpoint)?;
+        let next = self.retire_thread_in_registry(
+            context,
+            &mut state,
+            ThreadRetirementLane::Host,
+            failpoint,
+        )?;
         drop(state);
         self.finish_thread_retirement(context, &files);
         Ok(next)
@@ -282,6 +294,7 @@ impl Kernel {
         &self,
         context: &KernelContext,
         state: &mut RegistryState,
+        lane: ThreadRetirementLane,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<TaskRevision, KernelOperationError> {
         ensure_task_unreserved(state, context.task.key().id)?;
@@ -321,6 +334,15 @@ impl Kernel {
             .task
             .retire_thread(context.thread.key())
             .ok_or(KernelOperationError::UnknownThread(tid))?;
+        if lane == ThreadRetirementLane::Host {
+            thread
+                .control_lease()
+                .lifecycle()
+                .try_exit()
+                .unwrap_or_else(|_| {
+                    carrick_fatal!("kernel::thread_retirement", "host exit lost live count");
+                });
+        }
         let record = state
             .tasks
             .get_mut(&context.task.key().id)

@@ -389,6 +389,15 @@ impl PreparedThreadClone {
                     "publish_thread failed in PreparedThreadClone::publish_reserved"
                 );
             });
+        if lane == PublicationLane::HostClone {
+            thread
+                .control_lease()
+                .lifecycle()
+                .thread_born()
+                .unwrap_or_else(|| {
+                    carrick_fatal!("kernel::thread_publication", "thread live count overflow");
+                });
+        }
         record.thread_claims.insert(tid, claim);
         record.revision = published_revision;
         // The thread claim inserted above now carries this thread in the
