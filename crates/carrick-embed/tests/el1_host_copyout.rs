@@ -36,3 +36,24 @@ fn el1_host_copyout_into_and_out_of_untouched_reserved_memory() {
         result.stderr_utf8()
     );
 }
+
+#[test]
+fn el1_host_buffers_follow_reused_mapping_in_two_live_processes() {
+    let _guard = common::guest_lock();
+    let watchdog = common::Watchdog::start(std::time::Duration::from_secs(30));
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command(["/opt/carrick/copyout", "reuse"])
+            .vfs_mount("/opt/carrick", Box::new(common::copyout_vfs()))
+            .run_blocking(),
+    );
+    watchdog.disarm();
+    assert!(
+        result.success() && result.stdout_utf8().trim() == "copyout_reuse_ok",
+        "exit_code={} stdout={:?} stderr={}",
+        result.exit_code,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
+}
