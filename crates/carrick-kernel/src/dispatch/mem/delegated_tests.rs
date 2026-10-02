@@ -4091,11 +4091,14 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
         },
     );
     root.guest_mprotect(fault, PAGE, ReservationProtection::READ_WRITE);
+    dispatcher
+        .with_resident_fault_plan_for_test(fault, |plan| dispatcher.commit_resident_fault(plan))
+        .expect("EL1's live-page reconciliation can precede receipt settlement");
     crate::dispatch::mm_mutation::test_support::with_permit(
         dispatcher.mm_mutation_coordinator(),
         |permit| {
             let plan = dispatcher.published_frame_grant_plan(permit, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt)
-                .expect("a verified publication settles its still-armed page even after physical preparation");
+                .expect("a verified publication settles after physical preparation and residency reconciliation");
             assert_eq!((plan.start(), plan.len()), (start, len));
             dispatcher.commit_resident_frame_grant(plan);
         },
