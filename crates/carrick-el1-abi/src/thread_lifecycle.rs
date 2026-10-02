@@ -340,12 +340,16 @@ pub enum GateState {
     /// Terminal for this page: exec, tracer, seccomp or opt-out. A new page
     /// is stocked for the next incarnation.
     Closed = 2,
+    /// Exec committed; no conflicting operation owns this page, but its new
+    /// image has not installed executable birth capacity yet.
+    AwaitingExecBinding = 3,
 }
 impl GateState {
     const fn from_raw(raw: u32) -> Self {
         match raw {
             0 => Self::Open,
             1 => Self::ForkClosing,
+            3 => Self::AwaitingExecBinding,
             _ => Self::Closed,
         }
     }
@@ -770,6 +774,25 @@ impl ThreadLifecyclePage {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
+            .map(|_| ())
+            .map_err(GateState::from_raw)
+    }
+    /// Reserve host authority while the post-exec image has no birth binding.
+    pub fn close_awaiting_exec_binding(&self) -> Result<(), GateState> {
+        self.transition_gate(GateState::AwaitingExecBinding, GateState::ForkClosing)
+    }
+    /// Release host authority without admitting births into an unbound image.
+    pub fn await_exec_binding(&self) -> Result<(), GateState> {
+        self.transition_gate(GateState::ForkClosing, GateState::AwaitingExecBinding)
+    }
+    /// The new image's executable capacity is installed. This cannot release
+    /// a fork's temporary close or a tracer's terminal close.
+    pub fn reopen_after_exec_binding(&self) -> Result<(), GateState> {
+        self.transition_gate(GateState::AwaitingExecBinding, GateState::Open)
+    }
+    fn transition_gate(&self, from: GateState, to: GateState) -> Result<(), GateState> {
+        self.gate
+            .compare_exchange(from as u32, to as u32, Ordering::SeqCst, Ordering::SeqCst)
             .map(|_| ())
             .map_err(GateState::from_raw)
     }

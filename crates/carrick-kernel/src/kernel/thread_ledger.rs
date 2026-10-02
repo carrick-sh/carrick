@@ -42,36 +42,54 @@ use crate::namespace::pid::PreparedNamespaceIdentity;
 #[derive(Debug)]
 pub(super) struct BirthAdmissionGuard {
     page: Option<super::objects::ThreadLifecycleLease>,
+    awaiting_exec_binding: bool,
 }
 
 impl BirthAdmissionGuard {
     pub(super) fn acquire(task: &super::objects::Task) -> Result<Self, KernelOperationError> {
         let page = task.shared().pending_signals().lifecycle_lease();
         if !page.serves_threads() || page.gate() == carrick_el1_abi::GateState::Closed {
-            return Ok(Self { page: None });
+            return Ok(Self {
+                page: None,
+                awaiting_exec_binding: false,
+            });
         }
-        page.close_for_fork()
-            .map_err(|_| KernelOperationError::TaskBusy(task.key().id))?;
-        let guard = Self { page: Some(page) };
+        let awaiting_exec_binding = page.gate() == carrick_el1_abi::GateState::AwaitingExecBinding;
+        let close = if awaiting_exec_binding {
+            page.close_awaiting_exec_binding()
+        } else {
+            page.close_for_fork()
+        };
+        close.map_err(|_| KernelOperationError::LifecycleAdmissionBusy(task.key().id))?;
+        let guard = Self {
+            page: Some(page),
+            awaiting_exec_binding,
+        };
         if guard
             .page
             .as_ref()
             .is_some_and(|page| page.claimed_count() != 0)
         {
-            return Err(KernelOperationError::TaskBusy(task.key().id));
+            return Err(KernelOperationError::LifecycleAdmissionBusy(task.key().id));
         }
         Ok(guard)
     }
 
     pub(super) fn keep_closed(&mut self) {
-        self.page.take();
+        if let Some(page) = self.page.take() {
+            let _ = page.await_exec_binding();
+        }
     }
 }
 
 impl Drop for BirthAdmissionGuard {
     fn drop(&mut self) {
         if let Some(page) = self.page.take() {
-            let _ = page.reopen_after_fork();
+            if self.awaiting_exec_binding {
+                let _ = page.await_exec_binding();
+            } else {
+                let _ = page.reopen_after_fork();
+            }
         }
     }
 }
@@ -1013,7 +1031,7 @@ impl Kernel {
             .thread()
             .control_lease()
             .lifecycle()
-            .reopen_after_fork();
+            .reopen_after_exec_binding();
         self.registry()
             .thread_ledger()
             .replenish(self, &state, context);
@@ -1172,11 +1190,11 @@ mod tests {
         match operation {
             "fork" => assert!(matches!(
                 kernel.reserve_fork(&current, fork_plan(), "conflict".into(), None),
-                Err(KernelOperationError::TaskBusy(_))
+                Err(KernelOperationError::LifecycleAdmissionBusy(_))
             )),
             "credentials" => assert!(matches!(
                 kernel.update_credentials(&current, |_| {}),
-                Err(KernelOperationError::TaskBusy(_))
+                Err(KernelOperationError::LifecycleAdmissionBusy(_))
             )),
             "ptrace" => assert!(!kernel.claim_ptrace_traceme(&current)),
             _ => unreachable!(),
@@ -1191,6 +1209,35 @@ mod tests {
                     .unwrap();
                 assert_eq!(page.gate(), carrick_el1_abi::GateState::ForkClosing);
                 assert_eq!(root_page.gate(), carrick_el1_abi::GateState::Open);
+                #[derive(Debug)]
+                struct ExecutableFactory(super::super::TaskKey);
+                impl super::super::thread_adoption::ThreadBirthAdoptionFactory for ExecutableFactory {
+                    fn executable_births(&self) -> bool {
+                        true
+                    }
+                    fn owner(&self) -> super::super::TaskKey {
+                        self.0
+                    }
+                    fn reserve(
+                        &self,
+                        _: super::super::ThreadKey,
+                    ) -> Option<super::super::thread_adoption::ThreadBirthAdoptionReservation>
+                    {
+                        None
+                    }
+                }
+                current
+                    .task()
+                    .install_thread_adoption_factory(Arc::new(ExecutableFactory(
+                        current.task().key(),
+                    )))
+                    .unwrap();
+                kernel.prepare_executable_thread_births(&current);
+                assert_eq!(
+                    page.gate(),
+                    carrick_el1_abi::GateState::ForkClosing,
+                    "factory installation cannot release another operation's admission custody"
+                );
                 drop(reserved);
                 assert_eq!(page.gate(), carrick_el1_abi::GateState::Open);
             }
@@ -1261,6 +1308,13 @@ mod tests {
         peer_page.unclaim(peer_claim).unwrap();
         let committed = kernel.commit_exec(prepared, None).unwrap();
         assert_ne!(committed.shared().mm().id(), current.shared().mm().id());
+        assert_eq!(page.gate(), carrick_el1_abi::GateState::AwaitingExecBinding);
+        let post_exec_fork = kernel
+            .reserve_fork(&committed, fork_plan(), "post-exec".into(), None)
+            .unwrap();
+        assert_eq!(page.gate(), carrick_el1_abi::GateState::ForkClosing);
+        drop(post_exec_fork);
+        assert_eq!(page.gate(), carrick_el1_abi::GateState::AwaitingExecBinding);
         assert_eq!(
             page.claim_any(),
             Err(carrick_el1_abi::TransitionError::PoolEmpty),
