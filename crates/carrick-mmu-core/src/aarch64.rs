@@ -9820,7 +9820,10 @@ mod tests {
             .expect("map the grant window");
         let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let full = [(mgr.base(), host.as_mut_ptr())];
-        unsafe { mgr.restore_quiesced_snapshot_to_host(&full[..]).unwrap() };
+        unsafe {
+            mgr.restore_quiesced_snapshot_to_host(TestArenas(&full))
+                .unwrap()
+        };
         let lookups = core::cell::Cell::new(0_usize);
         let base = mgr.base();
         let host_ptr = host.as_ptr();
@@ -9886,7 +9889,10 @@ mod tests {
             .expect("map across an L3 boundary");
         let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let full = [(mgr.base(), host.as_mut_ptr())];
-        unsafe { mgr.restore_quiesced_snapshot_to_host(&full[..]).unwrap() };
+        unsafe {
+            mgr.restore_quiesced_snapshot_to_host(TestArenas(&full))
+                .unwrap()
+        };
         let base = mgr.base();
         let host_ptr = host.as_ptr();
         let resolver = || unsafe {
