@@ -511,3 +511,12 @@ lib tests passed; kernel signal-object tests 10 passed; hook instruction tests
 clippy command for runtime, EL1, memory and kernel exited zero
 (`/tmp/forkexit-sol-venue-clippy.log`). These are focused wiring receipts,
 not closure of the signed lifecycle contract or the full requested gates.
+
+Post-I2 rebase: wiring is `665a53f0f` atop main `d7548d894`. The first
+`just reconcile-inventories` refused the mapping count change, as designed;
+its follow-up regenerated the operation inventory. Reviewed additions are
+the eight mapping rows in `vcpu_loop/thread_lifecycle.rs`: the retained mapping
+type, page index, cached lookup/result, insertion, lifetime comment, draining
+iteration and retirement call. These are private anonymous lifecycle metadata,
+not file-description or host-fd authority. No existing row was retired or
+reclassified. The compiler capture still has all 596 authority rows unchanged.
