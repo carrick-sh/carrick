@@ -1442,6 +1442,10 @@ impl Task {
         Ok(())
     }
 
+    pub(in crate::kernel) fn clear_thread_adoption_factory(&self) {
+        self.thread_adoption_factory.lock().take();
+    }
+
     pub(in crate::kernel) fn thread_adoption_factory(
         &self,
     ) -> Option<Arc<dyn crate::kernel::thread_adoption::ThreadBirthAdoptionFactory>> {
