@@ -327,8 +327,45 @@ pub const FAULTSIG_MBOX: u8 = 79;
 /// of the MM that asked to install.
 pub const MMOCC_REFUSE: u8 = 80;
 
+/// Host thread-clone errno 11 producer. `a` and `b` identify the canonical
+/// caller's kernel task/thread IDs (not namespace projections); `c` is the
+/// typed producer below. This is diagnostic history, not identity authority.
+pub const CLONE_REFUSAL: u8 = 81;
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloneRefusalProducer {
+    AdmissionRefused,
+    Cancelled,
+    Nproc,
+    RuntimeReservation,
+}
+
+/// A stable cold-path breakpoint at the actual errno producer, unlike a
+/// source-line breakpoint that optimized code can bind to an admitted path.
+#[inline(never)]
+pub fn rec_clone_refusal(context: &crate::kernel::KernelContext, producer: CloneRefusalProducer) {
+    rec(
+        CLONE_REFUSAL,
+        context.task().key().id.raw(),
+        context.thread().key().tid.raw(),
+        producer as i32,
+    );
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn clone_refusal_label(producer: i32) -> &'static str {
+    match producer {
+        0 => "admission_refused",
+        1 => "cancelled",
+        2 => "nproc",
+        3 => "runtime_reservation",
+        _ => "unknown",
+    }
+}
+
 /// Highest event kind a reader accepts.
-const LAST_KIND: u8 = MMOCC_REFUSE;
+const LAST_KIND: u8 = CLONE_REFUSAL;
 
 /// At most this many [`FAULTSIG_MBOX`] records follow one fault signal, so a
 /// census of all mailboxes never floods the ring.
@@ -1537,6 +1574,10 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         FDOWNER => format!("FDOWNER pid={a} tid={b} gfd={c}"),
         FDREF => format!("FDREF    pid={a} gfd={b} refs_before={c}"),
         CLONESPAWN => format!("CLONESPAWN parent_pid={a} child_tid={b} errno={c}"),
+        CLONE_REFUSAL => format!(
+            "CLONEREFUSE task_id={a} tid={b} errno=11 producer={}",
+            clone_refusal_label(c)
+        ),
         HVPEXEC_CLAIM => format!("HVPEXEC  pid={a} tid={b} executor={c} phase=claim"),
         HVPEXEC_LOAD => format!("HVPEXEC  pid={a} tid={b} executor={c} phase=load"),
         HVPEXEC_BOUNDARY => format!(
@@ -1953,6 +1994,28 @@ mod tests {
             lo: AtomicU64::new(0),
             hi: AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn clone_refusal_producer_decodes_each_typed_stage() {
+        for (stage, label) in [
+            "admission_refused",
+            "cancelled",
+            "nproc",
+            "runtime_reservation",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                decode(CLONE_REFUSAL, 56172, 56099, stage as i32),
+                format!("CLONEREFUSE task_id=56172 tid=56099 errno=11 producer={label}")
+            );
+        }
+        assert_eq!(
+            decode(CLONE_REFUSAL, 56172, 56099, 99),
+            "CLONEREFUSE task_id=56172 tid=56099 errno=11 producer=unknown"
+        );
     }
 
     fn payload(kind: u8, a: i32, b: i32, c: i32) -> (u64, u64) {

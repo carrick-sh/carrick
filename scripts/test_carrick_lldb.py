@@ -26,6 +26,12 @@ PLUGIN = _load_plugin()
 
 
 class CarrickLldbHelperTests(unittest.TestCase):
+    def test_clone_refusal_producer_decodes_the_actual_error_stage(self):
+        formatter = PLUGIN._EVENTRING_KINDS[81][1]
+        for stage, name in enumerate(["admission_refused", "cancelled", "nproc", "runtime_reservation"]):
+            self.assertEqual(formatter(56172, 56099, stage),
+                f"task_id=56172 tid=56099 errno=11 producer={name}")
+
     def test_guest_thread_identity_accepts_process_aware_name(self):
         self.assertEqual(
             PLUGIN._guest_thread_identity("guest-pid-123-tid-456"),
@@ -185,7 +191,7 @@ class CarrickLldbHelperTests(unittest.TestCase):
         # Kinds 68..80 must all be known: an unknown kind reads as ERROR.
         for kind in range(68, 81):
             self.assertIn(kind, PLUGIN._EVENTRING_KINDS)
-        self.assertNotIn(81, PLUGIN._EVENTRING_KINDS)
+        self.assertNotIn(82, PLUGIN._EVENTRING_KINDS)
 
     def test_eventring_formats_el1_frame_grant_claim_and_decision(self):
         # Same packed words the Rust round-trip test publishes.
