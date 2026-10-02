@@ -57,20 +57,7 @@ pub struct LocalNvmmConfig {
     pub timeout_scale: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DockerPlatform {
-    LinuxArm64,
-    LinuxAmd64,
-}
-
-impl DockerPlatform {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DockerPlatform::LinuxArm64 => "linux/arm64",
-            DockerPlatform::LinuxAmd64 => "linux/amd64",
-        }
-    }
-}
+pub use crate::argv::DockerPlatform;
 
 /// The selected lane. `Hvf` is the single local macOS lane; `Kvm` carries the
 /// lima wiring.
