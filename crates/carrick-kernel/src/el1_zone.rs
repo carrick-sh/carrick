@@ -705,11 +705,49 @@ pub fn hand_back(records: &[RecordRef]) {
 
 fn publish_handback(record: RecordRef) {
     if let Some(zone) = zone_tables() {
-        zone.counters
-            .host_handbacks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        publish_handback_in_zone(zone, record, &mut |record| {
+            deliver_handback_event(HandbackEvent::Ready(record));
+        });
+    } else {
+        deliver_handback_event(HandbackEvent::Ready(record));
     }
-    deliver_handback_event(HandbackEvent::Ready(record));
+}
+
+fn publish_handback_in_zone(
+    zone: &ZoneTables,
+    record: RecordRef,
+    publish: &mut impl FnMut(RecordRef),
+) {
+    zone.counters
+        .host_handbacks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if route_first_entry_in_zone(zone, record) {
+        return;
+    }
+    publish(record);
+}
+
+/// An uninitialized Born thread has reserved activation capacity, but no
+/// continuation to wake. Keep its exact record on an executor service queue.
+pub(crate) fn route_first_entry_handback(record: RecordRef) -> bool {
+    zone_tables().is_some_and(|zone| route_first_entry_in_zone(zone, record))
+}
+
+fn route_first_entry_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
+    let Some(rec) = zone.live(record).filter(|rec| {
+        rec.is_unadopted_birth()
+            && !rec.is_cancelled()
+            && matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. })
+    }) else {
+        return false;
+    };
+    let last_slot = rec.last_slot();
+    if deliver_placement(zone.place_from_host(record.id)) {
+        return true;
+    }
+    // As for an ordinary held service row, preserve custody on the previous
+    // driver when every eligible slot is temporarily away on host work.
+    last_slot.is_some_and(|slot| zone.requeue_on(slot, record.id))
 }
 
 fn deliver_handback_event(event: HandbackEvent<'_>) {
@@ -1255,6 +1293,39 @@ mod tests {
             zone.live(replacement).unwrap().claim(),
             Claim::Parked { seq }
         );
+    }
+
+    #[test]
+    fn born_wake_handbacks_reach_first_entry_for_two_live_processes() {
+        let zone = heap_zone();
+        let mut published = Vec::new();
+        for (cpu, mm) in [(0, 7), (1, 8)] {
+            let slot = SlotId::new(cpu);
+            zone.drive(slot, u64::from(cpu) + 1);
+            zone.publish_slot(slot, 0, Some(u32::from(cpu)), 0);
+            zone.enter_guest(slot);
+            zone.enter_idle(slot, true);
+            let id = zone
+                .alloc_record(ThreadIdentity {
+                    mm,
+                    generation: 0,
+                    affinity: 1 << cpu,
+                    lifecycle_page: 0x1000 + mm * 4096,
+                    control_slot: 0x2000 + mm * 4096,
+                    ..identity(mm)
+                })
+                .unwrap();
+            let record = zone.record_ref(id);
+            zone.publish_park(id, zone.next_seq(id));
+            zone.claim_for_host(record, None, Handback::Woken, &HostLockWait);
+            publish_handback_in_zone(&zone, record, &mut |record| published.push(record));
+            assert!(
+                published.is_empty(),
+                "a Born wake cannot target a nonexistent host continuation"
+            );
+            assert_eq!(zone.take_service_head(slot), Some(record));
+            assert_eq!(zone.live(record).unwrap().handback(), Some(Handback::Woken));
+        }
     }
 
     #[test]
