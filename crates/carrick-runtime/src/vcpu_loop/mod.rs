@@ -1482,6 +1482,11 @@ where
                 1,
             );
         }
+        // Settle lifecycle and owed wakes before resolving the thread that
+        // trapped. An in-zone birth may not yet be in the host task graph.
+        let served_boundary = engine.mailbox_slot().and_then(|slot| {
+            carrick_kernel::el1_delegation::settle_el1_boundary_for(slot, &kernel.dispatcher)
+        });
         let kernel_context = kernel
             .dispatcher
             .capture_kernel_context(self.linux_tid)
@@ -1525,10 +1530,6 @@ where
             }
         }
 
-        // Owed inotify and pipe/eventfd host wakes are delivered here.
-        let served_boundary = engine.mailbox_slot().and_then(|slot| {
-            carrick_kernel::el1_delegation::settle_el1_boundary(slot, kernel_context.kernel())
-        });
         let served_with_work = served_boundary.is_some();
         if served_with_work {
             CENSUS_EL1_BOUNDARY.with(|flag| flag.set(true));

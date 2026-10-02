@@ -49,6 +49,7 @@ pub fn settle_el1_boundary(
     slot: usize,
     kernel: &crate::kernel::Kernel,
 ) -> Option<carrick_el1_abi::ServedBoundary> {
+    kernel.settle_thread_ledger();
     let boundary = carrick_el1_abi::take_served_boundary(slot);
     let served = boundary.is_some();
     let pending = carrick_el1_abi::take_pending_host_work(slot);

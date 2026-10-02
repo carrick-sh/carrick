@@ -525,6 +525,13 @@ fn nproc_verdict(
 }
 
 impl Kernel {
+    /// Settle thread births before resolving a host-entry context. The
+    /// empty-ledger path is one atomic load; membership readers use the
+    /// same settlement body through the registry's settled view.
+    pub fn settle_thread_ledger(&self) {
+        let _ = self.registry().settled();
+    }
+
     /// Tids standing in `task`'s identity pool (diagnostics and tests).
     pub fn standing_thread_identities(&self, task: super::ids::TaskId) -> Vec<LinuxTid> {
         self.registry()
@@ -562,6 +569,52 @@ mod tests {
 
     fn fork_plan() -> ClonePlan {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
+    }
+
+    #[test]
+    fn lifecycle_host_boundary_settles_births_before_context_in_two_processes() {
+        let (kernel, root) = bootstrap(9_650);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_651),
+                "boundary-observer".into(),
+                None,
+            )
+            .unwrap();
+        let mut births = Vec::new();
+        for (index, parent) in [&root, &peer].into_iter().enumerate() {
+            let prepared = kernel
+                .reserve_thread_clone(parent, thread_plan(), None)
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(9_652 + index as i32))
+                .unwrap();
+            let tid = prepared.tid();
+            let key = prepared.record_birth();
+            births.push((parent.task().clone(), tid, key));
+        }
+        // Reserving the peer's birth observes membership and settles the
+        // first birth; the last birth remains pending at host entry.
+        assert_eq!(kernel.registry().thread_ledger().pending_births(), 1);
+        // No region or boundary flags are necessary: thread settlement is
+        // owed on every host entry, even an ordinary forwarded syscall.
+        crate::el1_delegation::settle_el1_boundary(usize::MAX, &kernel);
+        for (task, tid, _) in &births {
+            // Read the actual task before a context/membership lookup can
+            // hide missing boundary settlement by settling it itself.
+            assert!(
+                task.thread(*tid).is_some(),
+                "boundary left a birth invisible"
+            );
+        }
+        for (task, tid, key) in births {
+            assert_eq!(
+                kernel.context(task.key().id, tid).unwrap().thread().key(),
+                key
+            );
+        }
+        assert_eq!(kernel.registry().thread_ledger().pending_births(), 0);
     }
 
     #[test]
