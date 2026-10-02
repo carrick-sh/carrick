@@ -112,6 +112,12 @@ impl HostReservationProvider for Provider {
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
         Ok(Box::new(View(self.0.clone())))
     }
+    fn provision_metadata(&self, _mm: ReservationMm) -> Result<(), Refusal> {
+        // This deliberately finite reference substrate models a configured
+        // map-count resource limit. Unlike production carrier capacity, that
+        // Linux limit has an ENOMEM answer and no elastic backing service.
+        Err(Refusal::Limit)
+    }
 }
 
 /// `dispatcher`'s production admission under its own MM permit.

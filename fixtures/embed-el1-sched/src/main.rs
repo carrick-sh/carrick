@@ -2398,6 +2398,30 @@ fn permission_transitions(pages: usize, rounds: usize) -> i32 {
     i32::from(!ok)
 }
 
+fn reservation_capacity(count: usize) -> i32 {
+    let mut regions = Vec::with_capacity(count);
+    for i in 0..count {
+        let prot = if i % 2 == 0 { libc::PROT_READ } else { libc::PROT_READ | libc::PROT_WRITE };
+        let ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), 4096, prot,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        if ptr == libc::MAP_FAILED {
+            println!("reservation-capacity mmap failed at {i}");
+            return 1;
+        }
+        regions.push(ptr);
+    }
+    for ptr in regions {
+        if unsafe { libc::munmap(ptr, 4096) } != 0 {
+            println!("reservation-capacity munmap failed");
+            return 1;
+        }
+    }
+    println!("reservation-capacity count={count} ok=true");
+    0
+}
+
 fn anonymous_reservations(count: usize) -> i32 {
     let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size_raw <= 0 {
@@ -3415,6 +3439,7 @@ fn main() {
         "anonymous-reservations" => {
             anonymous_reservations(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(64))
         }
+        "reservation-capacity" => reservation_capacity(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1100)),
         "anonymous-discard-and-exit" => anonymous_discard_and_exit(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
