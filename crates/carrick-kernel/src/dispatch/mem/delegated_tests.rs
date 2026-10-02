@@ -3315,6 +3315,73 @@ fn delegated_unused_first_touch_stock_is_the_roots_holes_under_its_grants() {
     assert!(dispatcher.mem_view().take_first_touch_stock().1.is_empty());
 }
 
+#[test]
+fn delegated_fork_requires_stock_and_owed_returns_settled_before_snapshot() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    let rw = ReservationProtection::READ_WRITE;
+    root.guest_mmap(Placement::Fixed(base + 2 * PAGE), 2 * PAGE, rw)
+        .unwrap();
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base + 2 * PAGE, STOCK_WINDOW, |plan| {
+            assert!(plan.stock);
+            dispatcher.commit_resident_frame_grant(plan);
+        })
+        .unwrap();
+    let retired = root
+        .guest_mmap(Placement::Fixed(base + STOCK_WINDOW), PAGE, rw)
+        .unwrap();
+    root.guest_munmap_resident(retired, PAGE);
+    let parent_mm = dispatcher.mm_authority().mm_id;
+    let child_mm = crate::kernel::MmId::from_registry_allocation(
+        std::num::NonZeroU64::new(parent_mm.raw() + 1).unwrap(),
+    );
+    assert!(
+        dispatcher
+            .prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy)
+            .is_err(),
+        "an unsettled parent must not mint a fork snapshot"
+    );
+    let mut memory = CountingMmapMemory::new(base, (2 * STOCK_WINDOW) as usize);
+    reconcile(&dispatcher, &mut memory).unwrap();
+    let mut returned = memory.unmap_log.borrow().clone();
+    returned.sort_unstable();
+    assert_eq!(
+        returned,
+        vec![
+            (base, (2 * PAGE) as usize),
+            (base + 4 * PAGE, (4 * PAGE) as usize),
+            (retired, PAGE as usize)
+        ]
+    );
+    assert!(root.owed().is_empty());
+    assert!(dispatcher.mem().lock().first_touch_stock.is_empty());
+    let child = fork_child(&dispatcher);
+    assert!(child.mem().lock().first_touch_stock.is_empty());
+    assert!(proc_row_at(&child, base).is_none());
+    assert!(proc_row_at(&child, retired).is_none());
+    assert!(proc_row_at(&child, base + 2 * PAGE).is_some());
+    let child_root = root.publish_child(&child);
+    assert_eq!(
+        fork_commit(&dispatcher, &child),
+        Ok(El1Admission::Delegated)
+    );
+    for address in [base, retired] {
+        child_root
+            .guest_mmap(Placement::Fixed(address), PAGE, rw)
+            .unwrap();
+        assert!(
+            child.host_read_sees_fresh_zero(address),
+            "the child must observe fresh zero, not a returned parent's frame"
+        );
+        assert!(
+            stock_span(&child, address).is_some(),
+            "the child needs its own grant"
+        );
+    }
+}
+
 /// Contract `kernel.el1.anonymous-reservations`: returning first-touch
 /// stock costs work proportional to the stock-holding grants, not to the
 /// MM's mappings or the carrier's grant table. An MM without stock reads
