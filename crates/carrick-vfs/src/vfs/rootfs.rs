@@ -221,6 +221,7 @@ impl RootFsVfs {
                     });
                     continue;
                 }
+                crate::probes::fs_op("path-role", "coordinator-admission", 0);
                 let resolved = self.resolved_parent(path)?;
                 let identity = if let Some(ref fd) = resolved.parent_fd {
                     crate::vfs::namespace_mutation::NamespaceParentIdentity::Host(
@@ -689,17 +690,60 @@ impl RootFsVfs {
 
     /// Create hard link in writable overlay and update dentry cache.
     pub fn link(&self, from: &str, to: &str) -> Result<(), LinuxErrno> {
+        self.link_with_parent_check(from, to, |_| Ok(()))
+    }
+
+    /// Resolve and reserve both names once; validate the retained target parent
+    /// before physical publication. The permit spans checks, copy-up, link and
+    /// cache publication, so no preflight name snapshot becomes authority.
+    pub fn link_with_parent_check(
+        &self,
+        from: &str,
+        to: &str,
+        check_parent: impl FnOnce(&ResolvedParent) -> Result<(), LinuxErrno>,
+    ) -> Result<(), LinuxErrno> {
         self.with_namespace_batch(&[from, to], false, |permit| {
             let src = permit.parent(from).ok_or(LINUX_ENOENT)?;
             let dst = permit.parent(to).ok_or(LINUX_ENOENT)?;
-            let entry = self.admitted_entry_info(src, from);
-            if entry
-                .as_ref()
-                .is_some_and(|entry| entry.kind == RootFsEntryKind::Directory)
-            {
+            let mut entry = self.admitted_entry_info(src, from).ok_or(LINUX_ENOENT)?;
+            if self.admitted_entry_info(dst, to).is_some() {
+                return Err(LINUX_EEXIST);
+            }
+            check_parent(dst)?;
+            if entry.kind == RootFsEntryKind::Directory {
                 return Err(carrick_abi::LINUX_EPERM);
             }
-            let inode = entry.and_then(|entry| entry.inode);
+            if entry.in_rootfs && !entry.in_overlay {
+                let lower = self.rootfs.as_ref().ok_or(LINUX_ENOENT)?;
+                let lower_owner = lower
+                    .immutable_real_stat(from, false)
+                    .map(|stat| (stat.uid, stat.gid));
+                let metadata = lower
+                    .symlink_metadata(from)
+                    .map_err(crate::vfs::errno::rootfs_errno)?;
+                if metadata.kind == RootFsEntryKind::Symlink {
+                    let target = lower
+                        .read_link(from)
+                        .map_err(crate::vfs::errno::rootfs_errno)?;
+                    self.overlay
+                        .symlink(&target, from)
+                        .map_err(|_| LINUX_EROFS)?;
+                } else {
+                    let contents = lower
+                        .read_shared(from)
+                        .map_err(crate::vfs::errno::rootfs_errno)?;
+                    self.overlay
+                        .create_file_from_rootfs(from, contents, metadata.mode)
+                        .map_err(|_| LINUX_EROFS)?;
+                }
+                if let Some((uid, gid)) = lower_owner {
+                    self.overlay
+                        .set_owner(from, Some(uid), Some(gid))
+                        .map_err(|_| LINUX_EROFS)?;
+                }
+                entry = self.admitted_entry_info(src, from).ok_or(LINUX_ENOENT)?;
+            }
+            let inode = entry.inode;
             match self.overlay.hard_link_at(src, dst) {
                 Ok(()) => {
                     self.dentry_cache.entry_created(to, inode);

@@ -2560,6 +2560,47 @@ mod serial_host {
     /// ENOENT, new name opens), each unlink removes the name.
     #[cfg(target_os = "macos")]
     #[test]
+    fn namespace_linkat_path_visit_budget() {
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(scratch.path().join("a/b/c/d")).unwrap();
+        std::fs::write(scratch.path().join("a/b/c/d/source"), b"x").unwrap();
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        memory.write_bytes(0x4000, b"/a/b/c/d/source\0").unwrap();
+        memory.write_bytes(0x4100, b"/a/b/c/d/target\0").unwrap();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .dentry_cache
+            .reset_path_visit_count();
+        assert_eq!(
+            lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                37,
+                [LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4100, 0, 0]
+            ),
+            0
+        );
+        let visits = dispatcher.fs.rootfs_vfs.dentry_cache.path_visit_count();
+        assert!(
+            visits <= 8,
+            "linkat made {visits} dentry-stage path visits (budget 8)"
+        );
+        assert_eq!(visits, 4, "one shared four-component parent resolution");
+        let source = std::fs::metadata(scratch.path().join("a/b/c/d/source")).unwrap();
+        let target = std::fs::metadata(scratch.path().join("a/b/c/d/target")).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            (source.dev(), source.ino(), source.nlink()),
+            (target.dev(), target.ino(), 2)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn namespace_ops_host_syscall_budget() {
         use carrick_vfs::fs_backend::host::host_bsd_syscall_count;
         const N: u64 = 32;

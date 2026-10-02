@@ -36,6 +36,8 @@ carrick*:::syscall-entry
          this->name == "unlinkat" || this->name == "linkat" || this->name == "openat");
     self->anchor = (uint32_t)this->args[0];
     self->op = this->name == "renameat2" ? "renameat" : this->name;
+    self->role = "dispatcher";
+    self->visit_sequence = 0;
 }
 carrick*:::syscall-entry
 /(pid == $target || progenyof($target)) && self->active/
@@ -69,11 +71,19 @@ syscall:::return
     self->host_active = 0;
 }
 carrick*:::fs-op
+/(pid == $target || progenyof($target)) && self->active && copyinstr(arg1) == "path-role"/
+{ self->role = copyinstr(arg2); }
+carrick*:::fs-op
 /(pid == $target || progenyof($target)) && self->active && copyinstr(arg1) == "path-census:armed"/
 { @armed[self->anchor, self->op] = count(); }
 carrick*:::fs-op
 /(pid == $target || progenyof($target)) && self->active && copyinstr(arg1) == "path-visit:dentry"/
-{ @visits[self->anchor, self->op, "dentry"] = sum(1); }
+{
+    @visits[self->anchor, self->op, "dentry"] = sum(1);
+    self->visit_sequence++;
+    printf("NSDETAIL1|actor=%u|op=%s|visit=%u|role=%s|component=%s\n",
+        self->anchor, self->op, self->visit_sequence, self->role, copyinstr(arg2));
+}
 carrick*:::fs-op
 /(pid == $target || progenyof($target)) && self->active && copyinstr(arg1) == "path-visit:host-parent"/
 { @visits[self->anchor, self->op, "host-parent"] = sum(1); }

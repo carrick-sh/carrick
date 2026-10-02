@@ -86,7 +86,10 @@ pub(crate) fn validate(raw: &str, scale: u64) -> Result<NamespaceCensus> {
     let mut calls = BTreeMap::<(NamespaceActorFd, String), [Option<u64>; 3]>::new();
     let mut host = BTreeMap::<(NamespaceActorFd, String, String), [Option<u64>; 2]>::new();
     let mut visits = BTreeMap::new();
-    for line in raw.lines().filter(|line| !line.is_empty()) {
+    for line in raw
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with("NSDETAIL1|"))
+    {
         if !header_seen {
             if line != header {
                 bail!("namespace census has no qualified program digest");

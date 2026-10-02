@@ -216,6 +216,8 @@ pub struct DentryCache {
     is_shared: bool,
     host_opens: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
+    path_visits: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
     layer_probes: AtomicU64,
     capacity_bytes: usize,
     eviction_enabled: bool,
@@ -342,6 +344,8 @@ impl DentryCache {
             is_shared,
             host_opens: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
+            path_visits: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
             layer_probes: AtomicU64::new(0),
             capacity_bytes,
             eviction_enabled,
@@ -382,6 +386,16 @@ impl DentryCache {
 
     pub fn reset_host_open_count(&self) {
         self.host_opens.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn path_visit_count(&self) -> u64 {
+        self.path_visits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_path_visit_count(&self) {
+        self.path_visits.store(0, Ordering::Relaxed);
     }
 
     /// Count uncached parent/name probes across the upper and lower layers.
@@ -840,6 +854,8 @@ impl DentryCache {
         while comp_idx < components.len() {
             let name = &components[comp_idx];
             crate::probes::fs_op("path-visit:dentry", name, 0);
+            #[cfg(any(test, feature = "test-support"))]
+            self.path_visits.fetch_add(1, Ordering::Relaxed);
             let is_last = comp_idx + 1 == components.len();
 
             if current_id == DentryId::ROOT && (name == "proc" || name == "sys" || name == "dev") {

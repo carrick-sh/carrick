@@ -257,6 +257,7 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                     for i in 0..n {
                         let src = format!("/{parent}/{id}_{i}_src");
                         let dst = format!("/{parent}/{id}_{i}_dst");
+                        let alias = format!("/{parent}/{id}_{i}_alias");
                         let deleted = format!("/{parent}/{id}_{i}_deleted");
                         std::fs::write(lower.path().join(src.trim_start_matches('/')), b"lower")
                             .unwrap();
@@ -266,6 +267,36 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                         )
                         .unwrap();
                         actors[id].extend([
+                            Step::Sys(
+                                sys::linkat(
+                                    LINUX_AT_FDCWD,
+                                    src.clone(),
+                                    LINUX_AT_FDCWD,
+                                    alias.clone(),
+                                    0,
+                                )
+                                .ret(0),
+                            ),
+                            Step::Sys(
+                                sys::renameat2(
+                                    LINUX_AT_FDCWD,
+                                    src.clone(),
+                                    LINUX_AT_FDCWD,
+                                    alias.clone(),
+                                    0,
+                                )
+                                .ret(0),
+                            ),
+                            Step::Sys(
+                                sys::renameat2(
+                                    LINUX_AT_FDCWD,
+                                    src.clone(),
+                                    LINUX_AT_FDCWD,
+                                    alias,
+                                    LINUX_RENAME_NOREPLACE as u32,
+                                )
+                                .errno(LINUX_EEXIST),
+                            ),
                             Step::Sys(
                                 sys::renameat2(
                                     LINUX_AT_FDCWD,
@@ -346,6 +377,18 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                             b"deleted"
                         );
                         assert!(!base.join(format!("{id}_{i}_dst")).exists());
+                        let copied = std::fs::metadata(
+                            upper.path().join(parent).join(format!("{id}_{i}_dst")),
+                        )
+                        .unwrap();
+                        let alias = std::fs::metadata(
+                            upper.path().join(parent).join(format!("{id}_{i}_alias")),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            (copied.dev(), copied.ino(), copied.nlink()),
+                            (alias.dev(), alias.ino(), 2)
+                        );
                         assert_eq!(
                             std::fs::read(upper.path().join(parent).join(format!("{id}_{i}_dst")))
                                 .unwrap(),
