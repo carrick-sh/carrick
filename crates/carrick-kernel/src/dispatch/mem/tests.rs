@@ -326,8 +326,7 @@ impl GuestMemory for Stage1MmapMemory {
 
 impl CurrentMmMemory for Stage1MmapMemory {}
 
-#[test]
-fn fixed_prot_none_retires_prepared_private_backing_before_publication() {
+fn anonymous_mapping_retires_prepared_backing(flags: u64, prot: u64) {
     use carrick_mmu_core::aarch64::{
         El1PrivateLeafState, GuestLeafPublication, el1_private_leaf_state,
     };
@@ -368,8 +367,8 @@ fn fixed_prot_none_retires_prepared_private_backing_before_publication() {
             SyscallArgs([
                 target,
                 LINUX_PAGE_SIZE,
-                0,
-                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                prot,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | flags,
                 u64::MAX,
                 0,
             ]),
@@ -390,6 +389,21 @@ fn fixed_prot_none_retires_prepared_private_backing_before_publication() {
         memory.terminal_descriptor(target + LINUX_PAGE_SIZE),
         neighbor
     );
+}
+
+#[test]
+fn fixed_prot_none_retires_prepared_private_backing_before_publication() {
+    anonymous_mapping_retires_prepared_backing(LINUX_MAP_FIXED, 0);
+}
+
+#[test]
+fn fresh_prot_none_retires_prepared_private_backing_before_publication() {
+    anonymous_mapping_retires_prepared_backing(0, 0);
+}
+
+#[test]
+fn fresh_writable_retires_prepared_private_backing_before_publication() {
+    anonymous_mapping_retires_prepared_backing(0, LINUX_PROT_READ | LINUX_PROT_WRITE);
 }
 
 struct ConcurrentExecMemory(CountingMmapMemory);
@@ -868,7 +882,7 @@ fn lazy_fixed_prot_none_replacement_retires_its_predecessor() {
         LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
     )) as u64;
     assert_eq!(address, LINUX_MMAP_BASE);
-    assert_eq!(memory.unmap_calls.get(), 0);
+    assert_eq!(memory.unmap_calls.get(), 1);
     memory.protect_log.borrow_mut().clear();
 
     let replacement = mmap(
@@ -880,7 +894,7 @@ fn lazy_fixed_prot_none_replacement_retires_its_predecessor() {
     assert_eq!(returned(replacement), address as i64);
     assert_eq!(
         memory.unmap_calls.get(),
-        1,
+        2,
         "a PROT_NONE fixed replacement must retire the old backing"
     );
     assert_eq!(
@@ -950,7 +964,7 @@ fn lazy_fixed_anonymous_replacement_rearms_first_touch_after_retirement() {
     assert_eq!(returned(replacement), address as i64);
     assert_eq!(
         memory.unmap_calls.get(),
-        1,
+        2,
         "replacement must retire old backing"
     );
     assert_eq!(

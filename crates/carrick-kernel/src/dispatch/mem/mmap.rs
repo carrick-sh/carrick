@@ -6,6 +6,22 @@ use carrick_guest_mem::*;
 use carrick_vfs::ProcMapSharing;
 use std::os::fd::{FromRawFd, OwnedFd};
 
+fn retire_anonymous_mapping_backing(
+    dispatcher: &MemView<'_>,
+    memory: &mut impl GuestMemory,
+    address: u64,
+    length: u64,
+    length_usize: usize,
+    fixed: bool,
+    sparse: bool,
+) -> Result<(), MemoryError> {
+    if fixed || sparse {
+        memory.unmap_range(address, length_usize)?;
+        dispatcher.remove_mapping_metadata(address, length);
+    }
+    Ok(())
+}
+
 /// Why a guest `mmap` was refused — and whether the guest can work that out
 /// from its own errno.
 ///
@@ -1401,21 +1417,15 @@ impl<'a> MemView<'a> {
             let prot_none = prot_flags.is_empty();
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-                // A fixed PROT_NONE replacement in the sparse arena (V8's
-                // FreePages) retires its predecessor exactly as the general
-                // arm below does: the new reservation never reuses a VA still
-                // holding a live private frame.
-                if fixed_anonymous {
-                    if let Err(error) = memory.unmap_range(address, length_usize) {
-                        return Ok(request.refused_by(
-                            MmapRefusal::Internal(
-                                "fixed anonymous predecessor retirement failed",
-                            ),
-                            LINUX_ENOMEM,
-                            format_args!("at {address:#x}+{length:#x}: {error}"),
-                        ));
-                    }
-                    this.remove_mapping_metadata(address, length);
+                if let Err(error) = retire_anonymous_mapping_backing(
+                    this, memory, address, length, length_usize,
+                    fixed_anonymous, defer_anonymous,
+                ) {
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("anonymous predecessor retirement failed"),
+                        LINUX_ENOMEM,
+                        format_args!("at {address:#x}+{length:#x}: {error}"),
+                    ));
                 }
                 memory.set_mapping_protection_and_sharing(
                     address,
@@ -1495,19 +1505,15 @@ impl<'a> MemView<'a> {
                 && (!address_uses_alias || defer_anonymous)
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-                if fixed_anonymous {
-                    if let Err(error) = memory.unmap_range(address, length_usize)
-                        && defer_anonymous
-                    {
-                        return Ok(request.refused_by(
-                            MmapRefusal::Internal(
-                                "fixed anonymous predecessor retirement failed",
-                            ),
-                            LINUX_ENOMEM,
-                            format_args!("at {address:#x}+{length:#x}: {error}"),
-                        ));
-                    }
-                    this.remove_mapping_metadata(address, length);
+                if let Err(error) = retire_anonymous_mapping_backing(
+                    this, memory, address, length, length_usize,
+                    fixed_anonymous, defer_anonymous,
+                ) {
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("anonymous predecessor retirement failed"),
+                        LINUX_ENOMEM,
+                        format_args!("at {address:#x}+{length:#x}: {error}"),
+                    ));
                 }
                 memory.set_mapping_protection_and_sharing(
                     address,
