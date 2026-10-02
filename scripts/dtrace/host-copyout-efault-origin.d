@@ -31,6 +31,10 @@
  *     owners remained alive. Local rows did not authenticate MM ownership.
  *     Phases 8, 10-12, 16, 19 and 20 name other source-defined refusal
  *     branches; this qualification does not claim they fired.
+ *     Phase 23 names the guest-owned frame-grant descriptor transaction's
+ *     preparation refusal, before any EL1 store. Its VA/length cover the
+ *     full proposed publication and its reason names DescriptorRefusal.
+ *     This phase is not yet live-qualified.
  *
  * (c) Perturbation: failure-only, with one ustack() per event. Thousands
  *     of repeated refusals can materially perturb a run; this profile

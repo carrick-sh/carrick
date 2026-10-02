@@ -113,7 +113,15 @@ fn guest_frame_grant_submission(
     };
     match page_tables.prepare_guest_descriptor_txn(nonzero(grant.mm_key)?, op) {
         Ok(txn) => Ok(El1FrameGrantPublished::Submit(txn)),
-        Err(GuestTxnPrepareError::Refused(refusal)) => Ok(El1FrameGrantPublished::Refused(refusal)),
+        Err(GuestTxnPrepareError::Refused(refusal)) => {
+            carrick_observability::probes::guest_internal_write_fault(
+                publication.va,
+                publication.len,
+                23,
+                &format!("EL1 frame-grant descriptor preparation refused: {refusal:?}"),
+            );
+            Ok(El1FrameGrantPublished::Refused(refusal))
+        }
         Err(error) => Err(TrapError::Hypervisor(format!(
             "prepare EL1 frame-grant descriptor transaction: {error:?}"
         ))),
