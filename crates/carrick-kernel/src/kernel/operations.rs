@@ -1290,6 +1290,8 @@ pub enum KernelOperationError {
     StaleTaskGeneration(TaskId),
     #[error("kernel task {0:?} has a preparing operation")]
     TaskBusy(TaskId),
+    #[error("kernel task {0:?} has unfinished EL1 lifecycle admission")]
+    LifecycleAdmissionBusy(TaskId),
     #[error("kernel thread {0:?} is not live")]
     UnknownThread(LinuxTid),
     #[error("final thread {0:?} must retire through task exit")]
