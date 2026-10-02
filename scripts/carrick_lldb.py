@@ -673,6 +673,9 @@ _EVENTRING_KINDS = {
     40: ("ARWRITE", lambda a, b, c: f"hfd={a} off={b} n={c}"),
     41: ("ARMAGIC", lambda a, b, c: f"hfd={a} off={b} n={c}"),
     42: ("CLONESPAWN", lambda a, b, c: f"parent_pid={a} child_tid={b} errno={c}"),
+    81: ("CLONEREFUSE", lambda a, b, c: (
+        f"task_id={a} tid={b} errno=11 producer={dict(enumerate(['admission_refused', 'cancelled', 'nproc', 'runtime_reservation'])).get(c, 'unknown')}"
+    )),
     43: ("HVPEXEC", lambda a, b, c: f"pid={a} tid={b} executor={c} phase=claim"),
     44: ("HVPEXEC", lambda a, b, c: f"pid={a} tid={b} executor={c} phase=load"),
     45: (

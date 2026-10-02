@@ -1623,6 +1623,38 @@ mod tests {
     }
 
     #[test]
+    fn clone_refusal_producer_records_each_live_process_caller() {
+        let (kernel, root) = bootstrap(56_902);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(56_903),
+                "refusal-peer".into(),
+                None,
+            )
+            .unwrap();
+        use crate::event_ring::{
+            CLONE_REFUSAL, CloneRefusalProducer, contains_event, rec_clone_refusal,
+        };
+        assert!(root.exact_thread_is_live() && peer.exact_thread_is_live());
+        rec_clone_refusal(&root, CloneRefusalProducer::RuntimeReservation);
+        rec_clone_refusal(&peer, CloneRefusalProducer::AdmissionRefused);
+        assert!(contains_event(
+            CLONE_REFUSAL,
+            root.task().key().id.raw(),
+            root.thread().key().tid.raw(),
+            CloneRefusalProducer::RuntimeReservation as i32
+        ));
+        assert!(contains_event(
+            CLONE_REFUSAL,
+            peer.task().key().id.raw(),
+            peer.thread().key().tid.raw(),
+            CloneRefusalProducer::AdmissionRefused as i32
+        ));
+    }
+
+    #[test]
     fn lifecycle_abi_birth_is_resolved_by_a_second_process() {
         abi_birth_observed_by_peer(false, false, false);
     }

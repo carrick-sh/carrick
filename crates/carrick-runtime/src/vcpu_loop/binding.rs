@@ -1864,6 +1864,10 @@ where
                 });
             }
             CloneEnrollment::Refused => {
+                carrick_kernel::event_ring::rec_clone_refusal(
+                    parent_context,
+                    carrick_kernel::event_ring::CloneRefusalProducer::AdmissionRefused,
+                );
                 // A guest-visible resource failure must never be silent: EAGAIN
                 // from thread admission under NO real pressure has meant a leaked
                 // permit/lease before, and the guest's own report ("failed to
@@ -1875,6 +1879,10 @@ where
             }
         };
         if self.kernel.process_exiting() || clone_permit.is_cancelled() {
+            carrick_kernel::event_ring::rec_clone_refusal(
+                parent_context,
+                carrick_kernel::event_ring::CloneRefusalProducer::Cancelled,
+            );
             tracing::warn!(
                 exiting = self.kernel.process_exiting(),
                 "thread clone raced exec/exit cancellation; clone(2) = EAGAIN"
@@ -1940,6 +1948,10 @@ where
                         // RLIMIT_NPROC soft limit (setrlimit(2)). The pool
                         // claim is the enforcement point; nothing was
                         // published or copied out.
+                        carrick_kernel::event_ring::rec_clone_refusal(
+                            parent_context,
+                            carrick_kernel::event_ring::CloneRefusalProducer::Nproc,
+                        );
                         tracing::debug!(%error, "thread clone refused; clone(2) = EAGAIN");
                         return Ok(PersistentHvpatchCloneAttempt::Complete(
                             threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
@@ -2014,6 +2026,10 @@ where
             prepared.prepared_execution_identity().1,
             child_syscall,
         ) else {
+            carrick_kernel::event_ring::rec_clone_refusal(
+                parent_context,
+                carrick_kernel::event_ring::CloneRefusalProducer::RuntimeReservation,
+            );
             return Ok(PersistentHvpatchCloneAttempt::Complete(
                 threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
             ));
