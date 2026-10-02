@@ -6,6 +6,59 @@
 
 use super::*;
 
+/// Production projection builder, shared with the descriptor regression witness.
+fn build_projected_fork_mappings(
+    tables: &mut carrick_mmu_core::aarch64::PageTableManager,
+    source: &ThreadMappingDesc,
+    shares_mm: bool,
+    ranges: &[carrick_hal::ForkProjectionRange],
+) -> Result<Vec<ProjectedForkMapping>, TrapError> {
+    let mut result = Vec::new();
+    clear_projected_fork_gaps(tables, source, shares_mm, ranges)?;
+    for projected in projected_fork_mappings(source, shares_mm, ranges)? {
+        if ForkCarrickWindow::containing(projected.mapping.start, projected.mapping.end).is_some() {
+            result.push(projected);
+            continue;
+        }
+        let spans = tables
+            .fork_backed_spans(projected.mapping.start, projected.mapping.size)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("project child fork backing: {error:?}"))
+            })?;
+        let mut cursor = projected.mapping.start;
+        for span in spans {
+            if cursor < span.start {
+                tables
+                    .clear_offline_fork_range(cursor, (span.start - cursor) as usize)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "clear pristine child fork backing: {error:?}"
+                        ))
+                    })?;
+            }
+            let mapping = projected
+                .mapping
+                .semantic_slice(span.start, span.end)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("fork backing slice escapes semantic owner".to_owned())
+                })?;
+            let plan = projected_fork_mapping_disposition(&mapping, shares_mm, ranges);
+            result.push(ProjectedForkMapping { mapping, plan });
+            cursor = span.end;
+        }
+        if cursor < projected.mapping.end {
+            tables
+                .clear_offline_fork_range(cursor, (projected.mapping.end - cursor) as usize)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "clear pristine child fork backing tail: {error:?}"
+                    ))
+                })?;
+        }
+    }
+    Ok(result)
+}
+
 /// Remove guest VA holes from the offline child graph. Physical ownership is
 /// inherited through the projected aliases and deduplicated inventory, never
 /// through an inaccessible boot descriptor's retained output.
@@ -778,62 +831,13 @@ impl HvfTaskState {
                 // child extension arenas are allocated and installed into stage-2 below.
                 continue;
             }
-            clear_projected_fork_gaps(
+            for projected in build_projected_fork_mappings(
                 page_tables,
                 source,
                 request.shares_mm(),
                 &projection_ranges,
-            )?;
-            for projected in
-                projected_fork_mappings(source, request.shares_mm(), &projection_ranges)?
-            {
-                if ForkCarrickWindow::containing(projected.mapping.start, projected.mapping.end)
-                    .is_some()
-                {
-                    projected_source_mappings.push((index, projected));
-                    continue;
-                }
-                let spans = page_tables
-                    .fork_backed_spans(projected.mapping.start, projected.mapping.size)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!("project child fork backing: {error:?}"))
-                    })?;
-                let mut cursor = projected.mapping.start;
-                for span in spans {
-                    if cursor < span.start {
-                        page_tables
-                            .clear_offline_fork_range(cursor, (span.start - cursor) as usize)
-                            .map_err(|error| {
-                                TrapError::Hypervisor(format!(
-                                    "clear pristine child fork backing: {error:?}"
-                                ))
-                            })?;
-                    }
-                    let mapping = projected
-                        .mapping
-                        .semantic_slice(span.start, span.end)
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor(
-                                "fork backing slice escapes semantic owner".to_owned(),
-                            )
-                        })?;
-                    let plan = projected_fork_mapping_disposition(
-                        &mapping,
-                        request.shares_mm(),
-                        &projection_ranges,
-                    );
-                    projected_source_mappings.push((index, ProjectedForkMapping { mapping, plan }));
-                    cursor = span.end;
-                }
-                if cursor < projected.mapping.end {
-                    page_tables
-                        .clear_offline_fork_range(cursor, (projected.mapping.end - cursor) as usize)
-                        .map_err(|error| {
-                            TrapError::Hypervisor(format!(
-                                "clear pristine child fork backing tail: {error:?}"
-                            ))
-                        })?;
-                }
+            )? {
+                projected_source_mappings.push((index, projected));
             }
         }
         for (source_index, projected) in projected_source_mappings {
@@ -1885,12 +1889,12 @@ mod tests {
             "a mapped VMA's retired predecessor is not an inherited physical alias"
         );
         let ranges = [carrick_hal::ForkProjectionRange {
-            va: va + 0x4000,
-            len: 0x4000,
+            va,
+            len: 0x8000,
             disposition: carrick_hal::ForkLeafDisposition::Preserve,
         }];
-        let projected = projected_fork_mappings(&source, false, &ranges).unwrap();
-        clear_projected_fork_gaps(&mut tables, &source, false, &ranges).unwrap();
+        let projected =
+            build_projected_fork_mappings(&mut tables, &source, false, &ranges).unwrap();
         assert_eq!(tables.translate_retained_output(va), None);
         assert_eq!(tables.translate(va + 0x8000), None);
         assert_eq!(projected.len(), 1);
