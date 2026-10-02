@@ -919,3 +919,70 @@ not an external blocker. Production `born_slot` still returns `None`.
 Pending-ticket kernel lifetime, conflicting-authority admission guards,
 exact carrier metadata retirement and teardown remain open. Cached libc
 probes and the hatch comparison have not run; no Docker ran.
+
+### Phase B: production birth checkpoint, 2026-10-02
+
+Production `born_slot` is enabled behind the existing exact `=0` hatch.
+`d2aee1082` adds an exact-TaskKey owned inactive backend template, CPU and
+scheduler capacity, pre-issued COW identity, first-host-entry consumption,
+and the bind/activate routine shared with host clone. Thread-bound runtime
+state is constructed on the adopting executor; the driver job is not borrowed.
+Two-live-process owner rejection was captured red, then green. Runtime adoption,
+host lifecycle, EL1 lifecycle and ledger focused tests passed (3/9/17/24).
+This is implementation progress, **not Phase B acceptance**.
+
+The first signed run found premature scheduler service publication. A startup
+contract reproduced it red; `afbfa8b56` stocks births only after the prepared
+scheduler/wait-service pair publishes. Signed consumption then exposed the
+omitted `CLONE_DETACHED` and `CLONE_SYSVSEM` typed flags. The two-live-process
+birth contract reproduced each abort; `f21b5b38e` and `91b239e4f` represent
+the complete admitted pthread topology and pass that contract.
+
+Signed spawn on `91b239e4f` completed all workloads with zero thread failures:
+
+| Threads | Clone served / forwarded | Exit served / forwarded |
+|---|---|---|
+| 128 | 93 / 36 | 0 / 128 |
+| 512 | 374 / 140 | 0 / 512 |
+| 2048 | 1439 / 610 | 0 / 2050 |
+
+The reported 128→512 slopes are clone **0.2708**, exit **1.0000**. The
+512→2048 counters give clone **0.3060**, exit **1.0013**; the test stops at
+the first failed exit assertion before printing this second pair. Sigmask
+and sigaltstack forward slopes remain zero. Adoption currently frees the born
+record and runs the new job as an executor home thread. The required home-record
+exit decline therefore remains effective; it must not be removed to hide this
+ownership transition.
+
+The full signed `el1_` pass is red and its census is incomplete. New observed
+watchdogs: `el1_files_cross_process_readers_contract` (120 seconds) and
+`el1_inotify09_probe` (60 seconds). The reader's saved carrier core exposes
+executor failure `hypervisor operation failed: birth CPU template rejected a
+foreign process`: pre-exec inactive capacity survived into a replacement MM.
+Closing admission and retiring old capacity across exec remains required.
+Watchdog cleanup's second pass also killed the following inotify and scheduler
+executables under the suite's reused run ID; those kills are contaminated
+results, not independent semantic verdicts. No budgets or timeouts changed.
+
+Separate signed runs with unique IDs pass
+`el1_sched_mm_occupancy_two_processes` and
+`el1_thread_lifecycle_fork_during_clone_storm`. All run and `-cli` cleanup
+counts are zero. Logs:
+`/tmp/phaseb-born-signed-spawn-complete-mask.log`,
+`/tmp/phaseb-born-signed-full-complete-mask.log`,
+`/tmp/phaseb-born-signed-occupancy.log`,
+`/tmp/phaseb-born-signed-forkstorm.log`.
+Run IDs are `phaseb-born-91b239e4f-{spawn,full,occupancy,forkstorm}-20261002`.
+The full-pass scheduler SHA-256 is
+`4707695b48791ecf3f65535bef62c9adccbb63067a813ec68dd7fc4e3583ff25`;
+CDHash, UUID, entitlement and DOF are retained in
+`/tmp/phaseb-born-91b239-full-artifact.json`. Later focused scripts re-sign
+artifacts and have their own receipts. Reader core/stacks and extracted failure:
+`/tmp/phaseb-born-files-hang.core`, `/tmp/phaseb-born-files-hang.lldb.txt`,
+`/tmp/phaseb-born-files-failure-deep.txt`.
+
+Open: conflict admission/exec capacity invalidation, preservation of zone
+execution ownership after adoption, exact retirement, abort classification,
+current full host gates, cached libc probes and hatch comparison. No Docker ran.
+A sibling worktree built concurrently during release linking; no quiet-host
+performance claim is made. Forward counts are the recorded structural witness.
