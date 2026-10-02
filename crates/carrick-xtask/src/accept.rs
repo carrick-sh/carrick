@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +24,15 @@ pub struct AcceptArgs {
 
     #[arg(
         long,
-        help = "Path to write receipt JSON file (defaults to target/accept/<timestamp>/receipt.json)"
+        value_enum,
+        default_value = "no-docker",
+        help = "Acceptance profile: no-docker (default for workers) or full (director)"
+    )]
+    pub profile: AcceptProfile,
+
+    #[arg(
+        long,
+        help = "Path to write receipt JSON file (defaults to target/el1-gate/<head>/receipt.json)"
     )]
     pub receipt: Option<PathBuf>,
 }
@@ -43,6 +51,22 @@ impl fmt::Display for AcceptPhase {
             Self::Host => write!(f, "host"),
             Self::Signed => write!(f, "signed"),
             Self::All => write!(f, "all"),
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcceptProfile {
+    NoDocker,
+    Full,
+}
+
+impl fmt::Display for AcceptProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoDocker => write!(f, "no-docker"),
+            Self::Full => write!(f, "full"),
         }
     }
 }
@@ -116,8 +140,11 @@ pub struct AcceptReceipt {
     pub head: String,
     pub clean_tree: bool,
     pub phase: String,
+    pub profile: String,
     pub overall: String,
     pub steps: Vec<StepResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_steps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,6 +508,59 @@ pub fn inspect_artifact(root: &Path) -> Result<ArtifactIdentity, String> {
     })
 }
 
+pub fn matches_ltp_suite_pattern(name: &str) -> bool {
+    let prefixes = [
+        "inotify",
+        "fanotify",
+        "read",
+        "write",
+        "lseek",
+        "pread",
+        "pwrite",
+        "fstat",
+        "stat",
+        "dup",
+        "close",
+        "open",
+        "fsync",
+        "ftruncate",
+        "truncate",
+        "creat",
+    ];
+    if let Some(rest) = name.strip_prefix("ltp-") {
+        for prefix in prefixes {
+            let matched = rest.strip_prefix(prefix).is_some_and(|after| {
+                after
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            });
+            if matched {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn resolve_ltp_suites(root: &Path) -> io::Result<Vec<String>> {
+    let suites_path = root.join("scripts/conformance/suites.toml");
+    let content = fs::read_to_string(&suites_path)?;
+    let mut suites = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let matched = trimmed
+            .strip_prefix("name = \"")
+            .and_then(|r| r.strip_suffix('"'))
+            .filter(|n| matches_ltp_suite_pattern(n));
+        if let Some(name) = matched {
+            suites.push(name.to_string());
+        }
+    }
+    suites.sort();
+    suites.dedup();
+    Ok(suites)
+}
+
 fn run_command_redirect(
     prog: &str,
     args: &[&str],
@@ -519,8 +599,14 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
     let root = repo_info.repository_root;
     let head = repo_info.head;
 
+    let short_head_out = command::run_checked("git", ["rev-parse", "--short", "HEAD"], Some(&root))
+        .map_err(|e| AcceptError::Git(e.to_string()))?;
+    let short_head = short_head_out.stdout.trim().to_string();
+
     let timestamp = generate_timestamp();
-    let run_dir = root.join("target/accept").join(&timestamp);
+
+    // The output directory is target/el1-gate/<short_head>/
+    let run_dir = root.join("target/el1-gate").join(&short_head);
     fs::create_dir_all(&run_dir).map_err(|e| AcceptError::Io {
         path: run_dir.clone(),
         source: e,
@@ -539,6 +625,7 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
     }
 
     let mut step_results = Vec::new();
+    let mut skipped_steps = Vec::new();
     let mut artifact_identity = None;
     let mut el1_summary = None;
     let mut probe_diffs = Vec::new();
@@ -595,9 +682,10 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             )));
         }
 
-        println!("--- Signed phase starting ---");
+        println!("--- Signed phase starting (profile: {}) ---", args.profile);
 
         // Signed Step 1: just build + artifact inspection
+        let mut initial_sha = String::new();
         {
             let step_name = "build";
             let run_id = format!("accept-{timestamp}-{step_name}");
@@ -620,7 +708,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 source: e,
             })?;
 
-            // Scoped reap
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
             drop(lease);
 
@@ -654,6 +741,27 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             if passed {
                 match inspect_artifact(&root) {
                     Ok(identity) => {
+                        initial_sha = identity.sha256.clone();
+                        let artifact_txt_path = run_dir.join("artifact.txt");
+                        let artifact_txt = format!(
+                            "head {}\nsha256 {}\nCDHash={}\n    uuid {}\n{}\n{}",
+                            short_head,
+                            identity.sha256,
+                            identity.cdhash,
+                            identity.lc_uuid,
+                            if identity.hypervisor_entitlement {
+                                "com.apple.security.hypervisor"
+                            } else {
+                                "missing hypervisor entitlement"
+                            },
+                            if identity.dof_present {
+                                "dof present"
+                            } else {
+                                "missing __dof_carrick"
+                            }
+                        );
+                        let _ = fs::write(&artifact_txt_path, artifact_txt);
+
                         if !identity.hypervisor_entitlement {
                             passed = false;
                             let msg = "artifact missing com.apple.security.hypervisor entitlement"
@@ -689,11 +797,27 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             });
         }
 
-        // Signed Step 2: el1_ suite vs allowlist
+        // Signed Step 2: probe binaries check for musl and gnu (in full profile)
+        if args.profile == AcceptProfile::Full {
+            for target in ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"] {
+                let release_dir = root
+                    .join("conformance-probes/target")
+                    .join(target)
+                    .join("release");
+                if !release_dir.is_dir() {
+                    let msg = format!(
+                        "probe binaries missing for {target}: run scripts/build-probes.sh (Docker)"
+                    );
+                    failures.push(msg.clone());
+                }
+            }
+        }
+
+        // Signed Step 3: el1-embed (carrick-embed el1_) vs allowlist
         {
-            let step_name = "el1";
-            let run_id = format!("accept-{timestamp}-{step_name}");
-            let log_path = run_dir.join("signed-02-el1.log");
+            let step_name = "el1-embed";
+            let run_id = format!("accept-{timestamp}-el1");
+            let log_path = run_dir.join("el1-embed.log");
             let cmd_str = "./scripts/test-signed.sh carrick-embed el1_ --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
@@ -779,11 +903,11 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             });
         }
 
-        // Signed Step 3: a_fresh_executable_page
+        // Signed Step 4: a_fresh_executable_page (i-cache test)
         {
             let step_name = "fresh-executable-page";
             let run_id = format!("accept-{timestamp}-icache");
-            let log_path = run_dir.join("signed-03-fresh-executable-page.log");
+            let log_path = run_dir.join("fresh-executable-page.log");
             let cmd_str =
                 "./scripts/test-signed.sh carrick-embed a_fresh_executable_page --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
@@ -846,11 +970,11 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             });
         }
 
-        // Signed Step 4: generic_probe_shard_
+        // Signed Step 5: generic_probe_shard_
         {
             let step_name = "generic-probe-shards";
             let run_id = format!("accept-{timestamp}-probe-shards");
-            let log_path = run_dir.join("signed-04-generic-probe-shards.log");
+            let log_path = run_dir.join("generic-probe-shards.log");
             let cmd_str = "./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
@@ -928,11 +1052,11 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             });
         }
 
-        // Signed Step 5: case_
+        // Signed Step 6: case_
         {
             let step_name = "probe-cases";
             let run_id = format!("accept-{timestamp}-probe-cases");
-            let log_path = run_dir.join("signed-05-probe-cases.log");
+            let log_path = run_dir.join("probe-cases.log");
             let cmd_str = "./scripts/test-signed.sh carrick-conformance-next case_ --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
@@ -1005,6 +1129,256 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 error,
             });
         }
+
+        // Full Profile Only: Retained probes, LTP subset, inotify09
+        if args.profile == AcceptProfile::Full {
+            // Step 7: conformance-probes retained step (may start Docker -> LOCK_EX)
+            {
+                let step_name = "conformance-probes-retained";
+                let run_id = format!("accept-{timestamp}-probes");
+                let log_path = run_dir.join("probes.log");
+                let cmd_str = "just --no-deps conformance-probes";
+                println!("  running: {cmd_str} (run_id: {run_id})");
+
+                let lease = HostLease::acquire(HostLeaseMode::Docker).map_err(|e| {
+                    AcceptError::Failed(format!("failed to acquire docker host lease: {e}"))
+                })?;
+
+                let (exit_code, duration_s) = run_command_redirect(
+                    "just",
+                    &["--no-deps", "conformance-probes"],
+                    &[("CARRICK_RUN_ID", &run_id)],
+                    &root,
+                    &log_path,
+                )
+                .map_err(|e| AcceptError::Io {
+                    path: log_path.clone(),
+                    source: e,
+                })?;
+
+                let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
+                drop(lease);
+
+                let remaining_count = reap
+                    .as_ref()
+                    .ok()
+                    .and_then(|out| parse_cleanup_count(&out.stdout))
+                    .unwrap_or(0);
+                cleanup_counts.push(CleanupCount {
+                    step: step_name.to_string(),
+                    run_id: run_id.clone(),
+                    remaining_count,
+                });
+
+                let passed = exit_code == Some(0);
+                let error = if !passed {
+                    let msg = format!(
+                        "retained conformance probes failed with exit code {}",
+                        exit_code.unwrap_or(-1)
+                    );
+                    failures.push(msg.clone());
+                    Some(msg)
+                } else {
+                    None
+                };
+
+                step_results.push(StepResult {
+                    name: step_name.to_string(),
+                    command: cmd_str.to_string(),
+                    exit_code,
+                    log_path,
+                    duration_s,
+                    passed,
+                    error,
+                });
+            }
+
+            // Step 8: LTP file/inotify suite subset (may start Docker -> LOCK_EX)
+            {
+                let step_name = "ltp";
+                let run_id = format!("accept-{timestamp}-ltp");
+                let log_path = run_dir.join("ltp.log");
+                let ltp_jsonl_path = run_dir.join("ltp.jsonl");
+
+                let suites = resolve_ltp_suites(&root).unwrap_or_default();
+                let mut cmd_args = vec![
+                    "run",
+                    "-q",
+                    "-p",
+                    "carrick-conformance",
+                    "--",
+                    "--tier",
+                    "full",
+                ];
+                for s in &suites {
+                    cmd_args.push("--suite");
+                    cmd_args.push(s.as_str());
+                }
+                let ltp_jsonl_str = ltp_jsonl_path.to_string_lossy().to_string();
+                cmd_args.push("--jsonl");
+                cmd_args.push(&ltp_jsonl_str);
+
+                let display_cmd = format!(
+                    "cargo run -q -p carrick-conformance -- --tier full [{} suites] --jsonl {}",
+                    suites.len(),
+                    ltp_jsonl_path.display()
+                );
+                println!("  running: {display_cmd} (run_id: {run_id})");
+
+                let lease = HostLease::acquire(HostLeaseMode::Docker).map_err(|e| {
+                    AcceptError::Failed(format!("failed to acquire docker host lease: {e}"))
+                })?;
+
+                let (exit_code, duration_s) = run_command_redirect(
+                    "cargo",
+                    &cmd_args,
+                    &[("CARRICK_RUN_ID", &run_id)],
+                    &root,
+                    &log_path,
+                )
+                .map_err(|e| AcceptError::Io {
+                    path: log_path.clone(),
+                    source: e,
+                })?;
+
+                let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
+                drop(lease);
+
+                let remaining_count = reap
+                    .as_ref()
+                    .ok()
+                    .and_then(|out| parse_cleanup_count(&out.stdout))
+                    .unwrap_or(0);
+                cleanup_counts.push(CleanupCount {
+                    step: step_name.to_string(),
+                    run_id: run_id.clone(),
+                    remaining_count,
+                });
+
+                let passed = exit_code == Some(0);
+                let error = if !passed {
+                    let msg = format!(
+                        "LTP suites failed with exit code {}",
+                        exit_code.unwrap_or(-1)
+                    );
+                    failures.push(msg.clone());
+                    Some(msg)
+                } else {
+                    None
+                };
+
+                step_results.push(StepResult {
+                    name: step_name.to_string(),
+                    command: display_cmd,
+                    exit_code,
+                    log_path,
+                    duration_s,
+                    passed,
+                    error,
+                });
+            }
+
+            // Step 9: inotify09 screen with CARRICK_EL1=1 and =0
+            for mode in ["1", "0"] {
+                let step_name = format!("inotify09-el{mode}");
+                let run_id = format!("el1-gate-{mode}");
+                let log_path = run_dir.join(format!("inotify09-{mode}.log"));
+                let bin_path = root.join("target/release/carrick");
+                let bin_str = bin_path.to_string_lossy().to_string();
+
+                let cmd_str = format!(
+                    "CARRICK_EL1={mode} {bin_str} run --rm localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/inotify09"
+                );
+                println!("  running: {cmd_str} (run_id: {run_id})");
+
+                let lease = HostLease::acquire(HostLeaseMode::Docker).map_err(|e| {
+                    AcceptError::Failed(format!("failed to acquire docker host lease: {e}"))
+                })?;
+
+                let (exit_code, duration_s) = run_command_redirect(
+                    &bin_str,
+                    &[
+                        "run",
+                        "--rm",
+                        "localhost:5050/ltp:arm64",
+                        "/bin/sh",
+                        "-c",
+                        "/opt/ltp/testcases/bin/inotify09",
+                    ],
+                    &[("CARRICK_RUN_ID", &run_id), ("CARRICK_EL1", mode)],
+                    &root,
+                    &log_path,
+                )
+                .map_err(|e| AcceptError::Io {
+                    path: log_path.clone(),
+                    source: e,
+                })?;
+
+                let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
+                drop(lease);
+
+                let remaining_count = reap
+                    .as_ref()
+                    .ok()
+                    .and_then(|out| parse_cleanup_count(&out.stdout))
+                    .unwrap_or(0);
+                cleanup_counts.push(CleanupCount {
+                    step: step_name.clone(),
+                    run_id: run_id.clone(),
+                    remaining_count,
+                });
+
+                let log_content = fs::read_to_string(&log_path).unwrap_or_default();
+                let has_tpass = log_content.contains("TPASS");
+                let passed = exit_code == Some(0) && has_tpass;
+                let error = if !passed {
+                    let msg = if !has_tpass {
+                        format!("inotify09 EL1={mode} did not TPASS")
+                    } else {
+                        format!(
+                            "inotify09 EL1={mode} failed with exit code {}",
+                            exit_code.unwrap_or(-1)
+                        )
+                    };
+                    failures.push(msg.clone());
+                    Some(msg)
+                } else {
+                    None
+                };
+
+                let artifact_txt_path = run_dir.join("artifact.txt");
+                if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&artifact_txt_path) {
+                    let _ = writeln!(f, "inotify09 EL1={mode} wall {:.2}", duration_s);
+                }
+
+                step_results.push(StepResult {
+                    name: step_name,
+                    command: cmd_str,
+                    exit_code,
+                    log_path,
+                    duration_s,
+                    passed,
+                    error,
+                });
+            }
+        } else {
+            skipped_steps.push("conformance-probes-retained".to_string());
+            skipped_steps.push("ltp".to_string());
+            skipped_steps.push("inotify09-el1".to_string());
+            skipped_steps.push("inotify09-el0".to_string());
+        }
+
+        // Final check: Binary unchanged
+        let bin_path = root.join("target/release/carrick");
+        if let Ok(bytes) = fs::read(&bin_path) {
+            let now_sha = format!("{:x}", Sha256::digest(&bytes));
+            if !initial_sha.is_empty() && now_sha != initial_sha {
+                let msg = format!(
+                    "binary changed during the gate (initial: {initial_sha}, now: {now_sha})"
+                );
+                failures.push(msg);
+            }
+        }
     }
 
     let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
@@ -1015,8 +1389,10 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
         head,
         clean_tree,
         phase: args.phase.to_string(),
+        profile: args.profile.to_string(),
         overall: overall.to_string(),
         steps: step_results,
+        skipped_steps: skipped_steps.clone(),
         artifact: artifact_identity,
         el1: el1_summary,
         probe_diffs,
@@ -1040,6 +1416,7 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
     // Print summary
     println!("\n==================== ACCEPT GATE SUMMARY ====================");
     println!("Phase:        {}", args.phase);
+    println!("Profile:      {}", args.profile);
     println!("Timestamp:    {timestamp}");
     println!("Git HEAD:     {}", receipt.head);
     println!(
@@ -1055,6 +1432,13 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             step.name,
             step.duration_s
         );
+    }
+
+    if !skipped_steps.is_empty() {
+        println!("\nSkipped Steps (profile {}):", args.profile);
+        for skipped in &skipped_steps {
+            println!("  [SKIP] {skipped}");
+        }
     }
 
     if let Some(el1) = receipt.el1.as_ref().filter(|e| !e.now_passing.is_empty()) {
@@ -1109,6 +1493,19 @@ mod tests {
         let (is_clean, has_tracked) = check_git_status(staged);
         assert!(!is_clean);
         assert!(has_tracked);
+    }
+
+    #[test]
+    fn test_matches_ltp_suite_pattern() {
+        assert!(matches_ltp_suite_pattern("ltp-inotify01"));
+        assert!(matches_ltp_suite_pattern("ltp-fanotify10"));
+        assert!(matches_ltp_suite_pattern("ltp-read01"));
+        assert!(matches_ltp_suite_pattern("ltp-write02"));
+        assert!(matches_ltp_suite_pattern("ltp-fstat01"));
+        assert!(matches_ltp_suite_pattern("ltp-creat01"));
+        assert!(!matches_ltp_suite_pattern("ltp-clock_gettime01"));
+        assert!(!matches_ltp_suite_pattern("ltp-futex01"));
+        assert!(!matches_ltp_suite_pattern("cpython-socket"));
     }
 
     #[test]
@@ -1222,16 +1619,18 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
             head: "0123456789abcdef".to_string(),
             clean_tree: true,
             phase: "host".to_string(),
+            profile: "no-docker".to_string(),
             overall: "PASS".to_string(),
             steps: vec![StepResult {
                 name: "test-kernel".to_string(),
                 command: "just test-kernel".to_string(),
                 exit_code: Some(0),
-                log_path: PathBuf::from("target/accept/20261002-120000/01-test-kernel.log"),
+                log_path: PathBuf::from("target/el1-gate/012345678/01-test-kernel.log"),
                 duration_s: 1.23,
                 passed: true,
                 error: None,
             }],
+            skipped_steps: vec!["ltp".to_string()],
             artifact: None,
             el1: None,
             probe_diffs: vec![],
