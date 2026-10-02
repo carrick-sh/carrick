@@ -719,3 +719,7 @@ contracts = ["x86.run-elf.poll"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/test_hooks.rs"
 contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/native_ownership_tests.rs"
+contracts = ["kernel.el1.mm-exclusive-owner"]
