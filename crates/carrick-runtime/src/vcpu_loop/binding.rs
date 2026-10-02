@@ -2003,6 +2003,21 @@ where
             linux_tid: linux_tid.raw(),
             asid: mm_binding.asid.raw(),
         };
+        let child_syscall = self
+            .state
+            .syscall_completion
+            .guest("clone child reservation lost parent completion token")?
+            .syscall();
+        let Some(child_runtime_reservation) = super::thread_adoption::reserve_thread_runtime(
+            &self.kernel,
+            &self.state,
+            prepared.prepared_execution_identity().1,
+            child_syscall,
+        ) else {
+            return Ok(PersistentHvpatchCloneAttempt::Complete(
+                threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
+            ));
+        };
         let (prepared_backend, cpu) = ops.prepare(
             memory,
             carrier_identity,
@@ -2275,45 +2290,32 @@ where
             return Err(error);
         }
 
-        let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
-        let mut child_state = ThreadRuntimeState::<E>::new(
-            Arc::clone(&self.state.registry),
-            Arc::clone(&self.state.futex),
-            Arc::clone(&self.state.platform_futex),
-            Arc::clone(&self.state.platform_futex_factory),
-            self.kernel.process_fork_barrier.clone(),
-            self.kernel.crash_capture.clone(),
-            Some(Arc::clone(child_context.thread())),
-            Some(process.pid()),
-            linux_tid,
-            self.kernel.fatal_signal.current_generation(),
-            tid,
-            self.state.threads.clone(),
-            Arc::clone(&self.state.kicker),
-            carrick_hal::InGuestFlag::for_guest_thread(),
-            self.state.max_traps,
-        );
-        child_state.execution_lease = execution_lease;
-        child_state.service_kernel_context = Some(child_context.retain_exact());
-        let child_syscall = self
-            .state
-            .syscall_completion
-            .guest("clone child publication lost parent completion token")?
-            .syscall();
-        child_state.syscall_completion =
-            SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
-                child_syscall,
-                child_context.retain_exact(),
-                self.kernel.dispatcher.observers().cloned(),
-            ));
+        let child_runtime = match super::thread_adoption::adopt_thread_runtime::<E>(
+            child_runtime_reservation,
+            &child_context,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.rollback_published_hvpatch_clone(
+                    memory,
+                    &child_context,
+                    generation,
+                    tid,
+                    &tid_outputs,
+                    None,
+                    false,
+                );
+                return Err(RuntimeError::Trap(error));
+            }
+        };
         let mut logical = match prepare_hvpatch_logical_job(HvpatchLogicalJobInput {
-            kernel: Arc::clone(&self.kernel),
-            state: child_state,
+            kernel: child_runtime.kernel,
+            state: child_runtime.state,
             task_backend: ops.make_binding_state(task_backend),
             context: child_context.retain_exact(),
             cpu: task_state,
             generation,
-            injected_lease,
+            injected_lease: child_runtime.injected_lease,
             bootstrap_process_child: None,
             bootstrap_thread_child: true,
         }) {
@@ -5281,6 +5283,16 @@ where
             "prepared HVPatch logical job rejected Kernel/CPU/MM identity".to_owned(),
         ));
     }
+    let factory = super::thread_adoption::ProcessThreadAdoptionFactory::capture(&kernel, &state)
+        .ok_or_else(|| {
+            TrapError::Hypervisor("thread adoption factory has no owner process".into())
+        })?;
+    context
+        .task()
+        .install_thread_adoption_factory(Arc::new(factory))
+        .map_err(|_| {
+            TrapError::Hypervisor("thread adoption factory rejected foreign task owner".into())
+        })?;
     let result = HvpatchLoopResult::pending();
     let completion = continuation::LogicalJobCompletion::pending();
     let terminal_settlement =
