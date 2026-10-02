@@ -847,7 +847,7 @@ pub struct Thread {
     /// The only storage of this thread's blocked mask, `sigaltstack` and
     /// robust-list head (L2 ABI slot). Allocated with the thread, freed when
     /// the last `Arc<Thread>` drops at reap.
-    control: ThreadControlSlot,
+    control: super::ThreadControlLease,
     pub(in crate::kernel) revision: ObjectRevision,
     runner_gate: Arc<RunnerGate>,
     start_gate_open: AtomicBool,
@@ -2699,8 +2699,12 @@ impl Thread {
         self.signal_pending.load().0 != 0
     }
 
-    /// The control slot holding this thread's blocked mask, altstack and
-    /// robust-list head. The EL1 personality indexes the same layout.
+    /// Pin the authoritative slot across execution-lane publication and retirement.
+    pub fn control_lease(&self) -> super::ThreadControlLease {
+        self.control.clone()
+    }
+
+    /// The sole storage for this thread's mask, altstack and robust-list head.
     pub fn control_slot(&self) -> &ThreadControlSlot {
         &self.control
     }
@@ -2828,8 +2832,12 @@ impl Thread {
 
     /// A control slot seeded from a detached value before the thread is
     /// visible to any sender.
-    fn new_control(seed: &ThreadSignalState) -> ThreadControlSlot {
-        let slot = ThreadControlSlot::new();
+    fn new_control(
+        task: &Task,
+        key: ThreadKey,
+        seed: &ThreadSignalState,
+    ) -> super::ThreadControlLease {
+        let slot = task.allocate_thread_control(key);
         slot.init_blocked(BlockedMask(seed.blocked().raw()));
         slot.write_altstack(altstack_to_slot(seed.altstack()));
         slot
@@ -2927,7 +2935,7 @@ impl Thread {
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::default()),
             signal_pending: PendingSummary::new(),
-            control: Self::new_control(&ThreadSignalState::default()),
+            control: Self::new_control(task, key, &ThreadSignalState::default()),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(true),
@@ -2944,24 +2952,34 @@ impl Thread {
         })
     }
 
+    pub(in crate::kernel) fn prepare_clone_control(
+        task: &Task,
+        key: ThreadKey,
+        blocked: SigSet,
+    ) -> super::ThreadControlLease {
+        Self::new_control(task, key, &ThreadSignalState::for_clone_thread(blocked))
+    }
+
     pub(in crate::kernel) fn prepare_clone(
         task: &Arc<Task>,
-        key: ThreadKey,
         registry_id: ThreadId,
         resources: Arc<ThreadResources>,
-        caller_signal_state: ThreadSignalState,
+        control: super::ThreadControlLease,
         caller_affinity: CpuAffinity,
     ) -> ThreadRef {
-        let seed = &ThreadSignalState::for_clone_thread(&caller_signal_state);
+        let (owner, key) = control.identity();
+        if owner != task.key() {
+            carrick_fatal!("thread::control", "adoption crossed control owner");
+        }
         Arc::new(Thread {
             key,
             registry_id,
             task_key: task.key(),
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
-            signal_state: Mutex::new(Self::live_state(seed)),
+            signal_state: Mutex::new(ThreadSignalState::default()),
             signal_pending: PendingSummary::new(),
-            control: Self::new_control(seed),
+            control,
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(false),
@@ -2995,7 +3013,7 @@ impl Thread {
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(Self::live_state(seed)),
             signal_pending: PendingSummary::new(),
-            control: Self::new_control(seed),
+            control: Self::new_control(task, key, seed),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(false),
@@ -3028,7 +3046,7 @@ impl Thread {
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(Self::live_state(seed)),
             signal_pending: PendingSummary::new(),
-            control: Self::new_control(seed),
+            control: Self::new_control(task, key, seed),
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
             start_gate_open: AtomicBool::new(true),

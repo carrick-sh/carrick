@@ -354,6 +354,15 @@ impl ThreadControlSlot {
     /// the mask captured at claim, no alternate stack and no robust list
     /// (`clone(2)` with `CLONE_VM` clears both), its `clear_child_tid`.
     pub fn reset_for_birth(&self, blocked: BlockedMask, clear_child_tid: u64, entry: EntryRef) {
+        self.reset(blocked, clear_child_tid, Some(entry));
+    }
+
+    /// Initialise an exclusively retained host-born slot before publication.
+    pub fn reset_for_host_birth(&self, blocked: BlockedMask) {
+        self.reset(blocked, 0, None);
+    }
+
+    fn reset(&self, blocked: BlockedMask, clear_child_tid: u64, entry: Option<EntryRef>) {
         self.blocked.store(blocked.0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
         let seq = self.alt_seq.load(Ordering::Relaxed);
@@ -366,7 +375,8 @@ impl ThreadControlSlot {
         self.robust_len.store(0, Ordering::Relaxed);
         self.clear_child_tid
             .store(clear_child_tid, Ordering::Relaxed);
-        self.entry.store(entry.pack(), Ordering::Release);
+        self.entry
+            .store(entry.map_or(0, EntryRef::pack), Ordering::Release);
     }
 
     /// The pool entry the thread holds, if any.
@@ -1230,6 +1240,12 @@ mod tests {
         assert!(s.read_altstack().is_disabled());
         assert_eq!(s.clear_child_tid(), 0x7000);
         s.set_clear_child_tid(0);
+        assert_eq!(s.clear_child_tid(), 0);
+        s.reset_for_host_birth(BlockedMask(0x20));
+        assert_eq!(s.entry(), None);
+        assert_eq!(s.blocked(), BlockedMask(0x20));
+        assert_eq!(s.robust_list(), (0, 0));
+        assert!(s.read_altstack().is_disabled());
         assert_eq!(s.clear_child_tid(), 0);
     }
 

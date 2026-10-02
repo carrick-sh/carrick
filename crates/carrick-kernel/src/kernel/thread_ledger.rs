@@ -540,6 +540,7 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
+    use std::sync::Arc;
 
     use carrick_abi::{LinuxCloneFlags, LinuxResource, LinuxRlimit, NsGid, NsUid};
     use carrick_hal::ThreadId;
@@ -561,6 +562,96 @@ mod tests {
 
     fn fork_plan() -> ClonePlan {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
+    }
+
+    #[test]
+    fn lifecycle_control_backing_excludes_host_objects_in_two_processes() {
+        let (kernel, root) = bootstrap(9_620);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_621),
+                "peer".into(),
+                None,
+            )
+            .unwrap();
+        for context in [&root, &peer] {
+            let thread = context.thread();
+            let object = std::ptr::from_ref(thread.as_ref()).addr();
+            let slot = std::ptr::from_ref(thread.control_slot()).addr();
+            assert!(
+                !(object..object + std::mem::size_of_val(thread.as_ref())).contains(&slot),
+                "EL1 control backing must not expose the host Thread object's pointers and locks"
+            );
+        }
+        let first = root.thread().control_lease();
+        let second = peer.thread().control_lease();
+        assert_ne!(first.backing_base(), second.backing_base());
+        first.init_blocked(carrick_el1_abi::BlockedMask(0x400));
+        assert_eq!(root.thread().blocked_mask().raw(), 0x400);
+        assert_eq!(peer.thread().blocked_mask(), carrick_abi::SigSet::EMPTY);
+        let kernel_lifetime = Arc::downgrade(&kernel);
+        let first_task = Arc::downgrade(root.task());
+        let second_task = Arc::downgrade(peer.task());
+        drop(root);
+        drop(peer);
+        drop(kernel);
+        assert!(kernel_lifetime.upgrade().is_none());
+        assert!(first_task.upgrade().is_none());
+        assert!(second_task.upgrade().is_none());
+        assert_eq!(first.blocked().0, 0x400);
+        assert_eq!(second.blocked().0, 0);
+    }
+
+    #[test]
+    fn lifecycle_adoption_retains_born_control_in_two_processes() {
+        let (kernel, root) = bootstrap(9_630);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_631),
+                "peer".into(),
+                None,
+            )
+            .unwrap();
+        for (index, parent) in [&root, &peer].into_iter().enumerate() {
+            let claim = kernel
+                .reserve_thread_clone(parent, thread_plan(), None)
+                .unwrap();
+            let born = claim.control_lease();
+            let mask = carrick_el1_abi::BlockedMask(1 << (10 + index));
+            let stack = carrick_el1_abi::AltStack {
+                sp: 0x40000,
+                size: 0x10000,
+                flags: 0,
+            };
+            // EL1 has run setup before the thread's first forwarded call.
+            born.init_blocked(mask);
+            born.write_altstack(stack);
+            born.set_robust_list(0x1230, 24);
+            let child = claim
+                .prepare(ThreadId::synthetic_for_tests(9_632 + index as i32))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_context()
+                .unwrap();
+            let adopted = child.thread().control_lease();
+            assert_eq!(
+                adopted.slot_address(),
+                born.slot_address(),
+                "adoption copied control storage"
+            );
+            assert_eq!(
+                adopted.identity(),
+                (parent.task().key(), child.thread().key())
+            );
+            assert_eq!(child.thread().blocked_mask().raw(), mask.0);
+            assert_eq!(adopted.read_altstack(), stack);
+            assert_eq!(adopted.robust_list(), (0x1230, 24));
+        }
     }
 
     #[test]
