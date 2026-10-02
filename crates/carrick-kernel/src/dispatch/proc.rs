@@ -1430,11 +1430,11 @@ impl<'a> ProcView<'a> {
             match operation as u32 {
                 crate::seccomp::SECCOMP_SET_MODE_FILTER => {
                     cx.kernel.kernel().fd_ceiling().disable();
-                    Ok(this.install_seccomp_filter(&cx.kernel, &mut *cx.memory, args.0))
+                    Ok(this.install_seccomp_filter(cx.kernel, &mut *cx.memory, args.0))
                 }
                 crate::seccomp::SECCOMP_SET_MODE_STRICT => {
                     cx.kernel.kernel().fd_ceiling().disable();
-                    Ok(this.install_seccomp_strict(&cx.kernel, &mut *cx.memory))
+                    Ok(this.install_seccomp_strict(cx.kernel, &mut *cx.memory))
                 }
                 _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
@@ -1713,11 +1713,11 @@ impl<'a> ProcView<'a> {
                 LINUX_PR_SET_SECCOMP => match arg2 {
                     LINUX_SECCOMP_MODE_FILTER => {
                         cx.kernel.kernel().fd_ceiling().disable();
-                        this.install_seccomp_filter(&cx.kernel, memory, arg3)
+                        this.install_seccomp_filter(cx.kernel, memory, arg3)
                     }
                     LINUX_SECCOMP_MODE_STRICT => {
                         cx.kernel.kernel().fd_ceiling().disable();
-                        this.install_seccomp_strict(&cx.kernel, memory)
+                        this.install_seccomp_strict(cx.kernel, memory)
                     },
                     _ => DispatchOutcome::errno(LINUX_EINVAL),
                 },
