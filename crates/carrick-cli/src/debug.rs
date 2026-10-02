@@ -39,6 +39,20 @@ pub(crate) fn run_debug(
     store: carrick_image::ImageStore,
 ) -> anyhow::Result<()> {
     match command {
+        DebugCommand::HostNamespaceWork {
+            image,
+            probes,
+            scale,
+            population,
+            parents,
+        } => {
+            print!(
+                "{}",
+                carrick_embed::contracts::host_namespace_fixture(
+                    &image, &probes, scale, population, &parents
+                )?
+            );
+        }
         DebugCommand::Core { core } => {
             crate::debug_core::run_debug_core(&core).map_err(|error| anyhow::anyhow!("{error}"))?;
         }

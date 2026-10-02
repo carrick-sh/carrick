@@ -1028,12 +1028,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     }
                 }
                 if profile == Some(crate::trace_profile::TraceProfileKind::HostNamespaceWork) {
-                    if trace_out.is_none() || summary_jsonl.is_some() {
+                    if trace_out.is_none() {
                         bail!(
                             "host-namespace-work requires --trace-out and retains its strict raw census"
                         );
                     }
                     crate::namespace_work_profile::fixture_scale(&command)?;
+                    if summary_jsonl.is_some()
+                        && command.first().map(String::as_str) != Some("debug")
+                    {
+                        bail!(
+                            "registered namespace observations require the in-process embed fixture"
+                        );
+                    }
                 }
                 let me = std::env::current_exe()
                     .context("failed to resolve current carrick binary path")?;
@@ -1178,6 +1185,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         )?)
                     }
                     None => script_src,
+                };
+                let namespace_launch_hashes = if profile
+                    == Some(crate::trace_profile::TraceProfileKind::HostNamespaceWork)
+                    && summary_jsonl.is_some()
+                {
+                    Some((
+                        crate::namespace_work_profile::artifact_sha256(&me)?,
+                        crate::namespace_work_profile::artifact_sha256(
+                            &std::path::Path::new(&command[3]).join("perf_namespace_scale"),
+                        )?,
+                    ))
+                } else {
+                    None
                 };
                 let opts = carrick_runtime::dtrace_consumer::TraceOptions {
                     flowindent,
@@ -1334,6 +1354,45 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 .context("read namespace work census")?;
                             let scale = crate::namespace_work_profile::fixture_scale(&command)?;
                             let census = crate::namespace_work_profile::validate(&raw, scale)?;
+                            if let Some(path) = summary_jsonl.as_deref() {
+                                use std::io::Write;
+                                let source = crate::namespace_work_profile::artifact_sha256(&me)?;
+                                let probe =
+                                    std::path::Path::new(&command[3]).join("perf_namespace_scale");
+                                let probe_hash =
+                                    crate::namespace_work_profile::artifact_sha256(&probe)?;
+                                if namespace_launch_hashes.as_ref()
+                                    != Some(&(source.clone(), probe_hash.clone()))
+                                {
+                                    bail!("namespace executable identity changed during capture");
+                                }
+                                let fixture = format!(
+                                    "embed:perf_namespace_scale:image={}:probe={probe_hash}:population={}:parents={}",
+                                    command[2], command[5], command[6]
+                                );
+                                let observations = crate::namespace_work_profile::observations(
+                                    &census, scale, &source, &fixture,
+                                )?;
+                                let mut output = tempfile::NamedTempFile::new_in(
+                                    path.parent().unwrap_or(std::path::Path::new(".")),
+                                )?;
+                                for observation in &observations {
+                                    serde_json::to_writer(&mut output, observation)?;
+                                    writeln!(output)?;
+                                }
+                                output.persist(path)?;
+                                let root =
+                                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+                                let registry =
+                                    carrick_conformance_contract::ContractRegistry::load(&root)?;
+                                let id = carrick_conformance_contract::ContractId::new(
+                                    "kernel.vfs.host-namespace-mutation-work",
+                                )?;
+                                let contract = registry
+                                    .get(&id)
+                                    .ok_or_else(|| anyhow::anyhow!("namespace contract missing"))?;
+                                carrick_conformance_contract::evaluate(contract, &observations)?;
+                            }
                             eprintln!(
                                 "namespace work census accepted: scale {scale}, {} actor/operation populations, {} closed host syscall populations, {} path stages",
                                 census.calls.len(),

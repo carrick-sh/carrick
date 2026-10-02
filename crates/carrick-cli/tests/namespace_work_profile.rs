@@ -1,6 +1,62 @@
 #[path = "../src/namespace_work_profile.rs"]
 mod namespace_work_profile;
 
+#[test]
+fn namespace_artifact_identity_changes_with_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("probe");
+    std::fs::write(&path, b"before").unwrap();
+    let before = namespace_work_profile::artifact_sha256(&path).unwrap();
+    std::fs::write(&path, b"after").unwrap();
+    assert_ne!(
+        before,
+        namespace_work_profile::artifact_sha256(&path).unwrap()
+    );
+    assert!(namespace_work_profile::artifact_sha256(&directory.path().join("missing")).is_err());
+}
+
+#[test]
+fn namespace_observations_bind_each_actor_and_operation() {
+    let census = namespace_work_profile::validate(&complete(), 1).unwrap();
+    let observations =
+        namespace_work_profile::observations(&census, 1, &"a".repeat(64), "embed:namespace")
+            .unwrap();
+    assert_eq!(observations.len(), 8);
+    assert!(observations.iter().all(|item| item.layer == carrick_conformance_contract::ExecutionLayer::EmbedStructural));
+    assert!(namespace_work_profile::observations(&census, 1, "", "embed:namespace").is_err());
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let registry = carrick_conformance_contract::ContractRegistry::load(&root).unwrap();
+    let id =
+        carrick_conformance_contract::ContractId::new("kernel.vfs.host-namespace-mutation-work")
+            .unwrap();
+    let contract = registry.get(&id).unwrap();
+    carrick_conformance_contract::evaluate(contract, &observations).unwrap();
+    let mut red = observations;
+    red[0].work.as_mut().unwrap().values.insert(
+        carrick_conformance_contract::WorkMetric::NamespacePathVisits,
+        9,
+    );
+    assert!(carrick_conformance_contract::evaluate(contract, &red).is_err());
+}
+
+#[test]
+fn namespace_census_accepts_in_process_embed_fixture() {
+    let command = [
+        "debug",
+        "host-namespace-work",
+        "ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "/tmp/probes",
+        "8",
+        "128",
+        "unrelated",
+    ]
+    .map(str::to_owned);
+    assert_eq!(namespace_work_profile::fixture_scale(&command).unwrap(), 8);
+    let mut bad = command.clone();
+    bad[2] = "ubuntu:24.04".into();
+    assert!(namespace_work_profile::fixture_scale(&bad).is_err());
+}
+
 fn complete() -> String {
     let mut raw = format!(
         "NSWORK1|header|program_sha256={}\nNSWORK1|summary|seen=1|errors=0|code=0|bounded=0\n",

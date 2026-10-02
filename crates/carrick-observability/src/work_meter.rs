@@ -31,6 +31,10 @@ pub enum WorkMetric {
     VfsBackendOperations,
     DirectoryEntriesVisited,
     HostBackendCalls,
+    /// Executed owned dentry and host namei component visits in a namespace request.
+    NamespacePathVisits,
+    /// Host openat calls within the warm namespace mutation fixture.
+    HostNamespaceMutationOpens,
     /// Host SEEK_CUR queries used to prepare a scalar regular-file write.
     HostWritePositionQueries,
     PageTableEdits,
@@ -112,7 +116,7 @@ pub enum WorkMetric {
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 51;
+    pub const COUNT: usize = 53;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -128,6 +132,8 @@ impl WorkMetric {
         Self::VfsBackendOperations,
         Self::DirectoryEntriesVisited,
         Self::HostBackendCalls,
+        Self::NamespacePathVisits,
+        Self::HostNamespaceMutationOpens,
         Self::HostWritePositionQueries,
         Self::PageTableEdits,
         Self::PageTableInvalidations,

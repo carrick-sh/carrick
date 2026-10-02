@@ -10,6 +10,21 @@ pub(crate) fn program_sha256() -> String {
     format!("{:x}", Sha256::digest(BUNDLED_PROGRAM.as_bytes()))
 }
 
+pub(crate) fn artifact_sha256(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    let mut input = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 /// The fixture pins one distinct guest directory fd for each live actor.
 /// These numbers are guest capabilities, never host descriptor identities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -220,7 +235,106 @@ pub(crate) fn render_profile_script() -> Result<String> {
     Ok(BUNDLED_PROGRAM.replacen(PLACEHOLDER, &program_sha256(), 1))
 }
 
+pub(crate) fn observations(
+    census: &NamespaceCensus,
+    scale: u64,
+    source: &str,
+    fixture: &str,
+) -> Result<Vec<carrick_conformance_contract::ContractObservation>> {
+    use carrick_conformance_contract::{
+        Completeness, ContractId, ContractObservation, ExecutionLayer, SemanticAssertion,
+        WorkMetric, WorkSnapshot,
+    };
+    if source.len() != 64 || !source.bytes().all(|c| c.is_ascii_hexdigit()) || fixture.is_empty() {
+        bail!("namespace observation provenance missing");
+    }
+    let mut result = Vec::new();
+    for ((actor, op), completed) in &census.calls {
+        if *completed != scale {
+            bail!("namespace observation scale mismatch");
+        }
+        let filesystem_calls = census
+            .host_calls
+            .iter()
+            .filter(|((owner, operation, name), _)| {
+                owner == actor
+                    && operation == op
+                    && [
+                        "close",
+                        "fgetxattr",
+                        "fstat64",
+                        "fstatat64",
+                        "linkat",
+                        "lseek",
+                        "openat",
+                        "pread",
+                        "renameat",
+                        "unlinkat",
+                    ]
+                    .contains(&name.as_str())
+            })
+            .map(|(_, count)| count)
+            .sum();
+        let visits = census
+            .visits
+            .iter()
+            .filter(|((owner, operation, _), _)| owner == actor && operation == op)
+            .map(|(_, count)| count)
+            .sum();
+        let mutation_opens = if op == "openat" {
+            0
+        } else {
+            census
+                .host_calls
+                .get(&(*actor, op.clone(), "openat".into()))
+                .copied()
+                .unwrap_or(0)
+        };
+        let mut work = WorkSnapshot::new();
+        work.insert(WorkMetric::HostBackendCalls, filesystem_calls)?;
+        work.insert(WorkMetric::NamespacePathVisits, visits)?;
+        work.insert(WorkMetric::HostNamespaceMutationOpens, mutation_opens)?;
+        result.push(ContractObservation {
+            contract_id: ContractId::new("kernel.vfs.host-namespace-mutation-work")?,
+            layer: ExecutionLayer::EmbedStructural,
+            implementation_revision: source.into(),
+            fixture_identity: "carrick-vfs::serial_host::test_namespace_mutation_work".into(),
+            scale,
+            semantic_assertions: vec![SemanticAssertion {
+                name: "two_actor_closed_namespace_census".into(),
+                passed: true,
+                detail: Some(format!(
+                    "{fixture}; actor={actor:?}; op={op}; completed={completed}; program={}",
+                    program_sha256()
+                )),
+            }],
+            work: Some(work),
+            timing: None,
+            completeness: Completeness::Complete,
+        });
+    }
+    if result.len() != 8 {
+        bail!("namespace observation requires eight populations");
+    }
+    Ok(result)
+}
+
 pub(crate) fn fixture_scale(command: &[String]) -> Result<u64> {
+    if let [debug, fixture, image, directory, scale, population, parents] = command
+        && debug == "debug"
+        && fixture == "host-namespace-work"
+    {
+        if directory.is_empty() {
+            bail!("namespace probe directory missing");
+        }
+        return fixture_scale(&[
+            "run".into(),
+            image.clone(),
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("/p/perf_namespace_scale {scale} {population} {parents}"),
+        ]);
+    }
     let [.., image, shell, flag, payload] = command else {
         bail!("namespace census requires the shell fixture command");
     };
