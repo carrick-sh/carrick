@@ -184,7 +184,7 @@ impl<'a> MemView<'a> {
         root: DelegatedRoot,
         requested: u64,
     ) -> Result<Result<BreakMove, BreakAnswer>, DispatchError> {
-        let (current, decision) = match self.with_charged_root(mem, &root, |model| {
+        let (current, decision) = match self.with_charged_host_proposal(mem, &root, |model| {
             let current = model.brk_current();
             Ok((current, model.brk(requested)?))
         }) {
@@ -240,7 +240,7 @@ impl<'a> MemView<'a> {
         };
         // The limits and, when finite, the charges of everything the root
         // does not hold: the guest venue decides against both.
-        self.with_charged_root(&mem, &root, |_| Ok(()))
+        self.refresh_root_charges(&mem, &root)
             .map_err(super::anonymous::root_refusal)
     }
 
