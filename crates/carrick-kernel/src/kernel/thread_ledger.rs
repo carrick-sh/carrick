@@ -31,7 +31,7 @@ use parking_lot::Mutex;
 
 use super::core::{Kernel, KernelContext, RegistryState, TaskRecord};
 use super::ids::LinuxTid;
-use super::objects::TaskRef;
+use super::objects::{TaskRef, ThreadKey};
 use super::operations::KernelOperationError;
 use super::operations::thread::{PreparedThreadClone, PublicationLane};
 use super::registry::{RegistryLock, ThreadReservation};
@@ -65,12 +65,11 @@ enum EntryState {
     Revoked = 2,
 }
 
-/// The kernel-issued identity half of a thread: a reserved tid (the number
-/// cannot be issued to anything else while this lives) and, inside a PID
-/// namespace, the matching prepared visible id.
+/// The exact kernel-issued identity of a thread: a reserved tid and serial
+/// that adoption must retain, plus the prepared visible id in a PID namespace.
 #[derive(Debug)]
 pub(crate) struct ThreadIdentity {
-    pub(crate) tid: LinuxTid,
+    pub(crate) key: ThreadKey,
     pub(crate) reservation: ThreadReservation,
     pub(crate) pid_identity: Option<PreparedNamespaceIdentity>,
 }
@@ -94,7 +93,10 @@ impl ThreadIdentity {
             None => None,
         };
         Ok(Self {
-            tid,
+            key: ThreadKey {
+                tid,
+                serial: kernel.object_ids().thread_serial()?,
+            },
             reservation,
             pid_identity,
         })
@@ -180,7 +182,7 @@ impl ThreadIdentityPool {
         self.entries
             .lock()
             .iter()
-            .map(|entry| entry.identity.tid)
+            .map(|entry| entry.identity.key.tid)
             .collect()
     }
 }
@@ -580,6 +582,8 @@ mod tests {
         let second = kernel
             .reserve_thread_clone(&peer, thread_plan(), None)
             .unwrap();
+        let reserved_first = first.key();
+        let reserved_second = second.key();
         // Adoption may run in the reverse order of births. It must consume
         // identities already issued at reservation, not mint their serials.
         let second = second
@@ -588,6 +592,8 @@ mod tests {
         let first = first.prepare(ThreadId::synthetic_for_tests(9_602)).unwrap();
         let first_key = first.prepared_execution_identity().1;
         let second_key = second.prepared_execution_identity().1;
+        assert_eq!(first_key, reserved_first);
+        assert_eq!(second_key, reserved_second);
         assert!(
             first_key.serial.raw() < second_key.serial.raw(),
             "identity was assigned at adoption: {first_key:?} {second_key:?}"

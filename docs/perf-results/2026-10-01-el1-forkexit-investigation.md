@@ -191,3 +191,25 @@ all builds and tests for landing I. No test executed. Production code remains
 unchanged. After resume, run the focused contracts, implement their fixes,
 then continue shared backing, venue wiring, settlement and admission work.
 Rebase onto landing I before signed acceptance, as directed.
+
+### Resume on landing I
+
+Rebased onto `work/land-i` at `31ba5ef44`. The focused kernel contracts
+then failed with serials 21 and 17 in reverse adoption order, and an inherited
+mask of zero instead of `0x400`. The ABI hatch contract failed on `" 0"`.
+Both test commands exited 101, with actual assertion failures.
+
+The identity reservation now owns its full `ThreadKey`, exposed before
+preparation, and preparation retains that exact key. A detached clone seed
+captures the blocked mask and affinity at claim instead of rereading the
+caller at adoption; it does not copy non-inherited pending signal queues.
+Hatch parsing compares the exact string without trimming.
+
+The ledger module passed all 11 tests after these fixes, and all 107 ABI
+tests passed. `CARGO_BUILD_JOBS=3 just test-kernel` and
+`CARGO_BUILD_JOBS=3 cargo test -p carrick-el1 --lib` also exited zero (181
+EL1 tests). The serial `carrick-vmm-hvf --lib` suite passed with 681 tests
+and three ignored. These are L4 prerequisites, not a production venue: shared
+control backing, EL1 venue wiring, birth/exit settlement and adoption,
+admission gates, and teardown remain open. No signed acceptance is claimed
+for the rebased tree.

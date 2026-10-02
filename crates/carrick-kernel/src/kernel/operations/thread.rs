@@ -6,8 +6,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use carrick_abi::SigSet;
 use carrick_fatal::carrick_fatal;
-use carrick_hal::ThreadId;
+use carrick_hal::{CpuAffinity, ThreadId};
 
 use super::{
     ChildStartRelease, ChildStartWait, KernelFailpoint, KernelOperationError, TaskSetReservation,
@@ -16,6 +17,7 @@ use super::{
 use crate::kernel::clone_plan::{ClonePlan, CloneTaskMode};
 use crate::kernel::core::{Kernel, KernelContext, RegistryState};
 use crate::kernel::ids::{LinuxTid, MmId, TaskId};
+use crate::kernel::objects::signal::ThreadSignalState;
 use crate::kernel::objects::{
     TaskKey, TaskLifecycle, TaskRef, TaskShared, ThreadKey, ThreadRef, ThreadResources,
 };
@@ -83,12 +85,19 @@ impl Drop for PublishedThreadClone {
 }
 
 #[derive(Debug)]
+struct ThreadCloneSeed {
+    blocked: SigSet,
+    affinity: CpuAffinity,
+}
+
+#[derive(Debug)]
 pub struct ThreadCloneReservation {
     kernel: Arc<Kernel>,
     task: TaskRef,
     caller: ThreadRef,
     shared: Arc<TaskShared>,
     parent_resources: Arc<ThreadResources>,
+    seed: ThreadCloneSeed,
     plan: ClonePlan,
     /// The pool entry this clone claimed, with its `RLIMIT_NPROC` charge.
     identity: ClaimedThreadIdentity,
@@ -96,8 +105,13 @@ pub struct ThreadCloneReservation {
 }
 
 impl ThreadCloneReservation {
+    /// Exact identity issued before a child can become observable.
+    pub const fn key(&self) -> ThreadKey {
+        self.identity.identity.key
+    }
+
     pub const fn tid(&self) -> LinuxTid {
-        self.identity.identity.tid
+        self.key().tid
     }
 
     pub fn visible_tid(&self) -> i32 {
@@ -117,15 +131,14 @@ impl ThreadCloneReservation {
             self.plan,
             self.kernel.object_ids(),
         )?);
+        let mut signals = ThreadSignalState::default();
+        signals.set_blocked(self.seed.blocked);
         let thread = self.task.prepare_clone_thread(
-            ThreadKey {
-                tid: self.tid(),
-                serial: self.kernel.object_ids().thread_serial()?,
-            },
+            self.key(),
             registry_id,
             Arc::clone(&resources),
-            self.caller.signal_state(),
-            self.caller.affinity(),
+            signals,
+            self.seed.affinity,
         );
         check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
@@ -314,16 +327,18 @@ impl PreparedThreadClone {
             caller,
             shared,
             parent_resources,
+            seed: _,
             plan: _,
             identity,
             failpoint,
         } = reservation;
         let ClaimedThreadIdentity { identity, credit } = identity;
         let ThreadIdentity {
-            tid,
+            key,
             reservation,
             pid_identity,
         } = identity;
+        let tid = key.tid;
         let visible_tid = pid_identity
             .as_ref()
             .map_or(tid.raw(), |identity| identity.visible_id() as i32);
@@ -818,6 +833,10 @@ impl Kernel {
             caller: Arc::clone(&parent.thread),
             shared: Arc::clone(&parent.shared),
             parent_resources: Arc::clone(&parent.resources),
+            seed: ThreadCloneSeed {
+                blocked: parent.thread.blocked_mask(),
+                affinity: parent.thread.affinity(),
+            },
             plan,
             identity,
             failpoint,
