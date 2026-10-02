@@ -231,6 +231,12 @@ where
         if task.key() != self.owner {
             return None;
         }
+        if self.cpu_template.as_ref().is_some_and(|template| {
+            template.cpu.mm != task.shared().mm().id()
+                || template.cpu.asid_generation != process.asid_generation()
+        }) {
+            return None;
+        }
         let scheduler = kernel
             .hvpatch_runtime
             .as_ref()?
@@ -472,10 +478,15 @@ mod tests {
 
     #[test]
     fn shared_adoption_consumes_born_cpu_capacity_for_the_exact_new_thread() {
-        let (_, scheduler, kernel, owner, _, _) =
+        let (_, scheduler, kernel, owner, process, _) =
             test_carrier_graph_with_dispatcher!(72_495, SyscallDispatcher::new());
         let owner_state = state(&kernel, &owner, 1_005);
-        let source = executor::tests::task_state(&owner, 1_005);
+        let mut source = executor::tests::task_state(&owner, 1_005);
+        source.asid_generation = process.asid_generation();
+        let GuestCpuState::Aarch64V1(registers) = &mut source.cpu else {
+            panic!("architecture");
+        };
+        Arc::make_mut(registers).asid_generation = process.asid_generation();
         let factory = ProcessThreadAdoptionFactory::capture(&kernel, &owner_state)
             .unwrap()
             .with_cpu_template(&owner, source.clone())
@@ -493,6 +504,16 @@ mod tests {
                 None,
             )
             .unwrap();
+        let mut stale = source.clone();
+        stale.asid_generation = process.asid_generation().checked_add(1).unwrap();
+        let stale_factory = ProcessThreadAdoptionFactory::capture(&kernel, &owner_state)
+            .unwrap()
+            .with_cpu_template(&owner, stale)
+            .unwrap();
+        assert!(
+            stale_factory.reserve(prepared.key()).is_none(),
+            "stale image capacity must decline before Born"
+        );
         let ticket = factory.reserve(prepared.key()).unwrap();
         let born = prepared
             .prepare(ThreadId::synthetic_for_tests(72_496))
