@@ -2433,7 +2433,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn protections(&self) -> Option<&MemoryProtections> {
-        self.state.protections_ref()
+        Some(self.state.protections_ref())
     }
 
     fn fork_cow_ranges(&mut self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
