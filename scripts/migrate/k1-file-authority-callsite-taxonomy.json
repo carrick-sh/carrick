@@ -2890,7 +2890,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
-      "line": 252,
+      "line": 267,
       "categories": [
         "table_guard"
       ],
@@ -2901,7 +2901,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
-      "line": 272,
+      "line": 287,
       "categories": [
         "table_guard"
       ],
@@ -2912,7 +2912,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
-      "line": 277,
+      "line": 292,
       "categories": [
         "table_guard"
       ],
@@ -2923,7 +2923,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/scm_rights.rs",
-      "line": 383,
+      "line": 398,
       "categories": [
         "table_guard"
       ],
