@@ -1415,6 +1415,11 @@ impl HostFsBackend {
             | libc::O_NONBLOCK
             | libc::O_NOFOLLOW;
         for component in remaining {
+            crate::probes::fs_op(
+                "path-visit:host-parent",
+                component.to_str().unwrap_or("<non-utf8>"),
+                0,
+            );
             walked.push(component);
             let Some(component_c) = cstring_from_osstr(component) else {
                 return Err(libc::EINVAL);
@@ -1503,6 +1508,11 @@ impl HostFsBackend {
             | libc::O_NOFOLLOW;
         let mut walked = PathBuf::new();
         for component in dir.iter() {
+            crate::probes::fs_op(
+                "path-visit:host-parent",
+                component.to_str().unwrap_or("<non-utf8>"),
+                0,
+            );
             walked.push(component);
             let Some(component_c) = cstring_from_osstr(component) else {
                 return Err(libc::EINVAL);
@@ -1607,6 +1617,11 @@ impl HostFsBackend {
 
     fn namei_leaf_res(&self, rel: &Path) -> Result<NameiLeaf, i32> {
         let name = rel.file_name().ok_or(libc::EINVAL)?;
+        crate::probes::fs_op(
+            "path-visit:host-leaf",
+            name.to_str().unwrap_or("<non-utf8>"),
+            0,
+        );
         let name_c = cstring_from_osstr(name).ok_or(libc::EINVAL)?;
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
         let parent_fd = self.dir_fd_for(parent)?;
@@ -1672,6 +1687,11 @@ impl HostFsBackend {
             | libc::O_NONBLOCK
             | libc::O_NOFOLLOW;
         for component in parent.iter() {
+            crate::probes::fs_op(
+                "path-visit:host-parent",
+                component.to_str().unwrap_or("<non-utf8>"),
+                0,
+            );
             walked.push(component);
             let Some(comp_c) = cstring_from_osstr(component) else {
                 return Err(libc::EINVAL);

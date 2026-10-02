@@ -183,7 +183,14 @@ impl SyscallDispatcher {
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_handler(ctx.request.number.raw())?;
         let canonical_nr = ctx.request.number.raw();
-        let outcome = resources::with_captured_resources(ctx.kernel, || handler(self, &mut ctx));
+        let outcome = resources::with_captured_resources(ctx.kernel, || {
+            if matches!(canonical_nr, 35 | 37 | 38 | 56 | 276) {
+                // Qualify zero path-visit aggregates: the measured request
+                // reached the instrumented dispatcher, even on a cache hit.
+                carrick_observability::probes::fs_op("path-census:armed", "", 0);
+            }
+            handler(self, &mut ctx)
+        });
         // Single choke point for the fork-coherent resolve cache: a structural
         // namespace mutation (mkdirat/unlinkat/symlinkat/linkat/renameat/
         // renameat2/mknodat) can change how OTHER paths resolve, so bump the

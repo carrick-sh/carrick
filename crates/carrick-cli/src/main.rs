@@ -144,6 +144,8 @@ mod hvpatch_exit_attribution_profile;
 mod hvpatch_identity_host_safety_profile;
 mod hvpatch_k1_profile;
 mod lifecycle;
+#[cfg_attr(not(any(target_os = "macos", target_os = "freebsd")), allow(dead_code))]
+mod namespace_work_profile;
 // `perf_stats` + the bulk of `trace_profile` back the BSD libdtrace-based
 // `carrick trace --profile` pipeline. Other hosts retain only the shared
 // `TraceProfileKind` argument vocabulary.

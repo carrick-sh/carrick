@@ -17,13 +17,17 @@ fn actor(dir: i32, id: usize, n: usize) {
     let src = CString::new(format!("{id}_src")).unwrap();
     let moved = CString::new(format!("{id}_moved")).unwrap();
     let alias = CString::new(format!("{id}_alias")).unwrap();
-    for _ in 0..n {
+    for i in 0..n {
         unsafe {
-            checked(libc::renameat(dir, src.as_ptr(), dir, moved.as_ptr()));
-            checked(libc::renameat(dir, moved.as_ptr(), dir, src.as_ptr()));
-            checked(libc::linkat(dir, src.as_ptr(), dir, alias.as_ptr(), 0));
+            let (from, to) = if i % 2 == 0 {
+                (&src, &moved)
+            } else {
+                (&moved, &src)
+            };
+            checked(libc::renameat(dir, from.as_ptr(), dir, to.as_ptr()));
+            checked(libc::linkat(dir, to.as_ptr(), dir, alias.as_ptr(), 0));
             checked(libc::unlinkat(dir, alias.as_ptr(), 0));
-            let fd = checked(libc::openat(dir, src.as_ptr(), libc::O_RDONLY));
+            let fd = checked(libc::openat(dir, to.as_ptr(), libc::O_RDONLY));
             let mut byte = 0;
             assert_eq!(libc::read(fd, (&mut byte as *mut u8).cast(), 1), 1);
             assert_eq!(byte, b'x');
@@ -54,6 +58,9 @@ fn transfer(fd: i32, write: bool) {
 }
 
 fn main() {
+    unsafe {
+        conformance_probes::arm_alarm_ms(5000);
+    }
     let args = std::env::args().collect::<Vec<_>>();
     assert_eq!(args.len(), 4);
     let n: usize = args[1].parse().unwrap();
@@ -87,6 +94,7 @@ fn main() {
         checked(libc::pipe(done.as_mut_ptr()));
         let pid = checked(libc::fork());
         if pid == 0 {
+            conformance_probes::arm_alarm_ms(5000);
             transfer(start[0], false);
             actor(dirs[1], 1, n);
             transfer(done[1], true);
@@ -100,6 +108,9 @@ fn main() {
         let mut status = 0;
         assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
         assert_eq!(status, 0);
+    }
+    unsafe {
+        conformance_probes::disarm_alarm();
     }
     println!("namespace_scale={n}");
     println!("namespace_population={population}");

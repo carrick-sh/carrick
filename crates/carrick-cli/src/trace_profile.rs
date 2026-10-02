@@ -241,6 +241,7 @@ pub(crate) enum TraceProfileKind {
     HvpatchCarrierCpuAttribution,
     HvpatchExitAttribution,
     HvpatchInotify09Population,
+    HostNamespaceWork,
     HvpatchFrameCow,
     HvpatchExecRuntimeStages,
     HvpatchCoreLifecycle,
@@ -256,6 +257,7 @@ impl TraceProfileKind {
             Self::HvpatchCarrierCpuAttribution => "hvpatch-carrier-cpu-attribution",
             Self::HvpatchExitAttribution => "hvpatch-exit-attribution",
             Self::HvpatchInotify09Population => "hvpatch-inotify09-population",
+            Self::HostNamespaceWork => "host-namespace-work",
             Self::HvpatchFrameCow => "hvpatch-frame-cow",
             Self::HvpatchExecRuntimeStages => "hvpatch-exec-runtime-stages",
             Self::HvpatchCoreLifecycle => "hvpatch-core-lifecycle",
@@ -281,6 +283,7 @@ impl TraceProfileKind {
             }
             Self::HvpatchCarrierCpuLowRate
             | Self::HvpatchInotify09Population
+            | Self::HostNamespaceWork
             | Self::HvpatchFrameCow
             | Self::HvpatchExecRuntimeStages
             | Self::HvpatchCoreLifecycle
@@ -304,6 +307,7 @@ impl TraceProfileKind {
             Self::HvpatchInotify09Population => {
                 crate::hvpatch_inotify_population_profile::BUNDLED_PROGRAM
             }
+            Self::HostNamespaceWork => crate::namespace_work_profile::BUNDLED_PROGRAM,
             Self::HvpatchFrameCow => carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_FRAME_COW_D,
             Self::HvpatchExecRuntimeStages => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_EXEC_RUNTIME_STAGES_D
@@ -330,6 +334,7 @@ impl TraceProfileKind {
             "hvpatch-carrier-cpu-attribution" => Ok(Self::HvpatchCarrierCpuAttribution),
             "hvpatch-exit-attribution" => Ok(Self::HvpatchExitAttribution),
             "hvpatch-inotify09-population" => Ok(Self::HvpatchInotify09Population),
+            "host-namespace-work" => Ok(Self::HostNamespaceWork),
             "hvpatch-frame-cow" => Ok(Self::HvpatchFrameCow),
             "hvpatch-exec-runtime-stages" => Ok(Self::HvpatchExecRuntimeStages),
             "hvpatch-core-lifecycle" => Ok(Self::HvpatchCoreLifecycle),
