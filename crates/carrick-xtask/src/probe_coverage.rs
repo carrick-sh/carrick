@@ -466,4 +466,3 @@ pub fn refresh_coverage_base(root: Option<&Path>) -> Result<(), CoverageError> {
 
     Ok(())
 }
-

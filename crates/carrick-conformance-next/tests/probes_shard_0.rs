@@ -200,7 +200,7 @@ fn test_shard_0_generation_responds_to_additions() {
     let initial_shard_0_len = initial_partition.shards[0].len();
     let initial_total = initial_partition.generic_names.len();
 
-    let pad_count = (0 + 3 - (initial_total % 3)) % 3;
+    let pad_count = (3 - (initial_total % 3)) % 3;
     for i in 0..pad_count {
         inventory.insert(
             format!("zzz_pad_{i}"),
