@@ -3037,7 +3037,7 @@
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
       "function": "ThreadControlArena::allocate",
       "ordinal_in_function": 1,
-      "fingerprint": "2a7e467ea171e068756f06d155e5168016e3e7365143a594e4ce4bd470b337cd",
+      "fingerprint": "f7e1329b1290f587d16a12dca005a0182acffe365a84156a8dbeb6de5b1d925a",
       "verdict": "carrier_fault",
       "failure_domain": "thread::control",
       "rationale": "A successful control-page refill must supply a free slot while holding the arena lock. An empty free list here means the allocator invariant is corrupt; no guest resource shortage can produce this state.",
@@ -3057,12 +3057,12 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "function": "SharedAbiPage<T>::new",
+      "function": "AbiPagePool::allocate",
       "ordinal_in_function": 1,
-      "fingerprint": "2a007b1e62a839b4ae87dfe80553d86f62d8d722b903ed34a9256e51aaa2e883",
+      "fingerprint": "03194a08de6826a5786d7eb87727ee0c92572ba8075258afc0bb607b5c663493",
       "verdict": "carrier_fault",
       "failure_domain": "thread::control",
-      "rationale": "The infallible task/control constructors require shared backing before publishing any object. A host mapping failure cannot supply valid control authority; like the replaced heap allocation failure it terminates the carrier rather than publishing a detached or copied slot. Fallible guest clone admission remains a separate obligation.",
+      "rationale": "The infallible task/control constructors require a shared ABI slab before publishing any object. A host mapping failure cannot supply valid control authority; like the replaced heap allocation failure it terminates the carrier rather than publishing a detached or copied slot. Optional carrier-aperture exhaustion separately declines publication and leaves the thread host-served.",
       "sink": "fatal",
       "domain": "thread::control"
     }
