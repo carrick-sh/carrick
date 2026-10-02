@@ -1,10 +1,10 @@
 {
   "catalog_sha256": "aa230c66221233fd4f87b931261e33b4975eedfb45efa04d6929a502a7d392ad",
   "diagnostic_counts": {
-    "macos-cli-default": 596,
+    "macos-cli-default": 599,
     "macos-hvf-default": 96,
-    "macos-runtime-default": 456,
-    "merged": 596
+    "macos-runtime-default": 459,
+    "merged": 599
   },
   "executed_profiles": [
     "macos-cli-default",
@@ -466,15 +466,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 30374,
-        "byte_start": 30362,
+        "byte_end": 30495,
+        "byte_start": 30483,
         "column": 32,
         "column_end": 44,
         "column_start": 32,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 637,
-        "line_end": 637,
-        "line_start": 637
+        "line": 638,
+        "line_end": 638,
+        "line_start": 638
       }
     },
     {
@@ -486,15 +486,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 47071,
-        "byte_start": 47059,
+        "byte_end": 47371,
+        "byte_start": 47359,
         "column": 33,
         "column_end": 45,
         "column_start": 33,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1096,
-        "line_end": 1096,
-        "line_start": 1096
+        "line": 1102,
+        "line_end": 1102,
+        "line_start": 1102
       }
     },
     {
@@ -506,15 +506,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 50461,
-        "byte_start": 50449,
+        "byte_end": 51016,
+        "byte_start": 51004,
         "column": 33,
         "column_end": 45,
         "column_start": 33,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1161,
-        "line_end": 1161,
-        "line_start": 1161
+        "line": 1171,
+        "line_end": 1171,
+        "line_start": 1171
       }
     },
     {
@@ -526,15 +526,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 54463,
-        "byte_start": 54451,
+        "byte_end": 55294,
+        "byte_start": 55282,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1239,
-        "line_end": 1239,
-        "line_start": 1239
+        "line": 1257,
+        "line_end": 1257,
+        "line_start": 1257
       }
     },
     {
@@ -546,15 +546,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55788,
-        "byte_start": 55776,
+        "byte_end": 56619,
+        "byte_start": 56607,
         "column": 38,
         "column_end": 50,
         "column_start": 38,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1270,
-        "line_end": 1270,
-        "line_start": 1270
+        "line": 1288,
+        "line_end": 1288,
+        "line_start": 1288
       }
     },
     {
@@ -566,15 +566,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 251155,
-        "byte_start": 251143,
+        "byte_end": 253039,
+        "byte_start": 253027,
         "column": 28,
         "column_end": 40,
         "column_start": 28,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 5973,
-        "line_end": 5973,
-        "line_start": 5973
+        "line": 6042,
+        "line_end": 6042,
+        "line_start": 6042
       }
     },
     {
@@ -1629,15 +1629,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 36268,
-        "byte_start": 36249,
+        "byte_end": 36389,
+        "byte_start": 36370,
         "column": 52,
         "column_end": 71,
         "column_start": 52,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 772,
-        "line_end": 772,
-        "line_start": 772
+        "line": 773,
+        "line_end": 773,
+        "line_start": 773
       }
     },
     {
@@ -1942,15 +1942,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 44100,
-        "byte_start": 44075,
+        "byte_end": 44221,
+        "byte_start": 44196,
         "column": 30,
         "column_end": 55,
         "column_start": 30,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1017,
-        "line_end": 1017,
-        "line_start": 1017
+        "line": 1018,
+        "line_end": 1018,
+        "line_start": 1018
       }
     },
     {
@@ -1962,15 +1962,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 45581,
-        "byte_start": 45556,
+        "byte_end": 45831,
+        "byte_start": 45806,
         "column": 30,
         "column_end": 55,
         "column_start": 30,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1060,
-        "line_end": 1060,
-        "line_start": 1060
+        "line": 1065,
+        "line_end": 1065,
+        "line_start": 1065
       }
     },
     {
@@ -1982,15 +1982,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 290863,
-        "byte_start": 290838,
+        "byte_end": 292743,
+        "byte_start": 292718,
         "column": 16,
         "column_end": 41,
         "column_start": 16,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 6955,
-        "line_end": 6955,
-        "line_start": 6955
+        "line": 7024,
+        "line_end": 7024,
+        "line_start": 7024
       }
     },
     {
@@ -2002,15 +2002,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 293324,
-        "byte_start": 293299,
+        "byte_end": 295204,
+        "byte_start": 295179,
         "column": 24,
         "column_end": 49,
         "column_start": 24,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 7018,
-        "line_end": 7018,
-        "line_start": 7018
+        "line": 7087,
+        "line_end": 7087,
+        "line_start": 7087
       }
     },
     {
@@ -2022,15 +2022,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 28446,
-        "byte_start": 28421,
-        "column": 20,
-        "column_end": 45,
-        "column_start": 20,
-        "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 728,
-        "line_end": 728,
-        "line_start": 728
+        "byte_end": 12970,
+        "byte_start": 12945,
+        "column": 27,
+        "column_end": 52,
+        "column_start": 27,
+        "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
+        "line": 283,
+        "line_end": 283,
+        "line_start": 283
       }
     },
     {
@@ -2042,15 +2042,35 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 31673,
-        "byte_start": 31648,
+        "byte_end": 30245,
+        "byte_start": 30220,
         "column": 20,
         "column_end": 45,
         "column_start": 20,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 822,
-        "line_end": 822,
-        "line_start": 822
+        "line": 786,
+        "line_end": 786,
+        "line_start": 786
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+      "expansion": null,
+      "operation": "std::fs::OpenOptions::new",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 33552,
+        "byte_start": 33527,
+        "column": 20,
+        "column_end": 45,
+        "column_start": 20,
+        "file": "crates/carrick-vfs/src/vfs/bind.rs",
+        "line": 882,
+        "line_end": 882,
+        "line_start": 882
       }
     },
     {
@@ -2356,15 +2376,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 44204,
-        "byte_start": 44200,
+        "byte_end": 44325,
+        "byte_start": 44321,
         "column": 10,
         "column_end": 14,
         "column_start": 10,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1022,
-        "line_end": 1022,
-        "line_start": 1022
+        "line": 1023,
+        "line_end": 1023,
+        "line_start": 1023
       }
     },
     {
@@ -2376,15 +2396,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 45705,
-        "byte_start": 45701,
+        "byte_end": 45955,
+        "byte_start": 45951,
         "column": 14,
         "column_end": 18,
         "column_start": 14,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1065,
-        "line_end": 1065,
-        "line_start": 1065
+        "line": 1070,
+        "line_end": 1070,
+        "line_start": 1070
       }
     },
     {
@@ -2396,15 +2416,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 290967,
-        "byte_start": 290963,
+        "byte_end": 292847,
+        "byte_start": 292843,
         "column": 10,
         "column_end": 14,
         "column_start": 10,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 6960,
-        "line_end": 6960,
-        "line_start": 6960
+        "line": 7029,
+        "line_end": 7029,
+        "line_start": 7029
       }
     },
     {
@@ -2416,15 +2436,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 293393,
-        "byte_start": 293389,
+        "byte_end": 295273,
+        "byte_start": 295269,
         "column": 14,
         "column_end": 18,
         "column_start": 14,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 7021,
-        "line_end": 7021,
-        "line_start": 7021
+        "line": 7090,
+        "line_end": 7090,
+        "line_start": 7090
       }
     },
     {
@@ -2436,15 +2456,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 28545,
-        "byte_start": 28541,
-        "column": 14,
-        "column_end": 18,
-        "column_start": 14,
-        "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 732,
-        "line_end": 732,
-        "line_start": 732
+        "byte_end": 13196,
+        "byte_start": 13192,
+        "column": 28,
+        "column_end": 32,
+        "column_start": 28,
+        "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
+        "line": 289,
+        "line_end": 289,
+        "line_start": 289
       }
     },
     {
@@ -2456,15 +2476,35 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 31718,
-        "byte_start": 31714,
+        "byte_end": 30344,
+        "byte_start": 30340,
         "column": 14,
         "column_end": 18,
         "column_start": 14,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 824,
-        "line_end": 824,
-        "line_start": 824
+        "line": 790,
+        "line_end": 790,
+        "line_start": 790
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+      "expansion": null,
+      "operation": "std::fs::OpenOptions::open",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 33597,
+        "byte_start": 33593,
+        "column": 14,
+        "column_end": 18,
+        "column_start": 14,
+        "file": "crates/carrick-vfs/src/vfs/bind.rs",
+        "line": 884,
+        "line_end": 884,
+        "line_start": 884
       }
     },
     {
@@ -2575,15 +2615,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 22743,
-        "byte_start": 22724,
+        "byte_end": 24270,
+        "byte_start": 24251,
         "column": 9,
         "column_end": 28,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 599,
-        "line_end": 599,
-        "line_start": 599
+        "line": 647,
+        "line_end": 647,
+        "line_start": 647
       }
     },
     {
@@ -2920,15 +2960,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 24947,
-        "byte_start": 24924,
+        "byte_end": 25259,
+        "byte_start": 25236,
         "column": 25,
         "column_end": 48,
         "column_start": 25,
         "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-        "line": 641,
-        "line_end": 641,
-        "line_start": 641
+        "line": 645,
+        "line_end": 645,
+        "line_start": 645
       }
     },
     {
@@ -3160,15 +3200,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 33332,
-        "byte_start": 33309,
+        "byte_end": 33453,
+        "byte_start": 33430,
         "column": 8,
         "column_end": 31,
         "column_start": 8,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 700,
-        "line_end": 700,
-        "line_start": 700
+        "line": 701,
+        "line_end": 701,
+        "line_start": 701
       }
     },
     {
@@ -3180,15 +3220,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 40029,
-        "byte_start": 40006,
+        "byte_end": 40150,
+        "byte_start": 40127,
         "column": 31,
         "column_end": 54,
         "column_start": 31,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 896,
-        "line_end": 896,
-        "line_start": 896
+        "line": 897,
+        "line_end": 897,
+        "line_start": 897
       }
     },
     {
@@ -3200,15 +3240,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 45439,
-        "byte_start": 45416,
+        "byte_end": 45689,
+        "byte_start": 45666,
         "column": 9,
         "column_end": 32,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1058,
-        "line_end": 1058,
-        "line_start": 1058
+        "line": 1063,
+        "line_end": 1063,
+        "line_start": 1063
       }
     },
     {
@@ -3220,15 +3260,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 54020,
-        "byte_start": 53997,
+        "byte_end": 54840,
+        "byte_start": 54817,
         "column": 9,
         "column_end": 32,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 1228,
-        "line_end": 1228,
-        "line_start": 1228
+        "line": 1246,
+        "line_end": 1246,
+        "line_start": 1246
       }
     },
     {
@@ -3299,15 +3339,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 27627,
-        "byte_start": 27609,
+        "byte_end": 29375,
+        "byte_start": 29357,
         "column": 9,
         "column_end": 27,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 703,
-        "line_end": 703,
-        "line_start": 703
+        "line": 759,
+        "line_end": 759,
+        "line_start": 759
       }
     },
     {
@@ -3556,15 +3596,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 14896,
-        "byte_start": 14879,
+        "byte_end": 16211,
+        "byte_start": 16194,
         "column": 9,
         "column_end": 26,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 379,
-        "line_end": 379,
-        "line_start": 379
+        "line": 418,
+        "line_end": 418,
+        "line_start": 418
       }
     },
     {
@@ -3576,15 +3616,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 29346,
-        "byte_start": 29329,
+        "byte_end": 31208,
+        "byte_start": 31191,
         "column": 13,
         "column_end": 30,
         "column_start": 13,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 760,
-        "line_end": 760,
-        "line_start": 760
+        "line": 820,
+        "line_end": 820,
+        "line_start": 820
       }
     },
     {
@@ -4243,8 +4283,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 72587,
-        "byte_start": 72579,
+        "byte_end": 72632,
+        "byte_start": 72624,
         "column": 21,
         "column_end": 29,
         "column_start": 21,
@@ -4263,15 +4303,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 16112,
-        "byte_start": 16099,
+        "byte_end": 17427,
+        "byte_start": 17414,
         "column": 9,
         "column_end": 22,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 412,
-        "line_end": 412,
-        "line_start": 412
+        "line": 451,
+        "line_end": 451,
+        "line_start": 451
       }
     },
     {
@@ -4656,15 +4696,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 35020,
-        "byte_start": 35003,
+        "byte_end": 35141,
+        "byte_start": 35124,
         "column": 47,
         "column_end": 64,
         "column_start": 47,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 737,
-        "line_end": 737,
-        "line_start": 737
+        "line": 738,
+        "line_end": 738,
+        "line_start": 738
       }
     },
     {
@@ -4676,15 +4716,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 38247,
-        "byte_start": 38230,
+        "byte_end": 38368,
+        "byte_start": 38351,
         "column": 47,
         "column_end": 64,
         "column_start": 47,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 846,
-        "line_end": 846,
-        "line_start": 846
+        "line": 847,
+        "line_end": 847,
+        "line_start": 847
       }
     },
     {
@@ -4696,15 +4736,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 250670,
-        "byte_start": 250653,
+        "byte_end": 252554,
+        "byte_start": 252537,
         "column": 22,
         "column_end": 39,
         "column_start": 22,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 5960,
-        "line_end": 5960,
-        "line_start": 5960
+        "line": 6029,
+        "line_end": 6029,
+        "line_start": 6029
       }
     },
     {
@@ -4716,15 +4756,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 292315,
-        "byte_start": 292298,
+        "byte_end": 294195,
+        "byte_start": 294178,
         "column": 23,
         "column_end": 40,
         "column_start": 23,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 6993,
-        "line_end": 6993,
-        "line_start": 6993
+        "line": 7062,
+        "line_end": 7062,
+        "line_start": 7062
       }
     },
     {
@@ -4756,15 +4796,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 16334,
-        "byte_start": 16317,
+        "byte_end": 17649,
+        "byte_start": 17632,
         "column": 22,
         "column_end": 39,
         "column_start": 22,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 418,
-        "line_end": 418,
-        "line_start": 418
+        "line": 457,
+        "line_end": 457,
+        "line_start": 457
       }
     },
     {
@@ -4776,15 +4816,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 17514,
-        "byte_start": 17497,
+        "byte_end": 18829,
+        "byte_start": 18812,
         "column": 22,
         "column_end": 39,
         "column_start": 22,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 444,
-        "line_end": 444,
-        "line_start": 444
+        "line": 483,
+        "line_end": 483,
+        "line_start": 483
       }
     },
     {
@@ -4796,15 +4836,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 22144,
-        "byte_start": 22127,
+        "byte_end": 23671,
+        "byte_start": 23654,
         "column": 26,
         "column_end": 43,
         "column_start": 26,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 581,
-        "line_end": 581,
-        "line_start": 581
+        "line": 629,
+        "line_end": 629,
+        "line_start": 629
       }
     },
     {
@@ -4835,15 +4875,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 15947,
-        "byte_start": 15929,
+        "byte_end": 17262,
+        "byte_start": 17244,
         "column": 9,
         "column_end": 27,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 407,
-        "line_end": 407,
-        "line_start": 407
+        "line": 446,
+        "line_end": 446,
+        "line_start": 446
       }
     },
     {
@@ -5342,15 +5382,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 40245,
-        "byte_start": 40226,
+        "byte_end": 40366,
+        "byte_start": 40347,
         "column": 45,
         "column_end": 64,
         "column_start": 45,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 903,
-        "line_end": 903,
-        "line_start": 903
+        "line": 904,
+        "line_end": 904,
+        "line_start": 904
       }
     },
     {
@@ -5362,15 +5402,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 25712,
-        "byte_start": 25693,
+        "byte_end": 27324,
+        "byte_start": 27305,
         "column": 9,
         "column_end": 28,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 655,
-        "line_end": 655,
-        "line_start": 655
+        "line": 706,
+        "line_end": 706,
+        "line_start": 706
       }
     },
     {
@@ -5459,15 +5499,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 41909,
-        "byte_start": 41886,
+        "byte_end": 42030,
+        "byte_start": 42007,
         "column": 37,
         "column_end": 60,
         "column_start": 37,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 954,
-        "line_end": 954,
-        "line_start": 954
+        "line": 955,
+        "line_end": 955,
+        "line_start": 955
       }
     },
     {
@@ -5479,15 +5519,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 42449,
-        "byte_start": 42426,
+        "byte_end": 42570,
+        "byte_start": 42547,
         "column": 41,
         "column_end": 64,
         "column_start": 41,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 966,
-        "line_end": 966,
-        "line_start": 966
+        "line": 967,
+        "line_end": 967,
+        "line_start": 967
       }
     },
     {
@@ -6015,15 +6055,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 37995,
-        "byte_start": 37975,
+        "byte_end": 38116,
+        "byte_start": 38096,
         "column": 49,
         "column_end": 69,
         "column_start": 49,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 837,
-        "line_end": 837,
-        "line_start": 837
+        "line": 838,
+        "line_end": 838,
+        "line_start": 838
       }
     },
     {
@@ -6035,15 +6075,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 39512,
-        "byte_start": 39492,
+        "byte_end": 39633,
+        "byte_start": 39613,
         "column": 37,
         "column_end": 57,
         "column_start": 37,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 882,
-        "line_end": 882,
-        "line_start": 882
+        "line": 883,
+        "line_end": 883,
+        "line_start": 883
       }
     },
     {
@@ -6075,15 +6115,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 25121,
-        "byte_start": 25101,
+        "byte_end": 26682,
+        "byte_start": 26662,
         "column": 9,
         "column_end": 29,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 640,
-        "line_end": 640,
-        "line_start": 640
+        "line": 689,
+        "line_end": 689,
+        "line_start": 689
       }
     },
     {
@@ -6276,15 +6316,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 33813,
-        "byte_start": 33798,
+        "byte_end": 33934,
+        "byte_start": 33919,
         "column": 15,
         "column_end": 30,
         "column_start": 15,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 712,
-        "line_end": 712,
-        "line_start": 712
+        "line": 713,
+        "line_end": 713,
+        "line_start": 713
       }
     },
     {
@@ -6296,15 +6336,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 39299,
-        "byte_start": 39284,
+        "byte_end": 39420,
+        "byte_start": 39405,
         "column": 35,
         "column_end": 50,
         "column_start": 35,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 875,
-        "line_end": 875,
-        "line_start": 875
+        "line": 876,
+        "line_end": 876,
+        "line_start": 876
       }
     },
     {
@@ -6316,15 +6356,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 40133,
-        "byte_start": 40118,
+        "byte_end": 40254,
+        "byte_start": 40239,
         "column": 39,
         "column_end": 54,
         "column_start": 39,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 899,
-        "line_end": 899,
-        "line_start": 899
+        "line": 900,
+        "line_end": 900,
+        "line_start": 900
       }
     },
     {
@@ -6356,15 +6396,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 26340,
-        "byte_start": 26325,
+        "byte_end": 28003,
+        "byte_start": 27988,
         "column": 9,
         "column_end": 24,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 670,
-        "line_end": 670,
-        "line_start": 670
+        "line": 723,
+        "line_end": 723,
+        "line_start": 723
       }
     },
     {
@@ -6496,15 +6536,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 25477,
-        "byte_start": 25453,
+        "byte_end": 25789,
+        "byte_start": 25765,
         "column": 21,
         "column_end": 45,
         "column_start": 21,
         "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-        "line": 649,
-        "line_end": 649,
-        "line_start": 649
+        "line": 653,
+        "line_end": 653,
+        "line_start": 653
       }
     },
     {
@@ -6676,15 +6716,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 38134,
-        "byte_start": 38110,
+        "byte_end": 38255,
+        "byte_start": 38231,
         "column": 27,
         "column_end": 51,
         "column_start": 27,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 844,
-        "line_end": 844,
-        "line_start": 844
+        "line": 845,
+        "line_end": 845,
+        "line_start": 845
       }
     },
     {
@@ -6696,15 +6736,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 22926,
-        "byte_start": 22902,
+        "byte_end": 24487,
+        "byte_start": 24463,
         "column": 17,
         "column_end": 41,
         "column_start": 17,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 602,
-        "line_end": 602,
-        "line_start": 602
+        "line": 651,
+        "line_end": 651,
+        "line_start": 651
       }
     },
     {
@@ -6716,15 +6756,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 27941,
-        "byte_start": 27917,
+        "byte_end": 29740,
+        "byte_start": 29716,
         "column": 9,
         "column_end": 33,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 712,
-        "line_end": 712,
-        "line_start": 712
+        "line": 770,
+        "line_end": 770,
+        "line_start": 770
       }
     },
     {
@@ -6936,15 +6976,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 37849,
-        "byte_start": 37824,
+        "byte_end": 37970,
+        "byte_start": 37945,
         "column": 48,
         "column_end": 73,
         "column_start": 48,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 833,
-        "line_end": 833,
-        "line_start": 833
+        "line": 834,
+        "line_end": 834,
+        "line_start": 834
       }
     },
     {
@@ -6956,15 +6996,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 248983,
-        "byte_start": 248958,
+        "byte_end": 250867,
+        "byte_start": 250842,
         "column": 21,
         "column_end": 46,
         "column_start": 21,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 5916,
-        "line_end": 5916,
-        "line_start": 5916
+        "line": 5985,
+        "line_end": 5985,
+        "line_start": 5985
       }
     },
     {
@@ -7016,15 +7056,35 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 15157,
-        "byte_start": 15132,
+        "byte_end": 3259,
+        "byte_start": 3234,
+        "column": 16,
+        "column_end": 41,
+        "column_start": 16,
+        "file": "crates/carrick-vfs/src/vfs/bind.rs",
+        "line": 73,
+        "line_end": 73,
+        "line_start": 73
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-SYMLINK-METADATA",
+      "expansion": null,
+      "operation": "std::fs::symlink_metadata",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 16472,
+        "byte_start": 16447,
         "column": 9,
         "column_end": 34,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 386,
-        "line_end": 386,
-        "line_start": 386
+        "line": 425,
+        "line_end": 425,
+        "line_start": 425
       }
     },
     {
@@ -7036,15 +7096,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 18703,
-        "byte_start": 18678,
+        "byte_end": 20018,
+        "byte_start": 19993,
         "column": 26,
         "column_end": 51,
         "column_start": 26,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 478,
-        "line_end": 478,
-        "line_start": 478
+        "line": 517,
+        "line_end": 517,
+        "line_start": 517
       }
     },
     {
@@ -7056,15 +7116,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 20186,
-        "byte_start": 20161,
+        "byte_end": 21501,
+        "byte_start": 21476,
         "column": 53,
         "column_end": 78,
         "column_start": 53,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 532,
-        "line_end": 532,
-        "line_start": 532
+        "line": 571,
+        "line_end": 571,
+        "line_start": 571
       }
     },
     {
@@ -7076,15 +7136,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 29292,
-        "byte_start": 29267,
+        "byte_end": 31154,
+        "byte_start": 31129,
         "column": 13,
         "column_end": 38,
         "column_start": 13,
         "file": "crates/carrick-vfs/src/vfs/bind.rs",
-        "line": 758,
-        "line_end": 758,
-        "line_start": 758
+        "line": 818,
+        "line_end": 818,
+        "line_start": 818
       }
     },
     {
@@ -8346,15 +8406,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 33289,
-        "byte_start": 33273,
+        "byte_end": 33597,
+        "byte_start": 33581,
         "column": 32,
         "column_end": 48,
         "column_start": 32,
         "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-        "line": 738,
-        "line_end": 738,
-        "line_start": 738
+        "line": 743,
+        "line_end": 743,
+        "line_start": 743
       }
     },
     {
@@ -8366,15 +8426,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 24894,
-        "byte_start": 24878,
+        "byte_end": 25206,
+        "byte_start": 25190,
         "column": 73,
         "column_end": 89,
         "column_start": 73,
         "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-        "line": 640,
-        "line_end": 640,
-        "line_start": 640
+        "line": 644,
+        "line_end": 644,
+        "line_start": 644
       }
     },
     {
@@ -10296,15 +10356,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 33569,
-        "byte_start": 33553,
+        "byte_end": 33690,
+        "byte_start": 33674,
         "column": 15,
         "column_end": 31,
         "column_start": 15,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 707,
-        "line_end": 707,
-        "line_start": 707
+        "line": 708,
+        "line_end": 708,
+        "line_start": 708
       }
     },
     {
@@ -10316,15 +10376,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 39205,
-        "byte_start": 39189,
+        "byte_end": 39326,
+        "byte_start": 39310,
         "column": 17,
         "column_end": 33,
         "column_start": 17,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 872,
-        "line_end": 872,
-        "line_start": 872
+        "line": 873,
+        "line_end": 873,
+        "line_start": 873
       }
     },
     {
@@ -10336,15 +10396,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 39949,
-        "byte_start": 39933,
+        "byte_end": 40070,
+        "byte_start": 40054,
         "column": 61,
         "column_end": 77,
         "column_start": 61,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 894,
-        "line_end": 894,
-        "line_start": 894
+        "line": 895,
+        "line_end": 895,
+        "line_start": 895
       }
     },
     {
@@ -10840,15 +10900,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 41616,
-        "byte_start": 41591,
+        "byte_end": 41737,
+        "byte_start": 41712,
         "column": 9,
         "column_end": 34,
         "column_start": 9,
         "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-        "line": 948,
-        "line_end": 948,
-        "line_start": 948
+        "line": 949,
+        "line_end": 949,
+        "line_start": 949
       }
     },
     {
@@ -11956,9 +12016,9 @@
       }
     }
   ],
-  "rows_sha256": "6b5bb9ed797f7efefe8c59d92215efcb8583437b5f53b965cb20f7b23fa10942",
+  "rows_sha256": "ed46cd7307940981d95773a782161114763c54417a3ee853b330e7f5a94ab1dd",
   "schema": 1,
-  "source_head": "ad75b2e9f4b8c435d7dc56b36245138108324114",
+  "source_head": "be0f0dff50bb508c57013a84d0af79c4b352d524",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
