@@ -1405,7 +1405,8 @@ impl<'a> MemView<'a> {
             // page reclaimed from a prior munmap (which invalidated it) must be
             // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
             // (no TLBI) when the page is already at the target protection.
-            let defer_anonymous = memory.supports_lazy_anonymous_mmap()
+            let sparse_anonymous_backing = memory.supports_lazy_anonymous_mmap();
+            let defer_anonymous = sparse_anonymous_backing
                 && this.linux_page_size() == 4096
                 && map_flags.contains(LinuxMmapFlags::PRIVATE)
                 && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
@@ -1419,7 +1420,7 @@ impl<'a> MemView<'a> {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 if let Err(error) = retire_anonymous_mapping_backing(
                     this, memory, address, length, length_usize,
-                    fixed_anonymous, defer_anonymous,
+                    fixed_anonymous, sparse_anonymous_backing,
                 ) {
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("anonymous predecessor retirement failed"),
@@ -1507,7 +1508,7 @@ impl<'a> MemView<'a> {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 if let Err(error) = retire_anonymous_mapping_backing(
                     this, memory, address, length, length_usize,
-                    fixed_anonymous, defer_anonymous,
+                    fixed_anonymous, sparse_anonymous_backing,
                 ) {
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("anonymous predecessor retirement failed"),
