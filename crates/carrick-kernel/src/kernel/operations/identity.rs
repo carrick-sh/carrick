@@ -211,16 +211,32 @@ impl Kernel {
         if !Arc::ptr_eq(self, &context.kernel) {
             return Err(KernelOperationError::ForeignContext);
         }
-        let _birth_admission =
-            super::super::thread_ledger::BirthAdmissionGuard::acquire(context.task())?;
         let task_id = context.task.key().id;
         let mut update = Some(update);
         loop {
             let observed = self.reservation_epoch();
+            // A task reservation owns its own birth close. Wait for that
+            // transaction before attempting to acquire conflicting custody.
+            {
+                let state = self.registry().settled().read();
+                if let Err(KernelOperationError::TaskBusy(_)) =
+                    ensure_task_unreserved(&state, task_id)
+                {
+                    drop(state);
+                    self.wait_for_reservation_change(observed);
+                    continue;
+                }
+                ensure_task_unreserved(&state, task_id)?;
+            }
+            let birth_admission =
+                super::super::thread_ledger::BirthAdmissionGuard::acquire(context.task())?;
+            // Settle births completed before the close, then revalidate the
+            // reservation and captured resource authority before COW.
             let state = self.registry().settled().write();
             if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
             {
                 drop(state);
+                drop(birth_admission);
                 self.wait_for_reservation_change(observed);
                 continue;
             }

@@ -333,9 +333,10 @@ impl SyscallDispatcher {
                 | crate::kernel::KernelOperationError::ParentExited
                 | crate::kernel::KernelOperationError::UnknownThread(_),
             ) => Err(crate::linux_abi::LINUX_EINTR),
-            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                Err(crate::linux_abi::LINUX_EAGAIN)
-            }
+            Err(
+                crate::kernel::KernelOperationError::TaskBusy(_)
+                | crate::kernel::KernelOperationError::LifecycleAdmissionBusy(_),
+            ) => Err(crate::linux_abi::LINUX_EAGAIN),
             Err(error) => {
                 tracing::error!(%error, "credential COW publication invariant failed");
                 Err(crate::linux_abi::LINUX_EAGAIN)
