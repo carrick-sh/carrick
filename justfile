@@ -197,7 +197,102 @@ reconcile-inventories *args:
     python3 scripts/migrate/check-runtime-global-state.py --check
     if [ "$status" -ne 0 ]; then
       echo "reconcile-inventories: the line-pinned reconciler refused part of its work (see above); the K1 steps above ran"
+      exit "$status"
     fi
+
+# Verify exit status propagation for reconcile-inventories across refusal, success,
+# and followup failure states without executing real Python migrations.
+test-reconcile-exit-status:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' EXIT
+
+    cp "{{justfile()}}" "$tmp_dir/justfile"
+    mkdir -p "$tmp_dir/bin" "$tmp_dir/scripts/migrate"
+
+    printf '%s\n' '#!/usr/bin/env bash' 'script="$1"' 'shift' 'exec bash "$script" "$@"' > "$tmp_dir/bin/python3"
+    chmod +x "$tmp_dir/bin/python3"
+
+    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_RECONCILE_STATUS:-0}"' > "$tmp_dir/scripts/migrate/reconcile-line-pinned-inventories.py"
+
+    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_CHECK_K1_INVENTORY_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/check-k1-file-authority-inventory.py"
+
+    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_REBIND_K1_TAXONOMY_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/rebind-k1-taxonomy.py"
+
+    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_CHECK_K1_TAXONOMY_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/check-k1-file-authority-taxonomy.py"
+
+    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_CHECK_RUNTIME_ABORTS_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/check-runtime-aborts.py"
+
+    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_CHECK_RUNTIME_GLOBAL_STATE_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/check-runtime-global-state.py"
+
+    chmod +x "$tmp_dir/scripts/migrate"/*.py
+
+    echo "Running case: initial_refusal_survives_successful_followups"
+    for expected_status in 1 2; do
+        set +e
+        out_refusal=$(
+            PATH="$tmp_dir/bin:$PATH" \
+            STUB_RECONCILE_STATUS="$expected_status" \
+            STUB_FOLLOWUP_STATUS=0 \
+            just --justfile "$tmp_dir/justfile" --working-directory "$tmp_dir" reconcile-inventories 2>&1
+        )
+        rc_refusal=$?
+        set -e
+        if [ "$rc_refusal" -ne "$expected_status" ]; then
+            echo "ASSERTION FAILED [initial_refusal_survives_successful_followups]: expected exit status $expected_status, got $rc_refusal" >&2
+            echo "Output was:" >&2
+            echo "$out_refusal" >&2
+            exit 1
+        fi
+        if ! echo "$out_refusal" | grep -q "reconcile-inventories: the line-pinned reconciler refused part of its work"; then
+            echo "ASSERTION FAILED [initial_refusal_survives_successful_followups]: missing review diagnostic" >&2
+            exit 1
+        fi
+    done
+
+    echo "Running case: initial_success_and_followups_succeed"
+    set +e
+    out_success=$(
+        PATH="$tmp_dir/bin:$PATH" \
+        STUB_RECONCILE_STATUS=0 \
+        STUB_FOLLOWUP_STATUS=0 \
+        just --justfile "$tmp_dir/justfile" --working-directory "$tmp_dir" reconcile-inventories 2>&1
+    )
+    rc_success=$?
+    set -e
+    if [ "$rc_success" -ne 0 ]; then
+        echo "ASSERTION FAILED [initial_success_and_followups_succeed]: expected exit status 0, got $rc_success" >&2
+        echo "Output was:" >&2
+        echo "$out_success" >&2
+        exit 1
+    fi
+    if echo "$out_success" | grep -q "reconcile-inventories: the line-pinned reconciler refused part of its work"; then
+        echo "ASSERTION FAILED [initial_success_and_followups_succeed]: unexpected review diagnostic" >&2
+        exit 1
+    fi
+
+    echo "Running case: followup_failure_is_nonzero"
+    for init_status in 0 1; do
+        set +e
+        out_followup=$(
+            PATH="$tmp_dir/bin:$PATH" \
+            STUB_RECONCILE_STATUS="$init_status" \
+            STUB_FOLLOWUP_STATUS=3 \
+            just --justfile "$tmp_dir/justfile" --working-directory "$tmp_dir" reconcile-inventories 2>&1
+        )
+        rc_followup=$?
+        set -e
+        if [ "$rc_followup" -eq 0 ]; then
+            echo "ASSERTION FAILED [followup_failure_is_nonzero]: expected non-zero exit status, got 0" >&2
+            echo "Output was:" >&2
+            echo "$out_followup" >&2
+            exit 1
+        fi
+    done
+
+    echo "test-reconcile-exit-status: all cases passed"
 
 
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml
