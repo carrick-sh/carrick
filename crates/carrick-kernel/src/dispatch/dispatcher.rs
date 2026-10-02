@@ -523,6 +523,11 @@ impl SyscallDispatcher {
         // Fork preparation reads an exact revision and produces a private
         // projection. Publication validates the revision below; no host alias
         // is acquired while taking this snapshot.
+        if mode == crate::kernel::CloneObjectMode::Copy
+            && self.mem_view().fork_backing_is_unsettled()
+        {
+            return Err(PrepareDispatchMmForkError::UnsettledEl1Backing);
+        }
         let parent_mm = self.mm_binding.current.load_full();
         let (parent_revision, child_mm, backend_plan) = match mode {
             crate::kernel::CloneObjectMode::Share => {
