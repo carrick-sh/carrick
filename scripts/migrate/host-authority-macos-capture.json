@@ -1547,15 +1547,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 128327,
-        "byte_start": 128313,
+        "byte_end": 128203,
+        "byte_start": 128189,
         "column": 20,
         "column_end": 34,
         "column_start": 20,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 2959,
-        "line_end": 2959,
-        "line_start": 2959
+        "line": 2961,
+        "line_end": 2961,
+        "line_start": 2961
       }
     },
     {
@@ -2063,15 +2063,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 5757,
-        "byte_start": 5732,
+        "byte_end": 6062,
+        "byte_start": 6037,
         "column": 16,
         "column_end": 41,
         "column_start": 16,
         "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-        "line": 142,
-        "line_end": 142,
-        "line_start": 142
+        "line": 147,
+        "line_end": 147,
+        "line_start": 147
       }
     },
     {
@@ -2477,15 +2477,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 5861,
-        "byte_start": 5857,
+        "byte_end": 6166,
+        "byte_start": 6162,
         "column": 10,
         "column_end": 14,
         "column_start": 10,
         "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-        "line": 147,
-        "line_end": 147,
-        "line_start": 147
+        "line": 152,
+        "line_end": 152,
+        "line_start": 152
       }
     },
     {
@@ -4040,15 +4040,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 9497,
-        "byte_start": 9489,
+        "byte_end": 12788,
+        "byte_start": 12780,
         "column": 17,
         "column_end": 25,
         "column_start": 17,
         "file": "crates/carrick-mem/src/elf.rs",
-        "line": 267,
-        "line_end": 267,
-        "line_start": 267
+        "line": 356,
+        "line_end": 356,
+        "line_start": 356
       }
     },
     {
@@ -4061,15 +4061,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 10233,
-        "byte_start": 10225,
+        "byte_end": 13524,
+        "byte_start": 13516,
         "column": 17,
         "column_end": 25,
         "column_start": 17,
         "file": "crates/carrick-mem/src/elf.rs",
-        "line": 288,
-        "line_end": 288,
-        "line_start": 288
+        "line": 377,
+        "line_end": 377,
+        "line_start": 377
       }
     },
     {
@@ -4082,15 +4082,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 68501,
-        "byte_start": 68493,
+        "byte_end": 68332,
+        "byte_start": 68324,
         "column": 20,
         "column_end": 28,
         "column_start": 20,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 1412,
-        "line_end": 1412,
-        "line_start": 1412
+        "line": 1403,
+        "line_end": 1403,
+        "line_start": 1403
       }
     },
     {
@@ -4103,15 +4103,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 68610,
-        "byte_start": 68602,
+        "byte_end": 68441,
+        "byte_start": 68433,
         "column": 81,
         "column_end": 89,
         "column_start": 81,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 1414,
-        "line_end": 1414,
-        "line_start": 1414
+        "line": 1405,
+        "line_end": 1405,
+        "line_start": 1405
       }
     },
     {
@@ -4123,15 +4123,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55859,
-        "byte_start": 55846,
+        "byte_end": 55450,
+        "byte_start": 55437,
         "column": 16,
         "column_end": 29,
         "column_start": 16,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 1521,
-        "line_end": 1521,
-        "line_start": 1521
+        "line": 1512,
+        "line_end": 1512,
+        "line_start": 1512
       }
     },
     {
@@ -4143,15 +4143,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 56338,
-        "byte_start": 56325,
+        "byte_end": 55929,
+        "byte_start": 55916,
         "column": 29,
         "column_end": 42,
         "column_start": 29,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 1529,
-        "line_end": 1529,
-        "line_start": 1529
+        "line": 1520,
+        "line_end": 1520,
+        "line_start": 1520
       }
     },
     {
@@ -6096,15 +6096,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 5915,
-        "byte_start": 5895,
+        "byte_end": 6220,
+        "byte_start": 6200,
         "column": 25,
         "column_end": 45,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-        "line": 148,
-        "line_end": 148,
-        "line_start": 148
+        "line": 153,
+        "line_end": 153,
+        "line_start": 153
       }
     },
     {
@@ -6117,15 +6117,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 5981,
-        "byte_start": 5961,
+        "byte_end": 6286,
+        "byte_start": 6266,
         "column": 17,
         "column_end": 37,
         "column_start": 17,
         "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-        "line": 150,
-        "line_end": 150,
-        "line_start": 150
+        "line": 155,
+        "line_end": 155,
+        "line_start": 155
       }
     },
     {
@@ -10214,15 +10214,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 40219,
-        "byte_start": 40203,
+        "byte_end": 40144,
+        "byte_start": 40128,
         "column": 44,
         "column_end": 60,
         "column_start": 44,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 1086,
-        "line_end": 1086,
-        "line_start": 1086
+        "line": 1084,
+        "line_end": 1084,
+        "line_start": 1084
       }
     },
     {
@@ -10377,15 +10377,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 5706,
-        "byte_start": 5690,
+        "byte_end": 6011,
+        "byte_start": 5995,
         "column": 9,
         "column_end": 25,
         "column_start": 9,
         "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-        "line": 140,
-        "line_end": 140,
-        "line_start": 140
+        "line": 145,
+        "line_end": 145,
+        "line_start": 145
       }
     },
     {
@@ -11956,9 +11956,9 @@
       }
     }
   ],
-  "rows_sha256": "02a08fd546f8e939a66a27436746213868def1fc07104bae0425651c64ab3f22",
+  "rows_sha256": "6b5bb9ed797f7efefe8c59d92215efcb8583437b5f53b965cb20f7b23fa10942",
   "schema": 1,
-  "source_head": "2eee80ba33bda8142fc2c87d5f5ba4a4035cafdb",
+  "source_head": "36cfd78287a63ad697f84380f04f641b58c012ca",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
