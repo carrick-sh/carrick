@@ -131,9 +131,14 @@ these authority rules. The director must re-register it.
 
 These need a director ruling or the Docker oracle:
 
-- `gettid` is already served at EL1 by the legacy `CONTEXTIDR_EL1` shim
-  (`carrick-mem/src/memory.rs:466`). Does it collide with the "no EL1
-  `gettid`" second-path rule? Needs a census count and a ruling.
+- Resolved (director ruling, 2026-10-02): `gettid` moves into the typed
+  lifecycle venue as the immutable visible TID published before birth.
+  The legacy `CONTEXTIDR_EL1` shim and its identity stamps/readers are
+  deleted in the same change. The pre-change live census recorded 91 Born
+  threads and 89 forwarded `gettid` calls; this is attribution evidence,
+  not a completed three-scale acceptance receipt. Home-record exit
+  declines remain required; adopted jobs must not return to the zone as
+  an exit workaround.
 - The host lane returns EFAULT and rolls back when the `CLONE_PARENT_SETTID`
   copyout faults (`binding.rs:1999-2008`); Linux likely does not. Check with
   the Docker oracle before changing either lane.

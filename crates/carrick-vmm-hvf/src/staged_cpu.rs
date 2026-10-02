@@ -206,9 +206,8 @@ impl StagedCpu {
         self.snapshot.actlr_el1 = value;
     }
 
-    /// The EL1 `gettid` word and the EL0 read-only thread pointer.
+    /// The packed process/thread identity used by the EL0 vDSO.
     pub(crate) fn stamp_guest_thread_id(&mut self, packed: u64) {
-        self.snapshot.contextidr_el1 = packed & 0xffff_ffff;
         self.snapshot.tpidrro_el0 = packed;
     }
 
@@ -268,7 +267,7 @@ mod tests {
         assert_eq!(cpu.get_reg(Reg::X(8)).unwrap(), 221);
         assert_eq!(cpu.get_sys_reg(SysReg::Tcr).unwrap(), 7);
         assert_eq!(cpu.get_vreg(31).unwrap(), 5);
-        assert_eq!(cpu.snapshot().contextidr_el1, 4);
+        assert_eq!(cpu.snapshot().contextidr_el1, 0);
         assert_eq!(cpu.snapshot().tpidrro_el0, (9 << 32) | 4);
         assert!(cpu.get_reg(Reg::X(31)).is_err());
         assert!(cpu.get_sys_reg(SysReg::CntkctlEl1).is_err());

@@ -380,6 +380,9 @@ impl ThreadIdentityPool {
             .pid_identity
             .as_ref()
             .map_or(identity.key.tid.raw() as u32, |id| id.visible_id());
+        if !control.publish_visible_tid(visible_tid) {
+            return false;
+        }
         let mut entries = self.entries.lock();
         if entries.try_reserve(1).is_err()
             || self

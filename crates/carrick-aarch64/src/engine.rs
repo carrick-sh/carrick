@@ -4311,15 +4311,8 @@ fn seed_sibling_snapshot(
     // PSTATE the new thread must run with. Without this the sibling restores the
     // EL1h trap-time PSTATE and re-enters at the wrong exception level.
     snap.pstate = parent.spsr_el1;
-    // The gettid fast-path stamp (CONTEXTIDR_EL1) is PER-THREAD identity and
-    // must not be inherited: a sibling carrying the parent's stamp answered
-    // gettid(2) at EL1 with the LEADER's tid, so a container guest's
-    // tgkill(gettid_of_sibling) targeted the wrong thread and the suspended
-    // sibling never woke (sigsuspendxthread). Zero means "unstamped" — the
-    // EL1 handler then traps to the host, whose dispatch answers from the
-    // kernel graph's ThreadKey. A process-fork child leader is re-stamped by
-    // its bootstrap (`stamp_guest_tid_checked`); a clone sibling stays
-    // trap-served, matching the raw lane's proven behavior.
+    // A new logical thread starts with a neutral architectural CONTEXTIDR.
+    // Its Linux identity is owned by its lifecycle control slot.
     snap.contextidr_el1 = 0;
     snap
 }
@@ -5575,10 +5568,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
-        // Stamp the per-thread scratch sysreg the EL1-vector `gettid` fast path
-        // reads, so `gettid(2)` is serviced at EL1 without a host trap. Genuinely
-        // per-VMM (see `Aarch64Vcpu::stamp_guest_thread_id`): HVF stamps TPIDR_EL1;
-        // KVM no-ops (TPIDR_EL1 is its live-x9 stash) and traps `gettid` to the host.
+        // Publish the packed identity consumed by the EL0 vDSO. EL1 gettid
+        // reads the typed lifecycle slot, independently of the physical vCPU.
         self.vcpu.stamp_guest_thread_id(tid)
     }
 
