@@ -2486,6 +2486,18 @@ impl SyscallDispatcher {
             .resident_frame_grant_plan(permit, address, max_len)
     }
 
+    /// Revalidate an already prepared grant using its own authenticated receipt.
+    pub fn published_frame_grant_plan<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+        protection: LinuxProtFlags,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+    ) -> Option<ResidentFrameGrantPlan<'permit>> {
+        self.mem_view()
+            .published_frame_grant_plan(permit, grant, protection, receipt)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[inline]
     pub fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {

@@ -3955,3 +3955,160 @@ fn delegated_admission_releases_host_marks_over_the_roots_holes() {
     assert!(!protections.range_no_access(layout.heap_base, (16 * PAGE) as usize));
     assert!(!protections.range_no_access(layout.mmap_base, (16 * PAGE) as usize));
 }
+
+#[test]
+fn delegated_published_grant_settles_after_backing_leaves_pristine() {
+    use carrick_guest_mem::GuestVa;
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    let fault = base + 2 * PAGE;
+    root.guest_mmap(
+        Placement::Fixed(fault),
+        2 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let (start, len) = dispatcher
+        .with_resident_frame_grant_plan_for_test(fault, STOCK_WINDOW, |plan| {
+            dispatcher.adopt_frame_grant_provenance(&plan);
+            let state = dispatcher
+                .deferred_anonymous_state(dispatcher.mm_authority().mm_id)
+                .unwrap();
+            state
+                .begin_pristine_materialization(GuestVa(plan.start()), plan.len() as usize)
+                .unwrap()
+                .unwrap()
+                .commit();
+            (plan.start(), plan.len())
+        })
+        .unwrap();
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(fault, STOCK_WINDOW, |_| ())
+            .is_none(),
+        "prepared publication must not authorize a second fresh grant"
+    );
+    let grant = carrick_el1_abi::FrameGrantResidencyIdentity {
+        mm_key: dispatcher.mm_authority().mm_id.raw(),
+        semantic_base: start,
+        physical_ipa: 0x1234_0000,
+        len,
+        mapping_id: 1,
+        frame_id: 1,
+        owner_generation: 1,
+        inventory_revision: 1,
+    };
+    use carrick_mmu_core::aarch64::GuestLeafPublication;
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorApplied, DescriptorOp, DescriptorOutcome, DescriptorReceipt,
+        DescriptorTxn, DescriptorTxnId, PageSpan, ReclaimedTables, TableGrants,
+    };
+    let nz = |value| std::num::NonZeroU64::new(value).unwrap();
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: nz(grant.mm_key),
+            generation: nz(1),
+        },
+        root: SubstrateGpa(0x8800_0000_0000),
+        op: DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: start,
+                ipa: grant.physical_ipa,
+                len,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(fault, PAGE),
+            backing: BackingIdentity {
+                frame_id: nz(grant.frame_id),
+                mapping_id: nz(grant.mapping_id),
+                owner_generation: nz(grant.owner_generation),
+                inventory_revision: nz(grant.inventory_revision),
+            },
+        },
+        tables: TableGrants::NONE,
+    };
+    let receipt = txn
+        .verify_receipt(&DescriptorReceipt {
+            id: txn.id,
+            digest: txn.digest(),
+            outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                pages: len / PAGE,
+                live_stores: 1,
+                flush_required: true,
+                resident: PageSpan::new(fault, PAGE),
+                tables_linked: 0,
+                reclaimed: ReclaimedTables::NONE,
+            }),
+        })
+        .unwrap();
+    crate::dispatch::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            let mut wrong_owner = grant;
+            wrong_owner.owner_generation += 1;
+            assert!(
+                dispatcher
+                    .published_frame_grant_plan(
+                        permit,
+                        wrong_owner,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                        &receipt
+                    )
+                    .is_none()
+            );
+            let mut wrong_mm = grant;
+            wrong_mm.mm_key += 1;
+            assert!(
+                dispatcher
+                    .published_frame_grant_plan(
+                        permit,
+                        wrong_mm,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                        &receipt
+                    )
+                    .is_none()
+            );
+        },
+    );
+    root.guest_mprotect(fault, PAGE, ReservationProtection::from_bits(1).unwrap());
+    crate::dispatch::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            assert!(
+                dispatcher
+                    .published_frame_grant_plan(
+                        permit,
+                        grant,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                        &receipt
+                    )
+                    .is_none(),
+                "a reprotected page cannot settle its old publication"
+            );
+        },
+    );
+    root.guest_mprotect(fault, PAGE, ReservationProtection::READ_WRITE);
+    crate::dispatch::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            let plan = dispatcher.published_frame_grant_plan(permit, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt)
+                .expect("a verified publication settles its still-armed page even after physical preparation");
+            assert_eq!((plan.start(), plan.len()), (start, len));
+            dispatcher.commit_resident_frame_grant(plan);
+        },
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(fault, |_| ())
+            .is_none()
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(fault + PAGE, |_| ())
+            .is_some()
+    );
+    assert!(!dispatcher.mem().lock().first_touch_stock.is_empty());
+}
