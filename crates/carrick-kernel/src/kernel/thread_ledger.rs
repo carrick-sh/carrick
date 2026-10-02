@@ -101,6 +101,7 @@ struct PooledThreadIdentity {
     birth_resources: super::objects::ReservedThreadResources,
     retirement: super::thread_retirement::RetirementReservation,
     revisions: super::revision_capacity::RevisionReservation,
+    adoption: Option<super::thread_adoption::ThreadBirthAdoptionReservation>,
 }
 
 impl PooledThreadIdentity {
@@ -131,9 +132,22 @@ pub(in crate::kernel) struct PublishedAbiThread {
     pub(in crate::kernel) control: super::objects::ThreadControlLease,
     pub(in crate::kernel) storage: super::thread_retirement::RetirementReservation,
     pub(in crate::kernel) revisions: super::revision_capacity::RevisionReservation,
+    pub(in crate::kernel) adoption: Option<super::thread_adoption::ThreadBirthAdoptionReservation>,
 }
 
 impl ThreadIdentityPool {
+    fn take_adoption(
+        &self,
+        key: super::objects::ThreadKey,
+    ) -> Option<super::thread_adoption::ThreadBirthAdoptionReservation> {
+        self.published
+            .lock()
+            .iter_mut()
+            .find(|owned| owned.control.identity().1 == key)?
+            .adoption
+            .take()
+    }
+
     pub(in crate::kernel) fn take_published(
         &self,
         key: super::objects::ThreadKey,
@@ -243,6 +257,18 @@ impl ThreadIdentityPool {
         let Some(revisions) = task.reserve_thread_revisions(record.revision) else {
             return false;
         };
+        let adoption = match task.thread_adoption_factory() {
+            Some(factory) => {
+                let Some(reservation) = factory.reserve(identity.key) else {
+                    return false;
+                };
+                if reservation.owner() != task.key() || reservation.thread() != identity.key {
+                    return false;
+                }
+                Some(reservation)
+            }
+            None => None,
+        };
         let control = task.allocate_thread_control(identity.key);
         let page = control.lifecycle();
         let visible_tid = identity
@@ -250,6 +276,15 @@ impl ThreadIdentityPool {
             .as_ref()
             .map_or(identity.key.tid.raw() as u32, |id| id.visible_id());
         let mut entries = self.entries.lock();
+        if entries.try_reserve(1).is_err()
+            || self
+                .published
+                .lock()
+                .try_reserve(entries.len() + 1)
+                .is_err()
+        {
+            return false;
+        }
         let Some(entry) = (0..carrick_el1_abi::THREAD_POOL_ENTRIES).find_map(|index| {
             page.stock(
                 index,
@@ -272,6 +307,7 @@ impl ThreadIdentityPool {
             birth_resources,
             retirement,
             revisions,
+            adoption,
         });
         true
     }
@@ -521,6 +557,7 @@ impl ThreadLedger {
                                 control,
                                 storage: pooled.retirement,
                                 revisions: pooled.revisions,
+                                adoption: pooled.adoption,
                             });
                         published.push(publication);
                         abi_count += 1;
@@ -560,6 +597,7 @@ impl ThreadLedger {
                     control,
                     storage: retirement,
                     revisions,
+                    adoption: _,
                 } in exits
                 {
                     let record = state.tasks.get(&task_id).unwrap_or_else(|| {
@@ -868,6 +906,24 @@ impl Kernel {
         let _ = self.registry().settled();
     }
 
+    /// Consume only the born thread's exact process-owned first-entry capacity.
+    pub fn take_thread_birth_adoption(
+        &self,
+        task: super::objects::TaskKey,
+        thread: super::objects::ThreadKey,
+    ) -> Option<super::thread_adoption::ThreadBirthAdoptionReservation> {
+        let state = self.registry().settled().read();
+        let record = state
+            .tasks
+            .get(&task.id)
+            .filter(|record| record.task.key() == task)?;
+        record
+            .task
+            .thread(thread.tid)
+            .filter(|live| live.key() == thread)?;
+        record.thread_pool.take_adoption(thread)
+    }
+
     /// Tids standing in `task`'s identity pool (diagnostics and tests).
     pub fn standing_thread_identities(&self, task: super::ids::TaskId) -> Vec<LinuxTid> {
         self.registry()
@@ -907,6 +963,74 @@ mod tests {
 
     fn fork_plan() -> ClonePlan {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
+    }
+
+    #[test]
+    fn lifecycle_adoption_capacity_declines_before_birth_in_only_its_owner() {
+        use crate::kernel::thread_adoption::{
+            ThreadBirthAdoptionFactory, ThreadBirthAdoptionReservation,
+        };
+        #[derive(Debug)]
+        struct Factory {
+            owner: crate::kernel::TaskKey,
+            decline: bool,
+        }
+        impl ThreadBirthAdoptionFactory for Factory {
+            fn owner(&self) -> crate::kernel::TaskKey {
+                self.owner
+            }
+            fn reserve(
+                &self,
+                thread: crate::kernel::ThreadKey,
+            ) -> Option<ThreadBirthAdoptionReservation> {
+                (!self.decline).then(|| ThreadBirthAdoptionReservation::new(self.owner, thread, ()))
+            }
+        }
+        let (kernel, root) = bootstrap(9_696);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_697),
+                "adoption-peer".into(),
+                None,
+            )
+            .unwrap();
+        root.task()
+            .install_thread_adoption_factory(Arc::new(Factory {
+                owner: root.task().key(),
+                decline: true,
+            }))
+            .unwrap();
+        let peer_factory = Arc::new(Factory {
+            owner: peer.task().key(),
+            decline: false,
+        });
+        assert!(
+            root.task()
+                .install_thread_adoption_factory(peer_factory.clone())
+                .is_err()
+        );
+        peer.task()
+            .install_thread_adoption_factory(peer_factory)
+            .unwrap();
+        let before = kernel.ids().counts();
+        let identity = super::ThreadIdentity::reserve(&kernel, root.task()).unwrap();
+        let state = kernel.registry().settled().read();
+        let pool = &state.tasks.get(&root.task().key().id).unwrap().thread_pool;
+        assert!(
+            !pool.push(&kernel, &state, root.task(), NsUid::ROOT, identity),
+            "failed adoption capacity must leave the guest clone on its host fallback"
+        );
+        assert_eq!(kernel.ids().counts(), before);
+        assert_eq!(
+            root.thread().control_lease().lifecycle().claim_any(),
+            Err(carrick_el1_abi::TransitionError::PoolEmpty)
+        );
+        let identity = super::ThreadIdentity::reserve(&kernel, peer.task()).unwrap();
+        let pool = &state.tasks.get(&peer.task().key().id).unwrap().thread_pool;
+        assert!(pool.push(&kernel, &state, peer.task(), NsUid::ROOT, identity));
+        assert!(peer.exact_thread_is_live());
     }
 
     #[test]
