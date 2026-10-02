@@ -354,6 +354,46 @@ impl<'a> FsView<'a> {
             .err()
     }
 
+    /// Check the already admitted directory object, retaining its identity
+    /// through publication rather than resolving its name a second time.
+    pub(super) fn may_write_admitted_parent(
+        &self,
+        parent: &carrick_vfs::vfs::rootfs::ResolvedParent,
+    ) -> Result<(), LinuxErrno> {
+        if self.dac_overrides_permissions() {
+            return Ok(());
+        }
+        let Some(fd) = parent.parent_fd.as_ref() else {
+            let parent_path = parent
+                .rel
+                .as_path()
+                .parent()
+                .unwrap_or(std::path::Path::new(""));
+            return self
+                .may_write(&format!("/{}", parent_path.display()))
+                .map_or(Ok(()), Err);
+        };
+        use std::os::fd::AsRawFd;
+        let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+            return Err(LINUX_ENOENT);
+        }
+        let record = self
+            .fs
+            .rootfs_vfs
+            .get_or_fill_host_inode(fd.as_raw_fd(), &stat);
+        let (uid, gid) = self.dac_identity();
+        crate::dispatch::dac_check(
+            uid,
+            gid,
+            record.uid,
+            record.gid,
+            record.mode,
+            true,
+            LINUX_W_OK,
+        )
+    }
+
     /// Validate an `execve(2)`/`execveat(2)` target the way the kernel does
     /// BEFORE it reads the image: resolve the path (surfacing ENOENT / ENOTDIR /
     /// ELOOP / ENAMETOOLONG and the no-search-permission EACCES) and require

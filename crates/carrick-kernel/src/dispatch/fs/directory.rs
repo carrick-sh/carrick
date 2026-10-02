@@ -1085,6 +1085,31 @@ impl<'a> FsView<'a> {
             } else {
                 None
             };
+            // Ordinary rootfs names are checked under their parent reservation.
+            // Retain those capabilities through DAC, the host link, and cache
+            // publication instead of doing dispatcher preflight path walks.
+            if anon_fd_candidate.is_none() && !old.is_empty() {
+                let source = this.resolve_at_path(olddirfd, &old)?;
+                let target = this.resolve_at_path(newdirfd, &new_path)?;
+                if flags & LINUX_AT_SYMLINK_FOLLOW == 0
+                    && this.fs.vfs_mounts.resolve(&source).is_none()
+                    && this.fs.vfs_mounts.resolve(&target).is_none()
+                    && !this.is_synthetic_virtual_path(cx.kernel, &source)
+                    && !this.is_synthetic_virtual_path(cx.kernel, &target)
+                {
+                    let result = this.fs.rootfs_vfs.link_with_parent_check(
+                        &source, &target, |parent| this.may_write_admitted_parent(parent),
+                    );
+                    return Ok(match result {
+                        Ok(()) => {
+                            this.dnotify_child(cx.kernel, &target, LinuxDnotifyMask::CREATE);
+                            crate::el1_inotify::invalidate_name_cache_all();
+                            DispatchOutcome::Returned { value: 0 }
+                        }
+                        Err(errno) => DispatchOutcome::errno(errno),
+                    });
+                }
+            }
             let mut source_kind = None;
             let resolved_old = if old.is_empty() {
                 if !this.fd_is_valid(olddirfd as i32) {
@@ -1093,6 +1118,7 @@ impl<'a> FsView<'a> {
                 None
             } else {
                 let resolved = this.resolve_at_path(olddirfd, &old)?;
+                carrick_observability::probes::fs_op("path-role", "dispatcher-source", 0);
                 let source_metadata = this.layered_metadata(&resolved).ok();
                 source_kind = source_metadata.as_ref().map(|metadata| metadata.kind);
                 let exists =
@@ -1118,6 +1144,7 @@ impl<'a> FsView<'a> {
                 Some(resolved)
             };
             let resolved_new = this.resolve_at_path(newdirfd, &new_path)?;
+            carrick_observability::probes::fs_op("path-role", "dispatcher-target", 0);
             if this.is_synthetic_virtual_path(cx.kernel, &resolved_new)
                 || this.layered_metadata(&resolved_new).is_ok()
             {
@@ -1136,6 +1163,7 @@ impl<'a> FsView<'a> {
                         if s.is_empty() { "/".to_string() } else { s }
                     })
                     .unwrap_or_else(|| "/".to_string());
+                carrick_observability::probes::fs_op("path-role", "permission-parent", 0);
                 match this.layered_metadata(&new_parent) {
                     Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
                     Ok(md) if md.kind != RootFsEntryKind::Directory => {
