@@ -9064,8 +9064,6 @@ mod stub {
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(guest_internal_write_fault(address: u64, length: u64, phase: u32, error: &str));
     stub!(hvpatch_exec_publication(output: u64, len: u64, invalidations: u32));
-    }
-
     stub!(guest_internal_read_fault(page: u64, length: u64, phase: u32, live_descriptor: u64));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
     stub!(kick_in_kernel(pc: u64, el: u32));
