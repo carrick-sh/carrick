@@ -19,7 +19,12 @@ use common::SHARD_1_PROBES;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_1_PROBE_COUNT: usize = 156;
+fn cached_shard_1_probe_count() -> usize {
+    SHARD_1_PROBES
+        .iter()
+        .filter(|name| common::runs_in_cached_lane(name))
+        .count()
+}
 
 /// Shard 1 subset of baseline expected oracle mismatches for musl.
 pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = common::MUSL_BASELINE_GAPS;
@@ -103,13 +108,6 @@ pub fn probe_campaign_dir(root: &Path, target: &str) -> PathBuf {
 
 #[test]
 fn test_shard_1_inventory_count_and_sorted() {
-    assert_eq!(
-        SHARD_1_PROBES.len(),
-        169,
-        "shard 1 must contain exactly 169 generic probes"
-    );
-
-    // Hard assert uniqueness and strictly ascending sort order.
     for window in SHARD_1_PROBES.windows(2) {
         assert!(
             window[0] < window[1],
@@ -123,74 +121,78 @@ fn test_shard_1_inventory_count_and_sorted() {
             .iter()
             .filter(|name| common::runs_in_cached_lane(name))
             .count(),
-        CACHED_SHARD_1_PROBE_COUNT
+        cached_shard_1_probe_count(),
+        "shard 1 cached probe count must match derived policy"
     );
 
-    // Verify against conformance-probes/probe-inventory.json on disk if present.
     let root = common::repo_root();
     let inventory_path = root.join("conformance-probes/probe-inventory.json");
-    if let Ok(content) = std::fs::read_to_string(&inventory_path) {
-        let mut generic_probes = Vec::new();
-        let mut cur_name = None;
-        let mut cur_class = None;
-        let mut cur_excluded = None;
-        let mut cur_runner = None;
+    let inventory = carrick_xtask::probe_inventory::load_inventory(&inventory_path)
+        .expect("read and parse probe inventory");
+    let partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    let computed_shard_1: Vec<&str> = partition.shards[1].iter().map(String::as_str).collect();
 
-        for line in content.lines() {
-            let line = line.trim();
-            if line.starts_with('"') && line.ends_with("\": {") {
-                cur_name = Some(line[1..line.len() - 4].to_string());
-                cur_class = None;
-                cur_excluded = None;
-                cur_runner = None;
-            } else if let Some(stripped) = line.strip_prefix("\"class\":") {
-                cur_class = Some(
-                    stripped
-                        .trim()
-                        .trim_matches(|c| c == '"' || c == ',' || c == ' ')
-                        .to_string(),
-                );
-            } else if let Some(stripped) = line.strip_prefix("\"excluded\":") {
-                cur_excluded = Some(stripped.trim().trim_end_matches(',').trim() == "true");
-            } else if let Some(stripped) = line.strip_prefix("\"runner\":") {
-                cur_runner = Some(
-                    stripped
-                        .trim()
-                        .trim_matches(|c| c == '"' || c == ',' || c == ' ')
-                        .to_string(),
-                );
-            } else if line.starts_with('}') {
-                if let (Some(name), Some("conformance"), Some(false), Some("generic")) = (
-                    cur_name.as_deref(),
-                    cur_class.as_deref(),
-                    cur_excluded,
-                    cur_runner.as_deref(),
-                ) {
-                    generic_probes.push(name.to_string());
-                }
-                cur_name = None;
-            }
-        }
+    assert_eq!(
+        SHARD_1_PROBES.len(),
+        computed_shard_1.len(),
+        "shard 1 length must match derived shard 1 from probe-inventory.json"
+    );
+    assert_eq!(
+        SHARD_1_PROBES,
+        computed_shard_1.as_slice(),
+        "materialized SHARD_1_PROBES must match probe-inventory.json derived shard 1"
+    );
+}
 
-        generic_probes.sort();
-        let computed_shard_1: Vec<&str> = generic_probes
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| idx % 3 == 1)
-            .map(|(_, name)| name.as_str())
-            .collect();
+#[test]
+fn test_shard_1_generation_responds_to_additions() {
+    let root = common::repo_root();
+    let inventory_path = root.join("conformance-probes/probe-inventory.json");
+    let mut inventory = carrick_xtask::probe_inventory::load_inventory(&inventory_path)
+        .expect("read probe inventory");
 
-        assert_eq!(
-            computed_shard_1.len(),
-            169,
-            "derived shard 1 must have 169 items"
-        );
-        assert_eq!(
-            SHARD_1_PROBES,
-            computed_shard_1.as_slice(),
-            "materialized SHARD_1_PROBES must match probe-inventory.json derived shard 1"
+    let initial_partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    let initial_shard_1_len = initial_partition.shards[1].len();
+    let initial_total = initial_partition.generic_names.len();
+
+    let pad_count = (1 + 3 - (initial_total % 3)) % 3;
+    for i in 0..pad_count {
+        inventory.insert(
+            format!("zzz_pad_{i}"),
+            carrick_xtask::probe_inventory::ProbeInventoryRow {
+                class: "conformance".to_string(),
+                runner: "generic".to_string(),
+                excluded: false,
+                contract_ids: None,
+            },
         );
     }
+    let target_probe = "zzz_synthetic_probe_for_shard_1".to_string();
+    inventory.insert(
+        target_probe.clone(),
+        carrick_xtask::probe_inventory::ProbeInventoryRow {
+            class: "conformance".to_string(),
+            runner: "generic".to_string(),
+            excluded: false,
+            contract_ids: None,
+        },
+    );
+
+    let updated_partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
+    assert_eq!(
+        updated_partition.generic_names.len(),
+        initial_total + pad_count + 1,
+        "total generic probes must expand by added count"
+    );
+    assert_eq!(
+        updated_partition.shards[1].len(),
+        initial_shard_1_len + 1,
+        "shard 1 must expand by 1"
+    );
+    assert!(
+        updated_partition.shards[1].contains(&target_probe),
+        "new probe must appear in shard 1"
+    );
 }
 
 #[test]

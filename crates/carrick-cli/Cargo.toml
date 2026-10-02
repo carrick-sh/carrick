@@ -110,6 +110,7 @@ rustc-demangle.workspace = true
 
 [dev-dependencies]
 carrick-test-support = { path = "../carrick-test-support" }
+carrick-xtask = { path = "../carrick-xtask" }
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true

@@ -2928,16 +2928,8 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// execve. `childrusage` covers wait4/RUSAGE_CHILDREN CPU usage of reaped
 /// children. The seven `epollzone*` probes (`close`, `eintr`, `mixed`,
 /// `pingpong`, `sigmask`, `timeout`, `trigger`) cover the in-zone epoll
-/// served in EL1. `hostreadunmap` covers host-call guest sources (`write`,
-/// `pwritev`) racing a sibling's unmap. `epollstopcont` covers a sibling's
-/// `epoll_wait` interrupted by a handler-free stop and continue.
-/// `nxwritableimage` covers non-executable `.data`, `.bss`,
-/// stack and heap pages in the first image, a fork child and after execve.
-/// `carrierwindowaccess` covers Carrick's fixed windows being unmapped in a
-/// process that never mapped them, bringing the inventory to 558 sources: 529
-/// conformance sources (506 generic, 23 dedicated), 28 performance sources,
-/// and one helper. Both libc lanes gate 1058 rows.
-const PROBE_SOURCE_COUNT: usize = 558;
+/// served in EL1. Conformance, performance, and helper sources are tracked
+/// in the probe inventory and gated across both libc lanes.
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -3059,12 +3051,30 @@ fn validate_closure_probe_rows(
             inventory_names.difference(source_names).collect::<Vec<_>>()
         ));
     }
-    if source_names.len() != PROBE_SOURCE_COUNT {
-        return Err(format!(
-            "closure probe source denominator is {}, expected {PROBE_SOURCE_COUNT}",
-            source_names.len()
-        ));
-    }
+    let base_path = repo_path("conformance-probes/coverage-base.json");
+    let retirements_path = repo_path("conformance-probes/reviewed-retirements.json");
+    let xtask_inventory: BTreeMap<String, carrick_xtask::probe_inventory::ProbeInventoryRow> =
+        inventory
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    carrick_xtask::probe_inventory::ProbeInventoryRow {
+                        class: v.class.clone(),
+                        runner: v.runner.clone(),
+                        excluded: v.excluded,
+                        contract_ids: None,
+                    },
+                )
+            })
+            .collect();
+    carrick_xtask::probe_coverage::validate_coverage_files(
+        &base_path,
+        &retirements_path,
+        &xtask_inventory,
+        source_names,
+    )
+    .map_err(|e| format!("closure probe coverage ratchet violation: {e}"))?;
 
     let dedicated = DEDICATED_PROBE_RUNNERS
         .iter()
@@ -4706,13 +4716,36 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     }
 
     let sources = all_probe_source_names();
-    assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 23);
-    assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
-    let generic = validate_closure_probe_rows(&inventory(), &sources)
+    let dedicated_len = DEDICATED_PROBE_RUNNERS.len();
+    let inv_map = inventory();
+    assert_eq!(sources.len(), inv_map.len());
+    let generic = validate_closure_probe_rows(&inv_map, &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 506);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 529);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1058);
+    let xtask_inventory: BTreeMap<String, carrick_xtask::probe_inventory::ProbeInventoryRow> =
+        inv_map
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    carrick_xtask::probe_inventory::ProbeInventoryRow {
+                        class: v.class.clone(),
+                        runner: v.runner.clone(),
+                        excluded: v.excluded,
+                        contract_ids: None,
+                    },
+                )
+            })
+            .collect();
+    let counts = carrick_xtask::probe_inventory::derive_counts(&xtask_inventory);
+    assert_eq!(generic.len(), counts.generic_conformance_count);
+    assert_eq!(
+        generic.len() + dedicated_len,
+        counts.total_conformance_count
+    );
+    assert_eq!(
+        2 * (generic.len() + dedicated_len),
+        counts.two_libc_conformance_rows
+    );
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

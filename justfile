@@ -137,7 +137,7 @@ clippy *ARGS:
 # pending; a partial local pass is not matrix completeness.
 lint-domains:
     python3 scripts/conformance/check-next-strategy.py
-    python3 scripts/conformance/regen-next-shards.py --check
+    cargo run --locked -p carrick-xtask -- probe-coverage
     ./scripts/lint-domains.sh
     # The self-tests run FIRST and in the same gate as --check: every one of
     # these scanners keys at least one rule on an exact source PATH, so a crate
