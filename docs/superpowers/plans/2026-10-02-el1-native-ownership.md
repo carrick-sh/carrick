@@ -429,6 +429,34 @@ nor a claim that the early disproof experiment accepts the design.
 `just accept` remains the explicit tooling blocker described below. No
 signed guest or Docker execution belongs to this preparation receipt.
 
+
+Verification/handoff: rebased onto frozen admission `1cf7568e1`.
+`RUSTC_WRAPPER= just test-kernel`, `RUSTC_WRAPPER= just test`,
+`RUSTC_WRAPPER= just clippy` and `RUSTC_WRAPPER= just lint-domains`
+all exited zero in foreground verification. Receipts are
+`/tmp/carrick-n0-final-{test-kernel,test,clippy,lint-domains}.log`.
+The full kernel/host suites ran at `308e2515b`; subsequent changes were
+lint-only metadata on the existing USDT wrapper, a byte-identical test-file
+move, and position-only inventory reconciliation. The focused test was
+rerun after the move. Clippy passed after the USDT annotation; full
+lint-domains passed on clean `b4e7cee9d`. These preparatory exceptions do
+not confer signed or ownership acceptance.
+
+Shared-file changes: `carrick-el1/src/lib.rs` registers the test module;
+`carrick-observability/src/probes.rs` adds a method-local
+`redundant_closure` allowance because the USDT proc macro rejects Clippy's
+suggested bare FnOnce value. The executable closure is unchanged.
+Clean-source reconciliation rebound 28 existing host-authority positions
+and two K1 operation positions, preserving all 601 reviewed rows.
+The macOS compiler census passes as a subset; Linux/FreeBSD/NetBSD
+profiles remain pending. No admission memory/reservation/trap code was
+edited by this N0 slice.
+
+This handoff is **partial N0**, not completion. The sealed API/four compile-fail
+witnesses and the full section-6 transfer/fork/physical-capacity/service-progress
+experiment must still be implemented. No positive early-disproof verdict,
+owner cutover, or `just accept` implementation is claimed.
+
 ### In-flight disposition
 
 | Work | Recommendation |
