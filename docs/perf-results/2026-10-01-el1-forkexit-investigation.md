@@ -213,3 +213,25 @@ and three ignored. These are L4 prerequisites, not a production venue: shared
 control backing, EL1 venue wiring, birth/exit settlement and adoption,
 admission gates, and teardown remain open. No signed acceptance is claimed
 for the rebased tree.
+
+### Control storage and adoption checkpoint
+
+The two-live-process backing contract failed because the original control
+slot was inside the host `Thread` allocation. Mapping it would also expose
+host pointers and locks. Control slots now live in aligned, control-only
+pages owned by a task's arena. `ThreadControlLease` pins the exact slot and
+its `(TaskKey, ThreadKey)`; retaining a pin prevents reuse without retaining
+the task or kernel graph. Released slots are reset before a new claim.
+
+After introducing the pre-adoption lease, the adoption contract failed on
+different slot addresses: the old preparation path allocated fresh storage.
+Preparation now adopts the claim's lease without resetting mask, altstack
+or robust-list state that EL1 may have changed before host adoption.
+
+This is the storage/host-adoption foundation only. No stage-2 mapping or
+production `LifecycleVenue` is installed yet. Process lifecycle pages,
+identity-pool publication to EL1, settle-before-context, conflicting-authority
+gates, exit settlement and carrier teardown still need integration. The
+arena currently retains free pages until the task drops; guest mapping
+retirement has not been implemented or verified. Signed acceptance and the
+full clippy/domain gates remain outstanding for this checkpoint.

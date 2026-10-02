@@ -622,9 +622,9 @@ impl ThreadSignalState {
         }
     }
 
-    pub(crate) fn for_clone_thread(caller: &Self) -> Self {
+    pub(crate) fn for_clone_thread(blocked: SigSet) -> Self {
         Self {
-            blocked: caller.blocked,
+            blocked,
             pending: PendingQueue::default(),
             altstack: None,
             handler_frames: Vec::new(),
@@ -1711,7 +1711,7 @@ mod tests {
         assert!(forked.altstack_enabled());
         assert_eq!(forked.handler_frame_depth(), 1);
 
-        let cloned = ThreadSignalState::for_clone_thread(&caller);
+        let cloned = ThreadSignalState::for_clone_thread(caller.blocked());
         assert_eq!(cloned.blocked(), blocked);
         assert!(cloned.pending().is_empty());
         assert!(!cloned.altstack_enabled());

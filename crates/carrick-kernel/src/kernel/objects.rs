@@ -25,6 +25,8 @@ pub mod session;
 pub mod signal;
 pub mod task;
 pub mod thread;
+mod thread_control;
+pub use thread_control::ThreadControlLease;
 
 pub use self::credentials::Credentials;
 

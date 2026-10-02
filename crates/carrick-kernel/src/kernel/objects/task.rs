@@ -552,6 +552,7 @@ impl DumpableMode {
 #[derive(Debug)]
 pub struct Task {
     key: TaskKey,
+    controls: super::thread_control::ThreadControlArena,
     parent: Mutex<Option<TaskKey>>,
     children: Mutex<BTreeSet<TaskKey>>,
     /// Tasks this task traces (`PTRACE_TRACEME` children and `PTRACE_ATTACH`
@@ -802,6 +803,7 @@ impl Task {
     ) -> Self {
         Self {
             key,
+            controls: super::thread_control::ThreadControlArena::new(key),
             parent: Mutex::new(parent),
             children: Mutex::new(BTreeSet::new()),
             ptrace_tracees: Mutex::new(BTreeSet::new()),
@@ -832,6 +834,13 @@ impl Task {
             nsproxy: ArcSwap::new(Arc::new(NsProxy::for_container(container))),
             nsproxy_write: Mutex::new(()),
         }
+    }
+
+    pub(in crate::kernel) fn allocate_thread_control(
+        &self,
+        key: ThreadKey,
+    ) -> super::ThreadControlLease {
+        self.controls.allocate(key)
     }
 
     /// Mark this task as having run on an executor, returning `true` on first call.
@@ -1944,20 +1953,12 @@ impl Task {
 
     pub(in crate::kernel) fn prepare_clone_thread(
         self: &Arc<Self>,
-        key: ThreadKey,
         registry_id: ThreadId,
         resources: Arc<ThreadResources>,
-        caller_signal_state: ThreadSignalState,
+        control: super::ThreadControlLease,
         caller_affinity: carrick_hal::CpuAffinity,
     ) -> ThreadRef {
-        Thread::prepare_clone(
-            self,
-            key,
-            registry_id,
-            resources,
-            caller_signal_state,
-            caller_affinity,
-        )
+        Thread::prepare_clone(self, registry_id, resources, control, caller_affinity)
     }
 
     pub(in crate::kernel) fn prepare_fork_thread(
