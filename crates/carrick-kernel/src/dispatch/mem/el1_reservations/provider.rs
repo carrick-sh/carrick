@@ -13,8 +13,10 @@ pub trait HostReservationProvider: Send + Sync {
 
     /// Service a capacity refusal after releasing MM metadata/root guards.
     /// Providers without an elastic carrier authority decline the request.
-    /// `Limit` requires a Linux resource-limit authority; missing carrier
-    /// storage remains `MetadataRequired`, never a manufactured Linux ENOMEM.
+    /// `Limit` requires a Linux resource-limit authority. Missing carrier
+    /// storage remains `MetadataRequired` at this service boundary; after
+    /// this attempt fails, the personality may answer Linux ENOMEM without
+    /// transferring the admitted root back to a host placement authority.
     fn provision_metadata(&self, _mm: ReservationMm) -> Result<(), Refusal> {
         Err(Refusal::MetadataRequired)
     }

@@ -1367,7 +1367,12 @@ impl MemView<'_> {
                 // root or MM permit is retained across carrier allocation.
                 match root.provision_metadata() {
                     Ok(()) => {}
-                    Err(Refusal::Limit) => return Ok(Some(LINUX_ENOMEM)),
+                    // A real capacity request has now failed. Linux also
+                    // answers ENOMEM when mapping metadata cannot be
+                    // allocated; this MM remains admitted and unchanged.
+                    Err(Refusal::Limit | Refusal::MetadataRequired) => {
+                        return Ok(Some(LINUX_ENOMEM));
+                    }
                     Err(refusal) => return Err(root_refusal(refusal)),
                 }
                 secure()
