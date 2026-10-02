@@ -4025,8 +4025,9 @@ fn thread_witness(
     });
     let stdout = measured.result.stdout_utf8();
     println!(
-        "el1-sched {mode} {args:?} exits={} served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]={delta:?}\n{}",
+        "el1-sched {mode} {args:?} exits={} exit_classes=[{}] served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]={delta:?}\n{}",
         measured.exits,
+        exit_breakdown(&measured),
         stdout.trim()
     );
     assert!(measured.result.success(), "{mode}: {}", describe(&measured));
@@ -4081,7 +4082,12 @@ fn el1_thread_lifecycle_spawn_slope() {
             report.join(" "),
             (*exits1 as f64 - *exits0 as f64) / added
         );
+        let clone_slope = (delta1[0][1] as f64 - delta0[0][1] as f64) / added;
         let exit_slope = (delta1[1][1] as f64 - delta0[1][1] as f64) / added;
+        assert!(
+            clone_slope < 0.05,
+            "forwarded thread clones per added thread {clone_slope:.4} must be < 0.05 (exit slope {exit_slope:.4})"
+        );
         assert!(
             exit_slope < 0.05,
             "forwarded thread exits per added thread {exit_slope:.4} must be < 0.05 \
