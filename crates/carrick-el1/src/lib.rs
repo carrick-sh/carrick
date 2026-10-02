@@ -12,3 +12,6 @@ pub mod substrate;
 pub use fault::dispatch_fault;
 pub use personality::dispatch::*;
 pub use personality::{file, inotify, sched};
+
+#[cfg(test)]
+mod native_ownership_tests;
