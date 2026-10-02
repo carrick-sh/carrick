@@ -26,7 +26,8 @@ the shared MMU implementation through their venue adapters. They cannot
 obtain an edit capability for an admitted root.
 
 | Object | Sole owner after this step | Host responsibility |
-| --- | --- | --- |
+| --- | --- |
+| `HvfVmState::protections_ref`, host syscall-buffer read/write pre-gates using `MemoryProtections` | M3: delete admitted-MM mirror permission authority; authenticate live stage-1 descriptors and exact-MM physical owner generation; retain mirror only for host-editor MMs | --- |
 | Live root, table pages, leaf permissions, software access/dirty/COW tags, ASID TLBI | EL1 MMU substrate | supply table-frame capacity; no descriptor stores |
 | Private frame sharing, COW references, sole-owner reuse, fork table projection | EL1 | bulk stage-2 custody and authenticated extent receipts |
 | Anonymous reservations, brk, mapping placement/protection/retirement | EL1 Linux personality over neutral memory core | enforce host resource quotas; no parallel VMA policy |
