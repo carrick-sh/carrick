@@ -702,7 +702,7 @@ mod mm_executor_release_tests {
     }
 
     #[test]
-    fn pwritev_borrowed_payload_with_host_wait_reports_einval() {
+    fn pwritev_borrowed_payload_with_host_wait_writes_all_bytes() {
         use crate::dispatch::fd_table::HostFdRef;
         use crate::dispatch::resources::with_captured_resources;
         use crate::dispatch::{
@@ -724,10 +724,11 @@ mod mm_executor_release_tests {
         let running = scheduler.take(&registration).unwrap();
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().to_path_buf();
+        let host_fd = file.into_file().into_raw_fd();
         let fd = dispatcher.install_fd(
             OpenDescription::HostFile {
                 base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDWR),
-                host_fd: HostFdRef::new(file.into_file().into_raw_fd()),
+                host_fd: HostFdRef::new(host_fd),
                 metadata: RootFsMetadata {
                     path,
                     kind: RootFsEntryKind::File,
@@ -752,10 +753,8 @@ mod mm_executor_release_tests {
         let args = SyscallArgs::from([fd as u64, 0x10000, 1, 0, 0, 0]);
         assert!(!crate::dispatch::syscall_requires_execution_lease(70, args));
         let reporter = CompatReporter::default();
-        for (host_wait, expected) in [
-            (true, DispatchOutcome::errno(carrick_abi::LINUX_EINVAL)),
-            (false, DispatchOutcome::Returned { value: 4 }),
-        ] {
+        for host_wait in [true, false] {
+            assert_eq!(unsafe { libc::ftruncate(host_fd, 0) }, 0);
             let mut syscall = SyscallCtx {
                 host_wait: host_wait.then_some(HostWaitContext {
                     scheduler: &scheduler,
@@ -772,8 +771,14 @@ mod mm_executor_release_tests {
             let handler = crate::dispatch::routing::resolve_handler::<LinearMemory>(70).unwrap();
             assert_eq!(
                 with_captured_resources(&context, || handler(&dispatcher, &mut syscall)).unwrap(),
-                expected
+                DispatchOutcome::Returned { value: 4 }
             );
+            let mut bytes = [0_u8; 4];
+            assert_eq!(
+                unsafe { libc::pread(host_fd, bytes.as_mut_ptr().cast(), bytes.len(), 0) },
+                4
+            );
+            assert_eq!(&bytes, b"test");
         }
         drop(executor);
         scheduler.settle_exited(running).unwrap();
