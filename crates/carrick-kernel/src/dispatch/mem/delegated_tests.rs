@@ -4108,6 +4108,34 @@ fn published_grant_settlement(retired_page: Option<u64>) {
                     .is_err(),
                 "a reprotected page cannot settle its old publication"
             );
+            assert!(
+                dispatcher
+                    .mem_view()
+                    .reprotected_frame_grant_plan(
+                        permit,
+                        grant,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                        &receipt,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                    )
+                    .is_err(),
+                "a stale writable live leaf cannot be reclassified as read-only"
+            );
+            let plan = dispatcher
+                .mem_view()
+                .reprotected_frame_grant_plan(
+                    permit,
+                    grant,
+                    LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                    &receipt,
+                    LinuxProtFlags::READ,
+                )
+                .expect("retained backing settles under authenticated current protection");
+            let PublishedFrameGrantPlan::Resident(ref resident) = plan else {
+                panic!("mprotect does not retire backing")
+            };
+            assert_eq!(resident.prot(), LINUX_PROT_READ);
+            assert_eq!(root.lock().mapping(fault).unwrap().protection, READ);
         },
     );
     root.guest_mprotect(fault, PAGE, ReservationProtection::READ_WRITE);

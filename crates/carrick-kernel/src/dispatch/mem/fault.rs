@@ -1225,6 +1225,34 @@ impl<'a> MemView<'a> {
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
     ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
+        self.classify_published_frame_grant(permit, grant, protection, receipt, None)
+    }
+
+    pub(crate) fn reprotected_frame_grant_plan<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+        protection: LinuxProtFlags,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        live_protection: LinuxProtFlags,
+    ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
+        self.classify_published_frame_grant(
+            permit,
+            grant,
+            protection,
+            receipt,
+            Some(live_protection),
+        )
+    }
+
+    fn classify_published_frame_grant<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+        protection: LinuxProtFlags,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        live_protection: Option<LinuxProtFlags>,
+    ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
         let (publication, backing) = receipt
             .prepared_backing()
             .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?;
@@ -1291,7 +1319,9 @@ impl<'a> MemView<'a> {
             ),
             FirstTouchOwner::Unmapped => return Err(PublishedFrameGrantRefusal::Unmapped),
         };
-        if prot != protection {
+        if live_protection.is_some_and(|live| live != prot)
+            || (prot != protection && live_protection != Some(prot))
+        {
             return Err(PublishedFrameGrantRefusal::ProtectionChanged {
                 published: protection,
                 current: prot,
