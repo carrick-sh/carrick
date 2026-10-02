@@ -434,3 +434,15 @@ The operation inventory was refreshed after that explicit classification;
 the macOS compiler capture changed only its source-head receipt, with all
 596 authority rows unchanged. This is an intentional mapping-site addition,
 not a mechanical position-only refresh.
+
+Final domain receipt: `CARGO_BUILD_JOBS=3 just lint-domains` exited zero on
+`bfc22e05e` (`/tmp/forkexit-sol-vm-object-lint-domains.log`). All four abort
+shards, MM/task authority, the 97 raw-lock sites, K1 inventories/taxonomy,
+burndown and serial-host placement passed. The compiler authority census is
+the macOS subset; Linux/FreeBSD/NetBSD profiles remain pending as reported by
+the gate. The work is committed as `bb3842530` (backing prerequisite) and
+`bfc22e05e` (explicit mapping-site inventory classification).
+
+Resume at obligation 1's runtime retained-mapping owner/adapters and actual
+venue publication. This checkpoint does not implement any guest lifecycle
+service. Obligations 2–4 and all signed L4 acceptance remain uncompleted.
