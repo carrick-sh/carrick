@@ -1849,9 +1849,6 @@ impl FrameGrantResidencyTable {
         true
     }
 
-    /// Host: revoke every intersecting grant before backing retirement or
-    /// replacement. Revoking a partially covered grant merely sends its other
-    /// pages through the existing host fault path.
     /// Host: visit `[base, end)` of every live grant of `mm_key` that
     /// overlaps `[start, start + len)`: backing already prepared for this
     /// exact MM, which no second grant may cover. One pass over the table.
@@ -1880,8 +1877,16 @@ impl FrameGrantResidencyTable {
         }
     }
 
+    /// Revoke only replaced pages. Preserve the exact owner and committed
+    /// bits of each outside fragment, under the caller's exact-MM editor.
+    /// Republished fragments have fresh epochs: no captured pre-edit page
+    /// token can authorize a replaced or recycled page. Index saturation
+    /// declines fragment acceleration, as it does initial publication.
     pub fn retire_overlapping(&self, mm_key: u64, start: u64, len: u64) {
         let end = start.saturating_add(len);
+        if start >= end {
+            return;
+        }
         for (slot, record) in self.slots.iter().enumerate() {
             if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -1891,7 +1896,44 @@ impl FrameGrantResidencyTable {
                 && identity.semantic_base < end
                 && start < identity.semantic_base.saturating_add(identity.len)
             {
-                let _ = self.retire(slot, identity);
+                let Some(bits) = self.committed_words(slot, identity) else {
+                    continue;
+                };
+                if !self.retire(slot, identity) {
+                    continue;
+                }
+                let base = identity.semantic_base;
+                let grant_end = base + identity.len;
+                // A byte-level overlap revokes its entire Linux page.
+                let cut_start = start & !(GRANT_PAGE_SIZE - 1);
+                let cut_end = end.saturating_add(GRANT_PAGE_SIZE - 1) & !(GRANT_PAGE_SIZE - 1);
+                for (fragment_start, fragment_end) in [
+                    (base, cut_start.min(grant_end)),
+                    (cut_end.max(base), grant_end),
+                ] {
+                    if fragment_start >= fragment_end {
+                        continue;
+                    }
+                    let fragment = FrameGrantResidencyIdentity {
+                        semantic_base: fragment_start,
+                        physical_ipa: identity.physical_ipa + fragment_start - base,
+                        len: fragment_end - fragment_start,
+                        ..identity
+                    };
+                    if let Some(fragment_slot) = self.publish(fragment) {
+                        let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
+                        let count = (fragment.len / GRANT_PAGE_SIZE) as usize;
+                        for bit in 0..count {
+                            let old_bit = shift + bit;
+                            if bits[old_bit / 64] & (1 << (old_bit % 64)) != 0 {
+                                self.slots[fragment_slot].committed[bit / 64]
+                                    .fetch_or(1 << (bit % 64), Ordering::Release);
+                                self.dirty[fragment_slot / 64]
+                                    .fetch_or(1 << (fragment_slot % 64), Ordering::Release);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -4604,15 +4646,62 @@ mod tests {
         assert_eq!(table.committed_words(reused, second).unwrap()[0], 1);
         table.retire_overlapping(41, second.semantic_base, 4096);
         assert!(table.lookup(41, first.semantic_base).is_none());
+        assert!(table.lookup(41, first.semantic_base + 4096).is_some());
         // Even a byte-for-byte recycled identity cannot reuse a captured
         // page token from a retired publication.
         let stale = table.lookup(41, second.semantic_base);
         assert!(stale.is_none());
+        table.retire_overlapping(41, second.semantic_base, second.len);
         let fresh_slot = table.publish(second).unwrap();
         let stale_page = table.lookup(41, second.semantic_base).unwrap();
         assert!(table.retire(fresh_slot, second));
         table.publish(second).unwrap();
         assert!(!table.record_commit(stale_page));
+    }
+
+    #[test]
+    fn grant_residency_partial_replacement_preserves_outside_commits() {
+        let table = FrameGrantResidencyTable::new();
+        let identity = FrameGrantResidencyIdentity {
+            mm_key: 41,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x9000_0000,
+            len: 5 * 4096,
+            mapping_id: 17,
+            frame_id: 19,
+            owner_generation: 23,
+            inventory_revision: 29,
+        };
+        table.publish(identity).unwrap();
+        let base = identity.semantic_base;
+        let old_middle = table.lookup(41, base + 2 * 4096).unwrap();
+        let old_last = table.lookup(41, base + 4 * 4096).unwrap();
+        assert!(table.record_commit(table.lookup(41, base).unwrap()));
+        assert!(table.record_commit(old_middle));
+        assert!(table.record_commit(old_last));
+        table.retire_overlapping(41, base + 2 * 4096, 4096);
+        assert!(table.lookup(41, base + 2 * 4096).is_none());
+        assert!(!table.record_commit(old_middle));
+        assert!(!table.record_commit(old_last));
+        assert!(table.is_guest_committed(41, base));
+        assert!(table.is_guest_committed(41, base + 4 * 4096));
+        let surviving = table.lookup(41, base + 3 * 4096).unwrap();
+        assert_eq!(surviving.expected_ipa, identity.physical_ipa + 3 * 4096);
+        assert!(table.record_commit(surviving));
+        assert!(table.lookup(42, base).is_none());
+        let replacement = FrameGrantResidencyIdentity {
+            semantic_base: base + 2 * 4096,
+            physical_ipa: 0xa000_0000,
+            len: 4096,
+            owner_generation: 31,
+            ..identity
+        };
+        table.publish(replacement).unwrap();
+        assert!(!table.is_guest_committed(41, replacement.semantic_base));
+        assert!(!table.record_commit(old_middle));
+        let mut spans = 0;
+        table.live_spans_overlapping(41, base, identity.len, |_, _| spans += 1);
+        assert_eq!(spans, 3);
     }
 
     #[test]
