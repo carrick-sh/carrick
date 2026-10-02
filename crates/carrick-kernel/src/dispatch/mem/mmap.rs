@@ -1405,7 +1405,7 @@ impl<'a> MemView<'a> {
                 // FreePages) retires its predecessor exactly as the general
                 // arm below does: the new reservation never reuses a VA still
                 // holding a live private frame.
-                if fixed_anonymous && defer_anonymous {
+                if fixed_anonymous {
                     if let Err(error) = memory.unmap_range(address, length_usize) {
                         return Ok(request.refused_by(
                             MmapRefusal::Internal(
