@@ -3115,7 +3115,7 @@ impl ZoneTables {
                 // address space: moving it would only create a host exit.
                 || (!victim_stopped
                     && self.needs_executor(thief, rec)
-                    && !(rec.is_unadopted_birth() && !self.executor_has_task(thief)))
+                    && (!rec.is_unadopted_birth() || self.executor_has_task(thief)))
                 || !rec.allows_cpu(cpu)
             {
                 continue;
