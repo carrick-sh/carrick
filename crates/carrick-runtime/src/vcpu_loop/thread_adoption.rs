@@ -321,8 +321,7 @@ where
         let scheduler = kernel
             .hvpatch_runtime
             .as_ref()?
-            .continuation_services(process.kernel_graph())
-            .0;
+            .published_birth_scheduler(process.kernel_graph())?;
         let submission = scheduler.reserve_process_birth(&task, thread).ok()?;
         let backend = match &self.backend_template {
             Some(template) => Some(template.with_authority(
