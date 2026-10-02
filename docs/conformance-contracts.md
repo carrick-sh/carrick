@@ -241,6 +241,14 @@ capacity. VM-free bindings: `reservation_admission_secures_one_forwarding_reques
 `reservation_failed_admission_returns_import_and_reserve_nodes`,
 `delegated_initial_reserve_refusal_leaves_the_mm_unadmitted`, and
 `delegated_carrier_exhaustion_returns_enomem_without_handback_and_recovers`.
+`delegated_host_brk_uses_secured_metadata_when_the_shared_pool_is_empty`
+checks that host-forwarded heap moves use the same secured reserve rather
+than incorrectly returning the old break while metadata remains available.
+`delegated_host_mremap_uses_secured_metadata_when_the_shared_pool_is_empty`
+checks in-place growth and byte preservation under the same condition.
+`delegated_brk_capacity_refusal_returns_old_break_and_recovers` checks one
+capacity request before refusing heap growth, the raw Linux unchanged-break
+failure convention, allocation-free queries, and recovery without handback.
 The retained-bank signed binding remains
 `el1_reservation_metadata_grows_beyond_bootstrap`.
 
