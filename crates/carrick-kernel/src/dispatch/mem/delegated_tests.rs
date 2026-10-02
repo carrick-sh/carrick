@@ -4112,3 +4112,54 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
     );
     assert!(!dispatcher.mem().lock().first_touch_stock.is_empty());
 }
+
+#[test]
+fn delegated_replacement_with_owed_backing_cannot_revalidate_old_output() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    let range = ReservationRange::new(base, base + 32 * PAGE).unwrap();
+    let rw = ReservationProtection::READ_WRITE;
+    root.guest_mmap(Placement::Fixed(base), range.len(), rw)
+        .unwrap();
+    {
+        let mut model = root.lock();
+        let Decision::Work(request) = model.mmap(Placement::Fixed(base), range.len(), rw).unwrap()
+        else {
+            panic!("replacement requires a substrate step")
+        };
+        let slot = model.reserve_return(range).unwrap();
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        model.complete_deferring_return(completion, slot).unwrap();
+    }
+    assert!(dispatcher.el1_returns_owed());
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base + 16 * PAGE, STOCK_WINDOW, |_| ())
+            .is_none()
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base + 16 * PAGE, |_| ())
+            .is_none(),
+        "owed predecessor output must not be revalidated for a fresh replacement"
+    );
+    let mut memory = CountingMmapMemory::new(base, (32 * PAGE) as usize);
+    reconcile(&dispatcher, &mut memory).unwrap();
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base + 16 * PAGE, STOCK_WINDOW, |_| ())
+            .is_some(),
+        "after return, first touch can allocate fresh zero backing"
+    );
+}
