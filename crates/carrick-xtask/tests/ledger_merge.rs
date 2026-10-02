@@ -609,8 +609,90 @@ fn output_is_deterministic() {
     );
 
     let res1 = merge_ledger(path, &base, &ours, &theirs).expect("merge 1");
-    let res2 = merge_ledger(path, &base, &theirs, &ours).expect("merge 2");
+    let res2 = merge_ledger(path, &base, &ours, &theirs).expect("merge 2");
     assert_eq!(res1.to_json(), res2.to_json());
+}
+
+#[test]
+fn unsorted_ours_preserves_order_and_formatting_with_minimal_diff() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ours_file = temp.path().join("ours.json");
+    let merged_file = temp.path().join("merged.json");
+
+    let path = "scripts/migrate/runtime-aborts/hvf.json";
+    // base and ours have row 2 then row 1 (deliberately unsorted relative to ordinal/function)
+    let base = format!(
+        r#"{{
+  "schema": 1,
+  "shard": "hvf.json",
+  "typed_error_debt_ceiling": 0,
+  "rows": [
+    {SAMPLE_ABORT_ROW_2},
+    {SAMPLE_ABORT_ROW_1}
+  ]
+}}"#
+    );
+    let ours = base.clone();
+
+    // theirs adds SAMPLE_ABORT_ROW_3 between row 2 and row 1
+    let theirs = format!(
+        r#"{{
+  "schema": 1,
+  "shard": "hvf.json",
+  "typed_error_debt_ceiling": 0,
+  "rows": [
+    {SAMPLE_ABORT_ROW_2},
+    {SAMPLE_ABORT_ROW_3},
+    {SAMPLE_ABORT_ROW_1}
+  ]
+}}"#
+    );
+
+    let merged = merge_ledger(path, &base, &ours, &theirs).expect("merge should succeed");
+
+    fs::write(&ours_file, &ours).expect("write ours");
+    fs::write(&merged_file, merged.to_json()).expect("write merged");
+
+    // The merged output must equal ours plus the one inserted row, byte for byte
+    assert_eq!(
+        merged.to_json(),
+        theirs,
+        "merged output must equal theirs byte-for-byte in this scenario"
+    );
+
+    // git diff --no-index must show only added lines
+    let diff_output = Command::new("git")
+        .args([
+            "diff",
+            "--no-index",
+            ours_file.to_str().unwrap(),
+            merged_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("git diff");
+
+    let stdout = String::from_utf8_lossy(&diff_output.stdout);
+    let diff_lines: Vec<&str> = stdout.lines().collect();
+
+    // Verify there are added lines
+    let added_lines: Vec<&str> = diff_lines
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .collect();
+    assert!(!added_lines.is_empty(), "expected added lines in diff");
+
+    // Verify there are NO deleted lines
+    let deleted_lines: Vec<&str> = diff_lines
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .collect();
+    assert_eq!(
+        deleted_lines,
+        Vec::<&str>::new(),
+        "git diff --no-index must show only added lines, no deleted lines: diff was:\n{stdout}"
+    );
 }
 
 #[test]

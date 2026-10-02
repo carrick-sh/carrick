@@ -393,10 +393,10 @@ pub enum RegenerateError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct AbortKey {
-    file: String,
-    function: String,
-    ordinal_in_function: u64,
+pub struct AbortKey {
+    pub file: String,
+    pub function: String,
+    pub ordinal_in_function: u64,
 }
 
 impl fmt::Display for AbortKey {
@@ -810,6 +810,277 @@ fn format_value_preview(val: &Option<ParsedValue>) -> Option<String> {
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "<unprintable>".to_string()))
 }
 
+struct AbortFileLayout {
+    prefix: String,
+    suffix: String,
+    entries: Vec<(AbortKey, String)>,
+}
+
+fn extract_abort_file_layout(text: &str) -> Option<AbortFileLayout> {
+    let rows_idx = text.find("\"rows\"")?;
+    let colon_idx = text[rows_idx..].find(':')? + rows_idx;
+    let open_bracket = text[colon_idx..].find('[')? + colon_idx;
+
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut close_bracket = None;
+    for (i, c) in text[open_bracket..].char_indices() {
+        let abs_i = open_bracket + i;
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if c == '[' {
+            depth += 1;
+        } else if c == ']' {
+            depth -= 1;
+            if depth == 0 {
+                close_bracket = Some(abs_i);
+                break;
+            }
+        }
+    }
+    let close_bracket = close_bracket?;
+
+    let mut pos = open_bracket + 1;
+    let mut items = Vec::new();
+    while pos < close_bracket {
+        while pos < close_bracket
+            && text[pos..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace())
+        {
+            if let Some(ch) = text[pos..].chars().next() {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if pos >= close_bracket {
+            break;
+        }
+        let line_start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
+        let item_start = line_start;
+
+        let mut obj_depth = 0;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut item_end = None;
+        for (i, c) in text[pos..close_bracket].char_indices() {
+            let abs_i = pos + i;
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else if c == '"' {
+                in_str = true;
+            } else if c == '{' {
+                obj_depth += 1;
+            } else if c == '}' {
+                obj_depth -= 1;
+                if obj_depth == 0 {
+                    item_end = Some(abs_i + 1);
+                    break;
+                }
+            }
+        }
+        let item_end = item_end?;
+        let raw_snippet = text[item_start..item_end].to_string();
+
+        let parsed_val: serde_json::Value = serde_json::from_str(&raw_snippet).ok()?;
+        let file = parsed_val.get("file")?.as_str()?.to_string();
+        let function = parsed_val.get("function")?.as_str()?.to_string();
+        let ordinal = parsed_val.get("ordinal_in_function")?.as_u64()?;
+        let key = AbortKey {
+            file,
+            function,
+            ordinal_in_function: ordinal,
+        };
+        items.push((key, raw_snippet, item_start, item_end));
+
+        pos = item_end;
+        while pos < close_bracket
+            && text[pos..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace() || c == ',')
+        {
+            if let Some(ch) = text[pos..].chars().next() {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+
+    if items.is_empty() {
+        let prefix = text[..open_bracket + 1].to_string();
+        let suffix = text[close_bracket..].to_string();
+        Some(AbortFileLayout {
+            prefix,
+            suffix,
+            entries: Vec::new(),
+        })
+    } else {
+        let first_start = items[0].2;
+        let last_end = items.last().map_or(first_start, |it| it.3);
+        let prefix = text[..first_start].to_string();
+        let suffix = text[last_end..].to_string();
+        let entries = items.into_iter().map(|(k, s, _, _)| (k, s)).collect();
+        Some(AbortFileLayout {
+            prefix,
+            suffix,
+            entries,
+        })
+    }
+}
+
+struct ProbeFileLayout {
+    prefix: String,
+    suffix: String,
+    entries: Vec<(String, String)>,
+}
+
+fn extract_probe_file_layout(text: &str) -> Option<ProbeFileLayout> {
+    let open_brace = text.find('{')?;
+    let close_brace = text.rfind('}')?;
+
+    let mut pos = open_brace + 1;
+    let mut items = Vec::new();
+    while pos < close_brace {
+        while pos < close_brace
+            && text[pos..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace())
+        {
+            if let Some(ch) = text[pos..].chars().next() {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if pos >= close_brace {
+            break;
+        }
+        let line_start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
+        let item_start = line_start;
+
+        let colon_idx = text[pos..close_brace].find(':')? + pos;
+        let val_open = text[colon_idx..close_brace].find('{')? + colon_idx;
+
+        let mut depth = 0;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut item_end = None;
+        for (i, c) in text[val_open..close_brace].char_indices() {
+            let abs_i = val_open + i;
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else if c == '"' {
+                in_str = true;
+            } else if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    item_end = Some(abs_i + 1);
+                    break;
+                }
+            }
+        }
+        let item_end = item_end?;
+        let raw_snippet = text[item_start..item_end].to_string();
+
+        let key_str = text[pos..colon_idx].trim().trim_matches('"').to_string();
+        items.push((key_str, raw_snippet, item_start, item_end));
+
+        pos = item_end;
+        while pos < close_brace
+            && text[pos..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace() || c == ',')
+        {
+            if let Some(ch) = text[pos..].chars().next() {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+
+    if items.is_empty() {
+        let prefix = text[..open_brace + 1].to_string();
+        let suffix = text[close_brace..].to_string();
+        Some(ProbeFileLayout {
+            prefix,
+            suffix,
+            entries: Vec::new(),
+        })
+    } else {
+        let first_start = items[0].2;
+        let last_end = items.last().map_or(first_start, |it| it.3);
+        let prefix = text[..first_start].to_string();
+        let suffix = text[last_end..].to_string();
+        let entries = items.into_iter().map(|(k, s, _, _)| (k, s)).collect();
+        Some(ProbeFileLayout {
+            prefix,
+            suffix,
+            entries,
+        })
+    }
+}
+
+fn update_debt_ceiling_in_prefix(prefix: &str, old_val: u64, new_val: u64) -> String {
+    if old_val == new_val {
+        return prefix.to_string();
+    }
+    if let Some(pos) = prefix.find("\"typed_error_debt_ceiling\"")
+        && let Some(colon_pos) = prefix[pos..].find(':')
+    {
+        let num_start_search = pos + colon_pos + 1;
+        let mut num_start = None;
+        let mut num_end = None;
+        for (i, c) in prefix[num_start_search..].char_indices() {
+            let abs_i = num_start_search + i;
+            if c.is_ascii_digit() {
+                if num_start.is_none() {
+                    num_start = Some(abs_i);
+                }
+            } else if num_start.is_some() {
+                num_end = Some(abs_i);
+                break;
+            }
+        }
+        if let (Some(start), Some(end)) = (num_start, num_end) {
+            let mut updated = prefix[..start].to_string();
+            updated.push_str(&new_val.to_string());
+            updated.push_str(&prefix[end..]);
+            return updated;
+        }
+    }
+    prefix.to_string()
+}
+
 pub fn merge_ledger(
     path: &str,
     base: &str,
@@ -937,14 +1208,105 @@ fn merge_probe_inventory(
         }
     }
 
-    let serialized =
-        serde_json::to_string_pretty(&merged_probes).map_err(|e| MergeConflict::InvalidJson {
-            side: "merged".to_string(),
-            details: e.to_string(),
-        })?;
+    let ours_layout = extract_probe_file_layout(ours);
+    let theirs_layout = extract_probe_file_layout(theirs);
+
+    let output_json = match (ours_layout, theirs_layout) {
+        (Some(ours_lay), Some(theirs_lay)) => {
+            let ours_snippets: BTreeMap<String, String> =
+                ours_lay.entries.iter().cloned().collect();
+            let theirs_snippets: BTreeMap<String, String> =
+                theirs_lay.entries.iter().cloned().collect();
+
+            let mut merged_keys: Vec<String> = Vec::new();
+            for (k, _) in &ours_lay.entries {
+                if merged_probes.contains_key(k) {
+                    merged_keys.push(k.clone());
+                }
+            }
+
+            let theirs_keys: Vec<String> =
+                theirs_lay.entries.iter().map(|(k, _)| k.clone()).collect();
+            for (t_idx, t_add) in theirs_keys.iter().enumerate() {
+                if merged_keys.contains(t_add) {
+                    continue;
+                }
+                if !merged_probes.contains_key(t_add) {
+                    continue;
+                }
+
+                let mut found_preceding = None;
+                for p_idx in (0..t_idx).rev() {
+                    let candidate = &theirs_keys[p_idx];
+                    if merged_keys.contains(candidate) {
+                        found_preceding = Some(candidate.clone());
+                        break;
+                    }
+                }
+
+                match found_preceding {
+                    None => merged_keys.push(t_add.clone()),
+                    Some(p) => {
+                        let p_pos = merged_keys
+                            .iter()
+                            .position(|k| k == &p)
+                            .unwrap_or(merged_keys.len());
+                        let insert_pos = if p_pos < merged_keys.len() {
+                            p_pos + 1
+                        } else {
+                            merged_keys.len()
+                        };
+                        merged_keys.insert(insert_pos, t_add.clone());
+                    }
+                }
+            }
+
+            let mut snippets = Vec::new();
+            for k in &merged_keys {
+                if let Some(snip) = ours_snippets.get(k) {
+                    // Check if ours value was modified
+                    if ours_obj.get(k) == merged_probes.get(k) {
+                        snippets.push(snip.clone());
+                    } else if let Some(th_snip) = theirs_snippets.get(k) {
+                        snippets.push(th_snip.clone());
+                    } else {
+                        let val = &merged_probes[k];
+                        let val_str = serde_json::to_string_pretty(val).unwrap_or_default();
+                        snippets.push(format!("  \"{k}\": {val_str}"));
+                    }
+                } else if let Some(snip) = theirs_snippets.get(k) {
+                    snippets.push(snip.clone());
+                } else {
+                    let val = &merged_probes[k];
+                    let val_str = serde_json::to_string_pretty(val).unwrap_or_default();
+                    snippets.push(format!("  \"{k}\": {val_str}"));
+                }
+            }
+
+            let mut out = String::new();
+            out.push_str(&ours_lay.prefix);
+            for (i, s) in snippets.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                out.push_str(s);
+            }
+            out.push_str(&ours_lay.suffix);
+            out
+        }
+        _ => {
+            let serialized = serde_json::to_string_pretty(&merged_probes).map_err(|e| {
+                MergeConflict::InvalidJson {
+                    side: "merged".to_string(),
+                    details: e.to_string(),
+                }
+            })?;
+            format!("{serialized}\n")
+        }
+    };
 
     Ok(MergedLedger {
-        json: format!("{serialized}\n"),
+        json: output_json,
         summary: SemanticSummary {
             rows_added,
             rows_modified,
@@ -1109,50 +1471,163 @@ fn merge_abort_shard(
         }
     }
 
-    // Build deterministic output:
-    // schema, shard, typed_error_debt_ceiling, extra metadata (alphabetical), rows (sorted by AbortKey)
-    struct OrderedAbortLedger<'a> {
-        schema: u64,
-        shard: &'a str,
-        debt_ceiling: u64,
-        extra_meta: &'a BTreeMap<String, ParsedValue>,
-        rows: Vec<&'a ParsedValue>,
-    }
+    let ours_layout = extract_abort_file_layout(ours);
+    let theirs_layout = extract_abort_file_layout(theirs);
 
-    impl Serialize for OrderedAbortLedger<'_> {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            let mut map = serializer.serialize_map(None)?;
-            map.serialize_entry("schema", &self.schema)?;
-            map.serialize_entry("shard", &self.shard)?;
-            map.serialize_entry("typed_error_debt_ceiling", &self.debt_ceiling)?;
-            for (k, v) in self.extra_meta {
-                map.serialize_entry(k, v)?;
+    let output_json = match (ours_layout, theirs_layout) {
+        (Some(ours_lay), Some(theirs_lay)) => {
+            let ours_snippets: BTreeMap<AbortKey, String> =
+                ours_lay.entries.iter().cloned().collect();
+            let theirs_snippets: BTreeMap<AbortKey, String> =
+                theirs_lay.entries.iter().cloned().collect();
+
+            let mut merged_keys: Vec<AbortKey> = Vec::new();
+            for (k, _) in &ours_lay.entries {
+                if merged_rows.contains_key(k) {
+                    merged_keys.push(k.clone());
+                }
             }
-            map.serialize_entry("rows", &self.rows)?;
-            map.end()
-        }
-    }
 
-    let rows_sorted: Vec<&ParsedValue> = merged_rows.values().collect();
-    let ordered = OrderedAbortLedger {
-        schema: base_parsed.schema,
-        shard: &base_parsed.shard,
-        debt_ceiling: merged_debt_ceiling,
-        extra_meta: &merged_meta,
-        rows: rows_sorted,
+            let theirs_keys: Vec<AbortKey> =
+                theirs_lay.entries.iter().map(|(k, _)| k.clone()).collect();
+            for (t_idx, t_add) in theirs_keys.iter().enumerate() {
+                if merged_keys.contains(t_add) {
+                    continue;
+                }
+                if !merged_rows.contains_key(t_add) {
+                    continue;
+                }
+
+                // Find nearest preceding neighbour in theirs that is already in merged_keys
+                let mut found_preceding = None;
+                for p_idx in (0..t_idx).rev() {
+                    let candidate = &theirs_keys[p_idx];
+                    if merged_keys.contains(candidate) {
+                        found_preceding = Some(candidate.clone());
+                        break;
+                    }
+                }
+
+                match found_preceding {
+                    None => {
+                        merged_keys.push(t_add.clone());
+                    }
+                    Some(p) => {
+                        let p_pos = merged_keys
+                            .iter()
+                            .position(|k| k == &p)
+                            .unwrap_or(merged_keys.len());
+                        let mut insert_pos = if p_pos < merged_keys.len() {
+                            p_pos + 1
+                        } else {
+                            merged_keys.len()
+                        };
+
+                        while insert_pos < merged_keys.len() {
+                            let next_k = &merged_keys[insert_pos];
+                            let in_theirs_after =
+                                theirs_keys.iter().skip(t_idx + 1).any(|k| k == next_k);
+                            if in_theirs_after {
+                                break;
+                            }
+                            if next_k.file == t_add.file
+                                && next_k.function == t_add.function
+                                && next_k.ordinal_in_function < t_add.ordinal_in_function
+                            {
+                                insert_pos += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        merged_keys.insert(insert_pos, t_add.clone());
+                    }
+                }
+            }
+
+            let mut snippets = Vec::new();
+            for k in &merged_keys {
+                if let Some(snip) = ours_snippets.get(k) {
+                    if ours_parsed.rows.get(k) == merged_rows.get(k) {
+                        snippets.push(snip.clone());
+                    } else if let Some(th_snip) = theirs_snippets.get(k) {
+                        snippets.push(th_snip.clone());
+                    } else {
+                        let val = &merged_rows[k];
+                        let val_str = serde_json::to_string_pretty(val).unwrap_or_default();
+                        snippets.push(indent_row(&val_str, 4));
+                    }
+                } else if let Some(snip) = theirs_snippets.get(k) {
+                    snippets.push(snip.clone());
+                } else {
+                    let val = &merged_rows[k];
+                    let val_str = serde_json::to_string_pretty(val).unwrap_or_default();
+                    snippets.push(indent_row(&val_str, 4));
+                }
+            }
+
+            let updated_prefix = update_debt_ceiling_in_prefix(
+                &ours_lay.prefix,
+                ours_parsed.debt_ceiling,
+                merged_debt_ceiling,
+            );
+
+            let mut out = String::new();
+            out.push_str(&updated_prefix);
+            for (i, s) in snippets.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                out.push_str(s);
+            }
+            out.push_str(&ours_lay.suffix);
+            out
+        }
+        _ => {
+            struct OrderedAbortLedger<'a> {
+                schema: u64,
+                shard: &'a str,
+                debt_ceiling: u64,
+                extra_meta: &'a BTreeMap<String, ParsedValue>,
+                rows: Vec<&'a ParsedValue>,
+            }
+
+            impl Serialize for OrderedAbortLedger<'_> {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: Serializer,
+                {
+                    let mut map = serializer.serialize_map(None)?;
+                    map.serialize_entry("schema", &self.schema)?;
+                    map.serialize_entry("shard", &self.shard)?;
+                    map.serialize_entry("typed_error_debt_ceiling", &self.debt_ceiling)?;
+                    for (k, v) in self.extra_meta {
+                        map.serialize_entry(k, v)?;
+                    }
+                    map.serialize_entry("rows", &self.rows)?;
+                    map.end()
+                }
+            }
+
+            let rows_sorted: Vec<&ParsedValue> = merged_rows.values().collect();
+            let ordered = OrderedAbortLedger {
+                schema: base_parsed.schema,
+                shard: &base_parsed.shard,
+                debt_ceiling: merged_debt_ceiling,
+                extra_meta: &merged_meta,
+                rows: rows_sorted,
+            };
+
+            let serialized =
+                serde_json::to_string_pretty(&ordered).map_err(|e| MergeConflict::InvalidJson {
+                    side: "merged".to_string(),
+                    details: e.to_string(),
+                })?;
+            format!("{serialized}\n")
+        }
     };
 
-    let serialized =
-        serde_json::to_string_pretty(&ordered).map_err(|e| MergeConflict::InvalidJson {
-            side: "merged".to_string(),
-            details: e.to_string(),
-        })?;
-
     Ok(MergedLedger {
-        json: format!("{serialized}\n"),
+        json: output_json,
         summary: SemanticSummary {
             rows_added,
             rows_modified,
@@ -1160,6 +1635,19 @@ fn merge_abort_shard(
             debt_ceiling_change,
         },
     })
+}
+
+fn indent_row(s: &str, spaces: usize) -> String {
+    let pad = " ".repeat(spaces);
+    let mut out = String::new();
+    for (i, line) in s.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&pad);
+        out.push_str(line);
+    }
+    out
 }
 
 pub fn regenerate_contracts_with_runner<F>(root: &Path, runner: F) -> Result<(), RegenerateError>
