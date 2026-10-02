@@ -2627,18 +2627,19 @@ impl<'a> FsView<'a> {
                 };
                 let host_wait_runner = this.host_wait_runner_for_ctx(cx);
                 let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                if host_wait_ref.is_none() {
-                    if let PwritevPayloads::Borrowed {
-                        iovecs: borrowed_iovecs,
-                        reads: _retained,
-                    } = &payloads
-                    {
-                        if borrowed_iovecs.is_empty() {
-                            return Ok(DispatchOutcome::Returned { value: 0 });
-                        }
-                        let iovcnt =
-                            i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
-                        let n = unsafe {
+                if let PwritevPayloads::Borrowed {
+                    iovecs: borrowed_iovecs,
+                    reads: _retained,
+                } = &payloads
+                {
+                    if borrowed_iovecs.is_empty() {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    let iovcnt =
+                        i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                    let mut n = 0;
+                    let mut write = || {
+                        n = unsafe {
                             if at_current {
                                 libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
                             } else {
@@ -2650,16 +2651,25 @@ impl<'a> FsView<'a> {
                                 )
                             }
                         };
-                        restore_offset(saved_offset);
-                        let n = n.host_syscall_errno()?;
-                        if n > 0 {
-                            if let Some(old_len) = old_len {
-                                punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
-                            }
-                            this.invalidate_dentry_host_fd(hfd);
+                    };
+                    // Retained HostRead owners stay live while the caller
+                    // releases its execution capacity for the host syscall.
+                    let result = if let Some(runner) = host_wait_ref {
+                        runner.run_with_host_wait(&mut write)
+                    } else {
+                        write();
+                        Ok(())
+                    };
+                    restore_offset(saved_offset);
+                    result?;
+                    let n = n.host_syscall_errno()?;
+                    if n > 0 {
+                        if let Some(old_len) = old_len {
+                            punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
                         }
-                        return Ok(DispatchOutcome::returned_isize_or_errno(n));
+                        this.invalidate_dentry_host_fd(hfd);
                     }
+                    return Ok(DispatchOutcome::returned_isize_or_errno(n));
                 }
                 let Some(wait_authority) = this
                     .captured_slot_authority(fd.0)
