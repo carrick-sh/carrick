@@ -498,7 +498,10 @@ impl MmExecutorParticipation {
             ttbr1,
             brk_current,
             mmap_next,
-            crate::kernel::ReservationLimits::of_task(&rlimits, task.as_ref()),
+            crate::kernel::mm_occupancy::ReservationRootPublication {
+                limits: crate::kernel::ReservationLimits::of_task(&rlimits, task.as_ref()),
+                provider: self.authority.reservation_provider_for_publication(),
+            },
         )
     }
 

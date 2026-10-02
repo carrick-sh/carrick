@@ -1352,13 +1352,28 @@ impl MemView<'_> {
         let Some(root) = self.mem().lock().delegated_root().cloned() else {
             return Ok(None);
         };
-        let secured = root.with_root(|model| {
-            let needed = match munmap {
-                Some(range) => model.retire_nodes_needed(range),
-                None => carrick_el1::memory::reservations::HOST_RESERVE,
-            };
-            model.secure_host_nodes(needed)
-        });
+        let secure = || {
+            root.with_root(|model| {
+                let needed = match munmap {
+                    Some(range) => model.retire_nodes_needed(range),
+                    None => carrick_el1::memory::reservations::HOST_RESERVE,
+                };
+                model.secure_host_nodes(needed)
+            })
+        };
+        let secured = match secure() {
+            Err(Refusal::MetadataRequired) => {
+                // The failed proposal held no committed edit. No MemState,
+                // root or MM permit is retained across carrier allocation.
+                match root.provision_metadata() {
+                    Ok(()) => {}
+                    Err(Refusal::Limit) => return Ok(Some(LINUX_ENOMEM)),
+                    Err(refusal) => return Err(root_refusal(refusal)),
+                }
+                secure()
+            }
+            result => result,
+        };
         match secured {
             Ok(()) => Ok(None),
             Err(Refusal::MetadataRequired) => Ok(Some(LINUX_ENOMEM)),
@@ -1384,7 +1399,10 @@ impl MemView<'_> {
         root: &DelegatedRoot,
         step: impl FnOnce(&mut Reservations<'_>) -> Result<Decision, Refusal>,
     ) -> Result<Result<ReservationRequest, Refusal>, DispatchError> {
-        match self.with_charged_root(mem, root, step) {
+        match self.with_charged_root(mem, root, |model| {
+            model.begin_host_proposal()?;
+            step(model)
+        }) {
             Ok(Decision::Work(request)) => {
                 mem.open_venue(HostVenue::Proposal(request));
                 Ok(Ok(request))
