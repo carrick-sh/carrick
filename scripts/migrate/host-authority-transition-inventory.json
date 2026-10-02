@@ -16623,5 +16623,59 @@
       "line_end": 1437,
       "line_start": 1437
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current host thread waiting on an EL1 reservation root held by guest EL1, napping between holder-progress checks in `RootHostWait::wait`"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:62 in `RootHostWait::wait`, `std::thread::sleep` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1, napping between holder-progress checks in `RootHostWait::wait`; no guest identity selects its host target.",
+    "review_id": "HA-000693",
+    "source": {
+      "byte_end": 2898,
+      "byte_start": 2880,
+      "column": 13,
+      "column_end": 31,
+      "column_start": 13,
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs",
+      "line": 62,
+      "line_end": 62,
+      "line_start": 62
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-YIELD-NOW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current host thread waiting on an EL1 reservation root held by guest EL1 used by `RootHostWait::wait`"
+    },
+    "expansion": null,
+    "operation": "std::thread::yield_now",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:60 in `RootHostWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1 used by `RootHostWait::wait`; no guest identity selects its host target.",
+    "review_id": "HA-000692",
+    "source": {
+      "byte_end": 2847,
+      "byte_start": 2825,
+      "column": 13,
+      "column_end": 35,
+      "column_start": 13,
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs",
+      "line": 60,
+      "line_end": 60,
+      "line_start": 60
+    }
   }
 ]
