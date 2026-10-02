@@ -3594,7 +3594,7 @@ where
                 // this MM's fence), so EL1 can switch a vCPU running another
                 // process's thread to this process's threads without an exit.
                 if let Some(binding) = control.binding {
-                    let Some(participation) = self.state.guest_execution.as_ref() else {
+                    let Some(participation) = self.state.guest_execution.as_mut() else {
                         carrick_fatal!(
                             "vcpu_loop::slot_admission",
                             "admitted MM vanished before publication"
@@ -3603,7 +3603,14 @@ where
                     binding.publish_address_space(|lease_ttbr0| {
                         let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
                         (ttbr0 == lease_ttbr0)
-                            .then(|| dispatcher.publish_bound_address_space(participation, &mut *engine, ttbr0, ttbr1))
+                            .then(|| {
+                                self.kernel.dispatcher.publish_bound_address_space(
+                                    participation,
+                                    &mut *engine,
+                                    ttbr0,
+                                    ttbr1,
+                                )
+                            })
                             .flatten()
                     });
                 }
