@@ -142,6 +142,10 @@ fn source_file(len: usize) -> i64 {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "reuse") {
+        reused_mapping_two_live_processes();
+        return;
+    }
     const LEN: usize = 5 * PAGE + 123;
     let fd = source_file(LEN + 4 * PAGE);
 
@@ -256,4 +260,123 @@ fn main() {
 
     call(SYS_CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
     say(format_args!("copyout_ok"));
+}
+
+/// The child replaces a host-file VMA with an EL1-served anonymous VMA at
+/// the same VA, while the parent's file VMA remains live. Checked host reads
+/// and writes must follow each MM's live permissions, not old host masks.
+fn reused_mapping_two_live_processes() {
+    #[repr(C)]
+    struct Timeval { seconds: i64, micros: i64 }
+    #[repr(C)]
+    struct Timer { interval: Timeval, value: Timeval }
+    let arm = || {
+        let timer = Timer {
+            interval: Timeval { seconds: 0, micros: 0 },
+            value: Timeval { seconds: 5, micros: 0 },
+        };
+        if call(103 /* setitimer */, [0, &timer as *const Timer as u64, 0, 0, 0, 0]) != 0 {
+            fail("reuse-timer", format_args!("setitimer"));
+        }
+    };
+    let fd = source_file(4 * PAGE);
+    let map = fresh(4);
+    unmap(map, 4);
+    let file = call(SYS_MMAP, [map as u64, (4 * PAGE) as u64, PROT_RW, 0x12, fd as u64, 0]);
+    if file != map as i64 {
+        fail("reuse-file-map", format_args!("ret={file}"));
+    }
+    let path = unsafe { map.add(PAGE + 32) };
+    let put_path = || {
+        for (i, b) in b"/tmp/copyout-reused\0".iter().enumerate() {
+            unsafe { path.add(i).write_volatile(*b) };
+        }
+    };
+    let open = || call(SYS_OPENAT, [AT_FDCWD, path as u64, O_RDWR_CREAT_TRUNC, 0o600, 0, 0]);
+    put_path();
+    let mut ready = [-1_i32; 2];
+    let mut ack = [-1_i32; 2];
+    for pipe in [&mut ready, &mut ack] {
+        if call(SYS_PIPE2, [pipe.as_mut_ptr() as u64, 0, 0, 0, 0, 0]) != 0 {
+            fail("reuse-pipe", format_args!("pipe2"));
+        }
+    }
+    arm();
+    let child = call(220 /* clone: fork-shaped SIGCHLD */, [17, 0, 0, 0, 0, 0]);
+    if child < 0 {
+        fail("reuse-fork", format_args!("ret={child}"));
+    }
+    arm(); // Linux interval timers are not inherited by fork.
+    if child == 0 {
+        call(SYS_CLOSE, [ready[0] as u64, 0, 0, 0, 0, 0]);
+        call(SYS_CLOSE, [ack[1] as u64, 0, 0, 0, 0, 0]);
+        unmap(map, 4);
+        // Prepare a grant while only the first page is mapped. The remaining
+        // retired file pages are then first-touch stock, adopted by a later
+        // EL1-only mmap without another host grant to refresh any mirror.
+        let first = call(SYS_MMAP, [map as u64, PAGE as u64, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0]);
+        if first != map as i64 {
+            fail("reuse-first-map", format_args!("ret={first}"));
+        }
+        unsafe { map.write_volatile(0xa5) };
+        let rest = call(SYS_MMAP, [map as u64 + PAGE as u64, (3 * PAGE) as u64, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0]);
+        if rest != map as i64 + PAGE as i64 {
+            fail("reuse-stock-map", format_args!("ret={rest}"));
+        }
+        put_path();
+        let opened = open();
+        if opened < 0 {
+            fail("reuse-open", format_args!("ret={opened}"));
+        }
+        call(SYS_CLOSE, [opened as u64, 0, 0, 0, 0, 0]);
+        let source = unsafe { map.add(2 * PAGE) };
+        unsafe { source.write_volatile(0x5a) };
+        let wrote = call(68 /* pwrite64 */, [fd as u64, source as u64, 1, 0, 0, 0]);
+        let destination = unsafe { map.add(3 * PAGE) };
+        let got = call(SYS_PREAD64, [fd as u64, destination as u64, 1, 0, 0, 0]);
+        if wrote != 1 || got != 1 || byte(map, 3 * PAGE) != 0x5a {
+            fail("reuse-copy", format_args!("write={wrote} read={got}"));
+        }
+        if call(226 /* mprotect */, [path as u64 & !4095, PAGE as u64, 0, 0, 0, 0]) != 0 || open() != -14 {
+            fail("reuse-none", format_args!("host read must be EFAULT"));
+        }
+        if call(226, [destination as u64, PAGE as u64, 1, 0, 0, 0]) != 0
+            || call(SYS_PREAD64, [fd as u64, destination as u64, 1, 0, 0, 0]) != -14
+            || call(68, [fd as u64, destination as u64, 1, 0, 0, 0]) != 1
+        {
+            fail("reuse-readonly", format_args!("live read/write direction"));
+        }
+        unmap(map, 4);
+        if open() != -14 {
+            fail("reuse-hole", format_args!("host read must be EFAULT"));
+        }
+        let byte = [1_u8];
+        if call(SYS_WRITE, [ready[1] as u64, byte.as_ptr() as u64, 1, 0, 0, 0]) != 1 {
+            fail("reuse-ready", format_args!("write"));
+        }
+        let mut response = [0_u8];
+        if call(SYS_READ, [ack[0] as u64, response.as_mut_ptr() as u64, 1, 0, 0, 0]) != 1 {
+            fail("reuse-ack", format_args!("read"));
+        }
+        std::process::exit(0);
+    }
+    call(SYS_CLOSE, [ready[1] as u64, 0, 0, 0, 0, 0]);
+    call(SYS_CLOSE, [ack[0] as u64, 0, 0, 0, 0, 0]);
+    let mut response = [0_u8];
+    if call(SYS_READ, [ready[0] as u64, response.as_mut_ptr() as u64, 1, 0, 0, 0]) != 1 {
+        fail("reuse-parent-ready", format_args!("read"));
+    }
+    let opened = open();
+    if opened < 0 {
+        fail("reuse-parent-open", format_args!("child retirement changed parent: {opened}"));
+    }
+    call(SYS_CLOSE, [opened as u64, 0, 0, 0, 0, 0]);
+    if call(SYS_WRITE, [ack[1] as u64, response.as_ptr() as u64, 1, 0, 0, 0]) != 1 {
+        fail("reuse-parent-ack", format_args!("write"));
+    }
+    let mut status = -1_i32;
+    if call(260 /* wait4 */, [child as u64, &mut status as *mut i32 as u64, 0, 0, 0, 0]) != child || status != 0 {
+        fail("reuse-wait", format_args!("status={status}"));
+    }
+    say(format_args!("copyout_reuse_ok"));
 }
