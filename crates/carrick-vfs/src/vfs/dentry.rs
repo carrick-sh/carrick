@@ -255,6 +255,11 @@ struct InsertDirParams<'a> {
     ino: u64,
 }
 
+enum RetainedLowerDirectory {
+    Unknown,
+    Checked(Option<Arc<OwnedFd>>),
+}
+
 struct ConstructPositiveParams<'a> {
     parent_id: DentryId,
     name: &'a str,
@@ -466,24 +471,15 @@ impl DentryCache {
     ///   a directory this process has pinned: "this name still denotes this
     ///   directory" is exactly the claim a sibling rename/rmdir can falsify,
     ///   and trusting it without a fresh host check reintroduces the
-    ///   correctness property `d48c36823` exists to prevent. But a pinned
-    ///   directory (`pin_count > 0`, a live guest dir fd open on it via
-    ///   `pin_dir`) is not itself a name-lookup result: it is a host
-    ///   directory this process still holds open, identified by its
-    ///   `DentryId`/(dev, ino)/fds, and a sibling's unrelated mutation cannot
-    ///   invalidate THAT identity. So the pinned directory's OBJECT survives
-    ///   — by id, not by name — together with every ancestor its own
-    ///   `parent` chain needs to remain a valid `DirEntry`. Its probe state
-    ///   is reset (`lower_probed`, `upper_probed_gen`, `lower_negatives`,
-    ///   `dir_gen`) and it is indexed into `orphaned_dirs` by (dev, ino), so
-    ///   the next time `insert_dir` sees a host-verified lookup resolve that
-    ///   exact inode under ANY name, it reuses this SAME id/fds/pin_count
-    ///   instead of minting a duplicate (see `insert_dir`'s reuse branch and
-    ///   `orphaned_dirs`'s doc comment). Until such a rediscovery, the
-    ///   directory is reachable only by the `DentryId` its pinner already
-    ///   holds — `has_dir`/`is_directory`'s path-keyed fast path correctly
-    ///   sees nothing and falls back to a real host check, rather than ever
-    ///   answering from an unverified name.
+    ///   correctness property `d48c36823` exists to prevent. An owned
+    ///   directory fd is an object capability, not a name-lookup result.
+    ///   Retain these bounded directory objects in this cache until ordinary
+    ///   eviction, irrespective of pin count. Their names must still be
+    ///   rediscovered through fresh host identity checks. Upper probe state is
+    ///   reset; immutable lower facts stay scoped to their original path.
+    ///   orphaned_dirs indexes physical identities so insert_dir
+    ///   can reunite a checked name with its existing object and capability.
+    ///   No owner or name authority is transferred by this retention.
     fn check_fork(&self) {
         let cur_gen = crate::fs_resolve_cache::current_process_generation();
         let shared_gen = self.coherence.current_generation();
@@ -533,30 +529,11 @@ impl DentryCache {
                 let mut dirs = self.dirs.write();
                 let mut path_to_dir_id = self.path_to_dir_id.write();
 
-                // A pinned directory's ANCESTORS must be kept too: the walk
-                // resolves a path component by component through `entries`
-                // keyed on `(parent_id, name)`, so if an ancestor dropped
-                // out, re-resolving it mints a brand-new `DentryId` for that
-                // ancestor and, with it, a brand-new (duplicate) `DentryId`
-                // for the pinned directory itself the next time it is
-                // reached by path -- exactly the identity loss this branch
-                // exists to avoid. Walk each pinned directory's `parent`
-                // chain up to ROOT to compute the full kept set.
-                let mut keep_ids: HashSet<DentryId> = HashSet::new();
-                keep_ids.insert(DentryId::ROOT);
-                for (id, dir) in dirs.iter() {
-                    if dir.pin_count.load(Ordering::Relaxed) == 0 {
-                        continue;
-                    }
-                    let mut cur = *id;
-                    while keep_ids.insert(cur) {
-                        match dirs.get(&cur).and_then(|d| d.parent.as_ref()) {
-                            Some((parent_id, _)) => cur = *parent_id,
-                            None => break,
-                        }
-                    }
-                }
-
+                // Name knowledge expires, not the identity of an owned fd.
+                // Retain bounded directory objects until normal cache eviction;
+                // production trusted directory descriptions need not pin this
+                // cache. Fresh fstatat identity checks reunite names with these
+                // objects through orphaned_dirs, without reopening parents.
                 // Every NAME binding is unconditionally stale after a
                 // sibling's mutation -- it could have created, removed or
                 // renamed anything, anywhere -- and that applies EQUALLY to
@@ -573,11 +550,8 @@ impl DentryCache {
                 self.inodes.write().clear();
                 path_to_dir_id.retain(|_, id| *id == DentryId::ROOT);
 
-                dirs.retain(|id, _| keep_ids.contains(id));
                 for dir in dirs.values_mut() {
-                    dir.lower_probed = false;
                     dir.upper_probed_gen = 0;
-                    dir.lower_negatives.write().clear();
                     dir.dir_gen.fetch_add(1, Ordering::SeqCst);
                 }
 
@@ -1404,11 +1378,10 @@ impl DentryCache {
 
         let lower_probed = lower_dir_fd.is_some()
             || (parent_id != DentryId::ROOT
-                && self
-                    .dirs
-                    .read()
-                    .get(&parent_id)
-                    .is_some_and(|p| p.lower_probed && p.lower_dir_fd.is_none()));
+                && self.dirs.read().get(&parent_id).is_some_and(|p| {
+                    (p.lower_probed && p.lower_dir_fd.is_none())
+                        || p.lower_negatives.read().contains(name)
+                }));
         let upper_probed_gen = if upper_dir_fd.is_some() {
             u64::MAX
         } else {
@@ -1435,6 +1408,9 @@ impl DentryCache {
                 let updated = dirs.get_mut(&existing_id).map(|dir| {
                     let old_parent = dir.parent.take();
                     dir.parent = Some((parent_id, name.to_string()));
+                    if dir.path != path {
+                        dir.lower_negatives.write().clear();
+                    }
                     dir.path = path.to_string();
                     dir.upper_dir_fd = upper_dir_fd.clone();
                     dir.lower_dir_fd = lower_dir_fd.clone();
@@ -1757,17 +1733,25 @@ impl DentryCache {
             // pinned capability for this exact physical directory. Reuse
             // that capability before opening, rather than opening and then
             // discovering the retained identity in insert_dir.
-            let retained_upper = if !is_lower && st.st_dev != 0 {
+            let (retained_upper, retained_lower) = if !is_lower && st.st_dev != 0 {
                 let identity = InodeIdentity::new(st.st_dev as u64, st.st_ino);
                 let retained_id = self.orphaned_dirs.read().get(&identity).copied();
-                retained_id.and_then(|id| {
-                    self.dirs
-                        .read()
-                        .get(&id)
-                        .and_then(|dir| dir.upper_dir_fd.clone())
-                })
+                retained_id
+                    .and_then(|id| {
+                        self.dirs.read().get(&id).map(|dir| {
+                            let lower = if dir.path == full_path
+                                && (dir.lower_probed || dir.lower_dir_fd.is_some())
+                            {
+                                RetainedLowerDirectory::Checked(dir.lower_dir_fd.clone())
+                            } else {
+                                RetainedLowerDirectory::Unknown
+                            };
+                            (dir.upper_dir_fd.clone(), lower)
+                        })
+                    })
+                    .unwrap_or((None, RetainedLowerDirectory::Unknown))
             } else {
-                None
+                (None, RetainedLowerDirectory::Unknown)
             };
             let child_upper_dir_fd = if !is_lower {
                 retained_upper.or_else(|| {
@@ -1810,7 +1794,10 @@ impl DentryCache {
                     None => None,
                 }
             };
-            let child_lower_dir_fd = if is_lower {
+            let child_lower_dir_fd = if let RetainedLowerDirectory::Checked(lower) = retained_lower
+            {
+                lower
+            } else if is_lower {
                 let raw = unsafe {
                     libc::openat(
                         parent_fd.as_raw_fd(),
@@ -1843,6 +1830,14 @@ impl DentryCache {
                             self.host_opens.fetch_add(1, Ordering::Relaxed);
                             Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
                         } else {
+                            if matches!(
+                                std::io::Error::last_os_error().raw_os_error(),
+                                Some(libc::ENOENT | libc::ENOTDIR)
+                            ) {
+                                if let Some(parent) = self.dirs.read().get(&parent_id) {
+                                    parent.lower_negatives.write().insert(name.to_owned());
+                                }
+                            }
                             None
                         }
                     }
@@ -4147,6 +4142,95 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         churn_handle.join().unwrap();
+    }
+
+    #[test]
+    fn serial_host_merged_parent_rename_rebinds_lower_path() {
+        let lower = tempdir().unwrap();
+        let upper = tempdir().unwrap();
+        for name in ["left", "right"] {
+            fs::create_dir(lower.path().join(name)).unwrap();
+        }
+        fs::write(lower.path().join("left/old"), b"old").unwrap();
+        fs::write(lower.path().join("right/new"), b"new").unwrap();
+        fs::create_dir(upper.path().join("left")).unwrap();
+        let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let backend = HostFsBackend::from_path(upper.path()).unwrap();
+        let cache = DentryCache::new(false, Arc::clone(backend.cache_coherence()));
+        cache
+            .stat("/left/old", false, &backend, Some(&rootfs))
+            .unwrap();
+        fs::rename(upper.path().join("left"), upper.path().join("right")).unwrap();
+        cache.coherence.simulate_sibling_path_bump();
+        assert_eq!(
+            cache
+                .stat("/right/new", false, &backend, Some(&rootfs))
+                .unwrap()
+                .size,
+            3
+        );
+        assert_eq!(
+            cache.stat("/right/old", false, &backend, Some(&rootfs)),
+            Err(LINUX_ENOENT)
+        );
+    }
+
+    #[test]
+    fn serial_host_merged_parent_revalidation_does_not_reopen_lower() {
+        let lower = tempdir().unwrap();
+        let upper = tempdir().unwrap();
+        fs::create_dir_all(lower.path().join("parent/child")).unwrap();
+        fs::create_dir_all(upper.path().join("parent/child")).unwrap();
+        fs::write(upper.path().join("parent/child/file"), b"data").unwrap();
+        let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let backend = HostFsBackend::from_path(upper.path()).unwrap();
+        let cache = DentryCache::new(false, Arc::clone(backend.cache_coherence()));
+        cache
+            .stat("/parent/child/file", false, &backend, Some(&rootfs))
+            .unwrap();
+        cache.coherence.simulate_sibling_path_bump();
+        cache.reset_host_open_count();
+        assert_eq!(
+            cache
+                .stat("/parent/child/file", false, &backend, Some(&rootfs))
+                .unwrap()
+                .size,
+            4
+        );
+        assert_eq!(
+            cache.host_open_count(),
+            0,
+            "immutable lower capability must survive checked rebinding at the same path"
+        );
+    }
+
+    #[test]
+    fn serial_host_unpinned_parent_revalidation_does_not_reopen() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false, Arc::clone(backend.cache_coherence()));
+        fs::create_dir_all(tmp.path().join("parent/child")).unwrap();
+        cache
+            .lookup_path("/parent/child", false, &backend, None)
+            .unwrap();
+        fs::rename(tmp.path().join("parent"), tmp.path().join("renamed")).unwrap();
+        cache.coherence.simulate_sibling_path_bump();
+        cache.reset_host_open_count();
+        assert!(
+            cache
+                .lookup_path("/parent/child", false, &backend, None)
+                .is_err()
+        );
+        assert!(
+            cache
+                .lookup_path("/renamed/child", false, &backend, None)
+                .is_ok()
+        );
+        assert_eq!(
+            cache.host_open_count(),
+            0,
+            "name invalidation must not discard owned directory capabilities"
+        );
     }
 
     #[test]
