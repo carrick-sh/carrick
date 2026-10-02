@@ -1,0 +1,51 @@
+{
+  "sample_probe_base": {
+    "accessx": {
+      "class": "conformance",
+      "excluded": false,
+      "runner": "generic"
+    }
+  },
+  "sample_probe_ours": {
+    "accessx": {
+      "class": "conformance",
+      "excluded": false,
+      "runner": "generic"
+    },
+    "bigread": {
+      "class": "conformance",
+      "excluded": false,
+      "runner": "generic"
+    }
+  },
+  "sample_probe_theirs": {
+    "accessx": {
+      "class": "conformance",
+      "excluded": false,
+      "runner": "generic"
+    },
+    "clockadj": {
+      "class": "conformance",
+      "excluded": false,
+      "runner": "generic"
+    }
+  },
+  "sample_abort_base": {
+    "schema": 1,
+    "shard": "hvf.json",
+    "typed_error_debt_ceiling": 0,
+    "rows": [
+      {
+        "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+        "function": "attach_task_only_engine",
+        "ordinal_in_function": 1,
+        "fingerprint": "522d1350a169ac84061d7e3b2a617f3c70c608b998ad3fc3f11705cc6ad02442",
+        "verdict": "carrier_fault",
+        "failure_domain": "hvpatch::runtime_projection",
+        "rationale": "Missing runtime projection authority during task-only engine attach indicates double-attachment.",
+        "sink": "fatal",
+        "domain": "hvpatch::runtime_projection"
+      }
+    ]
+  }
+}
