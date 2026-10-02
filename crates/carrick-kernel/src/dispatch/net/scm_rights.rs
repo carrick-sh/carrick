@@ -26,27 +26,21 @@
 //!
 //! # The placeholder
 //!
-//! A fresh host `pipe()`. Its READ end travels in the host message (Darwin
-//! dups it into the receiver like any passed fd); its WRITE end stays here.
-//! The key is the pipe's `(st_dev, st_ino)`: XNU stats a pipe by object
-//! identity, so every dup of the read end — the one in flight, the one the
-//! receiver gets — reports the same pair. Holding the write end keeps the
-//! kernel object alive for as long as the entry exists, so a live key can
-//! never be reused by another pipe.
+//! A fresh host `pipe()`. The READ end travels in the host message; the WRITE
+//! end stays here. Every dup reports the same tuple. Holding the write end
+//! keeps the object alive so a live key is never reused.
 //!
 //! # Garbage collection
 //!
-//! The parked description holds one logical fd reference (like an in-flight fd
-//! on Linux). If the message is never received and the socket closes, read ends
-//! die and the retained writer reports `POLLERR`/`POLLHUP` from `poll(2)`: that
-//! signals nothing can claim the entry, releasing its reference. `gc` runs on
-//! every park/claim and socket close to collect orphaned entries.
+//! The parked description holds one logical fd reference. If the socket closes
+//! unread, read ends die and the writer reports `POLLERR`/`POLLHUP` from `poll`:
+//! that signals nothing can claim the entry, releasing it. `gc` runs on every
+//! park/claim and socket close to collect orphaned entries.
 //!
 //! # Scope
 //!
-//! This registry is CARRIER-scoped on purpose: the placeholder keys are host
-//! kernel identities, unique per carrier, and a message may cross guest
-//! process boundaries inside one carrier. It is not per-Linux-process state.
+//! CARRIER-scoped: placeholder keys are host identities unique per carrier;
+//! messages may cross guest process boundaries inside one carrier.
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -56,6 +50,7 @@ use crate::kernel::FileDescription;
 
 /// A description in flight, keyed by its placeholder pipe's identity.
 struct Parked {
+    key: PlaceholderKey,
     description: Arc<FileDescription>,
     /// The placeholder's write end; closing it is what lets the read ends
     /// finally EOF, and its `POLLERR` is the "no reader left" signal for GC.
@@ -63,7 +58,6 @@ struct Parked {
 }
 
 /// `(st_dev, st_ino, st_ctime)` of a placeholder pipe from `fstat` of either end.
-///
 /// Nanosecond creation timestamp keeps key identity unambiguous across allocations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct PlaceholderKey {
@@ -111,14 +105,20 @@ fn park(description: Arc<FileDescription>) -> Option<(PlaceholderKey, OwnedFd)> 
     description.retain_fd_ref();
     let mut vault = lock();
     collect(&mut vault);
-    let prev = vault.insert(
+    if let Some(displaced) = vault.insert(
         key,
         Parked {
+            key,
             description,
             writer,
         },
-    );
-    assert!(prev.is_none(), "vault key collision: entry already exists");
+    ) {
+        let existing = displaced.key;
+        carrick_fatal::carrick_fatal!(
+            "scm_rights::vault",
+            "vault key collision on insert: existing key {existing:?} displaced by new key {key:?}"
+        );
+    }
     Some((key, reader))
 }
 
