@@ -546,7 +546,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.vfs.host-namespace-mutation-work"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
