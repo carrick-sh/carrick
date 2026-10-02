@@ -763,3 +763,51 @@ were changed.
 Phase A is ready for review under the revised acceptance, with the known
 six still red. Phase B settlement, admission closing and exact per-thread
 teardown are not implemented or accepted by this checkpoint.
+
+### Phase B kernel settlement checkpoint (2026-10-02)
+
+Branch `work/lifecycle-phase-b` rebased on main `4c4d06b4c` before this work.
+This is an incomplete kernel checkpoint, not signed Phase B acceptance.
+
+- `828b888d5`: host and EL1 claims consume the same ABI pool CAS. The
+  two-process contract failed red with `PoolEmpty` before the correction.
+- `46cf43e6f`: ABI Born records publish through the canonical kernel thread
+  publication body before context/membership resolution. A peer's unknown-tid
+  lookup failed red before settlement; the exact slot and serial survive it.
+- `285a81f14`: ABI exits use canonical graph retirement and retain numeric
+  identity while captured contexts exist. The peer-observer red found the
+  departed tid still live. Birth followed by exit is also consumed in one
+  settlement pass.
+- `1c0f464ce`: host births and nonfinal host exits update the ABI live census;
+  EL1-accounted exits do not decrement twice. The two-process red saw one
+  instead of two after a host clone. Runtime census projection is unfinished.
+- `b5f18bfad`: a non-cloneable exit admission spans the bounded EL1 exit
+  window. Closing sees in-flight exits; rollback preserves concurrent birth
+  publication. The red allowed an exit through `ForkClosing`. Protocol is 4.
+
+Final focused checks: 29 kernel lifecycle contracts, 111 ABI tests and 184
+EL1 tests pass. `just test-kernel` passed after exit/census changes; `just
+test` passed before the exit-admission protocol change (including serial
+HVF library: 684 passed, three ignored). Clippy passed on protocol 4.
+Logs: `/tmp/phaseb-live-count-{red,green}.log`,
+`/tmp/phaseb-exit-admission-{red,abi-el1,kernel}.log`,
+`/tmp/phaseb-settlement-{test-kernel,test,clippy}.log`.
+
+Reconciliation captured 599 macOS host-authority rows and rebound K1
+positions without changing classifications/counts. It refused runtime-abort
+re-blessing. `just lint-domains` fails with **24 missing classifications**;
+the new settlement paths include fallible preparation/retirement after the
+guest birth has already succeeded, requiring reserve-before-birth or typed
+failure review rather than a blanket carrier-fault classification. Logs:
+`/tmp/phaseb-settlement-{reconcile,lint-domains}.log`.
+
+Production `GuestLifecycleVenue::born_slot` still declines. An ABI birth
+settles to an uninitialized execution record, so existing zone handback has
+no execution generation or runtime binding. The director confirmed that
+ABI and host origins must enter one adoption routine, owned by exact
+`TaskKey`, leasing the binding at first host entry; it must never borrow the
+driver process's job. This integration, conflicting-operation gate guards,
+exact carrier metadata retirement, pending-birth kernel lifetime and
+teardown proof remain open. Credentials/affinity at claim require those
+guards before production admission. No signed tests, cached probes, hatch
+comparison, or Docker ran on this checkpoint; spawn slope is not green.
