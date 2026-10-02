@@ -235,8 +235,9 @@ pub struct DentryCache {
     /// because this process still holds them open. Keyed by the directory's
     /// real (dev, ino) so `insert_dir` can, on the next fresh host-verified
     /// discovery of that inode under ANY name, reuse the SAME `DentryId`
-    /// instead of minting a duplicate. Entries are removed on reuse and on
-    /// ordinary capacity eviction; a dangling entry (its dir already gone)
+    /// instead of minting a duplicate. Rebinding never consumes this index:
+    /// another in-flight walk can still be rediscovering the same object.
+    /// Entries are removed on ordinary capacity eviction; a dangling entry (its dir already gone)
     /// is harmless and self-heals on the next lookup.
     orphaned_dirs: RwLock<HashMap<InodeIdentity, DentryId>>,
 }
@@ -1417,8 +1418,9 @@ impl DentryCache {
         if dev != 0 {
             let reused_id = self
                 .orphaned_dirs
-                .write()
-                .remove(&InodeIdentity::new(dev, ino));
+                .read()
+                .get(&InodeIdentity::new(dev, ino))
+                .copied();
             if let Some(existing_id) = reused_id {
                 let mut dirs = self.dirs.write();
                 let updated = dirs.get_mut(&existing_id).map(|dir| {
@@ -1495,6 +1497,11 @@ impl DentryCache {
             }
 
             dirs.insert(id, dir_entry);
+            if dev != 0 {
+                self.orphaned_dirs
+                    .write()
+                    .insert(InodeIdentity::new(dev, ino), id);
+            }
             path_map.insert(path.to_string(), id);
         }
 
@@ -4158,6 +4165,34 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         churn_handle.join().unwrap();
+    }
+
+    #[test]
+    fn serial_host_retained_directory_identity_is_not_consumed_by_rebinding() {
+        let upper = tempdir().unwrap();
+        fs::create_dir_all(upper.path().join("parent/child")).unwrap();
+        fs::write(upper.path().join("parent/child/file"), b"x").unwrap();
+        let backend = HostFsBackend::from_path(upper.path()).unwrap();
+        let cache = DentryCache::new(false, Arc::clone(backend.cache_coherence()));
+        cache
+            .lookup_path("/parent/child/file", false, &backend, None)
+            .unwrap();
+        cache.coherence.simulate_sibling_path_bump();
+        cache
+            .lookup_path("/parent/child/file", false, &backend, None)
+            .unwrap();
+        // A second already-running walk can miss the newly published binding.
+        // Its fresh physical identity must still find the retained capability.
+        cache.entries.write().clear();
+        cache.reset_host_open_count();
+        cache
+            .lookup_path_slow("/parent/child/file", false, &backend, None)
+            .unwrap();
+        assert_eq!(
+            cache.host_open_count(),
+            0,
+            "rebinding must not consume the directory identity index"
+        );
     }
 
     #[test]
