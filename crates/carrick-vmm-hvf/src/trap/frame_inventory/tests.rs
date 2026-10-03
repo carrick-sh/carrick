@@ -5110,6 +5110,11 @@ fn directory_failpoint_rolls_back_inventory_before_final_carrier_drop() {
         frames,
     });
     let row = HvpatchCarrierTaskRow {
+        mm_key: HvpatchMmAuthorityKey {
+            task_serial: 1,
+            mm_root_slot: None,
+            shared_kernel_mm: None,
+        },
         _mm: Some(carrier),
         rollbacks: None,
     };
