@@ -27,6 +27,18 @@ fn next_frame_grant_generation() -> u64 {
     }
 }
 
+/// The one lazy-supply protocol, shared by faults and stopped-target transfers.
+/// Failed mailbox admission leaves the caller's owned continuation resumable.
+pub fn request_lazy_frames(mailbox: &FrameGrantMailbox, mm_key: u64, va: u64, access: u64) -> bool {
+    mailbox.try_publish_request(FrameGrantRequest {
+        mm_key,
+        request_generation: next_frame_grant_generation(),
+        fault_va: va,
+        requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+        access,
+    })
+}
+
 /// Decode an EL0 translation fault that can be satisfied by publishing fresh
 /// anonymous backing. Permission faults name an already-mapped page and must
 /// follow the protection/COW path; requesting another frame for them adds a
@@ -64,10 +76,27 @@ pub fn is_write_permission_fault(esr: u64) -> bool {
 
 /// Operation needed to resolve a COW fault in EL1. The caller holds the
 /// faulting MM's exact editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CowResolution {
+    Resolved,
+    NeedsSupply,
+    Refused,
+}
+
 pub trait CowResolver {
     /// Resolve the write fault at `far` for `mm_key`, whose live root and
     /// ASID are in `ttbr0`. `true`: retry the faulting instruction.
     fn resolve_cow(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> bool;
+    fn executable_publication(&self) -> bool {
+        false
+    }
+    fn resolve_cow_outcome(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> CowResolution {
+        if self.resolve_cow(ttbr0, mm_key, far) {
+            CowResolution::Resolved
+        } else {
+            CowResolution::Refused
+        }
+    }
     /// The MM's editor could not be taken (another EL1 editor, or a host
     /// pause closed its gate): the fault goes to the host.
     fn editor_busy(&mut self) {}
@@ -179,11 +208,19 @@ impl PreparedPageResolver for HardwarePreparedResolver {
 }
 
 #[cfg(target_os = "none")]
-pub struct HardwareCowResolver;
+pub struct HardwareCowResolver {
+    pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
+}
 
 #[cfg(target_os = "none")]
 impl CowResolver for HardwareCowResolver {
+    fn executable_publication(&self) -> bool {
+        self.publication.is_some()
+    }
     fn resolve_cow(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> bool {
+        self.resolve_cow_outcome(ttbr0, mm_key, far) == CowResolution::Resolved
+    }
+    fn resolve_cow_outcome(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> CowResolution {
         use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
         let maintenance = El1TableMaintenance { ttbr0 };
         // SAFETY: the alias maps this MM's primary arena, the pool window
@@ -197,13 +234,27 @@ impl CowResolver for HardwareCowResolver {
             )
             .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
         }) else {
-            return false;
+            return CowResolution::Refused;
+        };
+        let publish = |grant, ipa, len| {
+            self.publication.is_some_and(|slot| {
+                slot.publish_with(
+                    carrick_el1_abi::PortalExecutablePublication { grant, ipa, len },
+                    || unsafe {
+                        core::arch::asm!("hvc #1", options(nostack));
+                    },
+                )
+            })
         };
         let outcome = crate::cow::resolve_guest_cow(
             &crate::cow::GuestCowVenue {
+                publish_executable: self
+                    .publication
+                    .map(|_| &publish as &dyn Fn(_, _, _) -> bool),
                 words: &words,
                 root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
                 pool: carrick_el1_abi::cow_grant_pool_guest(),
+                residency: carrick_el1_abi::frame_grant_residency_guest(),
                 copy_base: carrick_el1_abi::EL1_COW_COPY_BASE,
             },
             mm_key,
@@ -224,7 +275,13 @@ impl CowResolver for HardwareCowResolver {
                 crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
             },
         );
-        !matches!(outcome, crate::cow::GuestCowOutcome::Declined(_))
+        match outcome {
+            crate::cow::GuestCowOutcome::Declined(carrick_el1_abi::CowDecline::PoolEmpty) => {
+                CowResolution::NeedsSupply
+            }
+            crate::cow::GuestCowOutcome::Declined(_) => CowResolution::Refused,
+            _ => CowResolution::Resolved,
+        }
     }
 
     fn editor_busy(&mut self) {
@@ -257,8 +314,8 @@ pub struct DescriptorTxnPath<'a, X: DescriptorTxnApplier> {
 const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 #[cfg(target_os = "none")]
-struct El1TableMaintenance {
-    ttbr0: u64,
+pub(crate) struct El1TableMaintenance {
+    pub(crate) ttbr0: u64,
 }
 
 #[cfg(target_os = "none")]
@@ -719,7 +776,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 resolver: &mut HardwarePreparedResolver,
                 roots: Some(crate::memory::reservations::shared_guest()),
             }),
-            &mut HardwareCowResolver,
+            &mut HardwareCowResolver { publication: None },
         )
     }
     #[cfg(not(target_os = "none"))]
@@ -942,13 +999,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         return Action::Forward;
     }
 
-    let _ = mailbox.try_publish_request(FrameGrantRequest {
-        mm_key,
-        request_generation: next_frame_grant_generation(),
-        fault_va: frame.far,
-        requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
-        access,
-    });
+    let _ = request_lazy_frames(mailbox, mm_key, frame.far, access);
     Action::Forward
 }
 

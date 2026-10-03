@@ -479,6 +479,7 @@ pub(crate) struct CarrierVmCustodyState {
 #[derive(Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) struct CarrierVmCustody {
+    pub(crate) transfer_carrier: core::num::NonZeroU64,
     pub(crate) el1_frame_grants: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
     /// Host COW accounting for every MM admitted to this carrier.
     pub(crate) host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger,
@@ -659,7 +660,20 @@ impl Default for CarrierVmCustody {
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 impl CarrierVmCustody {
     pub(crate) fn new() -> Self {
+        static NEXT_CARRIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_CARRIER
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("hvf::transfer", "carrier identity exhausted")
+            });
         Self {
+            transfer_carrier: core::num::NonZeroU64::new(id).unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!("hvf::transfer", "zero carrier identity")
+            }),
             el1_frame_grants: std::sync::Arc::new(parking_lot::Mutex::new(
                 El1FrameGrantLedger::default(),
             )),
