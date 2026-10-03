@@ -1162,8 +1162,8 @@ pub struct SwitchedIn {
 pub enum Waker {
     /// EL1 on `slot`: woken threads go to its run queue.
     El1 { slot: SlotId },
-    /// The host: woken threads become [`Claim::Host`] with
-    /// [`Handback::Woken`], for the caller to hand back.
+    /// The host, with no current EL1 slot. The operation may place a woken
+    /// thread in an eligible guest slot or return an owned host handback.
     Host,
 }
 
@@ -1265,7 +1265,7 @@ impl HostTransfer<'_> {
         };
         match self
             .zone
-            .place_in_guest(self.record.id, from, Some(except), |_| {})
+            .place_in_guest(self.record.id, from, Some(except), &SpinForever, |_| {})
         {
             Placement::Placed(placement) => Ok(placement),
             Placement::NoSlot | Placement::Lost => Err(self),
@@ -2312,7 +2312,7 @@ impl ZoneTables {
         let mut attempt: u32 = 0;
         loop {
             if lock
-                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
                 return Some(SlotGuard { zone: self, slot });
@@ -3320,6 +3320,7 @@ impl ZoneTables {
         record: RecordId,
         from: Claim,
         except: Option<SlotId>,
+        wait: &impl LockWait,
         claimed: impl FnOnce(&ZoneRecord),
     ) -> Placement {
         let rec = self.record(record);
@@ -3344,8 +3345,12 @@ impl ZoneTables {
                 self.least_loaded_except(rec, true, except),
             ],
         };
-        for slot in candidates.into_iter().flatten() {
-            let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let Some(slot) = *candidate else { continue };
+            if candidates[..index].contains(candidate) {
+                continue;
+            }
+            let Some(guard) = self.slot_lock(slot, wait) else {
                 continue;
             };
             let state = self.slot(slot).state();
@@ -3492,7 +3497,7 @@ impl ZoneTables {
                 let rec = self.record(record);
                 let from = Claim::Parked { seq };
                 let outcome = if place && rec.entry_count() == 1 {
-                    self.place_in_guest(record, from, None, |rec| {
+                    self.place_in_guest(record, from, None, &SpinForever, |rec| {
                         self.mark_woken(rec, index);
                         self.unlink(guard, cursor);
                         self.drop_entry(rec, cursor);
