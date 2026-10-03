@@ -394,7 +394,8 @@ unmap/remap, moved bytes, child COW with unchanged parent and peer, actual
 zeroing/reuse of a dirty physical page in a partial 16 KiB compound with an
 unchanged adjacent page, and stale pinned completion refusal. The target's
 real scheduler address-space gate stays closed, and all **256** scheduler
-records are parked service records throughout transfer. No record is unparked,
+slot drivers are away on blocking waits, each with a queued service record,
+while the target record itself remains parked. No record is unparked,
 no EL0 entry occurs and no host worker is parked by this owner entry. This is
 an owner-core progress proof, not a production service transport binding.
 
@@ -443,7 +444,7 @@ host pointer; `just test` now runs them.
 Section 6's reject/rethink conditions:
 
 - Stopped transfer needs EL0/host-worker parking: **PASS**, zero entries/parks;
-  closed execution gate and 256 unchanged parked records.
+  closed execution gate, parked target and 256 unchanged away drivers/service queues.
 - Fork needs a host VMA/reference snapshot: **PASS**, zero host projection
   inputs/decisions; owner clone visits 260/9779, owner table words 7168/7680.
 - Lease drain needs host page-table pauses: **PASS**, pending drop performs
@@ -454,6 +455,13 @@ Section 6's reject/rethink conditions:
 - Zero 18-ID forwarding but approximately 161 total exits/fork: **UNMEASURED**.
   N0 contains no guest or creation workload and makes no exit-count promise;
   this remains a mandatory N2/N3 workload rejection gate.
+
+Host-only acceptance uses main's official xtask driver (main `b0d8743ee`),
+compiled into this worktree's target, with `--root` naming this frozen-admission
+worktree. Receipt location: `target/el1-gate/n0-host-receipt.json`; its HEAD,
+cleanliness and step results are authoritative. The director owns signed
+acceptance. The frozen admission has 64 commits absent from main; rebasing
+those dependencies is a separate integration decision, not an N0 code change.
 
 This is a bounded anonymous-MM experiment, not an installed second production
 lane. N1 still owns production admission binding, all VMA kinds, cross-core
