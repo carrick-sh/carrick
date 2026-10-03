@@ -279,6 +279,31 @@ where
     let cur_task = current_tasks.get(slot);
     let nr = frame.x[8] as usize;
 
+    #[cfg(target_os = "none")]
+    if matches!(nr, 214 | 215 | 216 | 222 | 226)
+        && let (Some(zone), Some(task), Some(zslot)) =
+            (zone.as_mut(), cur_task, SlotId::from_index(slot))
+    {
+        let mut sched = sched::Sched {
+            zone: zone.tables,
+            slot: zslot,
+            task,
+            cpu: &mut *zone.cpu,
+            user: zone.user,
+            counters,
+        };
+        if let Some(served) = super::mm_portal::park_prepared_edit(
+            &mut sched,
+            frame,
+            memory::reservations::shared_guest(),
+        ) {
+            return match served {
+                sched::Served::Returned { .. } => Action::Served,
+                sched::Served::Idle => Action::Idle,
+            };
+        }
+    }
+
     // Entry check: with host work pending (a kick, a signal, an owed
     // wake), forward without serving -- except the calls the IPC adapter
     // takes:
@@ -350,7 +375,7 @@ where
     // MM keeps the paths below unchanged.
     #[cfg(target_os = "none")]
     if matches!(nr, 214 | 215 | 222 | 226)
-        && let (Some(zone), Some(task)) = (zone.as_ref(), cur_task)
+        && let (Some(zone), Some(task)) = (zone.as_mut(), cur_task)
     {
         let orig_x0 = frame.x[0];
         match memory::serve_delegated_anonymous(
@@ -361,6 +386,30 @@ where
             memory::reservations::shared_guest(),
             &mut memory::HardwareAnonymousEditor,
         ) {
+            memory::DelegatedAnonymous::PreparedConflict => {
+                // An admission raced the earlier predicate check. No syscall
+                // effect has occurred; enroll against the new owner epoch.
+                let Some(zslot) = SlotId::from_index(slot) else {
+                    return Action::Forward;
+                };
+                let mut sched = sched::Sched {
+                    zone: zone.tables,
+                    slot: zslot,
+                    task,
+                    cpu: &mut *zone.cpu,
+                    user: zone.user,
+                    counters,
+                };
+                return match super::mm_portal::park_prepared_edit(
+                    &mut sched,
+                    frame,
+                    memory::reservations::shared_guest(),
+                ) {
+                    Some(sched::Served::Returned { .. }) => Action::Served,
+                    Some(sched::Served::Idle) => Action::Idle,
+                    None => Action::Forward,
+                };
+            }
             memory::DelegatedAnonymous::NotDelegated => {}
             memory::DelegatedAnonymous::Served => {
                 task.orig_arg0.store(orig_x0, Ordering::Relaxed);

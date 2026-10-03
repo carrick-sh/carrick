@@ -9,7 +9,7 @@ use carrick_el1_abi::ipc::pipe::{self, WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
     IpcError, IpcObjectGuard, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation, RawIpcOpToken,
 };
-use carrick_sched_core::object_wait::{OBJECT_WAIT_QUEUES, ObjectWaitKey, OperationToken};
+use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
 /// Granule at which user copies are split, so a fault ends a copy at an
 /// exact page-aligned prefix (the smallest guest page size).
@@ -25,7 +25,7 @@ pub fn wait_key(object: IpcObjectHandle, lane: WaitFor) -> Option<ObjectWaitKey>
         WaitFor::Writable => 1,
     };
     let index = 1 + 2 * u64::from(object.index()) + lane;
-    if index >= OBJECT_WAIT_QUEUES as u64 {
+    if index >= carrick_sched_core::ZONE_RECORDS as u64 {
         return None;
     }
     ObjectWaitKey::new(index as u32, u64::from(object.generation()) + 1)
@@ -44,6 +44,9 @@ pub fn to_sched_token(token: IpcOpToken) -> Result<OperationToken, IpcOpToken> {
 /// token no IPC operation could have produced (it is not ours).
 pub fn from_sched_token(token: OperationToken) -> Option<IpcOpToken> {
     let index = u32::try_from(token.index().checked_sub(1)?).ok()?;
+    if index as usize >= carrick_el1_abi::ipc::IPC_OPERATIONS {
+        return None;
+    }
     let generation = u32::try_from(token.generation().checked_sub(1)?).ok()?;
     Some(IpcOpToken::from_raw(RawIpcOpToken { index, generation }))
 }

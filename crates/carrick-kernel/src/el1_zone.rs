@@ -170,6 +170,23 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
 }
 
 impl LockWait for HostLockWait {
+    fn complete_object_wake(
+        &self,
+        zone: &ZoneTables,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects,
+    ) {
+        let (waker, effects) = owned.deliver_handbacks(&mut publish_handback);
+        for slot in effects
+            .sgi_slots()
+            .chain(effects.queued_own.then_some(waker))
+        {
+            zone.owe_resched(slot);
+            resched_slot(slot);
+        }
+        if effects.misplaced {
+            kick_slot(waker);
+        }
+    }
     fn wait(&self, attempt: u32) -> bool {
         if attempt < 128 {
             std::hint::spin_loop();
@@ -561,6 +578,13 @@ pub unsafe fn read_quiesced_parked_registers(
                 fpcr: ctx.fpcr as u32,
             })
         }
+    }
+}
+
+/// Complete the detached wake claims EL1 transferred at its exit boundary.
+pub fn hand_back_completions() {
+    if let Some(zone) = zone() {
+        zone.take_completion_handbacks(&HostLockWait, &mut publish_handback);
     }
 }
 

@@ -272,9 +272,12 @@ pub fn decide_anonymous_syscall(
         Err(Refusal::Invalid) => ReservationDisposition::Return(-EINVAL),
         Err(Refusal::Hole | Refusal::Limit) => ReservationDisposition::Return(-ENOMEM),
         Err(Refusal::ForeignMapping) => ReservationDisposition::Forward,
-        Err(error @ (Refusal::Busy | Refusal::Stale | Refusal::MetadataRequired)) => {
-            ReservationDisposition::Unavailable(error)
-        }
+        Err(
+            error @ (Refusal::Busy
+            | Refusal::PreparedConflict
+            | Refusal::Stale
+            | Refusal::MetadataRequired),
+        ) => ReservationDisposition::Unavailable(error),
     }
 }
 
@@ -641,6 +644,8 @@ impl AnonymousRetirementEditor for HardwareAnonymousEditor {
 /// Where a delegated MM's anonymous syscall went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatedAnonymous {
+    /// No effect occurred; park the unchanged syscall on its exact MM queue.
+    PreparedConflict,
     /// No admitted root owns this MM's anonymous memory: the caller keeps its
     /// pre-delegation path, unchanged.
     NotDelegated,
@@ -692,6 +697,11 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         crate::personality::dispatch::AnonymousReservationRoute::Action(_) => {
             counters.anonymous_leaves[Leave::RootDeclined as usize].fetch_add(1, Ordering::Relaxed);
             return DelegatedAnonymous::Forward;
+        }
+        crate::personality::dispatch::AnonymousReservationRoute::Unavailable(
+            reservations::Refusal::PreparedConflict,
+        ) => {
+            return DelegatedAnonymous::PreparedConflict;
         }
         crate::personality::dispatch::AnonymousReservationRoute::Unavailable(_) => {
             return forward(Leave::RootUnavailable);
