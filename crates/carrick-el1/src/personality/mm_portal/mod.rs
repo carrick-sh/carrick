@@ -6,7 +6,9 @@ pub use carrick_el1_abi::{El1MmHandle, ReservationMm};
 use carrick_mmu_core::aarch64::PageTableError;
 #[cfg(any(test, feature = "host-test"))]
 use core::num::NonZeroU64;
+mod fork;
 pub mod production;
+pub use fork::*;
 pub use production::*;
 
 /// Guest address, never a physical extent or a host pointer.
@@ -70,4 +72,4 @@ pub use carrick_el1_abi::PortalTransferIntent as TransferIntent;
 #[cfg(any(test, feature = "host-test"))]
 pub mod test_support;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
