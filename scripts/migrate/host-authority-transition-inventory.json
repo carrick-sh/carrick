@@ -200,18 +200,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:516 in `send_at`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `send_at` at line 453; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:517 in `send_at`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `send_at` at line 453; no guest identity selects its host target.",
     "review_id": "HA-000010",
     "source": {
-      "byte_end": 17307,
-      "byte_start": 17294,
+      "byte_end": 17263,
+      "byte_start": 17250,
       "column": 24,
       "column_end": 37,
       "column_start": 24,
       "file": "crates/carrick-kernel/src/kernel/control/mod.rs",
-      "line": 516,
-      "line_end": 516,
-      "line_start": 516
+      "line": 517,
+      "line_end": 517,
+      "line_start": 517
     }
   },
   {
@@ -227,18 +227,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:719 in `authenticate`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `authenticate` at line 656; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:720 in `authenticate`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `authenticate` at line 656; no guest identity selects its host target.",
     "review_id": "HA-000011",
     "source": {
-      "byte_end": 25191,
-      "byte_start": 25178,
+      "byte_end": 25147,
+      "byte_start": 25134,
       "column": 24,
       "column_end": 37,
       "column_start": 24,
       "file": "crates/carrick-kernel/src/kernel/control/mod.rs",
-      "line": 719,
-      "line_end": 719,
-      "line_start": 719
+      "line": 720,
+      "line_end": 720,
+      "line_start": 720
     }
   },
   {
@@ -12312,18 +12312,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:402 in `start`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `start` at line 364; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:403 in `start`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `start` at line 364; no guest identity selects its host target.",
     "review_id": "HA-000527",
     "source": {
-      "byte_end": 12914,
-      "byte_start": 12898,
+      "byte_end": 12870,
+      "byte_start": 12854,
       "column": 27,
       "column_end": 43,
       "column_start": 27,
       "file": "crates/carrick-kernel/src/kernel/control/mod.rs",
-      "line": 402,
-      "line_end": 402,
-      "line_start": 402
+      "line": 403,
+      "line_end": 403,
+      "line_start": 403
     }
   },
   {
@@ -14710,7 +14710,7 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "carrier-owned authenticated control connection handler thread used by `spawn_handler`"
+      "resource": "per-connection carrier control handler; bounded by CONTROL_MAX_CONNECTIONS; joined on shutdown"
     },
     "expansion": null,
     "operation": "std::thread::Builder::new",
@@ -14718,18 +14718,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/connection.rs:65 in `spawn_handler`, `std::thread::Builder::new` acts only on the carrier-owned authenticated per-connection control handler; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/connection.rs:92 in `spawn_handler`, `std::thread::Builder::new` acts only on the per-connection carrier control handler; bounded by CONTROL_MAX_CONNECTIONS; joined on shutdown; no guest identity selects its host target.",
     "review_id": "HA-000712",
     "source": {
-      "byte_end": 1757,
-      "byte_start": 1732,
+      "byte_end": 2550,
+      "byte_start": 2525,
       "column": 23,
       "column_end": 48,
       "column_start": 23,
       "file": "crates/carrick-kernel/src/kernel/control/connection.rs",
-      "line": 65,
-      "line_end": 65,
-      "line_start": 65
+      "line": 92,
+      "line_end": 92,
+      "line_start": 92
     }
   },
   {
@@ -14745,18 +14745,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:281 in `start_at_inner`, `std::thread::Builder::new` acts only on the carrier-owned authenticated control server thread used by `start_at_inner` at line 270; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:284 in `start_at_inner`, `std::thread::Builder::new` acts only on the carrier-owned authenticated control server thread used by `start_at_inner` at line 270; no guest identity selects its host target.",
     "review_id": "HA-000581",
     "source": {
-      "byte_end": 8568,
-      "byte_start": 8543,
+      "byte_end": 8783,
+      "byte_start": 8758,
       "column": 26,
       "column_end": 51,
       "column_start": 26,
       "file": "crates/carrick-kernel/src/kernel/control/mod.rs",
-      "line": 281,
-      "line_end": 281,
-      "line_start": 281
+      "line": 284,
+      "line_end": 284,
+      "line_start": 284
     }
   },
   {
