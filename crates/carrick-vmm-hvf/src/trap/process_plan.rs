@@ -1845,6 +1845,27 @@ impl HvfTaskState {
 
 #[cfg(test)]
 mod tests {
+    /// Structural ownership fence: admitted fork must consume an owner
+    /// completion before any legacy host projection can be consulted. This
+    /// complements the production byte/COW witnesses; it does not prove them.
+    #[test]
+    fn admitted_fork_has_no_host_protection_snapshot_input() {
+        let source = include_str!("process_plan.rs");
+        let body = source
+            .split_once("pub(crate) fn build_process_plan(")
+            .unwrap()
+            .1
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        let host_snapshot = body.find("self.protections.snapshot_all()").unwrap();
+        let owner_completion = body.find("consume_owner_fork_completion");
+        assert!(
+            owner_completion.is_some_and(|owner| owner < host_snapshot),
+            "admitted fork reaches process_plan child protections from the host mirror before an owner Fork completion"
+        );
+    }
+
     #[test]
     fn fork_bootstrap_heap_projects_live_vmas_after_stock_return() {
         let va = carrick_mem::memory::LINUX_HEAP_BASE;
