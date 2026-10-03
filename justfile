@@ -344,8 +344,8 @@ check-disk:
     fi
     floor="${CARRICK_DISK_FLOOR_GIB:-20}"
     warn="${CARRICK_DISK_WARN_GIB:-75}"
-    # -g reports whole GiB and rounds DOWN, so this never over-reports headroom.
-    free="$(df -g . | awk 'NR==2 {print $4}')"
+    # POSIX -P reports 1024-byte blocks; int($4/1048576) converts to GiB and rounds DOWN.
+    free="$(df -Pk . | awk 'NR==2 {print int($4/1048576)}')"
     if [ "$free" -lt "$floor" ]; then
         echo "error: only ${free} GiB free (floor ${floor} GiB)" >&2
         echo "       A near-full disk fails as a corrupt link, a truncated gate log," >&2

@@ -7,7 +7,7 @@ set -euo pipefail
 
 fixture_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="$fixture_dir/fork-wait4"
-obj="$(mktemp -t fork-wait4.XXXXXX.o)"
+obj="$(mktemp "${TMPDIR:-/tmp}/fork-wait4.XXXXXX")"
 trap 'rm -f "$obj"' EXIT
 
 sysroot="$(rustc --print sysroot)"

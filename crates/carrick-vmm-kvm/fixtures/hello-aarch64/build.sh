@@ -7,7 +7,7 @@ set -euo pipefail
 
 fixture_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="$fixture_dir/hello-aarch64"
-obj="$(mktemp -t hello-aarch64.XXXXXX.o)"
+obj="$(mktemp "${TMPDIR:-/tmp}/hello-aarch64.XXXXXX")"
 trap 'rm -f "$obj"' EXIT
 
 sysroot="$(rustc --print sysroot)"
