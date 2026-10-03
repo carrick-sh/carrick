@@ -1101,3 +1101,26 @@ line-position reconciliation remain the director's final gate.
 Scoped receipts are recorded in the worker report. No guest/Docker execution
 was performed. Fork, bulk Capacity and GuestMemory venue3 remain OPEN; this
 review fix does not confer whole-N1 or signed-artifact acceptance.
+
+#### N1 review fix2 receipt — full claimed-page I2 coverage
+
+The scoped rereview accepted findings 1/3/4 but found another finding 2 variant:
+4 KiB dirty bits could be cleared by a four-byte invalidation, allowing a
+second MM's completed write on another cache line of the same page to skip
+maintenance. `CodeContent::publish_icache` in
+`crates/carrick-vmm-hvf/src/trap/code_content.rs:216` now owns page expansion,
+backing-end clamping and bounded chunking as well as dirty claim/completion.
+Each lock hold covers at most 16 KiB of whole dirty-page coverage. An unaligned
+16 KiB request covering five pages is split into 16 KiB and 4 KiB maintenance,
+never one 20 KiB critical section. The raw bit-claim helper is private.
+`CarrierVmCustody::publish_user_executable` (`trap/carrier_custody.rs:575`)
+passes those exact callback offsets/lengths to existing I2 invalidation.
+
+Deterministic witnesses in `code_content.rs:433` and `:455` record actual
+callback ranges. Two completed writes at offsets 0 and 0x200 first failed with
+`[(0,4)]` versus required `[(0,4096)]`; the unaligned request first failed with
+`[(1,16384)]` versus `[(0,16384),(16384,4096)]`. Both now pass, including final
+partial-page clamping and rejection of a range beyond the retained backing.
+Existing claimed-invalidation exclusion, peer re-dirty, cache work budget and
+host RX executable-COW witnesses remain green. No new cache mechanism or owner
+was added; whole-N1/signed acceptance and the director's final gates remain open.
