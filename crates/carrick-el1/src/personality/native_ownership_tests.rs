@@ -219,7 +219,7 @@ fn require_exclusive_owner(host_callbacks: usize) -> Result<(), &'static str> {
 }
 
 #[test]
-fn red_until_n1_production_admission_retains_host_semantic_venue() {
+fn production_nonfork_admission_retains_host_semantic_venue() {
     for pages in [16, 64, 256] {
         for unrelated in [16, 512] {
             let (table, spaces) = (reservations(), AddressSpaces::new());
@@ -275,4 +275,12 @@ fn red_until_n1_production_admission_retains_host_semantic_venue() {
             }
         }
     }
+}
+
+#[test]
+fn production_admitted_fork_uses_exclusive_owner_without_host_semantic_venue() {
+    // The production fork API accepts exact root identity and physical table
+    // supply only. Exercise its live graph COW publication and complete undo;
+    // no host VMA/protection proposal can enter this operation.
+    crate::personality::mm_portal::tests::owner_fork_child_has_live_private_cow_and_parent_stays_unchanged_on_abort();
 }
