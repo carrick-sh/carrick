@@ -214,15 +214,21 @@ threads. Retirement removes the exact key; a replacement has another key
 and starts with no pending signal. This is a positive kernel routing binding,
 not an instrumented no-population-scan proof or a concurrent born-thread race.
 
-`red_until_step3_m5_peer_tgkill_selects_dispatcher_self_task` records exact
-failure `peer tgkill resolves target tgid as dispatcher self task`. A single
-carrier dispatcher receives a real `tgkill` request from the fork peer naming
-a live thread in the root task. When target TGID equals dispatcher cached
-identity PID, target resolution selects the caller task and returns numeric
-ESRCH (3), leaving both queues empty. Exact reproduction:
-`CARGO_BUILD_JOBS=3 cargo test -p carrick-kernel --lib m5_ -- --nocapture`.
-This is a cross-context syscall-boundary defect in the VM-free dispatcher;
-it is not yet reproduced through an EL0 application. No production fix.
+The former peer-tgkill known-red entry is retired: target resolution now uses
+the caller's PID namespace rather than comparing the dispatcher root PID.
+`m5_peer_tgkill_targets_root_group` and
+`m5_peer_rt_tgsigqueueinfo_targets_root_group` assert delivery to the root's
+exact secondary thread, leaving the peer and root leader queues untouched.
+`m5_peer_kill_targets_root_group` and
+`m5_peer_rt_sigqueueinfo_targets_root_group` assert root process pending and
+an empty peer queue. Both queued-signal calls separately reject forged
+nonnegative si_code from the peer. Each affected case fails before the fix;
+`m5_peer_tkill_targets_root_group` confirms the existing namespace TID route.
+Reproduction: `cargo test -p carrick-kernel --lib m5_peer_ -- --test-threads=1`.
+The process-route and queued-code helper fixtures live under `serial_host`
+because they pin the carrier-global HVPatch lane; `just test` executes them.
+These VM-free syscall-boundary bindings do not close EL0 integration,
+population-scan budgets, or EL1 signal ownership.
 
 ### M5 EL0 frame bindings
 

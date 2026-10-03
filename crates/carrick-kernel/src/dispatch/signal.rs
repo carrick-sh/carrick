@@ -1470,11 +1470,7 @@ impl<'a> SignalView<'a> {
         if !hvpatch_owns_specific_process_signal(crate::dispatch::hvpatch_lane_active(), pid) {
             return None;
         }
-        let target = if u32::try_from(pid).is_ok_and(|p| p == self.identity_pid()) {
-            Some(ProcessSignalTarget::process(ctx.kernel.task().key()))
-        } else {
-            hvpatch_process_signal_target(ctx.kernel, pid)
-        };
+        let target = hvpatch_process_signal_target(ctx.kernel, pid);
         let Some(target) = target else {
             if hvpatch_signal_observes_zombie(ctx.kernel, pid) {
                 // Addressable but no longer running: the signal is dropped and
@@ -1573,9 +1569,7 @@ impl<'a> SignalView<'a> {
         let kernel = context.kernel();
         let required_task = match tgid {
             Some(raw) => {
-                if u32::try_from(raw).is_ok_and(|pid| pid == self.identity_pid())
-                    || names_self_pid(i64::from(raw))
-                {
+                if NsPid(raw) == NsPid(ns_visible_sender_pid(context)) {
                     Some(context.task().key().id)
                 } else if let Some(target) = hvpatch_process_signal_target(context, raw) {
                     Some(target.task.id)
@@ -2487,7 +2481,7 @@ impl<'a> SignalView<'a> {
         // group's siginfo, which is a real cross-process spoof and not
         // merely a missing assertion (LTP rt_sigqueueinfo02).
         if user_info.is_some_and(|info| info.si_code >= 0)
-            && ns_target != i64::from(self.identity_pid())
+            && ns_target != i64::from(ns_visible_sender_pid(ctx.kernel))
         {
             return DispatchOutcome::errno(LINUX_EPERM);
         }
@@ -5234,9 +5228,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn red_until_step3_m5_peer_tgkill_selects_dispatcher_self_task() {
-        let mut dispatcher = SyscallDispatcher::new();
+    fn m5_peer_signal_fixture() -> (
+        SyscallDispatcher,
+        crate::kernel::KernelContext,
+        crate::kernel::KernelContext,
+        crate::kernel::KernelContext,
+    ) {
+        let dispatcher = SyscallDispatcher::new();
         let root = dispatcher.capture_one_task_context().unwrap();
         let peer = root
             .kernel()
@@ -5263,11 +5261,21 @@ mod tests {
             .register_one_task_thread(&root, crate::thread::ThreadId::synthetic_for_tests(940_001))
             .unwrap();
         let target = root.kernel().context(root.task().key().id, tid).unwrap();
+        dispatcher.proc.lock().bind_hvpatch_identity(
+            u32::try_from(root.task().key().id.raw()).unwrap(),
+            u32::try_from(ns_visible_sender_pid(&root)).unwrap(),
+        );
+        (dispatcher, root, peer, target)
+    }
+
+    #[test]
+    fn m5_peer_tgkill_targets_root_group() {
+        let (mut dispatcher, root, peer, target) = m5_peer_signal_fixture();
         let visible_tid = crate::namespace::pid::ns_visible_guest_tid(&target).unwrap();
         let root_pid =
             crate::namespace::pid::try_ns_self_pid_for(&root, root.task().key().id.raw() as u32)
                 .unwrap();
-        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 64]);
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 256]);
         let reporter = crate::compat::CompatReporter::default();
         let outcome = dispatcher
             .dispatch(
@@ -5280,19 +5288,92 @@ mod tests {
                 &reporter,
             )
             .unwrap();
-        let result = if matches!(outcome, DispatchOutcome::SignalThread {
-            kernel_target: Some(exact), .. } if exact == target.thread().key())
-        {
-            Ok(())
-        } else {
-            assert_eq!(outcome, DispatchOutcome::errno(LINUX_ESRCH));
-            Err("peer tgkill resolves target tgid as dispatcher self task")
-        };
-        assert_eq!(
-            result.expect_err("flips at M5 cutover"),
-            "peer tgkill resolves target tgid as dispatcher self task"
+        assert!(
+            matches!(outcome, DispatchOutcome::SignalThread { kernel_target: Some(exact), .. } if exact == target.thread().key())
         );
-        assert!(target.signal_authority().thread_pending().is_empty());
+        assert_eq!(
+            target
+                .signal_authority()
+                .take_lowest_in(SigSet::EMPTY.with(34))
+                .unwrap()
+                .pending
+                .signal
+                .raw(),
+            34
+        );
+        assert!(root.signal_authority().thread_pending().is_empty());
+        assert!(peer.signal_authority().thread_pending().is_empty());
+    }
+
+    #[test]
+    fn m5_peer_tkill_targets_root_group() {
+        let (mut dispatcher, root, peer, target) = m5_peer_signal_fixture();
+        let visible_tid = crate::namespace::pid::ns_visible_guest_tid(&target).unwrap();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 256]);
+        let reporter = crate::compat::CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                &peer,
+                SyscallRequest::new(130, SyscallArgs([u64::from(visible_tid), 34, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::SignalThread { kernel_target: Some(exact), .. } if exact == target.thread().key())
+        );
+        assert_eq!(
+            target
+                .signal_authority()
+                .take_lowest_in(SigSet::EMPTY.with(34))
+                .unwrap()
+                .pending
+                .signal
+                .raw(),
+            34
+        );
+        assert!(root.signal_authority().thread_pending().is_empty());
+        assert!(peer.signal_authority().thread_pending().is_empty());
+    }
+
+    #[test]
+    fn m5_peer_rt_tgsigqueueinfo_targets_root_group() {
+        let (mut dispatcher, root, peer, target) = m5_peer_signal_fixture();
+        let visible_tid = crate::namespace::pid::ns_visible_guest_tid(&target).unwrap();
+        let root_pid =
+            crate::namespace::pid::try_ns_self_pid_for(&root, root.task().key().id.raw() as u32)
+                .unwrap();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 256]);
+        let reporter = crate::compat::CompatReporter::default();
+        use zerocopy::IntoBytes;
+        let mut info = LinuxSiginfo::rt_queue(34, ns_visible_sender_pid(&peer), 0, 123);
+        info.si_code = -1;
+        memory.write_bytes(16, info.as_bytes()).unwrap();
+        let outcome = dispatcher
+            .dispatch(
+                &peer,
+                SyscallRequest::new(
+                    240,
+                    SyscallArgs([u64::from(root_pid), u64::from(visible_tid), 34, 16, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::SignalThread { kernel_target: Some(exact), .. } if exact == target.thread().key())
+        );
+        assert_eq!(
+            target
+                .signal_authority()
+                .take_lowest_in(SigSet::EMPTY.with(34))
+                .unwrap()
+                .pending
+                .signal
+                .raw(),
+            34
+        );
+        assert!(root.signal_authority().thread_pending().is_empty());
         assert!(peer.signal_authority().thread_pending().is_empty());
     }
 
@@ -5944,6 +6025,154 @@ mod tests {
 
     mod serial_host {
         use super::*;
+        #[test]
+        fn m5_peer_kill_targets_root_group() {
+            let (dispatcher, root, peer, _target) = m5_peer_signal_fixture();
+            let root_pid = crate::namespace::pid::try_ns_self_pid_for(
+                &root,
+                root.task().key().id.raw() as u32,
+            )
+            .unwrap();
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 256]);
+            let _lane = crate::dispatch::HvpatchLaneScope::force(true);
+            let reporter = crate::compat::CompatReporter::default();
+            let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
+                kernel: &peer,
+                request: SyscallRequest::new(138, SyscallArgs([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let outcome = dispatcher
+                .signal_view()
+                .hvpatch_specific_process_signal(&cx, i32::try_from(root_pid).unwrap(), 34, None)
+                .unwrap();
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+            assert!(root.signal_authority().task_pending().contains(34));
+            assert!(peer.signal_authority().task_pending().is_empty());
+            assert!(peer.signal_authority().thread_pending().is_empty());
+        }
+
+        #[test]
+        fn m5_peer_rt_sigqueueinfo_targets_root_group() {
+            let (dispatcher, root, peer, _target) = m5_peer_signal_fixture();
+            let root_pid = crate::namespace::pid::try_ns_self_pid_for(
+                &root,
+                root.task().key().id.raw() as u32,
+            )
+            .unwrap();
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 256]);
+            let _lane = crate::dispatch::HvpatchLaneScope::force(true);
+            let reporter = crate::compat::CompatReporter::default();
+            use zerocopy::IntoBytes;
+            let mut info = LinuxSiginfo::rt_queue(34, ns_visible_sender_pid(&peer), 0, 123);
+            info.si_code = -1;
+            memory.write_bytes(16, info.as_bytes()).unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
+                kernel: &peer,
+                request: SyscallRequest::new(138, SyscallArgs([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let outcome = dispatcher.sigqueueinfo_common(
+                &cx,
+                i64::from(root_pid),
+                i64::from(root_pid),
+                34,
+                GuestPtr(16),
+                false,
+            );
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+            assert!(root.signal_authority().task_pending().contains(34));
+            assert!(peer.signal_authority().task_pending().is_empty());
+            assert!(peer.signal_authority().thread_pending().is_empty());
+        }
+
+        #[test]
+        fn m5_peer_rt_sigqueueinfo_rejects_forged_code_targets_root_group() {
+            let (dispatcher, root, peer, target) = m5_peer_signal_fixture();
+            let root_pid = crate::namespace::pid::try_ns_self_pid_for(
+                &root,
+                root.task().key().id.raw() as u32,
+            )
+            .unwrap();
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 256]);
+            let _lane = crate::dispatch::HvpatchLaneScope::force(true);
+            let reporter = crate::compat::CompatReporter::default();
+            use zerocopy::IntoBytes;
+            let mut info = LinuxSiginfo::rt_queue(34, ns_visible_sender_pid(&peer), 0, 123);
+            info.si_code = 0;
+            memory.write_bytes(16, info.as_bytes()).unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
+                kernel: &peer,
+                request: SyscallRequest::new(138, SyscallArgs([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let outcome = dispatcher.sigqueueinfo_common(
+                &cx,
+                i64::from(root_pid),
+                i64::from(root_pid),
+                34,
+                GuestPtr(16),
+                false,
+            );
+            assert_eq!(outcome, DispatchOutcome::errno(LINUX_EPERM));
+            assert!(target.signal_authority().thread_pending().is_empty());
+            assert!(root.signal_authority().task_pending().is_empty());
+            assert!(peer.signal_authority().thread_pending().is_empty());
+        }
+
+        #[test]
+        fn m5_peer_rt_tgsigqueueinfo_rejects_forged_code_targets_root_group() {
+            let (dispatcher, root, peer, target) = m5_peer_signal_fixture();
+            let visible_tid = crate::namespace::pid::ns_visible_guest_tid(&target).unwrap();
+            let root_pid = crate::namespace::pid::try_ns_self_pid_for(
+                &root,
+                root.task().key().id.raw() as u32,
+            )
+            .unwrap();
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 256]);
+            let _lane = crate::dispatch::HvpatchLaneScope::force(true);
+            let reporter = crate::compat::CompatReporter::default();
+            use zerocopy::IntoBytes;
+            let mut info = LinuxSiginfo::rt_queue(34, ns_visible_sender_pid(&peer), 0, 123);
+            info.si_code = 0;
+            memory.write_bytes(16, info.as_bytes()).unwrap();
+            let cx = crate::dispatch::SyscallCtx {
+                host_wait: None,
+                kernel: &peer,
+                request: SyscallRequest::new(138, SyscallArgs([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: None,
+                mm_executor: None,
+            };
+            let outcome = dispatcher.sigqueueinfo_common(
+                &cx,
+                i64::from(visible_tid),
+                i64::from(root_pid),
+                34,
+                GuestPtr(16),
+                true,
+            );
+            assert_eq!(outcome, DispatchOutcome::errno(LINUX_EPERM));
+            assert!(target.signal_authority().thread_pending().is_empty());
+            assert!(root.signal_authority().task_pending().is_empty());
+            assert!(peer.signal_authority().thread_pending().is_empty());
+        }
 
         #[test]
         fn queued_signal_nonpositive_target_errno_depends_on_syscall_shape() {
