@@ -7,7 +7,7 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const MM_PORTAL_GRANT_ESR: u64 = 0x4352_4d4d_4752_0003;
+pub const MM_PORTAL_GRANT_ESR: u64 = 0x4352_4d4d_4752_0004;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortalGrantWindow {
     pub operation: PortalOperation,
@@ -16,6 +16,7 @@ pub struct PortalGrantWindow {
     pub protection: ReservationProtection,
     pub fault_page: u64,
     pub host_backing: Option<crate::HostBackingIdentity>,
+    pub fork_sequence: Option<NonZeroU64>,
 }
 impl PortalGrantWindow {
     pub fn valid(self) -> bool {
@@ -27,7 +28,7 @@ impl PortalGrantWindow {
                 .host_backing
                 .is_none_or(|source| source.advance(self.range.len()).is_some())
     }
-    fn words(self) -> [u64; 12] {
+    fn words(self) -> [u64; 13] {
         [
             self.operation.carrier.get(),
             self.operation.mm.raw(),
@@ -42,9 +43,10 @@ impl PortalGrantWindow {
             self.host_backing
                 .map_or(0, |source| source.generation().get()),
             self.host_backing.map_or(0, |source| source.offset()),
+            self.fork_sequence.map_or(0, NonZeroU64::get),
         ]
     }
-    fn decode(w: [u64; 12]) -> Option<Self> {
+    fn decode(w: [u64; 13]) -> Option<Self> {
         let value = Self {
             operation: PortalOperation {
                 carrier: NonZeroU64::new(w[0])?,
@@ -56,6 +58,7 @@ impl PortalGrantWindow {
             range: ReservationRange::new(w[5], w[6])?,
             protection: ReservationProtection::from_bits(w[7])?,
             fault_page: w[8],
+            fork_sequence: NonZeroU64::new(w[12]),
             host_backing: if w[9] == 0 {
                 if w[10] != 0 || w[11] != 0 {
                     return None;
@@ -75,7 +78,8 @@ impl PortalGrantWindow {
 #[repr(C, align(64))]
 pub struct PortalGrantSlot {
     state: AtomicU64,
-    window: [AtomicU64; 12],
+    window: [AtomicU64; 13],
+    fault_generation: AtomicU64,
     descriptor: DescriptorTxnSlot,
 }
 impl Default for PortalGrantSlot {
@@ -87,18 +91,94 @@ impl PortalGrantSlot {
     pub const fn new() -> Self {
         Self {
             state: AtomicU64::new(0),
-            window: [const { AtomicU64::new(0) }; 12],
+            window: [const { AtomicU64::new(0) }; 13],
+            fault_generation: AtomicU64::new(0),
             descriptor: DescriptorTxnSlot::new(),
         }
     }
-    pub fn submit(&self, window: PortalGrantWindow, txn: &DescriptorTxn) -> bool {
-        if !window.valid()
-            || txn.id.mm_key.get() != window.operation.mm.raw()
+    pub fn publish_fault_selection(
+        &self,
+        request_generation: u64,
+        window: PortalGrantWindow,
+    ) -> bool {
+        if request_generation == 0
+            || !window.valid()
             || self
                 .state
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
+            return false;
+        }
+        for (word, value) in self.window.iter().zip(window.words()) {
+            word.store(value, Ordering::Relaxed);
+        }
+        self.fault_generation
+            .store(request_generation, Ordering::Relaxed);
+        self.state.store(3, Ordering::Release);
+        true
+    }
+    pub fn fault_selection(
+        &self,
+        mm_key: u64,
+        request_generation: u64,
+    ) -> Option<PortalGrantWindow> {
+        if self.state.load(Ordering::Acquire) != 3
+            || self.fault_generation.load(Ordering::Relaxed) != request_generation
+        {
+            return None;
+        }
+        let window = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }))?;
+        (window.operation.mm.raw() == mm_key).then_some(window)
+    }
+    pub fn pending_fault_selection(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+    ) -> Option<(u64, PortalGrantWindow)> {
+        if self.state.load(Ordering::Acquire) != 3 {
+            return None;
+        }
+        let generation = self.fault_generation.load(Ordering::Relaxed);
+        let window = self.fault_selection(mm_key, generation)?;
+        (window.fault_page == fault_va & !4095).then_some((generation, window))
+    }
+    pub fn cancel_fault_selection(
+        &self,
+        window: PortalGrantWindow,
+        request_generation: u64,
+    ) -> bool {
+        if self.fault_selection(window.operation.mm.raw(), request_generation) != Some(window) {
+            return false;
+        }
+        self.state
+            .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    pub fn has_outstanding_for(&self, mm_key: u64) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        state != 0
+            && (state == 1
+                || PortalGrantWindow::decode(core::array::from_fn(|i| {
+                    self.window[i].load(Ordering::Relaxed)
+                }))
+                .is_none_or(|window| window.operation.mm.raw() == mm_key))
+    }
+    pub fn submit(&self, window: PortalGrantWindow, txn: &DescriptorTxn) -> bool {
+        if !window.valid() || txn.id.mm_key.get() != window.operation.mm.raw() || {
+            let state = self.state.load(Ordering::Acquire);
+            let selected = state == 3
+                && PortalGrantWindow::decode(core::array::from_fn(|i| {
+                    self.window[i].load(Ordering::Relaxed)
+                })) == Some(window);
+            (!selected && state != 0)
+                || self
+                    .state
+                    .compare_exchange(state, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+        } {
             return false;
         }
         if !self.descriptor.submit(txn) {
