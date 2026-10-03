@@ -555,9 +555,9 @@
     },
     {
       "file": "crates/carrick-aarch64/src/descriptor_drain.rs",
-      "function": "run_foreign_drain_call",
+      "function": "run_foreign_service_call",
       "ordinal_in_function": 1,
-      "fingerprint": "d01ae49ffa53d4a78efef5b9aaac0c03c925c7e94840d78b2547d30712d58043",
+      "fingerprint": "0134176cdb20a0fce046a831247fe3095db17109db984eb9641a2126298a5a80",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::descriptor_drain",
       "rationale": "After a foreign drain the caller vCPU must get its own TTBR0 back; failure leaves the caller executing with another MM's address space.",
@@ -585,6 +585,72 @@
       "rationale": "EL1 applied part of a host copyout's frame-grant transaction and its receipt cannot be settled: the grant's backing is live in some leaves and absent in others, so it can be neither rolled back nor committed, and the copyout would write through an unknown translation state.",
       "sink": "fatal",
       "domain": "hvpatch::host_copyout_grant"
+    },
+    {
+      "file": "crates/carrick-aarch64/src/engine.rs",
+      "function": "run_el1_service_effect_on",
+      "ordinal_in_function": 1,
+      "fingerprint": "1f2b14e5a050ac5cfc24bdb6246cb01d91929144f0509343cbfd729244359125",
+      "sink": "fatal",
+      "domain": "aarch64::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::user_transfer",
+      "rationale": "Unexpected exit while the EL1 service retains its actual editor; resetting the stack would abandon ownership."
+    },
+    {
+      "file": "crates/carrick-aarch64/src/engine.rs",
+      "function": "run_el1_service_effect_on",
+      "ordinal_in_function": 2,
+      "fingerprint": "1f2b14e5a050ac5cfc24bdb6246cb01d91929144f0509343cbfd729244359125",
+      "sink": "fatal",
+      "domain": "aarch64::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::user_transfer",
+      "rationale": "vCPU run failed while the EL1 service retains its actual editor; restoring caller state would abandon ownership."
+    },
+    {
+      "file": "crates/carrick-aarch64/src/user_transfer.rs",
+      "function": "OwnedUserTransfer::advance",
+      "ordinal_in_function": 1,
+      "fingerprint": "f399745191a650b34c91972c088a4cc058f6b495c151958aa8c1a5b92e45760d",
+      "sink": "fatal",
+      "domain": "aarch64::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::user_transfer",
+      "rationale": "Grant service returned without settlement; retained descriptor and physical ownership cannot be discarded."
+    },
+    {
+      "file": "crates/carrick-aarch64/src/user_transfer.rs",
+      "function": "OwnedUserTransfer::advance",
+      "ordinal_in_function": 2,
+      "fingerprint": "3035506c15ef09529599b74e198dd40fe58769589ab793c7c5e362fa14454651",
+      "sink": "fatal",
+      "domain": "aarch64::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::user_transfer",
+      "rationale": "Intermediate copy effect identity mismatch while exact EL1 editor remains live; cannot restore caller stack."
+    },
+    {
+      "file": "crates/carrick-aarch64/src/user_transfer.rs",
+      "function": "OwnedUserTransfer::advance",
+      "ordinal_in_function": 3,
+      "fingerprint": "d3ba65844796b64e20ad725b806531c788be7a6c93bab927022539f22d05a84e",
+      "sink": "fatal",
+      "domain": "aarch64::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::user_transfer",
+      "rationale": "Failed transfer service lacks exact completion; physical pins must remain retained for a potentially live editor."
+    },
+    {
+      "file": "crates/carrick-aarch64/src/user_transfer.rs",
+      "function": "OwnedUserTransfer::advance",
+      "ordinal_in_function": 4,
+      "fingerprint": "5135215b868fa5eb59ea66932f734a3cef50ffce5ea231770b7741658522df26",
+      "sink": "fatal",
+      "domain": "aarch64::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::user_transfer",
+      "rationale": "Service returned without exact completion receipt; dropping physical custody could invalidate the suspended editor."
     }
   ]
 }
