@@ -1689,3 +1689,20 @@ f_pos writer/lseek, release executor capacity during storage/cursor waits,
 provide symmetric O_APPEND writes, and wire owner PREPARE/COMMIT with one CPU
 loan across ready consumption. Existing offset callers remain open above.
 No guessed seek-back or MemoryProtections fallback is an accepted destination.
+
+Typed completion publisher prerequisite: publication and owned wake effects now
+carry Waker::Host or Waker::El1, never a fabricated host slot. Protocol3 changes
+the shared ABI hash for the host tag. Existing host placement remains the one
+transaction; completion drains use one strong try-CAS per distinct candidate,
+with no spin/retry/time budget, and retain exact owned handback on NoSlot.
+Normal placement callers retain their prior wait policy. The initial typed
+host held-slot test actually hung; a bounded replacement reproduced the wait
+before the correction. New tests cover host publication without an EL1 slot,
+host publication under a guest queue holder, deferred exact handback and later
+exact-once placement, and one attempt per distinct target. All102 scheduler
+unit tests pass. The durable-source held-queue test now asserts actual wake
+delivery after unlock (review minor addressed).
+
+This is only publication plumbing. Authenticated live-MM source attachment,
+real editor/root/gate/pending releases and cause-specific lost-wake closure
+remain open, along with owned recall, consumer activation and mirror removal.
