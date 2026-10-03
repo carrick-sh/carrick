@@ -92,8 +92,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             Err(error) => return Err((error, operation)),
         };
         let fresh = zone.slot(self.slot).current().is_none();
-        let affinity = zone.slot(self.slot).affinity();
-        let record = match zone.current_or_new(self.slot, identity_of(self.task, affinity)) {
+        let record = match self.current_record() {
             Ok(record) => record,
             Err(_) => return Err((ObjectWaitError::Exhausted, operation)),
         };

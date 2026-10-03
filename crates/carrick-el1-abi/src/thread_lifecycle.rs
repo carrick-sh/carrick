@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 5;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 6;
 
 /// One retained notification authority for a kernel graph's thread ledger.
 #[repr(C, align(16))]
@@ -504,6 +504,11 @@ pub struct ThreadControlSlot {
     /// a thread that holds none (the leader).
     entry: AtomicU64,
     pending: PendingSummary,
+    /// Owner-published exact zone record. Readers make one bounded attempt;
+    /// an in-flight publication is absent, never a mixed incarnation.
+    zone_seq: AtomicU64,
+    zone_incarnation: AtomicU64,
+    zone_id: AtomicU32,
 }
 
 impl ThreadControlSlot {
@@ -520,6 +525,9 @@ impl ThreadControlSlot {
             clear_child_tid: AtomicU64::new(0),
             entry: AtomicU64::new(0),
             pending: PendingSummary::new(),
+            zone_seq: AtomicU64::new(0),
+            zone_incarnation: AtomicU64::new(0),
+            zone_id: AtomicU32::new(0),
         }
     }
 
@@ -557,6 +565,9 @@ impl ThreadControlSlot {
     }
 
     fn reset(&self, blocked: BlockedMask, clear_child_tid: u64, entry: Option<EntryRef>) {
+        self.zone_id.store(0, Ordering::Relaxed);
+        self.zone_incarnation.store(0, Ordering::Relaxed);
+        self.zone_seq.store(0, Ordering::Relaxed);
         self.pending.clear(PendingSignals(u64::MAX));
         self.blocked.store(blocked.0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
@@ -577,6 +588,33 @@ impl ThreadControlSlot {
     /// The pool entry the thread holds, if any.
     pub fn entry(&self) -> Option<EntryRef> {
         EntryRef::unpack(self.entry.load(Ordering::Acquire))
+    }
+
+    /// The executing thread owns publication; host reset is exclusive before
+    /// birth. This is a reference, not record custody: reuse is authenticated
+    /// against the zone's live incarnation and exact thread identity.
+    pub fn bind_zone_record(&self, record: crate::RecordRef) {
+        self.zone_seq.fetch_add(1, Ordering::SeqCst);
+        self.zone_incarnation
+            .store(record.incarnation, Ordering::SeqCst);
+        self.zone_id.store(record.id.raw(), Ordering::SeqCst);
+        self.zone_seq.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// O(1), with no retry or population scan. A concurrent publication gives
+    /// no projection; the kernel must still validate the returned reference.
+    pub fn zone_record(&self) -> Option<crate::RecordRef> {
+        let before = self.zone_seq.load(Ordering::SeqCst);
+        if before & 1 != 0 {
+            return None;
+        }
+        let id = self.zone_id.load(Ordering::SeqCst);
+        let incarnation = self.zone_incarnation.load(Ordering::SeqCst);
+        let after = self.zone_seq.load(Ordering::SeqCst);
+        (before == after && incarnation != 0).then_some(crate::RecordRef {
+            id: crate::RecordId::from_raw(id)?,
+            incarnation,
+        })
     }
 
     /// The thread's `clear_child_tid` address (0 = none).
@@ -1224,7 +1262,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 21] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 24] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::size_of::<ThreadLedgerActivity>() as u64,
     core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
@@ -1245,11 +1283,33 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 21] = [
     core::mem::offset_of!(ThreadControlSlot, clear_child_tid) as u64,
     core::mem::offset_of!(ThreadControlSlot, entry) as u64,
     core::mem::offset_of!(ThreadControlSlot, pending) as u64,
+    core::mem::offset_of!(ThreadControlSlot, zone_seq) as u64,
+    core::mem::offset_of!(ThreadControlSlot, zone_incarnation) as u64,
+    core::mem::offset_of!(ThreadControlSlot, zone_id) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, serving) as u64,
 ];
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zone_record_binding_is_bounded_and_reset_with_its_control_incarnation() {
+        let slot = super::ThreadControlSlot::new();
+        let record = crate::RecordRef {
+            id: crate::RecordId::from_raw(19).unwrap(),
+            incarnation: 33,
+        };
+        assert_eq!(slot.zone_record(), None);
+        slot.bind_zone_record(record);
+        assert_eq!(slot.zone_record(), Some(record));
+        slot.zone_seq.fetch_add(1, super::Ordering::SeqCst);
+        assert_eq!(slot.zone_record(), None, "no retry on an in-flight writer");
+        slot.reset_for_host_birth(super::BlockedMask(0));
+        assert_eq!(
+            slot.zone_record(),
+            None,
+            "reused control slot drops the old reference"
+        );
+    }
     #[test]
     fn control_pending_is_owned_by_the_exact_thread_slot() {
         let first = ThreadControlSlot::new();

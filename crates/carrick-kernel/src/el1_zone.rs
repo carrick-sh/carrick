@@ -442,21 +442,38 @@ pub fn record_runs(record: RecordRef) -> Option<bool> {
     }
 }
 
-/// Whether the thread `key`, which the host loaded on a vCPU, is parked in
-/// EL1 there: its slot's home record is `Parked` (its vCPU runs another thread
-/// or idles, and the host learns it at the next exit).
-pub fn home_record_parked(key: crate::kernel::ThreadKey) -> bool {
-    let Some(zone) = zone_tables() else {
-        return false;
-    };
-    (0..carrick_el1_abi::ZONE_SLOTS)
-        .filter_map(SlotId::from_index)
-        .filter_map(|slot| zone.slot(slot).host_record())
-        .any(|record| {
-            let rec = zone.record(record);
-            matches!(rec.claim(), carrick_el1_abi::Claim::Parked { .. })
-                && thread_key_of(zone.record_ref(record)) == Some(key)
-        })
+/// Exact retained thread binding, independent of vCPU home/foreign scope.
+/// One live-record lookup: no record or slot population scan.
+pub fn thread_record_runs(record: RecordRef, key: crate::kernel::ThreadKey) -> Option<bool> {
+    thread_record_runs_in(zone_tables()?, record, key)
+}
+
+fn thread_record_runs_in(
+    zone: &ZoneTables,
+    record: RecordRef,
+    key: crate::kernel::ThreadKey,
+) -> Option<bool> {
+    let rec = zone.live(record)?;
+    let identity = rec.identity();
+    if identity.tid != carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw()
+        || identity.serial != key.serial.raw()
+    {
+        return None;
+    }
+    let claim = rec.claim();
+    // The record may be retired/reused during the snapshot. Never project
+    // another thread's claim through an old control-slot reference.
+    zone.live(record)?;
+    match claim {
+        carrick_el1_abi::Claim::Parked { .. } | carrick_el1_abi::Claim::Transferring { .. } => {
+            Some(false)
+        }
+        carrick_el1_abi::Claim::Queued { .. }
+        | carrick_el1_abi::Claim::OnCpu { .. }
+        | carrick_el1_abi::Claim::OnCpuRequested { .. }
+        | carrick_el1_abi::Claim::Host { .. } => Some(true),
+        _ => None,
+    }
 }
 
 /// The kernel thread a record names.
@@ -915,6 +932,55 @@ fn settle_vacated(
 mod tests {
     use super::*;
     use carrick_el1_abi::{Claim, ThreadIdentity};
+
+    #[test]
+    fn foreign_parked_thread_projection_uses_exact_incarnation_not_vcpu_home() {
+        let zone = heap_zone();
+        let own = crate::kernel::ThreadKey::from_zone_identity(
+            18,
+            std::num::NonZeroU64::new(262).unwrap(),
+        )
+        .unwrap();
+        let other = crate::kernel::ThreadKey::from_zone_identity(
+            18,
+            std::num::NonZeroU64::new(290).unwrap(),
+        )
+        .unwrap();
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 18,
+                serial: 262,
+                mm: 7,
+                ..ThreadIdentity::default()
+            })
+            .unwrap();
+        let reference = zone.record_ref(record);
+        let control = carrick_el1_abi::ThreadControlSlot::new();
+        control.bind_zone_record(reference);
+        zone.publish_park(record, zone.next_seq(record));
+        assert_eq!(zone.record(record).home(), None);
+        assert_eq!(
+            thread_record_runs_in(&zone, control.zone_record().unwrap(), own),
+            Some(false)
+        );
+        assert_eq!(thread_record_runs_in(&zone, reference, other), None);
+        zone.free_record(record);
+        let reused = zone
+            .alloc_record(ThreadIdentity {
+                tid: 18,
+                serial: 290,
+                mm: 22,
+                ..ThreadIdentity::default()
+            })
+            .unwrap();
+        assert_eq!(reused, record);
+        zone.publish_park(reused, zone.next_seq(reused));
+        assert_eq!(thread_record_runs_in(&zone, reference, own), None);
+        assert_eq!(
+            thread_record_runs_in(&zone, zone.record_ref(reused), other),
+            Some(false)
+        );
+    }
 
     fn heap_zone() -> Box<ZoneTables> {
         let layout = std::alloc::Layout::new::<ZoneTables>();
