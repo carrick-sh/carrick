@@ -184,6 +184,44 @@ impl PreparedPageResolver for NoopPreparedResolver {
 pub struct HardwarePreparedResolver;
 
 #[cfg(target_os = "none")]
+fn hardware_live_ttbr() -> u64 {
+    let ttbr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
+    }
+    ttbr
+}
+
+#[cfg(target_os = "none")]
+fn hardware_target_table_window(
+    target: u64,
+) -> Option<carrick_mmu_core::aarch64::descriptor_txn::TableWindow> {
+    carrick_el1_abi::service_target_table_window(hardware_live_ttbr(), target)
+}
+
+/// Only the executing slot uses its pair, so local ASID-0 invalidation is
+/// sufficient and never flushes another executor's maintenance translations.
+#[cfg(target_os = "none")]
+struct ServiceCopyMaintenance;
+#[cfg(target_os = "none")]
+impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopyMaintenance {
+    fn publish_barrier(&self) {
+        unsafe {
+            core::arch::asm!("dsb ishst", options(nostack));
+        }
+    }
+    fn invalidate_range(&self, va: u64, len: u64) {
+        unsafe {
+            core::arch::asm!("dsb ishst", options(nostack));
+            for page in (va..va + len).step_by(4096) {
+                core::arch::asm!("tlbi vae1, {}", in(reg) page >> 12, options(nostack));
+            }
+            core::arch::asm!("dsb ish", "isb", options(nostack));
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
 impl PreparedPageResolver for HardwarePreparedResolver {
     fn commit_prepared(
         &mut self,
@@ -192,10 +230,11 @@ impl PreparedPageResolver for HardwarePreparedResolver {
         expected_ipa: u64,
         access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+        let table =
+            hardware_target_table_window(ttbr0).ok_or(GuestPreparedCommitError::NotPrepared)?;
         let outcome = unsafe {
             carrick_mmu_core::aarch64::commit_existing_el1_prepared_page(
-                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
-                    as *mut core::sync::atomic::AtomicU64,
+                table.words,
                 ttbr0 & TTBR_BADDR_MASK,
                 carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
                 Some(carrick_el1_abi::stage1_table_pool_window()),
@@ -212,6 +251,7 @@ impl PreparedPageResolver for HardwarePreparedResolver {
 
 #[cfg(target_os = "none")]
 pub struct HardwareCowResolver {
+    pub service_slot: Option<carrick_el1_abi::SlotId>,
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
     pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
 }
@@ -229,19 +269,78 @@ impl CowResolver for HardwareCowResolver {
     }
     fn resolve_cow_outcome(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> CowResolution {
         use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
+        let Some(table) = hardware_target_table_window(ttbr0) else {
+            return CowResolution::Refused;
+        };
         let maintenance = El1TableMaintenance { ttbr0 };
         // SAFETY: the alias maps this MM's primary arena, the pool window
         // every other arena, and the caller holds the MM's exact editor.
         let Ok(words) = (unsafe {
             PrimaryTableWords::new(
-                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut AtomicU64,
-                ttbr0 & TTBR_BADDR_MASK,
+                table.words,
+                table.physical_base,
                 carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
                 &maintenance,
             )
             .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
         }) else {
             return CowResolution::Refused;
+        };
+        let live = hardware_live_ttbr();
+        let service_lease = if live == carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE {
+            let Some(slot) = self.service_slot else {
+                return CowResolution::Refused;
+            };
+            // SAFETY: the carrier owns this ABI region for its whole lifetime;
+            // only a successful exact-slot claim can touch this pair of leaves.
+            let table = unsafe {
+                &*(carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE
+                    as *const carrick_el1_abi::ServiceCopyTable)
+            };
+            let Some(lease) = table.try_claim(slot) else {
+                return CowResolution::Refused;
+            };
+            Some(lease)
+        } else {
+            None
+        };
+        let service_maintenance = ServiceCopyMaintenance;
+        let service_words = if service_lease.is_some() {
+            let words = unsafe {
+                PrimaryTableWords::new(
+                    carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE as *mut AtomicU64,
+                    carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
+                    carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_SIZE as usize,
+                    &service_maintenance,
+                )
+                .and_then(|words| {
+                    words.with_window(carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
+                        words: carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE as *mut AtomicU64,
+                        physical_base: carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE,
+                        byte_len: 4096,
+                    })
+                })
+            };
+            let Ok(words) = words else {
+                return CowResolution::Refused;
+            };
+            Some(words)
+        } else {
+            None
+        };
+        let copy_window = match (&service_lease, &service_words) {
+            (Some(lease), Some(copy_words)) => {
+                let Some(window) = crate::cow::CowCopyWindow::maintenance(copy_words, live, lease)
+                else {
+                    return CowResolution::Refused;
+                };
+                window
+            }
+            (None, None) => crate::cow::CowCopyWindow::target(
+                &words,
+                carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
+            ),
+            _ => unreachable!(),
         };
         let publish = |grant, ipa, len| {
             self.publication.is_some_and(|slot| {
@@ -262,7 +361,7 @@ impl CowResolver for HardwareCowResolver {
                 root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
                 pool: carrick_el1_abi::cow_grant_pool_guest(),
                 residency: carrick_el1_abi::frame_grant_residency_guest(),
-                copy_base: carrick_el1_abi::EL1_COW_COPY_BASE,
+                copy_window,
             },
             mm_key,
             far,
@@ -788,6 +887,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 roots: Some(crate::memory::reservations::shared_guest()),
             }),
             &mut HardwareCowResolver {
+                service_slot: None,
                 publication: None,
                 completion: None,
             },
