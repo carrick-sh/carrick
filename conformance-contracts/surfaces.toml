@@ -762,3 +762,11 @@ path = "crates/carrick-el1/src/native_ownership_tests.rs"
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/native_ownership_tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/mm_portal/mod.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/mm_portal/tests.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
