@@ -2439,6 +2439,18 @@ fn prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor() {
         .unwrap();
     assert_ne!(permit.generation, successor.generation);
     assert!(portal.cancel_prepared(permit, request, 0).is_err());
+    let mut stale_commit = slot.submit_commit(request, permit, 4096).unwrap();
+    assert_eq!(
+        serve_transfer(
+            &portal,
+            slot.claim().unwrap(),
+            &tables.live(&maintenance),
+            0,
+            || panic!("stale prepared COMMIT must never copy")
+        ),
+        Err(MmError::Stale)
+    );
+    assert_eq!(stale_commit.take_completion().unwrap().completed, 0);
     assert!(
         portal
             .cancel_prepared(successor, successor_request, u32::MAX)
@@ -2694,6 +2706,197 @@ fn prepared_copy_elastic_aggregate_prepare_and_settlement_have_linear_work() {
         root.reap_prepared();
         assert_eq!(root.work, 0, "settled history must not accumulate");
     }
+}
+
+#[test]
+fn prepared_copy_rejected_tuple_cannot_overwrite_concurrent_claim() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 1);
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let permit = prepare_transfer(&portal, request, &tables.live(&CallerInvalidatesAsid), 0)
+        .unwrap()
+        .unwrap();
+    let mut rejected = request;
+    rejected.selected.offset += 1;
+    let paused = std::sync::Barrier::new(2);
+    let resume = std::sync::Barrier::new(2);
+    let owner = region.table();
+    std::thread::scope(|scope| {
+        let rejecting = scope.spawn(|| {
+            assert!(
+                owner
+                    .claim_prepared_with_rejection::<NoPin>(None, permit, rejected, || {
+                        paused.wait();
+                        resume.wait();
+                    })
+                    .is_err()
+            );
+        });
+        paused.wait();
+        // Old code releases early here; fixed code keeps rejection custody
+        // until its sole rollback. Both paths must preserve the next claimant.
+        let early = owner.claim_prepared::<NoPin>(None, permit, request).ok();
+        resume.wait();
+        rejecting.join().unwrap();
+        let legitimate = early.unwrap_or_else(|| {
+            owner
+                .claim_prepared::<NoPin>(None, permit, request)
+                .unwrap()
+        });
+        assert!(
+            owner
+                .claim_prepared::<NoPin>(None, permit, request)
+                .is_err(),
+            "rejection rollback must not make a legitimate COPYING claim stealable"
+        );
+        assert!(
+            legitimate.release(),
+            "legitimate claimant must settle successfully"
+        );
+    });
+}
+
+fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
+    use crate::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served};
+    use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame, ZoneTables};
+    let region = Region::new();
+    let zone: Box<ZoneTables> = unsafe {
+        Box::from_raw(std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>()).cast())
+    };
+    let mm = admit(&region, &zone.spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(&zone)
+    .unwrap();
+    let plain = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    );
+    let tables = Tables::new(ROOT, IPA, 1);
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let permit = prepare_transfer(&portal, request, &tables.live(&CallerInvalidatesAsid), 0)
+        .unwrap()
+        .unwrap();
+    let slot = SlotId::from_index(0).unwrap();
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, mm.raw(), None, 0);
+    assert!(
+        zone.occupancy
+            .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, mm.raw())
+    );
+    zone.enter_guest(slot);
+    let task = CurrentTask::new();
+    task.set(El1TaskId::from_linux_tid(101), 1, 5);
+    task.zone_mm.store(mm.raw(), Ordering::Release);
+    task.thread_serial.store(1101, Ordering::Release);
+    task.mark_pending_host_work();
+    let counters = Counters::default();
+    let mut cpu = FakeCpu::default();
+    let mut frame = TrapFrame::default();
+    frame.x[8] = 215;
+    frame.x[0] = VA;
+    frame.x[1] = 4096;
+    frame.elr = 0x1004;
+    let original = frame.x;
+    let mut sched = Sched {
+        zone: &zone,
+        slot,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: &counters,
+    };
+    assert!(matches!(
+        park_prepared_edit(&mut sched, &mut frame, region.table()),
+        Some(Served::Idle)
+    ));
+    let key = portal.prepared_wait_key(transfer.handle).unwrap();
+    assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+    if cancel {
+        assert_eq!(
+            plain.cancel_prepared(permit, request, 0),
+            Err(MmError::Core)
+        );
+    } else {
+        let wire = carrick_el1_abi::PortalTransferSlot::new();
+        let mut ticket = wire.submit_commit(request, permit, 4096).unwrap();
+        let copied = core::cell::Cell::new(false);
+        assert_eq!(
+            serve_transfer(
+                &plain,
+                wire.claim().unwrap(),
+                &tables.live(&CallerInvalidatesAsid),
+                0,
+                || {
+                    copied.set(true);
+                    assert!(ticket.copy_requested(|_| true));
+                }
+            ),
+            Err(MmError::Core)
+        );
+        assert!(
+            !copied.get(),
+            "delivery authentication must precede any copy effect"
+        );
+        assert_eq!(
+            ticket.take_completion().unwrap().errno,
+            MmError::Core.errno()
+        );
+    }
+    assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+    portal
+        .cancel_prepared(permit, request, 0)
+        .expect("delivery refusal must preserve rightful cancellation custody");
+    assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+    let switched = zone
+        .switch_in_full(slot)
+        .expect("correct cancellation must wake enrolled edit");
+    let context = unsafe { zone.record(switched.record).ctx_mut() };
+    assert_eq!(context.x, original);
+    assert_eq!(context.pc, 0x1000);
+}
+
+#[test]
+fn prepared_copy_schedulerless_cancel_preserves_rightful_wake() {
+    schedulerless_settlement_preserves_prepared_permit(true);
+}
+
+#[test]
+fn prepared_copy_schedulerless_commit_refuses_before_copy_and_preserves_rightful_wake() {
+    schedulerless_settlement_preserves_prepared_permit(false);
 }
 
 #[test]
