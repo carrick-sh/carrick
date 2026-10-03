@@ -146,6 +146,24 @@ pub struct SpaceEditor<'a> {
     owner: NonZeroU64,
 }
 
+/// Exclusive initialization of a published, closed fork child. This guard
+/// never opens the runnable gate; task publication is a separate operation.
+pub struct ClosedChildEditor<'a> {
+    editor: SpaceEditor<'a>,
+    grant: SpaceGrant,
+}
+impl ClosedChildEditor<'_> {
+    pub fn grant(&self) -> SpaceGrant {
+        self.grant
+    }
+    pub fn set_mmap_next(&self, value: u64) {
+        self.editor.set_mmap_next(value);
+    }
+    pub fn set_brk_current(&self, value: u64) {
+        self.editor.set_brk_current(value);
+    }
+}
+
 /// Proof that the host has excluded the guest EL1 editor of address space
 /// `key`: its gate was raised or closed and no admitted editor remained, or
 /// no published entry names `key` (EL1 edits only published spaces, and a
@@ -516,6 +534,42 @@ impl AddressSpaces {
         Some(SpaceEditor { entry, owner })
     }
 
+    /// Claim a never-runnable child while its publication gate remains closed.
+    /// The exact key and gate are rechecked after acquiring its editor word.
+    pub fn try_begin_closed_child_edit(
+        &self,
+        index: SpaceIndex,
+        key: u64,
+        owner: NonZeroU64,
+    ) -> Option<ClosedChildEditor<'_>> {
+        let entry = self.entry(index);
+        entry
+            .active_editor
+            .compare_exchange(0, owner.get(), Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        let editor = SpaceEditor { entry, owner };
+        if key == 0
+            || entry.key.load(Ordering::SeqCst) != key
+            || entry.gate.load(Ordering::SeqCst) != GATE_CLOSED
+        {
+            return None;
+        }
+        let ttbr0 = entry.ttbr0.load(Ordering::Acquire);
+        let ttbr1 = entry.ttbr1.load(Ordering::Acquire);
+        if ttbr0 == 0 || ttbr1 == 0 {
+            return None;
+        }
+        Some(ClosedChildEditor {
+            editor,
+            grant: SpaceGrant {
+                index,
+                ttbr0,
+                ttbr1,
+                cow_owed: None,
+            },
+        })
+    }
+
     /// Guest EL1: [`Self::try_begin_edit`], waiting up to `spins` attempts
     /// while only another EL1 editor (a bounded critical section on another
     /// vCPU) holds the space. A raised or closed gate (the host) refuses at
@@ -594,6 +648,31 @@ mod tests {
     use core::num::NonZeroU64;
     use std::sync::{Arc, mpsc};
     use std::vec::Vec;
+
+    #[test]
+    fn unpublished_fork_child_editor_keeps_the_root_closed() {
+        let spaces = AddressSpaces::new();
+        let child = spaces.publish_closed(71, 0x40000, 0x40000).unwrap();
+        let owner = NonZeroU64::new(4).unwrap();
+        let editor = spaces
+            .try_begin_closed_child_edit(child, 71, owner)
+            .unwrap();
+        assert_eq!(editor.grant().ttbr0, 0x40000);
+        assert!(spaces.grant(child, 71).is_none());
+        assert!(
+            spaces
+                .try_begin_closed_child_edit(child, 71, owner)
+                .is_none()
+        );
+        drop(editor);
+        spaces.open(child);
+        assert!(
+            spaces
+                .try_begin_closed_child_edit(child, 71, owner)
+                .is_none()
+        );
+        assert!(spaces.grant(child, 71).is_some());
+    }
 
     #[test]
     fn a_bounded_edit_waits_for_a_guest_editor_but_never_for_the_host() {
