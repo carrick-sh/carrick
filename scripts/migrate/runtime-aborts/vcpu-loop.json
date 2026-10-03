@@ -370,7 +370,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 1,
-      "fingerprint": "5d60b7fb66f37fac0b16678feffb5058b32429e0809f823a2f0515d211b8eb92",
+      "fingerprint": "23ad48ee2d900cee8af3341c7082bb9a6a367569290fd557a15b18f38298c005",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::slot_admission",
       "rationale": "MM participation vanished during slot admission: guest_execution was checked Some before the admission loop and only this job clears it; parking for slot release keeps the participation. Re-reviewed 2026-10-01 (s3-t2): unchanged abort re-fingerprinted because the pre-run sequence it sits in is now inside the suspended-EL1 guard.",
@@ -381,7 +381,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 2,
-      "fingerprint": "5d60b7fb66f37fac0b16678feffb5058b32429e0809f823a2f0515d211b8eb92",
+      "fingerprint": "23ad48ee2d900cee8af3341c7082bb9a6a367569290fd557a15b18f38298c005",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::slot_admission",
       "rationale": "Admitted MM vanished before address-space publication: slot admission just succeeded with this job's participation, which only this job clears. Re-reviewed 2026-10-01 (s3-t2): unchanged abort re-fingerprinted because the pre-run sequence it sits in is now inside the suspended-EL1 guard.",
@@ -392,7 +392,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 3,
-      "fingerprint": "5d60b7fb66f37fac0b16678feffb5058b32429e0809f823a2f0515d211b8eb92",
+      "fingerprint": "23ad48ee2d900cee8af3341c7082bb9a6a367569290fd557a15b18f38298c005",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context on trap limit outcome assembly. Re-reviewed 2026-10-01 (s3-t2): unchanged abort re-fingerprinted because the pre-run sequence it sits in is now inside the suspended-EL1 guard.",
@@ -568,7 +568,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 1,
-      "fingerprint": "b10d38ed844c4ea049720b58c4490e4893557ee94dc9513219aae16a913301e2",
+      "fingerprint": "9713d9dfd7647a5850bf90d08f631ca7d53dd7dffdd9a2fd93d8b5897e06d741",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Missing HVPatch runtime reference when constructing the clone-admission deferral wake callback.",
@@ -1611,17 +1611,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "function": "publish_frame_grant_refusal",
-      "ordinal_in_function": 1,
-      "fingerprint": "979097e0f33623d6a6549b8edd384222238b160bfd60042f41681ca5d83806ef",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::el1_frame_grant",
-      "rationale": "Claimed frame-grant request could not publish backend refusal status to the guest mailbox.",
-      "sink": "fatal",
-      "domain": "hvpatch::el1_frame_grant"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
       "function": "abort_on_guest_fault_signal_if_armed",
       "ordinal_in_function": 1,
       "fingerprint": "dcd33cd1e62e98c8c563b84903081200888cfb7d12d426d31405ee2eb3425b18",
@@ -1630,6 +1619,39 @@
       "rationale": "Operator-armed diagnostic hatch CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1: the first SIGSEGV/SIGBUS bound for a guest thread aborts so a core captures the event ring, CARRICK_LAST_FATAL and every stack at the fault. Unarmed runs never reach it.",
       "sink": "fatal",
       "domain": "hvpatch::guest_fault_signal"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "function": "apply_guest_fork_arm",
+      "ordinal_in_function": 1,
+      "fingerprint": "acb2767418a70ca10574e9d79aeb8fc0fb10b9128fc5d740d270f16c6763c8b2",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_fork_arm",
+      "rationale": "Guest fork parent arm has no descriptor transaction slots: the fork already built a child that shares the parent's frames, so continuing would let the parent write them unarmed.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_fork_arm"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "function": "apply_guest_fork_arm",
+      "ordinal_in_function": 2,
+      "fingerprint": "1c1cd5f9a3449e645ff457cb1e089149b205956193497ade1f2c901aa609c100",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_fork_arm",
+      "rationale": "Guest fork parent arm refused, blocked or produced an unauthenticated receipt after the child was built: the parent's shared frames cannot be proven armed.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_fork_arm"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "function": "publish_frame_grant_refusal",
+      "ordinal_in_function": 1,
+      "fingerprint": "979097e0f33623d6a6549b8edd384222238b160bfd60042f41681ca5d83806ef",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Claimed frame-grant request could not publish backend refusal status to the guest mailbox.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
@@ -1773,28 +1795,6 @@
       "rationale": "An executor was owed a second zone adoption before claiming the first. One vCPU exit takes at most one thread (the one EL1 ran there) off the vCPU, and the executor claims it before its next run; a second means the first thread's only owner, this executor, would be overwritten and that thread never run again.",
       "sink": "fatal",
       "domain": "vcpu_loop::el1_zone"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "function": "apply_guest_fork_arm",
-      "ordinal_in_function": 1,
-      "fingerprint": "acb2767418a70ca10574e9d79aeb8fc0fb10b9128fc5d740d270f16c6763c8b2",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::guest_fork_arm",
-      "rationale": "Guest fork parent arm has no descriptor transaction slots: the fork already built a child that shares the parent's frames, so continuing would let the parent write them unarmed.",
-      "sink": "fatal",
-      "domain": "hvpatch::guest_fork_arm"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "function": "apply_guest_fork_arm",
-      "ordinal_in_function": 2,
-      "fingerprint": "1c1cd5f9a3449e645ff457cb1e089149b205956193497ade1f2c901aa609c100",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::guest_fork_arm",
-      "rationale": "Guest fork parent arm refused, blocked or produced an unauthenticated receipt after the child was built: the parent's shared frames cannot be proven armed.",
-      "sink": "fatal",
-      "domain": "hvpatch::guest_fork_arm"
     }
   ]
 }
