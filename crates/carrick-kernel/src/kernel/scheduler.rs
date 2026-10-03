@@ -1116,6 +1116,10 @@ pub(crate) struct RunQueueInner {
     close_started_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(any(test, feature = "test-support"))]
     pre_park_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    flush_publication_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    host_park_gate: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl RunQueueInner {
@@ -2485,6 +2489,10 @@ impl RunQueue {
                 close_started_gate: Mutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 pre_park_gate: Mutex::new(None),
+                #[cfg(test)]
+                flush_publication_gate: Mutex::new(None),
+                #[cfg(test)]
+                host_park_gate: Mutex::new(None),
             }),
         }
     }
@@ -2730,6 +2738,10 @@ impl RunQueue {
                 && self.inner.lifecycle() == QueueLifecycle::Open
                 && !executor.flush_requested()
             {
+                #[cfg(test)]
+                if let Some(parked) = self.inner.host_park_gate.lock().take() {
+                    parked.send(()).unwrap();
+                }
                 cpu.idle_condvar.wait(&mut local);
             }
             local.waiters = local.waiters.checked_sub(1).unwrap_or_else(|| {
@@ -4556,31 +4568,37 @@ impl Scheduler {
     }
 
     pub fn request_residency_flush(&self, executor: ExecutorId) {
-        let (bound_cpu, flush_requested) = {
-            let state = self.executors.state.lock();
-            match state.entries.get(&executor) {
-                Some(entry) => (
-                    entry.placement.lock().cpu,
-                    Arc::clone(&entry.flush_requested),
-                ),
-                None => return,
+        // Placement transitions and spare parking share the lifecycle lock.
+        // Publish the request before releasing it: a spare cannot bind after
+        // a None snapshot and then sleep on a CPU we did not select to nudge.
+        let bound_cpu = {
+            let _lifecycle = self.queue.inner.state.lock();
+            let (bound_cpu, flush_requested) = {
+                let state = self.executors.state.lock();
+                match state.entries.get(&executor) {
+                    Some(entry) => (
+                        entry.placement.lock().cpu,
+                        Arc::clone(&entry.flush_requested),
+                    ),
+                    None => return,
+                }
+            };
+            #[cfg(test)]
+            if let Some((arrived, resume)) = self.queue.inner.flush_publication_gate.lock().take() {
+                arrived.wait();
+                resume.wait();
             }
+            flush_requested.store(ResidencyFlushRequest::Requested, Ordering::Release);
+            self.queue.inner.changed.notify_all();
+            bound_cpu
         };
-        flush_requested.store(ResidencyFlushRequest::Requested, Ordering::Release);
+        // CPU locks and backend callbacks must remain outside lifecycle.
         self.executors.wake_guest_idle_executor(executor);
         if let Some(cpu) = bound_cpu
             && let Some(guest_cpu) = self.queue.inner.cpus.get(cpu.as_usize())
         {
             guest_cpu.nudge();
         }
-        // A spare parks in `park_spare`, which checks the flag under the
-        // queue state lock and then waits on `changed`: notify under that
-        // lock, or a request landing between its check and its wait is lost
-        // and the loader waiting for the flush times out. The placement read
-        // above can also be stale (a borrowed CPU returned meanwhile), so a
-        // spare is always notified.
-        let _state = self.queue.inner.state.lock();
-        self.queue.inner.changed.notify_all();
     }
 
     pub fn settle_blocked(
@@ -8225,6 +8243,85 @@ mod tests {
             }
         }
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn residency_flush_cannot_lose_a_spare_to_bound_handoff_wake() {
+        let (kernel, context) = bootstrap(12_407);
+        publish(&context, 50);
+        let scheduler = scheduler_with_cpus(kernel, 1);
+        let owner = scheduler
+            .register_executor_bound(
+                Arc::new(RecordingKick::default()),
+                Some(GuestCpuId::new(0)),
+                false,
+            )
+            .unwrap();
+        let kick = Arc::new(GuestIdleKick::default());
+        let spare = scheduler
+            .register_executor_bound(kick.clone(), None, true)
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&owner).unwrap();
+        let token = scheduler.begin_host_wait(&running, &owner).unwrap();
+        assert_eq!(spare.bound_cpu(), None);
+
+        let arrived = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *scheduler.queue.inner.flush_publication_gate.lock() =
+            Some((arrived.clone(), resume.clone()));
+        let requester = {
+            let scheduler = scheduler.clone();
+            let id = spare.id();
+            thread::spawn(move || scheduler.request_residency_flush(id))
+        };
+        arrived.wait();
+
+        // Force the handoff after the placement read, if publication permits
+        // it. The corrected transaction excludes this transition until the
+        // flag is visible, so park_spare must reject it instead.
+        let handed_off = scheduler.queue.inner.state.try_lock().is_some();
+        if handed_off {
+            assert!(!spare.flush_requested());
+            assert!(scheduler.try_take(&spare).unwrap().is_none());
+            assert_eq!(spare.bound_cpu(), Some(GuestCpuId::new(0)));
+        }
+        let (park_tx, park_rx) = std::sync::mpsc::channel();
+        if handed_off {
+            *scheduler.queue.inner.host_park_gate.lock() = Some(park_tx);
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let scheduler = scheduler.clone();
+            let spare = spare.clone();
+            thread::spawn(move || {
+                done_tx.send(scheduler.take(&spare).map(|_| ())).unwrap();
+            })
+        };
+        if handed_off {
+            park_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The park announcement runs under the CPU lock. Acquiring it
+            // proves the worker has atomically entered its condvar wait.
+            drop(scheduler.queue.inner.cpus[0].state.lock());
+        }
+        resume.wait();
+        requester.join().unwrap();
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        // Always release and join a stranded worker before asserting red.
+        if result.is_err() {
+            scheduler.queue.inner.cpus[0].nudge();
+        }
+        worker.join().unwrap();
+        assert_eq!(kick.idle_wakes.load(Ordering::SeqCst), 1);
+        if handed_off {
+            assert!(scheduler.queue.inner.release_handoff(spare.id, false));
+        }
+        drop(token);
+        scheduler.settle_exited(running).unwrap();
+        assert!(
+            matches!(result, Ok(Err(RunQueueError::FlushRequested))),
+            "flush wake was lost after spare-to-bound handoff: {result:?}"
+        );
     }
 
     /// A kick that counts the scheduler's attempts to force an executor out
