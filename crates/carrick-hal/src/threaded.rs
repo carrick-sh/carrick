@@ -1004,6 +1004,21 @@ mod generic_registry_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    #[test]
+    fn admitted_fork_identity_cannot_supply_a_host_projection() {
+        let copied = ForkProjectionPlan::OwnerCopied {
+            parent_mm: 7,
+            child_mm: 8,
+        };
+        assert_eq!(copied.owner_target(), Some((7, 8)));
+        assert_eq!(copied.ranges(), Err(ForkProjectionError::OwnerRequired));
+        assert!(!copied.is_shared());
+        let shared = ForkProjectionPlan::OwnerShared { parent_mm: 7 };
+        assert_eq!(shared.owner_target(), Some((7, 7)));
+        assert_eq!(shared.ranges(), Err(ForkProjectionError::OwnerRequired));
+        assert!(shared.is_shared());
+    }
+
     fn t(raw: i32) -> ThreadId {
         ThreadId::synthetic_for_tests(raw)
     }
@@ -1915,6 +1930,10 @@ pub struct ForkProjectionRange {
 /// cannot disagree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForkProjectionPlan {
+    /// Admitted roots supply identity only; EL1 derives the child from live state.
+    OwnerCopied { parent_mm: u64, child_mm: u64 },
+    /// A shared admitted MM retains its exact root lifetime.
+    OwnerShared { parent_mm: u64 },
     Shared {
         parent_mm: u64,
         ranges: std::sync::Arc<[ForkProjectionRange]>,
@@ -1928,25 +1947,43 @@ pub enum ForkProjectionPlan {
 
 impl ForkProjectionPlan {
     pub fn is_shared(&self) -> bool {
-        matches!(self, Self::Shared { .. })
+        matches!(self, Self::Shared { .. } | Self::OwnerShared { .. })
     }
 
-    pub fn ranges(&self) -> &std::sync::Arc<[ForkProjectionRange]> {
+    pub fn owner_target(&self) -> Option<(u64, u64)> {
         match self {
-            Self::Shared { ranges, .. } | Self::Copied { ranges, .. } => ranges,
+            Self::OwnerCopied {
+                parent_mm,
+                child_mm,
+            } => Some((*parent_mm, *child_mm)),
+            Self::OwnerShared { parent_mm } => Some((*parent_mm, *parent_mm)),
+            Self::Shared { .. } | Self::Copied { .. } => None,
+        }
+    }
+
+    /// Setup-only projection. An admitted root cannot be treated as empty.
+    pub fn ranges(&self) -> Result<&std::sync::Arc<[ForkProjectionRange]>, ForkProjectionError> {
+        match self {
+            Self::Shared { ranges, .. } | Self::Copied { ranges, .. } => Ok(ranges),
+            Self::OwnerCopied { .. } | Self::OwnerShared { .. } => {
+                Err(ForkProjectionError::OwnerRequired)
+            }
         }
     }
 
     pub fn parent_mm(&self) -> u64 {
         match self {
-            Self::Shared { parent_mm, .. } | Self::Copied { parent_mm, .. } => *parent_mm,
+            Self::Shared { parent_mm, .. }
+            | Self::Copied { parent_mm, .. }
+            | Self::OwnerShared { parent_mm }
+            | Self::OwnerCopied { parent_mm, .. } => *parent_mm,
         }
     }
 
     pub fn child_mm(&self) -> u64 {
         match self {
-            Self::Shared { parent_mm, .. } => *parent_mm,
-            Self::Copied { child_mm, .. } => *child_mm,
+            Self::Shared { parent_mm, .. } | Self::OwnerShared { parent_mm } => *parent_mm,
+            Self::Copied { child_mm, .. } | Self::OwnerCopied { child_mm, .. } => *child_mm,
         }
     }
 }
@@ -1970,6 +2007,7 @@ pub fn lookup_fork_projection(
 /// Error returned when fork projection validation fails.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkProjectionError {
+    OwnerRequired,
     ZeroLength,
     /// A range whose `va` or `len` is not 4 KiB aligned. Carries the exact
     /// offending pair: the rejection is otherwise indistinguishable from any
@@ -1987,6 +2025,7 @@ pub enum ForkProjectionError {
 impl std::fmt::Display for ForkProjectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::OwnerRequired => write!(f, "admitted fork requires production owner completion"),
             Self::ZeroLength => write!(f, "zero length projection range"),
             Self::Unaligned { va, len } => write!(
                 f,
@@ -2072,7 +2111,9 @@ impl ProcessForkRequest {
         self.plan.is_shared()
     }
 
-    pub fn projection_plan(&self) -> &std::sync::Arc<[ForkProjectionRange]> {
+    pub fn projection_plan(
+        &self,
+    ) -> Result<&std::sync::Arc<[ForkProjectionRange]>, ForkProjectionError> {
         self.plan.ranges()
     }
 }
@@ -2435,9 +2476,32 @@ pub trait FrameCowQuiesce {}
 
 impl<T> FrameCowQuiesce for T {}
 
+/// The pending production Fork result and its physical byte-source leases.
+pub type PendingOwnerForkReceipt = (
+    carrick_el1_abi::PortalForkCompletion,
+    Vec<(std::num::NonZeroU64, std::num::NonZeroU64)>,
+);
+
+/// Result of servicing an owner-selected retained file page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerFileFaultOutcome {
+    Resolved,
+    Refused,
+    BusFault,
+}
+
 pub trait FrameCowAuthority: Send + Sync {
     /// Bounded byte service for an owner-selected retained host source. No
     /// guest VA or permission decision crosses this physical boundary.
+    /// Authenticate physical handle custody without consulting mapping policy.
+    fn retains_host_backing(
+        &self,
+        _handle: std::num::NonZeroU64,
+        _generation: std::num::NonZeroU64,
+    ) -> bool {
+        false
+    }
+
     fn read_host_backing(
         &self,
         _identity: carrick_mmu_core::HostBackingIdentity,
@@ -3060,6 +3124,16 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     ) {
     }
 
+    /// Service an exact file fault selected by the admitted owner. `None`
+    /// means no owner file selection exists for this transport request.
+    fn service_owner_file_fault(
+        &mut self,
+        _mm_key: u64,
+        _request_generation: u64,
+    ) -> Result<Option<OwnerFileFaultOutcome>, TrapError> {
+        Ok(None)
+    }
+
     /// Prepare real stage-2 backing and publish its exact inventory/owner
     /// authority for one claimed EL1 frame grant. `None` means this backend
     /// cannot service the request and the guest must consume a refusal before
@@ -3431,6 +3505,30 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
 
     /// The child is materialized and every remaining fork publication failure
     /// is fail-closed. Forget the parent's saved pre-arm state.
+    /// Exact owner completion awaiting task commit, with opaque source custody.
+    /// Read fork output preimages through the production owner under exact ASID admission.
+    fn read_owner_fork_parent_bytes(
+        &mut self,
+        _address: u64,
+        _len: usize,
+        _admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    ) -> Result<Vec<u8>, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    fn write_owner_fork_parent_bytes(
+        &mut self,
+        _address: u64,
+        _bytes: &[u8],
+        _admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    fn pending_owner_fork_receipt(&self) -> Option<PendingOwnerForkReceipt> {
+        None
+    }
+
     fn commit_process_fork(&mut self) -> Result<(), TrapError> {
         Ok(())
     }

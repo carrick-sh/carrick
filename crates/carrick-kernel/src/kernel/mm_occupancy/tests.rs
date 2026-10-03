@@ -896,3 +896,48 @@ fn pre_admission_owner_blocks_publication_and_refuses_without_relocking() {
     assert_eq!(spaces.grant(index, key.raw()).unwrap().ttbr0, 0x9000);
     drop(successor);
 }
+
+#[test]
+fn owner_fork_publication_keeps_child_unswitchable_until_completion() {
+    let (spaces, occupancy) = space_tables();
+    let tables = SpaceTables {
+        spaces,
+        occupancy,
+        zone: false,
+    };
+    let child = mm(42_990);
+    let guard = PreAdmissionGuard::acquire_in(tables, child).unwrap();
+    let publication = publish_in_held(
+        &guard,
+        &fence(),
+        0x1000,
+        0x1000,
+        Anchors {
+            brk_current: 0,
+            mmap_next: 0,
+            limits: ReservationLimits {
+                address: u64::MAX,
+                data: u64::MAX,
+            },
+            reservation_provider: None,
+        },
+        PublicationAdmission::OwnerForkClosed,
+    )
+    .unwrap();
+    let index = spaces.find(child.raw()).unwrap();
+    assert_eq!(spaces.gate(index), carrick_sched_core::GATE_CLOSED);
+    assert!(spaces.grant(index, child.raw()).is_none());
+    assert!(
+        spaces
+            .try_begin_edit(index, child.raw(), std::num::NonZeroU64::MIN)
+            .is_none()
+    );
+    let editor = spaces
+        .try_begin_closed_child_edit(index, child.raw(), std::num::NonZeroU64::MIN)
+        .unwrap();
+    drop(editor);
+    assert_eq!(spaces.gate(index), carrick_sched_core::GATE_CLOSED);
+    drop(guard);
+    drop(publication);
+    assert!(spaces.find(child.raw()).is_none());
+}
