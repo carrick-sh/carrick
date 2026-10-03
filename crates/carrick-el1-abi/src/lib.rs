@@ -461,6 +461,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::align_of::<FrameGrantResidencyRecord>() as u64,
         core::mem::size_of::<FrameGrantResidencyTable>() as u64,
         core::mem::offset_of!(FrameGrantResidencyRecord, committed) as u64,
+        core::mem::offset_of!(FrameGrantResidencyRecord, transfer_pins) as u64,
+        TRANSFER_PIN_RETIRED,
         EL1_ZONE_OFFSET,
         carrick_sched_core::HOST_REQUEST_PROTOCOL,
         carrick_sched_core::Claim::OnCpuRequested {
@@ -1518,6 +1520,7 @@ const GRANT_LIVE: u64 = 3;
 const GRANT_STATE_MASK: u64 = 3;
 const GRANT_PAGE_SIZE: u64 = 4096;
 const GRANT_PROBES: usize = 64;
+const TRANSFER_PIN_RETIRED: u64 = 1 << 63;
 
 /// Exact frame ownership carried beside the residency bits. A slot cannot
 /// authorize a reused mapping or frame with the same VA and IPA but a new
@@ -1580,6 +1583,7 @@ pub struct FrameGrantResidencyRecord {
     owner_generation: AtomicU64,
     inventory_revision: AtomicU64,
     committed: [AtomicU64; 8],
+    transfer_pins: AtomicU64,
 }
 
 impl FrameGrantResidencyRecord {
@@ -1595,6 +1599,7 @@ impl FrameGrantResidencyRecord {
             owner_generation: AtomicU64::new(0),
             inventory_revision: AtomicU64::new(0),
             committed: [const { AtomicU64::new(0) }; 8],
+            transfer_pins: AtomicU64::new(TRANSFER_PIN_RETIRED),
         }
     }
 
@@ -1628,6 +1633,7 @@ impl FrameGrantResidencyRecord {
         for word in &self.committed {
             word.store(0, Ordering::Relaxed);
         }
+        self.transfer_pins.store(0, Ordering::Release);
         let writing = self.state.load(Ordering::Relaxed);
         self.state.store(
             (writing & !GRANT_STATE_MASK) | GRANT_LIVE,
@@ -1639,6 +1645,19 @@ impl FrameGrantResidencyRecord {
 impl Default for FrameGrantResidencyRecord {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// An exact-generation residency lease. Retirement is refused until every
+/// lease drops. This protects residency publication; physical reclamation
+/// callers must honor the retirement result before releasing backing.
+/// The shared table must outlive every lease, including canceled operations.
+pub struct FrameGrantTransferPin<'a> {
+    record: &'a FrameGrantResidencyRecord,
+}
+impl Drop for FrameGrantTransferPin<'_> {
+    fn drop(&mut self) {
+        self.record.transfer_pins.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1744,6 +1763,30 @@ impl FrameGrantResidencyTable {
         None
     }
 
+    /// Retain an exact live residency generation independently of the MM
+    /// editor. A racing retirement either closes admission first or observes
+    /// this pin and refuses; stale page tokens cannot pin a successor.
+    pub fn pin_transfer(&self, page: FrameGrantResidencyPage) -> Option<FrameGrantTransferPin<'_>> {
+        let record = self.slots.get(page.slot)?;
+        if record.state.load(Ordering::Acquire) != page.epoch || record.identity() != page.identity
+        {
+            return None;
+        }
+        record
+            .transfer_pins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+                (pins < TRANSFER_PIN_RETIRED - 1).then_some(pins + 1)
+            })
+            .ok()?;
+        let pin = FrameGrantTransferPin { record };
+        if record.state.load(Ordering::Acquire) != page.epoch || record.identity() != page.identity
+        {
+            drop(pin);
+            return None;
+        }
+        Some(pin)
+    }
+
     /// Guest: record a committed VALID leaf before releasing the MM editor.
     pub fn record_commit(&self, page: FrameGrantResidencyPage) -> bool {
         let Some(record) = self.slots.get(page.slot) else {
@@ -1842,6 +1885,13 @@ impl FrameGrantResidencyTable {
             return false;
         }
         if record
+            .transfer_pins
+            .compare_exchange(0, TRANSFER_PIN_RETIRED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if record
             .state
             .compare_exchange(
                 epoch,
@@ -1851,6 +1901,7 @@ impl FrameGrantResidencyTable {
             )
             .is_err()
         {
+            record.transfer_pins.store(0, Ordering::Release);
             return false;
         }
         self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
@@ -4609,6 +4660,40 @@ mod tests {
         );
         assert_eq!(result, Ok(true));
         assert!(committed.get());
+    }
+
+    #[test]
+    fn transfer_pin_blocks_retirement_and_generation_reuse() {
+        let table = FrameGrantResidencyTable::new();
+        let identity = FrameGrantResidencyIdentity {
+            mm_key: 41,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x9000_0000,
+            len: 4096,
+            mapping_id: 17,
+            frame_id: 19,
+            owner_generation: 23,
+            inventory_revision: 29,
+        };
+        let slot = table.publish(identity).unwrap();
+        let page = table.lookup(41, identity.semantic_base).unwrap();
+        let pin = table.pin_transfer(page).unwrap();
+        assert!(!table.retire(slot, identity));
+        assert_eq!(table.lookup(41, identity.semantic_base), Some(page));
+        assert!(table.publish(identity).is_none());
+        let second_pin = table.pin_transfer(page).unwrap();
+        drop(pin);
+        assert!(!table.retire(slot, identity));
+        drop(second_pin);
+        assert!(table.retire(slot, identity));
+        assert!(table.pin_transfer(page).is_none());
+        let successor = FrameGrantResidencyIdentity {
+            owner_generation: 31,
+            ..identity
+        };
+        let successor_slot = table.publish(successor).unwrap();
+        assert!(table.pin_transfer(page).is_none());
+        assert!(table.retire(successor_slot, successor));
     }
 
     #[test]
