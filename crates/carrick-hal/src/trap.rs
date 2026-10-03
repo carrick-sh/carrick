@@ -417,6 +417,11 @@ pub enum TrapError {
     /// termination instead of propagating a fatal carrick error.
     #[error("signal frame could not be delivered to the guest stack")]
     SignalDeliveryFault,
+    /// A retained file byte service selected a page beyond the file end.
+    #[error("owner-selected retained file page is beyond EOF")]
+    HostBackingEof,
+    #[error("production owner refused Fork: {errno:?}")]
+    OwnerForkRefused { errno: carrick_abi::LinuxErrno },
     #[error("guest mapping size {0} does not fit this host")]
     MappingTooLarge(u64),
     #[error("guest mapping at 0x{guest_start:x} with size {mapped_size} overflows")]

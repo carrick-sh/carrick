@@ -10,11 +10,13 @@
 //!   inside the heap/arena layout as EL1-editable nodes that then leave
 //!   `MemState`, everything else as opaque placement obstacles the host
 //!   keeps;
-//! - at fork commit ([`El1AdmissionOrigin::ForkCommit`]), holding both MM
-//!   permits: the child's root is seeded from the parent's committed root
-//!   (`clone_into`), so a fork child stays delegated. Its host-setup twin
-//!   (`MemState::fork_materialized`) only bridges fork preparation, where
-//!   the child's root is not yet published.
+//! - at owner fork commit ([`El1AdmissionOrigin::OwnerForkCommit`]), both MM
+//!   permits authenticate the production owner's exact completion and origin
+//!   certificate. The owner already inherited its live tables and reservation
+//!   tree. No child host VMA, protection, file-source or deferred projection is
+//!   created or imported;
+//! - a copied setup MM ([`El1AdmissionOrigin::SetupForkCommit`]) may import its
+//!   own setup rows only while its parent has no admitted owner.
 //!
 //! `CARRICK_EL1_RESERVATIONS=0` makes every admission answer
 //! [`El1Admission::HostSetup`] through the same entry point: the host keeps
@@ -44,12 +46,19 @@ pub enum El1AdmissionOrigin<'a, 'p> {
     /// Initial MM bind, or the new MM of an exec: this MM's own host-setup
     /// rows are the root's contents.
     Bind,
-    /// Fork commit of a copied MM: the child (the admitting dispatcher) is
-    /// seeded from `parent`'s committed root. `parent_permit` must be the
-    /// parent MM's permit, held with the child's for the whole admission.
-    ForkCommit {
+    /// A setup fork imports the child's own rows. An admitted parent is
+    /// rejected; it requires the exact production owner completion.
+    SetupForkCommit {
         parent: &'a SyscallDispatcher,
         parent_permit: &'a HostAliasPermit<'p>,
+    },
+    /// Attach a child already built by production owner Fork, with only its
+    /// exact completion and selected physical source custody.
+    OwnerForkCommit {
+        parent: &'a SyscallDispatcher,
+        parent_permit: &'a HostAliasPermit<'p>,
+        completion: &'a carrick_el1_abi::PortalForkCompletion,
+        inherited_sources: &'a [(core::num::NonZeroU64, core::num::NonZeroU64)],
     },
 }
 
@@ -132,7 +141,7 @@ fn admission_rows(mem: &MemState) -> Result<AdmissionRows, Refusal> {
                 .map(|source| {
                     let lease = mem
                         .host_backing_custody
-                        .retain_source(source.backing.clone())
+                        .retain_labeled_source(source.backing.clone(), vma.path.clone())
                         .ok_or(Refusal::MetadataRequired)?;
                     let offset = source
                         .offset
@@ -143,6 +152,11 @@ fn admission_rows(mem: &MemState) -> Result<AdmissionRows, Refusal> {
                     Ok(identity)
                 })
                 .transpose()?;
+            if backing.is_some()
+                && flags.contains(ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE))
+            {
+                owned.push((range.start(), range.end()));
+            }
             rows.push((range, prot, flags, backing));
         }
     }
@@ -227,57 +241,67 @@ fn admit_bind(
         result
     })?;
     mem.seal_delegated(root, &owned);
-    mem.host_backing_leases.extend(backing_leases);
+    mem.host_backing_leases
+        .extend(backing_leases.into_iter().map(|lease| {
+            let id = lease.identity(0);
+            ((id.handle(), id.generation()), lease)
+        }));
+    mem.reconcile_host_backing_leases();
     Ok(El1Admission::Delegated)
 }
 
-/// Seed the fork child `mem`'s root from `parent`'s committed root.
+/// Authenticate a child that the production owner already built.
 fn admit_fork(
     parent: &MemState,
     mem: &mut MemState,
     root: &DelegatedRoot,
     (address_limit, data_limit): (u64, u64),
-    unchanged: bool,
+    completed: (
+        &carrick_el1_abi::PortalForkCompletion,
+        &[(core::num::NonZeroU64, core::num::NonZeroU64)],
+    ),
 ) -> Result<El1Admission, Refusal> {
     let seed = match mem.anonymous_authority() {
         AnonymousAuthority::Delegated(_) => return already_delegated(mem, root),
         AnonymousAuthority::HostSetup(arena) => arena.fork_seed.ok_or(Refusal::Stale)?,
     };
     let parent_root = parent.delegated_root().ok_or(Refusal::Stale)?;
-    // The twin must still be exactly the fork's: neither MM edited since.
-    if seed.parent != parent_root.mm() || !unchanged {
+    let (completion, sources) = completed;
+    let request = completion.request;
+    if seed.parent != parent_root.mm()
+        || request.operation.mm != seed.parent
+        || request.parent_generation != seed.generation
+        || request.child_mm != root.mm()
+        || completion.child.mm() != root.mm()
+        || completion.child.carrier() != request.operation.carrier
+    {
         return Err(Refusal::Stale);
     }
-    // The parent's permit excludes its host venue; one still open is a
-    // syscall that never settled.
     if parent.host_venue_open() {
         return Err(Refusal::Busy);
     }
-    let host = HostCharges::at_admission(mem);
-    let mut owned = Vec::new();
-    root.seed_from(parent_root, |parent, child| {
-        if parent.generation() != seed.generation {
+    parent_root.with_root(|model| {
+        if model.incarnation().raw() != request.operation.incarnation.get()
+            || model.generation() != completion.parent_generation
+        {
             return Err(Refusal::Stale);
         }
-        // Busy while a guest-venue proposal is pending on the parent: its
-        // backend work must settle first, never be copied half-done.
-        parent.clone_into(child)?;
-        // The child root is admitted: nothing below may refuse.
-        child.set_limits(address_limit, data_limit);
-        let (address, data) = host
-            .beyond(child)
-            .unwrap_or_else(|refusal| broken_root("a fork admission charge", refusal));
-        child.set_external_charges(address, data);
-        child
-            .observe_mappings(&mut |mapping| {
-                if mapping.anonymous {
-                    owned.push((mapping.range.start(), mapping.range.end()));
-                }
-            })
-            .unwrap_or_else(|refusal| broken_root("a fork admission observation", refusal));
         Ok(())
     })?;
-    mem.seal_delegated(root, &owned);
+    // The owner supplied both the tree and the table graph. Host attachment
+    // authenticates that origin; it never clones or projects either graph.
+    root.with_root(|child| {
+        if child.incarnation().raw() != completion.child.incarnation().get()
+            || !child.authenticate_fork_origin(request)
+        {
+            return Err(Refusal::Stale);
+        }
+        child.set_limits(address_limit, data_limit);
+        Ok(())
+    })?;
+    mem.host_backing_leases
+        .retain(|identity, _| sources.contains(identity));
+    mem.seal_delegated(root, &[]);
     Ok(El1Admission::Delegated)
 }
 
@@ -304,7 +328,7 @@ impl MemView<'_> {
             .unwrap_or((LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY));
         match origin {
             El1AdmissionOrigin::Bind => admit_bind(&mut authority.lock(), &root, limits),
-            El1AdmissionOrigin::ForkCommit {
+            El1AdmissionOrigin::SetupForkCommit {
                 parent,
                 parent_permit,
             } => {
@@ -317,13 +341,37 @@ impl MemView<'_> {
                 {
                     return Err(Refusal::Stale);
                 }
-                // The child's host-setup twin starts at the parent's VMA
-                // revision; any host edit of either since moves it.
-                let unchanged = authority.vma_revision() == parent_authority.vma_revision();
-                // Parent before child, the fork's own order.
+                let parent_mem = parent_authority.lock();
+                if parent_mem.delegated_root().is_some() {
+                    return Err(Refusal::Stale);
+                }
+                let mut mem = authority.lock();
+                admit_bind(&mut mem, &root, limits)
+            }
+            El1AdmissionOrigin::OwnerForkCommit {
+                parent,
+                parent_permit,
+                completion,
+                inherited_sources,
+            } => {
+                let parent_authority = parent.mm_authority();
+                if parent_authority.mm_id == authority.mm_id
+                    || !parent_permit.authorizes(
+                        &parent_authority.mutation_coordinator,
+                        parent_authority.mm_id,
+                    )
+                {
+                    return Err(Refusal::Stale);
+                }
                 let parent_mem = parent_authority.lock();
                 let mut mem = authority.lock();
-                admit_fork(&parent_mem, &mut mem, &root, limits, unchanged)
+                admit_fork(
+                    &parent_mem,
+                    &mut mem,
+                    &root,
+                    limits,
+                    (completion, inherited_sources),
+                )
             }
         }
     }
@@ -422,7 +470,7 @@ impl SyscallDispatcher {
     /// The ONE production admission of this MM's delegated anonymous root.
     ///
     /// Locking contract: the caller holds THIS MM's `permit` (and, for
-    /// [`El1AdmissionOrigin::ForkCommit`], the parent MM's permit too, with
+    /// [`El1AdmissionOrigin::SetupForkCommit`], the parent MM's permit too, with
     /// the parent quiesced at its fork commit and the child not yet run).
     /// The root must be published (the MM's address space) and no root guard
     /// may be held. Inside, the MM's host-alias dispatch is begun, then the

@@ -554,7 +554,7 @@ fn repoint_inherited_invalid_alias(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build_process_plan(
+    pub(crate) fn build_setup_process_plan(
         &self,
         request: carrick_hal::ProcessForkRequest,
         page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
@@ -817,7 +817,10 @@ impl HvfTaskState {
             &source_mappings,
             &parent_inventory_by_stage2,
         );
-        let projection_ranges = std::sync::Arc::clone(request.projection_plan());
+        let projection_ranges =
+            std::sync::Arc::clone(request.projection_plan().map_err(|error| {
+                TrapError::Hypervisor(format!("host setup fork projection refused: {error}"))
+            })?);
         invalidate_projected_fork_omissions(page_tables, request.shares_mm(), &projection_ranges)?;
         let parent_extension_bases = self
             .page_tables_authority()
@@ -1850,20 +1853,23 @@ mod tests {
     /// complements the production byte/COW witnesses; it does not prove them.
     #[test]
     fn admitted_fork_has_no_host_protection_snapshot_input() {
-        let source = include_str!("process_plan.rs");
-        let body = source
-            .split_once("pub(crate) fn build_process_plan(")
-            .unwrap()
-            .1
-            .split_once("#[cfg(test)]")
-            .unwrap()
-            .0;
-        let host_snapshot = body.find("self.protections.snapshot_all()").unwrap();
-        let owner_completion = body.find("consume_owner_fork_completion");
-        assert!(
-            owner_completion.is_some_and(|owner| owner < host_snapshot),
-            "admitted fork reaches process_plan child protections from the host mirror before an owner Fork completion"
+        use carrick_hal::ForkProjectionPlan;
+        let plan = ForkProjectionPlan::OwnerCopied {
+            parent_mm: 11,
+            child_mm: 12,
+        };
+        assert_eq!(plan.owner_target(), Some((11, 12)));
+        assert_eq!(
+            plan.ranges(),
+            Err(carrick_hal::ForkProjectionError::OwnerRequired)
         );
+        let source = include_str!("owner_fork.rs");
+        let body = source
+            .split("fn consume_owner_fork_completion(")
+            .nth(1)
+            .unwrap();
+        assert!(!body.contains("snapshot_all()"));
+        assert!(!body.contains("projection_plan()"));
     }
 
     #[test]
