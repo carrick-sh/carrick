@@ -913,3 +913,108 @@ or closing MM gates. Do not give a maintenance service an unrestricted gate
 bypass to preserve the synthetic closed-gate success assertion. The original
 N0 stopped-target pass was measured on a gate-bypassing private model; it
 must be re-proven on production semantics before acceptance.
+
+
+N1 physical-custody ruling: user-data frame lifetime stays in host
+`CarrierVmCustody::pin_stage2_record` (`carrier_custody.rs:1367`), with
+pre-unmap `DeferredActivePins` at line 1460. The residency lease guards
+**grant windows only**, never general physical custody. COW now revokes
+old grant-window tokens before a repoint, refuses while such a lease is held,
+and publishes/commits the replacement grant identity on success. Index
+saturation declines acceleration; it does not fabricate physical custody.
+The red COW witness proved the old token still accepted a commit after
+repointing, before the correction.
+
+Director-approved UserTransfer handshake: EL1 selects IPAs under the exact
+MM transaction; host resolves those IPAs to exact physical records and
+generations in `CarrierVmCustody` and pins them; EL1 then revalidates the
+VA-to-IPA mapping under the exact MM before copying. A raced selection must
+release the physical pins and return owned retry/suspension. No shared
+physical directory is added, and root generations never substitute for
+physical generations. This supersedes the earlier physical-custody obstacle.
+The shared completion must carry retained-data identities, replacing the
+N0 metadata-storage description. UserTransfer and stopped-target lazy grant
+continuations remain open until this production handshake is implemented.
+
+### N1 UserTransfer implementation receipt — 2026-10-02
+
+This receipt supersedes the adapter checkpoints above that said UserTransfer
+was not rebound, that the private model remained, or that residency leases
+provided transfer custody. Those entries describe earlier inspection states.
+The N0 private MM/table/frame graph is now deleted. The production adapter
+borrows SharedReservations, retained reservation metadata and AddressSpaces;
+only CarrierVmCustody owns physical transfer pins. Residency leases protect
+unpublished/prepared grant windows, not committed transfer data.
+
+Director-approved scope implemented here:
+
+- Exact admitted carrier/MM/incarnation handle; EL1 selects the current IPA,
+  host retains its actual stage-2 record and backing allocation, EL1 revalidates
+  under the real SpaceEditor, and completion publishes before that guard drops.
+  A 4 KiB copy or cancellation resumes the same suspended EL1 service frame.
+- Stopped targets use an OPEN admitted MM gate and borrowed driving vCPU, with
+  no target EL0 entry or spare executor. Byte offset and host buffers remain
+  owned across preparation/retry. No editor survives a returned continuation.
+- Exact-target lazy preparation reuses physical allocation, inventory and
+  custody. Its pending owner exists immediately after physical publication,
+  pins before alias exposure, and settles only its exact descriptor receipt.
+  Concurrent-unmap rollback authenticates inventory mapping/frame and retained
+  owner generation; absent alias alone is insufficient. Exact removal leaves
+  successor stage-2 custody, inventory and bytes intact.
+- Imported private file pages are admitted as EL1-private/COW-armed. Only
+  page-granule imports descend to L3: the 2 MiB witness requires exactly one
+  additional table; untouched zero arenas and compound-only arming stay coarse.
+  Empty COW pools return an exact owner supply receipt, including non-anonymous
+  imported-private roots. The host supplies one compound through the existing
+  provision_guest_cow_grants allocator; it never reclassifies host table policy.
+- A remapped generation may replace only core-typed retired terminals through
+  bounded Prepare. It receives fresh zero backing; an adjacent live page in
+  the same old compound is untouched. No old physical frame is recycled while
+  custody retains it.
+- Executable COW uses the authorized bounded physical-publication HVC after
+  guest copy and before CowRepoint. The exact claimed grant/epoch/backing and
+  physical owner authenticate existing I2 publish_user_executable. No new cache
+  mechanism, metadata callback or host policy decision is introduced. Ordinary
+  COW has zero publication crossings. Executable UserTransfer writes dirty-mark
+  before memcpy and invoke I2 before completion. The guest editor remains held
+  for the bounded effect (maximum existing 16 KiB COW run).
+
+Current implementation map (line numbers at this checkpoint):
+
+| Responsibility | Production function |
+|---|---|
+| Sealed host target and owned request | `crates/carrick-aarch64/src/user_transfer.rs`, `TransferTarget::bind`, `OwnedUserTransfer::advance` |
+| Production selection/revalidation | `crates/carrick-el1/src/personality/mm_portal/production.rs:232`, `MmPortal::select` / `revalidate` |
+| Guard-retaining copy/completion | `production.rs:527`, `serve_transfer` |
+| Exact lazy root/descriptor settlement | `production.rs:776`, `serve_grant` |
+| Admitted target bind service | `production.rs:964`, `bind_transfer_hw` |
+| Same-frame service runner | `crates/carrick-aarch64/src/engine.rs:232`, `run_el1_service_effect_on`; `:7739`, `run_user_transfer_service` |
+| Host physical selection and memcpy | `crates/carrick-vmm-hvf/src/trap/user_transfer.rs`, `retain_exact`, `TransferPin::copy` |
+| Claimed executable publication | `user_transfer.rs:178`, `publish_claimed_executable` |
+| Exact-target physical adapter | `crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs:873`, `PublicationContext::for_transfer`; `:2297`, `prepare_transfer` |
+| Exact-target COW supply | `sparse_materialization.rs:2280`, `refill_transfer_cow` |
+
+Evidence replaces the selection-only draft, not the retained whole-N1 red:
+`native_owner_matrix` copies real bytes through the production service for
+both live MMs at every 16/64/256-page × 16/512-unrelated-node point, with all
+default slots occupied, target parked/open, ≤8 descriptor reads/page and
+≤4*ilog2(unrelated+1) reservation visits/page. The physical suite separately
+proves actual data pins, stale pin/refused copy, source allocation lifetime,
+Owned/CopyOnly/private/shared file bytes, exact rollback/successor retention,
+dirty pool reuse and same-compound partial replacement. These are compositional
+VM-free witnesses: the fake inventory authority models kernel unmap receipt
+ordering, not execution of a Linux syscall.
+
+Red-first observations: imported private admission initially left its leaf
+untagged; partial retired replacement initially returned Refused(Occupied);
+kernel-only writes initially returned Suspended; executable COW initially
+failed the Resolved assertion without publication capability. Each covering
+witness now passes. The executable witness additionally executes a host ARM64
+RX view of the retained bytes (7 before write, 9 afterward), after independent
+I2-clean assertions; mprotect is test-only W^X capability, not cache authority.
+
+Final worker commands/results and limits are in
+`.superpowers/sdd/2026-10-02-el1-native-ownership/task-1-report.md`. No guest or
+Docker run occurred in the quiet window. Public bulk Capacity, Fork rebinding,
+GuestMemory venue 3, existing production-admission reds, signed guest TLBI and
+end-to-end artifact acceptance remain outside this UserTransfer receipt.

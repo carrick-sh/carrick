@@ -226,6 +226,16 @@ fn run_el1_service_call_on<V: Aarch64Vmm>(
     entry_pc: u64,
     frame_va: u64,
 ) -> Result<(), TrapError> {
+    run_el1_service_effect_on::<V::Vcpu>(vcpu, entry_pc, frame_va, false, &mut || false)
+}
+
+fn run_el1_service_effect_on<C: Aarch64Vcpu>(
+    vcpu: &mut C,
+    entry_pc: u64,
+    frame_va: u64,
+    transfer: bool,
+    effect: &mut dyn FnMut() -> bool,
+) -> Result<(), TrapError> {
     const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
     let mut saved = Vec::with_capacity(36);
     let mut regs: Vec<Reg> = (0..31).map(Reg::X).collect();
@@ -256,9 +266,21 @@ fn run_el1_service_call_on<V: Aarch64Vmm>(
         // from where it stopped.
         result = loop {
             match vcpu.run() {
-                Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
+                Ok(Aarch64Exit::MaintenanceDone) => {
+                    if effect() {
+                        continue;
+                    }
+                    break Ok(());
+                }
                 Ok(Aarch64Exit::Kicked) => continue,
                 Ok(other) => {
+                    if transfer {
+                        carrick_fatal::carrick_fatal!(
+                            "aarch64::user_transfer",
+                            "cannot abandon suspended EL1 transfer stack: {}",
+                            maintenance_exit_detail(&other)
+                        );
+                    }
                     break Err(TrapError::UnexpectedExit {
                         reason: format!(
                             "{} during host-driven EL1 call",
@@ -266,7 +288,15 @@ fn run_el1_service_call_on<V: Aarch64Vmm>(
                         ),
                     });
                 }
-                Err(error) => break Err(error),
+                Err(error) => {
+                    if transfer {
+                        carrick_fatal::carrick_fatal!(
+                            "aarch64::user_transfer",
+                            "cannot abandon suspended EL1 transfer stack: {error}"
+                        );
+                    }
+                    break Err(error);
+                }
             }
         };
     }
@@ -7697,5 +7727,158 @@ mod tests {
         assert_eq!(rollback_mem_err, MemoryError::MetadataAllocation);
         let rollback_trap_err = memory_error_to_trap_error(rollback_mem_err, "test rollback");
         assert!(matches!(rollback_trap_err, TrapError::MetadataAllocation));
+    }
+}
+
+impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
+    /// Run the transfer owner's service on the borrowed driving vCPU. The
+    /// target never enters EL0; its ASID admission brackets the entire call.
+    /// A true effect result means the intermediate copy was acknowledged and
+    /// the same suspended EL1 stack must resume before register restoration.
+    pub fn run_user_transfer_service(
+        &mut self,
+        mut frame: carrick_el1_abi::TrapFrame,
+        ttbr0: u64,
+        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+        effect: &mut dyn FnMut() -> bool,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        frame.slot =
+            self.vcpu.mailbox_slot().ok_or_else(|| {
+                TrapError::Hypervisor("transfer caller has no EL1 slot".to_owned())
+            })? as u64;
+        let suspended = self.suspended_el1_sp;
+        let vcpu = std::cell::RefCell::new(&mut self.vcpu);
+        crate::descriptor_drain::run_foreign_service_call(
+            frame,
+            ttbr0,
+            admission,
+            || vcpu.borrow().get_sys_reg(SysReg::Ttbr0),
+            |value| vcpu.borrow_mut().set_sys_reg(SysReg::Ttbr0, value),
+            suspended,
+            |entry, frame_va| {
+                run_el1_service_effect_on::<V::Vcpu>(
+                    &mut vcpu.borrow_mut(),
+                    entry,
+                    frame_va,
+                    true,
+                    effect,
+                )
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod transfer_service_tests {
+    use super::*;
+    struct Cpu {
+        regs: Vec<(Reg, u64)>,
+        runs: usize,
+        ttbr0: u64,
+    }
+    impl Aarch64Vcpu for Cpu {
+        fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
+            Ok(self
+                .regs
+                .iter()
+                .find(|(reg, _)| *reg == r)
+                .map_or(0, |(_, value)| *value))
+        }
+        fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError> {
+            if let Some((_, value)) = self.regs.iter_mut().find(|(reg, _)| *reg == r) {
+                *value = v
+            } else {
+                self.regs.push((r, v))
+            }
+            Ok(())
+        }
+        fn get_sys_reg(&self, _: SysReg) -> Result<u64, TrapError> {
+            Ok(self.ttbr0)
+        }
+        fn set_sys_reg(&mut self, _: SysReg, v: u64) -> Result<(), TrapError> {
+            self.ttbr0 = v;
+            Ok(())
+        }
+        fn get_vreg(&self, _: u32) -> Result<u128, TrapError> {
+            Ok(0)
+        }
+        fn set_vreg(&mut self, _: u32, _: u128) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn get_fpcr(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+        fn set_fpcr(&mut self, _: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn get_fpsr(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+        fn set_fpsr(&mut self, _: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn get_esr_el1(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+        fn get_far_el1(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+        fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, TrapError> {
+            Err(TrapError::Hypervisor("unused snapshot".into()))
+        }
+        fn restore(&mut self, _: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn kick(&self) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
+            self.runs += 1;
+            assert_eq!(self.ttbr0, 0x7000_0080_0000_0000);
+            if self.runs == 1 {
+                assert_eq!(self.get_reg(Reg::Pc)?, 0x1000);
+                self.set_reg(Reg::Pc, 0x1114)?;
+                self.set_reg(Reg::SpEl1, 0x2200)?;
+                self.set_reg(Reg::X(19), 0xabcdef)?;
+            } else {
+                assert_eq!(self.runs, 2);
+                assert_eq!(self.get_reg(Reg::Pc)?, 0x1114);
+                assert_eq!(self.get_reg(Reg::SpEl1)?, 0x2200);
+                assert_eq!(self.get_reg(Reg::X(19))?, 0xabcdef);
+            }
+            Ok(Aarch64Exit::MaintenanceDone)
+        }
+    }
+    #[test]
+    fn transfer_copy_and_cancel_resume_exact_service_stack_before_restoration() {
+        for copied in [false, true] {
+            let mut cpu = Cpu {
+                regs: Vec::new(),
+                runs: 0,
+                ttbr0: 0x7000_0080_0000_0000,
+            };
+            let mut regs: Vec<_> = (0..31).map(Reg::X).collect();
+            regs.extend([Reg::Pc, Reg::Pstate, Reg::ElrEl1, Reg::SpsrEl1, Reg::SpEl1]);
+            for (i, reg) in regs.iter().copied().enumerate() {
+                cpu.set_reg(reg, 0x8000 + i as u64).unwrap();
+            }
+            let saved = cpu.regs.clone();
+            let mut exits = 0;
+            let mut acknowledged = None;
+            run_el1_service_effect_on(&mut cpu, 0x1000, 0x3000, true, &mut || {
+                exits += 1;
+                if exits == 1 {
+                    acknowledged = Some(copied);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap();
+            assert_eq!(exits, 2);
+            assert_eq!(acknowledged, Some(copied));
+            assert_eq!(cpu.runs, 2);
+            assert_eq!(cpu.regs, saved);
+        }
     }
 }

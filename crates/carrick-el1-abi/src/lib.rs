@@ -25,7 +25,11 @@ pub use cow_grants::*;
 mod descriptor_txn;
 pub use descriptor_txn::*;
 mod mm_portal;
+mod mm_portal_executable;
+mod mm_portal_grant;
 pub use mm_portal::*;
+pub use mm_portal_executable::*;
+pub use mm_portal_grant::*;
 mod metadata_extent;
 pub use metadata_extent::*;
 
@@ -373,6 +377,13 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
         MM_PORTAL_PROTOCOL,
+        MM_PORTAL_BIND_ESR,
+        MM_PORTAL_SELECT_ESR,
+        MM_PORTAL_SERVICE_ESR,
+        MM_PORTAL_GRANT_ESR,
+        core::mem::size_of::<PortalGrantSlot>() as u64,
+        core::mem::size_of::<PortalExecutableSlot>() as u64,
+        core::mem::size_of::<PortalExecutablePublication>() as u64,
         MM_PORTAL_MAX_BYTES,
         EL1_MM_PORTAL_OFFSET,
         core::mem::size_of::<PortalTransferSlot>() as u64,
@@ -1648,9 +1659,10 @@ impl Default for FrameGrantResidencyRecord {
     }
 }
 
-/// An exact-generation residency lease. Retirement is refused until every
-/// lease drops. This protects residency publication; physical reclamation
-/// callers must honor the retirement result before releasing backing.
+/// An exact-generation grant-window residency lease. Retirement is refused
+/// until every lease drops. This guards grant-window publication only; it
+/// does not retain physical frames. Physical custody belongs to the host
+/// CarrierVmCustody stage-2 pin and retirement protocol.
 /// The shared table must outlive every lease, including canceled operations.
 pub struct FrameGrantTransferPin<'a> {
     record: &'a FrameGrantResidencyRecord,
@@ -1941,10 +1953,12 @@ impl FrameGrantResidencyTable {
     /// Republished fragments have fresh epochs: no captured pre-edit page
     /// token can authorize a replaced or recycled page. Index saturation
     /// declines fragment acceleration, as it does initial publication.
-    pub fn retire_overlapping(&self, mm_key: u64, start: u64, len: u64) {
+    /// Returns false if a grant-window lease prevents revocation. Earlier
+    /// revocations remain valid; callers must not replace leaves on refusal.
+    pub fn retire_overlapping(&self, mm_key: u64, start: u64, len: u64) -> bool {
         let end = start.saturating_add(len);
         if start >= end {
-            return;
+            return true;
         }
         for (slot, record) in self.slots.iter().enumerate() {
             if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE {
@@ -1954,47 +1968,82 @@ impl FrameGrantResidencyTable {
             if identity.mm_key == mm_key
                 && identity.semantic_base < end
                 && start < identity.semantic_base.saturating_add(identity.len)
+                && !self.retire_fragment(slot, identity, start, end)
             {
-                let Some(bits) = self.committed_words(slot, identity) else {
-                    continue;
-                };
-                if !self.retire(slot, identity) {
-                    continue;
-                }
-                let base = identity.semantic_base;
-                let grant_end = base + identity.len;
-                // A byte-level overlap revokes its entire Linux page.
-                let cut_start = start & !(GRANT_PAGE_SIZE - 1);
-                let cut_end = end.saturating_add(GRANT_PAGE_SIZE - 1) & !(GRANT_PAGE_SIZE - 1);
-                for (fragment_start, fragment_end) in [
-                    (base, cut_start.min(grant_end)),
-                    (cut_end.max(base), grant_end),
-                ] {
-                    if fragment_start >= fragment_end {
-                        continue;
-                    }
-                    let fragment = FrameGrantResidencyIdentity {
-                        semantic_base: fragment_start,
-                        physical_ipa: identity.physical_ipa + fragment_start - base,
-                        len: fragment_end - fragment_start,
-                        ..identity
-                    };
-                    if let Some(fragment_slot) = self.publish(fragment) {
-                        let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
-                        let count = (fragment.len / GRANT_PAGE_SIZE) as usize;
-                        for bit in 0..count {
-                            let old_bit = shift + bit;
-                            if bits[old_bit / 64] & (1 << (old_bit % 64)) != 0 {
-                                self.slots[fragment_slot].committed[bit / 64]
-                                    .fetch_or(1 << (bit % 64), Ordering::Release);
-                                self.dirty[fragment_slot / 64]
-                                    .fetch_or(1 << (fragment_slot % 64), Ordering::Release);
-                            }
-                        }
+                return false;
+            }
+        }
+        true
+    }
+    /// Revoke a small page-aligned span using bounded grant lookups instead
+    /// of scanning the carrier's index. Intended for one COW compound.
+    /// The exact-MM editor excludes concurrent leaf/publication changes.
+    pub fn retire_small_span(&self, mm_key: u64, start: u64, len: u64) -> bool {
+        if !start.is_multiple_of(GRANT_PAGE_SIZE)
+            || !len.is_multiple_of(GRANT_PAGE_SIZE)
+            || len > crate::COW_GRANT_SIZE
+        {
+            return false;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        for page in (start..end).step_by(GRANT_PAGE_SIZE as usize) {
+            if let Some(found) = self.lookup(mm_key, page)
+                && !self.retire_fragment(found.slot, found.identity, start, end)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn retire_fragment(
+        &self,
+        slot: usize,
+        identity: FrameGrantResidencyIdentity,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        let Some(bits) = self.committed_words(slot, identity) else {
+            return false;
+        };
+        if !self.retire(slot, identity) {
+            return false;
+        }
+        let base = identity.semantic_base;
+        let grant_end = base + identity.len;
+        // A byte-level overlap revokes its entire Linux page.
+        let cut_start = start & !(GRANT_PAGE_SIZE - 1);
+        let cut_end = end.saturating_add(GRANT_PAGE_SIZE - 1) & !(GRANT_PAGE_SIZE - 1);
+        for (fragment_start, fragment_end) in [
+            (base, cut_start.min(grant_end)),
+            (cut_end.max(base), grant_end),
+        ] {
+            if fragment_start >= fragment_end {
+                continue;
+            }
+            let fragment = FrameGrantResidencyIdentity {
+                semantic_base: fragment_start,
+                physical_ipa: identity.physical_ipa + fragment_start - base,
+                len: fragment_end - fragment_start,
+                ..identity
+            };
+            if let Some(fragment_slot) = self.publish(fragment) {
+                let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
+                let count = (fragment.len / GRANT_PAGE_SIZE) as usize;
+                for bit in 0..count {
+                    let old_bit = shift + bit;
+                    if bits[old_bit / 64] & (1 << (old_bit % 64)) != 0 {
+                        self.slots[fragment_slot].committed[bit / 64]
+                            .fetch_or(1 << (bit % 64), Ordering::Release);
+                        self.dirty[fragment_slot / 64]
+                            .fetch_or(1 << (fragment_slot % 64), Ordering::Release);
                     }
                 }
             }
         }
+        true
     }
 }
 

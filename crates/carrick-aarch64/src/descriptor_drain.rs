@@ -418,24 +418,46 @@ pub(crate) fn run_foreign_drain_call(
     mm_key: u64,
     ttbr0: u64,
     admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    get_ttbr0: impl FnMut() -> Result<u64, TrapError>,
+    set_ttbr0: impl FnMut(u64) -> Result<(), TrapError>,
+    suspended_sp: Option<u64>,
+    run: impl FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<u64, TrapError> {
+    Ok(run_foreign_service_call(
+        drain_frame(slot, mm_key, ttbr0),
+        ttbr0,
+        admission,
+        get_ttbr0,
+        set_ttbr0,
+        suspended_sp,
+        run,
+    )?
+    .x[0])
+}
+
+/// Exact borrowed-root envelope shared by descriptor drains and UserTransfer.
+pub(crate) fn run_foreign_service_call(
+    frame: carrick_el1_abi::TrapFrame,
+    ttbr0: u64,
+    admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
     mut get_ttbr0: impl FnMut() -> Result<u64, TrapError>,
     mut set_ttbr0: impl FnMut(u64) -> Result<(), TrapError>,
     suspended_sp: Option<u64>,
     run: impl FnMut(u64, u64) -> Result<(), TrapError>,
-) -> Result<u64, TrapError> {
+) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
     let own = get_ttbr0()?;
     admission
         .arm()
         .map_err(|error| TrapError::Hypervisor(format!("admit borrowed target ASID: {error}")))?;
     set_ttbr0(ttbr0)?;
-    let answered = run_drain_call(drain_frame(slot, mm_key, ttbr0), suspended_sp, run);
+    let answered = run_drain_call(frame, suspended_sp, run);
     if let Err(error) = set_ttbr0(own) {
         carrick_fatal::carrick_fatal!(
             "aarch64::descriptor_drain",
-            "restore caller TTBR0 after a foreign descriptor drain: {error}"
+            "restore caller TTBR0 after foreign service: {error}"
         );
     }
-    Ok(answered?.x[0])
+    answered
 }
 
 /// Run the shared descriptor service using an already borrowed driving vCPU.

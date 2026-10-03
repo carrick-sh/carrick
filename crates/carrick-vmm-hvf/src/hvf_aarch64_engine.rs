@@ -406,6 +406,14 @@ impl HostCowStats {
 }
 
 impl HvfAarch64Vmm {
+    /// Retained physical adapter for the production EL1 UserTransfer service.
+    pub fn user_transfer_custody(&self) -> crate::trap::UserTransferCustody {
+        crate::trap::UserTransferCustody::from_transport(
+            std::sync::Arc::clone(&self.state.carrier_foreign_mm_transport),
+            self.state.carrier_mappings.clone(),
+        )
+    }
+
     /// Exact-MM COW accounting; retain the handle before detaching the MM.
     pub fn host_cow_stats(&self) -> HostCowStats {
         self.state.task.mm_access_authority().host_cow_stats.clone()
