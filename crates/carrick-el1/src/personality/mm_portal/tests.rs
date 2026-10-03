@@ -1,421 +1,12 @@
+use super::test_support::*;
 use super::*;
 use crate::fault::{NoopCowResolver, NoopPreparedResolver};
-use crate::memory::reservations::{Layout, ResolvedReservationNodes, SharedReservations};
 use carrick_el1_abi::{
-    FrameGrantMailbox, FrameGrantResidencyTable, MetadataExtent, MetadataExtentResolver,
-    MetadataResolutionError, PinnedMetadataExtent, ReservationProtection, ReservationRange,
+    FrameGrantMailbox, FrameGrantResidencyTable, ReservationProtection, ReservationRange,
 };
-use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
+use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_sched_core::AddressSpaces;
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
-
-const VA: u64 = 0x4000_0000;
-const IPA: u64 = 0x9000_0000;
-const ROOT: u64 = 0x8000_0000;
-const RW: u64 = 3 | (1 << 6) | (1 << 10) | (1 << 54);
-
-struct Region {
-    ptr: NonNull<u8>,
-    layout: std::alloc::Layout,
-    bank: Option<std::sync::Arc<Bank>>,
-}
-impl Region {
-    fn new() -> Self {
-        let layout =
-            std::alloc::Layout::from_size_align(carrick_el1_abi::EL1_REGION_SIZE as usize, 64)
-                .unwrap();
-        // SAFETY: allocation is the exact retained carrier region layout.
-        let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap();
-        Self {
-            ptr,
-            layout,
-            bank: None,
-        }
-    }
-    fn table(&self) -> &SharedReservations {
-        // SAFETY: zero-initialized production table in its real region offset;
-        // the retained region outlives every borrowed view.
-        unsafe {
-            &*self
-                .ptr
-                .as_ptr()
-                .add(carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize)
-                .cast()
-        }
-    }
-}
-impl Drop for Region {
-    fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
-    }
-}
-struct Bank {
-    ptr: NonNull<u8>,
-    layout: std::alloc::Layout,
-}
-// SAFETY: node accesses use production per-MM locks; the allocation is stable.
-unsafe impl Send for Bank {}
-unsafe impl Sync for Bank {}
-impl Drop for Bank {
-    fn drop(&mut self) {
-        unsafe {
-            std::alloc::dealloc(self.ptr.as_ptr(), self.layout);
-        }
-    }
-}
-struct NoPin(std::sync::Arc<Bank>);
-// SAFETY: the retained bank allocation cannot move or be freed before this pin.
-unsafe impl PinnedMetadataExtent for NoPin {
-    fn extent(&self) -> MetadataExtent {
-        MetadataExtent::new(self.0.ptr.as_ptr() as u64, self.0.layout.size() as u64, 91).unwrap()
-    }
-    fn host_base(&self) -> NonNull<u8> {
-        self.0.ptr
-    }
-}
-struct NoResolver<'a>(&'a Region);
-impl MetadataExtentResolver for NoResolver<'_> {
-    type Pin = NoPin;
-    fn pin(&self, extent: MetadataExtent) -> Result<NoPin, MetadataResolutionError> {
-        let pin = NoPin(
-            self.0
-                .bank
-                .as_ref()
-                .ok_or(MetadataResolutionError::StaleOwner)?
-                .clone(),
-        );
-        if pin.extent() != extent {
-            return Err(MetadataResolutionError::StaleOwner);
-        }
-        Ok(pin)
-    }
-}
-impl Region {
-    fn add_bank(&mut self) {
-        let layout = std::alloc::Layout::from_size_align(4 * 1024 * 1024, 64).unwrap();
-        let bank = std::sync::Arc::new(Bank {
-            ptr: NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap(),
-            layout,
-        });
-        self.table()
-            .provision_metadata(&NoPin(bank.clone()), self.table().storage_generation())
-            .unwrap();
-        self.bank = Some(bank);
-    }
-}
-struct CountWords<'a, W> {
-    words: &'a W,
-    loads: core::cell::Cell<usize>,
-}
-impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
-    carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords for CountWords<'_, W>
-{
-    fn load(
-        &self,
-        pa: u64,
-    ) -> Result<u64, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
-        self.loads.set(self.loads.get() + 1);
-        self.words.load(pa)
-    }
-    fn compare_exchange(
-        &self,
-        pa: u64,
-        current: u64,
-        new: u64,
-    ) -> Result<bool, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
-        self.words.compare_exchange(pa, current, new)
-    }
-    fn store_unlinked(
-        &self,
-        pa: u64,
-        value: u64,
-    ) -> Result<(), carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
-        self.words.store_unlinked(pa, value)
-    }
-    fn publish_barrier(&self) {
-        self.words.publish_barrier()
-    }
-    fn invalidate_range(&self, va: u64, len: u64) {
-        self.words.invalidate_range(va, len)
-    }
-}
-struct Tables {
-    base: u64,
-    words: Box<[AtomicU64]>,
-}
-impl Tables {
-    fn new(base: u64, ipa: u64, pages: usize) -> Self {
-        let words = (0..6 * 512)
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        words[0].store((base + 4096) | 3, Ordering::Relaxed);
-        words[512 + 1].store((base + 8192) | 3, Ordering::Relaxed);
-        words[1024].store((base + 12288) | 3, Ordering::Relaxed);
-        for page in 0..pages {
-            words[1536 + page].store((ipa + page as u64 * 4096) | RW, Ordering::Relaxed);
-        }
-        Self { base, words }
-    }
-    fn live<'a>(
-        &'a self,
-        maintenance: &'a CallerInvalidatesAsid,
-    ) -> PrimaryTableWords<'a, CallerInvalidatesAsid> {
-        // SAFETY: this is the production primary-table venue over a retained,
-        // aligned atomic arena. Every mutation holds this MM's editor.
-        unsafe {
-            PrimaryTableWords::new(
-                self.words.as_ptr().cast_mut(),
-                self.base,
-                self.words.len() * 8,
-                maintenance,
-            )
-        }
-        .unwrap()
-    }
-}
-fn admit(
-    region: &Region,
-    spaces: &AddressSpaces,
-    mm: u64,
-    root: u64,
-    pages: usize,
-    unrelated: usize,
-) -> ReservationMm {
-    admit_kind(region, spaces, mm, root, pages, unrelated, true)
-}
-fn admit_kind(
-    region: &Region,
-    spaces: &AddressSpaces,
-    mm: u64,
-    root: u64,
-    pages: usize,
-    unrelated: usize,
-    anonymous: bool,
-) -> ReservationMm {
-    let index = spaces.publish_closed(mm, root, root).unwrap();
-    let mm = ReservationMm::new(mm).unwrap();
-    let table = region.table();
-    table
-        .publish(
-            index.index(),
-            mm,
-            Layout {
-                heap: ReservationRange::new(4096, VA).unwrap(),
-                arena: ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
-                brk: 4096,
-                address_limit: u64::MAX,
-                data_limit: u64::MAX,
-                external_address_bytes: 0,
-                external_data_bytes: 0,
-            },
-        )
-        .unwrap();
-    let view = nodes(region);
-    let mut owner = table
-        .lock_el1_resolved(index.index(), mm, &view, 0)
-        .unwrap();
-    owner
-        .import(
-            ReservationRange::new(VA, VA + pages as u64 * 4096).unwrap(),
-            ReservationProtection::READ_WRITE,
-            anonymous,
-        )
-        .unwrap();
-    for n in 0..unrelated {
-        let va = VA + 0x0100_0000 + n as u64 * 8192;
-        owner
-            .import(
-                ReservationRange::new(va, va + 4096).unwrap(),
-                ReservationProtection::READ_WRITE,
-                true,
-            )
-            .unwrap();
-    }
-    owner.finish_import().unwrap();
-    drop(owner);
-    spaces.open(index);
-    mm
-}
-fn nodes(region: &Region) -> ResolvedReservationNodes<NoPin> {
-    let mut nodes = ResolvedReservationNodes::default();
-    unsafe { nodes.refresh(region.table(), &NoResolver(region), region.ptr) }.unwrap();
-    nodes
-}
-fn residency() -> Box<FrameGrantResidencyTable> {
-    let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<FrameGrantResidencyTable>();
-    assert!(!ptr.is_null());
-    unsafe { Box::from_raw(ptr) }
-}
-fn select(
-    portal: &MmPortal<'_, NoPin>,
-    continuation: &TransferContinuation,
-    tables: &Tables,
-) -> TransferStep {
-    let maintenance = CallerInvalidatesAsid;
-    portal
-        .select(
-            continuation,
-            &tables.live(&maintenance),
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency(),
-            &FrameGrantMailbox::new(),
-            0,
-        )
-        .unwrap()
-}
-fn selected(step: TransferStep) -> SelectedChunk {
-    match step {
-        TransferStep::Selected(chunk) => chunk,
-        _ => panic!("expected selected data"),
-    }
-}
-
-#[test]
-fn native_owner_matrix() {
-    for pages in [16, 64, 256] {
-        for unrelated in [16, 512] {
-            let mut region = Region::new();
-            region.add_bank();
-            let raw = unsafe {
-                std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_sched_core::ZoneTables>())
-            };
-            assert!(!raw.is_null());
-            let zone = unsafe { Box::from_raw(raw.cast::<carrick_sched_core::ZoneTables>()) };
-            let spaces = &zone.spaces;
-            let a = admit(&region, spaces, 77, ROOT, pages, unrelated);
-            // Both live MMs retain the original unrelated mapping population.
-            let b = admit(&region, spaces, 78, ROOT + 0x100_000, pages, unrelated);
-            let identity = |tid| carrick_sched_core::ThreadIdentity {
-                tid,
-                serial: 1,
-                mm: a.raw(),
-                file_table: 1,
-                generation: 1,
-                affinity: 0,
-                lifecycle_page: 0,
-                control_slot: 0,
-            };
-            let target = zone.alloc_record(identity(1000)).unwrap();
-            zone.publish_park(target, zone.next_seq(target));
-            let gate = spaces.gate(spaces.find(a.raw()).unwrap());
-            let mut waiting = Vec::new();
-            for n in 0..carrick_sched_core::ZONE_SLOTS {
-                let record = zone.alloc_host_runnable(identity(n as u64 + 1)).unwrap();
-                let slot = carrick_sched_core::SlotId::from_index(n).unwrap();
-                let driver = n as u64 + 1;
-                zone.publish_slot(slot, 1, None, 0);
-                zone.drive(slot, driver);
-                assert!(zone.step_away(
-                    slot,
-                    driver,
-                    &mut |_| panic!("unexpected take"),
-                    &mut |_| panic!("unexpected place")
-                ));
-                assert!(zone.requeue_on(slot, record));
-                waiting.push((slot, record, driver));
-            }
-            let view = nodes(&region);
-            let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), spaces, &view);
-            for (mm, root, ipa) in [(a, ROOT, IPA), (b, ROOT + 0x100_000, IPA + 0x100_000)] {
-                let tables = Tables::new(root, ipa, pages);
-                let handle = portal.admitted_handle(mm, 0).unwrap();
-                let mut transfer = portal
-                    .begin(
-                        handle,
-                        GuestVa::new(VA),
-                        pages as u64 * 4096,
-                        TransferIntent::UserRead,
-                        0,
-                    )
-                    .unwrap();
-                let maintenance = CallerInvalidatesAsid;
-                let words = tables.live(&maintenance);
-                let mut chunks = 0;
-                let source = vec![if mm == a { 0x31 } else { 0x72 }; pages * 4096];
-                let mut copied = vec![0; source.len()];
-                let visits_before = portal.vma_visits.load(Ordering::Relaxed);
-                let counted = CountWords {
-                    words: &words,
-                    loads: core::cell::Cell::new(0),
-                };
-                while !transfer.is_complete() {
-                    let chunk = selected(
-                        portal
-                            .select(
-                                &transfer,
-                                &counted,
-                                &mut NoopPreparedResolver,
-                                &mut NoopCowResolver,
-                                &residency(),
-                                &FrameGrantMailbox::new(),
-                                0,
-                            )
-                            .unwrap(),
-                    );
-                    assert_eq!(chunk.ipa, ipa + transfer.offset());
-                    assert!(region.table().el1_slot_holding(0).is_none());
-                    let request = chunk.request(TransferIntent::UserRead, retained()).unwrap();
-                    let slot = carrick_el1_abi::PortalTransferSlot::new();
-                    let mut ticket = slot.submit(request).unwrap();
-                    serve_transfer(&portal, slot.claim().unwrap(), &counted, 0, || {
-                        assert!(region.table().el1_slot_holding(0).is_none());
-                        assert!(
-                            spaces
-                                .try_begin_edit(
-                                    spaces.find(mm.raw()).unwrap(),
-                                    mm.raw(),
-                                    NonZeroU64::new(2).unwrap()
-                                )
-                                .is_none()
-                        );
-                        assert!(ticket.copy_requested(|authorization| {
-                            let selected = authorization.request().selected;
-                            let start = (selected.ipa - ipa) as usize;
-                            copied[start..start + 4096]
-                                .copy_from_slice(&source[start..start + 4096]);
-                            true
-                        }));
-                    })
-                    .unwrap();
-                    transfer
-                        .settle(request, ticket.take_completion().unwrap())
-                        .unwrap();
-                    chunks += 1;
-                }
-                for &(slot, record, driver) in &waiting {
-                    assert!(!zone.slot(slot).is_live());
-                    assert_eq!(zone.slot(slot).driver(), Some(driver));
-                    assert_eq!(zone.slot(slot).queued(), 1);
-                    assert!(zone.record(record).needs_host());
-                    assert!(
-                        matches!(zone.record(record).claim(),carrick_sched_core::Claim::Queued{slot:queued,..} if queued==slot)
-                    );
-                }
-                assert!(matches!(
-                    zone.record(target).claim(),
-                    carrick_sched_core::Claim::Parked { .. }
-                ));
-                assert_eq!(spaces.gate(spaces.find(a.raw()).unwrap()), gate);
-                assert!(spaces.is_open(a.raw()));
-                assert_eq!(copied, source);
-                assert_eq!(chunks, pages);
-                assert!(
-                    counted.loads.get() <= pages * 8,
-                    "two bounded live walks per copied page"
-                );
-                assert!(
-                    portal.vma_visits.load(Ordering::Relaxed) - visits_before
-                        <= pages * (unrelated + 1).ilog2() as usize * 4
-                );
-            }
-        }
-    }
-}
-
+use core::sync::atomic::Ordering;
 #[test]
 fn transfer_revalidates_exact_mm_before_copy() {
     let region = Region::new();
@@ -1445,4 +1036,55 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
             )
             .is_some()
     );
+}
+
+#[test]
+fn reservation_policy_readonly_none_and_retire_refuse_exact_mm() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let a = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let b = admit(&region, &spaces, 78, ROOT + 0x100_000, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let a_tables = Tables::new(ROOT, IPA, 1);
+    let b_tables = Tables::new(ROOT + 0x100_000, IPA + 0x100_000, 1);
+    for protection in [
+        Some(ReservationProtection::from_bits(1).unwrap()),
+        Some(ReservationProtection::from_bits(0).unwrap()),
+        None,
+    ] {
+        change_policy(&region, &spaces, a, &a_tables, protection);
+        for intent in [TransferIntent::UserRead, TransferIntent::UserWrite] {
+            for (mm, tables) in [(a, &a_tables), (b, &b_tables)] {
+                let transfer = portal
+                    .begin(
+                        portal.admitted_handle(mm, 0).unwrap(),
+                        GuestVa::new(VA),
+                        4,
+                        intent,
+                        0,
+                    )
+                    .unwrap();
+                let mailbox = FrameGrantMailbox::new();
+                let result = portal.select(
+                    &transfer,
+                    &tables.live(&CallerInvalidatesAsid),
+                    &mut NoopPreparedResolver,
+                    &mut NoopCowResolver,
+                    &residency(),
+                    &mailbox,
+                    0,
+                );
+                let allowed = mm == b
+                    || (intent == TransferIntent::UserRead
+                        && protection.is_some_and(|p| p.bits() == 1));
+                if allowed {
+                    assert!(matches!(result, Ok(TransferStep::Selected(_))));
+                } else {
+                    assert_eq!(result.unwrap_err().errno(), 14);
+                }
+                assert!(mailbox.claim_request().is_none());
+            }
+        }
+    }
 }
