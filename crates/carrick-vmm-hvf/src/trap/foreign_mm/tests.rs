@@ -13382,16 +13382,19 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
 /// reservation admission, descriptor setup and transfer copy are production.
 #[test]
 fn transfer_external_copy_only_and_stale_source_precede_root_admission() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
     exercise_retained_import(0);
 }
 
 #[test]
 fn transfer_import_refuses_existing_loader_journal() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
     exercise_retained_import(1);
 }
 
 #[test]
 fn transfer_import_refuses_competing_pending_journal() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
     exercise_retained_import(2);
 }
 
@@ -13401,7 +13404,6 @@ fn exercise_retained_import(journal_case: u8) {
     use carrick_el1_abi::{
         PortalRetainedData, PortalTransferIntent, ReservationProtection, ReservationRange,
     };
-    let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = Arc::new(CarrierForeignMmTransport::new());
