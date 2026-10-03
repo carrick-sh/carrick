@@ -24,6 +24,8 @@ mod cow_grants;
 pub use cow_grants::*;
 mod descriptor_txn;
 pub use descriptor_txn::*;
+mod mm_portal;
+pub use mm_portal::*;
 mod metadata_extent;
 pub use metadata_extent::*;
 
@@ -370,6 +372,12 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_RESERVATIONS_OFFSET,
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
+        MM_PORTAL_PROTOCOL,
+        MM_PORTAL_MAX_BYTES,
+        EL1_MM_PORTAL_OFFSET,
+        core::mem::size_of::<PortalTransferSlot>() as u64,
+        core::mem::size_of::<MmPortalSlots>() as u64,
+        core::mem::align_of::<MmPortalSlots>() as u64,
         core::mem::size_of::<ReservationRequest>() as u64,
         core::mem::size_of::<ReservationCompletion>() as u64,
         ReservationNodeFlags::ATTRIBUTES.bits() as u64,
