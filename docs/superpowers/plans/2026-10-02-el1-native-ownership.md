@@ -1557,3 +1557,43 @@ permit/MM edit continuation seam. Separate pre-implementation behavioral reds
 for direct cancel wake and stale prepared COMMIT were not recorded. Neither
 new greens nor an absent-API compile failure establishes such a red. The
 actual receive overlap/cancel host witness remains a Task 2 obligation.
+
+#### Venue-3 maintenance-root prerequisites — 2026-10-03
+
+Host cutover remains open. The carrier maintenance root now maps the retained
+stage-1 table pool EL1-only, non-global and non-executable. Owner transfer
+selection, lazy materialization and grant application authenticate target
+physical tables independently of the executing root. Maintenance-root COW
+uses one exclusive two-page alias pair per scheduler slot, with a retained
+L3 page and claims in the unused EL1 counters-area gap at offset `0x1b0000`.
+The shared ABI hashes this assignment; linker/boot and compile-time layout
+checks protect neighboring image, descriptor, portal and IPC ranges.
+
+`kernel.el1.mm-exclusive-owner` VM-free bindings:
+
+- `carrier_maintenance_root_reaches_table_pool_without_el0_access` failed
+  before the mapping because the leaf at `0x9a00000000` was absent; it passes
+  alongside the existing kernel-only root test.
+- `maintenance_copy_uses_service_root_without_target_aliases` failed before
+  separation with `Declined(Refused)`; it now resolves and restores the service
+  aliases without target copy aliases.
+- `maintenance_copy_two_live_same_va_mms_use_disjoint_slots_and_restore`
+  executes two COW operations with both pairs live simultaneously in one
+  production-layout maintenance root, preserving different physical bytes.
+- `maintenance_copy_failed_alias_install_restores_before_slot_reuse` refuses
+  the second alias publication, performs no copy/repoint, restores the first
+  alias, and releases the slot and physical grant for reuse.
+- `service_copy_slots_are_disjoint_and_refuse_live_reentry` and
+  `maintenance_service_authenticates_target_pool_not_current_alias` cover all
+  256 slots, exact root identity and pool-boundary refusal.
+
+These are owner service prerequisites, not the required checked GuestMemory,
+receiving-handler, raw-escape, internal-control or mirror-deletion witnesses.
+The frozen `mmapv8align` and `mmapprivatefiletrack` signed bindings are still
+unrun here. No signed/guest/Docker execution belongs to this receipt.
+
+The director's separate file `MAP_FIXED` over a sibling EL1 anonymous mapping
+currently returns ENOMEM instead of replacement (work/tlb-budget
+`93d2d0568`, `docs/perf-results/2026-10-03-tlb-budget/forced-gap-red.log`).
+This remains an open N1b memory-policy/host-backing venue obligation; this
+maintenance-root change does not claim to cover that witness.
