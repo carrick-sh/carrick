@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 
 use super::{ControlEndpoint, ControlNonce};
 
-const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+pub(super) const CONTROL_MAX_CONNECTIONS: usize = 16;
 
 pub(super) struct ConnectionTracker {
     next_id: u64,
@@ -30,12 +30,38 @@ impl Drop for RemoveOnDrop {
     }
 }
 
+impl std::fmt::Debug for ConnectionTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionTracker")
+            .field("next_id", &self.next_id)
+            .field("active_streams", &self.streams.lock().len())
+            .field("handlers", &self.handlers.len())
+            .finish()
+    }
+}
+
 impl ConnectionTracker {
     pub(super) fn new() -> Self {
         Self {
             next_id: 0,
             streams: Arc::new(Mutex::new(HashMap::new())),
             handlers: Vec::new(),
+        }
+    }
+
+    fn reap_finished(&mut self) {
+        let mut finished = Vec::new();
+        let mut active = Vec::new();
+        for handle in self.handlers.drain(..) {
+            if handle.is_finished() {
+                finished.push(handle);
+            } else {
+                active.push(handle);
+            }
+        }
+        self.handlers = active;
+        for handle in finished {
+            let _ = handle.join();
         }
     }
 
@@ -48,9 +74,10 @@ impl ConnectionTracker {
         exec: Arc<dyn super::CarrierExecAdmission>,
         archive: Arc<dyn super::CarrierArchiveControl>,
     ) {
-        self.handlers.retain(|h| !h.is_finished());
-        if self.streams.lock().len() >= MAX_CONCURRENT_CONNECTIONS {
+        self.reap_finished();
+        if self.handlers.len() >= CONTROL_MAX_CONNECTIONS {
             let _ = stream.shutdown(Shutdown::Both);
+            drop(stream);
             return;
         }
 
@@ -64,7 +91,7 @@ impl ConnectionTracker {
         let streams = Arc::clone(&self.streams);
         let builder = std::thread::Builder::new();
         if let Ok(handle) = builder
-            .name(format!("carrick-carrier-control-conn-{}", id))
+            .name(format!("carrick-control-conn-{id}"))
             .spawn(move || {
                 let _guard = RemoveOnDrop { id, streams };
                 if let Err(_error) = super::handle(
@@ -95,6 +122,11 @@ impl ConnectionTracker {
             let _ = h.join();
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn live_handlers_count(&self) -> usize {
+        self.handlers.len()
+    }
 }
 
 pub(super) struct ControlServerContext {
@@ -110,8 +142,8 @@ pub(super) fn run_accept_loop(
     thread_shutdown: Arc<AtomicBool>,
     context: ControlServerContext,
     thread_endpoint: ControlEndpoint,
+    tracker: Arc<Mutex<ConnectionTracker>>,
 ) {
-    let mut tracker = ConnectionTracker::new();
     while !thread_shutdown.load(Ordering::Acquire) {
         let Ok((stream, _)) = listener.accept() else {
             continue;
@@ -119,7 +151,7 @@ pub(super) fn run_accept_loop(
         if thread_shutdown.load(Ordering::Acquire) {
             break;
         }
-        tracker.spawn_handler(
+        tracker.lock().spawn_handler(
             stream,
             Arc::clone(&context.kernel),
             context.init,
@@ -128,6 +160,10 @@ pub(super) fn run_accept_loop(
             Arc::clone(&context.archive),
         );
     }
-    tracker.cancel_and_join();
+    tracker.lock().cancel_and_join();
+    // Ownership of the record is the server's, not the accept
+    // loop's: `shutdown` releases it, and a teardown quiesce keeps
+    // it (marked `TearingDown`) until the terminal receipt is
+    // durable.
     drop(thread_endpoint);
 }

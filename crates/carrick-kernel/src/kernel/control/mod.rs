@@ -197,6 +197,7 @@ pub struct CarrierControlServer {
     /// Set by `quiesce_admission`: the owner record is `TearingDown` and
     /// belongs to the managed guard until the terminal receipt is durable.
     retain_owner_on_drop: bool,
+    tracker: Arc<parking_lot::Mutex<connection::ConnectionTracker>>,
 }
 
 /// Run-lifetime guard for one managed carrier. Terminal state is persisted
@@ -278,21 +279,13 @@ impl CarrierControlServer {
         let thread_endpoint = endpoint.clone();
         let thread_exec = Arc::clone(&exec);
         let thread_archive = Arc::clone(&archive);
+        let tracker = Arc::new(parking_lot::Mutex::new(connection::ConnectionTracker::new()));
+        let thread_tracker = Arc::clone(&tracker);
         let join = match std::thread::Builder::new()
             .name("carrick-carrier-control".to_owned())
             .spawn(move || {
-                // Accept loop offloads all incoming
-                // connections to worker threads so that
-                // stalled clients cannot monopolize
-                // the control endpoint or block any
-                // status probes. The tracker records
-                // live client socket handles and their
-                // worker joins across execution.
-                // On shutdown, all active sockets are
-                // shut down (Shutdown::Both) to
-                // abort pending reads promptly, and
-                // all spawned workers are joined.
-                // This preserves liveness under stall.
+                // Offload incoming connections to bounded worker threads;
+                // on shutdown, cancel active sockets and join workers.
                 connection::run_accept_loop(
                     listener,
                     thread_shutdown,
@@ -304,6 +297,7 @@ impl CarrierControlServer {
                         archive: thread_archive,
                     },
                     thread_endpoint,
+                    thread_tracker,
                 );
             }) {
             Ok(join) => join,
@@ -321,6 +315,7 @@ impl CarrierControlServer {
             shutdown,
             join: Some(join),
             retain_owner_on_drop: false,
+            tracker,
         })
     }
 
@@ -356,10 +351,16 @@ impl CarrierControlServer {
         self.retain_owner_on_drop = true;
     }
 
+    #[cfg(test)]
+    pub(crate) fn live_handlers_count(&self) -> usize {
+        self.tracker.lock().live_handlers_count()
+    }
+
     fn stop_admission(&mut self) {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.tracker.lock().cancel_and_join();
         let _ = UnixStream::connect(self.endpoint.socket_path());
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -1729,5 +1730,95 @@ mod tests {
 
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("server shutdown timed out with stalled client connected");
+    }
+
+    #[test]
+    fn sequential_status_connections_reap_finished_handlers() {
+        let (_temp, endpoint) = endpoint::test_endpoint("control-sequential-status-reap");
+        let (kernel, init) = kernel_with_init();
+        let mut server = CarrierControlServer::start_at(
+            Arc::clone(&kernel),
+            init.task().key(),
+            endpoint.clone(),
+        )
+        .expect("server");
+        let state = server.state();
+
+        for _ in 0..100 {
+            assert_eq!(
+                send_at(&endpoint, &state, ControlOperation::Status).expect("status"),
+                ControlOutcome::Alive,
+            );
+        }
+
+        assert!(
+            server.live_handlers_count() <= connection::CONTROL_MAX_CONNECTIONS,
+            "live handlers count {} exceeded CONTROL_MAX_CONNECTIONS {}",
+            server.live_handlers_count(),
+            connection::CONTROL_MAX_CONNECTIONS
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn connection_limit_drops_excess_and_recovers_after_client_drops() {
+        let (_temp, endpoint) = endpoint::test_endpoint("control-conn-limit");
+        let (kernel, init) = kernel_with_init();
+        let mut server = CarrierControlServer::start_at(
+            Arc::clone(&kernel),
+            init.task().key(),
+            endpoint.clone(),
+        )
+        .expect("server");
+        let state = server.state();
+
+        // Hold 16 stalled connections.
+        let mut stalled = Vec::new();
+        for _ in 0..connection::CONTROL_MAX_CONNECTIONS {
+            let client = UnixStream::connect(endpoint.socket_path()).expect("connect stalled");
+            stalled.push(client);
+        }
+
+        // Wait until all 16 connections have been accepted and spawned.
+        for _ in 0..50 {
+            if server.live_handlers_count() == connection::CONTROL_MAX_CONNECTIONS {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            server.live_handlers_count(),
+            connection::CONTROL_MAX_CONNECTIONS
+        );
+
+        // A 17th connection must read EOF promptly (bounded wait that fails the test).
+        let mut client17 = UnixStream::connect(endpoint.socket_path()).expect("connect 17th");
+        client17
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+        let mut buf = [0u8; 1];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let res = client17.read(&mut buf);
+            let _ = tx.send(res);
+        });
+        let n = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("17th connection timed out waiting for EOF")
+            .expect("read from 17th connection");
+        assert_eq!(n, 0, "17th connection must read EOF promptly");
+
+        // After dropping one stalled client, a new Status succeeds.
+        drop(stalled.pop());
+        // Wait slightly for the dropped client's thread to exit so it can be reaped.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let outcome =
+            send_at(&endpoint, &state, ControlOperation::Status).expect("status after slot freed");
+        assert_eq!(outcome, ControlOutcome::Alive);
+
+        drop(stalled);
+        server.shutdown();
     }
 }
