@@ -97,6 +97,9 @@ pub trait CowResolver {
             CowResolution::Refused
         }
     }
+    fn take_cow_completion(&mut self) -> Option<carrick_el1_abi::CowGrantCompletion> {
+        None
+    }
     /// The MM's editor could not be taken (another EL1 editor, or a host
     /// pause closed its gate): the fault goes to the host.
     fn editor_busy(&mut self) {}
@@ -209,11 +212,15 @@ impl PreparedPageResolver for HardwarePreparedResolver {
 
 #[cfg(target_os = "none")]
 pub struct HardwareCowResolver {
+    pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
     pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
 }
 
 #[cfg(target_os = "none")]
 impl CowResolver for HardwareCowResolver {
+    fn take_cow_completion(&mut self) -> Option<carrick_el1_abi::CowGrantCompletion> {
+        self.completion.take()
+    }
     fn executable_publication(&self) -> bool {
         self.publication.is_some()
     }
@@ -275,6 +282,10 @@ impl CowResolver for HardwareCowResolver {
                 crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
             },
         );
+        self.completion = match outcome {
+            crate::cow::GuestCowOutcome::Resolved(completion) => Some(completion),
+            _ => None,
+        };
         match outcome {
             crate::cow::GuestCowOutcome::Declined(carrick_el1_abi::CowDecline::PoolEmpty) => {
                 CowResolution::NeedsSupply
@@ -776,7 +787,10 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 resolver: &mut HardwarePreparedResolver,
                 roots: Some(crate::memory::reservations::shared_guest()),
             }),
-            &mut HardwareCowResolver { publication: None },
+            &mut HardwareCowResolver {
+                publication: None,
+                completion: None,
+            },
         )
     }
     #[cfg(not(target_os = "none"))]
@@ -999,8 +1013,92 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         return Action::Forward;
     }
 
+    #[cfg(target_os = "none")]
+    if let Some(roots) = prepared.as_ref().and_then(|path| path.roots) {
+        let slots = unsafe {
+            &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+        };
+        if (FileFaultVenue {
+            roots,
+            spaces,
+            slots,
+            worker: frame.slot as u32,
+            mailbox,
+        })
+        .publish(mm_key, frame.far, access)
+        {
+            return Action::Forward;
+        }
+    }
     let _ = request_lazy_frames(mailbox, mm_key, frame.far, access);
     Action::Forward
+}
+
+/// File first-touch selects the source and access policy in the admitted root.
+/// The host sees only this exact owner window and retained handle byte service.
+pub struct FileFaultVenue<'a> {
+    pub roots: &'a crate::memory::reservations::SharedReservations,
+    pub spaces: &'a AddressSpaces,
+    pub slots: &'a carrick_el1_abi::MmPortalSlots,
+    pub worker: u32,
+    pub mailbox: &'a FrameGrantMailbox,
+}
+impl FileFaultVenue<'_> {
+    pub fn publish(&self, mm_key: u64, va: u64, access: u64) -> bool {
+        let owner_source = core::cell::Cell::new(false);
+        let run = || -> Option<bool> {
+            let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+            let index = self.spaces.find(mm_key)?;
+            if !self.roots.admitted(index.index(), mm) {
+                return None;
+            }
+            let mut root = self.roots.lock_el1(index.index(), mm, self.worker).ok()?;
+            root.mapping(va)?.host_backing?;
+            owner_source.set(true);
+            let protection = carrick_el1_abi::ReservationProtection::from_bits(access)?;
+            let plan = root
+                .transfer_fault_plan(va & !4095, 4096, protection)
+                .ok()?;
+            let mapping = root.mapping(plan.range.start())?;
+            let source = mapping
+                .host_backing?
+                .advance(plan.range.start().checked_sub(mapping.range.start())?)?;
+            let sequence = root.next_transfer_sequence().ok()?;
+            let carrier = self.slots.carrier()?;
+            let operation = carrick_el1_abi::PortalOperation {
+                carrier,
+                mm,
+                incarnation: NonZeroU64::new(root.incarnation().raw())?,
+                sequence,
+            };
+            let window = carrick_el1_abi::PortalGrantWindow {
+                operation,
+                generation: plan.generation,
+                range: plan.range,
+                protection: plan.protection,
+                fault_page: plan.fault_page,
+                host_backing: Some(source),
+                fork_sequence: None,
+            };
+            drop(root);
+            let slot = self.slots.grant(self.worker as usize)?;
+            let generation = next_frame_grant_generation();
+            if !slot.publish_fault_selection(generation, window) {
+                return Some(true);
+            }
+            if !self.mailbox.try_publish_request(FrameGrantRequest {
+                mm_key,
+                request_generation: generation,
+                fault_va: va,
+                requested_len: plan.range.len(),
+                access,
+            }) {
+                slot.cancel_fault_selection(window, generation);
+            }
+            Some(true)
+        };
+        run().unwrap_or(owner_source.get())
+    }
 }
 
 #[cfg(test)]

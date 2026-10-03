@@ -18,10 +18,10 @@ pub const TRANSFER_CHUNK_BYTES: u64 = 4096;
 const PA: u64 = 0x0000_ffff_ffff_f000;
 
 pub struct MmPortal<'a, P: PinnedMetadataExtent> {
-    carrier: NonZeroU64,
-    roots: &'a SharedReservations,
-    spaces: &'a AddressSpaces,
-    nodes: Option<&'a ResolvedReservationNodes<P>>,
+    pub(super) carrier: NonZeroU64,
+    pub(super) roots: &'a SharedReservations,
+    pub(super) spaces: &'a AddressSpaces,
+    pub(super) nodes: Option<&'a ResolvedReservationNodes<P>>,
     #[cfg(any(test, feature = "host-test"))]
     pub(super) vma_visits: core::sync::atomic::AtomicUsize,
 }
@@ -34,6 +34,7 @@ pub struct TransferContinuation {
     len: u64,
     offset: u64,
     sequence: NonZeroU64,
+    fork_sequence: Option<NonZeroU64>,
 }
 
 impl TransferContinuation {
@@ -52,6 +53,7 @@ impl TransferContinuation {
             len,
             offset: 0,
             sequence,
+            fork_sequence: None,
         })
     }
     pub fn settle(
@@ -87,6 +89,7 @@ impl TransferContinuation {
 /// physical record identity and retains the matching stage-2 pin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectedChunk {
+    fork_sequence: Option<NonZeroU64>,
     handle: El1MmHandle,
     sequence: NonZeroU64,
     pub(super) generation: u64,
@@ -147,7 +150,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             vma_visits: core::sync::atomic::AtomicUsize::new(0),
         }
     }
-    fn root(&self, mm: ReservationMm, slot: u32) -> Result<Reservations<'_>, MmError> {
+    pub(super) fn root(&self, mm: ReservationMm, slot: u32) -> Result<Reservations<'_>, MmError> {
         let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
         if !self.roots.admitted(index, mm) {
             return Err(MmError::Stale);
@@ -186,6 +189,29 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         let sequence = root.next_transfer_sequence()?;
         TransferContinuation::new(handle, address, len, intent, sequence)
     }
+    pub fn begin_fork_parent_write(
+        &self,
+        handle: El1MmHandle,
+        address: GuestVa,
+        len: u64,
+        intent: TransferIntent,
+        fork_sequence: NonZeroU64,
+        slot: u32,
+    ) -> Result<TransferContinuation, MmError> {
+        if handle.carrier() != self.carrier
+            || !matches!(intent, TransferIntent::UserRead | TransferIntent::UserWrite)
+        {
+            return Err(MmError::Stale);
+        }
+        let mut root = self.root(handle.mm(), slot)?;
+        if root.incarnation().raw() != handle.incarnation().get() {
+            return Err(MmError::Stale);
+        }
+        let sequence = root.next_fork_write_sequence(fork_sequence)?;
+        let mut continuation = TransferContinuation::new(handle, address, len, intent, sequence)?;
+        continuation.fork_sequence = Some(fork_sequence);
+        Ok(continuation)
+    }
     fn authorize(
         &self,
         continuation: &TransferContinuation,
@@ -197,6 +223,9 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             return Err(MmError::Stale);
         }
         let mut root = self.root(continuation.handle.mm(), slot)?;
+        if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence) {
+            return Err(MmError::Busy);
+        }
         if root.incarnation().raw() != continuation.handle.incarnation().get() {
             return Err(MmError::Stale);
         }
@@ -282,10 +311,28 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                     Err(GuestCowClass::Unreachable(_)) => return Err(MmError::Core),
                 }
                 match cow.resolve_cow_outcome(grant.ttbr0, mm, va) {
-                    crate::fault::CowResolution::Resolved => {}
+                    crate::fault::CowResolution::Resolved => {
+                        #[cfg(target_os = "none")]
+                        if let (Some(sequence), Some(completion)) =
+                            (continuation.fork_sequence, cow.take_cow_completion())
+                        {
+                            super::fork::reconcile_pending_parent_write(
+                                slot as usize,
+                                continuation.handle,
+                                sequence,
+                                completion,
+                                words,
+                            )?;
+                        }
+                    }
                     crate::fault::CowResolution::Refused => return Err(MmError::Core),
                     crate::fault::CowResolution::NeedsSupply => {
                         let mut root = self.root(continuation.handle.mm(), slot)?;
+                        if root.fork_pending()
+                            && !root.fork_write_authorized(continuation.fork_sequence)
+                        {
+                            return Err(MmError::Busy);
+                        }
                         // The live classifier already proved private COW.
                         // Imported file nodes participate here even though
                         // anonymous zero-fill fault_plan must reject them.
@@ -318,6 +365,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                                 protection: plan.protection,
                                 fault_page: plan.fault_page,
                                 host_backing: None,
+                                fork_sequence: continuation.fork_sequence,
                             },
                         ));
                     }
@@ -346,10 +394,22 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                 LeafAccess::Execute => 4,
             };
             let mut root = self.root(continuation.handle.mm(), slot)?;
-            let plan = root.transfer_fault_plan(
+            if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence) {
+                return Err(MmError::Busy);
+            }
+            let target = if root
+                .mapping(va)
+                .is_some_and(|mapping| mapping.host_backing.is_some())
+            {
+                4096
+            } else {
+                carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
+            };
+            let plan = root.fork_transfer_fault_plan(
                 va,
-                carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
+                target,
                 ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,
+                continuation.fork_sequence,
             )?;
             let host_backing = root.mapping(plan.range.start()).and_then(|mapping| {
                 mapping
@@ -372,9 +432,11 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                 protection: plan.protection,
                 fault_page: plan.fault_page,
                 host_backing,
+                fork_sequence: continuation.fork_sequence,
             }));
         };
         Ok(TransferStep::Selected(SelectedChunk {
+            fork_sequence: continuation.fork_sequence,
             handle: continuation.handle,
             sequence: continuation.sequence,
             generation,
@@ -396,7 +458,8 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         words: &W,
         slot: u32,
     ) -> Result<Option<ValidatedChunk<'_>>, MmError> {
-        if selected.handle != continuation.handle
+        if selected.fork_sequence != continuation.fork_sequence
+            || selected.handle != continuation.handle
             || selected.sequence != continuation.sequence
             || selected.offset != continuation.offset
         {
@@ -510,6 +573,10 @@ impl SelectedChunk {
             },
             retained,
         )
+        .map(|mut request| {
+            request.fork_sequence = self.fork_sequence;
+            request
+        })
         .ok_or(MmError::Invalid)
     }
 }
@@ -545,8 +612,10 @@ pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
         len: request.selected.offset + request.range.len(),
         offset: request.selected.offset,
         sequence: request.operation.sequence,
+        fork_sequence: request.fork_sequence,
     };
     let selected = SelectedChunk {
+        fork_sequence: request.fork_sequence,
         handle,
         sequence: request.operation.sequence,
         generation: request.selected.root_generation.get(),
@@ -699,13 +768,25 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         if range.is_empty() || range.len() > 4096 - (range.address() & 4095) {
             return Err(MmError::Invalid);
         }
-        let continuation = portal.begin(
-            handle,
-            GuestVa::new(range.address()),
-            range.len(),
-            intent,
-            frame.slot as u32,
-        )?;
+        let continuation = if let Some(sequence) = NonZeroU64::new(frame.x[19]) {
+            super::fork::authenticate_pending_parent_write(frame.slot as usize, handle, sequence)?;
+            portal.begin_fork_parent_write(
+                handle,
+                GuestVa::new(range.address()),
+                range.len(),
+                intent,
+                sequence,
+                frame.slot as u32,
+            )?
+        } else {
+            portal.begin(
+                handle,
+                GuestVa::new(range.address()),
+                range.len(),
+                intent,
+                frame.slot as u32,
+            )?
+        };
         let maintenance = CallerInvalidatesAsid;
         let words = unsafe {
             PrimaryTableWords::new(
@@ -726,6 +807,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             &mut crate::fault::HardwarePreparedResolver,
             &mut crate::fault::HardwareCowResolver {
                 publication: slots.executable(frame.slot as usize),
+                completion: None,
             },
             carrick_el1_abi::frame_grant_residency_guest(),
             mailbox,
@@ -812,7 +894,11 @@ pub fn serve_grant<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
                 fault_page: window.fault_page,
             };
             if root.incarnation().raw() != window.operation.incarnation.get()
-                || !root.authenticate_transfer_fault(plan, window.host_backing)
+                || !root.authenticate_fork_transfer_fault(
+                    plan,
+                    window.host_backing,
+                    window.fork_sequence,
+                )
             {
                 return Err(MmError::Stale);
             }
@@ -991,6 +1077,11 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         frame.x[3] = portal
             .admitted_handle(mm, frame.slot as u32)?
             .incarnation()
+            .get();
+        frame.x[4] = portal.root(mm, frame.slot as u32)?.generation().raw();
+        frame.x[5] = portal
+            .root(mm, frame.slot as u32)?
+            .next_transfer_sequence()?
             .get();
         Ok(())
     })();
