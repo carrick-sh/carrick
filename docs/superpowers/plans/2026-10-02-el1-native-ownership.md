@@ -1511,3 +1511,49 @@ wrong primary table. Host consuming paths, socket-derived aggregate bounds,
 mirror deletion, inverse EFAULT/raw-escape proofs and signed acceptance
 remain open. No guest, signed or Docker execution was performed for this
 owner receipt. This receipt does not close N1 or venue-3 acceptance.
+
+#### Venue-3 owner review fixes, round 1 — 2026-10-03
+
+Review of `bef8b2a65` found two custody errors under
+`kernel.el1.mm-exclusive-owner`: rejected exact claims stored LIVE twice,
+allowing the second rollback to overwrite another claimant's COPYING state;
+and a schedulerless portal could settle a scheduler-backed permit before
+failing to publish its retained notification. Both are fixed without changing
+the shared layout or the consuming-path work budget.
+
+Rejection now has exactly one rollback owner. A successful claimed permit
+restores exact COPYING-to-LIVE custody on Drop until settlement disarms it.
+A private `PreparedDelivery` capability authenticates the required scheduler
+venue before copying or releasing; publication afterward cannot refuse.
+Rejected wire settlement restores the claim before publishing its completion,
+so the rightful portal can cancel and wake an enrolled edit.
+
+Actual new red command:
+`RUSTC_WRAPPER= cargo test -p carrick-el1 prepared_copy_ -- --nocapture`
+on the reviewed implementation plus tests and a scoped rejection pause.
+Exit 101: 8 passed, 3 failed. Exact failing witnesses:
+
+- `prepared_copy_rejected_tuple_cannot_overwrite_concurrent_claim` pauses a
+  mismatched tuple on one thread, attempts a legitimate claim on another,
+  and observes the legitimate COPYING claim becoming stealable.
+- `prepared_copy_schedulerless_cancel_preserves_rightful_wake` observes the
+  rightful cancellation returning Stale after the plain portal's error.
+- `prepared_copy_schedulerless_commit_refuses_before_copy_and_preserves_rightful_wake`
+  observes the copy callback running before delivery rejection.
+
+The same filtered command is green, 11/11. Full EL1 is 242/242; ABI is
+119/119 plus 2 doctests; scheduler is 96/96; targeted five-crate clippy
+`--lib -- -D warnings` exits 0. EL1 and clippy were repeated after explicit
+rollback-before-completion ordering. Cargo commands use `RUSTC_WRAPPER=`.
+The existing held-root witness now also submits stale prepared COMMIT,
+requires no callback and verifies zero completed bytes before legitimate
+successor cancellation. This is current positive coverage, not a historical
+red receipt.
+
+Historical red reconciliation: the original overlap exclusion red reaches
+its pre-mutation failure before a cancel/wake suffix can execute. The original
+`7accff2e1` API has only editor fences and one-shot transfer, with no detached
+permit/MM edit continuation seam. Separate pre-implementation behavioral reds
+for direct cancel wake and stale prepared COMMIT were not recorded. Neither
+new greens nor an absent-API compile failure establishes such a red. The
+actual receive overlap/cancel host witness remains a Task 2 obligation.
