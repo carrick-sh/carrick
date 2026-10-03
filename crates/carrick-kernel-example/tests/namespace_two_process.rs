@@ -10,7 +10,7 @@ use carrick_abi::{
     LINUX_RENAME_NOREPLACE,
 };
 use carrick_kernel_example::{ScriptedBackend, Step, await_parked, last_child, slot, sys};
-use carrick_vfs::fs_backend::HostFsBackend;
+use carrick_vfs::fs_backend::{HostFsBackend, LowerEntryPublishHook};
 
 fn failing_archive(name: &str) -> std::io::Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
@@ -442,12 +442,13 @@ fn two_live_process_late_lower_refill_cannot_resurrect_whiteout() {
     let mut backend = HostFsBackend::from_path(upper.path()).unwrap();
     let hook_arrived = arrived.clone();
     let hook_release = release.clone();
-    backend.set_lower_entry_publish_hook(Arc::new(move |path| {
+    let hook: LowerEntryPublishHook = Arc::new(move |path| {
         if path == "/parent/victim" && !once.swap(true, Ordering::SeqCst) {
             hook_arrived.signal();
             assert!(hook_release.wait(), "writer did not release lower refill");
         }
-    }));
+    });
+    backend.set_lower_entry_publish_hook(hook);
     let finished = ScriptCheckpoint::default();
     let script = vec![
         Step::Sys(sys::fork()),

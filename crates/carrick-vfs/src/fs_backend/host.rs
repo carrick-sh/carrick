@@ -210,6 +210,10 @@ macro_rules! host_open {
 /// guest deleted that still exist in the read-only rootfs layer
 /// underneath. The dispatcher's layered lookup consults this to shadow
 /// the rootfs, just like for the memory backend.
+/// Test-only hook invoked before publishing a lower entry to the dentry cache.
+#[cfg(any(test, feature = "test-support"))]
+pub type LowerEntryPublishHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 // `root_prefix`/`fast_fs`/`cache_pid` drive the macOS `--fs host` fast-stat
 // path only; on non-macOS those fields are populated but never read.
 #[allow(dead_code)]
@@ -399,7 +403,7 @@ pub struct HostFsBackend {
     meta_xattr_absent_gen: std::sync::atomic::AtomicU64,
     /// Test-only scheduler seam, compiled out of the product closure.
     #[cfg(any(test, feature = "test-support"))]
-    lower_entry_publish_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    lower_entry_publish_hook: Option<LowerEntryPublishHook>,
     /// Sticky cache of the durable host-upper whiteout marker. The marker and
     /// adjacent sidecars make sparse-upper deletions visible across real host
     /// forks and native self-reexecs; the shared root-marker generation
@@ -1138,10 +1142,7 @@ impl HostFsBackend {
 
     /// Install a test-only scheduling hook; it carries no namespace authority.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn set_lower_entry_publish_hook(
-        &mut self,
-        hook: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
-    ) {
+    pub fn set_lower_entry_publish_hook(&mut self, hook: LowerEntryPublishHook) {
         self.lower_entry_publish_hook = Some(hook);
     }
 
