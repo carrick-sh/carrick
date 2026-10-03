@@ -1083,22 +1083,6 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "symbol": "run::CARRICK_TIDSTAMP_DEBUG",
-      "fingerprint": "b08dacc2138e865374ed526d3e3aabb8181ee2c9ebd960295680ed2a06f02e3b",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_TIDSTAMP_DEBUG read in run::CARRICK_TIDSTAMP_DEBUG (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "symbol": "stamp_guest_thread_id::CARRICK_TIDSTAMP_DEBUG",
-      "fingerprint": "b08dacc2138e865374ed526d3e3aabb8181ee2c9ebd960295680ed2a06f02e3b",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_TIDSTAMP_DEBUG read in stamp_guest_thread_id::CARRICK_TIDSTAMP_DEBUG (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
       "file": "crates/carrick-vmm-hvf/src/syscall_mailbox.rs",
       "symbol": "from_env::HVF_SYSCALL_TRANSPORT_ENV",
       "fingerprint": "00ecba304b999381fcbc6ed7f1000ac0a75cdd59e2f0c11d4642ecf236435cc6",
@@ -2320,14 +2304,6 @@
       "fingerprint": "0d9de7352b8882bd355ab2e7281ecc5a77a1d3653aaa55f91d6ab260b150b585",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache HVPATCH_PROCESS_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "symbol": "issue_hvpatch_child_token::NEXT_AUTHORITY_ID",
-      "fingerprint": "45bc010bdbb41963d263ca602e8a97759c89d7012ee1f19bbb6056b47b1b1735",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator issue_hvpatch_child_token::NEXT_AUTHORITY_ID in crates/carrick-runtime/src/vcpu_loop/memory.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
@@ -3880,6 +3856,14 @@
       "fingerprint": "67371d74ddd40139d7e53c78fcc20692f54007dd3b9269ca9952b8fcb87dfa3e",
       "classification": "test_only",
       "rationale": "Feature-only macOS/AArch64 metadata-grant-test-support rendezvous between signed fixture monitor and host service boundaries. The guest harness serializes fixture ownership; Probe drop releases and removes the gate. It changes only service timing, retains exact CarrierMetadataAccess/custody generation, re-authenticates at service time, and invokes the identical production completion function. It is absent from non-test product builds and owns no Linux guest identity or allocator authority."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "symbol": "reserve_child_cow_authority_identity::NEXT_AUTHORITY_ID",
+      "fingerprint": "45bc010bdbb41963d263ca602e8a97759c89d7012ee1f19bbb6056b47b1b1735",
+      "classification": "monotonic_allocator",
+      "rationale": "Host-process-wide non-reusing allocator for opaque child COW authority token identities. It stores no task, MM, membership, policy or measurement state; exact TaskKey, MM, ASID and owner generation remain authenticated by the token authority. Concurrent carriers may share the allocator without sharing Linux state. Checked exhaustion refuses reservation before birth and never wraps or reissues an identity."
     }
   ]
 }

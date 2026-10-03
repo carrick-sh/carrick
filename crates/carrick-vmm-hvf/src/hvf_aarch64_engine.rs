@@ -941,13 +941,12 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
             crate::trap::admit_vcpu_first_run();
             live.ran = true;
         }
-        let exit = HvfInner::run_to_exit(
+        HvfInner::run_to_exit(
             &mut live.inner,
             &mut live.mailbox,
             &live.custody,
             live.vm_generation,
-        );
-        exit
+        )
     }
 
     fn kick(&self) -> Result<(), TrapError> {
