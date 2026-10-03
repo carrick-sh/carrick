@@ -307,6 +307,7 @@ pub(crate) fn edit_budget(exe: &str, rounds: usize, force_gap_allocation: bool) 
     let original = unsafe { std::ptr::read_volatile(ptr) };
     let mut errors = 0u64;
     let mut first_error = String::new();
+    let mut diagnosed = false;
     let mut fail = |what: String| {
         if errors == 0 {
             first_error = what;
@@ -347,7 +348,21 @@ pub(crate) fn edit_budget(exe: &str, rounds: usize, force_gap_allocation: bool) 
         // A fresh private copy: the file's bytes, never this round's store.
         let seen = unsafe { std::ptr::read_volatile(ptr) };
         if seen != original {
-            fail(format!("stale round={round} value={seen:#x} file={original:#x}"));
+            if !diagnosed {
+                diagnosed = true;
+                // Failure-only diagnostic: retain the same page through a
+                // host-boundary copy before overwriting or remapping it.
+                // USDT records its live stage-1 IPA and copied bytes, so a
+                // stale CPU read can be distinguished from wrong backing.
+                // No extra syscall, output or work occurs on a passing run.
+                let _ = unsafe { libc::write(2, ptr.cast(), std::mem::size_of::<u64>()) };
+                println!(
+                    "tlb-stale-witness round={round} va={base:#x} value={seen:#x} file={original:#x}"
+                );
+            }
+            fail(format!(
+                "stale round={round} va={base:#x} value={seen:#x} file={original:#x}"
+            ));
         }
         unsafe { std::ptr::write_volatile(ptr, round + 3) };
     }
