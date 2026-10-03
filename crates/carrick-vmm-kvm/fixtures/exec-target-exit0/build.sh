@@ -7,7 +7,7 @@ set -euo pipefail
 
 fixture_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="$fixture_dir/exec-target-exit0"
-obj="$(mktemp -t exec-target-exit0.XXXXXX.o)"
+obj="$(mktemp "${TMPDIR:-/tmp}/exec-target-exit0.XXXXXX")"
 trap 'rm -f "$obj"' EXIT
 
 sysroot="$(rustc --print sysroot)"

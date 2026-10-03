@@ -140,7 +140,7 @@ cleanup() {
     # first (NOPASSWD on the rig: scripts/sudo/ is under carrick/*/*/*) also
     # catches root-owned `carrick trace` front-ends carrying the same id.
     for id in "$run_id" "$run_id-cli"; do
-        cleanup_log="$(mktemp -t carrick-test-signed-cleanup)"
+        cleanup_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-cleanup.XXXXXX")"
         if sudo -n scripts/sudo/kill.sh "$id" >"$cleanup_log" 2>&1; then
             :
         elif scripts/sudo/kill.sh "$id" >"$cleanup_log" 2>&1; then
@@ -219,7 +219,7 @@ fi
 #    `profile.test == true` plus an `executable`; dependencies compile with
 #    `test: false`. The JSON goes to a file first so a build failure stops the
 #    script (a process substitution's exit status would not).
-json_log="$(mktemp -t carrick-test-signed-build)"
+json_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-build.XXXXXX")"
 scratch+=("$json_log")
 cargo test -p "$pkg" ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json >"$json_log"
 exes=()
@@ -245,13 +245,13 @@ done
 
 # 3. Enumerate every test before execution, including the ignored subset, then
 #    resolve the invocation's exact/non-exact filter fail-closed.
-census="$(mktemp -t carrick-test-signed-census)"
-ignored_census="$(mktemp -t carrick-test-signed-ignored)"
-selected="$(mktemp -t carrick-test-signed-selected)"
+census="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-census.XXXXXX")"
+ignored_census="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-ignored.XXXXXX")"
+selected="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-selected.XXXXXX")"
 scratch+=("$census" "$ignored_census" "$selected")
 for exe in "${exes[@]}"; do
-    list_log="$(mktemp -t carrick-test-signed-list)"
-    ignored_log="$(mktemp -t carrick-test-signed-ignored-list)"
+    list_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-list.XXXXXX")"
+    ignored_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-ignored-list.XXXXXX")"
     scratch+=("$list_log" "$ignored_log")
     "$exe" --list >"$list_log"
     "$exe" --list --ignored >"$ignored_log"
@@ -335,7 +335,7 @@ record_executable() {
     sha256="$(shasum -a 256 "$exe" | awk '{print $1}')"
     cdhash="$(codesign -dvvv "$exe" 2>&1 | awk -F= '$1 == "CDHash" { print $2; exit }')"
     lc_uuid="$(otool -l "$exe" | awk '$1 == "cmd" && $2 == "LC_UUID" { seen=1; next } seen && $1 == "uuid" { print $2; exit }')"
-    entitlements_dump="$(mktemp -t carrick-test-signed-entitlements)"
+    entitlements_dump="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-entitlements.XXXXXX")"
     scratch+=("$entitlements_dump")
     codesign -d --entitlements :- "$exe" >"$entitlements_dump" 2>/dev/null
     if ! grep -q 'com.apple.security.hypervisor' "$entitlements_dump"; then
@@ -420,7 +420,7 @@ if codesign -d --entitlements - "$noent" 2>&1 | grep -q 'com.apple.security.hype
     echo "test-signed: $noent still carries the hypervisor entitlement; the negative control would prove nothing" >&2
     exit 1
 fi
-neg_log="$(mktemp -t carrick-test-signed-negative)"
+neg_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-negative.XXXXXX")"
 scratch+=("$neg_log")
 echo "test-signed: negative control on $noent"
 neg_rc=0
@@ -441,7 +441,7 @@ else
     noent_sha="$(shasum -a 256 "$noent" | awk '{print $1}')"
     noent_cdhash="$(codesign -dvvv "$noent" 2>&1 | awk -F= '$1 == "CDHash" { print $2; exit }')"
     noent_uuid="$(otool -l "$noent" | awk '$1 == "cmd" && $2 == "LC_UUID" { seen=1; next } seen && $1 == "uuid" { print $2; exit }')"
-    noent_entitlements="$(mktemp -t carrick-test-signed-noent-entitlements)"
+    noent_entitlements="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-noent-entitlements.XXXXXX")"
     scratch+=("$noent_entitlements")
     codesign -d --entitlements :- "$noent" >"$noent_entitlements" 2>/dev/null || true
     noent_entitlement_digest="$(shasum -a 256 "$noent_entitlements" | awk '{print $1}')"
