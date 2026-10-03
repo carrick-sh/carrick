@@ -5,9 +5,9 @@ use crate::ReservationMm;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const MM_PORTAL_PROTOCOL: u64 = 2;
+pub const MM_PORTAL_PROTOCOL: u64 = 3;
 pub const MM_PORTAL_MAX_BYTES: u64 = 4096;
-pub const MM_PORTAL_BIND_ESR: u64 = 0x4352_4d4d_4249_0002;
+pub const MM_PORTAL_BIND_ESR: u64 = 0x4352_4d4d_4249_0003;
 /// Identity of an admitted owner. It contains no editor, table, or host pointer.
 ///
 /// Safe callers cannot manufacture admitted ownership.
@@ -52,8 +52,8 @@ impl El1MmHandle {
     }
 }
 
-pub const MM_PORTAL_SELECT_ESR: u64 = 0x4352_4d4d_5345_0002;
-pub const MM_PORTAL_SERVICE_ESR: u64 = 0x4352_4d4d_5452_0002;
+pub const MM_PORTAL_SELECT_ESR: u64 = 0x4352_4d4d_5345_0003;
+pub const MM_PORTAL_SERVICE_ESR: u64 = 0x4352_4d4d_5452_0003;
 pub const EL1_MM_PORTAL_OFFSET: u64 = 0x1C_0000;
 pub const EL1_MM_PORTAL_BASE: u64 = crate::EL1_REGION_BASE + EL1_MM_PORTAL_OFFSET;
 const IDLE: u64 = 0;

@@ -241,6 +241,21 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
 }
 
 impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
+    fn read_host_backing(
+        &self,
+        identity: carrick_mmu_core::HostBackingIdentity,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_abi::LinuxErrno> {
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or(carrick_abi::LinuxErrno::new(9))?;
+        runtime
+            .dispatcher
+            .mem_view()
+            .read_host_backing(identity, length)
+    }
+
     fn commit_guest_host_first_touch(
         &self,
         address: u64,

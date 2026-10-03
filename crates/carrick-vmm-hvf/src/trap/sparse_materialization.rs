@@ -2331,6 +2331,17 @@ impl PublicationContext<'static> {
             .read()
             .clone()
             .ok_or_else(|| failure("missing binding".into()))?;
+        // EL1 chose the source and offset. Complete byte I/O before taking
+        // physical publication ownership; no MM editor survives this supply.
+        let source_bytes = window
+            .host_backing
+            .map(|identity| {
+                binding
+                    .authority
+                    .read_host_backing(identity, window.range.len() as usize)
+                    .map_err(|error| failure(format!("retained byte source: {error:?}")))
+            })
+            .transpose()?;
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
             carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
             binding.identity.linux_pid,
@@ -2350,7 +2361,7 @@ impl PublicationContext<'static> {
         {
             return Ok(None);
         }
-        let publication = publish_frame_grant(
+        let publication = publish_frame_grant_backing(
             &self,
             carrick_hal::El1FrameGrantRequest {
                 mm_key: window.operation.mm.raw(),
@@ -2361,6 +2372,10 @@ impl PublicationContext<'static> {
                 permissions: window.protection.bits(),
             },
             None,
+            match source_bytes.as_deref() {
+                Some(bytes) => SparseExtentBacking::SeededAnon { bytes },
+                None => SparseExtentBacking::Anon,
+            },
             &registry,
         )?;
         let mut pending = PendingTransferGrant {
