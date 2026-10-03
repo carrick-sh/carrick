@@ -52,6 +52,7 @@ pub struct Mapping {
     /// host-owned and every EL1 edit touching it forwards.
     pub flags: ReservationNodeFlags,
     pub generation: ReservationGeneration,
+    pub host_backing: Option<carrick_el1_abi::HostBackingIdentity>,
 }
 
 /// Byte charges of committed nodes, whole-root or within one range: every
@@ -260,6 +261,7 @@ struct NodeData {
     /// bits (seven), packed so the bootstrap table fits its region.
     prot: u16,
     flags: u16,
+    host_backing: Option<carrick_el1_abi::HostBackingIdentity>,
 }
 /// Lossless: validated protections use three bits.
 const fn pack_prot(prot: ReservationProtection) -> u16 {
@@ -312,6 +314,7 @@ impl NodeData {
             anonymous: self.flags().contains(ReservationNodeFlags::ANONYMOUS),
             flags: self.flags(),
             generation,
+            host_backing: self.host_backing,
         }
     }
     /// Whether an adjacent node is the same Linux mapping (a VMA boundary
@@ -425,7 +428,10 @@ const LAYOUT_HASH: u64 = {
     hash
 };
 
-const _: () = assert!(core::mem::size_of::<Counters>() <= 0x20000);
+const _: () = assert!(
+    core::mem::size_of::<Counters>()
+        <= (EL1_RESERVATIONS_OFFSET - carrick_el1_abi::EL1_COUNTERS_OFFSET) as usize
+);
 const _: () = assert!(
     RESERVATIONS_OFFSET + core::mem::size_of::<SharedReservations>()
         <= EL1_RESERVATIONS_END as usize

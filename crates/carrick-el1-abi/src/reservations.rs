@@ -8,12 +8,50 @@
 //! must fail stopped, never manufacture a refusal/completion.
 
 /// Shared reservation bootstrap region, before T2's descriptor transaction slots.
-pub const EL1_RESERVATIONS_OFFSET: u64 = crate::EL1_COUNTERS_OFFSET + 0x2_0000;
+pub const EL1_RESERVATIONS_OFFSET: u64 = crate::EL1_COUNTERS_OFFSET + 0x1_8000;
 pub const EL1_RESERVATIONS_END: u64 = crate::EL1_COUNTERS_OFFSET + 0x8_0000;
 /// Protocol revision of the request/flag vocabulary below. Folded into
 /// [`crate::EL1_ABI_LAYOUT_HASH`]: an image that decodes `Move`, node flags or
 /// the request's `source` differently must not attach to this host.
-pub const RESERVATION_PROTOCOL_VERSION: u64 = 2;
+pub const RESERVATION_PROTOCOL_VERSION: u64 = 3;
+
+/// Retained host byte source. This grants no mapping or permission authority:
+/// the owner tree supplies the VA, protection, sharing and fork policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct HostBackingIdentity {
+    handle: core::num::NonZeroU64,
+    generation: core::num::NonZeroU64,
+    offset: u64,
+}
+impl HostBackingIdentity {
+    pub const fn new(
+        handle: core::num::NonZeroU64,
+        generation: core::num::NonZeroU64,
+        offset: u64,
+    ) -> Self {
+        Self {
+            handle,
+            generation,
+            offset,
+        }
+    }
+    pub const fn handle(self) -> core::num::NonZeroU64 {
+        self.handle
+    }
+    pub const fn generation(self) -> core::num::NonZeroU64 {
+        self.generation
+    }
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+    pub fn advance(self, bytes: u64) -> Option<Self> {
+        Some(Self {
+            offset: self.offset.checked_add(bytes)?,
+            ..self
+        })
+    }
+}
 
 macro_rules! identity {
     ($(#[$meta:meta])* $name:ident) => {
