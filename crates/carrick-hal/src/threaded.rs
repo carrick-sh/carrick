@@ -2436,6 +2436,16 @@ pub trait FrameCowQuiesce {}
 impl<T> FrameCowQuiesce for T {}
 
 pub trait FrameCowAuthority: Send + Sync {
+    /// Bounded byte service for an owner-selected retained host source. No
+    /// guest VA or permission decision crosses this physical boundary.
+    fn read_host_backing(
+        &self,
+        _identity: carrick_mmu_core::HostBackingIdentity,
+        _length: usize,
+    ) -> Result<Vec<u8>, carrick_abi::LinuxErrno> {
+        Err(carrick_abi::LinuxErrno::new(9))
+    }
+
     /// Publish a prepared host-write page in EL1 while exact-MM exclusion is
     /// retained. Only the authenticated guest receipt permits residency commit.
     fn commit_guest_host_first_touch(
