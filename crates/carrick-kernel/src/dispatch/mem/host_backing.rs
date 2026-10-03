@@ -80,6 +80,26 @@ impl Drop for Record {
 mod tests {
     use super::*;
     #[test]
+    fn two_live_custodians_reject_each_others_source_tokens() {
+        let a = Arc::new(HostBackingCustody::default());
+        let b = Arc::new(HostBackingCustody::default());
+        let retain = |custody: &Arc<HostBackingCustody>, bytes: &[u8]| {
+            custody
+                .retain_source(PrivateFileBacking::LoadedImage {
+                    initialized_offset: 0,
+                    bytes: Arc::new(bytes.to_vec()),
+                })
+                .unwrap()
+        };
+        let a_source = retain(&a, b"parent-a");
+        let b_source = retain(&b, b"parent-b");
+        assert_ne!(a_source.identity(0), b_source.identity(0));
+        assert!(a.source(b_source.identity(0)).is_none());
+        assert!(b.source(a_source.identity(0)).is_none());
+        assert!(a.source(a_source.identity(0)).is_some());
+        assert!(b.source(b_source.identity(0)).is_some());
+    }
+    #[test]
     fn retained_source_outlives_original_lease_and_rejects_retirement() {
         let custody = Arc::new(HostBackingCustody::default());
         let lease = custody
