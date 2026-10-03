@@ -194,7 +194,7 @@ const VA: u64 = 0x100000;
 fn range(va: u64, bytes: u64) -> ReservationRange {
     ReservationRange::new(va, va + bytes).unwrap()
 }
-fn boot(nodes: usize) -> BootMmBuilder {
+fn boot(nodes: usize) -> BootMmBuilder<Pin> {
     let mut boot = BootMmBuilder::new(
         Layout {
             heap: range(PAGE_BYTES, VA - PAGE_BYTES),
@@ -684,8 +684,109 @@ fn red_until_n1a_seal_preserves_resident_boot_mapping() {
         .unwrap();
     boot.image = tables.into_bytes().unwrap();
     boot.map_lazy(range(VA, PAGE_BYTES), ReservationProtection::READ_WRITE);
+    boot.import_resident(
+        range(VA, PAGE_BYTES),
+        p.pin(data.extent).unwrap(),
+        0,
+        ResidentBacking::Owned,
+    )
+    .unwrap();
     let h = boot.seal(&mut p).unwrap();
     let mut bytes = [0; 4];
     read(&mut p, h, VA, &mut bytes).unwrap();
     assert_eq!(bytes, *b"live", "admission discarded resident input bytes");
+}
+
+#[test]
+fn n1a_import_modes_preserve_bytes_and_private_file_alias_cows() {
+    for backing in [
+        ResidentBacking::Owned,
+        ResidentBacking::CopyOnly,
+        ResidentBacking::HostBackingPrivate,
+        ResidentBacking::HostBackingShared,
+    ] {
+        let (mut p, _) = portal();
+        let mut input = boot(16);
+        let source = p.grant(ExtentKind::Data, None).unwrap();
+        p.backend.write(source.extent, 0, b"file").unwrap();
+        input.map_lazy(range(VA, PAGE_BYTES), ReservationProtection::READ_WRITE);
+        input
+            .import_resident(
+                range(VA, PAGE_BYTES),
+                p.pin(source.extent).unwrap(),
+                0,
+                backing,
+            )
+            .unwrap();
+        let h = input.seal(&mut p).unwrap();
+        let mut seen = [0; 4];
+        read(&mut p, h, VA, &mut seen).unwrap();
+        assert_eq!(seen, *b"file");
+        write(&mut p, h, VA, b"edit").unwrap();
+        read(&mut p, h, VA, &mut seen).unwrap();
+        assert_eq!(seen, *b"edit");
+        p.backend.read(source.extent, 0, &mut seen).unwrap();
+        assert_eq!(
+            seen,
+            if matches!(
+                backing,
+                ResidentBacking::CopyOnly | ResidentBacking::HostBackingPrivate
+            ) {
+                *b"file"
+            } else {
+                *b"edit"
+            }
+        );
+    }
+}
+
+#[test]
+fn n1a_import_rejects_stale_generation_without_publishing_an_mm() {
+    let (mut p, _) = portal();
+    let source = p.grant(ExtentKind::Data, None).unwrap();
+    let mut input = boot(16);
+    input.map_lazy(range(VA, PAGE_BYTES), ReservationProtection::READ_WRITE);
+    let mut stale = p.pin(source.extent).unwrap();
+    stale.extent = MetadataExtent::new(
+        source.extent.base(),
+        source.extent.len(),
+        source.extent.token() + 1,
+    )
+    .unwrap();
+    input
+        .import_resident(range(VA, PAGE_BYTES), stale, 0, ResidentBacking::Owned)
+        .unwrap();
+    assert_eq!(input.seal(&mut p), Err(MmError::Stale));
+    assert!(p.mms.is_empty());
+    assert_eq!(p.references(), (0, 0));
+    let h = boot(16).seal(&mut p).unwrap();
+    assert_eq!(h.mm.raw(), 1);
+}
+
+#[test]
+fn n1a_import_readonly_leaf_never_grants_guest_write() {
+    let (mut p, _) = portal();
+    let source = p.grant(ExtentKind::Data, None).unwrap();
+    let mut input = boot(16);
+    input.map_lazy(
+        range(VA, PAGE_BYTES),
+        ReservationProtection::from_bits(1).unwrap(),
+    );
+    input
+        .import_resident(
+            range(VA, PAGE_BYTES),
+            p.pin(source.extent).unwrap(),
+            0,
+            ResidentBacking::Owned,
+        )
+        .unwrap();
+    let h = input.seal(&mut p).unwrap();
+    assert_eq!(write(&mut p, h, VA, &[1]), Err(MmError::Fault));
+    let leaf = carrick_mmu_core::aarch64::terminal_descriptor(p.mms[0].tables.debug_walk(VA));
+    assert!(
+        !carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(
+            leaf,
+            carrick_mmu_core::aarch64::LeafAccess::Write
+        )
+    );
 }
