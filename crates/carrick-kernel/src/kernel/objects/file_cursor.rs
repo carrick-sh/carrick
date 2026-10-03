@@ -75,8 +75,20 @@ impl FileCursor {
             // Each queue belongs to one operation. Keep drain ownership
             // through callback AND final Arc drop: either can cancel the
             // granted ticket, appending the successor instead of recursing.
-            next.changed.wake_all();
-            drop(next);
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                next.changed.wake_all();
+                drop(next);
+            }))
+            .is_err()
+            {
+                // Runtime panic backstops may recover the worker. Cursor
+                // delivery cannot expose an abandoned drainer to such a
+                // caller, including when final effect destruction panics.
+                carrick_fatal!(
+                    "kernel::file_cursor",
+                    "cursor notification delivery panicked"
+                );
+            }
         }
     }
 }
@@ -383,5 +395,49 @@ mod tests {
                 .is_empty()
         );
         drop(subscription);
+    }
+    mod serial_host {
+        use super::*;
+        #[test]
+        fn serial_host_cursor_callback_panic_is_terminal() {
+            const CHILD: &str = "CARRICK_TEST_CURSOR_PANIC_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                let description = description();
+                let first = description.try_reserve_cursor().unwrap();
+                let next = description.try_reserve_cursor().unwrap_err();
+                let last = description.try_reserve_cursor().unwrap_err();
+                let (_subscription, ready) =
+                    next.subscribe(|| panic!("injected cursor callback panic"));
+                assert!(!ready);
+                let wakes = Arc::new(AtomicU64::new(0));
+                let target = wakes.clone();
+                let (_last_subscription, ready) = last.subscribe(move || {
+                    target.fetch_add(1, Ordering::Relaxed);
+                });
+                assert!(!ready);
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(first)));
+                assert!(caught.is_err());
+                drop(next.take_reservation().unwrap());
+                assert_eq!(
+                    wakes.load(Ordering::Relaxed),
+                    1,
+                    "caught callback panic stranded successor notification"
+                );
+                return;
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("kernel::objects::file_cursor::tests::serial_host::serial_host_cursor_callback_panic_is_terminal")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output().unwrap();
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                output.status.signal(),
+                Some(libc::SIGABRT),
+                "cursor delivery must not expose abandoned drain custody: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
