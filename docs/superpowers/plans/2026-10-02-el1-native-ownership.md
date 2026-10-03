@@ -1124,3 +1124,37 @@ partial-page clamping and rejection of a range beyond the retained backing.
 Existing claimed-invalidation exclusion, peer re-dirty, cache work budget and
 host RX executable-COW witnesses remain green. No new cache mechanism or owner
 was added; whole-N1/signed acceptance and the director's final gates remain open.
+
+#### N1 assembly boundary review receipt — 2026-10-03
+
+The final lint preflight identified six newly unreviewed assembly sites.
+`scripts/lint-domains.sh` runs both Semgrep and the Rust-token escape checker;
+these maintain matching exact reviewed-module lists. The compiler operation
+catalog covers resolved host calls and contains no inline-assembly operation
+rows. The two existing EL1 modules below are now included in those boundary
+lists, with no Rust source change, suppression comment, wildcard or new path.
+
+| Site | Reviewed authority and operation |
+|---|---|
+| `crates/carrick-el1/src/fault.rs:244` | `hvc #1` yields the exact claimed executable-COW grant's physical publication effect after guest copy and before CowRepoint. The slot authenticates the replacement IPA/owner; existing I2 performs bounded cache work while the actual EL1 editor remains on the resumed service stack. No host policy, metadata or I/O callback is authorized. |
+| `crates/carrick-el1/src/personality/mm_portal/production.rs:618` | Read `ttbr0_el1` for copy service and compare the complete live root/ASID against the target MM's current AddressSpaces grant before revalidation and retained-editor copy. The value is observed, not changed. |
+| `production.rs:648` | `hvc #1` supplies the existing bounded copy/cancel physical effect. The borrowed-vCPU runner resumes this same EL1 stack, retaining the actual SpaceEditor until exact completion is published; it cannot reset the frame or enter target EL0. |
+| `production.rs:675` | Read `ttbr0_el1` before selection and refuse a target whose current AddressSpaces grant differs. Carrier/MM/incarnation authentication remains in the production selector. |
+| `production.rs:906` | Read `ttbr0_el1` for exact grant preparation, compare with the authorized window's target grant, and use that same root/ASID for descriptor maintenance. This does not write TTBR or choose host policy. |
+| `production.rs:966` | Read `ttbr0_el1` before sealing the admitted target binding; complete live root equality with its AddressSpaces grant is required before returning the incarnation. |
+
+The token checker first reproduced exactly these six rejections. After review,
+its full-tree check passes. Focused boundary tests retain rejection of nested
+suffix lookalikes, including both new EL1 paths, and validate the reviewed exact
+paths through both Semgrep and the token checker. Runtime abort/global-state
+and carrier-only process checks remain unchanged and pass. Existing inventory
+order is preserved; the director owns the final full lint rerun.
+
+The small positive assembly fixture now invokes the real Semgrep assembly rule
+and token checker directly. The current full launcher additionally requires the
+repository's exact reviewed carrier birth/probe population; manufacturing that
+unrelated population in an assembly fixture would obscure its contract. The
+launcher-negative and exact-root/nested-path checks remain, and the carrier
+checker is separately verified on the actual repository. No product checker is
+skipped or relaxed. The focused three-test boundary run passes; full-tree escape,
+carrier-only, runtime abort and runtime global-state checks all exit zero.

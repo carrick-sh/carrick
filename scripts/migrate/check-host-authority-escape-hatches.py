@@ -59,6 +59,10 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-vmm-kvm/src/kvm.rs"),
         PurePosixPath("crates/carrick-el1/src/file.rs"),
         PurePosixPath("crates/carrick-el1/src/entry.rs"),
+        # Reviewed EL1 physical effects and exact live-root authentication;
+        # matches the six-site N1 assembly receipt and Semgrep boundary list.
+        PurePosixPath("crates/carrick-el1/src/fault.rs"),
+        PurePosixPath("crates/carrick-el1/src/personality/mm_portal/production.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/hw.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/aarch64_context.rs"),
         # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
