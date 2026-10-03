@@ -1652,3 +1652,19 @@ description with an abandoned draining flag. The actual child regression
 observed successor wake0 versus1 before the fix (no SIGABRT); after the fix
 it requires SIGABRT6. All seven cursor core tests pass. Consumer activation
 and the remaining release/recall prerequisites stay open.
+
+Release-notification source prerequisite (not yet MM guard integration):
+`ObjectNotificationSource` retains one exact queue-incarnation admission.
+Borrowed views never decrement that durable pin; bounded atomic derivation
+creates independently counted tickets without reacquiring the wait queue.
+`durable_notification_source_derives_while_queue_is_held` failed when the old
+admission returned Busy under the held queue. The derived ticket now publishes
+through existing deferred-after-unlock completion. Source retirement cannot
+rebind while a derived ticket remains, and an old notification cannot reach
+the recycled queue incarnation. The borrowed-view retirement witness and all
+99 scheduler-core tests pass, with all-target clippy.
+
+Real SpaceEditor/root/gate/pending release hooks, authenticated production
+region binding, cause-specific revisions, sample/enroll/reprobe, metadata
+supply distinction and host-versus-EL1 publication are still OPEN. This source
+primitive alone does not close PREPARE suspension or enable any consumer.
