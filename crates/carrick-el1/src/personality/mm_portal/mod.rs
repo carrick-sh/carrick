@@ -6,7 +6,9 @@ pub use carrick_el1_abi::{El1MmHandle, ReservationMm};
 use carrick_mmu_core::aarch64::PageTableError;
 #[cfg(any(test, feature = "host-test"))]
 use core::num::NonZeroU64;
+mod edit_wait;
 mod fork;
+pub use edit_wait::park_prepared_edit;
 pub mod production;
 pub use fork::*;
 pub use production::*;
@@ -30,6 +32,7 @@ pub enum MmError {
     Stale,
     Busy,
     NoMemory,
+    MetadataRequired,
     Invalid,
     Core,
     Reservation(Refusal),
@@ -43,6 +46,7 @@ impl MmError {
             Self::Stale => 3,
             Self::Busy => 16,
             Self::NoMemory => 12,
+            Self::MetadataRequired => 11,
             Self::Invalid => 22,
             Self::Core | Self::Reservation(_) | Self::Table(_) => 5,
         }
@@ -52,9 +56,9 @@ impl From<Refusal> for MmError {
     fn from(e: Refusal) -> Self {
         match e {
             Refusal::Stale => Self::Stale,
-            Refusal::Busy => Self::Busy,
+            Refusal::Busy | Refusal::PreparedConflict => Self::Busy,
             Refusal::Hole | Refusal::Limit => Self::Fault,
-            Refusal::MetadataRequired => Self::NoMemory,
+            Refusal::MetadataRequired => Self::MetadataRequired,
             _ => Self::Reservation(e),
         }
     }
