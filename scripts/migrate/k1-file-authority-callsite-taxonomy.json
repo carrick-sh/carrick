@@ -213,7 +213,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/access.rs",
-      "line": 516,
+      "line": 556,
       "categories": [
         "description_guard"
       ],
@@ -345,7 +345,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 519,
+      "line": 521,
       "categories": [
         "description_guard"
       ],
@@ -356,7 +356,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 693,
+      "line": 695,
       "categories": [
         "description_guard"
       ],
@@ -367,7 +367,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 702,
+      "line": 704,
       "categories": [
         "description_backing",
         "mapping"
@@ -379,7 +379,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 707,
+      "line": 709,
       "categories": [
         "description_guard"
       ],
@@ -1414,7 +1414,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 2935,
+      "line": 3041,
       "categories": [
         "description_guard"
       ],
@@ -1425,7 +1425,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 3659,
+      "line": 3765,
       "categories": [
         "description_guard"
       ],
@@ -1436,7 +1436,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 5598,
+      "line": 5704,
       "categories": [
         "description_guard"
       ],
@@ -1447,7 +1447,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 5647,
+      "line": 5753,
       "categories": [
         "table_guard"
       ],
@@ -1458,7 +1458,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 5664,
+      "line": 5770,
       "categories": [
         "table_guard"
       ],
@@ -1469,7 +1469,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "line": 7094,
+      "line": 7200,
       "categories": [
         "description_guard"
       ],
