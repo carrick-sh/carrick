@@ -379,6 +379,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
         MM_PORTAL_PROTOCOL,
+        MM_TRANSFER_LAYOUT_HASH,
         MM_PORTAL_BIND_ESR,
         MM_PORTAL_SELECT_ESR,
         MM_PORTAL_SERVICE_ESR,
@@ -503,6 +504,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
             host_requested: false,
         }
         .encode(),
+        carrick_sched_core::object_wait::OBJECT_WAIT_LAYOUT_HASH,
         core::mem::size_of::<ZoneTables>() as u64,
         core::mem::align_of::<ZoneTables>() as u64,
         core::mem::size_of::<ZoneRecord>() as u64,
