@@ -1305,7 +1305,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
       "function": "MmAccessState::retire_mm_root_stage2_in_using",
       "ordinal_in_function": 1,
-      "fingerprint": "3166d45ceb98f8b0f1f5112a055674cf01ab38d0d6904ffc6f55bd8b49c57929",
+      "fingerprint": "d1be8007bd313486c8c5f813764ce56f75186d4675c7f1af7c4ce4b5acb6c8a0",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "The exact root authority disappeared while its slot remained exclusively locked, after its structural record had already terminalized; this is an impossible authority-state transition, not a recoverable retirement refusal.",
