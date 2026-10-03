@@ -65,6 +65,12 @@ pub enum Commands {
 
     #[command(about = "Run the host and/or signed landing gate and output a JSON receipt")]
     Accept(crate::accept::AcceptArgs),
+
+    #[command(
+        name = "remote-accept",
+        about = "Run accept gate on a remote Mac over ssh and fetch the receipt"
+    )]
+    RemoteAccept(crate::remote_accept::RemoteAcceptArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -147,6 +153,8 @@ pub enum CliError {
     HostLease(#[from] crate::host_lease::HostLeaseError),
     #[error("accept error: {0}")]
     Accept(#[from] crate::accept::AcceptError),
+    #[error("remote accept error: {0}")]
+    RemoteAccept(#[from] crate::remote_accept::RemoteAcceptError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -341,6 +349,13 @@ where
         }
         Commands::Accept(args) => {
             crate::accept::run(cli.root.as_deref(), args)?;
+            Ok(())
+        }
+        Commands::RemoteAccept(args) => {
+            let exit_code = crate::remote_accept::run(cli.root.as_deref(), args)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
             Ok(())
         }
     }

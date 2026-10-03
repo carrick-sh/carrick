@@ -202,3 +202,23 @@ fn checked_command_preserves_failure_status_and_stderr() {
         other => panic!("expected NonZeroExit, got {other:?}"),
     }
 }
+
+#[test]
+fn remote_accept_cli_help() {
+    let bin = env!("CARGO_BIN_EXE_carrick-xtask");
+    let output = Command::new(bin)
+        .args(["remote-accept", "--help"])
+        .output()
+        .expect("spawn carrick-xtask remote-accept --help");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("--ref"));
+    assert!(combined.contains("--phase"));
+    assert!(combined.contains("--host"));
+    assert!(combined.contains("--remote-root"));
+    assert!(combined.contains("--attach"));
+    assert!(combined.contains("--keep-worktree"));
+}

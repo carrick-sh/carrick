@@ -95,6 +95,10 @@ lease MODE +CMD:
 accept *ARGS:
     cargo run --locked -p carrick-xtask -- accept --profile no-docker {{ARGS}}
 
+# Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt.
+remote-accept *ARGS:
+    cargo run --locked -p carrick-xtask -- remote-accept {{ARGS}}
+
 # Provision fresh-worktree guest artifacts before signed execution.
 land-provision *ARGS:
     just --justfile {{justfile()}} xtask provision {{ARGS}}
