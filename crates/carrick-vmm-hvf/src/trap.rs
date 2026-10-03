@@ -190,7 +190,11 @@ mod global_frame;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod host_writes;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod user_transfer;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use user_transfer::UserTransferCustody;
 
 /// One carrier accounting lifetime. Holding the token prevents identity reuse.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
