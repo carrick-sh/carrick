@@ -269,6 +269,65 @@ impl Drop for OwnedObjectWakeEffects<'_> {
     }
 }
 
+/// Durable exact-incarnation publication custody. A source is admitted once
+/// while its object is published and lends queue-lock-free counted tickets.
+/// Its Rust borrow excludes source retirement during derivation; a detached
+/// source requires the same exclusion from its owning shared object guard.
+#[must_use = "retain publication custody until object retirement"]
+pub struct ObjectNotificationSource<'a> {
+    ticket: ObjectNotificationTicket<'a>,
+}
+impl<'a> ObjectNotificationSource<'a> {
+    pub fn key(&self) -> ObjectWaitKey {
+        self.ticket.key
+    }
+    pub fn borrow(&self) -> BorrowedObjectNotificationSource<'_, 'a> {
+        BorrowedObjectNotificationSource {
+            zone: self.ticket.zone,
+            key: self.ticket.key,
+            _source: core::marker::PhantomData,
+        }
+    }
+    pub fn reserve(&self) -> ObjectNotificationTicket<'a> {
+        self.borrow().reserve()
+    }
+    /// Move this source's one admission into its owner-protected record.
+    pub fn detach(self) -> ObjectWaitKey {
+        self.ticket.detach()
+    }
+}
+
+/// Borrowed derivation authority. Dropping a view never releases the durable
+/// source's admission. The scope borrow excludes retirement during reserve;
+/// each derived ticket thereafter owns its own independently counted custody.
+pub struct BorrowedObjectNotificationSource<'scope, 'zone> {
+    zone: &'zone ZoneTables,
+    key: ObjectWaitKey,
+    _source: core::marker::PhantomData<&'scope ()>,
+}
+impl<'zone> BorrowedObjectNotificationSource<'_, 'zone> {
+    pub fn reserve(&self) -> ObjectNotificationTicket<'zone> {
+        let queue = &self.zone.object_waits[self.key.index as usize];
+        // The borrowed source retains a publisher, excluding rebind while
+        // deriving. No queue lock, retry loop, or owning source reconstruction.
+        assert_eq!(
+            queue.generation.load(Ordering::Acquire),
+            self.key.generation,
+            "retained source incarnation"
+        );
+        let previous = queue.publishers.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            previous != 0 && previous != u64::MAX,
+            "source publisher exhaustion"
+        );
+        ObjectNotificationTicket {
+            zone: self.zone,
+            key: self.key,
+            retained: true,
+        }
+    }
+}
+
 /// Linear notification custody; no source may be consumed before admission.
 #[must_use = "notification admission must be published, detached, or cancelled"]
 pub struct ObjectNotificationTicket<'a> {
@@ -276,7 +335,10 @@ pub struct ObjectNotificationTicket<'a> {
     key: ObjectWaitKey,
     retained: bool,
 }
-impl ObjectNotificationTicket<'_> {
+impl<'a> ObjectNotificationTicket<'a> {
+    pub fn into_source(self) -> ObjectNotificationSource<'a> {
+        ObjectNotificationSource { ticket: self }
+    }
     pub fn key(&self) -> ObjectWaitKey {
         self.key
     }
@@ -1878,5 +1940,99 @@ mod host_tests {
         // SAFETY: the caller owns the detached host handback.
         assert!(unsafe { rec.take_object_operation() }.is_some());
         assert_eq!(notify(&zone, 1).0.visited, 0);
+    }
+    #[test]
+    fn durable_notification_source_derives_while_queue_is_held() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::new(3, 11).unwrap();
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+            let _ = owned.deliver_handbacks(&mut |_| {});
+        };
+        zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        let source = zone
+            .admit_object_notification(key, &BoundedSpin(0), &completion)
+            .unwrap()
+            .into_source();
+        let guard = zone
+            .object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        let before = zone.object_queue_census(key.index()).unwrap().epoch;
+        let derived = source.reserve();
+        derived.publish(SLOT, &completion);
+        assert_eq!(
+            zone.object_queue_census(key.index()).unwrap().epoch,
+            before + 1
+        );
+        assert!(zone.object_queue_census(key.index()).unwrap().locked);
+        drop(guard);
+        assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+    }
+    #[test]
+    fn durable_notification_source_and_derived_ticket_exclude_rebind() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::new(3, 11).unwrap();
+        let successor = ObjectWaitKey::new(3, 12).unwrap();
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |_| {});
+        };
+        zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        let source = zone
+            .admit_object_notification(key, &BoundedSpin(0), &completion)
+            .unwrap()
+            .into_source();
+        let ticket = source.reserve();
+        assert_eq!(
+            zone.bind_object_wait_with_completion(successor, &BoundedSpin(0), &completion),
+            Err(ObjectWaitError::Occupied)
+        );
+        drop(source);
+        // Retirement of the source cannot recycle an outstanding old ticket.
+        assert_eq!(
+            zone.bind_object_wait_with_completion(successor, &BoundedSpin(0), &completion),
+            Err(ObjectWaitError::Occupied)
+        );
+        ticket.publish(SLOT, &completion);
+        zone.bind_object_wait_with_completion(successor, &BoundedSpin(0), &completion)
+            .unwrap();
+        let census = zone.object_queue_census(successor.index()).unwrap();
+        assert_eq!(census.generation, 12);
+        assert_eq!(
+            census.epoch, 1,
+            "old publication cannot wake recycled incarnation"
+        );
+        assert!(matches!(
+            zone.object_wait_with_completion(key, &BoundedSpin(0), &completion),
+            Err(ObjectWaitError::Stale)
+        ));
+    }
+    #[test]
+    fn borrowed_notification_source_cannot_retire_its_owner() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::new(3, 11).unwrap();
+        let successor = ObjectWaitKey::new(3, 12).unwrap();
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |_| {});
+        };
+        zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        let source = zone
+            .admit_object_notification(key, &BoundedSpin(0), &completion)
+            .unwrap()
+            .into_source();
+        {
+            let view = source.borrow();
+            drop(view.reserve());
+        }
+        assert_eq!(
+            zone.bind_object_wait_with_completion(successor, &BoundedSpin(0), &completion),
+            Err(ObjectWaitError::Occupied),
+            "borrowed view must not release durable admission"
+        );
+        drop(source);
+        zone.bind_object_wait_with_completion(successor, &BoundedSpin(0), &completion)
+            .unwrap();
     }
 }
