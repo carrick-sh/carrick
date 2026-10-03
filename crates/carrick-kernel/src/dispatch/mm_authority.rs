@@ -467,6 +467,11 @@ impl MmExecutorParticipation {
     pub fn mm_id(&self) -> crate::kernel::MmId {
         self.authority.mm_id
     }
+    /// Distinguish task/custody admission from host setup editing. This
+    /// exposes no MM policy, descriptor editor, or host protection projection.
+    pub fn has_admitted_el1_owner(&self) -> bool {
+        self.authority.lock().delegated_root().is_some()
+    }
 
     /// Capture immutable owner references before mutation borrows participation.
     pub(in crate::dispatch) fn address_space_publication_owner(
@@ -1053,10 +1058,56 @@ pub struct PreparedDispatchMmFork {
     pub(crate) mode: crate::kernel::CloneObjectMode,
     pub(crate) child_mm: Arc<DispatchMmAuthority>,
     pub(crate) backend_plan: Arc<[carrick_hal::ForkProjectionRange]>,
+    pub(crate) owner_fork: bool,
 }
 
 impl PreparedDispatchMmFork {
+    /// Publish only an owner-fork child's closed root. No setup mapping or
+    /// protection projection is available through this pending child.
+    pub fn publish_owner_child_address_space(
+        &self,
+        ttbr0: u64,
+        ttbr1: u64,
+    ) -> Option<crate::kernel::mm_occupancy::UnpublishedForkAddressSpace> {
+        if !self.owner_fork || self.mode != crate::kernel::CloneObjectMode::Copy {
+            return None;
+        }
+        self.child_mm.seal_reservation_provider();
+        let layout = self.child_mm.lock().layout;
+        crate::kernel::mm_occupancy::publish_closed_fork_address_space(
+            self.child_mm_id,
+            self.child_mm.pt_quiesce(),
+            ttbr0,
+            ttbr1,
+            layout.heap_base,
+            layout.mmap_base,
+            crate::kernel::mm_occupancy::ReservationRootPublication {
+                // Owner Fork inherits the parent's live limits and anchors.
+                limits: crate::kernel::ReservationLimits {
+                    address: u64::MAX,
+                    data: u64::MAX,
+                },
+                provider: self.child_mm.reservation_provider_for_publication(),
+            },
+        )
+    }
+
     pub fn fork_projection_plan(&self) -> carrick_hal::ForkProjectionPlan {
+        if self.owner_fork {
+            return match self.mode {
+                crate::kernel::CloneObjectMode::Share => {
+                    carrick_hal::ForkProjectionPlan::OwnerShared {
+                        parent_mm: self.parent_mm_id.raw(),
+                    }
+                }
+                crate::kernel::CloneObjectMode::Copy => {
+                    carrick_hal::ForkProjectionPlan::OwnerCopied {
+                        parent_mm: self.parent_mm_id.raw(),
+                        child_mm: self.child_mm_id.raw(),
+                    }
+                }
+            };
+        }
         match self.mode {
             crate::kernel::CloneObjectMode::Share => carrick_hal::ForkProjectionPlan::Shared {
                 parent_mm: self.parent_mm_id.raw(),

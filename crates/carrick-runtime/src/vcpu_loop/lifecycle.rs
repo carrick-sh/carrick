@@ -142,21 +142,21 @@ pub(crate) fn validate_hvpatch_process_prepare_boundary(
     request: &carrick_hal::ProcessForkRequest,
     mm_generation: u64,
 ) -> Result<(), RuntimeError> {
-    carrick_hal::validate_fork_projection(request.plan.ranges()).map_err(|error| {
-        RuntimeError::Configuration(format!("invalid HVPatch fork projection: {error}"))
-    })?;
+    if let Ok(ranges) = request.plan.ranges() {
+        carrick_hal::validate_fork_projection(ranges).map_err(|error| {
+            RuntimeError::Configuration(format!("invalid HVPatch fork projection: {error}"))
+        })?;
+    }
     match (inventory, &request.plan) {
         (
             HvpatchProcessInventoryPreparation::Copied(_),
-            carrick_hal::ForkProjectionPlan::Copied {
-                parent_mm,
-                child_mm,
-                ..
-            },
+            carrick_hal::ForkProjectionPlan::Copied { parent_mm, child_mm, .. }
+            | carrick_hal::ForkProjectionPlan::OwnerCopied { parent_mm, child_mm },
         ) if *child_mm == mm_generation && parent_mm != child_mm => Ok(()),
         (
             HvpatchProcessInventoryPreparation::SharedMm { kernel_mm },
-            carrick_hal::ForkProjectionPlan::Shared { parent_mm, .. },
+            carrick_hal::ForkProjectionPlan::Shared { parent_mm, .. }
+            | carrick_hal::ForkProjectionPlan::OwnerShared { parent_mm },
         ) if *parent_mm == *kernel_mm
             && request.plan.child_mm() == *kernel_mm
             && mm_generation == *kernel_mm =>
@@ -214,6 +214,34 @@ pub(crate) trait HvpatchProcessBackendOps<E: ThreadedEngine, M: CurrentMmMemory>
         mm_generation: u64,
         asid_generation: u64,
     ) -> Result<HvpatchProcessPreparation<Self::Prepared>, RuntimeError>;
+    /// Exact production owner's pending receipt, with only byte custody tokens.
+    fn pending_owner_fork_receipt(
+        &self,
+        _memory: &M,
+    ) -> Option<carrick_hal::threaded::PendingOwnerForkReceipt> {
+        None
+    }
+    fn read_optional_fork_output(
+        &mut self,
+        memory: &mut M,
+        address: Option<u64>,
+        _admission: &mut Option<Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>>,
+    ) -> Option<Option<Vec<u8>>> {
+        address
+            .map(|address| memory.read_bytes(address, std::mem::size_of::<i32>()).ok())
+            .map_or(Some(None), |bytes| bytes.map(Some))
+    }
+    fn write_fork_parent_output(
+        &mut self,
+        memory: &mut M,
+        address: u64,
+        bytes: &[u8],
+        _admission: &mut Option<Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>>,
+    ) -> Result<(), RuntimeError> {
+        memory
+            .write_bytes(address, bytes)
+            .map_err(|error| RuntimeError::Configuration(format!("fork parent output: {error:?}")))
+    }
     fn abort(&mut self, prepared: Self::Prepared) -> Result<(), RuntimeError>;
     /// Fresh stage-1 software-image allocations charged to the fork that
     /// `prepare` just completed. Charged to the execution work scope as
@@ -396,6 +424,54 @@ where
             }
         };
         Ok((prepared, cpu, memory.fresh_fork_kicker()))
+    }
+
+    fn read_optional_fork_output(
+        &mut self,
+        memory: &mut E,
+        address: Option<u64>,
+        admission: &mut Option<Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>>,
+    ) -> Option<Option<Vec<u8>>> {
+        let Some(address) = address else {
+            return Some(None);
+        };
+        match admission.as_mut() {
+            Some(admission) => memory
+                .read_owner_fork_parent_bytes(
+                    address,
+                    std::mem::size_of::<i32>(),
+                    admission.as_mut(),
+                )
+                .ok()
+                .map(Some),
+            None => memory
+                .read_bytes(address, std::mem::size_of::<i32>())
+                .ok()
+                .map(Some),
+        }
+    }
+    fn write_fork_parent_output(
+        &mut self,
+        memory: &mut E,
+        address: u64,
+        bytes: &[u8],
+        admission: &mut Option<Box<dyn carrick_guest_mem::BorrowedTtbr0Admission>>,
+    ) -> Result<(), RuntimeError> {
+        match admission.as_mut() {
+            Some(admission) => memory
+                .write_owner_fork_parent_bytes(address, bytes, admission.as_mut())
+                .map_err(RuntimeError::Trap),
+            None => memory.write_bytes(address, bytes).map_err(|error| {
+                RuntimeError::Configuration(format!("fork setup parent output: {error:?}"))
+            }),
+        }
+    }
+
+    fn pending_owner_fork_receipt(
+        &self,
+        memory: &E,
+    ) -> Option<carrick_hal::threaded::PendingOwnerForkReceipt> {
+        memory.pending_owner_fork_receipt()
     }
 
     fn last_fork_stage1_image_allocations(&self, memory: &E) -> u64 {
@@ -688,7 +764,42 @@ where
     stamp_ns_visible_guest_tid(engine, context).map_err(RuntimeError::Trap)?;
     if let ProcessChildBootstrap::GuestFork { child_settid, .. } = bootstrap {
         if let Some((address, tid)) = child_settid {
-            bootstrap_hvpatch_process_child_tid(engine, address, tid)?;
+            let owner_mm = match state.guest_execution.as_ref() {
+                Some(participation) => participation.has_admitted_el1_owner(),
+                None => kernel
+                    .dispatcher
+                    .enter_mm_executor()
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!("child TID owner admission: {error}"))
+                    })?
+                    .has_admitted_el1_owner(),
+            };
+            if owner_mm {
+                use carrick_hal::stage1_mm::Stage1MmProjection;
+                check_hvpatch_process_failpoint(HvpatchProcessFailpoint::ChildSettidBootstrap)?;
+                let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration("owner child TID lost process lease".into())
+                })?;
+                let lease =
+                    process
+                        .mm_resources()
+                        .lease(context.task().key())
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "child TID ASID admission: {error}"
+                            ))
+                        })?;
+                let mut admission = lease.admit_borrowed_ttbr0().ok_or_else(|| {
+                    RuntimeError::Configuration("child TID ASID generation closed".into())
+                })?;
+                // FINISH has settled: the loaded child's exact owner now grants
+                // ordinary CopyOut, including untouched retained file pages.
+                engine
+                    .write_owner_fork_parent_bytes(address, &tid.to_le_bytes(), admission.as_mut())
+                    .map_err(RuntimeError::Trap)?;
+            } else {
+                bootstrap_hvpatch_process_child_tid(engine, address, tid)?;
+            }
         }
         state.complete_precompleted_child(&kernel.reporter, 0)?;
     }

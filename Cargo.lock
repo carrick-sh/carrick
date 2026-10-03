@@ -556,6 +556,7 @@ name = "carrick-hal"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",

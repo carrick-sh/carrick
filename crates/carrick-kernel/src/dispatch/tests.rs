@@ -6982,7 +6982,7 @@ mod container_policy_dispatch_tests {
             )
             .unwrap();
         let plan = prepared.fork_projection_plan();
-        let ranges = plan.ranges();
+        let ranges = plan.ranges().unwrap();
 
         // Check totality over live leaves
         assert_eq!(
@@ -7032,7 +7032,7 @@ mod container_policy_dispatch_tests {
             .unwrap();
         assert_eq!(
             carrick_hal::lookup_fork_projection(
-                grown.fork_projection_plan().ranges(),
+                grown.fork_projection_plan().ranges().unwrap(),
                 heap_base + 0x2000,
             ),
             Some(carrick_hal::ForkLeafDisposition::Preserve)
@@ -7053,12 +7053,12 @@ mod container_policy_dispatch_tests {
             )
             .unwrap();
         assert_eq!(
-            carrick_hal::lookup_fork_projection(shrunk.fork_projection_plan().ranges(), heap_base,),
+            carrick_hal::lookup_fork_projection(shrunk.fork_projection_plan().ranges().unwrap(), heap_base,),
             Some(carrick_hal::ForkLeafDisposition::Preserve)
         );
         assert_eq!(
             carrick_hal::lookup_fork_projection(
-                shrunk.fork_projection_plan().ranges(),
+                shrunk.fork_projection_plan().ranges().unwrap(),
                 heap_base + 0x1000,
             ),
             None
