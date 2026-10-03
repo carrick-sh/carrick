@@ -437,7 +437,8 @@ extent per MM after settlement. No second policy table was introduced.
 `extent_generation_and_pin_custody` additionally fills 512 pages, refuses a
 forged grant token, refuses returning an extent containing a referenced or
 pinned retired page, refuses fork with an outstanding target copy, then rejects
-the stale completion and returns the exact generation. Four compile-fail
+the stale completion and returns the exact generation. Re-grant reuses the
+same physical base with a new token; the old return is refused. Four compile-fail
 doctests prevent handle access to manager, mutable VMA, protections and raw
 host pointer; `just test` now runs them.
 
