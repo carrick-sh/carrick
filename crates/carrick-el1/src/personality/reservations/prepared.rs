@@ -29,9 +29,10 @@ pub struct ClaimedPreparedCopy<'a> {
     settled: &'a carrick_sched_core::completion_queue::CompletionQueue,
     permit: PortalPreparedPermit,
     notification: Option<carrick_sched_core::object_wait::ObjectWaitKey>,
+    armed: bool,
 }
 impl ClaimedPreparedCopy<'_> {
-    pub fn release(self) -> bool {
+    pub fn release(mut self) -> bool {
         if self
             .node
             .next_free
@@ -45,6 +46,7 @@ impl ClaimedPreparedCopy<'_> {
         {
             return false;
         }
+        self.armed = false;
         // Only settled nodes are queued. The guarded doubly-linked live list
         // retains root lifetime until this publication is visible and reaped.
         // SAFETY: the detached primary/tail remain owner-linked until popped.
@@ -70,6 +72,24 @@ impl ClaimedPreparedCopy<'_> {
         self.permit
     }
 }
+impl Drop for ClaimedPreparedCopy<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            assert!(
+                self.node
+                    .next_free
+                    .compare_exchange(
+                        COPYING | self.permit.generation.get(),
+                        LIVE | self.permit.generation.get(),
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok(),
+                "exact prepared claim rollback custody"
+            );
+        }
+    }
+}
 impl SharedReservations {
     /// No root lock or editor acquisition. Metadata-bank pins must outlive
     /// this claim, exactly as they outlive the borrowed production portal.
@@ -78,6 +98,25 @@ impl SharedReservations {
         nodes: Option<&'a ResolvedReservationNodes<P>>,
         permit: PortalPreparedPermit,
         request: PortalTransferRequest,
+    ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
+        self.claim_prepared_inner(nodes, permit, request, || {})
+    }
+    #[cfg(test)]
+    pub(crate) fn claim_prepared_with_rejection<'a, P: PinnedMetadataExtent>(
+        &'a self,
+        nodes: Option<&'a ResolvedReservationNodes<P>>,
+        permit: PortalPreparedPermit,
+        request: PortalTransferRequest,
+        before_rollback: impl FnOnce(),
+    ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
+        self.claim_prepared_inner(nodes, permit, request, before_rollback)
+    }
+    fn claim_prepared_inner<'a, P: PinnedMetadataExtent>(
+        &'a self,
+        nodes: Option<&'a ResolvedReservationNodes<P>>,
+        permit: PortalPreparedPermit,
+        request: PortalTransferRequest,
+        before_rollback: impl FnOnce(),
     ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
         if permit.generation.get() > GENERATION
             || permit.index == 0
@@ -122,8 +161,7 @@ impl SharedReservations {
         if permit.operation != request.operation
             || PortalTransferRequest::decode(words) != Some(request)
         {
-            node.next_free
-                .store(LIVE | permit.generation.get(), Ordering::Release);
+            before_rollback();
             return Err(Refusal::Stale);
         }
         let notification = match u32::try_from(notification_index) {
@@ -131,8 +169,6 @@ impl SharedReservations {
                 carrick_sched_core::object_wait::ObjectWaitKey::new(index, notification_generation)
             }
             Err(_) => {
-                node.next_free
-                    .store(LIVE | permit.generation.get(), Ordering::Release);
                 return Err(Refusal::Stale);
             }
         };
@@ -158,6 +194,7 @@ impl SharedReservations {
             },
             permit,
             notification,
+            armed: true,
         })
     }
 }
