@@ -176,17 +176,25 @@ impl LockWait for HostLockWait {
         owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects,
     ) {
         let (waker, effects) = owned.deliver_handbacks(&mut publish_handback);
+        let own = match waker {
+            carrick_sched_core::Waker::El1 { slot } => Some(slot),
+            carrick_sched_core::Waker::Host => None,
+        };
+        assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
         for slot in effects
             .sgi_slots()
-            .chain(effects.queued_own.then_some(waker))
+            .chain(own.filter(|_| effects.queued_own))
         {
             zone.owe_resched(slot);
             resched_slot(slot);
         }
-        if effects.misplaced {
-            kick_slot(waker);
+        if effects.misplaced
+            && let Some(slot) = own
+        {
+            kick_slot(slot);
         }
     }
+
     fn wait(&self, attempt: u32) -> bool {
         if attempt < 128 {
             std::hint::spin_loop();
