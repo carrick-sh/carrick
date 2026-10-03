@@ -578,7 +578,7 @@ fn handle(
     archive: &dyn CarrierArchiveControl,
 ) -> Result<(), ControlError> {
     authenticate(stream)?;
-    stream.set_read_timeout(Some(DEADLINE))?;
+    wait_readable(stream)?; // await readable
     stream.set_write_timeout(Some(DEADLINE))?;
     let request: ControlRequest = serde_json::from_slice(&read_frame(stream)?).map_err(protocol)?;
     let request_id = request.request_id;
@@ -738,15 +738,28 @@ fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), ControlError
     Ok(())
 }
 
-fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, ControlError> {
-    read_frame_with_deadline(stream, DEADLINE)
+fn wait_readable(stream: &UnixStream) -> Result<(), ControlError> {
+    let mut pollfd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        if rc > 0 {
+            return Ok(());
+        }
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ControlError::Io(err));
+        }
+    }
 }
 
-fn read_frame_with_deadline(
-    stream: &mut UnixStream,
-    deadline: Duration,
-) -> Result<Vec<u8>, ControlError> {
-    let started = Instant::now();
+fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, ControlError> {
     let mut prefix = [0_u8; 4];
     stream.read_exact(&mut prefix)?;
     let len = u32::from_be_bytes(prefix) as usize;
@@ -759,6 +772,15 @@ fn read_frame_with_deadline(
     if stream.read(&mut trailing)? != 0 {
         return Err(ControlError::Protocol("trailing bytes".to_owned()));
     }
+    Ok(bytes)
+}
+
+fn read_frame_with_deadline(
+    stream: &mut UnixStream,
+    deadline: Duration,
+) -> Result<Vec<u8>, ControlError> {
+    let started = Instant::now();
+    let bytes = read_frame(stream)?;
     if started.elapsed() > deadline {
         return Err(ControlError::Protocol("deadline exceeded".to_owned()));
     }
@@ -1167,11 +1189,42 @@ mod tests {
         assert!(work.admit(ControlTaskKey { pid: 71, serial: 1 }));
         assert_eq!(submitter.join().expect("submitter"), Ok(capability));
 
+        #[derive(Debug)]
+        struct NotifyingExecAdmission {
+            inner: Arc<dyn CarrierExecAdmission>,
+            entered: std::sync::mpsc::SyncSender<()>,
+        }
+
+        impl CarrierExecAdmission for NotifyingExecAdmission {
+            fn admit(
+                &self,
+                request_id: ExecCapability,
+                request: ExecRequest,
+            ) -> Result<ExecCapability, ExecAdmissionError> {
+                self.inner.admit(request_id, request)
+            }
+
+            fn query(&self, capability: ExecCapability) -> ExecStatus {
+                self.inner.query(capability)
+            }
+
+            fn wait(&self, capability: ExecCapability) -> ExecStatus {
+                let _ = self.entered.send(());
+                self.inner.wait(capability)
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let notifying_runtime = Arc::new(NotifyingExecAdmission {
+            inner: Arc::clone(&runtime) as Arc<dyn CarrierExecAdmission>,
+            entered: entered_tx,
+        });
+
         let mut server = CarrierControlServer::start_at_with_exec(
             Arc::clone(&kernel),
             init.task().key(),
             endpoint.clone(),
-            runtime,
+            notifying_runtime,
         )
         .expect("server");
         let state = server.state();
@@ -1184,7 +1237,9 @@ mod tests {
                 ControlOperation::ExecWait { capability },
             )
         });
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("waiter entered exec wait");
         let started = std::time::Instant::now();
         assert_eq!(
             send_at(&endpoint, &state, ControlOperation::Status).expect("status"),
