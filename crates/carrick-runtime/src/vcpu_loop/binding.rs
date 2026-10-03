@@ -4304,17 +4304,41 @@ where
                         VcpuLoopOutcome::ProcessExit(Box::new(result)),
                     ));
                 };
+                let owner_file_fault = match self.state.zone_mm {
+                    Some(mm_key) => {
+                        signal::resolve_owner_file_fault(engine, mm_key, si_addr, fault_access)
+                            .map_err(RuntimeError::Trap)?
+                    }
+                    None => None,
+                };
+                if owner_file_fault == Some(carrick_hal::OwnerFileFaultOutcome::Resolved) {
+                    return Ok(executor::ExecutorExit::Syscall);
+                }
+                let (signum, si_code) =
+                    if owner_file_fault == Some(carrick_hal::OwnerFileFaultOutcome::BusFault) {
+                        (
+                            crate::linux_abi::LINUX_SIGBUS,
+                            carrick_abi::LINUX_BUS_ADRERR,
+                        )
+                    } else {
+                        (signum, si_code)
+                    };
                 // Raw hardware/host faults can decode as MAPERR even when
                 // Carrick tracks a live VMA denying the access. Upgrade from the
                 // shared protection metadata (LTP mmap05 / roprotect probe).
-                let si_code = carrick_kernel::kernel::objects::signal::upgrade_protection_si_code(
-                    &*engine, signum, si_code, si_addr,
-                );
+                let si_code = if owner_file_fault.is_none() {
+                    carrick_kernel::kernel::objects::signal::upgrade_protection_si_code(
+                        &*engine, signum, si_code, si_addr,
+                    )
+                } else {
+                    si_code
+                };
                 let interrupted_pc = from_el0_direct.then_some(elr);
                 let faulting_tid = self.state.linux_tid;
                 let requires_mm_mutation =
                     self.kernel.dispatcher.fault_requires_mm_mutation(si_addr);
-                if requires_mm_mutation
+                if owner_file_fault.is_none()
+                    && requires_mm_mutation
                     && self
                         .state
                         .with_mm_mutation_authority(&self.kernel, |mutation| {

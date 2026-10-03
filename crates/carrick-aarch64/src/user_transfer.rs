@@ -16,6 +16,14 @@ pub trait TransferPin {
     /// finish during retention, before EL1 takes the copy editor.
     fn copy(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &mut [u8]) -> bool;
 }
+impl TransferPin for Box<dyn TransferPin> {
+    fn identity(&self) -> PortalRetainedData {
+        (**self).identity()
+    }
+    fn copy(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &mut [u8]) -> bool {
+        (**self).copy(request, bytes)
+    }
+}
 pub trait TransferGrant {
     fn transaction(&self) -> &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn;
     fn settle(
@@ -49,6 +57,8 @@ pub trait TransferCustody {
     ) -> Result<Option<Self::Pin>, TrapError>;
 }
 
+pub type ErasedPhysicalCustody = dyn TransferCustody<Pin = Box<dyn TransferPin>>;
+
 /// The target binding comes from the admitted production MM and ASID owner.
 #[derive(Clone, Copy)]
 pub struct TransferTarget {
@@ -66,7 +76,7 @@ impl TransferTarget {
     pub fn ttbr0(self) -> u64 {
         self.ttbr0
     }
-    pub fn bind<V: Aarch64Vmm, C: TransferCustody>(
+    pub fn bind<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         engine: &mut Aarch64EngineCore<V>,
         mm: ReservationMm,
         ttbr0: u64,
@@ -135,6 +145,7 @@ pub struct OwnedUserTransfer {
     intent: PortalTransferIntent,
     bytes: Vec<u8>,
     offset: usize,
+    fork_sequence: Option<NonZeroU64>,
 }
 impl OwnedUserTransfer {
     pub fn new(target: TransferTarget, request: UserTransfer) -> Option<Self> {
@@ -160,7 +171,24 @@ impl OwnedUserTransfer {
             intent,
             bytes,
             offset: 0,
+            fork_sequence: None,
         })
+    }
+    /// Scope only the fork task-commit copyout to the exact retained parent
+    /// operation. Generic transfers remain excluded while Fork is pending.
+    pub fn authorize_fork_parent_write(&mut self, operation: PortalOperation) -> bool {
+        if operation.carrier != self.target.handle.carrier()
+            || operation.mm != self.target.handle.mm()
+            || operation.incarnation != self.target.handle.incarnation()
+            || !matches!(
+                self.intent,
+                PortalTransferIntent::UserRead | PortalTransferIntent::UserWrite
+            )
+        {
+            return false;
+        }
+        self.fork_sequence = Some(operation.sequence);
+        true
     }
     pub fn offset(&self) -> usize {
         self.offset
@@ -171,7 +199,7 @@ impl OwnedUserTransfer {
 
     /// One page per admission; never keeps the editor across the next chunk,
     /// a grant/refill, a scheduler suspension, or host I/O.
-    pub fn advance<V: Aarch64Vmm, C: TransferCustody>(
+    pub fn advance<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         &mut self,
         engine: &mut Aarch64EngineCore<V>,
         admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
@@ -207,6 +235,7 @@ impl OwnedUserTransfer {
         frame.x[5] = len as u64;
         frame.x[6] = self.intent.encode();
         frame.x[7] = self.offset as u64;
+        frame.x[19] = self.fork_sequence.map_or(0, NonZeroU64::get);
         let caller = engine
             .vcpu()
             .mailbox_slot()
@@ -214,10 +243,14 @@ impl OwnedUserTransfer {
         let executable = slots
             .executable(caller)
             .ok_or_else(|| error("invalid publication slot"))?;
-        let selected_frame =
-            engine.run_user_transfer_service(frame, self.target.ttbr0, admission, &mut || {
-                executable.handle(|request| custody.publish_executable(self.target, request))
-            })?;
+        let selected_frame = run_selected_service(
+            engine,
+            frame,
+            self.target,
+            self.fork_sequence,
+            admission,
+            &mut || executable.handle(|request| custody.publish_executable(self.target, request)),
+        )?;
         match selected_frame.x[0] {
             11 => {
                 if matches!(selected_frame.x[14], 1 | 2) {
@@ -245,6 +278,7 @@ impl OwnedUserTransfer {
                         )
                         .ok_or_else(|| error("invalid supply permission"))?,
                         fault_page: selected_frame.x[13],
+                        fork_sequence: self.fork_sequence,
                         host_backing: if selected_frame.x[16] == 0 {
                             if selected_frame.x[17] != 0 || selected_frame.x[18] != 0 {
                                 return Err(error("invalid backing receipt"));
@@ -290,9 +324,11 @@ impl OwnedUserTransfer {
                                 esr: carrick_el1_abi::MM_PORTAL_GRANT_ESR,
                                 ..TrapFrame::default()
                             };
-                            let outcome = engine.run_user_transfer_service(
+                            let outcome = run_selected_service(
+                                engine,
                                 frame,
-                                self.target.ttbr0,
+                                self.target,
+                                self.fork_sequence,
                                 admission,
                                 &mut || false,
                             );
@@ -338,7 +374,7 @@ impl OwnedUserTransfer {
         let Some(mut pin) = custody.retain(selected, len, self.intent)? else {
             return Ok(TransferProgress::Suspended);
         };
-        let request = PortalTransferRequest::new(
+        let mut request = PortalTransferRequest::new(
             operation,
             PortalByteRange::new(va, len as u64).ok_or_else(|| error("invalid range"))?,
             self.intent,
@@ -346,6 +382,7 @@ impl OwnedUserTransfer {
             pin.identity(),
         )
         .ok_or_else(|| error("invalid retained request"))?;
+        request.fork_sequence = self.fork_sequence;
         let slot = slots
             .slot(selected_frame.slot as usize)
             .ok_or_else(|| error("invalid caller slot"))?;
@@ -356,8 +393,13 @@ impl OwnedUserTransfer {
             esr: carrick_el1_abi::MM_PORTAL_SERVICE_ESR,
             ..TrapFrame::default()
         };
-        if let Err(failure) =
-            engine.run_user_transfer_service(frame, self.target.ttbr0, admission, &mut || {
+        if let Err(failure) = run_selected_service(
+            engine,
+            frame,
+            self.target,
+            self.fork_sequence,
+            admission,
+            &mut || {
                 let handled = ticket.copy_requested(|exact| {
                     pin.copy(exact, &mut self.bytes[self.offset..self.offset + len])
                 });
@@ -368,8 +410,8 @@ impl OwnedUserTransfer {
                     );
                 }
                 handled
-            })
-        {
+            },
+        ) {
             if !ticket.cancel_unclaimed() && ticket.take_completion().is_none() {
                 carrick_fatal::carrick_fatal!(
                     "aarch64::user_transfer",
@@ -400,5 +442,104 @@ impl OwnedUserTransfer {
             )),
             _ => Err(error("invalid completion errno")),
         }
+    }
+}
+
+fn run_selected_service<V: Aarch64Vmm>(
+    engine: &mut Aarch64EngineCore<V>,
+    frame: TrapFrame,
+    target: TransferTarget,
+    fork_sequence: Option<NonZeroU64>,
+    admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    effect: &mut dyn FnMut() -> bool,
+) -> Result<TrapFrame, TrapError> {
+    if let Some(sequence) = fork_sequence {
+        engine.run_owner_parent_transfer(frame, target, sequence, effect)
+    } else {
+        engine.run_user_transfer_service(frame, target.ttbr0, admission, effect)
+    }
+}
+
+/// Erase only the retained physical pin type for a backend-owned byte venue.
+pub struct ErasedTransferCustody<C>(pub C);
+impl<C: TransferCustody> TransferCustody for ErasedTransferCustody<C>
+where
+    C::Pin: 'static,
+{
+    type Pin = Box<dyn TransferPin>;
+    fn carrier(&self) -> NonZeroU64 {
+        self.0.carrier()
+    }
+    fn prepare(
+        &self,
+        target: TransferTarget,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<Option<Box<dyn TransferGrant>>, TrapError> {
+        self.0.prepare(target, window)
+    }
+    fn publish_executable(
+        &self,
+        target: TransferTarget,
+        request: carrick_el1_abi::PortalExecutablePublication,
+    ) -> bool {
+        self.0.publish_executable(target, request)
+    }
+    fn refill_cow(
+        &self,
+        target: TransferTarget,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<bool, TrapError> {
+        self.0.refill_cow(target, window)
+    }
+    fn retain(
+        &self,
+        selected: PortalSelectedData,
+        len: usize,
+        intent: PortalTransferIntent,
+    ) -> Result<Option<Self::Pin>, TrapError> {
+        self.0
+            .retain(selected, len, intent)
+            .map(|pin| pin.map(|pin| Box::new(pin) as Box<dyn TransferPin>))
+    }
+}
+
+#[cfg(test)]
+mod fork_parent_tests {
+    use super::*;
+    #[test]
+    fn fresh_parent_copyout_after_finish_has_no_stale_fork_scope() {
+        let carrier = NonZeroU64::new(1).unwrap();
+        let mm = ReservationMm::new(2).unwrap();
+        let incarnation = NonZeroU64::new(3).unwrap();
+        // SAFETY: isolated capability fixture, never submitted to production.
+        let handle =
+            unsafe { carrick_el1_abi::El1MmHandle::from_admitted_owner(carrier, mm, incarnation) };
+        let target = TransferTarget::from_handle(handle, 0x4000);
+        let output = || UserTransfer::CopyOut {
+            address: 0x7000,
+            bytes: vec![1],
+        };
+        let operation = PortalOperation {
+            carrier,
+            mm,
+            incarnation,
+            sequence: NonZeroU64::new(4).unwrap(),
+        };
+        let mut pending = OwnedUserTransfer::new(target, output()).unwrap();
+        assert!(pending.authorize_fork_parent_write(operation));
+        assert_eq!(pending.fork_sequence, Some(operation.sequence));
+        drop(pending);
+        let rollback = OwnedUserTransfer::new(target, output()).unwrap();
+        assert_eq!(rollback.fork_sequence, None);
+        let input = || UserTransfer::CopyIn {
+            address: 0x7000,
+            len: 4,
+            intent: PortalTransferIntent::UserRead,
+        };
+        let preflight = OwnedUserTransfer::new(target, input()).unwrap();
+        assert_eq!(preflight.fork_sequence, None);
+        let mut pending_input = OwnedUserTransfer::new(target, input()).unwrap();
+        assert!(pending_input.authorize_fork_parent_write(operation));
+        assert_eq!(pending_input.fork_sequence, Some(operation.sequence));
     }
 }

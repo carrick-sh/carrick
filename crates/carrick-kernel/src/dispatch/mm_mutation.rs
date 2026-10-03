@@ -469,6 +469,45 @@ pub fn from_sole_executor<'authority>(
     }
 }
 
+/// Exact-MM task/custody admission for an admitted owner. This capability
+/// owns no host page-table pause or EL1 editor exclusion and cannot be
+/// converted to a host descriptor editor. The owner supplies memory policy.
+pub struct OwnerMmTopologyGuard<'authority> {
+    inner: MmMutationGuard<'authority>,
+}
+impl OwnerMmTopologyGuard<'_> {
+    pub fn mm_id(&self) -> MmId {
+        self.inner.mm_id()
+    }
+    pub fn host_alias_permit(&self) -> HostAliasPermit<'_> {
+        self.inner.host_alias_permit()
+    }
+    pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {
+        self.inner.begin_transaction()
+    }
+}
+
+pub fn from_owner_executor<'authority>(
+    participation: &'authority mut super::MmExecutorParticipation,
+) -> Option<OwnerMmTopologyGuard<'authority>> {
+    if !participation.has_admitted_el1_owner() {
+        return None;
+    }
+    Some(OwnerMmTopologyGuard {
+        inner: MmMutationGuard {
+            coordinator: participation.mutation_coordinator(),
+            mm: participation.mm_id(),
+            operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+            guest_tid: participation.guest_tid(),
+            foreign_authority: None,
+            _el1_editor: None,
+            _stage1: None,
+            caller_el1: None,
+            _authority: PhantomData,
+        },
+    })
+}
+
 pub fn from_executor<'authority>(
     participation: &'authority mut super::MmExecutorParticipation,
 ) -> Result<MmMutationGuard<'authority>, super::mm_quiesce::PtPauseError> {

@@ -178,32 +178,6 @@ impl DelegatedRoot {
         }
         step(&mut model)
     }
-
-    /// The fork admission step: `parent`'s exact admitted root and this
-    /// child's exact published, unsealed root, both views prepared before
-    /// either root guard is taken. Host queues are taken parent first.
-    pub(in crate::dispatch) fn seed_from<R>(
-        &self,
-        parent: &DelegatedRoot,
-        step: impl FnOnce(&mut Reservations<'_>, &mut Reservations<'_>) -> Result<R, Refusal>,
-    ) -> Result<R, Refusal> {
-        if parent.mm == self.mm || Arc::ptr_eq(&parent.host_serial, &self.host_serial) {
-            return Err(Refusal::Invalid);
-        }
-        let _parent_host = parent.host_serial.lock();
-        let _host = self.host_serial.lock();
-        let parent_view = parent.provider.prepare()?;
-        let view = self.provider.prepare()?;
-        let mut parent_model = parent_view.lock(parent.mm)?;
-        if parent_model.mm() != parent.mm || !parent_model.is_admitted() {
-            return Err(Refusal::Stale);
-        }
-        let mut model = view.lock(self.mm)?;
-        if model.mm() != self.mm || model.is_admitted() {
-            return Err(Refusal::Stale);
-        }
-        step(&mut parent_model, &mut model)
-    }
 }
 
 impl DispatchMmAuthority {
