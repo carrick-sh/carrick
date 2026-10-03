@@ -5,9 +5,9 @@ use crate::ReservationMm;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const MM_PORTAL_PROTOCOL: u64 = 3;
+pub const MM_PORTAL_PROTOCOL: u64 = 4;
 pub const MM_PORTAL_MAX_BYTES: u64 = 4096;
-pub const MM_PORTAL_BIND_ESR: u64 = 0x4352_4d4d_4249_0003;
+pub const MM_PORTAL_BIND_ESR: u64 = 0x4352_4d4d_4249_0004;
 /// Identity of an admitted owner. It contains no editor, table, or host pointer.
 ///
 /// Safe callers cannot manufacture admitted ownership.
@@ -52,8 +52,8 @@ impl El1MmHandle {
     }
 }
 
-pub const MM_PORTAL_SELECT_ESR: u64 = 0x4352_4d4d_5345_0003;
-pub const MM_PORTAL_SERVICE_ESR: u64 = 0x4352_4d4d_5452_0003;
+pub const MM_PORTAL_SELECT_ESR: u64 = 0x4352_4d4d_5345_0004;
+pub const MM_PORTAL_SERVICE_ESR: u64 = 0x4352_4d4d_5452_0004;
 pub const EL1_MM_PORTAL_OFFSET: u64 = 0x1C_0000;
 pub const EL1_MM_PORTAL_BASE: u64 = crate::EL1_REGION_BASE + EL1_MM_PORTAL_OFFSET;
 const IDLE: u64 = 0;
@@ -151,6 +151,7 @@ pub struct PortalTransferRequest {
     pub intent: PortalTransferIntent,
     pub selected: PortalSelectedData,
     pub retained: PortalRetainedData,
+    pub fork_sequence: Option<NonZeroU64>,
 }
 impl PortalTransferRequest {
     pub fn new(
@@ -175,9 +176,10 @@ impl PortalTransferRequest {
             intent,
             selected,
             retained,
+            fork_sequence: None,
         })
     }
-    fn words(self) -> [u64; 16] {
+    fn words(self) -> [u64; 17] {
         [
             MM_PORTAL_PROTOCOL,
             self.operation.carrier.get(),
@@ -195,9 +197,10 @@ impl PortalTransferRequest {
             self.retained.owner.map_or(0, |owner| owner.0.get()),
             self.retained.owner.map_or(0, |owner| owner.1.get()),
             u64::from(self.selected.executable),
+            self.fork_sequence.map_or(0, NonZeroU64::get),
         ]
     }
-    fn decode(w: [u64; 16]) -> Option<Self> {
+    fn decode(w: [u64; 17]) -> Option<Self> {
         if w[0] != MM_PORTAL_PROTOCOL || w[15] > 1 {
             return None;
         }
@@ -226,6 +229,10 @@ impl PortalTransferRequest {
                 owner,
             },
         )
+        .map(|mut request| {
+            request.fork_sequence = NonZeroU64::new(w[16]);
+            request
+        })
     }
 }
 
@@ -241,7 +248,7 @@ pub struct PortalTransferCompletion {
 #[repr(C, align(64))]
 pub struct PortalTransferSlot {
     state: AtomicU64,
-    request: [AtomicU64; 16],
+    request: [AtomicU64; 17],
     completed: AtomicU64,
     errno: AtomicU64,
 }
@@ -254,7 +261,7 @@ impl PortalTransferSlot {
     pub const fn new() -> Self {
         Self {
             state: AtomicU64::new(IDLE),
-            request: [const { AtomicU64::new(0) }; 16],
+            request: [const { AtomicU64::new(0) }; 17],
             completed: AtomicU64::new(0),
             errno: AtomicU64::new(0),
         }
@@ -429,6 +436,7 @@ impl PortalTransferService<'_> {
 pub struct MmPortalSlots {
     carrier: AtomicU64,
     executable: [crate::PortalExecutableSlot; crate::EL1_STACK_SLOTS as usize],
+    forks: [crate::PortalForkSlot; crate::EL1_STACK_SLOTS as usize],
     grants: [crate::PortalGrantSlot; crate::EL1_STACK_SLOTS as usize],
     slots: [PortalTransferSlot; crate::EL1_STACK_SLOTS as usize],
 }
@@ -443,9 +451,26 @@ impl MmPortalSlots {
             carrier: AtomicU64::new(0),
             executable: [const { crate::PortalExecutableSlot::new() };
                 crate::EL1_STACK_SLOTS as usize],
+            forks: [const { crate::PortalForkSlot::new() }; crate::EL1_STACK_SLOTS as usize],
             grants: [const { crate::PortalGrantSlot::new() }; crate::EL1_STACK_SLOTS as usize],
             slots: [const { PortalTransferSlot::new() }; crate::EL1_STACK_SLOTS as usize],
         }
+    }
+    pub fn fork(&self, slot: usize) -> Option<&crate::PortalForkSlot> {
+        self.forks.get(slot)
+    }
+    pub fn has_outstanding_transfer(&self, mm: ReservationMm) -> bool {
+        self.slots.iter().any(|slot| {
+            let state = slot.state.load(Ordering::Acquire);
+            state != IDLE
+                && (state == WRITING
+                    || slot
+                        .load_request()
+                        .is_none_or(|request| request.operation.mm == mm))
+        }) || self
+            .grants
+            .iter()
+            .any(|slot| slot.has_outstanding_for(mm.raw()))
     }
     /// Bind this retained carrier region once. Independent custody objects
     /// must use distinct IDs even when their VM generations both start at one.
