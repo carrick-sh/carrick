@@ -1165,8 +1165,8 @@ impl Thread {
 
     /// The thread's Linux run state. A zone thread's execution state is the
     /// host's last word on it, but where the guest schedules, EL1 moves it
-    /// without the host: a thread the host loaded on a vCPU may be parked in
-    /// EL1 (its home record) while its vCPU idles, and a thread in a host zone
+    /// without the host: a thread may be parked on a home or foreign EL1
+    /// record while its vCPU idles, and a thread in a host zone
     /// wait may be queued or running in EL1. The zone's claim word is the
     /// authority for those, so it decides `S` or `R` there.
     pub fn linux_run_state(&self) -> Option<char> {
@@ -1179,9 +1179,11 @@ impl Thread {
                 .and_then(|continuation| continuation.zone_wait())
                 .and_then(|wait| crate::el1_zone::record_runs(wait.record))
                 .map(|runs| if runs { 'R' } else { 'S' }),
-            ThreadExecutionState::Running { .. } => {
-                crate::el1_zone::home_record_parked(self.key).then_some('S')
-            }
+            ThreadExecutionState::Running { .. } | ThreadExecutionState::Runnable { .. } => self
+                .control_slot()
+                .zone_record()
+                .and_then(|record| crate::el1_zone::thread_record_runs(record, self.key))
+                .map(|runs| if runs { 'R' } else { 'S' }),
             _ => None,
         };
         Some(zone.unwrap_or(base))

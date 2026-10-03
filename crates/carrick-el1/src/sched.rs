@@ -125,6 +125,22 @@ pub struct IrqsTaken {
 }
 
 impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
+    fn current_record(&self) -> Result<carrick_el1_abi::RecordId, carrick_sched_core::Exhausted> {
+        let record = self.zone.current_or_new(
+            self.slot,
+            identity_of(self.task, self.zone.slot(self.slot).affinity()),
+        )?;
+        #[cfg(target_os = "none")]
+        {
+            use crate::personality::lifecycle::LifecycleVenue;
+            if let Some(thread) =
+                crate::personality::lifecycle::GuestLifecycleVenue.thread(self.task)
+            {
+                thread.slot.bind_zone_record(self.zone.record_ref(record));
+            }
+        }
+        Ok(record)
+    }
     pub(crate) fn ticks(&self, ns: u64) -> u64 {
         (u128::from(ns) * u128::from(self.cpu.freq()) / 1_000_000_000) as u64
     }
@@ -200,10 +216,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return Some(Served::Returned { switched: false });
         }
         let fresh = zone.slot(slot).current().is_none();
-        let affinity = zone.slot(slot).affinity();
-        let record = zone
-            .current_or_new(slot, identity_of(self.task, affinity))
-            .ok()?;
+        let record = self.current_record().ok()?;
         if deadline.is_some()
             && (zone.slot(slot).host_record() != Some(record) || !zone.timer_free(slot))
         {
@@ -541,8 +554,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// executor). False if it could not be parked; it keeps running.
     fn park_preempted(&mut self, frame: &TrapFrame) -> bool {
         let (zone, slot) = (self.zone, self.slot);
-        let affinity = zone.slot(slot).affinity();
-        let Ok(prev) = zone.current_or_new(slot, identity_of(self.task, affinity)) else {
+        let Ok(prev) = self.current_record() else {
             return false;
         };
         // SAFETY: `prev` holds the running thread (a fresh home record, or
@@ -562,8 +574,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return true;
         }
         let fresh = zone.slot(slot).current().is_none();
-        let affinity = zone.slot(slot).affinity();
-        let Ok(prev) = zone.current_or_new(slot, identity_of(self.task, affinity)) else {
+        let Ok(prev) = self.current_record() else {
             return true;
         };
         // SAFETY: `prev` holds the running thread (a fresh home record, or
