@@ -193,6 +193,7 @@ pub(crate) mod host_writes;
 mod user_transfer;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
+pub use sparse_materialization::{PendingImport, RetainedImportSource};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use user_transfer::UserTransferCustody;
 
