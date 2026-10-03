@@ -693,3 +693,74 @@ Validate Markdown through Pandoc, check all relative document/source targets,
 review diff/whitespace, and commit with a Why/What/Verified body and agent
 trailer. Documentation verification establishes reviewability, not any proposed
 contract, runtime result, branch acceptance or performance forecast.
+
+### N1 execution order
+
+These four checkpoints partition all 30 section-2 venues. Each can land with
+its own red-first witnesses and acceptance receipt; none accepts the complete
+MM cutover until all four close. Ordering follows the frozen admission report's
+observed failure groups, not a claimed causal ranking: buffer authorization
+blocks probe output and later shard coverage, policy has four observed DIFFs,
+and fork/observer attribution remains mixed with N2. The report did not measure
+per-venue failure counts, so an exact frequency ranking is unavailable.
+
+| Checkpoint | Venues | Red-first witnesses and landing boundary |
+| --- | --- | --- |
+| N1a: live host buffer transfers | 3, 4, 5, 7, 28 | Signed musl `mmapv8align` and separately reached `mmapprivatefiletrack`; inverse EL1 munmap/PROT_NONE then host read must return EFAULT (14), with two live MMs at the same VA. Bind checked GuestMemory entries and every raw escape to UserTransfer; delete admitted protection-mirror storage, host permission/COW selection and guessed VA-to-IPA copyout. Internal control-window reads use a distinct bounded intent. Physical content pins/coherence remain. Production transport required. |
+| N1b: memory policy and physical backing | 6, 12, 13, 14, 15, 16, 17, 18, 19, 20 | Frozen `coredumpbit`, `mmapcluster`, `forkfault`, `roprotect`, `msyncalign`, `rlimitasdata`; signed `el1_anonymous_reservations_stay_in_guest` and `el1_delegated_root_map_fixed_over_cow_pages`. Include all VMA kinds, partial-compound reuse, stale/duplicate grants, failure rollback and live fault classification. Reuse N1a transport for Capacity/HostBacking; no host policy proposals for admitted roots. These tests' causal assignment is provisional. |
+| N1c: fork, exec and sealed root lifecycle | 1, 2, 10, 11, 21, 22, 23, 29 | N0 `red_until_n1_production_admission_retains_host_semantic_venue` must become a positive exclusive-owner assertion; compiler fences plus owner matrix fork/child isolation, outstanding-copy refusal, stale completion and exec rollback. Frozen `nxwritableimage`, `forkexecstorm`, `exitgroupthreads`, `futexforkwakegroups` are composition witnesses, with N2 task/wait failures separately retained. Delete projection/snapshot/edit/pause capabilities; preserve task birth and root occupancy proofs. Reuse transport for Fork/Exec. |
+| N1d: exceptional readers and writers | 8, 9, 24, 25, 26, 27, 30 | Two-MM stopped-target ptrace/process_vm and /proc/mem permission/prefix witnesses; live maps/residency, parked-thread core snapshot, signal-frame fault and native activation revocation under protect/unmap/exec. Owner matrix stopped-target/default-slot and delayed completion proofs must bind to signed production. Reuse transport for UserTransfer/Observe/Snapshot; ReadInstruction, NativeData and authorized POKE remain distinct intents. |
+
+`killrt`, `splicepipeempty` and deadline failure `epollstopcont` remain explicit
+N2 composition reds unless production evidence attributes them to N1. Preserve
+all 13 observed musl DIFFs and the deadline row as the frozen denominator;
+GNU/private-file cases not reached by that batch must be reported separately.
+Do not remove either named `el1_` known red until it actually passes on this
+branch's identified signed executable, regardless of checkpoint placement.
+
+#### One production transport, shared by all checkpoints
+
+Extend `carrick-el1-abi`'s existing versioned service/mailbox ABI with a bounded
+MmPortal request/completion record. Do not export N0's in-process Rust slices
+or host pointers on the wire. Requests name carrier, exact MM/incarnation,
+operation generation, closed intent, GuestVa/length and bounded transfer-storage
+identity; responses carry completed prefix, errno and the same identities.
+Validate lengths, arithmetic, storage custody and generation at both ends.
+Release/acquire slot ownership makes storage immutable while EL1 consumes it;
+stale, canceled or duplicate completion cannot release a newer operation's pins.
+
+The host enqueues work for the exact owner and schedules the existing EL1
+service-call entry on the carrier maintenance root. Reuse the existing
+`run_el1_service_call_on` register save/restore and MaintenanceDone return ABI,
+with scheduler-owned service capacity, rather than a target-EL0 resume or a
+borrowed target descriptor editor. A stopped/parked target stays stopped;
+service resolves its root by exact AddressSpaces identity. The shared MM owner
+transaction checks live permissions, materializes/COWs and pins selected spans,
+then copies through bounded storage. No MM lock spans host file I/O. Capacity
+or backing suspension returns an owned continuation; settlement resumes the
+same operation, never a host fallback or a restart from byte zero. Default-slot
+exhaustion must prove service progress before promotion; register save/restore
+alone is not that proof. Checked read APIs currently take `&self`, whereas the
+existing service-call entry needs mutable vCPU ownership: production binding
+must introduce a scheduler-owned transfer capability, not mutate the vCPU
+through an unchecked alias or run the EL1 personality on the host.
+
+N0's 14,630–63,963 backend validation callbacks against 8–10 grants are
+**EL1-local work, never host crossings**. Production descriptor resolution,
+VMA checks, reference/pin validation and span authentication execute within
+the EL1 owner against its live tables and granted extent metadata. Only bulk
+Capacity grant/return and actual HostBacking effects cross the physical backend
+boundary. A per-validation host RPC would violate N0's cost contract; count
+local validations separately from transport requests and bulk grants.
+CarrickInternalRead is constructed only by the internal-window capability and
+is restricted to the declared immutable boot-control window, including the
+previously rejected read at `0x2d001e4004`; it never authorizes user pointers
+or arbitrary writes to EL1-owned windows. Dedicated physical clock updates
+retain their own carrier control capability.
+
+Each checkpoint uses `kernel.el1.mm-exclusive-owner` and the existing
+reservation/reader/fork contracts, preserving all budgets. Run host and signed
+`just accept` through main's xtask `--root` if recipes remain absent here;
+signed commands take `just lease carrick`, exact CARRICK_RUN_ID and scoped
+`scripts/sudo/kill.sh` cleanup. Record signed artifact identities and generic
+shard remaining-DIFF delta. No Docker is authorized for this execution task.
