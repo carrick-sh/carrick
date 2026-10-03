@@ -286,126 +286,6 @@ fn hostfs_teardown_has_no_process_creation_surface() {
     }
 }
 
-/// Regression for the measured 26k-entry OCI upper teardown: the exit
-/// owner may retire the live name, but it must not recursively unlink the
-/// tree before returning. The cleanup worker is allowed to finish while
-/// this test process remains alive.
-#[test]
-fn hostfs_teardown_retires_large_tree_before_recursive_cleanup() {
-    let parent = tempfile::TempDir::new().expect("teardown test parent");
-    let victim = parent.path().join("run-scratch");
-    std::fs::create_dir(&victim).expect("create scratch");
-    std::fs::write(victim.join(".carrick.lock"), b"").expect("seed lock");
-    for index in 0..26_000 {
-        std::fs::write(victim.join(format!("entry-{index}")), b"")
-            .expect("seed representative OCI entry");
-    }
-
-    let started = std::time::Instant::now();
-    defer_remove_tree(victim.clone());
-    let return_wall = started.elapsed();
-
-    assert!(
-        !victim.exists(),
-        "the retired live scratch name must disappear"
-    );
-    let retired = std::fs::read_dir(parent.path().join(SCRATCH_TRASH_DIRECTORY))
-        .expect("read scratch parent")
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".carrick-trash-"))
-        })
-        .expect("recursive cleanup must not finish on the caller's exit path");
-    assert!(
-        return_wall < std::time::Duration::from_millis(250),
-        "retiring 26k entries must be an O(1) rename, took {return_wall:?}"
-    );
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while retired.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(
-        !retired.exists(),
-        "the in-process cleanup worker did not reclaim the retired tree"
-    );
-}
-
-#[test]
-fn startup_sweep_enqueues_partially_cleaned_trash_without_blocking() {
-    let root = tempfile::TempDir::new().expect("sweep test root");
-    let retired = root.path().join(".carrick-trash-dead-carrier");
-    std::fs::create_dir(&retired).expect("create retired tree");
-    for index in 0..26_000 {
-        std::fs::write(retired.join(format!("remaining-entry-{index}")), b"")
-            .expect("seed partial cleanup residue");
-    }
-
-    let started = std::time::Instant::now();
-    sweep_orphans(root.path());
-    let sweep_wall = started.elapsed();
-
-    assert!(
-        sweep_wall < std::time::Duration::from_millis(250),
-        "startup sweep must enqueue, not recursively delete, 26k entries; took {sweep_wall:?}"
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while retired.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(
-        !retired.exists(),
-        "cleanup worker did not reclaim startup trash"
-    );
-}
-
-#[test]
-fn startup_sweep_retires_unlocked_orphan_before_cleanup() {
-    let root = tempfile::TempDir::new().expect("sweep test root");
-    let orphan = root.path().join("crashed-run");
-    std::fs::create_dir(&orphan).expect("create orphan");
-    std::fs::write(orphan.join(".carrick.lock"), b"").expect("seed orphan lock");
-    for index in 0..26_000 {
-        std::fs::write(orphan.join(format!("remaining-entry-{index}")), b"")
-            .expect("seed orphan residue");
-    }
-
-    let started = std::time::Instant::now();
-    sweep_orphans(root.path());
-    let sweep_wall = started.elapsed();
-
-    assert!(
-        !orphan.exists(),
-        "unlocked orphan must leave the live namespace"
-    );
-    assert!(
-        sweep_wall < std::time::Duration::from_millis(250),
-        "startup sweep must rename, not recursively delete, 26k entries; took {sweep_wall:?}"
-    );
-    let retired = std::fs::read_dir(root.path().join(SCRATCH_TRASH_DIRECTORY))
-        .expect("read scratch root")
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(SCRATCH_TRASH_PREFIX))
-        });
-    if let Some(retired) = retired {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while retired.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            !retired.exists(),
-            "cleanup worker did not reclaim orphan trash"
-        );
-    }
-}
-
 #[test]
 fn background_discovery_cannot_retire_a_scratch_under_the_root_creation_lock() {
     let root = tempfile::TempDir::new().expect("discovery race root");
@@ -611,7 +491,7 @@ fn startup_orphan_discovery_is_bounded_on_a_wide_root() {
             .expect("create live directory");
     }
     let started = std::time::Instant::now();
-    sweep_orphans(root.path());
+    let _ = sweep_orphans(root.path());
     assert!(
         started.elapsed() < std::time::Duration::from_millis(250),
         "startup must inspect only a bounded root prefix"
@@ -2222,6 +2102,122 @@ fn trusted_dirent_stream_owns_its_seek_offset() {
 
 mod serial_host {
     use super::*;
+
+    /// Failure-message bound only: a queued 26k-entry reclaim completes in
+    /// well under a second on an idle host. The verdict is the worker's
+    /// completion event, never elapsed time.
+    const CLEANUP_RECEIPT_FAILURE_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Wait for the worker's completion event for exactly one queued reclaim.
+    /// These tests live in `serial_host` because the cleanup worker and its
+    /// bounded queue are process-global: concurrently running tests would
+    /// saturate the queue (an unqueued retirement is, by design, left to the
+    /// next startup sweep) and queue this test's tree behind theirs.
+    fn await_reclaim(receipt: ScratchCleanupReceipt) -> ScratchCleanupCompletion {
+        match receipt {
+            ScratchCleanupReceipt::Queued(done) => done
+                .recv_timeout(CLEANUP_RECEIPT_FAILURE_BOUND)
+                .unwrap_or_else(|error| {
+                    panic!("cleanup worker produced no completion event: {error:?}")
+                }),
+            ScratchCleanupReceipt::NotQueued(path) => {
+                panic!("retired tree {path:?} was not queued for in-process cleanup")
+            }
+        }
+    }
+
+    fn seed_tree(root: &std::path::Path, prefix: &str) {
+        std::fs::create_dir(root).expect("create tree");
+        for index in 0..26_000 {
+            std::fs::write(root.join(format!("{prefix}-{index}")), b"")
+                .expect("seed representative OCI entry");
+        }
+    }
+
+    fn assert_retired_off_thread(
+        completion: &ScratchCleanupCompletion,
+        scratch_root: &std::path::Path,
+    ) {
+        assert_eq!(
+            completion.retired.parent(),
+            Some(scratch_root.join(SCRATCH_TRASH_DIRECTORY).as_path()),
+            "the live name must be retired by rename into the trash namespace"
+        );
+        assert!(
+            completion
+                .retired
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(SCRATCH_TRASH_PREFIX)),
+            "retired name must carry the trash prefix: {:?}",
+            completion.retired
+        );
+        assert_ne!(
+            completion.worker,
+            std::thread::current().id(),
+            "the recursive delete must not run on the caller's thread"
+        );
+        assert!(
+            !completion.retired.exists(),
+            "the in-process cleanup worker did not reclaim the retired tree"
+        );
+    }
+
+    /// Regression for the measured 26k-entry OCI upper teardown: the exit
+    /// owner retires the live name by rename and hands the recursive delete
+    /// to the cleanup worker.
+    #[test]
+    fn hostfs_teardown_retires_large_tree_before_recursive_cleanup() {
+        let parent = tempfile::TempDir::new().expect("teardown test parent");
+        let victim = parent.path().join("run-scratch");
+        seed_tree(&victim, "entry");
+        std::fs::write(victim.join(".carrick.lock"), b"").expect("seed lock");
+
+        let mut receipts = defer_remove_tree(victim.clone()).into_vec();
+
+        assert!(
+            !victim.exists(),
+            "the retired live scratch name must disappear"
+        );
+        assert_eq!(receipts.len(), 1, "exactly one retired tree is queued");
+        let completion = await_reclaim(receipts.remove(0));
+        assert_retired_off_thread(&completion, parent.path());
+    }
+
+    #[test]
+    fn startup_sweep_enqueues_partially_cleaned_trash_without_blocking() {
+        let root = tempfile::TempDir::new().expect("sweep test root");
+        let retired = root.path().join(".carrick-trash-dead-carrier");
+        seed_tree(&retired, "remaining-entry");
+
+        let mut receipts = sweep_orphans(root.path()).into_vec();
+
+        assert!(
+            !retired.exists(),
+            "startup trash must leave the scan root by rename"
+        );
+        assert_eq!(receipts.len(), 1, "exactly one retired tree is queued");
+        let completion = await_reclaim(receipts.remove(0));
+        assert_retired_off_thread(&completion, root.path());
+    }
+
+    #[test]
+    fn startup_sweep_retires_unlocked_orphan_before_cleanup() {
+        let root = tempfile::TempDir::new().expect("sweep test root");
+        let orphan = root.path().join("crashed-run");
+        seed_tree(&orphan, "remaining-entry");
+        std::fs::write(orphan.join(".carrick.lock"), b"").expect("seed orphan lock");
+
+        let mut receipts = sweep_orphans(root.path()).into_vec();
+
+        assert!(
+            !orphan.exists(),
+            "unlocked orphan must leave the live namespace"
+        );
+        assert_eq!(receipts.len(), 1, "exactly one retired tree is queued");
+        let completion = await_reclaim(receipts.remove(0));
+        assert_retired_off_thread(&completion, root.path());
+    }
 
     #[cfg(test)]
     #[test]
