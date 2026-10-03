@@ -75,12 +75,15 @@ impl FileCursor {
             // Each queue belongs to one operation. Keep drain ownership
             // through callback AND final Arc drop: either can cancel the
             // granted ticket, appending the successor instead of recursing.
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let delivery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 next.changed.wake_all();
                 drop(next);
-            }))
-            .is_err()
-            {
+            }));
+            if let Err(payload) = delivery {
+                // A caught payload may itself panic from Drop. Retain it
+                // through process termination; never destroy it on the way
+                // to the fatal boundary, where an outer catch could recover.
+                core::mem::forget(payload);
                 // Runtime panic backstops may recover the worker. Cursor
                 // delivery cannot expose an abandoned drainer to such a
                 // caller, including when final effect destruction panics.
@@ -401,13 +404,24 @@ mod tests {
         #[test]
         fn serial_host_cursor_callback_panic_is_terminal() {
             const CHILD: &str = "CARRICK_TEST_CURSOR_PANIC_CHILD";
-            if std::env::var_os(CHILD).is_some() {
+            if let Some(kind) = std::env::var_os(CHILD) {
+                struct PayloadBomb;
+                impl Drop for PayloadBomb {
+                    fn drop(&mut self) {
+                        panic!("injected payload destructor panic");
+                    }
+                }
+                let payload = kind == "payload";
                 let description = description();
                 let first = description.try_reserve_cursor().unwrap();
                 let next = description.try_reserve_cursor().unwrap_err();
                 let last = description.try_reserve_cursor().unwrap_err();
-                let (_subscription, ready) =
-                    next.subscribe(|| panic!("injected cursor callback panic"));
+                let (_subscription, ready) = next.subscribe(move || {
+                    if payload {
+                        std::panic::panic_any(PayloadBomb);
+                    }
+                    panic!("injected cursor callback panic");
+                });
                 assert!(!ready);
                 let wakes = Arc::new(AtomicU64::new(0));
                 let target = wakes.clone();
@@ -425,19 +439,21 @@ mod tests {
                 );
                 return;
             }
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("kernel::objects::file_cursor::tests::serial_host::serial_host_cursor_callback_panic_is_terminal")
-            .arg("--nocapture")
-            .env(CHILD, "1")
-            .output().unwrap();
-            use std::os::unix::process::ExitStatusExt;
-            assert_eq!(
-                output.status.signal(),
-                Some(libc::SIGABRT),
-                "cursor delivery must not expose abandoned drain custody: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            for kind in ["string", "payload"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg("kernel::objects::file_cursor::tests::serial_host::serial_host_cursor_callback_panic_is_terminal")
+                    .arg("--nocapture")
+                    .env(CHILD, kind)
+                    .output().unwrap();
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    output.status.signal(),
+                    Some(libc::SIGABRT),
+                    "cursor delivery ({kind}) must not expose abandoned drain custody: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
     }
 }
