@@ -2586,7 +2586,9 @@ mod tests {
             assert!(known_kind(kind), "kind {kind} must be readable");
             assert!(!decode(kind, 0, 0, 0).is_empty(), "kind {kind} decodes");
         }
-        assert!(!known_kind(MMOCC_REFUSE + 1));
+        assert_eq!(CLONE_REFUSAL, MMOCC_REFUSE + 1);
+        assert!(known_kind(CLONE_REFUSAL));
+        assert!(!known_kind(LAST_KIND + 1));
     }
 
     #[test]

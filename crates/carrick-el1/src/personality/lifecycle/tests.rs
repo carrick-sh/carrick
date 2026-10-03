@@ -880,10 +880,13 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
     assert_ne!(Some(record), hosted.zone.slot(SLOT).host_record());
     let mut identity = hosted.zone.record(record).identity();
     identity.generation = 2;
-    hosted.zone.release_current(
-        SLOT,
-        record,
-        &carrick_sched_core::BoundedSpin(carrick_el1_abi::EL1_GUEST_LOCK_SPINS),
+    assert_eq!(
+        hosted.zone.release_current(
+            SLOT,
+            record,
+            &carrick_sched_core::BoundedSpin(carrick_el1_abi::EL1_GUEST_LOCK_SPINS),
+        ),
+        carrick_sched_core::CurrentRelease::Released,
     );
     let record = hosted.zone.alloc_record(identity).unwrap();
     hosted.zone.requeue_preempted(SLOT, record);
