@@ -1284,8 +1284,8 @@ fn teardown_storm(name: &str, how: Teardown, rounds: usize, argv0: &str) -> i32 
             Teardown::ExitGroup => 7,
             Teardown::Exec => 0,
         };
-        match reap(pid, Duration::from_secs(30)) {
-            Some(code) if code == expected => {}
+        match reap_outcome(pid, Duration::from_secs(30)) {
+            ReapOutcome::Exited(code) if code == expected => {}
             other => failures.push(format!(
                 "round {round}: victim status {other:?} want {expected}"
             )),
