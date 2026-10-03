@@ -291,7 +291,7 @@ fn retained() -> carrick_el1_abi::PortalRetainedData {
 }
 
 #[test]
-fn service_copies_real_bytes_under_editor_and_refuses_remapped_selection() {
+fn service_copies_real_bytes_under_permit_and_refuses_remapped_selection() {
     let region = Region::new();
     let spaces = AddressSpaces::new();
     let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
@@ -328,7 +328,7 @@ fn service_copies_real_bytes_under_editor_and_refuses_remapped_selection() {
                     assert!(
                         spaces
                             .try_begin_edit(index, mm.raw(), NonZeroU64::new(2).unwrap())
-                            .is_none()
+                            .is_some()
                     );
                 })
                 .join()
@@ -372,7 +372,10 @@ fn service_copies_real_bytes_under_editor_and_refuses_remapped_selection() {
         panic!("stale selection copied")
     })
     .unwrap();
-    assert_eq!(stale.take_completion().unwrap().errno, 11);
+    assert_eq!(
+        stale.take_prepare_suspension(),
+        Some(carrick_el1_abi::PortalPrepareSuspension::SelectionChanged)
+    );
     assert!(old[4096..].iter().all(|byte| *byte == 0));
     assert_eq!(transfer.offset(), 4096);
     let next = selected(select(&portal, &transfer, &tables));
@@ -2259,4 +2262,526 @@ fn owner_fork_census_allocates_for_live_graph_not_physical_arena_capacity() {
             .table()
             .admitted(spaces.find(78).unwrap().index(), request.child_mm)
     );
+}
+
+// Contract kernel.mm.prepared-copy: ready-source effects must retain semantic
+// range admission without monopolizing the MM descriptor editor.
+#[test]
+fn prepared_copy_overlapping_munmap_waits_before_any_mutation() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 2);
+    let maintenance = CallerInvalidatesAsid;
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let chunk = selected(select(&portal, &transfer, &tables));
+    let request = chunk
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+        .unwrap()
+        .unwrap();
+    let mut root = portal.root(mm, 1).unwrap();
+    assert!(
+        matches!(
+            root.munmap(ReservationRange::new(VA, VA + 4096).unwrap()),
+            Err(crate::memory::reservations::Refusal::PreparedConflict)
+        ),
+        "overlapping munmap must wait before proposing mutation"
+    );
+    drop(root);
+    portal.cancel_prepared(permit, request, 0).unwrap();
+    assert!(
+        portal
+            .root(mm, 1)
+            .unwrap()
+            .munmap(ReservationRange::new(VA, VA + 4096).unwrap())
+            .is_ok()
+    );
+}
+#[test]
+fn prepared_copy_releases_editor_for_unrelated_edit() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 2);
+    let maintenance = CallerInvalidatesAsid;
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let chunk = selected(select(&portal, &transfer, &tables));
+    let request = chunk
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+        .unwrap()
+        .unwrap();
+    assert!(
+        spaces
+            .try_begin_edit(
+                spaces.find(mm.raw()).unwrap(),
+                mm.raw(),
+                NonZeroU64::new(2).unwrap()
+            )
+            .is_some(),
+        "ready consumption must not hold descriptor editor"
+    );
+    portal.cancel_prepared(permit, request, 0).unwrap();
+}
+
+#[test]
+fn prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 2);
+    let maintenance = CallerInvalidatesAsid;
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let slot = carrick_el1_abi::PortalTransferSlot::new();
+    let mut ticket = slot.submit_prepare(request).unwrap();
+    serve_transfer(
+        &portal,
+        slot.claim().unwrap(),
+        &tables.live(&maintenance),
+        0,
+        || panic!("prepare must not copy"),
+    )
+    .unwrap();
+    let permit = ticket.take_prepared().unwrap();
+    // A non-overlapping committed edit changes the MM generation, preserving
+    // this permit's own generation and exact semantic admission.
+    let mut root = portal.root(mm, 1).unwrap();
+    let decision = root
+        .mprotect(
+            ReservationRange::new(VA + 4096, VA + 8192).unwrap(),
+            ReservationProtection::from_bits(1).unwrap(),
+        )
+        .unwrap();
+    if let crate::memory::reservations::Decision::Work(request) = decision {
+        root.complete(unsafe {
+            carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                carrick_el1_abi::ReservationBackingReceipt {
+                    receipt: 1,
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+            .unwrap()
+        })
+        .unwrap();
+    }
+    let _editor = spaces
+        .try_begin_edit(
+            spaces.find(mm.raw()).unwrap(),
+            mm.raw(),
+            NonZeroU64::new(2).unwrap(),
+        )
+        .unwrap();
+    let mut commit = slot.submit_commit(request, permit, 23).unwrap();
+    serve_transfer(
+        &portal,
+        slot.claim().unwrap(),
+        &tables.live(&maintenance),
+        0,
+        || {
+            assert!(commit.copy_requested(|authorization| {
+                assert_eq!(authorization.request().range.len(), 23);
+                true
+            }));
+        },
+    )
+    .unwrap();
+    assert_eq!(commit.take_completion().unwrap().completed, 23);
+    assert!(
+        root.has_prepared_copy(),
+        "settled metadata remains queued until the root holder reaps it"
+    );
+    // A stale generation cannot copy or cancel a successor, even at same VA.
+    drop(_editor);
+    drop(root);
+    let successor_request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let successor = prepare_transfer(&portal, successor_request, &tables.live(&maintenance), 0)
+        .unwrap()
+        .unwrap();
+    assert_ne!(permit.generation, successor.generation);
+    assert!(portal.cancel_prepared(permit, request, 0).is_err());
+    let held_root = portal.root(mm, 1).unwrap();
+    let held_editor = spaces
+        .try_begin_edit(
+            spaces.find(mm.raw()).unwrap(),
+            mm.raw(),
+            NonZeroU64::new(2).unwrap(),
+        )
+        .unwrap();
+    portal
+        .cancel_prepared(successor, successor_request, 0)
+        .unwrap();
+    assert!(
+        held_root.has_prepared_copy(),
+        "atomic cancellation does not reacquire the held root"
+    );
+    drop(held_editor);
+}
+
+#[test]
+fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall() {
+    use crate::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served, ThreadCpu};
+    use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame, ZoneTables};
+    for cancel in [false, true] {
+        for nr in [215, 226, 216] {
+            let region = Region::new();
+            // All-zero is the production empty shared scheduler layout.
+            let zone: Box<ZoneTables> = unsafe {
+                Box::from_raw(
+                    std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>()).cast(),
+                )
+            };
+            let mm = admit(&region, &zone.spaces, 77, ROOT, 2, 0);
+            let view = nodes(&region);
+            let portal = MmPortal::new(
+                NonZeroU64::new(1).unwrap(),
+                region.table(),
+                &zone.spaces,
+                &view,
+            )
+            .with_zone(&zone)
+            .unwrap();
+            let tables = Tables::new(ROOT, IPA, 2);
+            let maintenance = CallerInvalidatesAsid;
+            let transfer = portal
+                .begin(
+                    portal.admitted_handle(mm, 0).unwrap(),
+                    GuestVa::new(VA),
+                    4096,
+                    TransferIntent::UserWrite,
+                    0,
+                )
+                .unwrap();
+            let request = selected(select(&portal, &transfer, &tables))
+                .request(TransferIntent::UserWrite, retained())
+                .unwrap();
+            let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+                .unwrap()
+                .unwrap();
+            let slot = SlotId::from_index(0).unwrap();
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, mm.raw(), None, 0);
+            assert!(zone.occupancy.replace(
+                carrick_sched_core::ExecutionSlot::zone(slot),
+                0,
+                mm.raw()
+            ));
+            zone.enter_guest(slot);
+            let task = CurrentTask::new();
+            task.set(El1TaskId::from_linux_tid(101), 1, 5);
+            task.zone_mm.store(mm.raw(), Ordering::Release);
+            task.thread_serial.store(1101, Ordering::Release);
+            task.mark_pending_host_work(); // deterministic leave, no WFI.
+            let counters = Counters::default();
+            let mut cpu = FakeCpu::default();
+            let mut frame = TrapFrame::default();
+            frame.x[8] = nr;
+            frame.x[0] = VA;
+            frame.x[1] = 4096;
+            frame.x[2] = if nr == 216 { 4096 } else { 1 };
+            if nr == 216 {
+                frame.x[1] = 8192;
+            }
+            frame.elr = 0x1004;
+            let original = frame.x;
+            let key = portal.prepared_wait_key(transfer.handle).unwrap();
+            let mut sched = Sched {
+                zone: &zone,
+                slot,
+                task: &task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: &counters,
+            };
+            assert!(matches!(
+                park_prepared_edit(&mut sched, &mut frame, region.table()),
+                Some(Served::Idle)
+            ));
+            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+            assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
+            assert_eq!(
+                portal
+                    .root(mm, 1)
+                    .unwrap()
+                    .mapping(VA)
+                    .unwrap()
+                    .range
+                    .start(),
+                VA
+            );
+            let delivered = core::cell::Cell::new(false);
+            let completion =
+                |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+                    assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+                    let (_, effects) = owned.deliver_handbacks(&mut |_| panic!("available slot"));
+                    assert!(effects.queued_own);
+                    delivered.set(true);
+                };
+            let held_queue = zone
+                .object_wait_with_completion(key, &carrick_sched_core::BoundedSpin(0), &completion)
+                .unwrap();
+            if cancel {
+                portal.cancel_prepared(permit, request, 0).unwrap();
+            } else {
+                let wire = carrick_el1_abi::PortalTransferSlot::new();
+                let mut ticket = wire.submit_commit(request, permit, 4096).unwrap();
+                serve_transfer(
+                    &portal,
+                    wire.claim().unwrap(),
+                    &tables.live(&maintenance),
+                    0,
+                    || {
+                        assert!(ticket.copy_requested(|_| true));
+                    },
+                )
+                .unwrap();
+                assert_eq!(ticket.take_completion().unwrap().completed, 4096);
+            }
+            assert!(
+                !delivered.get(),
+                "commit/cancel must return before the queue holder unlocks"
+            );
+            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+            drop(held_queue);
+            assert!(delivered.get(), "the holder owns eventual wake delivery");
+            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+            let switched = zone
+                .switch_in_full(slot)
+                .expect("settlement must queue waiter");
+            // SAFETY: switch_in_full assigned the exact context to this slot.
+            let context = unsafe { zone.record(switched.record).ctx_mut() };
+            assert_eq!(context.x, original);
+            assert_eq!(context.pc, 0x1000);
+            sched.cpu.load(&mut frame, context);
+            assert!(park_prepared_edit(&mut sched, &mut frame, region.table()).is_none());
+            let mut root = portal.root(mm, 1).unwrap();
+            let range = ReservationRange::new(VA, VA + 4096).unwrap();
+            let decision = match nr {
+                215 => root.munmap(range),
+                226 => root.mprotect(range, ReservationProtection::from_bits(1).unwrap()),
+                _ => root.mremap(
+                    ReservationRange::new(VA, VA + 8192).unwrap(),
+                    4096,
+                    crate::memory::reservations::MoveTarget::InPlace,
+                ),
+            }
+            .unwrap();
+            let crate::memory::reservations::Decision::Work(edit) = decision else {
+                panic!("resumed edit must apply");
+            };
+            root.complete(unsafe {
+                carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                    edit,
+                    carrick_el1_abi::ReservationBackingReceipt {
+                        receipt: 1,
+                        granted_bytes: 0,
+                        returned_bytes: 0,
+                    },
+                )
+                .unwrap()
+            })
+            .unwrap();
+            match nr {
+                215 => assert!(root.mapping(VA).is_none()),
+                226 => assert_eq!(root.mapping(VA).unwrap().protection.bits(), 1),
+                _ => assert!(root.mapping(VA + 4096).is_none()),
+            }
+            assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 1);
+        }
+    }
+}
+
+#[test]
+fn prepared_copy_elastic_aggregate_prepare_and_settlement_have_linear_work() {
+    for count in [16usize, 64, 256, 320] {
+        let region = Region::new();
+        let spaces = AddressSpaces::new();
+        let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+        let tables = Tables::new(ROOT, IPA, 1);
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                GuestVa::new(VA),
+                4096,
+                TransferIntent::UserWrite,
+                0,
+            )
+            .unwrap();
+        let request = selected(select(&portal, &transfer, &tables))
+            .request(TransferIntent::UserWrite, retained())
+            .unwrap();
+        let mut root = portal.root(mm, 1).unwrap();
+        let mut permits = Vec::with_capacity(count);
+        root.work = 0;
+        for _ in 0..count {
+            permits.push(root.prepare_copy(request, None).unwrap());
+        }
+        assert_eq!(
+            root.work, count,
+            "preparation must not visit already active record pages"
+        );
+        assert!(root.has_prepared_copy());
+        for permit in permits {
+            assert!(
+                region
+                    .table()
+                    .claim_prepared(Some(&view), permit, request)
+                    .unwrap()
+                    .release()
+            );
+        }
+        root.reap_prepared();
+        assert_eq!(
+            root.work,
+            count * 2,
+            "each settlement unlinks one owned record directly"
+        );
+        assert!(!root.has_prepared_copy());
+        root.work = 0;
+        root.reap_prepared();
+        assert_eq!(root.work, 0, "settled history must not accumulate");
+    }
+}
+
+#[test]
+fn prepared_copy_metadata_capacity_suspends_before_source_and_recovers_after_cancel() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 1);
+    let maintenance = CallerInvalidatesAsid;
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let mut permits = Vec::new();
+    {
+        let mut root = portal.root(mm, 1).unwrap();
+        loop {
+            match root.prepare_copy(request, None) {
+                Ok(permit) => permits.push(permit),
+                Err(crate::memory::reservations::Refusal::MetadataRequired) => break,
+                other => panic!("unexpected admission {other:?}"),
+            }
+        }
+    }
+    assert!(
+        permits.len() > 256,
+        "record capacity follows elastic metadata authority, not a guessed slot cap"
+    );
+    let wire = carrick_el1_abi::PortalTransferSlot::new();
+    let mut ticket = wire.submit_prepare(request).unwrap();
+    serve_transfer(
+        &portal,
+        wire.claim().unwrap(),
+        &tables.live(&maintenance),
+        0,
+        || panic!("capacity suspension must precede source consumption"),
+    )
+    .unwrap();
+    assert_eq!(
+        ticket.take_prepare_suspension(),
+        Some(carrick_el1_abi::PortalPrepareSuspension::ReservationMetadata)
+    );
+    for permit in permits {
+        portal.cancel_prepared(permit, request, 0).unwrap();
+    }
+    let recovered = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+        .unwrap()
+        .unwrap();
+    portal.cancel_prepared(recovered, request, 0).unwrap();
+}
+
+#[test]
+fn prepared_copy_hardware_settlement_seam_needs_no_live_grant_or_descriptor_words() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 1);
+    let maintenance = CallerInvalidatesAsid;
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+        .unwrap()
+        .unwrap();
+    spaces.close(spaces.find(mm.raw()).unwrap());
+    assert!(
+        spaces
+            .grant(spaces.find(mm.raw()).unwrap(), mm.raw())
+            .is_none()
+    );
+    let wire = carrick_el1_abi::PortalTransferSlot::new();
+    let mut ticket = wire.submit_commit(request, permit, 4096).unwrap();
+    let root = portal.root(mm, 1).unwrap();
+    // This is the exact hardware phase seam. It has no descriptor words or
+    // SpaceGrant parameter; target-table lookup follows only the other phases.
+    production::settle_prepared_service(&portal, wire.claim().unwrap(), permit, 0, || {
+        assert!(ticket.copy_requested(|_| true))
+    })
+    .unwrap();
+    assert_eq!(ticket.take_completion().unwrap().completed, 4096);
+    drop(root);
 }
