@@ -7315,7 +7315,7 @@ mod tests {
             .split("if self.state.guest_execution.is_none()")
             .nth(1)
             .expect("registration admission block")
-            .split("// Exec/exit can force")
+            .split("// The task is loaded on this vCPU:")
             .next()
             .expect("bounded registration admission block");
         assert!(registration.contains("enter_mm_executor_then_register"));
