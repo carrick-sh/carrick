@@ -25,6 +25,7 @@ fn caught(flags: ActionFlags, blocked: &[i32]) -> Action {
         disposition: Disposition::Handler(HandlerAddress(0x4000)),
         flags,
         mask: set(blocked),
+        restorer: None,
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -114,7 +115,14 @@ fn handler_entry_resets_action_and_composes_mask_without_losing_siginfo() {
     assert!(delivery.restart);
     assert_eq!(delivery.restore_mask, mask(&[2]));
     assert_eq!(masks.effective(), mask(&[2, 10, 12]));
-    assert_eq!(actions.action(sig(10)), Action::default());
+    assert_eq!(
+        actions.action(sig(10)),
+        Action {
+            disposition: Disposition::Default,
+            ..action
+        },
+        "one-shot reset preserves flags and mask for action queries"
+    );
     masks.restore_after_handler(delivery.restore_mask);
     assert_eq!(masks.effective(), mask(&[2]));
     assert_eq!(
@@ -672,4 +680,117 @@ fn timer_zero_value_disarms_and_overflow_does_not_replace_live_state() {
     assert_eq!(update.ticket, None);
     assert_eq!(timer.remaining(ClockInstant(2)), disabled);
     assert_eq!(timer.expire(ticket, ClockInstant(5)).unwrap(), None);
+}
+
+#[test]
+fn aarch64_and_x86_64_use_one_signal_policy_and_explicit_return_policy() {
+    let aarch64 = HandlerReturnPolicy::Aarch64 {
+        trampoline: RestorerAddress(0x7000),
+    };
+    let x86_64 = HandlerReturnPolicy::X86_64;
+    let action = caught(ActionFlags::default(), &[]);
+    assert_eq!(handler_return(action, aarch64), Ok(RestorerAddress(0x7000)));
+    assert_eq!(
+        handler_return(action, x86_64),
+        Err(HandlerReturnError::MissingRestorer)
+    );
+    let registered = Action {
+        restorer: Some(RestorerAddress(0x8000)),
+        ..action
+    };
+    for architecture in [aarch64, x86_64] {
+        assert_eq!(
+            handler_return(registered, architecture),
+            Ok(RestorerAddress(0x8000))
+        );
+        let mut table = ActionTable::default();
+        table.install(sig(10), registered).unwrap();
+        let mut masks = MaskState::default();
+        assert!(matches!(
+            table.prepare_delivery(sig(10), &mut masks),
+            Delivery::Handler(_)
+        ));
+        assert_eq!(masks.effective(), mask(&[10]));
+        assert_eq!(table.action(sig(10)).restorer, registered.restorer);
+    }
+}
+
+#[test]
+fn pending_selection_and_discard_preserve_other_owners_and_counts() {
+    let mut thread = PendingSignals::default();
+    let mut process = PendingSignals::default();
+    thread.enqueue(sig(35), Some(1));
+    process.enqueue(sig(34), Some(2));
+    process.enqueue(sig(34), Some(3));
+    process.enqueue(sig(12), Some(4));
+    assert_eq!(
+        take_pending(&mut thread, &mut process, set(&[34, 35]))
+            .unwrap()
+            .owner,
+        PendingOwner::Process
+    );
+    assert_eq!(process.len(), 2);
+    assert_eq!(take_pending(&mut thread, &mut process, set(&[10])), None);
+    process.discard(set(&[34]));
+    assert_eq!(process.len(), 1);
+    assert_eq!(process.present(), set(&[12]));
+    assert_eq!(thread.len(), 1);
+    process.discard(set(&[12, 64]));
+    assert!(process.is_empty());
+    assert_eq!(thread.take_in(set(&[35])).unwrap().info, Some(1));
+}
+
+#[test]
+fn ignored_signal_preserves_temporary_wait_and_nested_handlers_restore_masks() {
+    let mut table = ActionTable::default();
+    let mut masks = MaskState::new(mask(&[12]));
+    masks.begin_temporary(mask(&[10])).unwrap();
+    assert_eq!(
+        table.prepare_delivery(Signal::CHLD, &mut masks),
+        Delivery::Ignore
+    );
+    assert_eq!(masks.effective(), mask(&[10]));
+    assert!(masks.end_temporary());
+    table
+        .install(sig(10), caught(ActionFlags::default(), &[2]))
+        .unwrap();
+    table
+        .install(sig(3), caught(ActionFlags::default(), &[4]))
+        .unwrap();
+    let Delivery::Handler(outer) = table.prepare_delivery(sig(10), &mut masks) else {
+        unreachable!()
+    };
+    let Delivery::Handler(inner) = table.prepare_delivery(sig(3), &mut masks) else {
+        unreachable!()
+    };
+    assert_eq!(masks.effective(), mask(&[2, 3, 4, 10, 12]));
+    masks.restore_after_handler(inner.restore_mask);
+    assert_eq!(masks.effective(), mask(&[2, 10, 12]));
+    masks.restore_after_handler(outer.restore_mask);
+    assert_eq!(masks.effective(), mask(&[12]));
+}
+
+#[test]
+fn periodic_expiry_overflow_refuses_effect_without_consuming_ticket() {
+    let mut timer = IntervalTimer::new(task(1, 1));
+    let ticket = timer
+        .set(
+            ClockInstant(u64::MAX - 2),
+            IntervalSpec {
+                value: TimerSpan(1),
+                interval: TimerSpan(3),
+            },
+        )
+        .unwrap()
+        .ticket
+        .unwrap();
+    assert_eq!(
+        timer.expire(ticket, ClockInstant(u64::MAX)),
+        Err(TimerError::ClockOverflow)
+    );
+    assert_eq!(
+        timer.remaining(ClockInstant(u64::MAX - 2)).value,
+        TimerSpan(1)
+    );
+    assert_eq!(timer.cancel(), Some(ticket));
 }

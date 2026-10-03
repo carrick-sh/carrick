@@ -1,7 +1,9 @@
-//! Personality-free signal storage and state transitions.
+//! Host-free signal storage and Linux signal policy transitions.
 //!
-//! Signal slots are numbered 1 through 64. Their meanings, unmaskable set,
-//! queue/coalescing policy, host synchronization and transport belong to callers.
+//! Storage slots are numbered 1 through 64. [`policy`] supplies typed Linux
+//! asm-generic semantics; synchronization, ABI conversion, transport and guest
+//! handler frames belong to the consuming owner. [`timer`] takes an injected
+//! clock; it never reads a host clock or schedules a host wait.
 #![no_std]
 
 extern crate alloc;
@@ -9,6 +11,9 @@ extern crate alloc;
 extern crate std;
 
 pub mod fasync;
+pub mod policy;
+pub mod timer;
+pub mod wait;
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -23,12 +28,42 @@ pub fn pending_bit(slot: i32) -> Option<u64> {
 pub struct SignalSet(u64);
 
 impl SignalSet {
+    pub const EMPTY: Self = Self(0);
+
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
     }
 
     pub const fn bits(self) -> u64 {
         self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, signal: policy::Signal) -> bool {
+        self.0 & signal.bit() != 0
+    }
+
+    pub const fn with(self, signal: policy::Signal) -> Self {
+        Self(self.0 | signal.bit())
+    }
+
+    pub const fn without(self, signal: policy::Signal) -> Self {
+        Self(self.0 & !signal.bit())
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
     }
 
     pub const fn lowest(self) -> Option<i32> {
@@ -115,8 +150,9 @@ impl DispositionSet {
     }
 }
 
-/// Pending payload queue. The caller chooses replacement versus FIFO delivery.
-#[derive(Debug)]
+/// Pending payload queue. Coalescing retains the first instance, including an
+/// explicitly absent payload; otherwise instances are delivered FIFO.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingQueue<T>(VecDeque<T>);
 
 impl<T> Default for PendingQueue<T> {
@@ -127,8 +163,8 @@ impl<T> Default for PendingQueue<T> {
 
 impl<T> PendingQueue<T> {
     pub fn publish(&mut self, value: T, coalesce: bool) {
-        if coalesce {
-            self.0.clear();
+        if coalesce && !self.0.is_empty() {
+            return;
         }
         self.0.push_back(value);
     }
