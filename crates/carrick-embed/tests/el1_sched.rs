@@ -2594,6 +2594,27 @@ fn el1_tlb_running_thread_mm_edits_cost_no_maintenance() {
     );
 }
 
+/// A deterministic replay of the fixture's late sibling initialization:
+/// allocate an alternate-stack-sized region while the measured page is
+/// unmapped. The file's private window must exclude that allocation.
+#[test]
+fn el1_tlb_mm_edit_window_excludes_sibling_allocations() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["tlb-edit-budget", "36", "force-gap-allocation"],
+        Duration::from_secs(120),
+    );
+    let stdout = measured.result.stdout_utf8();
+    println!("{stdout}");
+    assert!(
+        stdout.contains("forced_gap=true sibling_gap_overlaps=false"),
+        "a sibling allocated the measured page during its munmap/MAP_FIXED gap: {stdout}"
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+}
+
 /// The stale-translation half of the TLB-maintenance contract with more than
 /// one other vCPU running the MM: workers on guest CPUs 1 and 2 keep a page
 /// hot while CPU 0 `mprotect`s it read-only and `munmap`s it. Every worker's

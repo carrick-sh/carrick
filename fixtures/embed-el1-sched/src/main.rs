@@ -3393,7 +3393,11 @@ fn main() {
             cross_vcpu_stale(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200))
         }
         "tlb-edit-budget" => {
-            tlb::edit_budget(&args[0], args.get(2).and_then(|n| n.parse().ok()).unwrap_or(32))
+            tlb::edit_budget(
+                &args[0],
+                args.get(2).and_then(|n| n.parse().ok()).unwrap_or(32),
+                args.get(3).is_some_and(|arg| arg == "force-gap-allocation"),
+            )
         }
         "tlb-stale-threads" => tlb::stale_threads(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200),

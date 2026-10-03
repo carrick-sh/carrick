@@ -5,6 +5,10 @@
 //!   executable each round (`mprotect` RO, `mprotect` RW, `munmap`, `mmap`
 //!   again): host-edited, three required invalidations per round. The test
 //!   reads their cost as a slope against `rounds`.
+//!   The sibling acknowledges completed runtime initialization before editing.
+//!   A reserved window bounds the unmapped hole to one page. Optional
+//!   `force-gap-allocation` requests a 16 KiB sibling allocation inside that
+//!   gap to prove an alternate-stack-sized allocation cannot consume it.
 //! - `tlb-stale-threads <rounds> <workers>`: `workers` threads pinned to
 //!   guest CPUs `1..=workers` keep one page hot while the main thread (CPU 0)
 //!   `mprotect`s it read-only and later `munmap`s it. Every worker's next
@@ -223,23 +227,78 @@ fn map_file_page(fd: libc::c_int, at: usize) -> usize {
 /// `tlb-edit-budget <rounds>`: the edited page is a private mapping of this
 /// executable, which the host maps and edits (anonymous memory may be served
 /// by EL1 in-zone, which never needs a host round trip to begin with).
-pub(crate) fn edit_budget(exe: &str, rounds: usize) -> i32 {
+pub(crate) fn edit_budget(exe: &str, rounds: usize, force_gap_allocation: bool) -> i32 {
     if rounds == 0 || rounds > 10_000 {
         println!("tlb-edit-budget invalid rounds={rounds}");
         return 1;
     }
     unsafe { libc::alarm(90) };
+    // Keep the edited 4 KiB page inside a reserved window. Its transient
+    // munmap hole cannot fit a sibling's 16 KiB alternate signal stack:
+    // neither adjacent reservation may be consumed by an ordinary mmap.
+    const WINDOW_BYTES: usize = 16 * PAGE;
+    let window = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(), WINDOW_BYTES, libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0,
+        )
+    };
+    if window == libc::MAP_FAILED {
+        println!("tlb-edit-budget private window reservation failed");
+        return 1;
+    }
+    let private_page = window as usize + 8 * PAGE;
     // A second thread makes this a multi-threaded MM; it stays parked.
     static PARKED: AtomicU32 = AtomicU32::new(0);
+    static READY: AtomicU32 = AtomicU32::new(0);
+    static ALLOCATED: AtomicU32 = AtomicU32::new(0);
+    static SIBLING_REGION: AtomicUsize = AtomicUsize::new(0);
+    static SIBLING_ERROR: AtomicU32 = AtomicU32::new(0);
+    const SIBLING_BYTES: usize = 4 * PAGE;
     let sibling = std::thread::spawn(|| {
-        while PARKED.load(Ordering::SeqCst) == 0 {
+        // Rust's alternate signal stack and guard are initialized before
+        // this closure. Do not start editing until that initialization ends.
+        READY.store(1, Ordering::Release);
+        let _ = futex_wake(&READY, 1);
+        while PARKED.load(Ordering::Acquire) != 1 {
+            if PARKED.load(Ordering::Acquire) == 2 {
+                let region = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(), SIBLING_BYTES,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0,
+                    )
+                };
+                let address = if region == libc::MAP_FAILED { usize::MAX } else {
+                    unsafe { std::ptr::write_volatile(region.cast::<u64>(), 0x51b11a6) };
+                    region as usize
+                };
+                SIBLING_REGION.store(address, Ordering::Release);
+                let _ = PARKED.compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire);
+                ALLOCATED.store(1, Ordering::Release);
+                let _ = futex_wake(&ALLOCATED, 1);
+            }
             let _ = futex_wait_timeout(&PARKED, 0, Duration::from_secs(1));
         }
+        let address = SIBLING_REGION.load(Ordering::Acquire);
+        if address != 0 && address != usize::MAX
+            && unsafe { libc::munmap(address as *mut libc::c_void, SIBLING_BYTES) } != 0
+        {
+            SIBLING_ERROR.store(1, Ordering::Release);
+        }
     });
+    if !wait_until_changed(&READY, 0, Duration::from_secs(5)) {
+        PARKED.store(1, Ordering::Release);
+        let _ = futex_wake(&PARKED, 1);
+        println!("tlb-edit-budget sibling initialization timed out");
+        return 1;
+    }
     let path = std::ffi::CString::new(exe).expect("exe path");
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
-    let base = if fd < 0 { 0 } else { map_file_page(fd, 0) };
+    let base = if fd < 0 { 0 } else { map_file_page(fd, private_page) };
     if base == 0 {
+        PARKED.store(1, Ordering::Release);
+        let _ = futex_wake(&PARKED, 1);
         println!("tlb-edit-budget map {exe} failed");
         return 1;
     }
@@ -269,6 +328,18 @@ pub(crate) fn edit_budget(exe: &str, rounds: usize) -> i32 {
             fail(format!("munmap round={round} {}", std::io::Error::last_os_error()));
             break;
         }
+        if force_gap_allocation && round == 0 {
+            PARKED.store(2, Ordering::Release);
+            let _ = futex_wake(&PARKED, 1);
+            if !wait_until_changed(&ALLOCATED, 0, Duration::from_secs(5)) {
+                fail("sibling gap allocation timed out".to_owned());
+                break;
+            }
+            if SIBLING_REGION.load(Ordering::Acquire) == usize::MAX {
+                fail("sibling gap allocation failed".to_owned());
+                break;
+            }
+        }
         if map_file_page(fd, base) != base {
             fail(format!("remap round={round} {}", std::io::Error::last_os_error()));
             break;
@@ -284,6 +355,16 @@ pub(crate) fn edit_budget(exe: &str, rounds: usize) -> i32 {
     PARKED.store(1, Ordering::SeqCst);
     let _ = futex_wake(&PARKED, 1);
     let _ = sibling.join();
+    if SIBLING_ERROR.load(Ordering::Acquire) != 0 {
+        fail("sibling gap retirement failed".to_owned());
+    }
+    if unsafe { libc::munmap(window, WINDOW_BYTES) } != 0 {
+        fail("private window retirement failed".to_owned());
+    }
+    let sibling_region = SIBLING_REGION.load(Ordering::Acquire);
+    let overlaps = sibling_region != 0 && sibling_region != usize::MAX
+        && base < sibling_region + SIBLING_BYTES && sibling_region < base + PAGE;
+    println!("tlb-edit-budget forced_gap={force_gap_allocation} sibling_gap_overlaps={overlaps}");
     println!(
         "tlb-edit-budget rounds={rounds} errors={errors} ok={} {first_error}",
         errors == 0
