@@ -230,6 +230,7 @@ where
         let Some((zone, slot)) = zone_slot(engine) else {
             return Ok(None);
         };
+        carrick_kernel::el1_zone::hand_back_completions();
         zone.sweep_cancelled(slot);
         carrick_kernel::el1_zone::hand_back_wanted(slot);
         // Every exit: nothing serves this slot's timer until the vCPU
