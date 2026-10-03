@@ -180,7 +180,7 @@ impl PendingExecStage2Cleanup {
         }
         let mut root_proof = None;
         if let (Some(mm_access), Some(root_slot)) = (&self.mm_access, self.mm_root_slot) {
-            let retired_root = mm_access.retire_mm_root_stage2_in(custody, root_slot)?;
+            let retired_root = mm_access.retire_exec_mm_root_stage2_in(custody, root_slot)?;
             let (ipa, size) = retired_root.physical_extent;
             if !retired_extents.iter().any(|retired| {
                 (retired.physical_ipa, retired.physical_length) == (ipa, size as u64)

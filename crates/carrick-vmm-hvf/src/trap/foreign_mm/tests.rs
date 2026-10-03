@@ -11422,7 +11422,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     let mut retirement_excluded_access = false;
     let retired_root = installed
         .state
-        .retire_mm_root_stage2_in_using(&transport.custody, root_slot, &mut |_, _| {
+        .retire_mm_root_stage2_in_using(&transport.custody, root_slot, true, &mut |_, _| {
             saw_unmap = true;
             retirement_excluded_access = table_authority.try_with_manager_until(
                 std::time::Instant::now(),
