@@ -18,6 +18,40 @@ use carrick_fatal::carrick_fatal;
 use carrick_kernel::dispatch::mm_quiesce::PtPauseBudget;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum ForkMemoryAuthority<'a> {
+    Setup(carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'a>),
+    Owner(carrick_kernel::dispatch::mm_mutation::OwnerMmTopologyGuard<'a>),
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ForkMemoryAuthority<'_> {
+    fn host_alias_permit(&self) -> carrick_kernel::dispatch::mm_mutation::HostAliasPermit<'_> {
+        match self {
+            Self::Setup(guard) => guard.host_alias_permit(),
+            Self::Owner(guard) => guard.host_alias_permit(),
+        }
+    }
+    fn begin_transaction(&self) -> carrick_kernel::dispatch::mm_mutation::MmTransactionGuard<'_> {
+        match self {
+            Self::Setup(guard) => guard.begin_transaction(),
+            Self::Owner(guard) => guard.begin_transaction(),
+        }
+    }
+    fn fork_commit<'fork>(
+        &'fork self,
+        transaction: &'fork carrick_kernel::dispatch::mm_mutation::MmTransactionGuard<'_>,
+        child: &'fork carrick_kernel::dispatch::SyscallDispatcher,
+    ) -> Result<
+        carrick_kernel::dispatch::mm_mutation::ForkCommit<'fork>,
+        carrick_kernel::dispatch::mm_mutation::ForkCommitRefusal,
+    > {
+        match self {
+            Self::Setup(guard) => guard.fork_commit(transaction, child),
+            Self::Owner(guard) => guard.fork_commit(transaction, child),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 enum PreparedHvpatchProcessMm {
     Copied(crate::hvpatch::PreparedStage1Mm),
     Shared {
@@ -44,19 +78,6 @@ impl PreparedHvpatchProcessMm {
             Self::Copied(mm) => mm.asid_generation().generation(),
             Self::Shared { lease, .. } => lease.asid_generation().generation(),
         }
-    }
-}
-
-fn read_optional_fork_output(
-    memory: &impl CurrentMmMemory,
-    address: Option<u64>,
-) -> Option<Option<Vec<u8>>> {
-    match address {
-        None => Some(None),
-        Some(address) => memory
-            .read_bytes(address, std::mem::size_of::<i32>())
-            .ok()
-            .map(Some),
     }
 }
 
@@ -1069,44 +1090,53 @@ where
                 ),
             };
         let parent_mm_id = parent_context.shared().mm().id();
-        let parent_mutation =
-            match carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor) {
-                Ok(mutation) => mutation,
-                Err(install_failure) => {
+        let owner_mm = mm_executor.has_admitted_el1_owner();
+        let parent_mutation = if owner_mm {
+            ForkMemoryAuthority::Owner(
+                carrick_kernel::dispatch::mm_mutation::from_owner_executor(mm_executor)
+                    .ok_or_else(|| {
+                        RuntimeError::Configuration(
+                            "admitted fork lost owner task/custody authority".into(),
+                        )
+                    })?,
+            )
+        } else {
+            ForkMemoryAuthority::Setup(
+                match carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor) {
+                    Ok(mutation) => mutation,
+                    Err(install_failure) => {
+                        tracing::warn!(?install_failure, "setup fork could not pause parent MM");
+                        return Ok(PreparedInProcessFork::Complete(Some(
+                            crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                        )));
+                    }
+                },
+            )
+        };
+        if let ForkMemoryAuthority::Setup(setup) = &parent_mutation {
+            if let Some(engine) = (memory as &dyn std::any::Any).downcast_ref::<E>() {
+                super::signal::reconcile_guest_frame_commits(&kernel.dispatcher, engine, setup);
+            }
+            if !shares_mm {
+                let permit = setup.host_alias_permit();
+                if let Err(error) = kernel.dispatcher.with_kernel_resources(parent_context, || {
+                    kernel
+                        .dispatcher
+                        .reconcile_el1_deferred_returns(&permit, memory)
+                }) {
                     tracing::warn!(
-                        ?install_failure,
-                        "dispatcher fork install could not pause the parent MM; fork(2) = EAGAIN"
+                        ?error,
+                        "setup fork could not settle EL1 stock and owed returns"
                     );
                     return Ok(PreparedInProcessFork::Complete(Some(
                         crate::linux_abi::LINUX_EAGAIN.guest_retval(),
                     )));
                 }
-            };
-        if let Some(engine) = (memory as &dyn std::any::Any).downcast_ref::<E>() {
-            super::signal::reconcile_guest_frame_commits(
-                &kernel.dispatcher,
-                engine,
-                &parent_mutation,
-            );
-        }
-        if !shares_mm {
-            let permit = parent_mutation.host_alias_permit();
-            if let Err(error) = kernel.dispatcher.with_kernel_resources(parent_context, || {
-                kernel
-                    .dispatcher
-                    .reconcile_el1_deferred_returns(&permit, memory)
-            }) {
-                tracing::warn!(?error, "fork could not settle EL1 stock and owed returns");
-                return Ok(PreparedInProcessFork::Complete(Some(
-                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-                )));
             }
-        }
-        if (memory as &dyn std::any::Any).is::<E>() {
-            // Fork can arm COW and repoint both committed and still-prepared
-            // leaves. No pre-fork grant may authorize a later guest commit.
-            if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
-                table.retire_overlapping(parent_mm_id.raw(), 0, u64::MAX);
+            if (memory as &dyn std::any::Any).is::<E>() {
+                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                    table.retire_overlapping(parent_mm_id.raw(), 0, u64::MAX);
+                }
             }
         }
         let mut inventory_transaction = None;
@@ -1151,19 +1181,42 @@ where
         );
         let child_key = prepared_fork.child_key();
 
-        let Some(parent_tid_original) = read_optional_fork_output(memory, request.parent_tid_addr)
+        let mut owner_parent_admission = if matches!(parent_mutation, ForkMemoryAuthority::Owner(_))
+        {
+            use carrick_hal::stage1_mm::Stage1MmProjection;
+            let lease = parent_process
+                .mm_resources()
+                .lease(parent_context.task().key())
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!("fork parent ASID admission: {error}"))
+                })?;
+            Some(lease.admit_borrowed_ttbr0().ok_or_else(|| {
+                RuntimeError::Configuration("fork parent ASID generation closed".into())
+            })?)
+        } else {
+            None
+        };
+        let Some(parent_tid_original) = ops.read_optional_fork_output(
+            memory,
+            request.parent_tid_addr,
+            &mut owner_parent_admission,
+        ) else {
+            return Ok(PreparedInProcessFork::Complete(Some(
+                crate::linux_abi::LINUX_EFAULT.guest_retval(),
+            )));
+        };
+        let Some(pidfd_original) =
+            ops.read_optional_fork_output(memory, request.pidfd_out, &mut owner_parent_admission)
         else {
             return Ok(PreparedInProcessFork::Complete(Some(
                 crate::linux_abi::LINUX_EFAULT.guest_retval(),
             )));
         };
-        let Some(pidfd_original) = read_optional_fork_output(memory, request.pidfd_out) else {
-            return Ok(PreparedInProcessFork::Complete(Some(
-                crate::linux_abi::LINUX_EFAULT.guest_retval(),
-            )));
-        };
-        let Some(_child_tid_original) = read_optional_fork_output(memory, request.child_tid_addr)
-        else {
+        let Some(_child_tid_original) = ops.read_optional_fork_output(
+            memory,
+            request.child_tid_addr,
+            &mut owner_parent_admission,
+        ) else {
             return Ok(PreparedInProcessFork::Complete(Some(
                 crate::linux_abi::LINUX_EFAULT.guest_retval(),
             )));
@@ -1229,6 +1282,25 @@ where
             PreparedHvpatchProcessMm::Copied(prepared) => Some(prepared.table_arena_source()),
             PreparedHvpatchProcessMm::Shared { .. } => None,
         };
+        // Publish only a closed owner root. Its contents are built by Fork;
+        // no host child rows are imported before or after the portal service.
+        let mut owner_child_publication =
+            if matches!(parent_mutation, ForkMemoryAuthority::Owner(_)) && !shares_mm {
+                Some(
+                    prepared_dispatch_mm
+                        .publish_owner_child_address_space(
+                            child_binding.ttbr0.raw(),
+                            child_binding.ttbr0.raw(),
+                        )
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "owner fork closed child publication refused".into(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
         let (prepared_backend, cpu, child_kicker) = match ops.prepare(
             memory,
             inventory_preparation,
@@ -1253,6 +1325,18 @@ where
             Ok(prepared) => prepared,
             Err(error) => {
                 rollback_pidfd(installed_pidfd);
+                if let RuntimeError::Trap(carrick_hal::TrapError::OwnerForkRefused { errno }) =
+                    &error
+                {
+                    let errno = if *errno == carrick_abi::LINUX_EBUSY
+                        || *errno == carrick_abi::LINUX_ESTALE
+                    {
+                        crate::linux_abi::LINUX_EAGAIN
+                    } else {
+                        *errno
+                    };
+                    return Ok(PreparedInProcessFork::Complete(Some(errno.guest_retval())));
+                }
                 return Err(error);
             }
         };
@@ -1338,11 +1422,22 @@ where
         // PID until commit. Copy out that captured visible identity while all
         // backend keys continue to use the carrier-global TaskId.
         let parent_outputs_published = request.parent_tid_addr.is_none_or(|address| {
-            memory
-                .write_bytes(address, &guest_child_pid.to_le_bytes())
-                .is_ok()
+            ops.write_fork_parent_output(
+                memory,
+                address,
+                &guest_child_pid.to_le_bytes(),
+                &mut owner_parent_admission,
+            )
+            .is_ok()
         }) && match (request.pidfd_out, installed_pidfd) {
-            (Some(address), Some(fd)) => memory.write_bytes(address, &fd.to_le_bytes()).is_ok(),
+            (Some(address), Some(fd)) => ops
+                .write_fork_parent_output(
+                    memory,
+                    address,
+                    &fd.to_le_bytes(),
+                    &mut owner_parent_admission,
+                )
+                .is_ok(),
             (None, _) => true,
             (Some(_), None) => false,
         };
@@ -1362,7 +1457,7 @@ where
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
-                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
                     carrick_fatal!(
                         "vcpu_loop::quiesce_rollback",
                         "failed to restore original parent_tid memory bytes during fork copyout rollback: address={:?}",
@@ -1371,7 +1466,7 @@ where
                 });
             }
             if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
-                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
                     carrick_fatal!(
                         "vcpu_loop::quiesce_rollback",
                         "failed to restore original pidfd memory bytes during fork copyout rollback: address={:?}",
@@ -1392,7 +1487,7 @@ where
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
-                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
                     carrick_fatal!(
                         "vcpu_loop::quiesce_rollback",
                         "failed to restore parent_tid bytes on failpoint rollback: address={:?}",
@@ -1401,13 +1496,14 @@ where
                 });
             }
             if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
-                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
-                    carrick_fatal!(
-                        "vcpu_loop::quiesce_rollback",
-                        "failed to restore pidfd bytes on failpoint rollback: address={:?}",
-                        address
-                    );
-                });
+                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission)
+                    .unwrap_or_else(|_| {
+                        carrick_fatal!(
+                            "vcpu_loop::quiesce_rollback",
+                            "failed to restore pidfd bytes on failpoint rollback: address={:?}",
+                            address
+                        );
+                    });
             }
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
@@ -1421,7 +1517,7 @@ where
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
-                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
                     carrick_fatal!(
                         "vcpu_loop::quiesce_rollback",
                         "failed to restore parent_tid memory on child materialization failure: address={:?}",
@@ -1430,7 +1526,7 @@ where
                 });
             }
             if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
-                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
                     carrick_fatal!(
                         "vcpu_loop::quiesce_rollback",
                         "failed to restore pidfd memory on child materialization failure: address={:?}",
@@ -1447,28 +1543,51 @@ where
             return Err(error);
         }
         if !shares_mm {
+            let owner_receipt = if owner_child_publication.is_some() {
+                Some(ops.pending_owner_fork_receipt(memory).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::fork_commit",
+                        "admitted Fork has no exact owner completion: child_pid={child_pid}"
+                    )
+                }))
+            } else {
+                None
+            };
+            if let Some((completion, sources)) = &owner_receipt {
+                let commit = parent_mutation.fork_commit(&topology, &child_dispatcher).unwrap_or_else(|refusal| {
+                    carrick_fatal!("hvpatch::fork_commit", "owner Fork child commit authority refused: child_pid={child_pid}, refusal={refusal:?}")
+                });
+                commit.admit_owner_child_root(&kernel.dispatcher, completion, sources).unwrap_or_else(|refusal| {
+                    carrick_fatal!("hvpatch::fork_commit", "owner Fork child authentication refused: child_pid={child_pid}, refusal={refusal:?}")
+                });
+            }
             ops.commit_parent(memory).unwrap_or_else(|error| {
-                tracing::error!(%error, "commit parent HVPatch fork transaction");
                 carrick_fatal!(
                     "hvpatch::fork_parent_commit",
-                    "failed to commit parent HVPatch fork transaction: parent_pid={parent_pid}, error={error}"
-                );
+                    "failed to commit parent fork: parent_pid={parent_pid}, error={error}"
+                )
             });
-            // The copied child's address space is published, and its
-            // reservation root admitted from the parent's committed root,
-            // under this fork's own MM transaction, before the child can run.
             if let PreparedHvpatchProcessMm::Copied(prepared) = &prepared_mm {
-                let commit = parent_mutation
-                    .fork_commit(&topology, &child_dispatcher)
-                    .unwrap_or_else(|refusal| {
-                        carrick_fatal!(
-                            "hvpatch::fork_commit",
-                            "fork commit authority refused over the prepared child MM: parent_pid={parent_pid}, child_pid={child_pid}, refusal={refusal:?}"
-                        )
+                if let Some((completion, _)) = owner_receipt {
+                    let publication = owner_child_publication
+                        .take()
+                        .unwrap()
+                        .into_admitted_publication(completion.child)
+                        .unwrap_or_else(|_| {
+                            carrick_fatal!(
+                                "hvpatch::fork_commit",
+                                "owner Fork exact child root opening refused: child_pid={child_pid}"
+                            )
+                        });
+                    prepared.publish_address_space(|_| Some(publication));
+                } else {
+                    let commit = parent_mutation.fork_commit(&topology, &child_dispatcher).unwrap_or_else(|refusal| {
+                        carrick_fatal!("hvpatch::fork_commit", "setup fork commit authority refused: child_pid={child_pid}, refusal={refusal:?}")
                     });
-                prepared.publish_address_space(|child_ttbr0| {
-                    commit.publish_and_admit_child(&kernel.dispatcher, child_ttbr0)
-                });
+                    prepared.publish_address_space(|child_ttbr0| {
+                        commit.publish_and_admit_child(&kernel.dispatcher, child_ttbr0)
+                    });
+                }
             }
         }
         drop(topology);

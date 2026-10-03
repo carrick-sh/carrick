@@ -61,6 +61,14 @@ pub trait TableArenaPublisher: Send + Sync {
     /// Publish every extension arena of `manager` the backend does not hold
     /// yet. An error leaves the arenas unpublished.
     fn publish_extension_arenas(&self, manager: &PageTableManager) -> Result<(), String>;
+    /// Publish physical capacity before the owner chooses any descriptors.
+    fn publish_raw_fork_arena(&self, _base: u64) -> Result<(), String> {
+        Err("raw Fork table capacity is unavailable".into())
+    }
+    /// Release unused capacity after the owner's exact abort/unused receipt.
+    fn retire_raw_fork_arena(&self, _base: u64) -> Result<(), String> {
+        Err("raw Fork table capacity retirement is unavailable".into())
+    }
 }
 
 struct Stage1AuthorityInner {
@@ -865,6 +873,35 @@ impl Stage1Authority {
         f(&mut editor)
     }
 
+    /// Reserve physically published, unlinked table capacity for owner Fork.
+    /// This method neither observes nor edits the MM's descriptor graph.
+    pub fn reserve_owner_fork_arena(&self) -> Result<OwnerForkTableArena, String> {
+        let (base, publisher) = {
+            let mut inner = self.inner.lock();
+            let publisher = inner
+                .arena_publisher
+                .clone()
+                .ok_or_else(|| "Fork table capacity has no physical publisher".to_owned())?;
+            let base = inner
+                .arena_source
+                .as_mut()
+                .and_then(|source| source.take_arena())
+                .ok_or_else(|| "Fork table capacity is exhausted".to_owned())?;
+            (base, publisher)
+        };
+        if let Err(error) = publisher.publish_raw_fork_arena(base.0) {
+            if let Some(source) = self.inner.lock().arena_source.as_mut() {
+                source.return_arena(base);
+            }
+            return Err(error);
+        }
+        Ok(OwnerForkTableArena {
+            authority: self.clone(),
+            publisher,
+            base: Some(base),
+        })
+    }
+
     /// Install an arena source. Refuses conflicting lease identities.
     /// Fires probe site 1 if the manager is already present, or site 3 if deferred.
     pub fn install_source(&self, source: Box<dyn TableArenaSource>) -> Result<(), PageTableError> {
@@ -1365,6 +1402,46 @@ pub enum HostLaneCause {
 
 impl HostLaneCause {
     pub const COUNT: usize = 6;
+}
+
+/// Physical source lifetime for one owner-selected parent split-table extent.
+#[must_use = "Fork table capacity must settle from an exact owner receipt"]
+pub struct OwnerForkTableArena {
+    authority: Stage1Authority,
+    publisher: Arc<dyn TableArenaPublisher>,
+    base: Option<carrick_mmu_core::aarch64::SubstrateGpa>,
+}
+impl OwnerForkTableArena {
+    pub fn arena(&self) -> Option<carrick_el1_abi::PortalForkTableArena> {
+        self.base
+            .and_then(|base| carrick_el1_abi::PortalForkTableArena::new(base.0, 2 * 1024 * 1024))
+    }
+    /// Called only after owner FINISH; used capacity remains part of this MM.
+    pub fn settle(mut self, used: u64) -> Result<(), String> {
+        if used > 2 * 1024 * 1024 {
+            return Err("owner Fork exceeded table capacity".into());
+        }
+        if used != 0 {
+            if let Some(base) = self.base.take() {
+                self.authority.inner.lock().published_arenas.push(base.0);
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for OwnerForkTableArena {
+    fn drop(&mut self) {
+        if let Some(base) = self.base.take() {
+            if self.publisher.retire_raw_fork_arena(base.0).is_err() {
+                // The physical publisher still holds this exact allocation;
+                // quarantine it rather than recycle capacity that remains live.
+                return;
+            }
+            if let Some(source) = self.authority.inner.lock().arena_source.as_mut() {
+                source.return_arena(base);
+            }
+        }
+    }
 }
 
 pub struct Stage1Editor<'a> {

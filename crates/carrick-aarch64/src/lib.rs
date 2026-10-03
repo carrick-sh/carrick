@@ -28,6 +28,7 @@
 pub mod descriptor_drain;
 pub mod engine;
 pub mod esr;
+pub mod fork;
 #[cfg(test)]
 mod guest_alias_writer_tests;
 pub mod icache;

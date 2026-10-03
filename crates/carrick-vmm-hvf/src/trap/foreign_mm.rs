@@ -380,6 +380,37 @@ pub(crate) struct MmArenaPublisher {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher {
+    fn publish_raw_fork_arena(&self, base: u64) -> Result<(), String> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| "the MM retired".to_owned())?;
+        let mut published = Vec::new();
+        state
+            .publish_raw_stage1_arenas_into(
+                &self.custody,
+                &[base],
+                applevisor::memory::MemPerms::ReadWrite,
+                &mut published,
+            )
+            .map_err(|error| error.to_string())
+    }
+    fn retire_raw_fork_arena(&self, base: u64) -> Result<(), String> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| "the MM retired".to_owned())?;
+        let owner = state
+            .structural_owners
+            .read()
+            .get(&(base, 2 * 1024 * 1024))
+            .cloned()
+            .ok_or_else(|| "raw Fork capacity lost exact structural owner".to_owned())?;
+        retire_carrier_stage2_record_at_safe_point(&self.custody, owner.record_identity())
+            .map_err(|error| error.to_string())?;
+        state.release_structural_owner_at(base, 2 * 1024 * 1024);
+        Ok(())
+    }
     fn publish_extension_arenas(
         &self,
         manager: &carrick_mmu_core::aarch64::PageTableManager,
