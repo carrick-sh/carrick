@@ -2535,20 +2535,9 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "<PendingImport<'_> as Drop>::drop",
-      "ordinal_in_function": 2,
-      "fingerprint": "cc71c9dc59d4405482787e9427101321353ece1f46c8518b669d3d915ebf21d7",
-      "sink": "fatal",
-      "domain": "hvpatch::user_transfer",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::user_transfer",
-      "rationale": "Host-setup descriptor rollback lost its retained exact target resolver; physical release cannot proceed."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "<PendingImport<'_> as Drop>::drop",
-      "ordinal_in_function": 3,
-      "fingerprint": "cc71c9dc59d4405482787e9427101321353ece1f46c8518b669d3d915ebf21d7",
+      "function": "ImportDescriptorUndo::rollback",
+      "ordinal_in_function": 1,
+      "fingerprint": "b0947b1483700b4fb1c59140f655deaecd0398fc5f2d07c066ac4524f799ece5",
       "sink": "fatal",
       "domain": "hvpatch::user_transfer",
       "verdict": "carrier_fault",
