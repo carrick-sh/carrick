@@ -39,6 +39,22 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
         return carrick_el1_abi::Action::Forward as u64;
     }
     let frame_ref = unsafe { &mut *frame };
+    if frame_ref.esr == carrick_el1_abi::MM_PORTAL_BIND_ESR {
+        carrick_el1::personality::mm_portal::bind_transfer_hw(frame_ref);
+        return carrick_el1_abi::Action::Served as u64;
+    }
+    if frame_ref.esr == carrick_el1_abi::MM_PORTAL_GRANT_ESR {
+        carrick_el1::personality::mm_portal::serve_grant_hw(frame_ref);
+        return carrick_el1_abi::Action::Served as u64;
+    }
+    if frame_ref.esr == carrick_el1_abi::MM_PORTAL_SELECT_ESR {
+        carrick_el1::personality::mm_portal::select_transfer_hw(frame_ref);
+        return carrick_el1_abi::Action::Served as u64;
+    }
+    if frame_ref.esr == carrick_el1_abi::MM_PORTAL_SERVICE_ESR {
+        carrick_el1::personality::mm_portal::serve_transfer_hw(frame_ref);
+        return carrick_el1_abi::Action::Served as u64;
+    }
     if frame_ref.esr == carrick_el1_abi::DESCRIPTOR_DRAIN_ESR {
         carrick_el1::fault::serve_host_drain_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
