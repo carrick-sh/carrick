@@ -12891,7 +12891,7 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
     };
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();
-    for retired in [0, 1, 2] {
+    for retired in [3, 0, 1, 2] {
         let _stub = ScopedStage2MapTestStub::enable();
         let transport = CarrierForeignMmTransport::new();
         let installed = install_mm(
@@ -12940,6 +12940,32 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
             window,
         )
         .unwrap();
+        if retired == 3 {
+            // The physical publication succeeds, but descriptor preparation
+            // refuses. Its rollback must not reacquire its own registry guard.
+            installed
+                .state
+                .page_tables_authority()
+                .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Host);
+            let before = installed.state.frame_inventory.ledger.lock().extents.len();
+            assert!(context.prepare_transfer(window).is_err());
+            assert_eq!(
+                installed.state.frame_inventory.ledger.lock().extents.len(),
+                before
+            );
+            assert!(
+                alias_registry()
+                    .lock()
+                    .overlapping_process_aliases(
+                        start,
+                        4096,
+                        Some(installed.owners.0[0]),
+                        ContainerRootToken::ROOT,
+                    )
+                    .is_empty()
+            );
+            continue;
+        }
         let mut pending = context.prepare_transfer(window).unwrap().unwrap();
         let txn = *pending.transaction();
         let DescriptorOp::Prepare {
@@ -13345,4 +13371,293 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
         grants,
         "ready target never allocates duplicate supply"
     );
+}
+
+/// VM-free physical/admission composition. This fixture models the kernel
+/// publication guard; its real lock/normal-publication interleaving is covered
+/// in kernel::mm_occupancy. Source custody, allocation, inventory, rollback,
+/// reservation admission, descriptor setup and transfer copy are production.
+#[test]
+fn transfer_external_copy_only_and_stale_source_precede_root_admission() {
+    use carrick_aarch64::user_transfer::TransferCustody;
+    use carrick_el1::personality::mm_portal::test_support::{Region, VA, admit, nodes};
+    use carrick_el1_abi::{
+        PortalRetainedData, PortalTransferIntent, ReservationProtection, ReservationRange,
+    };
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let mut installed = install_mm(
+        &transport,
+        297,
+        0x9a00_6300_0000,
+        0x9b00_6300_0000,
+        *b"peer",
+    );
+    let (authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+    let target =
+        super::super::user_transfer::UserTransferCustody::from_transport(transport.clone(), None);
+    let source_custody = Arc::new(CarrierVmCustody::new_live_fixture());
+    let source_ipa = 0xa088_2300_0000;
+    let source_owner = super::super::user_transfer::tests::backing(&source_custody, source_ipa);
+    unsafe {
+        std::ptr::copy_nonoverlapping(b"away".as_ptr(), source_owner.ptr(), 4);
+    }
+    let source = super::super::user_transfer::UserTransferCustody::new(source_custody.clone());
+    let identity = source_owner.record_identity;
+    let receipt = PortalRetainedData {
+        record: nonzero(identity.record_id.0),
+        vm_generation: nonzero(identity.vm_generation.0),
+        owner: identity
+            .logical_owner
+            .map(|owner| (nonzero(owner.id), nonzero(owner.generation))),
+    };
+    let region = Region::new();
+    struct Owner<'a> {
+        spaces: &'a carrick_el1_abi::ZoneTables,
+        mm: std::num::NonZeroU64,
+    }
+    // SAFETY: this single-thread physical fixture owns its private tables;
+    // production issues the same permit from the kernel's SPACES_LOCK guard.
+    unsafe impl carrick_hal::PreAdmissionOwner for Owner<'_> {
+        fn mm(&self) -> std::num::NonZeroU64 {
+            self.mm
+        }
+        fn unpublished(&self) -> bool {
+            self.spaces.spaces.find(self.mm.get()).is_none()
+        }
+    }
+    let zone_layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+    let raw = unsafe { std::alloc::alloc_zeroed(zone_layout) };
+    assert!(!raw.is_null());
+    let zone = unsafe { Box::from_raw(raw.cast::<carrick_el1_abi::ZoneTables>()) };
+    let guard = Owner {
+        spaces: &zone,
+        mm: nonzero(installed.snapshot.mm.get()),
+    };
+    let before = installed.state.frame_inventory.ledger.lock().extents.len();
+    let mut stale = receipt;
+    stale.owner.as_mut().unwrap().1 = nonzero(stale.owner.unwrap().1.get() + 1);
+    assert!(
+        source
+            .retain_import_source(Gpa(source_ipa), 4096, stale)
+            .is_err()
+    );
+    assert!(zone.spaces.find(guard.mm.get()).is_none());
+    assert_eq!(
+        installed.state.frame_inventory.ledger.lock().extents.len(),
+        before
+    );
+    assert_eq!(
+        source_custody
+            .stage2_record_snapshot(identity.record_id)
+            .unwrap()
+            .pin_count,
+        0
+    );
+    let binding = carrick_hal::ForeignMmBinding::for_aarch64(
+        carrick_hal::ForeignAsid::from_kernel_allocation(installed.snapshot.asid),
+        installed.snapshot.stage1_root,
+    );
+    // A refused admission drops the exact staged destination before any root
+    // publication. A later source/target generation must remain usable.
+    let original_translation = installed
+        .state
+        .page_tables_authority()
+        .with_manager(|manager| manager.translate(VA));
+    let refused = target
+        .prepare_import(
+            binding,
+            carrick_hal::PreAdmissionPermit::new(&guard).unwrap(),
+            source
+                .retain_import_source(Gpa(source_ipa), 4096, receipt)
+                .unwrap(),
+            ReservationRange::new(VA, VA + 4096).unwrap(),
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    let refused_ready = refused.ready();
+    let refused_owner = transport
+        .custody
+        .global_frame_host_owners
+        .lock()
+        .range(..=(refused_ready.physical_ipa, u64::MAX))
+        .next_back()
+        .unwrap()
+        .1
+        .owner()
+        .clone();
+    let tables = installed.state.page_tables_authority();
+    assert_eq!(
+        tables.with_manager(|manager| manager.translate(VA)),
+        Some(Some(refused_ready.physical_ipa))
+    );
+    drop(refused);
+    assert_eq!(
+        tables.with_manager(|manager| manager.translate(VA)),
+        original_translation,
+        "refused admission must undo loader descriptors before physical release"
+    );
+    assert!(zone.spaces.find(guard.mm.get()).is_none());
+    assert_eq!(
+        installed.state.frame_inventory.ledger.lock().extents.len(),
+        before
+    );
+    assert!(
+        !authority
+            .live
+            .read()
+            .mapping_ids
+            .iter()
+            .any(|mapping| mapping.raw() == refused_ready.mapping_id)
+    );
+    assert_eq!(
+        transport
+            .custody
+            .stage2_record_snapshot(refused_owner.record_identity.record_id)
+            .unwrap()
+            .pin_count,
+        0
+    );
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(source_owner.ptr(), 4) },
+        b"away"
+    );
+    let retained = source
+        .retain_import_source(Gpa(source_ipa), 4096, receipt)
+        .unwrap();
+    assert_eq!(
+        source_custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+        CarrierStage2RetireOutcome::DeferredActivePins
+    );
+    source_custody
+        .global_frame_host_owners
+        .lock()
+        .remove(&(source_ipa, 16384));
+    assert!(
+        source
+            .retain_import_source(Gpa(source_ipa), 4096, receipt)
+            .is_err()
+    );
+    drop(source_owner);
+    drop(source);
+    drop(source_custody);
+    let pending = target
+        .prepare_import(
+            binding,
+            carrick_hal::PreAdmissionPermit::new(&guard).unwrap(),
+            retained,
+            ReservationRange::new(VA, VA + 4096).unwrap(),
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    let ready = pending.ready();
+    assert!(zone.spaces.find(guard.mm.get()).is_none());
+    let owner = transport
+        .custody
+        .global_frame_host_owners
+        .lock()
+        .range(..=(ready.physical_ipa, u64::MAX))
+        .next_back()
+        .unwrap()
+        .1
+        .owner()
+        .clone();
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
+        b"away"
+    );
+    assert_ne!(ready.physical_ipa, source_ipa);
+    assert_eq!(
+        transport
+            .custody
+            .stage2_record_snapshot(owner.record_identity.record_id)
+            .unwrap()
+            .pin_count,
+        1
+    );
+    // The pending import owns loader undo until normal root admission.
+    let mm = admit(
+        &region,
+        &zone.spaces,
+        guard.mm.get(),
+        installed.snapshot.stage1_root.0,
+        1,
+        0,
+    );
+    let committed = pending
+        .commit(unsafe { carrick_hal::PreAdmissionReceipt::after_admission(&guard) })
+        .unwrap();
+    assert_eq!(committed, ready);
+    assert_eq!(
+        transport
+            .custody
+            .stage2_record_snapshot(owner.record_identity.record_id)
+            .unwrap()
+            .pin_count,
+        0
+    );
+    assert!(
+        authority
+            .live
+            .read()
+            .mapping_ids
+            .iter()
+            .any(|mapping| mapping.raw() == ready.mapping_id)
+    );
+    // Actual selected source bytes survive source owner/directory destruction.
+    let view = nodes(&region);
+    let portal = carrick_el1::personality::mm_portal::MmPortal::new(
+        target.carrier(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    );
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            carrick_el1::personality::mm_portal::GuestVa::new(VA),
+            4,
+            PortalTransferIntent::UserRead,
+            0,
+        )
+        .unwrap();
+    let root_host =
+        global_frame_host_owner_identity(installed.owners.0[0].0, installed.owners.0[0].1)
+            .unwrap()
+            .0;
+    let maintenance = carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
+    let words = unsafe {
+        carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords::new(
+            root_host as *mut _,
+            installed.snapshot.stage1_root.0,
+            installed.owners.0[0].1 as usize,
+            &maintenance,
+        )
+    }
+    .unwrap();
+    let chunk = carrick_el1::personality::mm_portal::test_support::selected(
+        portal
+            .select(
+                &transfer,
+                &words,
+                &mut carrick_el1::fault::NoopPreparedResolver,
+                &mut carrick_el1::fault::NoopCowResolver,
+                &carrick_el1::personality::mm_portal::test_support::residency(),
+                &carrick_el1_abi::FrameGrantMailbox::new(),
+                0,
+            )
+            .unwrap(),
+    );
+    assert_eq!(chunk.ipa, ready.physical_ipa);
+    let mut bytes = [0; 4];
+    super::super::user_transfer::tests::copy_bytes(
+        &target,
+        chunk.ipa,
+        PortalTransferIntent::UserRead,
+        &mut bytes,
+    );
+    assert_eq!(&bytes, b"away");
+    installed.owners.0.push((owner.ipa(), owner.length()));
 }

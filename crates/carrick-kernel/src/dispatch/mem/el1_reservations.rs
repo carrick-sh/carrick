@@ -407,7 +407,8 @@ impl SyscallDispatcher {
     /// memory ([`El1AdmissionOrigin::Bind`]) in the same step: an address
     /// space is never published without its admission being decided.
     /// `participation` is this MM's loading executor; the admission takes
-    /// its exact-MM mutation authority after the publication.
+    /// its exact-MM mutation authority before publication and retains it
+    /// through admission.
     ///
     /// A fork child is published and admitted by its fork commit instead
     /// ([`crate::dispatch::mm_mutation::ForkCommit::publish_and_admit_child`]).
@@ -428,22 +429,139 @@ impl SyscallDispatcher {
                 participation.mm_id()
             );
         }
-        let publication = participation.publish_address_space(ttbr0, ttbr1)?;
+        self.with_address_space_admission(participation, |admission| {
+            admission.publish(memory, ttbr0, ttbr1, false).map(|_| ())
+        })
+        .map(|(publication, ())| publication)
+    }
+}
+
+/// Mutation admission precedes publication and remains held through root
+/// import. The borrowed physical permit cannot outlive this exact owner.
+pub struct BoundAddressSpaceAdmission<'a> {
+    dispatcher: &'a SyscallDispatcher,
+    mutation: crate::dispatch::mm_mutation::MmMutationGuard<'a>,
+    owner: crate::dispatch::mm_authority::AddressSpacePublicationOwner,
+    publication: crate::kernel::mm_occupancy::PreAdmissionGuard,
+    prepared: core::cell::RefCell<Option<crate::kernel::AddressSpacePublication>>,
+    #[cfg(test)]
+    after_publication: core::cell::RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+}
+impl SyscallDispatcher {
+    /// Run physical preparation and normal admission under one publication
+    /// owner. The callback cannot let borrowed permits escape. The returned
+    /// publication leaves only after the owner's lock is released.
+    pub fn with_address_space_admission<R>(
+        &self,
+        participation: &mut crate::dispatch::MmExecutorParticipation,
+        operation: impl FnOnce(&BoundAddressSpaceAdmission<'_>) -> Option<R>,
+    ) -> Option<(crate::kernel::AddressSpacePublication, R)> {
+        let admission = self.begin_address_space_admission(participation)?;
+        let result = operation(&admission)?;
+        let publication = admission.prepared.borrow_mut().take()?;
+        drop(admission);
+        Some((publication, result))
+    }
+    fn begin_address_space_admission<'a>(
+        &'a self,
+        participation: &'a mut crate::dispatch::MmExecutorParticipation,
+    ) -> Option<BoundAddressSpaceAdmission<'a>> {
+        self.begin_address_space_admission_with(
+            participation,
+            crate::kernel::mm_occupancy::PreAdmissionGuard::acquire,
+        )
+    }
+    fn begin_address_space_admission_with<'a>(
+        &'a self,
+        participation: &'a mut crate::dispatch::MmExecutorParticipation,
+        acquire: impl FnOnce(
+            crate::kernel::MmId,
+        ) -> Option<crate::kernel::mm_occupancy::PreAdmissionGuard>,
+    ) -> Option<BoundAddressSpaceAdmission<'a>> {
+        if !participation.authorizes(&self.mm_authority()) {
+            return None;
+        }
+        let owner = participation.address_space_publication_owner();
         let mm = participation.mm_id();
-        let admission = match crate::dispatch::mm_mutation::from_executor(participation) {
-            Ok(guard) => RootAdmission::of(
-                self.admit_el1_reservations(&guard.host_alias_permit(), El1AdmissionOrigin::Bind),
-            ),
-            Err(_) => RootAdmission::NoAuthority,
+        let mutation = match crate::dispatch::mm_mutation::from_executor(participation) {
+            Ok(mutation) => mutation,
+            Err(_) => {
+                RootAdmission::NoAuthority.trace(
+                    mm,
+                    carrick_observability::probes::HvpatchEl1RootOrigin::Bind,
+                );
+                return None;
+            }
         };
+        let publication = acquire(mm)?;
+        Some(BoundAddressSpaceAdmission {
+            dispatcher: self,
+            mutation,
+            owner,
+            publication,
+            prepared: core::cell::RefCell::new(None),
+            #[cfg(test)]
+            after_publication: core::cell::RefCell::new(None),
+        })
+    }
+}
+impl BoundAddressSpaceAdmission<'_> {
+    pub fn permit(&self) -> Option<carrick_hal::PreAdmissionPermit<'_>> {
+        self.publication.permit()
+    }
+    /// A physical import requires successful normal delegated admission. On
+    /// refusal, cleanup uses the same publication lock before physical rollback.
+    pub fn publish_import<M: CurrentMmMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        ttbr0: u64,
+        ttbr1: u64,
+    ) -> Option<carrick_hal::PreAdmissionReceipt<'_>> {
+        self.publish(memory, ttbr0, ttbr1, true)?
+    }
+    fn publish<M: CurrentMmMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        ttbr0: u64,
+        ttbr1: u64,
+        require_delegated: bool,
+    ) -> Option<Option<carrick_hal::PreAdmissionReceipt<'_>>> {
+        *self.prepared.borrow_mut() = Some(self.owner.publish(&self.publication, ttbr0, ttbr1)?);
+        #[cfg(test)]
+        if let Some(hook) = self.after_publication.borrow_mut().take() {
+            hook();
+        }
+        let admission =
+            RootAdmission::of(self.dispatcher.admit_el1_reservations(
+                &self.mutation.host_alias_permit(),
+                El1AdmissionOrigin::Bind,
+            ));
         admission.trace(
-            mm,
+            self.mutation.mm_id(),
             carrick_observability::probes::HvpatchEl1RootOrigin::Bind,
         );
-        if admission == RootAdmission::Decided(El1Admission::Delegated) {
-            self.mem_view().release_root_territory(memory);
+        let receipt = if admission == RootAdmission::Decided(El1Admission::Delegated) {
+            self.dispatcher.mem_view().release_root_territory(memory);
+            // SAFETY: descriptor/backing setup preceded this call; exact root
+            // import completed under mutation and publication authority.
+            Some(unsafe { carrick_hal::PreAdmissionReceipt::after_admission(&self.publication) })
+        } else {
+            if require_delegated {
+                if let Some(publication) = self.prepared.borrow_mut().take() {
+                    self.publication.refuse(publication);
+                }
+                return None;
+            }
+            None
+        };
+        Some(receipt)
+    }
+}
+impl Drop for BoundAddressSpaceAdmission<'_> {
+    fn drop(&mut self) {
+        if let Some(publication) = self.prepared.get_mut().take() {
+            self.publication.refuse(publication);
         }
-        Some(publication)
     }
 }
 
@@ -842,6 +960,65 @@ mod tests {
         let mem = snapshot();
         seal(&mut model, &mem).unwrap();
         assert!(model.mapping(mem.layout.mmap_base).is_some());
+    }
+    #[test]
+    fn publication_to_root_admission_keeps_exact_mutation_authority() {
+        let dispatcher = SyscallDispatcher::new();
+        let mut executor = dispatcher.enter_mm_executor().unwrap();
+        let mm = executor.mm_id();
+        let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+        let occupancy = Box::leak(Box::new(carrick_sched_core::Occupancy::new()));
+        let admission = dispatcher
+            .begin_address_space_admission_with(&mut executor, |mm| {
+                crate::kernel::mm_occupancy::PreAdmissionGuard::for_test(spaces, occupancy, mm)
+            })
+            .unwrap();
+        *admission.after_publication.borrow_mut() = Some(Box::new(|| {
+            let index = spaces.find(mm.raw()).unwrap();
+            std::thread::scope(|scope| {
+                let edit = scope.spawn(|| {
+                    spaces
+                        .try_begin_edit(index, mm.raw(), core::num::NonZeroU64::new(2).unwrap())
+                        .is_some()
+                });
+                assert!(
+                    !edit.join().unwrap(),
+                    "edit entered after publication before root admission"
+                );
+            });
+        }));
+        let mut memory = crate::dispatch::LinearMemory::new(0x10000, vec![0; 4096]);
+        assert!(
+            admission
+                .publish(&mut memory, 0x1000, 0x1000, false)
+                .is_some()
+        );
+        let index = spaces.find(mm.raw()).unwrap();
+        assert!(!spaces.is_open(mm.raw()));
+        let publication = admission.prepared.borrow_mut().take().unwrap();
+        drop(admission);
+        assert!(
+            spaces
+                .try_begin_edit(index, mm.raw(), core::num::NonZeroU64::new(2).unwrap())
+                .is_some()
+        );
+        drop(publication);
+        // This VM-free owner has no installed zone root, so normal import
+        // admission refuses delegation. Cleanup must reuse its held lock.
+        let refused = dispatcher
+            .begin_address_space_admission_with(&mut executor, |mm| {
+                crate::kernel::mm_occupancy::PreAdmissionGuard::for_test(spaces, occupancy, mm)
+            })
+            .unwrap();
+        assert!(
+            refused
+                .publish_import(&mut memory, 0x1000, 0x1000)
+                .is_none()
+        );
+        assert!(spaces.find(mm.raw()).is_none());
+        assert!(refused.prepared.borrow().is_none());
+        assert!(refused.permit().is_some());
+        drop(refused);
     }
 }
 

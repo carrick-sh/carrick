@@ -22,7 +22,7 @@ pub struct MmPortal<'a, P: PinnedMetadataExtent> {
     roots: &'a SharedReservations,
     spaces: &'a AddressSpaces,
     nodes: Option<&'a ResolvedReservationNodes<P>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "host-test"))]
     pub(super) vma_visits: core::sync::atomic::AtomicUsize,
 }
 
@@ -89,7 +89,7 @@ impl TransferContinuation {
 pub struct SelectedChunk {
     handle: El1MmHandle,
     sequence: NonZeroU64,
-    generation: u64,
+    pub(super) generation: u64,
     offset: u64,
     pub va: GuestVa,
     pub ipa: u64,
@@ -143,7 +143,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             roots,
             spaces,
             nodes: Some(nodes),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "host-test"))]
             vma_visits: core::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -221,7 +221,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                 return Err(MmError::Fault);
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "host-test"))]
         self.vma_visits
             .fetch_add(root.work, core::sync::atomic::Ordering::Relaxed);
         Ok(root.generation().raw())
@@ -336,7 +336,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             }
             leaf = translated(words, root, va, access, continuation.intent)?;
         }
-        let Some(ipa) = leaf else {
+        let Some((ipa, executable)) = leaf else {
             // Permission policy was already checked. Reuse the one lazy supply
             // mailbox; failed admission keeps the same continuation position.
             let bits = match access {
@@ -374,17 +374,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             offset: continuation.offset,
             va: GuestVa::new(va),
             ipa,
-            executable: continuation.intent == TransferIntent::UserWrite
-                && matches!(
-                    translated(
-                        words,
-                        grant.ttbr0 & PA,
-                        va,
-                        LeafAccess::Execute,
-                        TransferIntent::ReadInstruction
-                    ),
-                    Ok(Some(_))
-                ),
+            executable: continuation.intent == TransferIntent::UserWrite && executable,
             len,
         }))
     }
@@ -435,21 +425,14 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             Err(MmError::Fault) => return Ok(None),
             result => result?,
         };
-        let executable = continuation.intent == TransferIntent::UserWrite
-            && matches!(
-                translated(
-                    words,
-                    grant.ttbr0 & PA,
-                    selected.va.raw(),
-                    LeafAccess::Execute,
-                    TransferIntent::ReadInstruction
-                ),
-                Ok(Some(_))
-            );
-        if generation != selected.generation
-            || current != Some(selected.ipa)
-            || executable != selected.executable
-        {
+        let expected = (selected.ipa, selected.executable);
+        let current = current.map(|(ipa, executable)| {
+            (
+                ipa,
+                continuation.intent == TransferIntent::UserWrite && executable,
+            )
+        });
+        if generation != selected.generation || current != Some(expected) {
             return Ok(None);
         }
         Ok(Some(ValidatedChunk {
@@ -465,7 +448,7 @@ fn translated<W: LiveDescriptorWords + ?Sized>(
     va: u64,
     access: LeafAccess,
     intent: TransferIntent,
-) -> Result<Option<u64>, MmError> {
+) -> Result<Option<(u64, bool)>, MmError> {
     let mut table = root;
     for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
         let descriptor = words
@@ -484,7 +467,10 @@ fn translated<W: LiveDescriptorWords + ?Sized>(
                 return Err(MmError::Fault);
             }
             let mask = (1u64 << shift) - 1;
-            return Ok(Some((descriptor & PA & !mask) + (va & mask)));
+            return Ok(Some((
+                (descriptor & PA & !mask) + (va & mask),
+                terminal_descriptor_permits_el0(descriptor, LeafAccess::Execute),
+            )));
         }
         table = descriptor & PA;
     }
