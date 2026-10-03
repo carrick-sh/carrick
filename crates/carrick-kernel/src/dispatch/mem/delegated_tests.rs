@@ -552,6 +552,42 @@ fn admitted_private_file_mmap_publishes_owner_backing_before_fork() {
 }
 
 #[test]
+fn admitted_private_file_fork_has_no_host_source_projection() {
+    let mut parent = SyscallDispatcher::new();
+    install_host_file_fd(&parent, FILE_FD, &[0x5a; 2 * PAGE as usize]);
+    let root = Root::admit(&parent);
+    let mut memory = arena_memory();
+    let file = returned(host_mmap(
+        &mut parent,
+        &mut memory,
+        0,
+        2 * PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let source = root.lock().mapping(file).unwrap().host_backing.unwrap();
+    let child = fork_child(&parent);
+    assert!(
+        child.mem().lock().private_file_maps.is_empty(),
+        "admitted fork clones host private_file_maps instead of inheriting owner HostBacking"
+    );
+    let child_root = root.publish_child(&child);
+    assert_eq!(fork_commit(&parent, &child), Ok(El1Admission::Delegated));
+    assert_eq!(
+        child_root.lock().mapping(file).unwrap().host_backing,
+        Some(source)
+    );
+    assert_eq!(
+        child
+            .mem_view()
+            .read_host_backing(source, PAGE as usize)
+            .unwrap(),
+        vec![0x5a; PAGE as usize]
+    );
+}
+
+#[test]
 fn delegated_rlimit_as_counts_every_mapping_exactly_once() {
     let mut dispatcher = SyscallDispatcher::new();
     install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 2 * PAGE as usize]);
