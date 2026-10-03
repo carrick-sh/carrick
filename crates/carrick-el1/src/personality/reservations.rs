@@ -17,7 +17,7 @@ const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
-const VERSION: u64 = 6;
+const VERSION: u64 = 7;
 /// Nodes each root keeps for its host venue: enough for the net growth of
 /// any one host syscall's mirror (at most two straddler splits per edit
 /// boundary pair, demotion and placeholder included).
@@ -741,6 +741,259 @@ impl Reservations<'_> {
     fn state_mut(&mut self) -> &mut State {
         unsafe { (&mut *self.root.state.get()).assume_init_mut() }
     }
+    // The same owner family header stores the immutable fork certificate and
+    // roots of the HostBacking counter/index and retirement queue. All nodes
+    // live in the retained physical metadata pool, never a private MM ledger.
+    fn ensure_family_header(&mut self) -> Result<(), Refusal> {
+        if self.state().fork_origin_node == 0 {
+            let id = self.host_node()?;
+            self.write(id, NodeData::default());
+            self.state_mut().fork_origin_node = id;
+        }
+        Ok(())
+    }
+    fn source_tree(&mut self) -> u32 {
+        let id = self.state().fork_origin_node;
+        if id == 0 { 0 } else { self.read(id).left }
+    }
+    fn source_retired(&mut self) -> u32 {
+        let id = self.state().fork_origin_node;
+        if id == 0 { 0 } else { self.read(id).right }
+    }
+    fn set_source_tree(&mut self, tree: u32) {
+        let id = self.state().fork_origin_node;
+        if id != 0 {
+            let mut header = self.read(id);
+            header.left = tree;
+            self.write(id, header);
+        }
+    }
+    fn set_source_retired(&mut self, head: u32) {
+        let id = self.state().fork_origin_node;
+        if id != 0 {
+            let mut header = self.read(id);
+            header.right = head;
+            self.write(id, header);
+        }
+    }
+    /// Retained byte references, indexed by exact physical handle/generation.
+    /// This secondary metadata family contains no VA or protection policy.
+    pub fn source_ref_count(
+        &mut self,
+        handle: core::num::NonZeroU64,
+        generation: core::num::NonZeroU64,
+    ) -> u64 {
+        let mut id = self.source_tree();
+        while id != 0 {
+            let node = self.read(id);
+            match (handle.get(), generation.get()).cmp(&(node.start, node.end)) {
+                core::cmp::Ordering::Less => id = node.left,
+                core::cmp::Ordering::Greater => id = node.right,
+                core::cmp::Ordering::Equal => return node.first,
+            }
+        }
+        0
+    }
+    pub fn source_nodes_needed(&mut self, backing: HostBackingIdentity) -> u32 {
+        u32::from(self.source_find(backing.handle().get(), backing.generation().get()) == 0)
+            + u32::from(self.state().fork_origin_node == 0)
+    }
+    fn source_find(&mut self, handle: u64, generation: u64) -> u32 {
+        let mut id = self.source_tree();
+        while id != 0 {
+            let node = self.read(id);
+            match (handle, generation).cmp(&(node.start, node.end)) {
+                core::cmp::Ordering::Less => id = node.left,
+                core::cmp::Ordering::Greater => id = node.right,
+                core::cmp::Ordering::Equal => return id,
+            }
+        }
+        0
+    }
+    fn source_fix(&mut self, id: u32) -> u32 {
+        let mut node = self.read(id);
+        node.height = 1 + self
+            .read(node.left)
+            .height
+            .max(self.read(node.right).height);
+        self.write(id, node);
+        id
+    }
+    fn source_rotate_left(&mut self, id: u32) -> u32 {
+        let mut node = self.read(id);
+        let top = node.right;
+        let mut right = self.read(top);
+        node.right = right.left;
+        right.left = id;
+        self.write(id, node);
+        self.write(top, right);
+        self.source_fix(id);
+        self.source_fix(top)
+    }
+    fn source_rotate_right(&mut self, id: u32) -> u32 {
+        let mut node = self.read(id);
+        let top = node.left;
+        let mut left = self.read(top);
+        node.left = left.right;
+        left.right = id;
+        self.write(id, node);
+        self.write(top, left);
+        self.source_fix(id);
+        self.source_fix(top)
+    }
+    fn source_balance(&mut self, id: u32) -> u32 {
+        if id == 0 {
+            return 0;
+        }
+        self.source_fix(id);
+        let mut node = self.read(id);
+        let left = self.read(node.left);
+        let right = self.read(node.right);
+        if left.height > right.height + 1 {
+            if self.read(left.left).height < self.read(left.right).height {
+                node.left = self.source_rotate_left(node.left);
+                self.write(id, node);
+            }
+            return self.source_rotate_right(id);
+        }
+        if right.height > left.height + 1 {
+            if self.read(right.right).height < self.read(right.left).height {
+                node.right = self.source_rotate_right(node.right);
+                self.write(id, node);
+            }
+            return self.source_rotate_left(id);
+        }
+        id
+    }
+    fn source_insert(&mut self, root: u32, id: u32) -> u32 {
+        if root == 0 {
+            return self.source_fix(id);
+        }
+        let mut node = self.read(root);
+        let inserted = self.read(id);
+        if (inserted.start, inserted.end) < (node.start, node.end) {
+            node.left = self.source_insert(node.left, id);
+        } else {
+            node.right = self.source_insert(node.right, id);
+        }
+        self.write(root, node);
+        self.source_balance(root)
+    }
+    fn source_min(&mut self, id: u32) -> (u32, u32) {
+        let mut node = self.read(id);
+        if node.left == 0 {
+            return (node.right, id);
+        }
+        let (left, min) = self.source_min(node.left);
+        node.left = left;
+        self.write(id, node);
+        (self.source_balance(id), min)
+    }
+    fn source_erase(&mut self, root: u32, key: (u64, u64)) -> (u32, u32) {
+        let mut node = self.read(root);
+        match key.cmp(&(node.start, node.end)) {
+            core::cmp::Ordering::Less => {
+                let (left, freed) = self.source_erase(node.left, key);
+                node.left = left;
+                self.write(root, node);
+                (self.source_balance(root), freed)
+            }
+            core::cmp::Ordering::Greater => {
+                let (right, freed) = self.source_erase(node.right, key);
+                node.right = right;
+                self.write(root, node);
+                (self.source_balance(root), freed)
+            }
+            core::cmp::Ordering::Equal => {
+                if node.left == 0 {
+                    return (node.right, root);
+                }
+                if node.right == 0 {
+                    return (node.left, root);
+                }
+                let (right, min) = self.source_min(node.right);
+                let mut replacement = self.read(min);
+                replacement.left = node.left;
+                replacement.right = right;
+                self.write(min, replacement);
+                (self.source_balance(min), root)
+            }
+        }
+    }
+    fn source_reserve(&mut self, backing: HostBackingIdentity) -> Result<u32, Refusal> {
+        let existing = self.source_find(backing.handle().get(), backing.generation().get());
+        if existing != 0 {
+            return Ok(existing);
+        }
+        self.ensure_family_header()?;
+        let id = self.host_node()?;
+        self.write(
+            id,
+            NodeData {
+                start: backing.handle().get(),
+                end: backing.generation().get(),
+                ..NodeData::default()
+            },
+        );
+        let source_tree = self.source_tree();
+        let tree = self.source_insert(source_tree, id);
+        self.set_source_tree(tree);
+        Ok(id)
+    }
+    fn source_add(&mut self, backing: HostBackingIdentity, bytes: u64) {
+        let id = self.source_find(backing.handle().get(), backing.generation().get());
+        assert!(
+            id != 0,
+            "HostBacking counter must be reserved before mutation"
+        );
+        let mut node = self.read(id);
+        node.first = node
+            .first
+            .checked_add(bytes)
+            .expect("disjoint source byte references");
+        self.write(id, node);
+    }
+    fn source_sub(&mut self, backing: HostBackingIdentity, bytes: u64) {
+        let id = self.source_find(backing.handle().get(), backing.generation().get());
+        assert!(id != 0, "HostBacking counter must name the live mapping");
+        let mut node = self.read(id);
+        node.first = node
+            .first
+            .checked_sub(bytes)
+            .expect("live source reference count");
+        if node.first == 0 && node.data == 0 {
+            node.data = 1;
+            node.gap = u64::from(self.source_retired());
+            self.set_source_retired(id);
+        }
+        self.write(id, node);
+    }
+    /// Pop exact physical retirements, including those produced by the guest
+    /// venue. A revived token is skipped; no reservation population is walked.
+    pub fn take_retired_host_backing(
+        &mut self,
+    ) -> Option<(core::num::NonZeroU64, core::num::NonZeroU64)> {
+        while self.source_retired() != 0 {
+            let id = self.source_retired();
+            let mut node = self.read(id);
+            self.set_source_retired(node.gap as u32);
+            node.gap = 0;
+            node.data = 0;
+            if node.first != 0 {
+                self.write(id, node);
+                continue;
+            }
+            let source_tree = self.source_tree();
+            let (tree, freed) = self.source_erase(source_tree, (node.start, node.end));
+            self.set_source_tree(tree);
+            self.free_node(freed);
+            return Some((
+                core::num::NonZeroU64::new(node.start).expect("source handle"),
+                core::num::NonZeroU64::new(node.end).expect("source generation"),
+            ));
+        }
+        None
+    }
     pub fn mm(&self) -> ReservationMm {
         self.mm
     }
@@ -832,11 +1085,18 @@ impl Reservations<'_> {
         &mut self,
         request: carrick_el1_abi::PortalForkRequest,
     ) -> Result<(), Refusal> {
-        if self.state().fork_origin_node != 0 {
+        if self.state().fork_origin_node != 0 && self.read(self.state().fork_origin_node).prot == 1
+        {
             return Err(Refusal::Stale);
         }
-        let node = self.pool_node()?;
+        self.ensure_family_header()?;
+        let node = self.state().fork_origin_node;
+        let old = self.read(node);
         let data = NodeData {
+            left: old.left,
+            right: old.right,
+            prot: 1,
+            bytes: request.operation.carrier.get(),
             start: request.operation.mm.raw(),
             end: request.operation.incarnation.get(),
             incarnation: request.parent_generation.raw(),
@@ -851,8 +1111,20 @@ impl Reservations<'_> {
     pub fn clear_fork_origin(&mut self) {
         let node = self.state().fork_origin_node;
         if node != 0 {
-            self.table.release(node, self.banks);
-            self.state_mut().fork_origin_node = 0;
+            let data = self.read(node);
+            if data.left != 0 || data.right != 0 {
+                self.write(
+                    node,
+                    NodeData {
+                        left: data.left,
+                        right: data.right,
+                        ..NodeData::default()
+                    },
+                );
+            } else {
+                self.table.release(node, self.banks);
+                self.state_mut().fork_origin_node = 0;
+            }
         }
     }
     pub fn finish_fork_publication(
@@ -876,13 +1148,26 @@ impl Reservations<'_> {
             return false;
         }
         let node = self.read(self.state().fork_origin_node);
-        [node.start, node.end, node.incarnation, node.first]
-            == [
-                request.operation.mm.raw(),
-                request.operation.incarnation.get(),
-                request.parent_generation.raw(),
-                request.operation.sequence.get(),
-            ]
+        node.prot == 1
+            && node.bytes == request.operation.carrier.get()
+            && [node.start, node.end, node.incarnation, node.first]
+                == [
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    request.parent_generation.raw(),
+                    request.operation.sequence.get(),
+                ]
+    }
+
+    pub fn authenticate_fork_handle(&mut self, handle: carrick_el1_abi::El1MmHandle) -> bool {
+        self.is_admitted()
+            && self.mm() == handle.mm()
+            && self.incarnation().raw() == handle.incarnation().get()
+            && self.state().fork_origin_node != 0
+            && {
+                let node = self.read(self.state().fork_origin_node);
+                node.prot == 1 && node.bytes == handle.carrier().get()
+            }
     }
 
     /// Advance policy visibility when fork replaces live descriptor authority.
@@ -894,6 +1179,9 @@ impl Reservations<'_> {
             .ok_or(Refusal::Stale)?;
         self.state_mut().generation = next;
         Ok(self.generation())
+    }
+    pub fn fork_ready(&self) -> bool {
+        self.pending().is_none() && !self.state().fork_pending
     }
     pub fn fork_settled(&self) -> bool {
         self.pending().is_none() && !self.state().fork_pending && self.deferred().next().is_none()
@@ -2004,6 +2292,9 @@ impl Reservations<'_> {
             }
             let (tree, freed) = self.erase(self.state().tree, n.start);
             self.state_mut().tree = tree;
+            if let Some(source) = n.host_backing {
+                self.source_sub(source, n.end - n.start);
+            }
             self.free_node(freed);
         }
     }
@@ -2113,6 +2404,9 @@ impl Reservations<'_> {
             };
             node.incarnation = self.incarnation_for(&node);
             self.write(id, node);
+            if let Some(source) = created_backing {
+                self.source_add(source, range.len());
+            }
             self.insert_coalescing(id);
         }
         self.release_spares(spares.0);
@@ -2389,6 +2683,12 @@ impl Reservations<'_> {
             return Err(Refusal::Collision);
         }
         let id = self.host_node()?;
+        if let Some(source) = host_backing
+            && let Err(error) = self.source_reserve(source)
+        {
+            self.free_node(id);
+            return Err(error);
+        }
         let mut node = NodeData {
             start: range.start(),
             end: range.end(),
@@ -2399,6 +2699,9 @@ impl Reservations<'_> {
         };
         node.incarnation = self.incarnation_for(&node);
         self.write(id, node);
+        if let Some(source) = host_backing {
+            self.source_add(source, range.len());
+        }
         self.insert_coalescing(id);
         Ok(())
     }
@@ -2524,10 +2827,9 @@ impl Reservations<'_> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
-        // Fork plans from settled memory only: retired extents whose
-        // frames the host has not reconciled are not settled.
-        if self.pending().is_some() || self.state().fork_pending || self.deferred().next().is_some()
-        {
+        // Pending policy/copy continuations exclude Fork. Owed physical
+        // returns remain solely on the parent; they are not child mappings.
+        if !self.fork_ready() {
             return Err(Refusal::Busy);
         }
         if child.state().admitted || child.state().tree != 0 || child.pending().is_some() {
@@ -2545,13 +2847,20 @@ impl Reservations<'_> {
             return Err(reason);
         }
         let mut list = CopyList::default();
-        if let Err(reason) = self.copy_in_order(self.state().tree, &mut list) {
+        if let Err(reason) = self
+            .copy_in_order(self.state().tree, &mut list, child)
+            .and_then(|()| child.secure_host_nodes(HOST_RESERVE))
+        {
             let mut id = list.head;
             while id != 0 {
                 let next = self.read(id).right;
                 self.table.release(id, self.banks);
                 id = next;
             }
+            let source_tree = child.source_tree();
+            child.release_tree(source_tree);
+            child.set_source_tree(0);
+            child.set_source_retired(0);
             child.drain_host_reserve();
             return Err(reason);
         }
@@ -2569,12 +2878,17 @@ impl Reservations<'_> {
         child.mark_admitted();
         Ok(())
     }
-    fn copy_in_order(&mut self, id: u32, list: &mut CopyList) -> Result<(), Refusal> {
+    fn copy_in_order(
+        &mut self,
+        id: u32,
+        list: &mut CopyList,
+        child: &mut Reservations<'_>,
+    ) -> Result<(), Refusal> {
         if id == 0 {
             return Ok(());
         }
         let n = self.read(id);
-        self.copy_in_order(n.left, list)?;
+        self.copy_in_order(n.left, list, child)?;
         if !n.flags().contains(ReservationNodeFlags::DONTFORK) {
             let copy = self.pool_node()?;
             let mut data = n;
@@ -2590,8 +2904,12 @@ impl Reservations<'_> {
             }
             list.tail = copy;
             list.len += 1;
+            if let Some(source) = n.host_backing {
+                child.source_reserve(source)?;
+                child.source_add(source, n.end - n.start);
+            }
         }
-        self.copy_in_order(n.right, list)
+        self.copy_in_order(n.right, list, child)
     }
     /// Consume `len` nodes of a `right`-linked sorted list into a perfectly
     /// balanced subtree (a valid AVL tree), constant work per node.
@@ -2668,6 +2986,10 @@ impl Reservations<'_> {
             return Err(Refusal::Stale);
         }
         self.release_tree(self.state().tree);
+        let source_tree = self.source_tree();
+        self.release_tree(source_tree);
+        self.set_source_tree(0);
+        self.set_source_retired(0);
         self.clear_fork_origin();
         self.state_mut().tree = 0;
         self.drain_host_reserve();
@@ -2685,6 +3007,10 @@ impl Reservations<'_> {
             slot.mm.store(0, Ordering::Release);
         }
         self.release_tree(self.state().tree);
+        let source_tree = self.source_tree();
+        self.release_tree(source_tree);
+        self.set_source_tree(0);
+        self.set_source_retired(0);
         self.clear_fork_origin();
         self.state_mut().tree = 0;
         self.drain_host_reserve();
@@ -4072,6 +4398,147 @@ mod tests {
         let Decision::Work(request) = d else { panic!() };
         assert_eq!(request.operation, ReservationOperation::Move);
         g.refuse(request).unwrap();
+    }
+
+    #[test]
+    fn owner_source_reference_index_tracks_fork_split_move_and_retirement() {
+        use core::num::NonZeroU64;
+        let table = table();
+        let parent_mm = ReservationMm::new(40).unwrap();
+        let child_mm = ReservationMm::new(41).unwrap();
+        table.publish(0, parent_mm, layout()).unwrap();
+        table.publish(1, child_mm, layout()).unwrap();
+        let source = HostBackingIdentity::new(
+            NonZeroU64::new(17).unwrap(),
+            NonZeroU64::new(3).unwrap(),
+            0x8000,
+        );
+        let mut parent = table.lock(0, parent_mm).unwrap();
+        parent
+            .import_with_backing(
+                range(0x100000, 0x104000),
+                ReservationProtection::READ_WRITE,
+                ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                source,
+            )
+            .unwrap();
+        parent.finish_import().unwrap();
+        assert_eq!(
+            parent.source_ref_count(source.handle(), source.generation()),
+            0x4000
+        );
+        assert_eq!(
+            parent.source_ref_count(source.handle(), NonZeroU64::new(4).unwrap()),
+            0
+        );
+        let mut child = table.lock(1, child_mm).unwrap();
+        parent.clone_into(&mut child).unwrap();
+        let protection = child
+            .mprotect(
+                range(0x101000, 0x102000),
+                ReservationProtection::from_bits(1).unwrap(),
+            )
+            .unwrap();
+        complete(&mut child, protection);
+        assert_eq!(
+            child.source_ref_count(source.handle(), source.generation()),
+            0x4000
+        );
+        let retirement = child.munmap(range(0x102000, 0x103000)).unwrap();
+        complete(&mut child, retirement);
+        assert_eq!(
+            child.source_ref_count(source.handle(), source.generation()),
+            0x3000
+        );
+        let moved = child
+            .mremap(
+                range(0x103000, 0x104000),
+                0x2000,
+                MoveTarget::Fixed(0x110000),
+            )
+            .unwrap();
+        complete(&mut child, moved);
+        assert_eq!(
+            child.source_ref_count(source.handle(), source.generation()),
+            0x4000
+        );
+        let retirement = child.munmap(range(0x100000, 0x130000)).unwrap();
+        complete(&mut child, retirement);
+        assert_eq!(
+            child.source_ref_count(source.handle(), source.generation()),
+            0
+        );
+        assert_eq!(
+            parent.source_ref_count(source.handle(), source.generation()),
+            0x4000
+        );
+        assert_eq!(
+            child.take_retired_host_backing(),
+            Some((source.handle(), source.generation()))
+        );
+        assert_eq!(child.take_retired_host_backing(), None);
+        assert_eq!(parent.take_retired_host_backing(), None);
+    }
+
+    #[test]
+    fn owner_source_index_avl_deletion_preserves_exact_generation_and_revival() {
+        use core::num::NonZeroU64;
+        let table = table();
+        let mm = ReservationMm::new(42).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut root = table.lock(0, mm).unwrap();
+        for token in 1..=128 {
+            let source = HostBackingIdentity::new(
+                NonZeroU64::new(token).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+                0,
+            );
+            root.source_reserve(source).unwrap();
+            root.source_add(source, 4096);
+        }
+        for token in 1..=128 {
+            let before = root.work;
+            assert_eq!(
+                root.source_ref_count(NonZeroU64::new(token).unwrap(), NonZeroU64::new(1).unwrap()),
+                4096
+            );
+            assert!(root.work - before <= 9, "source lookup must be logarithmic");
+        }
+        let before = root.work;
+        assert_eq!(root.take_retired_host_backing(), None);
+        assert!(
+            root.work - before <= 1,
+            "empty retirement queue must not scan sources"
+        );
+        for token in (1..=128).rev() {
+            let source = HostBackingIdentity::new(
+                NonZeroU64::new(token).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+                0,
+            );
+            root.source_sub(source, 4096);
+        }
+        let revived =
+            HostBackingIdentity::new(NonZeroU64::new(64).unwrap(), NonZeroU64::new(1).unwrap(), 0);
+        root.source_add(revived, 4096);
+        let mut retired = 0;
+        while let Some((handle, generation)) = root.take_retired_host_backing() {
+            assert_ne!(handle.get(), 64);
+            assert_eq!(generation.get(), 1);
+            assert_eq!(root.source_ref_count(handle, generation), 0);
+            retired += 1;
+        }
+        assert_eq!(retired, 127);
+        assert_eq!(
+            root.source_ref_count(revived.handle(), revived.generation()),
+            4096
+        );
+        root.source_sub(revived, 4096);
+        assert_eq!(
+            root.take_retired_host_backing(),
+            Some((revived.handle(), revived.generation()))
+        );
+        assert_eq!(root.take_retired_host_backing(), None);
     }
 
     #[test]
