@@ -3477,6 +3477,7 @@ impl Drop for HvpatchCarrierMmAuthority {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct HvpatchCarrierTaskRow {
+    mm_key: HvpatchMmAuthorityKey,
     _mm: Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
     #[cfg(test)]
     rollbacks: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -5363,8 +5364,41 @@ struct HvpatchCarrierTaskDirectoryInner {
         HvpatchMmAuthorityKey,
         std::sync::Weak<HvpatchCarrierMmAuthority>,
     >,
-    task_mms:
-        std::collections::BTreeMap<HvpatchMmAuthorityKey, std::sync::Weak<HvpatchTaskMmAuthority>>,
+    task_mms: std::collections::BTreeMap<HvpatchMmAuthorityKey, HvpatchInternedTaskMm>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvpatchInternedTaskMm {
+    authority: std::sync::Weak<HvpatchTaskMmAuthority>,
+    bindings: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchCarrierTaskDirectoryInner {
+    fn retain_mm_binding(
+        &mut self,
+        key: HvpatchMmAuthorityKey,
+        authority: &std::sync::Arc<HvpatchTaskMmAuthority>,
+    ) {
+        self.task_mms
+            .entry(key)
+            .and_modify(|entry| entry.bindings += 1)
+            .or_insert_with(|| HvpatchInternedTaskMm {
+                authority: std::sync::Arc::downgrade(authority),
+                bindings: 1,
+            });
+    }
+
+    fn release_mm_binding(&mut self, key: HvpatchMmAuthorityKey) {
+        if let Some(entry) = self.task_mms.get_mut(&key)
+            && entry.bindings > 1
+        {
+            entry.bindings -= 1;
+            return;
+        }
+        self.task_mms.remove(&key);
+        self.carrier_mms.remove(&key);
+    }
 }
 
 #[cfg(test)]
@@ -5436,14 +5470,18 @@ impl HvpatchCarrierTaskStateDirectory {
         if inner
             .task_mms
             .get(&new_mm_key)
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(|entry| entry.authority.upgrade())
             .is_some()
         {
             return Err(TrapError::Hypervisor(
                 "duplicate HVPatch MM authority key for exec replacement".to_owned(),
             ));
         }
-        let existing_carrier_mm = inner.states.get(&key).and_then(|row| row._mm.clone());
+        let row = inner.states.get(&key).ok_or_else(|| {
+            TrapError::Hypervisor("exec replacement has no exact carrier task row".to_owned())
+        })?;
+        let old_mm_key = row.mm_key;
+        let existing_carrier_mm = row._mm.clone();
         let new_carrier_mm = match existing_carrier_mm.as_deref() {
             Some(HvpatchCarrierMmAuthority::Live { _vm, .. }) => {
                 Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
@@ -5470,6 +5508,10 @@ impl HvpatchCarrierTaskStateDirectory {
             }
             None => None,
         };
+        inner.release_mm_binding(old_mm_key);
+        if let Some(row) = inner.states.get_mut(&key) {
+            row.mm_key = new_mm_key;
+        }
         if let Some(carrier_mm) = new_carrier_mm {
             inner
                 .carrier_mms
@@ -5478,9 +5520,7 @@ impl HvpatchCarrierTaskStateDirectory {
                 row._mm = Some(carrier_mm);
             }
         }
-        inner
-            .task_mms
-            .insert(new_mm_key, std::sync::Arc::downgrade(task_mm));
+        inner.retain_mm_binding(new_mm_key, task_mm);
         task_mm.record_holder(HvpatchTaskMmHolder::CarrierDirectory);
         Ok(())
     }
@@ -5489,7 +5529,7 @@ impl HvpatchCarrierTaskStateDirectory {
     /// owner's `mm_root_slot`, if one is still registered. Sharers publish
     /// under `{task_serial: 0, mm_root_slot, shared_kernel_mm: Some(mm)}`
     /// (`shared_mm_projection`), distinct from the owner's
-    /// `{0, mm_root_slot, None}` row.
+    /// `{owner_task_serial, mm_root_slot, None}` row.
     fn clone_vm_sharer_authority(
         &self,
         mm_root_slot: Option<(u64, u64)>,
@@ -5503,7 +5543,7 @@ impl HvpatchCarrierTaskStateDirectory {
                 mm_root_slot,
                 shared_kernel_mm: Some(mm.get()),
             })
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(|entry| entry.authority.upgrade())
     }
 }
 
@@ -6228,7 +6268,7 @@ impl HvpatchCarrierTaskStateDirectory {
         let existing_task_mm = inner
             .task_mms
             .get(&mm_key)
-            .and_then(std::sync::Weak::upgrade);
+            .and_then(|entry| entry.authority.upgrade());
         if process_owner && (existing_carrier_mm.is_some() || existing_task_mm.is_some()) {
             alias_receipt.retire_exact();
             drop(inner);
@@ -6421,6 +6461,7 @@ impl HvpatchCarrierTaskStateDirectory {
             .insert(
                 key,
                 HvpatchCarrierTaskRow {
+                    mm_key,
                     _mm: carrier_mm.clone(),
                     #[cfg(test)]
                     rollbacks: test_rollbacks,
@@ -6463,9 +6504,7 @@ impl HvpatchCarrierTaskStateDirectory {
                 .carrier_mms
                 .insert(mm_key, std::sync::Arc::downgrade(&carrier_mm));
         }
-        inner
-            .task_mms
-            .insert(mm_key, std::sync::Arc::downgrade(&task_mm));
+        inner.retain_mm_binding(mm_key, &task_mm);
         drop(inner);
         Ok(HvpatchTaskOnlyBackendState {
             registration: Some(HvpatchTaskRegistration {
@@ -6490,9 +6529,12 @@ impl HvpatchCarrierTaskStateDirectory {
                 "cross-directory HVPatch carrier token rejected".to_owned(),
             ));
         }
-        let row = self.inner.lock().states.remove(&key).ok_or_else(|| {
+        let mut inner = self.inner.lock();
+        let row = inner.states.remove(&key).ok_or_else(|| {
             TrapError::Hypervisor("missing exact carrier task-state retirement".to_owned())
         })?;
+        inner.release_mm_binding(row.mm_key);
+        drop(inner);
         #[cfg(test)]
         if let Some(rollbacks) = &row.rollbacks {
             rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

@@ -612,6 +612,64 @@ fn retired_process_slot_reuse_does_not_alias_retained_thread_authority() {
     // Delayed predecessor cleanup must not erase the successor's interned MM.
     drop(old);
     assert_eq!(successor_mm.inventory.lock().phase_name(), "prepared");
+    // One sibling leaving must keep the exact interned authority available
+    // to another sibling until the final directory binding retires.
+    drop(successor);
+    sibling_identity.thread_serial += 1;
+    sibling_identity.linux_tid += 1;
+    let later_sibling = directory
+        .publish(
+            sibling_identity,
+            test_state(&rollbacks),
+            HvpatchPreparedTaskAuthority {
+                mm_root_slot: slot,
+                ..prepared_task()
+            },
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        later_sibling
+            .registration
+            .as_ref()
+            .unwrap()
+            .task_mm
+            .as_ref()
+            .unwrap(),
+        &successor_mm,
+    ));
+    drop(sibling);
+    drop(later_sibling);
+    let inner = directory.inner.lock();
+    assert!(inner.task_mms.is_empty());
+    assert!(inner.carrier_mms.is_empty());
+}
+
+#[test]
+fn retired_process_mm_indexes_do_not_grow_with_historical_forks() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+    let rollbacks = Arc::new(AtomicUsize::new(0));
+    for scale in [1, 8, 32] {
+        for generation in 0..scale {
+            let mut task_identity = identity(generation + 1);
+            task_identity.task_serial += generation;
+            let task = directory
+                .publish(
+                    task_identity,
+                    test_state(&rollbacks),
+                    HvpatchPreparedTaskAuthority {
+                        mm_root_slot: Some((0x1100_0000, 0x20_0000)),
+                        ..prepared_task()
+                    },
+                )
+                .unwrap();
+            drop(task);
+        }
+        let inner = directory.inner.lock();
+        assert!(inner.states.is_empty());
+        assert_eq!(inner.task_mms.len(), 0, "historical scale {scale}");
+        assert_eq!(inner.carrier_mms.len(), 0, "historical scale {scale}");
+    }
 }
 
 fn owner_key(
