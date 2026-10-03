@@ -245,9 +245,17 @@ impl MemAuthority {
     > {
         let state = self.state.lock();
         let revision = self.vma_revision();
-        // The child is a different MM in host setup: a delegated parent's
-        // root rows and break become its values, never its root.
+        // An admitted parent's child contains only an unswitchable identity
+        // and provisional physical custody until owner Fork builds its root.
         let mut forked = state.fork_materialized();
+        if state.delegated_root().is_some() {
+            // The backend receives an explicit owner plan, never these ranges.
+            return Ok((
+                Self::with_revision(forked, revision),
+                revision,
+                Arc::from([]),
+            ));
+        }
         let projection = Self::derive_fork_projection(&forked)?;
 
         for (start, len) in projection.omitted_ranges {
@@ -287,10 +295,10 @@ impl MemAuthority {
     > {
         let state = self.state.lock();
         let revision = self.vma_revision();
-        let projection = match state.delegated_root() {
-            None => Self::derive_fork_projection(&state)?,
-            Some(_) => Self::derive_fork_projection(&state.fork_materialized())?,
-        };
+        if state.delegated_root().is_some() {
+            return Ok((revision, Arc::from([])));
+        }
+        let projection = Self::derive_fork_projection(&state)?;
         Ok((
             revision,
             std::sync::Arc::from(projection.ranges.into_boxed_slice()),
@@ -482,7 +490,11 @@ pub struct MemState {
     /// and pathname replacement. Discard must return to this original source.
     pub(super) private_file_maps: Vec<PrivateFileMapEntry>,
     host_backing_custody: Arc<host_backing::HostBackingCustody>,
-    host_backing_leases: Vec<host_backing::HostBackingLease>,
+    host_backing_leases: std::collections::BTreeMap<
+        (core::num::NonZeroU64, core::num::NonZeroU64),
+        host_backing::HostBackingLease,
+    >,
+    owner_rows_exclusive: bool,
     /// VA ranges of live MAP_SHARED mappings backed by a `memfd_secret(2)` fd.
     /// Secret memory is hidden from the kernel's own view of the process, so
     /// `/proc/<pid>/mem` reads that touch one of these ranges fail EIO
@@ -591,7 +603,8 @@ impl MemState {
             shared_file_alias_maps: Vec::new(),
             private_file_maps: Vec::new(),
             host_backing_custody: Arc::default(),
-            host_backing_leases: Vec::new(),
+            host_backing_leases: std::collections::BTreeMap::new(),
+            owner_rows_exclusive: false,
             secretmem_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
             core_file_mappings: Vec::new(),

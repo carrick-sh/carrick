@@ -305,7 +305,6 @@ fn brk_growth_past_rlimit_data_returns_the_unchanged_break() {
 mod delegated {
     use super::super::super::tests::{CountingMmapMemory, returned};
     use super::*;
-    use crate::dispatch::mem::anonymous::AnonymousAuthority;
     use crate::dispatch::mem::delegated_tests::Root;
     use carrick_el1_abi::ReservationRange;
 
@@ -458,18 +457,17 @@ mod delegated {
         let first = base + 2 * LINUX_PAGE_SIZE;
         assert_eq!(root.guest_brk(first), first);
 
-        let child_mm = crate::kernel::MmId::from_registry_allocation(
-            std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
+        let child = crate::dispatch::mem::delegated_tests::fork_child(&dispatcher);
+        let child_root = root.publish_child(&child);
+        assert_eq!(
+            crate::dispatch::mem::delegated_tests::fork_commit(&dispatcher, &child),
+            Ok(crate::dispatch::mem::el1_reservations::El1Admission::Delegated)
         );
-        let child = dispatcher.mm_authority().fork_private(child_mm);
-        assert!(matches!(
-            child.lock().anonymous_authority(),
-            AnonymousAuthority::HostSetup(arena) if arena.brk == first
-        ));
+        assert_eq!(child_root.lock().brk_current(), first);
         // The parent's root moves on; the child's break is its own.
         let second = base + LINUX_PAGE_SIZE;
         assert_eq!(root.guest_brk(second), second);
-        assert_eq!(child.lock().program_break(), first);
+        assert_eq!(child.mem().lock().program_break(), first);
         assert_eq!(dispatcher.mem().lock().program_break(), second);
     }
 }
