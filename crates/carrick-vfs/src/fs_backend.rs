@@ -513,6 +513,11 @@ impl Drop for ArchiveTransactionGuard<'_> {
 /// aware (see module docs); the dispatcher does its own overlay-first
 /// merging with the read-only rootfs underneath.
 pub trait FsBackend: Send + Sync {
+    /// Deterministic test interleaving after a lower file lookup,
+    /// before its cache publication. Never present in product builds.
+    #[cfg(any(test, feature = "test-support"))]
+    fn before_lower_entry_publish(&self, _path: &str) {}
+
     /// Coherence authority of an admitted host backing. Synthetic backends
     /// have no host generation words; their rootfs establishes a fresh cohort.
     fn cache_coherence(

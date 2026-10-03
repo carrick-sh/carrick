@@ -397,6 +397,9 @@ pub struct HostFsBackend {
     /// BEFORE the first xattr write.
     meta_xattr_seen: std::sync::atomic::AtomicBool,
     meta_xattr_absent_gen: std::sync::atomic::AtomicU64,
+    /// Test-only scheduler seam, compiled out of the product closure.
+    #[cfg(any(test, feature = "test-support"))]
+    lower_entry_publish_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     /// Sticky cache of the durable host-upper whiteout marker. The marker and
     /// adjacent sidecars make sparse-upper deletions visible across real host
     /// forks and native self-reexecs; the shared root-marker generation
@@ -1124,11 +1127,22 @@ impl HostFsBackend {
             marker_absent_dirs: parking_lot::RwLock::new(std::collections::HashMap::new()),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            lower_entry_publish_hook: None,
             whiteout_seen: std::sync::atomic::AtomicBool::new(false),
             whiteout_absent_gen: std::sync::atomic::AtomicU64::new(0),
             symlink_seen: std::sync::atomic::AtomicBool::new(false),
             symlink_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Install a test-only scheduling hook; it carries no namespace authority.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_lower_entry_publish_hook(
+        &mut self,
+        hook: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+        self.lower_entry_publish_hook = Some(hook);
     }
 
     /// Authorize the fail-closed sparse-upper miss proof. Callers may do this
@@ -1193,6 +1207,8 @@ impl HostFsBackend {
             marker_absent_dirs: parking_lot::RwLock::new(std::collections::HashMap::new()),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            lower_entry_publish_hook: None,
             whiteout_seen: std::sync::atomic::AtomicBool::new(false),
             whiteout_absent_gen: std::sync::atomic::AtomicU64::new(0),
             symlink_seen: std::sync::atomic::AtomicBool::new(false),
@@ -4335,6 +4351,13 @@ fn read_whiteout_leaf_from_marker(
 }
 
 impl FsBackend for HostFsBackend {
+    #[cfg(any(test, feature = "test-support"))]
+    fn before_lower_entry_publish(&self, path: &str) {
+        if let Some(hook) = &self.lower_entry_publish_hook {
+            hook(path);
+        }
+    }
+
     fn cache_coherence(
         &self,
     ) -> Option<&std::sync::Arc<crate::fs_resolve_cache::FsCacheCoherence>> {

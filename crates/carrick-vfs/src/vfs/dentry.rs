@@ -71,6 +71,9 @@ pub struct PositiveDentry {
     pub parent_gen: u64,
     pub dir_gen: Option<Arc<AtomicU64>>,
     pub is_lower: bool,
+    // A lower inode is immutable, but its upper absence / whiteout proof
+    // belongs to the namespace generation in which this binding was read.
+    observed_generation: (u64, u64, u64),
     pub accessed: Arc<AtomicBool>,
 }
 
@@ -204,6 +207,17 @@ struct FastPathCache {
     lookup_nofollow: HashMap<String, Result<ResolvedDentry, LinuxErrno>>,
 }
 
+/// Commit the cache generation only after every name / inode invalidation.
+/// Readers overlapping a mutation may observe its earlier binding, but their
+/// fast-path publication must be invalidated before the mutator returns.
+struct CacheMutationPublication<'a>(&'a DentryCache);
+
+impl Drop for CacheMutationPublication<'_> {
+    fn drop(&mut self) {
+        self.0.bump_mutation();
+    }
+}
+
 pub struct DentryCache {
     pub coherence: Arc<crate::fs_resolve_cache::FsCacheCoherence>,
     proc_gen: AtomicU64,
@@ -213,6 +227,8 @@ pub struct DentryCache {
     reset_lock: Mutex<()>,
     mutation_gen: AtomicU64,
     next_dentry_id: AtomicU64,
+    #[cfg(test)]
+    before_entry_remove_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     is_shared: bool,
     host_opens: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
@@ -249,6 +265,7 @@ impl Default for DentryCache {
 }
 
 struct InsertDirParams<'a> {
+    observed_generation: (u64, u64, u64),
     upper_dir_fd: Option<Arc<OwnedFd>>,
     lower_dir_fd: Option<Arc<OwnedFd>>,
     parent_id: DentryId,
@@ -264,6 +281,7 @@ enum RetainedLowerDirectory {
 }
 
 struct ConstructPositiveParams<'a> {
+    observed_generation: (u64, u64, u64),
     parent_id: DentryId,
     name: &'a str,
     parent_dir_gen: u64,
@@ -342,6 +360,8 @@ impl DentryCache {
             reset_lock: Mutex::new(()),
             mutation_gen: AtomicU64::new(1),
             next_dentry_id: AtomicU64::new(1),
+            #[cfg(test)]
+            before_entry_remove_hook: Mutex::new(None),
             is_shared,
             host_opens: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -637,7 +657,11 @@ impl DentryCache {
             } else {
                 &fp.lookup_nofollow
             };
-            if let Some(res) = map.get(norm_path) {
+            if let Some(res) = map.get(norm_path)
+                && !res.as_ref().is_ok_and(|r| {
+                    r.dentry.is_lower && r.dentry.observed_generation != self.walk_generation()
+                })
+            {
                 if requires_dir
                     && let Ok(r) = res
                     && r.dentry.kind != RootFsEntryKind::Directory
@@ -769,6 +793,7 @@ impl DentryCache {
                     parent_gen: 1,
                     dir_gen: Some(root_gen),
                     is_lower: false,
+                    observed_generation: self.walk_generation(),
                     accessed: Arc::new(AtomicBool::new(true)),
                 },
                 canonical_path: "/".to_string(),
@@ -1047,7 +1072,9 @@ impl DentryCache {
                 }
                 Some(DentryNode::Positive(pos)) => {
                     pos.accessed.store(true, Ordering::Relaxed);
-                    if pos.parent_gen == parent_dir_gen {
+                    if pos.parent_gen == parent_dir_gen
+                        && (!pos.is_lower || pos.observed_generation == self.walk_generation())
+                    {
                         if self.is_shared {
                             let parent_fd = if pos.is_lower { &lower_fd } else { &upper_fd };
                             if let Some(parent_fd) = parent_fd {
@@ -1302,13 +1329,27 @@ impl DentryCache {
         Ok(())
     }
 
-    fn insert_positive(&self, parent_id: DentryId, name: &str, pos: PositiveDentry) {
+    fn insert_positive(
+        &self,
+        parent_id: DentryId,
+        name: &str,
+        pos: PositiveDentry,
+        observed_generation: (u64, u64, u64),
+    ) {
         let node = DentryNode::Positive(pos);
         let added_bytes = entry_node_approx_bytes(name, &node);
-        self.add_approx_bytes(added_bytes);
 
         {
             let mut entries = self.entries.write();
+            // A refill may overlap physical publication and its invalidation.
+            // It can still supply the overlapping caller's earlier observation,
+            // but cannot install that observation AFTER the invalidation. Check
+            // under the same entries lock used by the mutation hooks: either
+            // publication wins and the hook removes it, or this refill is stale.
+            if self.walk_generation() != observed_generation {
+                return;
+            }
+            self.add_approx_bytes(added_bytes);
             if !self.eviction_enabled && entries.len() >= 16384 {
                 entries.clear();
             }
@@ -1349,6 +1390,7 @@ impl DentryCache {
     /// what makes reuse observable to the rest of the cache.
     fn insert_dir(&self, params: InsertDirParams<'_>) -> (DentryId, Arc<AtomicU64>) {
         let InsertDirParams {
+            observed_generation,
             upper_dir_fd,
             lower_dir_fd,
             parent_id,
@@ -1402,7 +1444,10 @@ impl DentryCache {
         let upper_probed_gen = if upper_dir_fd.is_some() {
             u64::MAX
         } else {
-            self.combined_generation()
+            // Absence belongs to the generation sampled BEFORE the host
+            // probes. A delayed refill must not stamp an old missing-parent
+            // result with the generation of a later copy-up / whiteout.
+            observed_generation.0.wrapping_add(observed_generation.1)
         };
 
         // Reuse-by-inode: `dev == 0` is this file's own sentinel for a
@@ -1675,6 +1720,7 @@ impl DentryCache {
         params: ConstructPositiveParams<'_>,
     ) -> Result<PositiveDentry, LinuxErrno> {
         let ConstructPositiveParams {
+            observed_generation,
             parent_id,
             name,
             parent_dir_gen,
@@ -1744,9 +1790,10 @@ impl DentryCache {
                 parent_gen: parent_dir_gen,
                 dir_gen: None,
                 is_lower,
+                observed_generation,
                 accessed: Arc::new(AtomicBool::new(true)),
             };
-            self.insert_positive(parent_id, name, pos.clone());
+            self.insert_positive(parent_id, name, pos.clone(), observed_generation);
             return Ok(pos);
         }
 
@@ -1868,6 +1915,7 @@ impl DentryCache {
                 }
             };
             let (new_dir_id, child_dir_gen) = self.insert_dir(InsertDirParams {
+                observed_generation,
                 upper_dir_fd: child_upper_dir_fd,
                 lower_dir_fd: child_lower_dir_fd,
                 parent_id,
@@ -1913,9 +1961,10 @@ impl DentryCache {
                 parent_gen: parent_dir_gen,
                 dir_gen: Some(child_dir_gen),
                 is_lower,
+                observed_generation,
                 accessed: Arc::new(AtomicBool::new(true)),
             };
-            self.insert_positive(parent_id, name, pos.clone());
+            self.insert_positive(parent_id, name, pos.clone(), observed_generation);
             return Ok(pos);
         }
 
@@ -1971,9 +2020,14 @@ impl DentryCache {
             parent_gen: parent_dir_gen,
             dir_gen: None,
             is_lower,
+            observed_generation,
             accessed: Arc::new(AtomicBool::new(true)),
         };
-        self.insert_positive(parent_id, name, pos.clone());
+        #[cfg(any(test, feature = "test-support"))]
+        if is_lower {
+            backend.before_lower_entry_publish(full_path);
+        }
+        self.insert_positive(parent_id, name, pos.clone(), observed_generation);
         Ok(pos)
     }
 
@@ -1984,6 +2038,7 @@ impl DentryCache {
     ) -> Result<PositiveDentry, LinuxErrno> {
         #[cfg(any(test, feature = "test-support"))]
         self.layer_probes.fetch_add(1, Ordering::Relaxed);
+        let observed_generation = self.walk_generation();
         let FillComponentParams {
             parent_id,
             name,
@@ -2041,6 +2096,7 @@ impl DentryCache {
             }
             if rc == 0 {
                 return self.construct_positive_from_stat(ConstructPositiveParams {
+                    observed_generation,
                     parent_id,
                     name,
                     parent_dir_gen,
@@ -2106,6 +2162,7 @@ impl DentryCache {
                     None => None,
                 };
                 let (new_dir_id, child_dir_gen) = self.insert_dir(InsertDirParams {
+                    observed_generation,
                     upper_dir_fd: child_upper_dir_fd,
                     lower_dir_fd: child_lower_dir_fd,
                     parent_id,
@@ -2141,9 +2198,10 @@ impl DentryCache {
                 parent_gen: parent_dir_gen,
                 dir_gen: child_dir_gen,
                 is_lower: false,
+                observed_generation,
                 accessed: Arc::new(AtomicBool::new(true)),
             };
-            self.insert_positive(parent_id, name, pos.clone());
+            self.insert_positive(parent_id, name, pos.clone(), observed_generation);
             return Ok(pos);
         } else if let Some(md) = backend.fast_nofollow_metadata(&full_path) {
             let symlink_target = if md.kind == RootFsEntryKind::Symlink {
@@ -2200,6 +2258,7 @@ impl DentryCache {
                     None => None,
                 };
                 let (new_dir_id, child_dir_gen) = self.insert_dir(InsertDirParams {
+                    observed_generation,
                     upper_dir_fd: child_upper_dir_fd,
                     lower_dir_fd: child_lower_dir_fd,
                     parent_id,
@@ -2240,9 +2299,10 @@ impl DentryCache {
                 parent_gen: parent_dir_gen,
                 dir_gen: child_dir_gen,
                 is_lower: false,
+                observed_generation,
                 accessed: Arc::new(AtomicBool::new(true)),
             };
-            self.insert_positive(parent_id, name, pos.clone());
+            self.insert_positive(parent_id, name, pos.clone(), observed_generation);
             return Ok(pos);
         }
 
@@ -2272,6 +2332,7 @@ impl DentryCache {
                 };
                 if rc == 0 {
                     return self.construct_positive_from_stat(ConstructPositiveParams {
+                        observed_generation,
                         parent_id,
                         name,
                         parent_dir_gen,
@@ -2362,6 +2423,7 @@ impl DentryCache {
                         None => None,
                     };
                     let (new_dir_id, child_dir_gen) = self.insert_dir(InsertDirParams {
+                        observed_generation,
                         upper_dir_fd: child_upper_dir_fd,
                         lower_dir_fd: child_lower_dir_fd,
                         parent_id,
@@ -2397,9 +2459,10 @@ impl DentryCache {
                     parent_gen: parent_dir_gen,
                     dir_gen: child_dir_gen,
                     is_lower: true,
+                    observed_generation,
                     accessed: Arc::new(AtomicBool::new(true)),
                 };
-                self.insert_positive(parent_id, name, pos.clone());
+                self.insert_positive(parent_id, name, pos.clone(), observed_generation);
                 return Ok(pos);
             }
         }
@@ -2890,7 +2953,7 @@ impl DentryCache {
 
     /// Notify that an entry was created at `path`.
     pub fn entry_created(&self, path: &str, inode: Option<InodeIdentity>) {
-        self.bump_mutation();
+        let _publication = CacheMutationPublication(self);
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
         if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
@@ -2907,9 +2970,10 @@ impl DentryCache {
                 }
             }
         }
-        if let Some(dir_id) = self.path_to_dir_id.read().get(norm) {
+        let dir_id = self.path_to_dir_id.read().get(norm).copied();
+        if let Some(dir_id) = dir_id {
             let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(dir_id) {
+            if let Some(d) = dirs.get(&dir_id) {
                 d.dir_gen.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -2922,7 +2986,14 @@ impl DentryCache {
 
     /// Notify that an entry at `path` was removed (unlinked or rmdir'd).
     pub fn entry_removed(&self, path: &str, inode: Option<InodeIdentity>) {
-        self.bump_mutation();
+        let _publication = CacheMutationPublication(self);
+        #[cfg(test)]
+        {
+            let hook = self.before_entry_remove_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
         let removed_dir = {
@@ -2984,7 +3055,7 @@ impl DentryCache {
 
     /// Notify that an entry was moved from `old_path` to `new_path`.
     pub fn entry_moved(&self, old_path: &str, new_path: &str, inode: Option<InodeIdentity>) {
-        self.bump_mutation();
+        let _publication = CacheMutationPublication(self);
         let norm_old = old_path.trim_end_matches('/');
         let norm_new = new_path.trim_end_matches('/');
 
@@ -3068,14 +3139,17 @@ impl DentryCache {
         inode_a: Option<InodeIdentity>,
         inode_b: Option<InodeIdentity>,
     ) {
-        self.bump_mutation();
+        let _publication = CacheMutationPublication(self);
         let norm_a = a.trim_end_matches('/');
         let norm_b = b.trim_end_matches('/');
 
         // Invalidate directory path cache for both if present
         {
-            let mut path_map = self.path_to_dir_id.write();
+            // Match check_fork / insert_dir / entry_removed: directory
+            // objects precede name bindings. Reversing these locks deadlocks
+            // an exchange against a concurrent generation reset.
             let mut dirs = self.dirs.write();
+            let mut path_map = self.path_to_dir_id.write();
             if let Some(id_a) = path_map.remove(norm_a) {
                 if let Some(d) = dirs.remove(&id_a) {
                     self.sub_approx_bytes(dir_entry_approx_bytes(&d));
@@ -3146,7 +3220,7 @@ impl DentryCache {
 
     /// Invalidate cached inode or path metadata when file attributes/contents changed.
     pub fn inode_changed(&self, path: &str, inode: Option<InodeIdentity>) {
-        self.bump_mutation();
+        let _publication = CacheMutationPublication(self);
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
         if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
@@ -3171,7 +3245,7 @@ impl DentryCache {
 
     /// Invalidate cached inode record for `id`.
     pub fn invalidate_inode(&self, id: InodeIdentity) {
-        self.bump_mutation();
+        let _publication = CacheMutationPublication(self);
         if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
             self.sub_approx_bytes(inode_approx_bytes());
         }
@@ -3179,12 +3253,13 @@ impl DentryCache {
 
     /// Bump the generation of a directory, invalidating negative lookups within it.
     pub fn bump_dir_generation(&self, path: &str) {
-        self.bump_mutation();
+        let _publication = CacheMutationPublication(self);
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
-        if let Some(dir_id) = self.path_to_dir_id.read().get(norm) {
+        let dir_id = self.path_to_dir_id.read().get(norm).copied();
+        if let Some(dir_id) = dir_id {
             let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(dir_id) {
+            if let Some(d) = dirs.get(&dir_id) {
                 d.dir_gen.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -3258,13 +3333,15 @@ impl DentryCache {
     pub fn has_lower_dir(&self, path: &str) -> bool {
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
-        let map = self.path_to_dir_id.read();
-        if let Some(dir_id) = map
-            .get(norm)
-            .or_else(|| map.get(norm.trim_end_matches('/')))
-        {
+        let dir_id = {
+            let map = self.path_to_dir_id.read();
+            map.get(norm)
+                .or_else(|| map.get(norm.trim_end_matches('/')))
+                .copied()
+        };
+        if let Some(dir_id) = dir_id {
             let dirs = self.dirs.read();
-            if let Some(dir) = dirs.get(dir_id) {
+            if let Some(dir) = dirs.get(&dir_id) {
                 if dir.lower_probed && dir.lower_dir_fd.is_none() {
                     return false;
                 }
@@ -3337,6 +3414,130 @@ mod tests {
     use crate::fs_backend::HostFsBackend;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn late_lower_directory_absence_cannot_hide_published_whiteout() {
+        use crate::fs_backend::FsBackend;
+        let lower = tempdir().unwrap();
+        let upper = tempdir().unwrap();
+        fs::create_dir(lower.path().join("parent")).unwrap();
+        fs::write(lower.path().join("parent/victim"), b"lower").unwrap();
+        let backend = HostFsBackend::from_path(upper.path()).unwrap();
+        let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let cache = DentryCache::new(false, Arc::clone(backend.cache_coherence()));
+        let (fd, _, _, _) = cache
+            .fast_open("/parent/victim", false, &backend, Some(&rootfs))
+            .unwrap();
+        drop(fd);
+        let id = cache.find_parent_dir_id("/parent").unwrap();
+        // Capture exactly the lower-directory refill's pre-publication probes.
+        let observed_generation = cache.walk_generation();
+        let (upper_fd, lower_fd, dev, ino) = {
+            let dirs = cache.dirs.read();
+            let dir = dirs.get(&id).unwrap();
+            (
+                dir.upper_dir_fd.clone(),
+                dir.lower_dir_fd.clone(),
+                dir.dev,
+                dir.ino,
+            )
+        };
+        assert!(upper_fd.is_none());
+        cache
+            .get_or_open_dir_fd("/parent", &backend, Some(&rootfs))
+            .unwrap();
+        backend.mark_deleted("/parent/victim").unwrap();
+        cache.entry_removed("/parent/victim", None);
+        // A second in-flight walk publishes its earlier directory probe after
+        // the complete mutation. It cannot certify upper absence NOW.
+        cache.insert_dir(InsertDirParams {
+            observed_generation,
+            upper_dir_fd: upper_fd,
+            lower_dir_fd: lower_fd,
+            parent_id: DentryId::ROOT,
+            name: "parent",
+            path: "/parent",
+            dev,
+            ino,
+        });
+        // Eviction of the cached negative must not change the answer: this
+        // is a physical whiteout, not a cache-owned deletion.
+        cache.entries.write().remove(&(id, "victim".to_owned()));
+        assert!(matches!(
+            cache.fast_open("/parent/victim", false, &backend, Some(&rootfs)),
+            Err(LINUX_ENOENT)
+        ));
+    }
+
+    #[test]
+    fn completed_whiteout_clears_overlapping_fast_path_publication() {
+        use crate::fs_backend::FsBackend;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let lower = tempdir().unwrap();
+        let upper = tempdir().unwrap();
+        fs::create_dir(lower.path().join("parent")).unwrap();
+        fs::write(lower.path().join("parent/victim"), b"lower").unwrap();
+        let backend = Arc::new(HostFsBackend::from_path(upper.path()).unwrap());
+        let rootfs = Arc::new(RootFs::from_immutable_host_dir(lower.path()).unwrap());
+        let cache = Arc::new(DentryCache::new(
+            false,
+            Arc::clone(backend.cache_coherence()),
+        ));
+        let (fd, _, _, _) = cache
+            .fast_open(
+                "/parent/victim",
+                false,
+                backend.as_ref(),
+                Some(rootfs.as_ref()),
+            )
+            .unwrap();
+        drop(fd);
+        // Materialise the upper directory capability before the whiteout.
+        cache
+            .get_or_open_dir_fd("/parent", backend.as_ref(), Some(rootfs.as_ref()))
+            .unwrap();
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *cache.before_entry_remove_hook.lock() = Some(Arc::new(move || {
+            arrived_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+        let writer_cache = Arc::clone(&cache);
+        let writer_backend = Arc::clone(&backend);
+        let writer = std::thread::spawn(move || {
+            writer_backend.mark_deleted("/parent/victim").unwrap();
+            writer_cache.entry_removed("/parent/victim", None);
+        });
+        arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // This open overlaps the writer and may observe either the earlier
+        // lower binding or the whiteout. Its cache publication cannot outlive
+        // the completed mutation's invalidation.
+        match cache.fast_open(
+            "/parent/victim",
+            false,
+            backend.as_ref(),
+            Some(rootfs.as_ref()),
+        ) {
+            Ok((fd, _, _, _)) => drop(fd),
+            Err(errno) => assert_eq!(errno, LINUX_ENOENT),
+        }
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(matches!(
+            cache.fast_open(
+                "/parent/victim",
+                false,
+                backend.as_ref(),
+                Some(rootfs.as_ref())
+            ),
+            Err(LINUX_ENOENT)
+        ));
+    }
 
     #[test]
     fn capacity_cache_observes_backing_cohort_sibling_rename() {

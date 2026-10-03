@@ -224,9 +224,22 @@ impl ScriptedBackend {
         // Every child thread is joined before the verdict, whatever the root
         // did: a task that outlives its parent's script is a backend defect.
         let joined = Self::join_children(&shared);
+        let mut ledger = std::mem::take(&mut *shared.ledger.lock());
+        // A failed child never sends its completion byte. Preserve that
+        // causal expectation instead of masking it with the parent's read /
+        // wait deadline. A direct root failure retains its own precedence.
+        if matches!(root_exit, Err(ExampleError::WaitTimedOut(_)))
+            && !ledger.task_failures.is_empty()
+        {
+            let (pid, tid, error) = ledger.task_failures.remove(0);
+            return Err(ExampleError::Task {
+                pid,
+                tid,
+                error: Box::new(error),
+            });
+        }
         let script_exit_code = root_exit?;
         joined?;
-        let ledger = std::mem::take(&mut *shared.ledger.lock());
         if let Some((pid, tid, error)) = ledger.task_failures.into_iter().next() {
             return Err(ExampleError::Task {
                 pid,
@@ -429,6 +442,12 @@ impl Task {
                 return Ok(0);
             }
             match step {
+                Step::AwaitCheckpoint(checkpoint) => {
+                    if !checkpoint.wait() {
+                        return Err(ExampleError::WaitTimedOut("script checkpoint"));
+                    }
+                }
+                Step::SignalCheckpoint(checkpoint) => checkpoint.signal(),
                 Step::ArchiveImportRollback { destination, bytes } => {
                     use carrick_kernel::kernel::control::{
                         ArchiveCapability, ArchiveControlError, ArchiveRequest, ArchiveRuntime,
