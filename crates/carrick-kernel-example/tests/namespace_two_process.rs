@@ -307,20 +307,22 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                                 )
                                 .ret(0),
                             ),
-                            Step::Sys(
-                                sys::openat(LINUX_AT_FDCWD, src, LINUX_O_RDONLY as i32, 0)
-                                    .errno(LINUX_ENOENT),
-                            ),
+                            Step::Sys(carrick_kernel_example::Syscall {
+                                label: "openat-after-rename-whiteout",
+                                ..sys::openat(LINUX_AT_FDCWD, src, LINUX_O_RDONLY as i32, 0)
+                                    .errno(LINUX_ENOENT)
+                            }),
                             Step::Sys(
                                 sys::openat(LINUX_AT_FDCWD, dst, LINUX_O_RDONLY as i32, 0).save(4),
                             ),
                             Step::Sys(sys::read(slot(4), 5).ret(5)),
                             Step::Sys(sys::close(slot(4)).ret(0)),
                             Step::Sys(sys::unlinkat(LINUX_AT_FDCWD, deleted.clone(), 0).ret(0)),
-                            Step::Sys(
-                                sys::openat(LINUX_AT_FDCWD, deleted, LINUX_O_RDONLY as i32, 0)
-                                    .errno(LINUX_ENOENT),
-                            ),
+                            Step::Sys(carrick_kernel_example::Syscall {
+                                label: "openat-after-unlink-whiteout",
+                                ..sys::openat(LINUX_AT_FDCWD, deleted, LINUX_O_RDONLY as i32, 0)
+                                    .errno(LINUX_ENOENT)
+                            }),
                         ]);
                     }
                 }
@@ -358,11 +360,24 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                 ]);
                 let mut backend = HostFsBackend::from_path(upper.path()).unwrap();
                 backend.enable_sparse_upper_fast_miss();
-                let run = ScriptedBackend::new()
+                let result = ScriptedBackend::new()
                     .with_fs_backend(Box::new(backend))
-                    .with_rootfs_layer(carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap())
-                    .run_root(script)
-                    .unwrap_or_else(|error| panic!("lower n={n} population={population} same_parent={same_parent}: {error:?}"));
+                    .with_rootfs_layer(
+                        carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
+                    )
+                    .run_root(script);
+                let run = match result {
+                    Ok(run) => run,
+                    Err(error) => {
+                        let lower_evidence = lower.keep();
+                        let upper_evidence = upper.keep();
+                        panic!(
+                            "lower n={n} population={population} same_parent={same_parent}: {error:?}; lower evidence {}; upper evidence {}",
+                            lower_evidence.display(),
+                            upper_evidence.display()
+                        );
+                    }
+                };
                 assert_eq!(run.tasks_started(), 2);
                 assert_eq!(run.exit_code(), 0);
                 for (id, parent) in parents.iter().enumerate() {
@@ -406,4 +421,87 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
             }
         }
     }
+}
+
+/// A lower file refill paused after its host identity check must not publish
+/// its earlier observation into the cache after another live task's whiteout.
+#[test]
+fn two_live_process_late_lower_refill_cannot_resurrect_whiteout() {
+    use carrick_kernel_example::operand::ScriptCheckpoint;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let lower = tempfile::TempDir::new().unwrap();
+    let upper = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(lower.path().join("parent")).unwrap();
+    std::fs::write(lower.path().join("parent/victim"), b"lower").unwrap();
+    let arrived = ScriptCheckpoint::default();
+    let release = ScriptCheckpoint::default();
+    let once = AtomicBool::new(false);
+    let mut backend = HostFsBackend::from_path(upper.path()).unwrap();
+    let hook_arrived = arrived.clone();
+    let hook_release = release.clone();
+    backend.set_lower_entry_publish_hook(Arc::new(move |path| {
+        if path == "/parent/victim" && !once.swap(true, Ordering::SeqCst) {
+            hook_arrived.signal();
+            assert!(hook_release.wait(), "writer did not release lower refill");
+        }
+    }));
+    let finished = ScriptCheckpoint::default();
+    let script = vec![
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::AwaitCheckpoint(arrived),
+            Step::Sys(
+                sys::linkat(
+                    LINUX_AT_FDCWD,
+                    "/parent/victim",
+                    LINUX_AT_FDCWD,
+                    "/parent/alias",
+                    0,
+                )
+                .ret(0),
+            ),
+            Step::Sys(
+                sys::renameat2(
+                    LINUX_AT_FDCWD,
+                    "/parent/victim",
+                    LINUX_AT_FDCWD,
+                    "/parent/moved",
+                    0,
+                )
+                .ret(0),
+            ),
+            Step::SignalCheckpoint(release),
+            Step::AwaitCheckpoint(finished.clone()),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        // This read overlaps the mutation and may retain the earlier file.
+        Step::Sys(sys::openat(LINUX_AT_FDCWD, "/parent/victim", LINUX_O_RDONLY as i32, 0).save(4)),
+        Step::Sys(sys::close(slot(4)).ret(0)),
+        // The writer completed before the previous open returned, so this
+        // distinct open has no overlap and must see the published whiteout.
+        Step::Sys(
+            sys::openat(LINUX_AT_FDCWD, "/parent/victim", LINUX_O_RDONLY as i32, 0)
+                .errno(LINUX_ENOENT),
+        ),
+        Step::SignalCheckpoint(finished),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let run = ScriptedBackend::new()
+        .with_fs_backend(Box::new(backend))
+        .with_rootfs_layer(
+            carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
+        )
+        .run_root(script)
+        .unwrap();
+    assert_eq!(run.tasks_started(), 2);
+    assert_eq!(run.exit_code(), 0);
+    assert!(!upper.path().join("parent/victim").exists());
+    assert_eq!(
+        std::fs::read(upper.path().join("parent/moved")).unwrap(),
+        b"lower"
+    );
 }

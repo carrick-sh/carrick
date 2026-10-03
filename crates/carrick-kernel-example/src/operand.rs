@@ -141,6 +141,37 @@ impl Layout {
     }
 }
 
+/// A bounded host scheduling checkpoint for deterministic scripted interleavings.
+/// It has no guest namespace or execution authority.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptCheckpoint(std::sync::Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>);
+
+impl PartialEq for ScriptCheckpoint {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ScriptCheckpoint {}
+
+impl ScriptCheckpoint {
+    pub fn signal(&self) {
+        *self.0.0.lock() = true;
+        self.0.1.notify_all();
+    }
+
+    pub fn wait(&self) -> bool {
+        let deadline = std::time::Instant::now() + crate::scripted::WAIT_BOUND;
+        let mut signalled = self.0.0.lock();
+        while !*signalled {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            self.0.1.wait_for(&mut signalled, remaining);
+        }
+        true
+    }
+}
+
 /// Where a syscall takes an argument from or materialises a buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Operand {
@@ -280,6 +311,10 @@ impl Syscall {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// Await a bounded host checkpoint at this exact script position.
+    AwaitCheckpoint(ScriptCheckpoint),
+    /// Release a deterministic host checkpoint at this exact script position.
+    SignalCheckpoint(ScriptCheckpoint),
     /// Apply an archive through the carrier control authority and require a
     /// late filesystem failure. Subsequent syscalls must verify rollback.
     ArchiveImportRollback {
