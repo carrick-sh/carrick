@@ -871,7 +871,7 @@ The production functions and structures to reuse are:
   existing supply paths. They do not yet constitute a stopped-target
   UserTransfer continuation or a general user-frame pin capability.
 
-Adapter prerequisite requiring director disposition: N0's delayed completion
+Adapter prerequisites authorized by the director: N0's delayed completion
 and partial-compound reuse witnesses retain physical data pins independently
 of the MM editor. Production `FrameGrantResidencyTable::retire`
 (`crates/carrick-el1-abi/src/lib.rs:1766`) revokes a record without a transfer
@@ -880,12 +880,36 @@ pin count. `HostApertureState::pin_extent`
 metadata aperture, not general user frames. Reusing either as a general data
 pin would invent custody. The stopped-target lazy path also needs an owned
 transfer continuation: current frame supply ends in `Action::Forward`
-(`fault.rs:952`), not a suspended portal operation. Decide whether the
-production data-pin and transfer suspension protocol is a prerequisite in
-this turn despite deferring the public Capacity operation. Do not retain the
+(`fault.rs:952`), not a suspended portal operation. The director authorized the
+production data-pin and transfer suspension protocol as prerequisites in
+this turn, while deferring the public Capacity operation. Do not retain the
 N0 ledger, hold an MM editor across suspension, run target EL0, or report an
 unbacked lazy page as EFAULT to make these witnesses pass.
 
 This adapter entry is design and source inspection only. UserTransfer has not
 been rebound, the private model has not been deleted, and no tests, signed
 acceptance or review-ready implementation receipt are claimed by this entry.
+
+
+N1 adapter prerequisite checkpoint: the production residency record now has
+an exact-generation transfer lease count. Retirement closes pin admission
+atomically and refuses while a lease is outstanding. Drop releases the lease;
+a stale page token cannot pin a successor. Field offset and pin protocol enter
+the ABI layout hash. The red witness first failed because `pin_transfer` was
+absent, then passed. This is residency retention only: it does not yet protect
+physical reclamation, because production callers must honor refusal before
+unmapping. No UserTransfer consumer uses the lease yet.
+
+Resolved owner-matrix conflict (director ruling): `mm_portal/tests.rs:299` publishes the supposed
+stopped MM with `AddressSpaces::publish_closed` and asserts that the gate
+stays closed (`tests.rs:365-366`). This gate is a publication/ASID retirement and
+host page-table pause fence (`carrick-sched-core/src/spaces.rs:10`), not a
+thread-stop flag. Production `try_begin_edit` refuses it (`spaces.rs:506`).
+The N0 portal ignored that scheduler authority because its private MM graph
+was separate. Required replacement witness: keep the target thread parked
+with its admitted MM gate open, require transfer progress without an EL0
+entry, and separately require an owned suspension/refusal for host-excluded
+or closing MM gates. Do not give a maintenance service an unrestricted gate
+bypass to preserve the synthetic closed-gate success assertion. The original
+N0 stopped-target pass was measured on a gate-bypassing private model; it
+must be re-proven on production semantics before acceptance.
