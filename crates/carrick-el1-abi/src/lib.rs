@@ -710,6 +710,37 @@ impl CurrentTask {
         }
     }
 
+    /// The lifecycle page and control slot published for the running task.
+    ///
+    /// Both addresses live in the retained EL1 metadata window. Keeping the
+    /// validation here gives substrate schedulers and Linux-personality code
+    /// one typed boundary for the host-published addresses.
+    pub fn lifecycle_refs(&self) -> Option<(&ThreadLifecyclePage, &ThreadControlSlot)> {
+        let page = self.lifecycle_page.load(Ordering::Acquire);
+        let slot = self.control_slot.load(Ordering::Acquire);
+        let contains = |address: u64, len: usize| {
+            address >= EL1_DYNAMIC_METADATA_BASE
+                && address
+                    .checked_add(len as u64)
+                    .is_some_and(|end| end <= EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE)
+        };
+        if !page.is_multiple_of(16384)
+            || !slot.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
+            || !contains(page, core::mem::size_of::<ThreadLifecyclePage>())
+            || !contains(slot, core::mem::size_of::<ThreadControlSlot>())
+        {
+            return None;
+        }
+        // SAFETY: only the runtime publishes these EL1-only addresses; its
+        // carrier owner pins both allocations while this task is runnable.
+        Some(unsafe {
+            (
+                &*(page as *const ThreadLifecyclePage),
+                &*(slot as *const ThreadControlSlot),
+            )
+        })
+    }
+
     /// Publication belongs to the loaded task, never to the executor itself.
     pub fn publish_lifecycle(&self, page: u64, slot: u64) {
         self.control_slot.store(slot, Ordering::Relaxed);
