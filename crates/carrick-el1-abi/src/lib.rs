@@ -39,6 +39,8 @@ mod reservations;
 pub use reservations::*;
 mod thread_lifecycle;
 pub use thread_lifecycle::*;
+mod service_copy;
+pub use service_copy::*;
 
 use core::cell::UnsafeCell;
 
@@ -375,6 +377,12 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_REGION_BASE,
         EL1_REGION_SIZE,
         EL1_COUNTERS_OFFSET,
+        EL1_SERVICE_COPY_TABLE_OFFSET,
+        core::mem::size_of::<ServiceCopyTable>() as u64,
+        EL1_SERVICE_COPY_BASE,
+        EL1_SERVICE_COPY_SIZE,
+        EL1_CARRIER_MAINT_ROOT_BASE,
+        EL1_CARRIER_MAINT_ROOT_SIZE,
         EL1_RESERVATIONS_OFFSET,
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
