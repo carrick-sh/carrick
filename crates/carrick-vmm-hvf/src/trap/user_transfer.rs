@@ -13,6 +13,77 @@ pub struct UserTransferCustody {
     metadata: Option<crate::metadata_grant::CarrierMetadataAccess>,
 }
 impl UserTransferCustody {
+    /// Retain an exact external physical source for pre-admission copying.
+    /// This never transfers its source frame or directory into the target.
+    pub fn retain_import_source(
+        &self,
+        physical: carrick_guest_mem::Gpa,
+        len: usize,
+        expected: PortalRetainedData,
+    ) -> Result<sparse_materialization::RetainedImportSource, TrapError> {
+        let invalid = || TrapError::Hypervisor("stale import source identity".into());
+        let owner = self
+            .custody
+            .global_frame_host_owners
+            .lock()
+            .range(..=(physical.0, u64::MAX))
+            .next_back()
+            .filter(|((base, size), _)| {
+                physical
+                    .0
+                    .checked_add(len as u64)
+                    .is_some_and(|end| end <= base.saturating_add(*size))
+            })
+            .and_then(|(_, entry)| entry.live_owner().cloned())
+            .ok_or_else(invalid)?;
+        let identity = owner.record_identity;
+        let logical = identity.logical_owner.and_then(|owner| {
+            Some((
+                NonZeroU64::new(owner.id)?,
+                NonZeroU64::new(owner.generation)?,
+            ))
+        });
+        if expected.record.get() != identity.record_id.0
+            || expected.vm_generation.get() != identity.vm_generation.0
+            || expected.owner != logical
+        {
+            return Err(invalid());
+        }
+        let base = owner.snapshot().ok_or_else(invalid)?.ipa;
+        let offset = usize::try_from(physical.0.checked_sub(base).ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+        let pin = owner.pin().map_err(|_| invalid())?;
+        sparse_materialization::RetainedImportSource::from_pin(pin, identity, offset, len)
+    }
+    /// Prepare copied physical bytes before the exact target's root admission.
+    /// The kernel permit retains publication exclusion through commit/refusal.
+    pub fn prepare_import<'a>(
+        &self,
+        target: carrick_hal::ForeignMmBinding,
+        permit: carrick_hal::PreAdmissionPermit<'a>,
+        source: sparse_materialization::RetainedImportSource,
+        range: carrick_el1_abi::ReservationRange,
+        protection: carrick_el1_abi::ReservationProtection,
+    ) -> Result<sparse_materialization::PendingImport<'a>, TrapError> {
+        let invalid = || TrapError::Hypervisor("import target is not bound".into());
+        let transport = self.transport.as_ref().ok_or_else(invalid)?;
+        let binding = CarrierForeignMmBinding {
+            asid: target.asid(),
+            stage1_root: target.stage1_root(),
+        };
+        let state = transport
+            .states
+            .read()
+            .get(&binding)
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(invalid)?;
+        sparse_materialization::PublicationContext::for_import(
+            state,
+            self.custody.clone(),
+            &permit,
+        )?
+        .prepare_import(permit, source, range, protection)
+    }
     pub(crate) fn from_transport(
         transport: Arc<CarrierForeignMmTransport>,
         carrier: Option<Arc<PersistentCarrierMappings>>,
@@ -74,6 +145,18 @@ impl TransferPin for RetainedUserData {
             } else {
                 core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), self.len);
             }
+        }
+        if self.intent == PortalTransferIntent::UserWrite {
+            // A peer MM may have consumed admission dirtiness before this
+            // memcpy. Publish the completed write, then await I2 completion.
+            let mapping = self._mapping.as_ref().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "write lost retained content owner"
+                )
+            });
+            let offset = self.pointer as usize - mapping.host_base() as usize;
+            mapping.code_content.mark_icache_dirty(offset, self.len);
         }
         if self.intent == PortalTransferIntent::UserWrite && self.selected.executable {
             self.custody
@@ -347,13 +430,21 @@ impl UserTransferCustody {
 pub(super) mod tests {
     use super::*;
     use carrick_el1_abi::{PortalByteRange, PortalOperation, PortalTransferSlot, ReservationMm};
-    fn backing(custody: &Arc<CarrierVmCustody>, ipa: u64) -> Arc<GlobalFrameHostOwner> {
+    use std::sync::atomic::Ordering;
+    pub(crate) fn backing(custody: &Arc<CarrierVmCustody>, ipa: u64) -> Arc<GlobalFrameHostOwner> {
+        backing_len(custody, ipa, 16384)
+    }
+    fn backing_len(
+        custody: &Arc<CarrierVmCustody>,
+        ipa: u64,
+        len: usize,
+    ) -> Arc<GlobalFrameHostOwner> {
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-            16384,
+            len,
             crate::host_mapping::HostMappingKind::FrameCow,
         )
         .unwrap();
-        let mut lease = GlobalFrameStage2Lease::fixed(ipa, 16384);
+        let mut lease = GlobalFrameStage2Lease::fixed(ipa, len as u64);
         lease.mark_test_mapped_without_backend();
         register_global_frame_host_owner_in(
             custody,
@@ -366,7 +457,7 @@ pub(super) mod tests {
             custody
                 .global_frame_host_owners
                 .lock()
-                .get(&(ipa, 16384))
+                .get(&(ipa, len as u64))
                 .unwrap()
                 .owner(),
         )
@@ -379,6 +470,211 @@ pub(super) mod tests {
             offset: 0,
         }
     }
+    #[test]
+    fn native_owner_matrix_moves_bytes_with_balanced_physical_pins() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        struct Physical {
+            custody: UserTransferCustody,
+            pin: Option<RetainedUserData>,
+            owners: Vec<Arc<GlobalFrameHostOwner>>,
+        }
+        impl carrick_el1::personality::mm_portal::test_support::PhysicalTransferFixture for Physical {
+            fn carrier(&self) -> NonZeroU64 {
+                self.custody.carrier()
+            }
+            fn provision(&mut self, ipa: u64, len: usize) {
+                self.owners
+                    .push(backing_len(&self.custody.custody, ipa, len));
+            }
+            fn retain(
+                &mut self,
+                selected: PortalSelectedData,
+                len: usize,
+                intent: PortalTransferIntent,
+            ) -> PortalRetainedData {
+                assert!(self.pin.is_none());
+                let pin = self.custody.retain(selected, len, intent).unwrap().unwrap();
+                let identity = pin.identity();
+                self.pin = Some(pin);
+                assert_eq!(
+                    self.owners
+                        .iter()
+                        .map(|owner| self
+                            .custody
+                            .custody
+                            .stage2_record_snapshot(owner.record_identity.record_id)
+                            .unwrap()
+                            .pin_count)
+                        .sum::<u64>(),
+                    1
+                );
+                identity
+            }
+            fn copy(
+                &mut self,
+                authorization: carrick_el1_abi::PortalCopyRequest<'_>,
+                bytes: &mut [u8],
+            ) -> bool {
+                self.pin.as_mut().unwrap().copy(authorization, bytes)
+            }
+            fn release(&mut self) {
+                drop(self.pin.take().unwrap());
+                assert!(self.owners.iter().all(|owner| {
+                    self.custody
+                        .custody
+                        .stage2_record_snapshot(owner.record_identity.record_id)
+                        .unwrap()
+                        .pin_count
+                        == 0
+                }));
+            }
+        }
+        carrick_el1::personality::mm_portal::test_support::native_owner_matrix(|| {
+            Box::new(Physical {
+                custody: UserTransferCustody::new(Arc::new(CarrierVmCustody::new_live_fixture())),
+                pin: None,
+                owners: Vec::new(),
+            })
+        });
+    }
+
+    #[test]
+    fn executable_transfer_republishes_after_peer_cleans_admitted_write() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa = 0xa085_2000_0000;
+        let owner = backing(&custody, ipa);
+        let physical = UserTransferCustody::new(custody.clone());
+        let selected = PortalSelectedData {
+            executable: true,
+            ..selection(ipa)
+        };
+        let mut pin = physical
+            .retain(selected, 4, PortalTransferIntent::UserWrite)
+            .unwrap()
+            .unwrap();
+        // A different MM publishes the same physical source after write
+        // admission, before the exact transfer copy fence has been entered.
+        assert_eq!(
+            custody
+                .publish_user_executable(ipa, 4, |_, _| None, |_, _| None)
+                .unwrap(),
+            1
+        );
+        let before = owner
+            .mapping
+            .code_content
+            .icache_publications
+            .load(Ordering::Relaxed);
+        let request = carrick_el1_abi::PortalTransferRequest::new(
+            PortalOperation {
+                carrier: physical.carrier(),
+                mm: ReservationMm::new(77).unwrap(),
+                incarnation: NonZeroU64::new(1).unwrap(),
+                sequence: NonZeroU64::new(1).unwrap(),
+            },
+            PortalByteRange::new(0x4000_0000, 4).unwrap(),
+            PortalTransferIntent::UserWrite,
+            selected,
+            pin.identity(),
+        )
+        .unwrap();
+        let slot = PortalTransferSlot::new();
+        let mut ticket = slot.submit(request).unwrap();
+        let service = slot.claim().unwrap();
+        let mut bytes = *b"code";
+        assert!(service.copy_with(|| assert!(
+            ticket.copy_requested(|authorization| pin.copy(authorization, &mut bytes))
+        )));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(owner.mapping.host_base(), 4) },
+            b"code"
+        );
+        assert_eq!(
+            owner
+                .mapping
+                .code_content
+                .icache_publications
+                .load(Ordering::Relaxed),
+            before + 1,
+            "copy must complete I2 even when another MM consumed admission dirtiness"
+        );
+        assert!(service.complete(4, 0));
+        assert_eq!(ticket.take_completion().unwrap().errno, 0);
+    }
+
+    #[test]
+    fn nonexecutable_transfer_redirties_for_executable_peer() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa = 0xa085_2000_0000;
+        let owner = backing(&custody, ipa);
+        let physical = UserTransferCustody::new(custody.clone());
+        let selected = PortalSelectedData {
+            executable: false,
+            ..selection(ipa)
+        };
+        let mut pin = physical
+            .retain(selected, 4, PortalTransferIntent::UserWrite)
+            .unwrap()
+            .unwrap();
+        // A different MM publishes the same physical source after write
+        // admission, before the exact transfer copy fence has been entered.
+        assert_eq!(
+            custody
+                .publish_user_executable(ipa, 4, |_, _| None, |_, _| None)
+                .unwrap(),
+            1
+        );
+        let before = owner
+            .mapping
+            .code_content
+            .icache_publications
+            .load(Ordering::Relaxed);
+        let request = carrick_el1_abi::PortalTransferRequest::new(
+            PortalOperation {
+                carrier: physical.carrier(),
+                mm: ReservationMm::new(77).unwrap(),
+                incarnation: NonZeroU64::new(1).unwrap(),
+                sequence: NonZeroU64::new(1).unwrap(),
+            },
+            PortalByteRange::new(0x4000_0000, 4).unwrap(),
+            PortalTransferIntent::UserWrite,
+            selected,
+            pin.identity(),
+        )
+        .unwrap();
+        let slot = PortalTransferSlot::new();
+        let mut ticket = slot.submit(request).unwrap();
+        let service = slot.claim().unwrap();
+        let mut bytes = *b"code";
+        assert!(service.copy_with(|| assert!(
+            ticket.copy_requested(|authorization| pin.copy(authorization, &mut bytes))
+        )));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(owner.mapping.host_base(), 4) },
+            b"code"
+        );
+        assert_eq!(
+            custody
+                .publish_user_executable(ipa, 4, |_, _| None, |_, _| None)
+                .unwrap(),
+            1,
+            "nonexecuting writer must dirty bytes after copy"
+        );
+        assert_eq!(
+            owner
+                .mapping
+                .code_content
+                .icache_publications
+                .load(Ordering::Relaxed),
+            before + 1,
+            "copy must complete I2 even when another MM consumed admission dirtiness"
+        );
+        assert!(service.complete(4, 0));
+        assert_eq!(ticket.take_completion().unwrap().errno, 0);
+    }
+
     #[test]
     fn retained_data_uses_exact_physical_pin_and_moves_actual_bytes() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
@@ -565,12 +861,7 @@ pub(super) mod tests {
         use std::io::{Read, Seek, Write};
         use std::os::fd::AsRawFd;
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        for mode in [
-            "Owned",
-            "CopyOnly",
-            "HostBackingPrivate",
-            "HostBackingShared",
-        ] {
+        for mode in ["Owned", "HostBackingPrivate", "HostBackingShared"] {
             let before = [0xe0, 0x00, 0x80, 0x52]; // mov w0,#7
             let after = [0x20, 0x01, 0x80, 0x52]; // mov w0,#9
 
@@ -646,7 +937,7 @@ pub(super) mod tests {
                 &mut seen,
             );
             assert_eq!(&seen, &before);
-            let private = matches!(mode, "CopyOnly" | "HostBackingPrivate");
+            let private = mode == "HostBackingPrivate";
             let destination = if private {
                 Some(backing(&custody, source_ipa + 0x4000))
             } else {

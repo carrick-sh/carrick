@@ -1,6 +1,7 @@
 # Task 1 implementation report
 
-Status: UserTransfer implementation and focused VM-free evidence completed;
+Initial checkpoint (4f7a6d89a; superseded by the fix1 receipt below):
+UserTransfer implementation and focused VM-free evidence completed;
 all worker checks below passed before the implementation commit. Whole-N1 acceptance and
 independent director review are not claimed. Worktree `wt-n1`, branch `work/n1`,
 base `580c4a299`. No guests, Docker, merge, push, stash or bypassed hooks.
@@ -88,3 +89,61 @@ The initially attempted RWX host permission view returned -1; this was not
 interpreted as a cache defect or a skipped witness. The final W^X RX/RW view
 executes the actual retained ARM64 bytes successfully, with I2 completion
 asserted independently before changing host permissions. No guest VM ran.
+
+
+## Review fix1 receipt
+
+All four Important review findings have covering fixes. Final commit follows
+this receipt; parent owns independent review, six foreground gates and clean
+line-position capture. No Cargo command will remain running at handoff.
+
+- Recursive registry rollback: `PendingTransferGrant` carries the held guard
+  through every fallible preparation step. The descriptor refusal red hung in
+  the old recursive lock (exact test process killed at5s); current refusal and
+  concurrent-unmap/successor fixture passes.
+- Executable publication: every completed UserWrite re-dirties exact bytes,
+  including non-executable aliases. Existing I2 lock spans dirty claim through
+  invalidation, at most16KiB per lock, without content drain. Reds showed I2
+  count1 vs2, nonexec peer0 vs1, and premature peer completion. All green.
+- Original matrix: actual writeA/writeB/readA/readB at all six size/population
+  points, both live roots, real pin1→0 per chunk, full slots/parked OPEN target,
+  RO/NONE/retire A policy with errno14 and unchanged B. Restored writes exposed
+  extra execute descriptor walks; one leaf translation now returns executable
+  permission too, preserving original ≤8 descriptor loads/page and logarithmic
+  reservation visits. Core EL1 reservation policy test remains present.
+- External CopyOnly: source pin survives source directory/owner destruction;
+  stale source generation refuses before target root publication. SeededAnon
+  preparation uses existing allocator/inventory/custody. PendingImport owns
+  host-setup descriptor undo through normal admission; refusal restores exact
+  original descriptors BEFORE physical release. The additional red left new
+  IPA665719930880 installed after physical rollback; green restores original
+  IPA1073741824, then a new same-address import succeeds and reads `away`.
+  This fixture models kernel permit issuance explicitly; separate kernel tests
+  cover the actual SPACES_LOCK guard and normal dispatcher ordering.
+
+Director-licensed admission authority is now concrete: kernel PreAdmissionGuard
+holds existing SPACES_LOCK, outer BoundAddressSpaceAdmission obtains exact MM
+mutation first, samples mutable anchors/limits under that authority, and owns
+published cleanup before root admission. Raw AddressSpacePublication escapes
+only after lock release. Actual old publish-before-mutation red admitted an
+intervening editor and failed `old publish-before-mutation order admitted
+concurrent edit`; current dispatcher test excludes that same editor.
+
+Exact focused commands after fixes:
+
+- `cargo test -p carrick-kernel --lib publication_to_root_admission_keeps_exact_mutation_authority -- --test-threads=1`: 1 passed.
+- `cargo test -p carrick-kernel --lib pre_admission_owner_blocks -- --test-threads=1`: 1 passed.
+- `cargo clippy -p carrick-kernel -p carrick-vmm-hvf -p carrick-aarch64 -p carrick-el1 -p carrick-hal --all-targets -- -D warnings`: exit0.
+- `cargo test -p carrick-vmm-hvf --lib user_transfer -- --test-threads=1`: 8 passed.
+- `cargo test -p carrick-vmm-hvf --lib transfer_ -- --test-threads=1`: 7 passed.
+- `cargo test -p carrick-vmm-hvf --lib executable_ -- --test-threads=1`: 6 passed; one preexisting signed-harness-only entitlement negative control ignored.
+- Core four-crate units repeated after final changes:637 passed (93/214/116/214); ABI sealing doctests2 passed.
+- `python3 scripts/migrate/check-runtime-aborts.py --check`: all four shards valid, runtime282/HVF251/vCPU165/other59.
+- `python3 scripts/migrate/check-runtime-global-state.py --check`: exit0.
+
+Exact implementation/witness file:line map and reviewed inventory rationale
+are in the plan's final N1 review fix receipt. No new cataloged host process or
+identity operation is introduced by kernel admission locking; authoritative
+compiler capture and line-position reconciliation require the clean final tree
+and remain parent gates. This is VM-free composition, not signed guest syscall
+or whole-N1 acceptance. Fork, bulk Capacity, GuestMemory venue3 remain OPEN.

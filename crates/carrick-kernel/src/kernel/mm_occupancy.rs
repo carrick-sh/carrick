@@ -830,6 +830,112 @@ pub struct ReservationRootPublication {
     pub provider: Option<Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
 }
 
+/// Holds the existing publication owner from physical preparation through
+/// normal root admission. The lock is never reacquired by its publication.
+pub struct PreAdmissionGuard {
+    tables: SpaceTables,
+    mm: MmId,
+    _serial: parking_lot::MutexGuard<'static, ()>,
+}
+// SAFETY: every publication of these tables takes SPACES_LOCK. This guard
+// retains it through preparation, publication, admission and refusal cleanup.
+unsafe impl carrick_hal::PreAdmissionOwner for PreAdmissionGuard {
+    fn mm(&self) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(self.mm.raw()).unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::mm_occupancy",
+                "pre-admission owner lost nonzero MM"
+            )
+        })
+    }
+    fn unpublished(&self) -> bool {
+        self.tables.spaces.find(self.mm.raw()).is_none()
+    }
+}
+impl PreAdmissionGuard {
+    pub(crate) fn acquire(mm: MmId) -> Option<Self> {
+        if !switching_enabled() {
+            return None;
+        }
+        let zone = crate::el1_zone::zone()?;
+        Self::acquire_in(
+            SpaceTables {
+                spaces: &zone.spaces,
+                occupancy: &zone.occupancy,
+                zone: true,
+            },
+            mm,
+        )
+    }
+    fn acquire_in(tables: SpaceTables, mm: MmId) -> Option<Self> {
+        let serial = SPACES_LOCK.lock();
+        if mm.raw() == 0 || tables.spaces.find(mm.raw()).is_some() {
+            return None;
+        }
+        Some(Self {
+            tables,
+            mm,
+            _serial: serial,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        spaces: &'static AddressSpaces,
+        occupancy: &'static Occupancy,
+        mm: MmId,
+    ) -> Option<Self> {
+        Self::acquire_in(
+            SpaceTables {
+                spaces,
+                occupancy,
+                zone: false,
+            },
+            mm,
+        )
+    }
+    pub fn permit(&self) -> Option<carrick_hal::PreAdmissionPermit<'_>> {
+        carrick_hal::PreAdmissionPermit::new(self)
+    }
+    pub(crate) fn publish(
+        &self,
+        fence: &MmFence,
+        ttbr0: u64,
+        ttbr1: u64,
+        brk_current: u64,
+        mmap_next: u64,
+        root: ReservationRootPublication,
+    ) -> Option<AddressSpacePublication> {
+        publish_in_held(
+            self,
+            fence,
+            ttbr0,
+            ttbr1,
+            Anchors {
+                brk_current,
+                mmap_next,
+                limits: root.limits,
+                reservation_provider: root.provider,
+            },
+        )
+    }
+    /// Refused admission removes the exact root while its original owner is
+    /// still held. Suppress Drop's separate lock acquisition, then settle.
+    pub(crate) fn refuse(&self, publication: AddressSpacePublication) {
+        assert_eq!(publication.mm, self.mm);
+        assert!(core::ptr::eq(publication.tables.spaces, self.tables.spaces));
+        let _ = publication.fence.unbind_mirror();
+        let publication = core::mem::ManuallyDrop::new(publication);
+        publication.retire_reservations();
+        self.tables.spaces.free(publication.index);
+        // SAFETY: the remaining owned fields are released once; the custom
+        // destructor's root cleanup was performed under this held guard.
+        unsafe {
+            drop(core::ptr::read(&publication.fence));
+            drop(core::ptr::read(&publication.reservation_provider));
+        }
+    }
+}
+
 /// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, with initial
 /// `brk_current` and `mmap_next` layout anchors for guest EL1 to install and
 /// the publishing process's `limits` for its reservation root.
@@ -908,6 +1014,19 @@ fn publish_in_with_layout(
     ttbr1: u64,
     anchors: Anchors,
 ) -> Option<AddressSpacePublication> {
+    let guard = PreAdmissionGuard::acquire_in(tables, mm)?;
+    publish_in_held(&guard, fence, ttbr0, ttbr1, anchors)
+}
+
+fn publish_in_held(
+    guard: &PreAdmissionGuard,
+    fence: &MmFence,
+    ttbr0: u64,
+    ttbr1: u64,
+    anchors: Anchors,
+) -> Option<AddressSpacePublication> {
+    let tables = guard.tables;
+    let mm = guard.mm;
     let Anchors {
         brk_current,
         mmap_next,
@@ -915,7 +1034,6 @@ fn publish_in_with_layout(
         reservation_provider,
     } = anchors;
     let spaces = tables.spaces;
-    let _serial = SPACES_LOCK.lock();
     if spaces.find(mm.raw()).is_some() {
         return None;
     }
