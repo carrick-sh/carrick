@@ -167,6 +167,7 @@ pub enum ExtentKind {
     Data,
     Tables,
     Metadata,
+    TransferStorage,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExtentGrant {
@@ -319,6 +320,7 @@ struct Mm<P> {
     free: BTreeSet<u64>,
     internal: u64,
     imports: Arc<Vec<P>>,
+    transfer_sequence: u64,
 }
 struct Extent {
     grant: ExtentGrant,
@@ -465,6 +467,7 @@ where
     reap: Arc<AtomicBool>,
     meter: Arc<Meter>,
     work: Work,
+    seal_grants: Option<Vec<ExtentGrant>>,
 }
 impl<B: PhysicalExtentBackend> MmPortal<B>
 where
@@ -483,6 +486,7 @@ where
             reap: Arc::new(AtomicBool::new(false)),
             meter: Arc::new(Meter::default()),
             work: Work::default(),
+            seal_grants: None,
         }
     }
     pub fn work(&self) -> Work {
@@ -524,6 +528,11 @@ where
         self.extents
             .insert(grant.extent.base(), Extent { grant, owner });
         self.work.capacity_grants += 1;
+        if kind != ExtentKind::Metadata
+            && let Some(journal) = &mut self.seal_grants
+        {
+            journal.push(grant);
+        }
         if let Some(i) = owner.filter(|_| kind == ExtentKind::Data) {
             for page in (grant.extent.base()..grant.extent.base() + EXTENT_BYTES)
                 .step_by(PAGE_BYTES as usize)
@@ -597,43 +606,48 @@ where
         Ok(tables)
     }
     fn seal(&mut self, boot: BootMmBuilder<B::Pin>) -> Result<El1MmHandle, MmError> {
+        if self.seal_grants.is_some() {
+            return Err(MmError::Busy);
+        }
         let i = self.mms.len();
-        let prior_extents: BTreeSet<_> = self.extents.keys().copied().collect();
-        let prior_frames: BTreeMap<_, _> = self
-            .frames
-            .iter()
-            .map(|(page, frame)| (*page, frame.counts.references.load(Ordering::Acquire)))
-            .collect();
+        // Rollback visits only the imported spans and grants made by this
+        // bootstrap. It never snapshots an unrelated MM/frame population.
+        let mut prior_frames = BTreeMap::new();
+        for import in &boot.resident {
+            for offset in (0..import.range.len()).step_by(PAGE_BYTES as usize) {
+                let page = import.pin.extent().base() + import.offset + offset;
+                prior_frames.insert(
+                    page,
+                    self.frames
+                        .get(&page)
+                        .map(|frame| frame.counts.references.load(Ordering::Acquire)),
+                );
+            }
+        }
+        self.seal_grants = Some(Vec::new());
         let result = self.seal_inner(boot);
+        let rollback = self.seal_grants.take().ok_or(MmError::Core)?;
         if result.is_err() {
-            // No handle/task was published. Restore semantic references before
-            // dropping table pins and returning newly allocated physical data.
             let mm = ReservationMm::new(i as u64 + 1).ok_or(MmError::Invalid)?;
             if let Ok(root) = self.table.lock_el1_resolved(i, mm, &self.nodes, 0) {
                 root.retire()?;
             }
             self.mms.truncate(i);
-            self.frames.retain(|page, frame| {
-                if let Some(references) = prior_frames.get(page) {
-                    frame
-                        .counts
-                        .references
-                        .store(*references, Ordering::Release);
-                    true
+            for (page, references) in prior_frames {
+                if let Some(references) = references {
+                    if let Some(frame) = self.frames.get(&page) {
+                        frame.counts.references.store(references, Ordering::Release);
+                    }
                 } else {
-                    false
+                    self.frames.remove(&page);
                 }
-            });
-            let rollback: Vec<_> = self
-                .extents
-                .values()
-                .filter(|extent| {
-                    !prior_extents.contains(&extent.grant.extent.base())
-                        && extent.grant.kind != ExtentKind::Metadata
-                })
-                .map(|extent| extent.grant)
-                .collect();
+            }
             for grant in rollback {
+                for page in (grant.extent.base()..grant.extent.base() + grant.extent.len())
+                    .step_by(PAGE_BYTES as usize)
+                {
+                    self.frames.remove(&page);
+                }
                 self.backend.return_extent(grant)?;
                 self.extents.remove(&grant.extent.base());
                 self.work.capacity_returns += 1;
@@ -647,9 +661,11 @@ where
             if !boot.seeds.iter().any(|(range, _)| *range == import.range) {
                 return Err(MmError::Invalid);
             }
-            let live = self.pin(import.pin.extent())?;
-            if live.host_base() != import.pin.host_base() {
-                return Err(MmError::Stale);
+            if import.backing != ResidentBacking::CopyOnly {
+                let live = self.pin(import.pin.extent())?;
+                if live.host_base() != import.pin.host_base() {
+                    return Err(MmError::Stale);
+                }
             }
         }
         let mm = ReservationMm::new(i as u64 + 1).ok_or(MmError::Invalid)?;
@@ -669,6 +685,7 @@ where
             free: BTreeSet::new(),
             internal: 0,
             imports: Arc::new(Vec::new()),
+            transfer_sequence: 0,
         });
         let mut root = self.root(i)?;
         for (range, protection) in boot.seeds {
@@ -709,9 +726,11 @@ where
             let extent = import.pin.extent();
             // Authenticate exact backend generation while the consumed source
             // pin still owns custody. No source VA or host permission query.
-            let authenticated = self.pin(extent)?;
-            if authenticated.host_base() != import.pin.host_base() {
-                return Err(MmError::Stale);
+            if import.backing != ResidentBacking::CopyOnly {
+                let authenticated = self.pin(extent)?;
+                if authenticated.host_base() != import.pin.host_base() {
+                    return Err(MmError::Stale);
+                }
             }
             for offset in (0..import.range.len()).step_by(PAGE_BYTES as usize) {
                 let va = import.range.start() + offset;
@@ -720,8 +739,22 @@ where
                     let page = self.page(i)?;
                     let target = self.frames[&page].extent;
                     let mut bytes = [0; PAGE_BYTES as usize];
-                    self.backend
-                        .read(extent, source - extent.base(), &mut bytes)?;
+                    // SAFETY: the consumed source pin owns this exact bounded
+                    // span even when its physical extent cannot be transferred
+                    // to this backend. The source is not looked up in the
+                    // destination's physical namespace.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            import
+                                .pin
+                                .host_base()
+                                .as_ptr()
+                                .add((source - extent.base()) as usize),
+                            bytes.as_mut_ptr(),
+                            bytes.len(),
+                        );
+                    }
+                    self.callback();
                     self.backend.write(target, page - target.base(), &bytes)?;
                     page
                 } else {
@@ -1252,6 +1285,81 @@ where
         }
         Ok(()) // pending drop releases pins without any wait.
     }
+    /// Physical transfer storage is separate from user data and remains
+    /// allocated until the producer settles the exact wire completion.
+    pub fn transfer_storage(&mut self) -> Result<ExtentGrant, MmError> {
+        self.grant(ExtentKind::TransferStorage, None)
+    }
+
+    /// Owner-side decoding of the shared service ABI. Every validation and
+    /// translation below executes locally at EL1, not through host callbacks.
+    pub fn serve_user_transfer(
+        &mut self,
+        service: carrick_el1_abi::PortalTransferService<'_>,
+    ) -> bool {
+        use carrick_el1_abi::PortalTransferIntent as WireIntent;
+        let request = service.request();
+        let result = (|| {
+            let operation = request.operation;
+            let handle = El1MmHandle {
+                carrier: operation.carrier,
+                mm: operation.mm,
+                incarnation: operation.incarnation,
+            };
+            let i = self.index(handle)?;
+            if operation.sequence.get() <= self.mms[i].transfer_sequence {
+                return Err(MmError::Stale);
+            }
+            let storage = request.storage();
+            let registered = self.extents.get(&storage.base()).ok_or(MmError::Stale)?;
+            if registered.grant.extent != storage
+                || registered.grant.kind != ExtentKind::TransferStorage
+            {
+                return Err(MmError::Stale);
+            }
+            let _storage_pin = self.pin(storage)?;
+            self.mms[i].transfer_sequence = operation.sequence.get();
+            let mut bytes = owned::vec![0; request.range.len() as usize];
+            let address = GuestVa::new(request.range.address());
+            if request.intent == WireIntent::UserWrite {
+                self.callback();
+                self.backend
+                    .read(storage, request.storage_offset(), &mut bytes)?;
+                self.user_transfer(
+                    handle,
+                    UserTransfer::CopyOut {
+                        address,
+                        bytes: &bytes,
+                        intent: TransferIntent::UserWrite,
+                    },
+                )?;
+            } else {
+                let intent = match request.intent {
+                    WireIntent::UserRead => TransferIntent::UserRead,
+                    WireIntent::ReadInstruction => TransferIntent::ReadInstruction,
+                    WireIntent::CarrickInternalRead => TransferIntent::CarrickInternalRead,
+                    WireIntent::UserWrite => return Err(MmError::Invalid),
+                };
+                self.user_transfer(
+                    handle,
+                    UserTransfer::CopyIn {
+                        address,
+                        bytes: &mut bytes,
+                        intent,
+                    },
+                )?;
+                self.callback();
+                self.backend
+                    .write(storage, request.storage_offset(), &bytes)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => service.complete(request.range.len(), 0),
+            Err(error) => service.complete(0, error.errno()),
+        }
+    }
+
     pub fn user_transfer(
         &mut self,
         h: El1MmHandle,
@@ -1437,6 +1545,7 @@ where
             free: BTreeSet::new(),
             internal,
             imports: self.mms[parent].imports.clone(),
+            transfer_sequence: 0,
         });
         Ok(UnpublishedEl1Child { handle })
     }
