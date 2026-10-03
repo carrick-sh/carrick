@@ -170,6 +170,25 @@ fn guest_frame_grant_submission(
 /// of a host-driven EL1 call so its `ret` completes as `MaintenanceDone`.
 const EL1_SERVICE_CALL_RETURN: u64 = carrick_mem::memory::LINUX_EL1_MAINT_BASE + 16;
 
+fn with_maintenance_transfer_root<C: Aarch64Vcpu, T>(
+    cpu: &mut C,
+    root: carrick_mem::memory::CarrierMaintenanceRoot,
+    service: impl FnOnce(&mut C) -> Result<T, TrapError>,
+) -> Result<T, TrapError> {
+    if root.raw() != carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE {
+        return Err(TrapError::Hypervisor(
+            "unrecognized carrier maintenance root".into(),
+        ));
+    }
+    let saved = cpu.get_sys_reg(SysReg::Ttbr0)?;
+    cpu.set_sys_reg(SysReg::Ttbr0, root.raw())?;
+    let outcome = service(cpu);
+    if let Err(error) = cpu.set_sys_reg(SysReg::Ttbr0, saved) {
+        carrick_fatal!("aarch64::user_transfer", "restore executor TTBR0: {error}");
+    }
+    outcome
+}
+
 /// See [`carrick_hal::threaded::ThreadedEngine::run_el1_service_call`].
 fn run_el1_service_call_on<V: Aarch64Vmm>(
     vcpu: &mut V::Vcpu,
@@ -344,7 +363,7 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// Owns stage-2 mapping, fork/execve rebuild, sibling spawn.
     vm: V,
     /// The (one) vCPU for this process thread.
-    vcpu: V::Vcpu,
+    vcpu: std::cell::RefCell<V::Vcpu>,
 
     // ── syscall-doorbell state (OWNED BY ENGINE, §2.1; backend run() stateless) ──
     /// Resume PC (= `ELR_EL1`, post-`svc`) for the pending syscall; `Some` between
@@ -677,7 +696,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         vm.bind_stage1_page_tables(page_tables.clone());
         Self {
             vm,
-            vcpu,
+            vcpu: std::cell::RefCell::new(vcpu),
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
@@ -714,7 +733,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         } = self;
         (
             vm,
-            vcpu,
+            vcpu.into_inner(),
             Aarch64TaskRuntimeProjection {
                 page_tables,
                 protections,
@@ -733,12 +752,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             ));
         };
         self.validate_task_metadata(state)?;
-        let destination = self.vcpu.snapshot()?;
+        let destination = self.vcpu.get_mut().snapshot()?;
         let restored = restore_aarch64_task_state(&destination, state)?;
-        self.vcpu.restore(&restored)?;
+        self.vcpu.get_mut().restore(&restored)?;
         self.discharge_owed_stage1_maintenance()?;
         self.vm.install_task_continuation_for_executor_switch(
-            &mut self.vcpu,
+            self.vcpu.get_mut(),
             state.syscall_continuation,
         )?;
         self.apply_task_metadata(state);
@@ -753,11 +772,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         match self.owed_stage1_maintenance.discharge() {
             None => {}
             Some(crate::vmm::Stage1Maintenance::AllAsids) => {
-                Self::run_el1_maintenance_on(&mut self.vcpu)?;
+                Self::run_el1_maintenance_on(self.vcpu.get_mut())?;
             }
             Some(crate::vmm::Stage1Maintenance::Asid(asid)) => {
                 let root = self.vm.carrier_maintenance_root()?;
-                Self::invalidate_asid_on_vcpu(&mut self.vcpu, asid, root)?;
+                Self::invalidate_asid_on_vcpu(self.vcpu.get_mut(), asid, root)?;
             }
         }
         self.owed_stage1_maintenance = crate::vmm::OwedStage1Maintenance::default();
@@ -775,8 +794,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             ));
         };
         self.validate_task_metadata(state)?;
-        self.vm
-            .install_task_continuation_for_executor_switch(&mut self.vcpu, metadata.continuation)?;
+        self.vm.install_task_continuation_for_executor_switch(
+            self.vcpu.get_mut(),
+            metadata.continuation,
+        )?;
         self.pending_resume_pc = metadata.pending_resume_pc;
         self.last_syscall_nr = metadata.last_syscall_nr;
         self.last_syscall_orig_x0 = metadata.last_syscall_orig_x0;
@@ -792,7 +813,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             return Ok(());
         };
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-        let ttbr = self.vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        let ttbr = self.vcpu.borrow().get_sys_reg(SysReg::Ttbr0)?;
         let hardware_asid = (ttbr >> 48) as u16;
         if hardware_asid != process_asid {
             return Err(TrapError::Hypervisor(format!(
@@ -815,8 +836,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         self.settle_owed_resume_invalidation()?;
         let continuation = self
             .vm
-            .take_task_continuation_for_executor_switch(&mut self.vcpu)?;
-        let snapshot = self.vcpu.snapshot()?;
+            .take_task_continuation_for_executor_switch(self.vcpu.get_mut())?;
+        let snapshot = self.vcpu.get_mut().snapshot()?;
         Ok(GuestCpuState::from_aarch64_v1(
             aarch64_task_state_from_snapshot(
                 &snapshot,
@@ -838,7 +859,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     ) -> Result<Aarch64ResidentTaskMetadata, TrapError> {
         let continuation = self
             .vm
-            .take_task_continuation_for_executor_switch(&mut self.vcpu)?;
+            .take_task_continuation_for_executor_switch(self.vcpu.get_mut())?;
         Ok(Aarch64ResidentTaskMetadata {
             pending_resume_pc: self.pending_resume_pc,
             last_syscall_nr: self.last_syscall_nr,
@@ -854,14 +875,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     pub fn restore_persistent_executor_invariants(&mut self) -> Result<(), TrapError> {
         self.vm
-            .restore_persistent_executor_invariants(&mut self.vcpu)
+            .restore_persistent_executor_invariants(self.vcpu.get_mut())
     }
 
     pub fn into_task_state_and_vcpu(mut self) -> (Aarch64TaskEngineState<V>, V::Vcpu) {
         self.settle_owed_resume_invalidation_or_log();
         let Self {
             vm,
-            mut vcpu,
+            vcpu,
             pending_resume_pc,
             last_syscall_nr,
             last_syscall_orig_x0,
@@ -879,6 +900,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             mut owed_stage1_maintenance,
             ..
         } = self;
+        let mut vcpu = vcpu.into_inner();
         owed_stage1_maintenance.merge(vcpu.take_deferred_stage1_maintenance());
         (
             Aarch64TaskEngineState {
@@ -924,7 +946,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         } = state;
         Self {
             vm,
-            vcpu,
+            vcpu: std::cell::RefCell::new(vcpu),
             pending_resume_pc,
             last_syscall_nr,
             last_syscall_orig_x0,
@@ -1249,7 +1271,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         seed_heap_unmapped(&protections);
         Self {
             vm,
-            vcpu,
+            vcpu: std::cell::RefCell::new(vcpu),
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
@@ -1285,13 +1307,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     }
 
     /// The (one) vCPU for this process thread.
-    pub fn vcpu(&self) -> &V::Vcpu {
-        &self.vcpu
+    pub fn vcpu(&self) -> std::cell::Ref<'_, V::Vcpu> {
+        self.vcpu.borrow()
     }
 
     /// Mutable access to the vCPU (the trap-surfacing primitive runs through it).
     pub fn vcpu_mut(&mut self) -> &mut V::Vcpu {
-        &mut self.vcpu
+        self.vcpu.get_mut()
     }
 
     /// The pending syscall resume PC (`Some` between `next_syscall` and
@@ -1374,7 +1396,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         vm.bind_stage1_page_tables(page_tables.clone());
         Self {
             vm,
-            vcpu,
+            vcpu: std::cell::RefCell::new(vcpu),
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
@@ -1454,6 +1476,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
+            .borrow_mut()
             .get_sys_reg(SysReg::Ttbr0)
             .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
             & TTBR_ROOT_MASK;
@@ -1509,6 +1532,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
+            .borrow_mut()
             .get_sys_reg(SysReg::Ttbr0)
             .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
             & TTBR_ROOT_MASK;
@@ -1852,6 +1876,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
+            .borrow_mut()
             .get_sys_reg(SysReg::Ttbr0)
             .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
             & TTBR_ROOT_MASK;
@@ -1890,6 +1915,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
+            .borrow_mut()
             .get_sys_reg(SysReg::Ttbr0)
             .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
             & TTBR_ROOT_MASK;
@@ -2215,7 +2241,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     }
 
     fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
-        Self::run_el1_maintenance_on(&mut self.vcpu)
+        Self::run_el1_maintenance_on(self.vcpu.get_mut())
     }
 
     fn run_stage1_maintenance_on(
@@ -2243,7 +2269,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let slot = self.mailbox_slot();
         let carrier_root = self.vm.carrier_maintenance_root().ok();
         EngineStage1Services::<V> {
-            vcpu: &mut self.vcpu,
+            vcpu: self.vcpu.get_mut(),
             tables: self.page_tables.clone(),
             slot,
             process_asid: self.process_asid,
@@ -2255,7 +2281,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn run_stage1_maintenance(&mut self) -> Result<(), TrapError> {
         Self::run_stage1_maintenance_on(
-            &mut self.vcpu,
+            self.vcpu.get_mut(),
             self.process_asid,
             self.vm.carrier_maintenance_root().ok(),
         )
@@ -2273,7 +2299,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             && self.last_syscall_nr.is_some_and(|number| {
                 crate::resume_invalidation::eligible_syscall(carrick_abi::CanonicalNr(number))
             })
-            && self.vcpu.returns_syscalls_through_resume_invalidation()
+            && self
+                .vcpu
+                .borrow_mut()
+                .returns_syscalls_through_resume_invalidation()
     }
 
     fn owe_resume_invalidation(&mut self) {
@@ -2361,13 +2390,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // run) into this thread's guest_cpu slot so getrusage(RUSAGE_SELF) /
             // times / `/proc` see it. Done ONCE here, so every aarch64 backend on
             // this shared engine gets it for free (mirrors carrick-x86).
-            let run = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
+            let run = carrick_host::guest_cpu::timed_run(|| self.vcpu.get_mut().run());
             self.pending_guest_run_receipt_ns = self
                 .pending_guest_run_receipt_ns
                 .saturating_add(run.elapsed_ns);
             match run
                 .value
-                .map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))?
+                .map_err(|error| self.vm.enrich_vcpu_run_error(&*self.vcpu.get_mut(), error))?
             {
                 Aarch64Exit::Syscall {
                     frame,
@@ -2386,7 +2415,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     // ISA-neutral: x8 → number, x0..x5 → args. `last_syscall_nr`/
                     // `orig_x0` stay set from the raw frame above (their x8/x0
                     // meaning is aarch64-fixed).
-                    owed_kick.settle(&mut self.vcpu)?;
+                    owed_kick.settle(self.vcpu.get_mut())?;
                     let (number, args) = <Self as ThreadedEngine>::Arch::decode_syscall(&frame);
                     let guest_abi = <Self as ThreadedEngine>::Arch::linux_guest_abi();
                     return Ok(Some(RawSyscall {
@@ -2414,7 +2443,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     // it so `inject_signal` can put it in the arm64 sigframe's
                     // `esr_context` (required by Rosetta's handler).
                     self.last_fault_esr = syndrome;
-                    owed_kick.settle(&mut self.vcpu)?;
+                    owed_kick.settle(self.vcpu.get_mut())?;
                     return Err(TrapError::el0_fault(
                         syndrome,
                         elr,
@@ -2430,17 +2459,17 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 Aarch64Exit::Stage1CowFault { syndrome, far } => {
                     self.last_fault_esr = syndrome;
                     self.suspended_el1_sp =
-                        Some(self.vcpu.get_reg(Reg::SpEl1).map_err(|error| {
+                        Some(self.vcpu.get_mut().get_reg(Reg::SpEl1).map_err(|error| {
                             TrapError::Hypervisor(format!(
                                 "read SP_EL1 of EL1 stopped by a COW fault: {error}"
                             ))
                         })?);
-                    owed_kick.settle(&mut self.vcpu)?;
+                    owed_kick.settle(self.vcpu.get_mut())?;
                     return Err(TrapError::Stage1CowFault {
                         syndrome,
                         far,
-                        elr: self.vcpu.get_reg(Reg::Pc).unwrap_or(0),
-                        spsr: self.vcpu.get_reg(Reg::Pstate).unwrap_or(0),
+                        elr: self.vcpu.get_mut().get_reg(Reg::Pc).unwrap_or(0),
+                        spsr: self.vcpu.get_mut().get_reg(Reg::Pstate).unwrap_or(0),
                     });
                 }
                 Aarch64Exit::Sys64Read { esr: _ } => {
@@ -2449,20 +2478,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     // never surfaces on the KVM path; a future HVF migration
                     // services it via the shared `emulate_el0_sys64_read` and
                     // re-enters. Re-run the guest for now (no-op on KVM).
-                    owed_kick.rearm(&mut self.vcpu)?;
+                    owed_kick.rearm(self.vcpu.get_mut())?;
                     continue;
                 }
                 Aarch64Exit::MaintenanceDone => {
                     // The maintenance trampoline's completion vehicle is consumed by
                     // `run_el1_maintenance`'s own loop; reaching it here is a
                     // spurious re-entry — re-run the guest.
-                    owed_kick.rearm(&mut self.vcpu)?;
+                    owed_kick.rearm(self.vcpu.get_mut())?;
                     continue;
                 }
                 // A WFI/halt with no pending syscall: report `None` so the run loop
                 // can run signal delivery and resume.
                 Aarch64Exit::Halt => {
-                    owed_kick.settle(&mut self.vcpu)?;
+                    owed_kick.settle(self.vcpu.get_mut())?;
                     return Ok(None);
                 }
                 Aarch64Exit::Kicked => {
@@ -2477,7 +2506,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     // syscall completes; the pending signal is delivered cleanly on
                     // the syscall return. Only a kick taken in genuine guest EL0 code
                     // is reported (`Ok(None)`).
-                    let pc = self.vcpu.get_reg(Reg::Pc)?;
+                    let pc = self.vcpu.get_mut().get_reg(Reg::Pc)?;
                     let in_vector = carrick_mem::memory::is_carrick_el1_vector_va(pc);
                     let in_el1_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
                         ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE
@@ -2492,7 +2521,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         // kick to EL0: it is taken at the SVC's PC BEFORE the
                         // syscall replays, and the replay crosses host
                         // dispatch afterwards with the kick already served.
-                        let normalized = self.vcpu.force_clock_host_boundary()?;
+                        let normalized = self.vcpu.get_mut().force_clock_host_boundary()?;
                         if in_vector || in_el1_image || normalized {
                             let site = if in_vector {
                                 crate::owed_kick::AbsorbedKickSite::El1Vector
@@ -2501,11 +2530,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             } else {
                                 crate::owed_kick::AbsorbedKickSite::El0ClockStub
                             };
-                            owed_kick.absorb(&mut self.vcpu, pc, site)?;
+                            owed_kick.absorb(self.vcpu.get_mut(), pc, site)?;
                             continue;
                         }
                     }
-                    owed_kick.settle(&mut self.vcpu)?;
+                    owed_kick.settle(self.vcpu.get_mut())?;
                     return Ok(None);
                 }
                 Aarch64Exit::Memory { gpa, va } => {
@@ -2513,7 +2542,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     // resolve + retry; KVM keeps the default `Ok(false)`. Unhandled
                     // → surface.
                     if self.vm.handle_memory_exit(gpa, va)? {
-                        owed_kick.rearm(&mut self.vcpu)?;
+                        owed_kick.rearm(self.vcpu.get_mut())?;
                         continue;
                     }
                     return Err(TrapError::Hypervisor(format!(
@@ -2535,7 +2564,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &mut self,
     ) -> Result<Option<crate::resume_invalidation::ResumeInvalidation>, TrapError> {
         if let Some(owed) = self.owed_resume_invalidation.take() {
-            return match self.vcpu.resume_through_invalidation() {
+            let resumed = self.vcpu.get_mut().resume_through_invalidation();
+            return match resumed {
                 Ok(true) => Ok(Some(owed)),
                 Ok(false) => {
                     self.owed_resume_invalidation = Some(owed);
@@ -2553,7 +2583,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             })
             && crate::resume_invalidation::outstanding_for_mm(self.mm_generation)
         {
-            self.vcpu.resume_through_invalidation()?;
+            self.vcpu.get_mut().resume_through_invalidation()?;
         }
         Ok(None)
     }
@@ -2569,7 +2599,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let slot = self.mailbox_slot();
         let carrier_root = self.vm.carrier_maintenance_root().ok();
         let mut services = EngineStage1Services::<V> {
-            vcpu: &mut self.vcpu,
+            vcpu: self.vcpu.get_mut(),
             tables: self.page_tables.clone(),
             slot,
             process_asid: self.process_asid,
@@ -2592,7 +2622,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let slot = self.mailbox_slot();
         let tables = self.page_tables.clone();
         let vm = &mut self.vm;
-        let vcpu = &mut self.vcpu;
+        let vcpu = self.vcpu.get_mut();
         let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
         let mut flush = EngineStage1Services::<V> {
@@ -2641,7 +2671,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let vm = &mut self.vm;
         let carrier_root = vm.carrier_maintenance_root().ok();
         let mut flush = EngineStage1Services::<V> {
-            vcpu: &mut self.vcpu,
+            vcpu: self.vcpu.get_mut(),
             tables,
             slot,
             process_asid: self.process_asid,
@@ -3051,7 +3081,7 @@ fn debug_tid() -> i64 {
 
 impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
     fn slot(&self) -> Option<usize> {
-        self.vcpu.mailbox_slot()
+        self.vcpu.borrow().mailbox_slot()
     }
 
     fn drain_foreign(
@@ -3062,10 +3092,11 @@ impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
     ) -> Result<u64, String> {
         let slot = self
             .vcpu
+            .borrow_mut()
             .mailbox_slot()
             .ok_or_else(|| "caller vCPU has no EL1 slot".to_owned())?;
         let suspended = self.suspended_el1_sp;
-        let vcpu = std::cell::RefCell::new(&mut self.vcpu);
+        let vcpu = std::cell::RefCell::new(self.vcpu.get_mut());
         crate::descriptor_drain::run_foreign_drain_call(
             slot,
             mm_key,
@@ -3082,7 +3113,7 @@ impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
 
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
-        self.vcpu.mailbox_slot()?;
+        self.vcpu.get_mut().mailbox_slot()?;
         Some(self)
     }
 
@@ -3661,7 +3692,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let vm = &mut self.vm;
         let carrier_root = vm.carrier_maintenance_root().ok();
         let mut flush = EngineStage1Services::<V> {
-            vcpu: &mut self.vcpu,
+            vcpu: self.vcpu.get_mut(),
             tables,
             slot,
             process_asid: self.process_asid,
@@ -3762,7 +3793,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             let slot = self.mailbox_slot();
             let carrier_root = self.vm.carrier_maintenance_root().ok();
             let mut services = EngineStage1Services::<V> {
-                vcpu: &mut self.vcpu,
+                vcpu: self.vcpu.get_mut(),
                 tables: self.page_tables.clone(),
                 slot,
                 process_asid: self.process_asid,
@@ -4030,34 +4061,34 @@ fn classify_private_repoint_tlbi(result: Result<(), TrapError>) -> Result<(), Re
 
 impl<V: Aarch64Vmm> carrick_hal::RegAccess for Aarch64EngineCore<V> {
     fn get_reg(&self, r: Reg) -> Result<u64, OsError> {
-        self.vcpu.get_reg(r).map_err(trap_to_os)
+        self.vcpu.borrow().get_reg(r).map_err(trap_to_os)
     }
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), OsError> {
-        self.vcpu.set_reg(r, v).map_err(trap_to_os)
+        self.vcpu.get_mut().set_reg(r, v).map_err(trap_to_os)
     }
     fn get_sys_reg(&self, r: SysReg) -> Result<u64, OsError> {
-        self.vcpu.get_sys_reg(r).map_err(trap_to_os)
+        self.vcpu.borrow().get_sys_reg(r).map_err(trap_to_os)
     }
     fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), OsError> {
-        self.vcpu.set_sys_reg(r, v).map_err(trap_to_os)
+        self.vcpu.get_mut().set_sys_reg(r, v).map_err(trap_to_os)
     }
     fn get_vreg(&self, n: u32) -> Result<u128, OsError> {
-        self.vcpu.get_vreg(n).map_err(trap_to_os)
+        self.vcpu.borrow().get_vreg(n).map_err(trap_to_os)
     }
     fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), OsError> {
-        self.vcpu.set_vreg(n, v).map_err(trap_to_os)
+        self.vcpu.get_mut().set_vreg(n, v).map_err(trap_to_os)
     }
     fn get_fpcr(&self) -> Result<u64, OsError> {
-        self.vcpu.get_fpcr().map_err(trap_to_os)
+        self.vcpu.borrow().get_fpcr().map_err(trap_to_os)
     }
     fn set_fpcr(&mut self, v: u64) -> Result<(), OsError> {
-        self.vcpu.set_fpcr(v).map_err(trap_to_os)
+        self.vcpu.get_mut().set_fpcr(v).map_err(trap_to_os)
     }
     fn get_fpsr(&self) -> Result<u64, OsError> {
-        self.vcpu.get_fpsr().map_err(trap_to_os)
+        self.vcpu.borrow().get_fpsr().map_err(trap_to_os)
     }
     fn set_fpsr(&mut self, v: u64) -> Result<(), OsError> {
-        self.vcpu.set_fpsr(v).map_err(trap_to_os)
+        self.vcpu.get_mut().set_fpsr(v).map_err(trap_to_os)
     }
 }
 
@@ -4118,7 +4149,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             // exit lies past it: the invalidation completed. Stopped inside it
             // (a failed run) the debt stays owed.
             let layout = carrick_mem::memory::mailbox_resume_layout();
-            match self.vcpu.get_reg(Reg::Pc) {
+            match self.vcpu.get_mut().get_reg(Reg::Pc) {
                 Ok(pc) if !(layout.entry..layout.end).contains(&pc) => owed.complete_on_return(),
                 _ => self.owed_resume_invalidation = Some(owed),
             }
@@ -4131,7 +4162,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     }
 
     fn current_pc(&self) -> Result<u64, TrapError> {
-        self.vcpu.get_reg(Reg::Pc)
+        self.vcpu.borrow().get_reg(Reg::Pc)
     }
 
     fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
@@ -4148,7 +4179,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // restores its sentinel-clobbered x9; HVF mailbox mode release-publishes
         // the return payload without register calls. ELR_EL1 already points past
         // the SVC, so neither path advances PC here.
-        self.vcpu.complete_syscall_return(return_value)
+        self.vcpu.get_mut().complete_syscall_return(return_value)
     }
 
     fn is_forked_child(&self) -> bool {
@@ -4164,7 +4195,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // a descendant of a forked child keeps the `_exit`-without-report shutdown
         // path even after it execve's into a different image. The flag is a plain
         // field on `self`, untouched by the remap.
-        self.vm.execve_rebuild(&mut self.vcpu, new_image)?;
+        self.vm.execve_rebuild(self.vcpu.get_mut(), new_image)?;
         // `execve_rebuild` installed a fresh table image. Drop the manager for
         // the old image before the hvpatch ASID configuration reserves its
         // per-mm root-slot aperture in the NEW tables.
@@ -4332,7 +4363,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             })?;
         let pending_syscall_retval =
             pending_syscall_retval_for_boundary(pending_syscall_retval, interrupted_pc, || {
-                self.vcpu.pending_syscall_return()
+                self.vcpu.get_mut().pending_syscall_return()
             })?;
         // The interrupted PSTATE to save into the sigframe: KICK path (interrupted_pc
         // set, EL0) → the live CPSR we just read; SYSCALL/eret path → SPSR_EL1 where
@@ -4367,7 +4398,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // The fault ESR is only valid between fault and delivery; clear it so a
         // later async signal doesn't reuse a stale synchronous-fault syndrome.
         self.last_fault_esr = 0;
-        self.vcpu.prepare_register_resume()
+        self.vcpu.get_mut().prepare_register_resume()
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
@@ -4376,7 +4407,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         let fpsimd = self.vm.fpsimd_enabled();
         let r = <Self as ThreadedEngine>::Arch::restore_sigframe(self, fpsimd)?;
         carrick_observability::probes::signal_restore(r.saved_pc, r.frame_sp, r.magic);
-        self.vcpu.prepare_register_resume()?;
+        self.vcpu.get_mut().prepare_register_resume()?;
         Ok(r.sigmask)
     }
 }
@@ -4400,7 +4431,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let slot = self.mailbox_slot();
         let carrier_root = self.vm.carrier_maintenance_root().ok();
         let mut services = EngineStage1Services::<V> {
-            vcpu: &mut self.vcpu,
+            vcpu: self.vcpu.get_mut(),
             tables: self.page_tables.clone(),
             slot,
             process_asid: self.process_asid,
@@ -4605,7 +4636,7 @@ fn seed_sibling_snapshot(
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
-        self.vcpu.el1_switchable_roots()
+        self.vcpu.borrow_mut().el1_switchable_roots()
     }
 
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
@@ -4635,11 +4666,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
-        self.vm.audit_executor_boundary(&mut self.vcpu)
+        self.vm.audit_executor_boundary(self.vcpu.get_mut())
     }
 
     fn mailbox_slot(&self) -> Option<usize> {
-        self.vcpu.mailbox_slot()
+        self.vcpu.borrow().mailbox_slot()
     }
 
     fn bind_task_snapshot_identity(&mut self, mm_generation: u64, asid_generation: u64) {
@@ -4661,8 +4692,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn snapshot_guest_state_for_publication(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
         self.settle_owed_resume_invalidation()?;
-        let snapshot = self.vcpu.snapshot()?;
-        let continuation = self.vm.task_continuation(&self.vcpu)?;
+        let snapshot = self.vcpu.get_mut().snapshot()?;
+        let continuation = self.vm.task_continuation(&*self.vcpu.get_mut())?;
         Ok(GuestCpuState::from_aarch64_v1(
             aarch64_task_state_from_snapshot(
                 &snapshot,
@@ -4682,7 +4713,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn discard_terminal_syscall_continuation(&mut self) -> Result<(), TrapError> {
         let _ = self
             .vm
-            .take_task_continuation_for_executor_switch(&mut self.vcpu)?;
+            .take_task_continuation_for_executor_switch(self.vcpu.get_mut())?;
         self.pending_resume_pc = None;
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;
@@ -4714,7 +4745,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         mm_key: u64,
         request_generation: u64,
     ) -> Result<Option<carrick_hal::OwnerFileFaultOutcome>, TrapError> {
-        let Some(slot_index) = self.vcpu.mailbox_slot() else {
+        let Some(slot_index) = self.vcpu.get_mut().mailbox_slot() else {
             return Ok(None);
         };
         let region = carrick_el1_abi::get_el1_region_host_ptr();
@@ -4738,7 +4769,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 "owner file fault selection names another MM or source".into(),
             ));
         }
-        let ttbr0 = self.vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        let ttbr0 = self.vcpu.get_mut().get_sys_reg(SysReg::Ttbr0)?;
         // SAFETY: this exact window was published by the production owner in
         // this carrier's immutable fault-selection slot.
         let handle = unsafe {
@@ -4901,12 +4932,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn live_ttbr0(&mut self) -> Result<u64, TrapError> {
         self.vcpu
+            .borrow()
             .get_sys_reg(SysReg::Ttbr0)
             .map_err(|error| TrapError::Hypervisor(format!("read TTBR0_EL1: {error}")))
     }
 
     fn run_el1_service_call(&mut self, entry_pc: u64, frame_va: u64) -> Result<(), TrapError> {
-        run_el1_service_call_on::<V>(&mut self.vcpu, entry_pc, frame_va)
+        run_el1_service_call_on::<V>(self.vcpu.get_mut(), entry_pc, frame_va)
     }
 
     fn suspended_el1_stack_pointer(&mut self) -> Result<Option<u64>, TrapError> {
@@ -5032,7 +5064,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let slot = self.mailbox_slot();
         let tables = self.page_tables.clone();
         let vm = &mut self.vm;
-        let vcpu = &mut self.vcpu;
+        let vcpu = self.vcpu.get_mut();
         let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
         let mut flush = EngineStage1Services::<V> {
@@ -5082,7 +5114,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let slot = self.mailbox_slot();
         let tables = self.page_tables.clone();
         let vm = &mut self.vm;
-        let vcpu = &mut self.vcpu;
+        let vcpu = self.vcpu.get_mut();
         let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
         let mut flush = EngineStage1Services::<V> {
@@ -5151,14 +5183,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     type ProcessSpec = Aarch64ProcessSpec<V>;
 
     fn diagnostic_wait_registers(&self) -> Option<carrick_hal::GuestWaitRegisters> {
-        let live_pc = self.vcpu.get_reg(Reg::Pc).ok()?;
+        let live_pc = self.vcpu.borrow().get_reg(Reg::Pc).ok()?;
         let resume_pc = diagnostic_resume_pc(self.pending_resume_pc, live_pc);
         // A symbol to look up: the svc instruction's own address, not +4.
         let pc = self.hvpatch_island_svc_addr(resume_pc).unwrap_or(resume_pc);
         Some(carrick_hal::GuestWaitRegisters {
             pc,
-            sp: self.vcpu.get_reg(Reg::Sp).ok()?,
-            lr: self.vcpu.get_reg(Reg::X(30)).ok()?,
+            sp: self.vcpu.borrow().get_reg(Reg::Sp).ok()?,
+            lr: self.vcpu.borrow().get_reg(Reg::X(30)).ok()?,
         })
     }
 
@@ -5166,7 +5198,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         &self,
     ) -> Result<Option<carrick_hal::Aarch64CoreRegisters>, TrapError> {
         require_core_fpsimd_authority(self.vm.fpsimd_enabled())?;
-        let snapshot = self.vcpu.snapshot()?;
+        let snapshot = self.vcpu.borrow().snapshot()?;
         let (resume_pc, resume_pstate) = core_resume_pair(self.pending_resume_pc, &snapshot);
         // The Linux-visible resume pc of a thread blocked in this syscall is
         // the instruction AFTER its svc, so +4 past the island's decoded
@@ -5221,7 +5253,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn diagnostic_fault_page_tables(&self, far: u64) -> Option<(u64, [u64; 4])> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-        let ttbr = self.vcpu.get_sys_reg(SysReg::Ttbr0).ok()?;
+        let ttbr = self.vcpu.borrow().get_sys_reg(SysReg::Ttbr0).ok()?;
         let root = ttbr & TTBR_ROOT_MASK;
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         // Walk the live backing in place. This runs on EVERY frame-COW fault
@@ -5328,12 +5360,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             reserved_len,
             true,
         );
-        let tcr = self.vcpu.get_sys_reg(SysReg::Tcr)?;
-        let root = self.vcpu.get_sys_reg(SysReg::Ttbr0)? & TTBR_ROOT_MASK;
+        let tcr = self.vcpu.get_mut().get_sys_reg(SysReg::Tcr)?;
+        let root = self.vcpu.get_mut().get_sys_reg(SysReg::Ttbr0)? & TTBR_ROOT_MASK;
         let ttbr = (u64::from(asid) << 48) | root;
-        self.vcpu.set_sys_reg(SysReg::Tcr, tcr | TCR_AS)?;
-        self.vcpu.set_sys_reg(SysReg::Ttbr0, ttbr)?;
-        self.vcpu.set_sys_reg(SysReg::Ttbr1, ttbr)?;
+        self.vcpu
+            .borrow_mut()
+            .set_sys_reg(SysReg::Tcr, tcr | TCR_AS)?;
+        self.vcpu.get_mut().set_sys_reg(SysReg::Ttbr0, ttbr)?;
+        self.vcpu.get_mut().set_sys_reg(SysReg::Ttbr1, ttbr)?;
         self.process_asid = Some(asid);
         Ok(())
     }
@@ -5375,7 +5409,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 "hvpatch process-exit stage-2 retirement failed: {error}"
             ))
         })?;
-        self.vm.destroy_vcpu_on_thread_exit(&mut self.vcpu);
+        self.vm.destroy_vcpu_on_thread_exit(self.vcpu.get_mut());
         Ok(())
     }
 
@@ -5483,7 +5517,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         };
 
         let stage_started = std::time::Instant::now();
-        let parent = self.vcpu.snapshot()?;
+        let parent = self.vcpu.get_mut().snapshot()?;
         // A process child, like a thread sibling, starts at the instruction
         // after the trapped clone in EL0. The raw parent snapshot is currently
         // parked in the EL1 syscall vector; using its live PC/PSTATE would send
@@ -5651,9 +5685,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             let publish_parent = (|| -> Result<(), TrapError> {
                 if !unarmed_ranges.is_empty() {
                     const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-                    let pt_base = self.vcpu.get_sys_reg(SysReg::Ttbr0).map_err(|error| {
-                        TrapError::Hypervisor(format!("read TTBR0_EL1: {error}"))
-                    })? & TTBR_ROOT_MASK;
+                    let pt_base =
+                        self.vcpu
+                            .borrow()
+                            .get_sys_reg(SysReg::Ttbr0)
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!("read TTBR0_EL1: {error}"))
+                            })?
+                            & TTBR_ROOT_MASK;
                     let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
                     let host = self.vm.host_ptr(pt_base, size).ok_or_else(|| {
                         TrapError::Hypervisor("page-table region not mapped".to_owned())
@@ -5902,14 +5941,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn save_initial_runner_state(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
-        if self.vm.task_continuation(&self.vcpu)?.is_some() {
+        if self.vm.task_continuation(&*self.vcpu.get_mut())?.is_some() {
             return Err(TrapError::Hypervisor(
                 "initial AArch64 runner unexpectedly owns a syscall continuation".to_owned(),
             ));
         }
         // A root that has not run owns no vCPU: its registers are staged data
         // (HVF), so the snapshot is a copy, never a vCPU hand-off.
-        let snapshot = self.vcpu.snapshot().map_err(|error| {
+        let snapshot = self.vcpu.get_mut().snapshot().map_err(|error| {
             TrapError::Hypervisor(format!("save initial AArch64 runner state: {error}"))
         })?;
         Ok(GuestCpuState::from_aarch64_v1(
@@ -5932,12 +5971,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // Snapshot the parent vCPU (taken while it is suspended at the trapped
         // `clone` syscall — atomic, race-free), then seed it for the new thread
         // (x0=0, sp_el0=stack, tpidr_el0=tls, pc=parent.elr_el1 = post-svc).
-        let parent = self.vcpu.snapshot()?;
+        let parent = self.vcpu.borrow().snapshot()?;
         let snapshot = seed_sibling_snapshot(&parent, entry);
         // HVF needs the parent vCPU to clone its VM handle + capture its mapping
         // descriptors into the builder; KVM ignores it. The seeded SNAPSHOT (above)
         // is what the new vCPU is restored from — both backends share that.
-        let builder = self.vm.build_sibling_builder(&self.vcpu, entry)?;
+        let builder = self.vm.build_sibling_builder(&*self.vcpu.borrow(), entry)?;
         Ok(Aarch64SiblingSpec {
             builder,
             snapshot,
@@ -5967,17 +6006,17 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn program_counter(&self) -> Result<u64, TrapError> {
-        self.vcpu.get_reg(Reg::Pc)
+        self.vcpu.borrow().get_reg(Reg::Pc)
     }
 
     fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError> {
-        self.vm.set_guest_sp(&self.vcpu, sp)
+        self.vm.set_guest_sp(&*self.vcpu.borrow(), sp)
     }
 
     fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
         // Publish the packed identity consumed by the EL0 vDSO. EL1 gettid
         // reads the typed lifecycle slot, independently of the physical vCPU.
-        self.vcpu.stamp_guest_thread_id(tid)
+        self.vcpu.borrow().stamp_guest_thread_id(tid)
     }
 
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
@@ -5986,7 +6025,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn destroy_vcpu_on_thread_exit(&mut self) {
         // A guest thread exiting frees an HVF concurrent-vCPU slot (HVF). KVM no-op.
-        self.vm.destroy_vcpu_on_thread_exit(&mut self.vcpu);
+        self.vm.destroy_vcpu_on_thread_exit(self.vcpu.get_mut());
     }
 }
 
@@ -7753,7 +7792,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .vm
             .owner_transfer_custody()
             .ok_or(TrapError::UnsupportedPlatform)?;
-        let ttbr0 = self.vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        let ttbr0 = self.vcpu.get_mut().get_sys_reg(SysReg::Ttbr0)?;
         let region = carrick_el1_abi::get_el1_region_host_ptr();
         if region == 0 {
             return Err(TrapError::UnsupportedPlatform);
@@ -7777,15 +7816,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         } else {
             let mm = carrick_el1_abi::ReservationMm::new(self.mm_generation)
                 .ok_or(TrapError::UnsupportedPlatform)?;
-            crate::user_transfer::TransferTarget::bind(
-                self,
-                mm,
-                ttbr0,
-                admission,
-                custody.as_ref(),
-                slots,
-            )?
-            .ok_or(TrapError::UnsupportedPlatform)?
+            crate::user_transfer::TransferTarget::bind(self, mm, ttbr0, custody.as_ref(), slots)?
+                .ok_or(TrapError::UnsupportedPlatform)?
         };
         let mut transfer = crate::user_transfer::OwnedUserTransfer::new(target, request)
             .ok_or_else(|| TrapError::Hypervisor("owner parent transfer range overflow".into()))?;
@@ -7795,7 +7827,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             return Err(TrapError::UnsupportedPlatform);
         }
         loop {
-            match transfer.advance(self, admission, custody.as_ref(), slots)? {
+            match transfer.advance(self, custody.as_ref(), slots)? {
                 crate::user_transfer::TransferProgress::Complete => {
                     return Ok(transfer.into_bytes());
                 }
@@ -7812,7 +7844,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// Run a Fork exchange on the driving task's retained service stack. The
     /// request names both roots exactly; no host descriptor editor is lent.
     pub fn run_owner_parent_transfer(
-        &mut self,
+        &self,
         frame: carrick_el1_abi::TrapFrame,
         target: crate::user_transfer::TransferTarget,
         sequence: core::num::NonZeroU64,
@@ -7821,7 +7853,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let operation = self
             .pending_owner_fork_operation()
             .ok_or_else(|| TrapError::Hypervisor("parent transfer has no retained Fork".into()))?;
-        let current = self.vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        let current = self.vcpu.borrow().get_sys_reg(SysReg::Ttbr0)?;
         if operation.sequence != sequence
             || operation.carrier != target.handle().carrier()
             || operation.mm != target.handle().mm()
@@ -7903,6 +7935,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         };
         let index = self
             .vcpu
+            .borrow_mut()
             .mailbox_slot()
             .ok_or_else(|| TrapError::Hypervisor("owner Fork has no executor slot".into()))?;
         let region = carrick_el1_abi::get_el1_region_host_ptr();
@@ -7972,7 +8005,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     TrapError::Hypervisor(format!("install owner child physical source: {error:?}"))
                 })?;
             }
-            let parent = self.vcpu.snapshot()?;
+            let parent = self.vcpu.get_mut().snapshot()?;
             let mut snapshot = seed_sibling_snapshot(&parent, request.entry);
             snapshot.ttbr0 = request.child_ttbr0;
             snapshot.ttbr1 = request.child_ttbr0;
@@ -8013,54 +8046,48 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     }
 
     pub fn run_owner_fork_service(
-        &mut self,
+        &self,
         mut frame: carrick_el1_abi::TrapFrame,
         effect: &mut dyn FnMut() -> bool,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
         frame.slot =
-            self.vcpu.mailbox_slot().ok_or_else(|| {
+            self.vcpu.borrow().mailbox_slot().ok_or_else(|| {
                 TrapError::Hypervisor("Fork caller has no EL1 service slot".into())
             })? as u64;
         let suspended = self.suspended_el1_sp;
+        let mut cpu = self
+            .vcpu
+            .try_borrow_mut()
+            .map_err(|_| TrapError::Hypervisor("EL1 service CPU is already borrowed".into()))?;
         crate::descriptor_drain::run_drain_call(frame, suspended, |entry, frame_va| {
-            run_el1_service_effect_on::<V::Vcpu>(&mut self.vcpu, entry, frame_va, true, effect)
+            run_el1_service_effect_on::<V::Vcpu>(&mut cpu, entry, frame_va, true, effect)
         })
     }
 
-    /// Run the transfer owner's service on the borrowed driving vCPU. The
-    /// target never enters EL0; its ASID admission brackets the entire call.
+    /// Borrow the current executor exclusively and run the owner on the
+    /// carrier maintenance root. No target translation or spare CPU is used.
     /// A true effect result means the intermediate copy was acknowledged and
     /// the same suspended EL1 stack must resume before register restoration.
     pub fn run_user_transfer_service(
-        &mut self,
+        &self,
         mut frame: carrick_el1_abi::TrapFrame,
-        ttbr0: u64,
-        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
         effect: &mut dyn FnMut() -> bool,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
-        frame.slot =
-            self.vcpu.mailbox_slot().ok_or_else(|| {
-                TrapError::Hypervisor("transfer caller has no EL1 slot".to_owned())
-            })? as u64;
+        let root = self.vm.carrier_maintenance_root()?;
+        let mut cpu = self
+            .vcpu
+            .try_borrow_mut()
+            .map_err(|_| TrapError::Hypervisor("UserTransfer CPU is already borrowed".into()))?;
+        frame.slot = cpu
+            .mailbox_slot()
+            .ok_or_else(|| TrapError::Hypervisor("transfer caller has no EL1 slot".into()))?
+            as u64;
         let suspended = self.suspended_el1_sp;
-        let vcpu = std::cell::RefCell::new(&mut self.vcpu);
-        crate::descriptor_drain::run_foreign_service_call(
-            frame,
-            ttbr0,
-            admission,
-            || vcpu.borrow().get_sys_reg(SysReg::Ttbr0),
-            |value| vcpu.borrow_mut().set_sys_reg(SysReg::Ttbr0, value),
-            suspended,
-            |entry, frame_va| {
-                run_el1_service_effect_on::<V::Vcpu>(
-                    &mut vcpu.borrow_mut(),
-                    entry,
-                    frame_va,
-                    true,
-                    effect,
-                )
-            },
-        )
+        with_maintenance_transfer_root(&mut *cpu, root, |cpu| {
+            crate::descriptor_drain::run_drain_call(frame, suspended, |entry, frame_va| {
+                run_el1_service_effect_on::<V::Vcpu>(cpu, entry, frame_va, true, effect)
+            })
+        })
     }
 }
 
@@ -8145,6 +8172,32 @@ mod transfer_service_tests {
             Ok(Aarch64Exit::MaintenanceDone)
         }
     }
+    #[test]
+    fn maintenance_transfer_uses_current_cpu_and_restores_root_after_failure() {
+        let original = 0x1700_009a_0020_0000;
+        let mut cpu = Cpu {
+            regs: Vec::new(),
+            runs: 0,
+            ttbr0: original,
+        };
+        let root = carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa(
+            carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
+        ));
+        let result: Result<(), TrapError> = with_maintenance_transfer_root(&mut cpu, root, |cpu| {
+            assert_eq!(cpu.ttbr0, carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE);
+            assert_eq!(cpu.runs, 0);
+            Err(TrapError::Hypervisor("injected service refusal".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(cpu.ttbr0, original);
+        let wrong = carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa(original));
+        let result: Result<(), TrapError> = with_maintenance_transfer_root(&mut cpu, wrong, |_| {
+            panic!("unrecognized root must be refused before service effects")
+        });
+        assert!(result.is_err());
+        assert_eq!(cpu.ttbr0, original);
+    }
+
     #[test]
     fn transfer_copy_and_cancel_resume_exact_service_stack_before_restoration() {
         for copied in [false, true] {
