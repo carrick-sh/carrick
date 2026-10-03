@@ -20,6 +20,8 @@ use carrick_fatal::carrick_fatal;
 mod ipc;
 pub use ipc::FileTableStdioGuard;
 pub mod credentials;
+mod file_cursor;
+pub use file_cursor::{FileCursorReservation, FileCursorWait};
 pub mod process;
 pub mod session;
 pub mod signal;
@@ -819,6 +821,7 @@ impl SocketCork {
 
 #[derive(Debug)]
 pub struct DescriptionCommon {
+    cursor: file_cursor::FileCursor,
     status_flags: AtomicU64,
     ipc_status_flags: std::sync::OnceLock<Arc<crate::el1_ipc::HostDescriptionFlags>>,
     /// A shared routing record for descriptions whose effects remain host-owned.
@@ -856,6 +859,7 @@ pub struct DescriptionCommon {
 impl DescriptionCommon {
     pub(crate) fn new(status_flags: u64) -> Self {
         Self {
+            cursor: file_cursor::FileCursor::new(),
             status_flags: AtomicU64::new(status_flags),
             ipc_status_flags: std::sync::OnceLock::new(),
             ipc_forwarding: Mutex::new(None),
@@ -877,6 +881,7 @@ impl DescriptionCommon {
 
     pub(crate) fn new_with_seals(status_flags: u64, seals: Arc<Mutex<Option<u32>>>) -> Self {
         Self {
+            cursor: file_cursor::FileCursor::new(),
             status_flags: AtomicU64::new(status_flags),
             ipc_status_flags: std::sync::OnceLock::new(),
             ipc_forwarding: Mutex::new(None),
