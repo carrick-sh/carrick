@@ -1,0 +1,22 @@
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-sched-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.46s
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-036ede8fc0dd8d55)
+
+running 1 test
+test object_wait::host_tests::metadata_completion_follows_parked_record_after_slot_switch ... FAILED
+
+failures:
+
+---- object_wait::host_tests::metadata_completion_follows_parked_record_after_slot_switch stdout ----
+
+thread 'object_wait::host_tests::metadata_completion_follows_parked_record_after_slot_switch' (77283540) panicked at crates/carrick-sched-core/src/lib.rs:3884:66:
+index out of bounds: the len is 64 but the index is 64
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    object_wait::host_tests::metadata_completion_follows_parked_record_after_slot_switch
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-sched-core --lib`

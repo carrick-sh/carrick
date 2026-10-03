@@ -7,7 +7,7 @@ use carrick_sched_core::{BoundedSpin, IDLE_SPIN_NS, PREEMPT_SLICE_NS, SwitchedIn
 use core::sync::atomic::Ordering;
 
 /// Bucket-lock spins before EL1 gives up and forwards.
-const EL1_ZONE_LOCK_SPINS: u32 = 1024;
+pub(crate) const EL1_ZONE_LOCK_SPINS: u32 = 1024;
 
 /// The earliest the virtual timer is armed from now: a deadline that could
 /// not be served (a busy lock, a full run queue) is retried after this.

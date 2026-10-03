@@ -781,7 +781,25 @@ impl MetadataStorage {
 
     #[cfg(target_os = "none")]
     fn publish_request(slot: usize, request: carrick_el1_abi::MetadataGrantRequest) -> bool {
-        if !carrick_el1_abi::metadata_mailbox_guest().try_publish_request(request) {
+        if !carrick_el1_abi::metadata_mailbox_guest().try_publish_request_prepared(
+            request,
+            |generation| {
+                // SAFETY: the carrier maps the zone for the complete EL1 lifetime.
+                let zone = unsafe {
+                    &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_sched_core::ZoneTables)
+                };
+                let Some(key) =
+                    carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(generation)
+                else {
+                    return false;
+                };
+                zone.bind_object_wait(
+                    key,
+                    &carrick_sched_core::BoundedSpin(crate::substrate::sched::EL1_ZONE_LOCK_SPINS),
+                )
+                .is_ok()
+            },
+        ) {
             return false;
         }
         Self::mark_pending_host_work(slot);

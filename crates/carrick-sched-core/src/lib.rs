@@ -3872,7 +3872,7 @@ impl ZoneTables {
             }
         }
         // Each queue a record is linked on, once.
-        let mut seen = [0u64; object_wait::OBJECT_WAIT_QUEUES / 64];
+        let mut seen = [0u64; object_wait::OBJECT_WAIT_QUEUES.div_ceil(64)];
         for record in self.records.iter().skip(1) {
             if record.claim() == Claim::Free {
                 continue;

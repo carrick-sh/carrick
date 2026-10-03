@@ -16,7 +16,7 @@ use super::*;
 
 /// Admission capacity, independent of the number of execution slots. Queue
 /// storage is provisioned once with the zone; transfers allocate no entries.
-pub const OBJECT_WAIT_QUEUES: usize = ZONE_RECORDS;
+pub const OBJECT_WAIT_QUEUES: usize = ZONE_RECORDS + 1;
 
 /// Direct queue index plus the exact object incarnation. Different readiness
 /// classes of one object have different indices, assigned by its authority.
@@ -29,10 +29,30 @@ pub struct ObjectWaitKey {
 
 impl ObjectWaitKey {
     pub const fn new(index: u32, generation: u64) -> Option<Self> {
-        if index == 0 || index as usize >= OBJECT_WAIT_QUEUES || generation == 0 {
+        if index == 0 || index as usize >= ZONE_RECORDS || generation == 0 {
             None
         } else {
             Some(Self { index, generation })
+        }
+    }
+
+    /// Carrier metadata has its own queue, outside IPC's admitted indices.
+    pub const fn metadata_request(generation: u64) -> Option<Self> {
+        if generation == 0 {
+            None
+        } else {
+            Some(Self {
+                index: ZONE_RECORDS as u32,
+                generation,
+            })
+        }
+    }
+
+    fn from_registration(index: u32, generation: u64) -> Option<Self> {
+        if index == ZONE_RECORDS as u32 {
+            Self::metadata_request(generation)
+        } else {
+            Self::new(index, generation)
         }
     }
 
@@ -60,10 +80,30 @@ pub struct OperationToken {
 
 impl OperationToken {
     pub const fn new(index: u64, generation: u64) -> Option<Self> {
-        if index == 0 || generation == 0 {
+        if index == 0 || index == u64::MAX || generation == 0 {
             None
         } else {
             Some(Self { index, generation })
+        }
+    }
+
+    /// An owned metadata request wait; no IPC operation arena owns this token.
+    pub const fn metadata_request(generation: u64) -> Option<Self> {
+        if generation == 0 {
+            None
+        } else {
+            Some(Self {
+                index: u64::MAX,
+                generation,
+            })
+        }
+    }
+
+    pub const fn metadata_generation(&self) -> Option<u64> {
+        if self.index == u64::MAX {
+            Some(self.generation)
+        } else {
+            None
         }
     }
 
@@ -405,10 +445,12 @@ impl ZoneRecord {
     /// the record's exact MM and task identity before touching user memory.
     pub unsafe fn take_object_operation(&self) -> Option<OperationToken> {
         let index = self.object.operation.swap(0, Ordering::AcqRel);
-        OperationToken::new(
-            index,
-            self.object.operation_generation.load(Ordering::Relaxed),
-        )
+        let generation = self.object.operation_generation.load(Ordering::Relaxed);
+        if index == u64::MAX {
+            OperationToken::metadata_request(generation)
+        } else {
+            OperationToken::new(index, generation)
+        }
     }
 }
 
@@ -509,7 +551,8 @@ impl ZoneTables {
     ) -> Result<bool, ()> {
         let rec = self.record(record);
         let index = rec.object.queue.load(Ordering::Acquire);
-        let Some(key) = ObjectWaitKey::new(index, rec.object.generation.load(Ordering::Relaxed))
+        let Some(key) =
+            ObjectWaitKey::from_registration(index, rec.object.generation.load(Ordering::Relaxed))
         else {
             return Ok(false);
         };
@@ -542,9 +585,10 @@ impl ZoneTables {
             if index == 0 {
                 return;
             }
-            let Some(key) =
-                ObjectWaitKey::new(index, rec.object.generation.load(Ordering::Relaxed))
-            else {
+            let Some(key) = ObjectWaitKey::from_registration(
+                index,
+                rec.object.generation.load(Ordering::Relaxed),
+            ) else {
                 return;
             };
             let Ok(guard) = self.object_wait(key, wait) else {
@@ -583,6 +627,97 @@ mod host_tests {
         zone.bind_object_wait(key(1), &SpinForever).unwrap();
         zone.bind_object_wait(key(2), &SpinForever).unwrap();
         zone
+    }
+
+    #[test]
+    fn metadata_completion_follows_parked_record_after_slot_switch() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::metadata_request(17).unwrap();
+        zone.bind_object_wait(key, &SpinForever).unwrap();
+        let original = allocate(&zone, 101);
+        let original_ref = zone.record_ref(original);
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        queue
+            .park(
+                queue.snapshot(),
+                original,
+                OperationToken::metadata_request(17).unwrap(),
+            )
+            .unwrap();
+        drop(queue);
+        let mut census = std::string::String::new();
+        zone.write_census(&mut census).unwrap();
+        assert!(census.contains(&std::format!(
+            "zone object queue {}: generation=17",
+            key.index(),
+        )));
+        // A different guest now occupies the executor slot. Reconciliation
+        // hands that record back; it must not receive the metadata wake.
+        let occupant = park(&zone, 1, 202);
+        notify(&zone, 1);
+        assert_eq!(zone.switch_in(SLOT), Some(occupant));
+        zone.leave_guest(SLOT, &SpinForever);
+        assert_eq!(
+            zone.handback_current(SLOT, occupant),
+            CurrentHandback::HandedBack
+        );
+        let occupant_claim = zone.record(occupant).claim();
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let mut handed = Vec::new();
+        let report = queue
+            .notify_object_host(&mut |record| handed.push(record), &mut |_| {})
+            .unwrap();
+        assert_eq!(report.visited, 1);
+        assert_eq!(handed.as_slice(), &[original_ref]);
+        assert_eq!(zone.record(occupant).claim(), occupant_claim);
+        assert_eq!(
+            unsafe { zone.record(original).take_object_operation() }
+                .unwrap()
+                .metadata_generation(),
+            Some(17)
+        );
+        drop(queue);
+        // A later incarnation cannot alias an outstanding earlier wait.
+        let next = ObjectWaitKey::metadata_request(18).unwrap();
+        zone.bind_object_wait(next, &SpinForever).unwrap();
+        assert!(zone.object_wait(key, &SpinForever).is_err());
+    }
+
+    #[test]
+    fn metadata_wait_cancellation_unlinks_its_reserved_queue() {
+        let zone = fixture(false);
+        let key = ObjectWaitKey::metadata_request(1).unwrap();
+        zone.bind_object_wait(key, &SpinForever).unwrap();
+        let record = allocate(&zone, 1);
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        queue
+            .park(
+                queue.snapshot(),
+                record,
+                OperationToken::metadata_request(1).unwrap(),
+            )
+            .unwrap();
+        drop(queue);
+        assert_eq!(
+            zone.claim_for_host(
+                zone.record_ref(record),
+                None,
+                Handback::Control,
+                &SpinForever
+            ),
+            HostClaim::Claimed
+        );
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        assert_eq!(
+            queue
+                .notify_object_host(
+                    &mut |_| panic!("cancelled metadata record woke"),
+                    &mut |_| {}
+                )
+                .unwrap()
+                .visited,
+            0
+        );
     }
 
     fn key(index: u32) -> ObjectWaitKey {

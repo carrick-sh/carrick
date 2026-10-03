@@ -3076,6 +3076,39 @@
       "rationale": "The infallible task/control constructors require a shared ABI slab before publishing any object. A host mapping failure cannot supply valid control authority; like the replaced heap allocation failure it terminates the carrier rather than publishing a detached or copied slot. Optional carrier-aperture exhaustion separately declines publication and leaves the thread host-served.",
       "sink": "fatal",
       "domain": "thread::control"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "function": "<MetadataCompletionWake as carrick_el1_abi::MetadataCompletionWake>::publish_and_wake",
+      "ordinal_in_function": 1,
+      "fingerprint": "81b0de2f77285d7a0d7df2139351ac282d233712305d1365988b19a0d67e56bd",
+      "sink": "fatal",
+      "domain": "metadata::wake",
+      "verdict": "carrier_fault",
+      "failure_domain": "metadata::wake",
+      "rationale": "Zero request incarnation at metadata completion violates publication admission; no valid guest request can select it."
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "function": "<MetadataCompletionWake as carrick_el1_abi::MetadataCompletionWake>::publish_and_wake",
+      "ordinal_in_function": 2,
+      "fingerprint": "a95cba5da4106ed58e72ad645b53b56c39233dc0b32ea87533b57e0f0dcbaa6f",
+      "sink": "fatal",
+      "domain": "metadata::wake",
+      "verdict": "carrier_fault",
+      "failure_domain": "metadata::wake",
+      "rationale": "The fixed wake delivery array has one slot per zone record; exceeding it means duplicate record ownership, not guest allocation refusal."
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "function": "<MetadataCompletionWake as carrick_el1_abi::MetadataCompletionWake>::publish_and_wake",
+      "ordinal_in_function": 3,
+      "fingerprint": "6739c385ac7b66f697ac0cf07e665d068812e0c3fab8d6eaa021e139bcadbb30",
+      "sink": "fatal",
+      "domain": "metadata::wake",
+      "verdict": "carrier_fault",
+      "failure_domain": "metadata::wake",
+      "rationale": "An admitted metadata wake failed record ownership validation; continuing could resume the wrong transaction or leak its execution capacity."
     }
   ]
 }

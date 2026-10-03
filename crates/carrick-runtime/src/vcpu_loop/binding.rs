@@ -5447,15 +5447,23 @@ where
         // No guest has entered: its start gate remains held. The extracted
         // factory now owns the shared control backing, so register existing
         // file slots and restrictive policy before workers can run this root.
-        if let Some(access) = authority.reservation_metadata_access()
-            && let Err(error) = kernel.dispatcher.install_reservation_provider(Arc::new(
+        if let Some(access) = authority.reservation_metadata_access() {
+            if let Err(error) = access
+                .install_completion_wake(Arc::new(carrick_kernel::el1_zone::MetadataCompletionWake))
+            {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
+                    "metadata completion registration failed: {error:?}"
+                ))));
+            }
+            if let Err(error) = kernel.dispatcher.install_reservation_provider(Arc::new(
                 super::reservations::CarrierReservations::new(access),
-            ))
-        {
-            prepared.fail_exact();
-            return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
-                "carrier reservation provider installation failed: {error:?}"
-            ))));
+            )) {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
+                    "carrier reservation provider installation failed: {error:?}"
+                ))));
+            }
         }
         super::fd_ceiling::register(
             &kernel.dispatcher,
