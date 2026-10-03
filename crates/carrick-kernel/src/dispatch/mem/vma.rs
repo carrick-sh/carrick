@@ -905,6 +905,28 @@ pub(crate) fn mapped_data_rows(mem: &MemState) -> impl Iterator<Item = &ProcMaps
 /// implementation backing, not VMAs; the heap is clamped to `brk`, and dynamic
 /// mappings supply the committed pieces of the hidden mmap arena.
 pub(crate) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
+    if mem.owner_rows_exclusive && mem.delegated_root().is_some() {
+        return mem
+            .owner_observed_rows()
+            .iter()
+            .map(|row| ProcMapsEntry {
+                start: row.start,
+                end: row.end,
+                read: row.read,
+                write: row.write,
+                execute: row.execute,
+                sharing: if matches!(
+                    row.provenance,
+                    VmaBackingProvenance::SharedAnonymous | VmaBackingProvenance::SharedFile
+                ) {
+                    ProcMapSharing::Shared
+                } else {
+                    ProcMapSharing::Private
+                },
+                path: row.path.clone(),
+            })
+            .collect();
+    }
     let mut maps = project_host_core_maps(mem);
     let root_rows = mem.root_anonymous_rows();
     if root_rows.is_empty() {

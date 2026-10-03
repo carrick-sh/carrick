@@ -189,10 +189,12 @@ mod code_content;
 mod global_frame;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod host_writes;
+mod owner_fork;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod user_transfer;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
+pub use owner_fork::{ForkPhysicalCustody, ForkPhysicalRetention};
 pub use sparse_materialization::{PendingImport, RetainedImportSource};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use user_transfer::UserTransferCustody;
@@ -6824,7 +6826,15 @@ impl HvfVmState {
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
                     lease.mark_pre_mapped();
                 }
-            } else if process_mapping_needs_stage2_install(mapping.inherited_frame) {
+            } else if process_mapping_needs_stage2_install(mapping.inherited_frame)
+                && !matches!(
+                    mapping.host,
+                    ProcessMappingHost::Borrowed {
+                        structural_owner: Some(_),
+                        ..
+                    }
+                )
+            {
                 let rc = unsafe {
                     inventory_hv_vm_map(
                         mapping.physical_host_addr.cast(),
@@ -7290,7 +7300,15 @@ impl HvfVmState {
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
                     lease.mark_pre_mapped();
                 }
-            } else if process_mapping_needs_stage2_install(mapping.inherited_frame) {
+            } else if process_mapping_needs_stage2_install(mapping.inherited_frame)
+                && !matches!(
+                    mapping.host,
+                    ProcessMappingHost::Borrowed {
+                        structural_owner: Some(_),
+                        ..
+                    }
+                )
+            {
                 let rc = unsafe {
                     inventory_hv_vm_map(
                         mapping.physical_host_addr.cast(),

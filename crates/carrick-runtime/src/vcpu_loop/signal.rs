@@ -379,6 +379,63 @@ fn claim_frame_grant_request(
         .map_or(FrameGrantClaim::None, FrameGrantClaim::Accepted)
 }
 
+/// Service a source selected by the owner before any host page-table pause.
+/// Absence leaves the scheduler request untouched for other fault venues.
+pub(super) fn resolve_owner_file_fault(
+    engine: &mut impl carrick_hal::threaded::ThreadedEngine,
+    mm_key: u64,
+    address: u64,
+    access: Option<carrick_mmu_core::aarch64::LeafAccess>,
+) -> Result<Option<carrick_hal::OwnerFileFaultOutcome>, TrapError> {
+    let Some(index) = engine.mailbox_slot() else {
+        return Ok(None);
+    };
+    let region = carrick_el1_abi::get_el1_region_host_ptr();
+    if region == 0 {
+        return Ok(None);
+    }
+    // SAFETY: the driving engine retains the installed carrier region. The
+    // ABI slot table is aligned and lies within that retained region.
+    let slots = unsafe {
+        &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+            as *const carrick_el1_abi::MmPortalSlots)
+    };
+    let Some(slot) = slots.grant(index) else {
+        return Ok(None);
+    };
+    let Some((generation, window)) = slot.pending_fault_selection(mm_key, address) else {
+        return Ok(None);
+    };
+    let mailbox = carrick_el1_abi::frame_grant_mailbox_host_for_slot(index)
+        .ok_or_else(|| TrapError::Hypervisor("owner file fault has no frame mailbox".into()))?;
+    let request = match claim_frame_grant_request(mailbox, mm_key, address, access) {
+        FrameGrantClaim::Accepted(request) if request.request_generation == generation => request,
+        _ => {
+            return Err(TrapError::Hypervisor(
+                "owner file fault scheduler request is stale".into(),
+            ));
+        }
+    };
+    if window.host_backing.is_none() {
+        return Err(TrapError::Hypervisor(
+            "owner file fault lost source identity".into(),
+        ));
+    }
+    let completed = engine
+        .service_owner_file_fault(mm_key, generation)?
+        .ok_or_else(|| TrapError::Hypervisor("owner file fault selection was displaced".into()))?;
+    publish_frame_grant_refusal(
+        mailbox,
+        request,
+        if completed == carrick_hal::OwnerFileFaultOutcome::Resolved {
+            carrick_el1_abi::FRAME_GRANT_ERR_STALE
+        } else {
+            carrick_el1_abi::FRAME_GRANT_ERR_DENIED
+        },
+    );
+    Ok(Some(completed))
+}
+
 fn publish_frame_grant_refusal(
     mailbox: &carrick_el1_abi::FrameGrantMailbox,
     request: carrick_el1_abi::FrameGrantRequest,

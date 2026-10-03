@@ -1334,6 +1334,29 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// and SHARES the protections/page_tables Arc.
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError>;
 
+    /// Retain physical backing for an exact owner-selected lazy file window.
+    fn prepare_owner_frame_grant(
+        &self,
+        _target: crate::user_transfer::TransferTarget,
+        _window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<Option<Box<dyn crate::user_transfer::TransferGrant>>, TrapError> {
+        Ok(None)
+    }
+
+    fn owner_transfer_custody(&self) -> Option<Box<crate::user_transfer::ErasedPhysicalCustody>> {
+        None
+    }
+
+    /// Allocate physical child capacity without inspecting host VMA policy.
+    fn prepare_owner_fork_builder(
+        &self,
+        _request: &mut ProcessForkRequest,
+    ) -> Result<Box<dyn crate::fork::PhysicalForkBuilder<Self::ProcessBuilder>>, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend has no production owner fork adapter".into(),
+        ))
+    }
+
     fn build_process_builder(
         &self,
         _request: ProcessForkRequest,
