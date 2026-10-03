@@ -1381,7 +1381,7 @@ fn adopt_host_leaf_as_el1_private(desc: u64, level: usize) -> u64 {
 
 /// Apply `rule` to one covering terminal. `Ok(None)`: the terminal already
 /// satisfies the rule and its whole span is skipped without a split.
-pub(crate) fn terminal_rule_edit(
+pub fn terminal_rule_edit(
     asid_scoped_leaves: bool,
     rule: TerminalRule,
     desc: u64,
@@ -1450,6 +1450,35 @@ pub(crate) fn terminal_rule_edit(
             Ok((current != desc).then_some(current))
         }
     }
+}
+
+/// Derive one child terminal when splitting an existing block. Invalid
+/// prepared/retired outputs retain their tags without becoming accessible.
+pub fn split_terminal_descriptor(
+    descriptor: u64,
+    level: usize,
+    index: usize,
+) -> Result<u64, PageTableError> {
+    let (mask, child_mask, shift, page) = match level {
+        1 => (PA_MASK_1GIB, PA_MASK_2MIB, 21, false),
+        2 => (PA_MASK_2MIB, PA_MASK_4KIB, 12, true),
+        _ => return Err(PageTableError::BadAddress),
+    };
+    if index >= 512 {
+        return Err(PageTableError::BadAddress);
+    }
+    let output = descriptor & mask;
+    if descriptor & VALID == 0 && output == 0 {
+        return Ok(0);
+    }
+    let attrs = descriptor & !mask & !TYPE_BITS;
+    let ty = if page { TYPE_TABLE_OR_PAGE } else { TYPE_BLOCK };
+    let result = ((output + ((index as u64) << shift)) & child_mask) | attrs | ty;
+    Ok(if descriptor & VALID == 0 {
+        result & !VALID
+    } else {
+        result
+    })
 }
 
 /// Whether a sub-table whose entries are descriptors at `level` may be
