@@ -5269,6 +5269,12 @@ mod real {
         /// phase (0=map, 1=unmap), IPA, length, host VA, permissions. Host VA
         /// and permissions are zero on unmap.
         fn hvpatch__global__frame__stage2(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Committed sparse publication: exact MM, semantic VA/IPA,
+        /// physical host-owner generation, and stage-1 root-slot base.
+        fn hvpatch__mm__publication(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// ASID/root pool edge: phase (0 allocate, 1 proven retirement),
+        /// ASID, ASID generation, root-slot base. Recorded under pool exclusion.
+        fn hvpatch__mm__slot(_: u32, _: u32, _: u64, _: u64) {}
         /// A non-owning mapping row failed exact global-owner authentication.
         /// Args: requested IPA/length/host VA and the current owner's host VA
         /// for that exact IPA/length (zero when the lease is retired).
@@ -5893,6 +5899,10 @@ mod real {
         /// `guest-mem-copy`; then a wrapping byte-sum plus little-endian first
         /// eight bytes of the copied payload. This avoids DTrace reading guest VAs.
         fn guest__mem__bytes(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Consumer-only payload view of the same authenticated guest copy.
+        /// Args: direction, guest VA, host byte-slice pointer, exact byte length.
+        /// The pointer is valid only during this synchronous probe fire.
+        fn guest__mem__payload(_: u32, _: u64, _: u64, _: u64) {}
         /// Companion for `guest-mem-bytes`: little-endian last eight bytes.
         fn guest__mem__tail(_: u32, _: u64, _: u64, _: u64) {}
         /// Stage-1 sample point inside a guest-memory copy range. Args are:
@@ -6467,6 +6477,13 @@ mod real {
 
     pub fn hvpatch_tlb_invalidation(asid: u32, va: u64, pages: u32) {
         carrick_usdt::hvpatch__tlb__invalidation!(|| (asid, va, pages));
+    }
+
+    pub fn hvpatch_mm_publication(mm: u64, va: u64, ipa: u64, generation: u64, root: u64) {
+        carrick_usdt::hvpatch__mm__publication!(|| (mm, va, ipa, generation, root));
+    }
+    pub fn hvpatch_mm_slot(phase: u32, asid: u32, generation: u64, root: u64) {
+        carrick_usdt::hvpatch__mm__slot!(|| (phase, asid, generation, root));
     }
 
     #[inline(never)]
@@ -8162,6 +8179,12 @@ mod real {
     }
 
     pub fn guest_mem_bytes(direction: u32, address: u64, bytes: &[u8]) {
+        carrick_usdt::guest__mem__payload!(|| (
+            direction,
+            address,
+            bytes.as_ptr() as u64,
+            bytes.len() as u64
+        ));
         carrick_usdt::guest__mem__bytes!(|| {
             let digest = guest_mem_probe_digest(bytes);
             (
@@ -8849,6 +8872,8 @@ mod stub {
     ));
     stub!(lifecycle(phase: u32));
     stub!(hvpatch_tlb_invalidation(asid: u32, va: u64, pages: u32));
+    stub!(hvpatch_mm_publication(mm: u64, va: u64, ipa: u64, generation: u64, root: u64));
+    stub!(hvpatch_mm_slot(phase: u32, asid: u32, generation: u64, root: u64));
     stub!(mmap_lowering_verdict(va: u64, len: u64, offset: u64, outcome: super::MmapLoweringOutcome));
     stub!(mmap_lowering_error(va: u64, len: u64, offset: u64, error: &dyn std::fmt::Display));
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));

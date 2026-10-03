@@ -1529,6 +1529,13 @@ pub(super) fn publish_replacing(
         shared_key_offset: 0,
         owner_generation,
     };
+    carrick_observability::probes::hvpatch_mm_publication(
+        context.mm_key.get(),
+        start,
+        semantic_ipa,
+        owner_generation,
+        context.mm_root_slot.map_or(0, |slot| slot.0),
+    );
     Ok(PublishedSparseExtent {
         region,
         extension_regions,
