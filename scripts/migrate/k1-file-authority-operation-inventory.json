@@ -15728,7 +15728,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "line": 925,
+      "line": 983,
       "categories": [
         "mapping"
       ],
@@ -22416,7 +22416,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5947,
+      "line": 5955,
       "categories": [
         "mapping"
       ],
@@ -22425,7 +22425,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5955,
+      "line": 5963,
       "categories": [
         "mapping"
       ],
@@ -22434,7 +22434,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5971,
+      "line": 5979,
       "categories": [
         "mapping"
       ],
@@ -23406,7 +23406,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
-      "line": 722,
+      "line": 745,
       "categories": [
         "epoll"
       ],
@@ -23415,7 +23415,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
-      "line": 811,
+      "line": 834,
       "categories": [
         "epoll"
       ],
@@ -23424,7 +23424,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
-      "line": 1119,
+      "line": 1142,
       "categories": [
         "epoll"
       ],

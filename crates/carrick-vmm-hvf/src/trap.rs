@@ -8115,6 +8115,9 @@ impl HvfInner {
             // the parked thread before anything could resume the vCPU, and a
             // resume past the `hvc` fails loud.
             if carrick_hal::is_aarch64_hvc_idle(exception.syndrome) {
+                // Metadata waiters park a record and leave the guest before
+                // service; no allocator or scheduler lock crosses this exit.
+                crate::metadata_grant::service_pending_metadata_request(custody, vm_generation)?;
                 return Ok(Aarch64Exit::Halt);
             }
             if is_aarch64_hvc_kick(exception.syndrome) {

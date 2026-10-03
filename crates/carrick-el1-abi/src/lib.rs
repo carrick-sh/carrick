@@ -82,6 +82,9 @@ pub const EL1_CURRENT_TASKS_SIZE: u64 = 0x10_0000;
 pub const EL1_METADATA_MAILBOX_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x10_000;
 pub const EL1_METADATA_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_METADATA_MAILBOX_OFFSET;
 
+/// Dedicated metadata readiness queue, outside guest IPC queue admission.
+pub const METADATA_WAIT_QUEUE_INDEX: u32 = carrick_sched_core::ZONE_RECORDS as u32;
+
 pub const METADATA_MAILBOX_IDLE: u32 = 0;
 pub const METADATA_MAILBOX_GUEST_WRITING: u32 = 1;
 pub const METADATA_MAILBOX_REQUESTED: u32 = 2;
@@ -423,6 +426,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, control_slot) as u64,
         core::mem::size_of::<MetadataGrantMailbox>() as u64,
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
+        core::mem::offset_of!(MetadataGrantMailbox, request_generation) as u64,
+        carrick_sched_core::object_wait::OBJECT_WAIT_QUEUES as u64,
         FRAME_GRANT_PROTOCOL_VERSION,
         core::mem::size_of::<FrameGrantMailbox>() as u64,
         core::mem::align_of::<FrameGrantMailbox>() as u64,
@@ -817,6 +822,7 @@ pub struct MetadataGrantMailbox {
     arg2: AtomicU64,
     arg3: AtomicU64,
     cookie: AtomicU64,
+    request_generation: AtomicU64,
 }
 
 impl MetadataGrantMailbox {
@@ -829,10 +835,24 @@ impl MetadataGrantMailbox {
             arg2: AtomicU64::new(0),
             arg3: AtomicU64::new(0),
             cookie: AtomicU64::new(0),
+            request_generation: AtomicU64::new(0),
         }
     }
 
+    pub fn request_generation(&self) -> u64 {
+        self.request_generation.load(Ordering::Acquire)
+    }
+
     pub fn try_publish_request(&self, request: MetadataGrantRequest) -> bool {
+        self.try_publish_request_prepared(request, |_| true)
+    }
+
+    /// Bind the wait queue before the host can claim this incarnation.
+    pub fn try_publish_request_prepared(
+        &self,
+        request: MetadataGrantRequest,
+        prepare: impl FnOnce(u64) -> bool,
+    ) -> bool {
         let Ok(op) = u32::try_from(request.op) else {
             return false;
         };
@@ -848,6 +868,19 @@ impl MetadataGrantMailbox {
         {
             return false;
         }
+        let Some(generation) = self
+            .request_generation
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+        else {
+            self.state.store(METADATA_MAILBOX_IDLE, Ordering::Release);
+            return false;
+        };
+        if !prepare(generation) {
+            self.state.store(METADATA_MAILBOX_IDLE, Ordering::Release);
+            return false;
+        }
+        self.request_generation.store(generation, Ordering::Relaxed);
         self.op.store(op, Ordering::Relaxed);
         self.status
             .store(METADATA_GRANT_ERR_INVALID, Ordering::Relaxed);
@@ -921,6 +954,12 @@ impl MetadataGrantMailbox {
     pub fn has_guest_work(&self) -> bool {
         self.state.load(Ordering::Acquire) != METADATA_MAILBOX_IDLE
     }
+}
+
+/// Host completion publishes under the exact request's waiter queue lock.
+/// The implementation delivers record wakes only after that lock is released.
+pub trait MetadataCompletionWake: Send + Sync + core::fmt::Debug {
+    fn publish_and_wake(&self, mailbox: &MetadataGrantMailbox, generation: u64, response: [u64; 4]);
 }
 
 impl Default for MetadataGrantMailbox {
@@ -4216,6 +4255,48 @@ mod tests {
         image[24..32].copy_from_slice(&60u64.to_le_bytes());
         image[4..8].copy_from_slice(&IMAGE_VERSION.to_le_bytes());
         assert_eq!(check_image_abi(&image), Err(ImageAbiError::HashOutOfBounds));
+    }
+
+    #[test]
+    fn metadata_mailbox_admits_wait_identity_before_host_claim() {
+        let mailbox = MetadataGrantMailbox::new();
+        let request = MetadataGrantRequest {
+            op: METADATA_GRANT_OP_ALLOC,
+            arg1: 4096,
+            arg2: 0,
+            arg3: 0,
+            cookie: 0,
+        };
+        assert!(!mailbox.try_publish_request_prepared(request, |_| false));
+        assert_eq!(mailbox.request_generation(), 0);
+        assert!(mailbox.claim_request().is_none());
+        for expected in [1, 2] {
+            assert!(mailbox.try_publish_request_prepared(request, |generation| {
+                assert_eq!(generation, expected);
+                assert!(
+                    mailbox.claim_request().is_none(),
+                    "host claim before queue admission"
+                );
+                true
+            }));
+            assert_eq!(mailbox.request_generation(), expected);
+            assert_eq!(mailbox.claim_request(), Some(request));
+            assert!(!mailbox.try_publish_request_prepared(request, |_| panic!(
+                "occupied request was prepared twice"
+            )));
+            mailbox.publish_response(METADATA_GRANT_SUCCESS, 1, 4096, expected);
+            assert!(mailbox.claim_response().is_some());
+            mailbox.finish_response();
+        }
+        mailbox
+            .request_generation
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(!mailbox.try_publish_request(request));
+        assert_eq!(mailbox.request_generation(), u64::MAX);
+        assert!(
+            mailbox.claim_request().is_none(),
+            "request incarnation must never wrap"
+        );
     }
 
     #[test]

@@ -2996,6 +2996,72 @@ fn el1_metadata_allocator_grows_and_returns_extents() {
     );
 }
 
+/// Hold the actual host owner before mapping backing. Other allocator users
+/// must park exact records, rather than spending their 258-attempt budget.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn el1_metadata_allocator_delayed_owner_parks_participants() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    carrick_runtime::reset_metadata_grant_state();
+    let carrier = carrier_or_fail();
+    // Admit only the barrier-synchronized 10 MiB transaction, not startup
+    // metadata requests that can occur before the four workers exist.
+    let probe = carrick_vmm_hvf::metadata_grant::arm_delayed_metadata_request(10 * 1024 * 1024);
+    let monitor = std::thread::spawn(move || {
+        use carrick_vmm_hvf::metadata_grant::MetadataDelayObservation;
+        let mut owner = false;
+        let mut parked = 0;
+        let mut boundaries = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let observation = probe
+                .events
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+            match observation.unwrap_or_else(|error| panic!("delayed metadata owner observation: {error}; owner={owner} parked={parked} boundaries={boundaries}")) {
+                MetadataDelayObservation::OwnerClaimed => owner = true,
+                MetadataDelayObservation::Contended { parked: count } => {
+                    parked = parked.max(count);
+                    boundaries += 1;
+                    if parked >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
+        // Drop releases the owner before the test evaluates either verdict.
+        drop(probe);
+        (owner, parked, boundaries)
+    });
+    let measured = run_fixture(
+        &carrier,
+        &["metadata-allocator", "concurrent"],
+        Duration::from_secs(30),
+    );
+    let (owner, parked, boundaries) = monitor.join().expect("metadata delay monitor");
+    println!(
+        "metadata delayed owner claimed={owner} parked={parked} losing_boundaries={boundaries}"
+    );
+    assert!(
+        owner && parked >= 3,
+        "metadata participants must release execution capacity on owned records: parked={parked} losing_boundaries={boundaries}; {}",
+        describe(&measured)
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        measured
+            .result
+            .stdout_utf8()
+            .contains("workers=4 rounds=16 failures=0 host_calls=1024 host_failures=0"),
+        "{}",
+        describe(&measured)
+    );
+    let stats = carrick_runtime::metadata_grant_stats();
+    assert_eq!(stats.grants_denied, 0, "{stats:?}");
+    assert_eq!(stats.grants_succeeded, stats.returns_completed, "{stats:?}");
+    assert_eq!(stats.bytes_granted, stats.bytes_returned, "{stats:?}");
+}
+
 /// Concurrent users of the actual guest allocator must complete with unrelated
 /// host service work, return every dynamic byte, and stay within the watchdog.
 #[test]

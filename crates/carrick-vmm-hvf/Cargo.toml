@@ -25,6 +25,8 @@ debug-stats = []
 # with carrick-runtime's private kernel authority. It exports no production
 # constructors and is enabled only by the runtime's dev-dependency.
 foreign-cow-test-support = []
+# Deterministic signed metadata request owner/participant interleaving.
+metadata-grant-test-support = []
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }

@@ -173,6 +173,15 @@ impl CarrierMetadataAccess {
         })
     }
 
+    pub fn install_completion_wake(
+        &self,
+        wake: Arc<dyn carrick_el1_abi::MetadataCompletionWake>,
+    ) -> Result<(), MetadataResolutionError> {
+        self.region()?;
+        *self.carrier.custody.metadata_completion.lock() = Some(wake);
+        Ok(())
+    }
+
     /// The returned address is borrowed from this retained carrier mapping.
     pub fn region(&self) -> Result<core::ptr::NonNull<u8>, MetadataResolutionError> {
         if self.carrier.custody.live_generation() != Some(self.generation) {
@@ -766,6 +775,145 @@ fn service_metadata_operation(
     }
 }
 
+#[cfg(all(
+    feature = "metadata-grant-test-support",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod delayed_owner {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, mpsc};
+
+    #[derive(Debug)]
+    pub enum Observation {
+        OwnerClaimed,
+        Contended { parked: u32 },
+    }
+    struct Gate {
+        minimum_bytes: u64,
+        active: AtomicBool,
+        events: mpsc::Sender<Observation>,
+        release: Mutex<mpsc::Receiver<()>>,
+        owner: Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+    static GATE: Mutex<Option<Arc<Gate>>> = Mutex::new(None);
+
+    pub struct Probe {
+        pub events: mpsc::Receiver<Observation>,
+        release: mpsc::Sender<()>,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            let gate = GATE.lock().take();
+            if let Some(gate) = gate
+                && let Some(owner) = gate.owner.lock().take()
+            {
+                let _ = owner.join();
+            }
+        }
+    }
+    pub fn arm(minimum_bytes: u64) -> Probe {
+        let (events, receiver) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let gate = Arc::new(Gate {
+            minimum_bytes,
+            active: AtomicBool::new(false),
+            events,
+            release: Mutex::new(released),
+            owner: Mutex::new(None),
+        });
+        *GATE.lock() = Some(gate);
+        Probe {
+            events: receiver,
+            release,
+        }
+    }
+    pub(super) fn defer(
+        request: carrick_el1_abi::MetadataGrantRequest,
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        custody: &crate::trap::CarrierVmCustody,
+        generation: Option<crate::trap::CarrierVmGeneration>,
+    ) -> bool {
+        let gate = GATE.lock().clone();
+        let Some(gate) = gate.filter(|gate| {
+            request.op == METADATA_GRANT_OP_ALLOC
+                && request.arg1 >= gate.minimum_bytes
+                && !gate.active.swap(true, Ordering::AcqRel)
+        }) else {
+            return false;
+        };
+        let access = match crate::trap::persistent_carrier_cell().lock().as_ref() {
+            Some(crate::trap::PersistentCarrierCellEntry::Published(spec)) => {
+                spec.reservation_metadata_access()
+            }
+            _ => None,
+        };
+        let Some(access) = access.filter(|access| {
+            core::ptr::eq(access.carrier.custody.as_ref(), custody)
+                && Some(access.generation) == generation
+        }) else {
+            gate.active.store(false, Ordering::Release);
+            return false;
+        };
+        let request_generation = mailbox.request_generation();
+        let _ = gate.events.send(Observation::OwnerClaimed);
+        loser(mailbox);
+        // Test-only custody: defer completion without holding an executor or
+        // trap/engine ownership while the remaining records enroll.
+        let owner_gate = Arc::clone(&gate);
+        let owner = std::thread::spawn(move || {
+            let _ = owner_gate
+                .release
+                .lock()
+                .recv_timeout(std::time::Duration::from_secs(20));
+            if let Ok(region) = access.region() {
+                // SAFETY: exact live-generation access retains the whole ABI
+                // mapping until completion; the mailbox contains only atomics.
+                let mailbox = unsafe {
+                    &*region
+                        .as_ptr()
+                        .add(carrick_el1_abi::EL1_METADATA_MAILBOX_OFFSET as usize)
+                        .cast::<carrick_el1_abi::MetadataGrantMailbox>()
+                };
+                let _ = complete_metadata_request(
+                    &access.carrier.custody,
+                    Some(access.generation),
+                    mailbox,
+                    request_generation,
+                    request,
+                );
+            }
+        });
+        *gate.owner.lock() = Some(owner);
+        true
+    }
+    pub(super) fn loser(mailbox: &carrick_el1_abi::MetadataGrantMailbox) {
+        let gate = GATE.lock().clone();
+        if let Some(gate) = gate
+            && gate.active.load(Ordering::Acquire)
+            && mailbox.state.load(Ordering::Acquire)
+                == carrick_el1_abi::METADATA_MAILBOX_HOST_WORKING
+        {
+            let parked = carrick_el1_abi::zone_tables()
+                .and_then(|zone| {
+                    zone.object_queue_census(carrick_el1_abi::METADATA_WAIT_QUEUE_INDEX)
+                })
+                .map_or(0, |census| census.waiters);
+            let _ = gate.events.send(Observation::Contended { parked });
+        }
+    }
+}
+#[cfg(all(
+    feature = "metadata-grant-test-support",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub use delayed_owner::{
+    Observation as MetadataDelayObservation, Probe as MetadataDelayProbe,
+    arm as arm_delayed_metadata_request,
+};
+
 /// Service one shared request after EL1 has unwound to its ordinary
 /// pending-host-work boundary. Returns whether this boundary claimed work.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -777,8 +925,32 @@ pub(crate) fn service_pending_metadata_request(
         return Ok(false);
     };
     let Some(request) = mailbox.claim_request() else {
+        #[cfg(feature = "metadata-grant-test-support")]
+        delayed_owner::loser(mailbox);
         return Ok(false);
     };
+    #[cfg(feature = "metadata-grant-test-support")]
+    if delayed_owner::defer(request, mailbox, custody, generation) {
+        return Ok(false);
+    }
+    complete_metadata_request(
+        custody,
+        generation,
+        mailbox,
+        mailbox.request_generation(),
+        request,
+    )?;
+    Ok(true)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn complete_metadata_request(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+    request_generation: u64,
+    request: carrick_el1_abi::MetadataGrantRequest,
+) -> Result<(), TrapError> {
     let result = service_metadata_operation(
         custody,
         generation,
@@ -786,9 +958,20 @@ pub(crate) fn service_pending_metadata_request(
         request.arg1,
         request.arg2,
         request.arg3,
-    )?;
-    mailbox.publish_response(result[0], result[1], result[2], result[3]);
-    Ok(true)
+    );
+    // Failure still completes the incarnation and releases every enrolled record.
+    let response = result
+        .as_ref()
+        .copied()
+        .unwrap_or([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+    let wake = custody.metadata_completion.lock().clone();
+    if let Some(wake) = wake {
+        wake.publish_and_wake(mailbox, request_generation, response);
+    } else {
+        mailbox.publish_response(response[0], response[1], response[2], response[3]);
+    }
+    result?;
+    Ok(())
 }
 
 /// Legacy synchronous transport retained only as a fail-closed compatibility
@@ -1272,6 +1455,45 @@ mod tests {
         assert!(other_weak.upgrade().is_some());
         drop(surviving_pin);
         assert!(other_weak.upgrade().is_none());
+    }
+
+    /// The delay injector and ordinary boundary call this identical completion
+    /// function. Retirement between claim and service cannot publish backing.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn deferred_metadata_service_reauthenticates_retired_generation() {
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let mailbox = carrick_el1_abi::MetadataGrantMailbox::new();
+        let request = carrick_el1_abi::MetadataGrantRequest {
+            op: METADATA_GRANT_OP_ALLOC,
+            arg1: EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+            arg2: 0,
+            arg3: 0,
+            cookie: 0,
+        };
+        assert!(mailbox.try_publish_request(request));
+        let claimed = mailbox.claim_request().unwrap();
+        let incarnation = mailbox.request_generation();
+        custody.begin_destroy(generation).unwrap();
+        custody.commit_destroy(generation).unwrap();
+        assert!(
+            complete_metadata_request(&custody, Some(generation), &mailbox, incarnation, claimed,)
+                .is_err()
+        );
+        assert_eq!(
+            mailbox.claim_response().unwrap().status,
+            METADATA_GRANT_ERR_INVALID
+        );
+        assert!(custody.stage2_record_identities().is_empty());
+        assert!(
+            metadata_aperture(&custody)
+                .lock()
+                .slots
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     #[test]

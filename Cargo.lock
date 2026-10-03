@@ -488,6 +488,7 @@ dependencies = [
  "carrick-spec",
  "carrick-thread",
  "carrick-vfs",
+ "carrick-vmm-hvf",
  "flate2",
  "libc",
  "parking_lot",

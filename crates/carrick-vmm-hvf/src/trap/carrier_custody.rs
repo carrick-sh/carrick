@@ -482,6 +482,8 @@ pub(crate) struct CarrierVmCustody {
     pub(crate) el1_frame_grants: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
     /// Host COW accounting for every MM admitted to this carrier.
     pub(crate) host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger,
+    pub(crate) metadata_completion:
+        parking_lot::Mutex<Option<std::sync::Arc<dyn carrick_el1_abi::MetadataCompletionWake>>>,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
@@ -662,6 +664,7 @@ impl CarrierVmCustody {
                 El1FrameGrantLedger::default(),
             )),
             host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger::default(),
+            metadata_completion: parking_lot::Mutex::new(None),
             metadata_aperture: parking_lot::Mutex::new(
                 crate::metadata_grant::HostApertureState::new(),
             ),

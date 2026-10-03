@@ -111,6 +111,64 @@ impl ObjectWakeDelivery {
     }
 }
 
+/// Metadata readiness uses the same record-owned waits as IPC, with a
+/// separately admitted queue and a typed token that IPC cannot construct.
+#[derive(Debug)]
+pub struct MetadataCompletionWake;
+
+impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
+    fn publish_and_wake(
+        &self,
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        generation: u64,
+        response: [u64; 4],
+    ) {
+        let publish =
+            || mailbox.publish_response(response[0], response[1], response[2], response[3]);
+        let Some(zone) = zone() else {
+            publish();
+            return;
+        };
+        let Some(key) =
+            carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(generation)
+        else {
+            carrick_fatal::carrick_fatal!("metadata::wake", "zero metadata request incarnation");
+        };
+        let Ok(queue) = zone.object_wait(key, &HostLockWait) else {
+            // No zone participant bound a queue (e.g. guest scheduling disabled).
+            publish();
+            return;
+        };
+        let mut delivery = ObjectWakeDelivery::new();
+        publish();
+        let ObjectWakeDelivery { handed, len, slots } = &mut delivery;
+        queue
+            .notify_object_host(
+                &mut |record| {
+                    let Some(target) = handed.get_mut(*len) else {
+                        carrick_fatal::carrick_fatal!(
+                            "metadata::wake",
+                            "duplicate metadata waiter delivery"
+                        );
+                    };
+                    target.write(record);
+                    *len += 1;
+                },
+                &mut |placed| {
+                    if placed.resched {
+                        let index = usize::from(placed.slot.raw());
+                        slots[index / 64] |= 1 << (index % 64);
+                    }
+                },
+            )
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("metadata::wake", "metadata wake ownership failed")
+            });
+        drop(queue);
+        delivery.deliver();
+    }
+}
+
 impl LockWait for HostLockWait {
     fn wait(&self, attempt: u32) -> bool {
         if attempt < 128 {

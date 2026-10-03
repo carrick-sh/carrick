@@ -1,0 +1,21 @@
+{
+  "source_base_head": "a257cdf9d5b44d47ed42de9e2fbbdb9ab0801b4a",
+  "candidate_files": {
+    "Cargo.lock": "576d2d1703ec5f16a80273d01512e38f8058feeba649c51bd6af041c10aeb472",
+    "crates/carrick-el1-abi/src/lib.rs": "657880c38bd8b500910751452ba632075d6d23d9a49cf0cc799d12b88b886afc",
+    "crates/carrick-el1/src/alloc.rs": "a85756c83809eaec8150b13ae91234c7027f99bde968afd4d1bac3c1962f4020",
+    "crates/carrick-el1/src/personality/dispatch.rs": "4ecb97e47efedd415df2807545031f8845113f4d34b172c6602ce30708598f97",
+    "crates/carrick-el1/src/sched.rs": "285a7829d5e189caee19330299b85a412e0999f50a00d270b8e556a44d892eba",
+    "crates/carrick-embed/Cargo.toml": "40a851e6c791ee32ac37fc1cf247a01db2b7fd31625e1b89624897c7173ee08b",
+    "crates/carrick-embed/tests/el1_sched.rs": "89608e70a55fc5d1907f921bed481b5e610768a38a21cad07879324b540abff0",
+    "crates/carrick-kernel/src/el1_zone.rs": "77e8b14e16330294232d3634d7a27c9df145f2b37e6cb9a5dc11989b32b29d75",
+    "crates/carrick-runtime/src/vcpu_loop/binding.rs": "3eb2eaf937907402b6e39aa8c0eb5a027ef486c684dc2ff51796f657f2a3a45c",
+    "crates/carrick-runtime/src/vcpu_loop/zone.rs": "fca5852479a0eb922ff16f9d1234c60753b74bc4478e87cbd6a943d1f52f43da",
+    "crates/carrick-sched-core/src/lib.rs": "2a599ede5a397b4659161791845d828e59f5d236574feceda224700ca50d016b",
+    "crates/carrick-sched-core/src/object_wait.rs": "0c7250f26f95a4d8708ae59458eff6fe8fbc0facf0cd3523712fbcb0d2689b30",
+    "crates/carrick-vmm-hvf/Cargo.toml": "478eda159fd60e5462fc874d1df0aa454b06a4a2e4ef0b46c33959c5aacf8bd7",
+    "crates/carrick-vmm-hvf/src/metadata_grant.rs": "2e9384cd124d66b7e06a12327eb34d80397388dfa882eee3aa2b7496e5348577",
+    "crates/carrick-vmm-hvf/src/trap.rs": "d2db08861ad931e3a2aa31fc9963215347af5ce76d41442ec1efcf7e7d9aaa58",
+    "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs": "5038650a3946ef6619013820e5c7f03e8acc43401c2182b5e7e82d0a72ae745d"
+  }
+}

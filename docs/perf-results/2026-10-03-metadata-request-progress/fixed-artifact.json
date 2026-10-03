@@ -1,0 +1,17 @@
+{
+  "schema": "carrick.fixed-signed-el1.v1",
+  "record_type": "artifact",
+  "executable_id": "37b37c30b4bf2a67c62686221b27aff2e10c8350fb17c883f2d9be1eefb3f7b2:/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/meta-alloc-evidence/fixed-el1-sched",
+  "canonical_path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/meta-alloc-evidence/fixed-el1-sched",
+  "sha256": "37b37c30b4bf2a67c62686221b27aff2e10c8350fb17c883f2d9be1eefb3f7b2",
+  "cdhash": "3b5b7ea6ef46fa50171ec317890eea35769927e3",
+  "lc_uuid": "9868B07A-38B5-33A7-9936-0342D781E8B5",
+  "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+  "entitlement_present": true,
+  "dof_carrick_present": true,
+  "enabled_features": [],
+  "source_executable_id": "37b37c30b4bf2a67c62686221b27aff2e10c8350fb17c883f2d9be1eefb3f7b2:/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-2026a1c7c8dd8aae",
+  "source_canonical_path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-2026a1c7c8dd8aae",
+  "source_wrapper_receipt": "fixed-source-wrapper-receipt.jsonl",
+  "source_head": "5861786b48f70cc666dd29b4b69308b889403aef"
+}

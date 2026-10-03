@@ -1,0 +1,15 @@
+cargo run --locked -p carrick-xtask -- host-lease --mode carrick -- target/meta-alloc-evidence/fixed-el1-sched el1_metadata_allocator_ --nocapture
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running `target/debug/carrick-xtask host-lease --mode carrick -- target/meta-alloc-evidence/fixed-el1-sched el1_metadata_allocator_ --nocapture`
+
+running 4 tests
+test el1_metadata_allocator_concurrent_growth ... ok
+test el1_metadata_allocator_delayed_owner_parks_participants ... metadata delayed owner claimed=true parked=3 losing_boundaries=6
+ok
+test el1_metadata_allocator_grows_and_returns_extents ... metadata_grant_stats after growth: MetadataGrantStats { grants_requested: 1, grants_succeeded: 1, grants_denied: 0, returns_completed: 1, bytes_granted: 11010048, bytes_returned: 11010048, inline_hvc_traps: 0 }
+metadata_grant_stats final: MetadataGrantStats { grants_requested: 3, grants_succeeded: 2, grants_denied: 1, returns_completed: 2, bytes_granted: 13631488, bytes_returned: 13631488, inline_hvc_traps: 0 }
+ok
+test el1_metadata_allocator_host_wait_requires_unmasked_irq ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 81 filtered out; finished in 1.25s
+

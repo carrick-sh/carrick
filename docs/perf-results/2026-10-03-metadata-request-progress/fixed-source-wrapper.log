@@ -1,0 +1,185 @@
+cargo run --locked -p carrick-xtask -- host-lease --mode carrick -- ./scripts/test-signed.sh carrick-embed el1_metadata_allocator_ --nocapture
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running `target/debug/carrick-xtask host-lease --mode carrick -- ./scripts/test-signed.sh carrick-embed el1_metadata_allocator_ --nocapture`
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-cat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-argv-echo: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-timerfd-epoll: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-ppoll-eventfd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pselect-eventfd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-process-bootstrap: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-futex: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-rseq: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-membarrier: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-scheduler: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-prctl: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-getcpu: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-flock-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-nanosleep: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-clock-nanosleep: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-madvise: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-shared-mmap-fork: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-mprotect-fault: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-sp-fault: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-munmap-fault: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-mmap-churn-threads: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-mmap-v8-hint: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fork-private-isolation: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-statx-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-openat2-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-faccessat2-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-sendfile-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-preadv-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-splice-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-sync-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pwrite64-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pwritev-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-ftruncate-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-utimensat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-mkdirat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-unlinkat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-renameat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fchmod-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fchown-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-truncate-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-symlinkat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-linkat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-errno-matrix: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-signal-basic: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-signal-default: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-fork-poll: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-bidi: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-dup3: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-nested-pipe: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-thread-stress: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-inet-connect: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-write-hi-to-fd1: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-dup3-exec: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-read-then-write-via-stdio: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-two-pipes-dup3-exec: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-udp-dns: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-udp-dns-debian: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pie-hello: ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), static-pie linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fork-bench: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fork-bench-10k: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-scheduler-preemption: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-discard-fork-threads: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el1-served-loop-kick: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el0-id-view: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el1-vtimer-loop: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-coarse-clock-vdso: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-crash-parked-thread: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+    Finished `release` profile [optimized] target(s) in 0.01s
+build-embed-interceptor-probe: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/embed-fixtures/interceptor-probe-aarch64
+    Finished `release` profile [optimized] target(s) in 0.00s
+build-embed-zone-readers: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/embed-fixtures/zone-readers-aarch64
+    Finished `release` profile [optimized] target(s) in 0.01s
+build-embed-icache-reuse: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/embed-fixtures/icache-reuse-aarch64
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-sched-core)
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-fd-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-el1-abi)
+   Compiling carrick-embed-el1-sched v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/embed-el1-sched)
+    Finished `release` profile [optimized] target(s) in 2.75s
+build-embed-el1-sched: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/embed-fixtures/el1-sched-aarch64
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-sched-core)
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-el1-image)
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-fd-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-el1-abi)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-el1)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 8m 27s
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_ipc_routing-74d54280a9f1f1a9.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_ipc_routing-74d54280a9f1f1a9
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify09_probe-ca36e605253f1b85.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify09_probe-ca36e605253f1b85
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/exec_publication_icache-349fadff95f07860.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/exec_publication_icache-349fadff95f07860
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_kick_served_loop-3d8889becd0c3fc0.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_kick_served_loop-3d8889becd0c3fc0
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/crash_parked_thread-6dc247d42840787b.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/crash_parked_thread-6dc247d42840787b
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/realtime_calibration-cf6c6918e3e4db33.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/realtime_calibration-cf6c6918e3e4db33
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/scheduler_race-87987605a211ed64.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/scheduler_race-87987605a211ed64
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/host_wait_policy-9c9830e1745c04d4.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/host_wait_policy-9c9830e1745c04d4
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-2026a1c7c8dd8aae.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-2026a1c7c8dd8aae
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/inotify_hotpath_contract-bd6f627250b5d6ba.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/inotify_hotpath_contract-bd6f627250b5d6ba
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/entitlement_negative-e482912dda066335.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/entitlement_negative-e482912dda066335
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify-fc50a14601527a42.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify-fc50a14601527a42
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_gic-62e4620cd65ca430.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_gic-62e4620cd65ca430
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/coarse_clock_vdso-46f9a18849c56ea1.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/coarse_clock_vdso-46f9a18849c56ea1
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/conformance_contracts-ea07911f1f81671f.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/conformance_contracts-ea07911f1f81671f
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/guest_smoke-13598d3923fa5485.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/guest_smoke-13598d3923fa5485
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_vcpu_lifetime-f928ba4b539161b9.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_vcpu_lifetime-f928ba4b539161b9
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/kernel_abort-73cc644660ab2482.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/kernel_abort-73cc644660ab2482
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/discard_fork_threads-cb92d311f3dc0e3c.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/discard_fork_threads-cb92d311f3dc0e3c
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/two_process_parallelism-f3adabb5cb2a5b56.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/two_process_parallelism-f3adabb5cb2a5b56
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/carrick_embed-6b16a64211fecf6e.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/carrick_embed-6b16a64211fecf6e
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/fault_budget_guest-978d2b6965986272.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/fault_budget_guest-978d2b6965986272
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/perf_regression-215c401651ed2b5c.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/perf_regression-215c401651ed2b5c
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/shared_buffer_futex-1c66ee12471bdc56.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/shared_buffer_futex-1c66ee12471bdc56
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/write_seek_contract-ccfe106c853f5973.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/write_seek_contract-ccfe106c853f5973
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/scheduler_preemption-b9f73ffc35fae86d.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/scheduler_preemption-b9f73ffc35fae86d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/pt_pause_drain_pressure-c1affcec2161a1a3.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/pt_pause_drain_pressure-c1affcec2161a1a3
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_files-7a7cd358b163b4a7.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_files-7a7cd358b163b4a7
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/wedge_capture_ladder-677bf4a34bfda22a.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/wedge_capture_ladder-677bf4a34bfda22a
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_transparent-38001ff1ff258440.tmp.41596: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_transparent-38001ff1ff258440
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-2026a1c7c8dd8aae el1_metadata_allocator_ --nocapture
+
+running 4 tests
+test el1_metadata_allocator_concurrent_growth ... ok
+test el1_metadata_allocator_delayed_owner_parks_participants ... metadata delayed owner claimed=true parked=3 losing_boundaries=3
+ok
+test el1_metadata_allocator_grows_and_returns_extents ... metadata_grant_stats after growth: MetadataGrantStats { grants_requested: 1, grants_succeeded: 1, grants_denied: 0, returns_completed: 1, bytes_granted: 11010048, bytes_returned: 11010048, inline_hvc_traps: 0 }
+metadata_grant_stats final: MetadataGrantStats { grants_requested: 3, grants_succeeded: 2, grants_denied: 1, returns_completed: 2, bytes_granted: 13631488, bytes_returned: 13631488, inline_hvc_traps: 0 }
+ok
+test el1_metadata_allocator_host_wait_requires_unmasked_irq ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 81 filtered out; finished in 1.23s
+
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/entitlement_negative-e482912dda066335.noent.41596: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/entitlement_negative-e482912dda066335.noent.41596
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+remaining carrick procs (run-id meta-alloc-final-source) = 0
+remaining carrick procs (run-id meta-alloc-final-source-cli) = 0
+test-signed: receipt target/test-results/carrick-embed-signed-artifacts.jsonl
+test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 30 signed, negative control passed)

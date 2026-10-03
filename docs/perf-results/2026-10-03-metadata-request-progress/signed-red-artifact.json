@@ -1,0 +1,11 @@
+{
+  "record_type": "manual_failed_signed_artifact",
+  "source_base_head": "a257cdf9d5b44d47ed42de9e2fbbdb9ab0801b4a",
+  "path": "target/meta-alloc-evidence/deferred-red-el1-sched",
+  "sha256": "c370b01846a8331778ce1f1acaac247d511d1bc16958ca2047f530039e245ced",
+  "cdhash": "d0826744802c97e12b7bbb581587c22333686272",
+  "lc_uuid": "CD775A5F-7D4B-3288-B3C7-D13AB77F605D",
+  "hypervisor_entitlement": true,
+  "dof_carrick_present": true,
+  "dispatch_source_sha256": "2737be89ae20ec630106e3d8f3e7bf205599572ca7e2739513ff4db7cfc6e89e"
+}

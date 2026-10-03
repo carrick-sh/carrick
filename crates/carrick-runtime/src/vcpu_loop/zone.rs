@@ -633,6 +633,29 @@ where
             let taken = unsafe { rec.take_object_operation() };
             zone.free_record(record.id);
             self.state.service_kernel_context = Some(context.retain_exact());
+            if taken
+                .as_ref()
+                .is_some_and(|token| token.metadata_generation().is_some())
+            {
+                // Metadata readiness resumes the saved control SVC with every
+                // original register intact. A wake is not its return value.
+                let pc = engine.current_pc()?;
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    None,
+                    Some(pc),
+                    None,
+                    reserved,
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+                return Ok(executor::ExecutorExit::Syscall);
+            }
             let token = taken.and_then(host_ipc::from_sched_token).ok_or_else(|| {
                 RuntimeError::Configuration(
                     "EL1 zone resume: IPC operation token is not ours".to_owned(),

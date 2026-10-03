@@ -482,7 +482,8 @@ where
     // served futex wait or for its slice to end (EL1 plan 1d: other
     // syscalls are served or forwarded as usual; 1b forwarded them all so
     // the host could run the queued threads).
-    if let (Some(zone), Some(task), Some(zslot)) = (zone, cur_task, SlotId::from_index(slot))
+    if let (Some(zone), Some(task), Some(zslot)) =
+        (zone.as_mut(), cur_task, SlotId::from_index(slot))
         && sched::is_served_futex_op(frame)
     {
         let orig_x0 = frame.x[0];
@@ -490,7 +491,7 @@ where
             zone: zone.tables,
             slot: zslot,
             task,
-            cpu: zone.cpu,
+            cpu: &mut *zone.cpu,
             user: zone.user,
             counters,
         };
@@ -636,10 +637,71 @@ where
         #[cfg(feature = "allocator-test-control")]
         _ if (nr as u64) == carrick_el1_abi::SYS_CARRICK_EL1_CONTROL => {
             let orig_x0 = frame.x[0];
+            #[cfg(target_os = "none")]
+            let saved = *frame;
+            // Consume the record-owned metadata wait before executing this
+            // control transaction again; IPC cannot construct this token.
+            if let (Some(zone), Some(task), Some(zslot)) =
+                (zone.as_mut(), cur_task, SlotId::from_index(slot))
+            {
+                let sched = sched::Sched {
+                    zone: zone.tables,
+                    slot: zslot,
+                    task,
+                    cpu: &mut *zone.cpu,
+                    user: zone.user,
+                    counters,
+                };
+                if let Ok(Some(operation)) = sched.take_object_operation()
+                    && operation.metadata_generation().is_none()
+                {
+                    return Action::Forward;
+                }
+            }
             let res = match frame.x[0] {
                 1 => crate::alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
                 _ => 1,
             };
+            if res == carrick_el1_abi::METADATA_GRANT_PENDING {
+                #[cfg(target_os = "none")]
+                if let (Some(zone), Some(task), Some(zslot)) =
+                    (zone.as_mut(), cur_task, SlotId::from_index(slot))
+                {
+                    let mailbox = carrick_el1_abi::metadata_mailbox_guest();
+                    let generation = mailbox.request_generation();
+                    let mut sched = sched::Sched {
+                        zone: zone.tables,
+                        slot: zslot,
+                        task,
+                        cpu: &mut *zone.cpu,
+                        user: zone.user,
+                        counters,
+                    };
+                    if let (Some(key), Some(operation), Some(resume)) = (
+                        carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(
+                            generation,
+                        ),
+                        carrick_sched_core::object_wait::OperationToken::metadata_request(
+                            generation,
+                        ),
+                        crate::substrate::sched::object_wait::OperationResumePc::new(
+                            saved.elr.wrapping_sub(4),
+                        ),
+                    ) && let Ok(snapshot) = sched.observe_object(key)
+                        && matches!(
+                            mailbox.state.load(Ordering::Acquire),
+                            carrick_el1_abi::METADATA_MAILBOX_REQUESTED
+                                | carrick_el1_abi::METADATA_MAILBOX_HOST_WORKING
+                        )
+                        && mailbox.request_generation() == generation
+                        && let Ok(parked) =
+                            sched.park_object(&saved, key, snapshot, resume, operation, None)
+                    {
+                        let _ = sched.leave_after_object_park(parked);
+                        return Action::Idle;
+                    }
+                }
+            }
             frame.x[0] = res;
             if let Some(task) = cur_task
                 && task.has_pending_host_work()

@@ -1,0 +1,993 @@
+cargo run --locked -p carrick-xtask -- host-lease --mode carrick -- ./scripts/test-signed.sh carrick-embed el1_ --nocapture
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.0
+   Compiling libc v0.2.186
+   Compiling memchr v2.8.0
+   Compiling zmij v1.0.21
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle v1.0.14
+   Compiling serde_json v1.0.149
+   Compiling thiserror v2.0.20
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling generic-array v0.14.7
+   Compiling anstyle-query v1.1.5
+   Compiling colorchoice v1.0.5
+   Compiling anstream v1.0.0
+   Compiling clap_lex v1.1.0
+   Compiling itoa v1.0.18
+   Compiling regex-syntax v0.8.10
+   Compiling winnow v0.7.15
+   Compiling heck v0.5.0
+   Compiling aho-corasick v1.1.4
+   Compiling toml_write v0.1.2
+   Compiling strsim v0.11.1
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling anyhow v1.0.102
+   Compiling indexmap v2.14.0
+   Compiling cpufeatures v0.2.17
+   Compiling clap_builder v4.6.0
+   Compiling cfg-if v1.0.4
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling regex-automata v0.4.14
+   Compiling thiserror-impl v2.0.20
+   Compiling serde_derive v1.0.228
+   Compiling clap_derive v4.6.1
+   Compiling regex v1.12.3
+   Compiling clap v4.6.1
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling carrick-coordinator v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-coordinator)
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling carrick-conformance v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-conformance)
+   Compiling carrick-xtask v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 38.54s
+     Running `target/debug/carrick-xtask host-lease --mode carrick -- ./scripts/test-signed.sh carrick-embed el1_ --nocapture`
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-cat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-argv-echo: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-timerfd-epoll: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-ppoll-eventfd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pselect-eventfd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-process-bootstrap: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-futex: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-rseq: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-membarrier: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-scheduler: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-prctl: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-getcpu: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-flock-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-nanosleep: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-clock-nanosleep: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-madvise: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-shared-mmap-fork: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-mprotect-fault: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-sp-fault: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-munmap-fault: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-mmap-churn-threads: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-mmap-v8-hint: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fork-private-isolation: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-statx-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-openat2-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-faccessat2-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-sendfile-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-preadv-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-splice-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-sync-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pwrite64-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pwritev-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-ftruncate-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-utimensat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-mkdirat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-unlinkat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-renameat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fchmod-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fchown-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-truncate-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-symlinkat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-linkat-motd: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-errno-matrix: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-signal-basic: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-signal-default: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-fork-poll: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-bidi: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-dup3: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-nested-pipe: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-thread-stress: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-inet-connect: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-write-hi-to-fd1: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-dup3-exec: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-read-then-write-via-stdio: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-two-pipes-dup3-exec: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-udp-dns: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-udp-dns-debian: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pie-hello: ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), static-pie linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fork-bench: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fork-bench-10k: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-scheduler-preemption: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-discard-fork-threads: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el1-served-loop-kick: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el0-id-view: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el1-vtimer-loop: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-coarse-clock-vdso: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-crash-parked-thread: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+   Compiling libc v0.2.189
+   Compiling carrick-embed-interceptor-probe v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/embed-interceptor-probe)
+    Finished `release` profile [optimized] target(s) in 2.89s
+build-embed-interceptor-probe: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/embed-fixtures/interceptor-probe-aarch64
+   Compiling carrick-embed-zone-readers v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/embed-zone-readers)
+    Finished `release` profile [optimized] target(s) in 1.03s
+build-embed-zone-readers: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/embed-fixtures/zone-readers-aarch64
+   Compiling libc v0.2.189
+   Compiling carrick-embed-icache-reuse v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/embed-icache-reuse)
+    Finished `release` profile [optimized] target(s) in 2.53s
+build-embed-icache-reuse: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/embed-fixtures/icache-reuse-aarch64
+   Compiling foldhash v0.1.5
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-sched-core)
+   Compiling libc v0.2.189
+   Compiling carrick-inotify-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-inotify-core)
+   Compiling carrick-pipe-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-pipe-core)
+   Compiling hashbrown v0.15.5
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-fd-core)
+   Compiling carrick-mmu-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-mmu-core)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-el1-abi)
+   Compiling carrick-embed-el1-sched v0.0.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/fixtures/embed-el1-sched)
+    Finished `release` profile [optimized] target(s) in 13.91s
+build-embed-el1-sched: wrote /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/embed-fixtures/el1-sched-aarch64
+   Compiling quote v1.0.45
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling serde v1.0.228
+   Compiling serde_core v1.0.228
+   Compiling zmij v1.0.21
+   Compiling thiserror v2.0.20
+   Compiling memchr v2.8.0
+   Compiling itoa v1.0.18
+   Compiling portable-atomic v1.13.1
+   Compiling smallvec v1.15.1
+   Compiling serde_json v1.0.149
+   Compiling critical-section v1.2.0
+   Compiling log v0.4.29
+   Compiling bitflags v2.11.1
+   Compiling version_check v0.9.5
+   Compiling stable_deref_trait v1.2.1
+   Compiling pin-project-lite v0.2.17
+   Compiling zerocopy v0.8.48
+   Compiling generic-array v0.14.7
+   Compiling ucd-trie v0.1.7
+   Compiling subtle v2.6.1
+   Compiling typenum v1.20.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling cc v1.2.62
+   Compiling bytes v1.11.1
+   Compiling pest v2.8.6
+   Compiling errno v0.3.14
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling once_cell v1.21.4
+   Compiling parking_lot_core v0.9.12
+   Compiling futures-core v0.3.32
+   Compiling signal-hook-registry v1.4.8
+   Compiling carrick-fatal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-fatal)
+   Compiling litemap v0.8.2
+   Compiling writeable v0.6.3
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling tracing-core v0.1.36
+   Compiling socket2 v0.6.3
+   Compiling mio v1.2.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling pest_meta v2.8.6
+   Compiling cpufeatures v0.2.17
+   Compiling usdt-impl v0.6.0
+   Compiling icu_properties_data v2.2.0
+   Compiling utf8_iter v1.0.4
+   Compiling icu_normalizer_data v2.2.0
+   Compiling plain v0.2.3
+   Compiling rustix v1.1.4
+   Compiling sha2 v0.10.9
+   Compiling thread-id v5.1.0
+   Compiling parking_lot v0.12.5
+   Compiling ring v0.17.14
+   Compiling foldhash v0.1.5
+   Compiling getrandom v0.3.4
+   Compiling thiserror-impl v2.0.20
+   Compiling byteorder v1.5.0
+   Compiling percent-encoding v2.3.2
+   Compiling hashbrown v0.15.5
+   Compiling http v1.4.0
+   Compiling pretty-hex v0.4.2
+   Compiling carrick-sched-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-sched-core)
+   Compiling fnv v1.0.7
+   Compiling zeroize v1.8.2
+   Compiling ident_case v1.0.1
+   Compiling strsim v0.11.1
+   Compiling rustls-pki-types v1.14.1
+   Compiling carrick-mmu-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-mmu-core)
+   Compiling synstructure v0.13.2
+   Compiling pest_generator v2.8.6
+   Compiling carrick-fd-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-fd-core)
+   Compiling serde_derive v1.0.228
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling zerocopy-derive v0.8.48
+   Compiling displaydoc v0.2.5
+   Compiling pest_derive v2.8.6
+   Compiling zerofrom v0.1.8
+   Compiling scroll_derive v0.13.1
+   Compiling yoke v0.8.2
+   Compiling tokio-macros v2.7.0
+   Compiling dtrace-parser v0.3.0
+   Compiling tracing-attributes v0.1.31
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling scroll v0.13.0
+   Compiling tokio v1.52.3
+   Compiling goblin v0.10.5
+   Compiling futures-macro v0.3.32
+   Compiling http-body v1.0.1
+   Compiling darling_core v0.20.11
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling tracing v0.1.44
+   Compiling getrandom v0.2.17
+   Compiling carrick-inotify-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-inotify-core)
+   Compiling icu_provider v2.2.0
+   Compiling serde_tokenstream v0.2.3
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling futures-task v0.3.32
+   Compiling untrusted v0.9.0
+   Compiling slab v0.4.12
+   Compiling fastrand v2.4.1
+   Compiling carrick-pipe-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-pipe-core)
+   Compiling httparse v1.10.1
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-el1-abi)
+   Compiling idna_adapter v1.2.2
+   Compiling tempfile v3.27.0
+   Compiling futures-util v0.3.32
+   Compiling darling_macro v0.20.11
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+   Compiling form_urlencoded v1.2.2
+   Compiling memmap2 v0.9.10
+   Compiling aho-corasick v1.1.4
+   Compiling mach2 v0.6.0
+   Compiling regex-syntax v0.8.10
+   Compiling carrick-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-guest-mem)
+   Compiling dof v0.4.0
+   Compiling heck v0.5.0
+   Compiling try-lock v0.2.5
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-el1-image)
+   Compiling tower-service v0.3.3
+   Compiling rustls v0.23.40
+   Compiling want v0.3.1
+   Compiling regex-automata v0.4.14
+   Compiling usdt v0.6.0
+   Compiling rustls-webpki v0.103.13
+   Compiling darling v0.20.11
+   Compiling idna v1.1.0
+   Compiling futures-channel v0.3.32
+   Compiling atomic-waker v1.1.2
+   Compiling autocfg v1.5.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling ipnet v2.12.0
+   Compiling num-traits v0.2.19
+   Compiling tinyvec v1.11.0
+   Compiling hyper v1.9.0
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-observability)
+   Compiling url v2.5.8
+   Compiling derive_builder_core v0.20.2
+   Compiling sync_wrapper v1.0.2
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling base64 v0.22.1
+   Compiling konst_macro_rules v0.2.19
+   Compiling unicode-xid v0.2.6
+   Compiling carrick-signal-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-signal-core)
+   Compiling tower-layer v0.3.3
+   Compiling carrick-signal-linux v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-signal-linux)
+   Compiling tower v0.5.3
+   Compiling const_format_proc_macros v0.2.34
+   Compiling konst v0.2.20
+   Compiling derive_builder_macro v0.20.2
+   Compiling hyper-util v0.1.20
+   Compiling proc-macro-error2 v2.0.1
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-mem)
+   Compiling webpki-roots v1.0.7
+   Compiling carrick-timer-core v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-timer-core)
+   Compiling futures-sink v0.3.32
+   Compiling lazy_static v1.5.0
+   Compiling core-foundation-sys v0.8.7
+   Compiling ryu v1.0.23
+   Compiling serde_urlencoded v0.7.1
+   Compiling iana-time-zone v0.1.65
+   Compiling tokio-util v0.7.18
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-hal)
+   Compiling getset v0.1.6
+   Compiling const_format v0.2.36
+   Compiling derive_builder v0.20.2
+   Compiling tower-http v0.6.10
+   Compiling unicode-normalization v0.1.25
+   Compiling regex v1.12.3
+   Compiling tokio-rustls v0.26.4
+   Compiling strum_macros v0.27.2
+   Compiling hyper-rustls v0.27.9
+   Compiling http-body-util v0.1.3
+   Compiling hmac v0.12.1
+   Compiling carrick-kernel-arena v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-kernel-arena)
+   Compiling base64 v0.13.1
+   Compiling strum v0.27.2
+   Compiling camino v1.2.2
+   Compiling oci-spec v0.8.4
+   Compiling jwt v0.16.0
+   Compiling carrick-host v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-host)
+   Compiling reqwest v0.12.28
+   Compiling olpc-cjson v0.1.4
+   Compiling chrono v0.4.44
+   Compiling http-auth v0.1.10
+   Compiling crc32fast v1.5.0
+   Compiling getrandom v0.4.2
+   Compiling rand_core v0.10.1
+   Compiling utf8parse v0.2.2
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-host-bsd)
+   Compiling unicase v2.9.0
+   Compiling anstyle-parse v1.0.0
+   Compiling filetime v0.2.29
+   Compiling simd-adler32 v0.3.9
+   Compiling rustversion v1.0.22
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle v1.0.14
+   Compiling adler2 v2.0.1
+   Compiling colorchoice v1.0.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstream v1.0.0
+   Compiling miniz_oxide v0.8.9
+   Compiling tar v0.4.45
+   Compiling chacha20 v0.10.1
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-el1)
+   Compiling clap_lex v1.1.0
+   Compiling oci-client v0.15.0
+   Compiling anyhow v1.0.102
+   Compiling clap_builder v4.6.0
+   Compiling rand v0.10.1
+   Compiling flate2 v1.1.9
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-thread)
+   Compiling clap_derive v4.6.1
+   Compiling fd-lock v4.0.4
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-vmm-hvf)
+   Compiling carrick-portable v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-portable)
+   Compiling applevisor-sys v1.0.0
+   Compiling carrick-spec v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-spec)
+   Compiling data-encoding v2.11.0
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-kernel)
+   Compiling hashbrown v0.17.1
+   Compiling signal-hook v0.4.4
+   Compiling equivalent v1.0.2
+   Compiling indexmap v2.14.0
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-vfs)
+   Compiling hickory-proto v0.26.1
+   Compiling clap v4.6.1
+   Compiling applevisor v1.0.0
+   Compiling arc-swap v1.9.2
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-aarch64)
+   Compiling sharded-slab v0.1.7
+   Compiling matchers v0.2.0
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling toml_write v0.1.2
+   Compiling winnow v0.7.15
+   Compiling nu-ansi-term v0.50.3
+   Compiling tracing-subscriber v0.3.23
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling carrick-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-image)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-conformance-contract)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 14m 14s
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/inotify_hotpath_contract-3ce79835c33da7e9.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/inotify_hotpath_contract-3ce79835c33da7e9
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_transparent-b02e2a532aeea3f8.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_transparent-b02e2a532aeea3f8
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify09_probe-1e693e0ed8b346be.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify09_probe-1e693e0ed8b346be
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/crash_parked_thread-667bf85f887654aa.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/crash_parked_thread-667bf85f887654aa
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/exec_publication_icache-41f8db44de2f94fd.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/exec_publication_icache-41f8db44de2f94fd
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/kernel_abort-5f37b3b4d214e11e.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/kernel_abort-5f37b3b4d214e11e
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/discard_fork_threads-69e9f74c614839f5.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/discard_fork_threads-69e9f74c614839f5
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/realtime_calibration-1ec6329ace213d4c.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/realtime_calibration-1ec6329ace213d4c
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/write_seek_contract-49dde6cd554fee83.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/write_seek_contract-49dde6cd554fee83
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_vcpu_lifetime-f6aee0a2867a25ac.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_vcpu_lifetime-f6aee0a2867a25ac
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_ipc_routing-64baed2b43ce44b5.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_ipc_routing-64baed2b43ce44b5
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/pt_pause_drain_pressure-18d34f094a0f39b7.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/pt_pause_drain_pressure-18d34f094a0f39b7
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_gic-0cd743e32a110130.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_gic-0cd743e32a110130
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_kick_served_loop-edd1de42a9bf5917.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_kick_served_loop-edd1de42a9bf5917
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify-98ec9118281b3c87.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify-98ec9118281b3c87
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-67e2aabf7afcdc0d.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-67e2aabf7afcdc0d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/host_wait_policy-45017294ab531076.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/host_wait_policy-45017294ab531076
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/scheduler_preemption-929dabce0b0b3d1d.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/scheduler_preemption-929dabce0b0b3d1d
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_files-c6e40446cda4a643.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_files-c6e40446cda4a643
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/fault_budget_guest-15b32f3f77f1e519.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/fault_budget_guest-15b32f3f77f1e519
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/wedge_capture_ladder-2b2a2a40863a44e4.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/wedge_capture_ladder-2b2a2a40863a44e4
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/perf_regression-304773571f07aa73.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/perf_regression-304773571f07aa73
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/carrick_embed-caa9f6f00c8f2feb.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/carrick_embed-caa9f6f00c8f2feb
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/shared_buffer_futex-ae3ecaad3e64bc51.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/shared_buffer_futex-ae3ecaad3e64bc51
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/conformance_contracts-68403658beeec8e1.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/conformance_contracts-68403658beeec8e1
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/coarse_clock_vdso-ecb1ee04fbf7e380.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/coarse_clock_vdso-ecb1ee04fbf7e380
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/guest_smoke-c0722e1372c8fa47.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/guest_smoke-c0722e1372c8fa47
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/entitlement_negative-2b32ac058a7ccd99.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/entitlement_negative-2b32ac058a7ccd99
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/scheduler_race-af44fb2fb68506ae.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/scheduler_race-af44fb2fb68506ae
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/two_process_parallelism-2375359d9e3f367b.tmp.3965: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/two_process_parallelism-2375359d9e3f367b
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_transparent-b02e2a532aeea3f8 el1_ --nocapture
+
+running 2 tests
+test el1_transparent_fork_exec_shared_backing ... ok
+test el1_transparent_smoke ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify09_probe-1e693e0ed8b346be el1_ --nocapture
+
+running 2 tests
+test el1_inotify09_probe ... LTP| ../../../../include/tst_fuzzy_sync.h:484: TINFO: Minimum sampling period ended
+LTP| ../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1024, delay_bias = 0
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -51ns, avg_dev =    15ns, dev_ratio = 0.29 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =   242ns, avg_dev =    14ns, dev_ratio = 0.06 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =   578ns, avg_dev =    29ns, dev_ratio = 0.05 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =  -387ns, avg_dev =    31ns, dev_ratio = 0.08 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   209  , avg_dev =    11  , dev_ratio = 0.05 }
+LTP| ../../../../include/tst_fuzzy_sync.h:494: TINFO: Reached deviation ratios < 0.10, introducing randomness
+LTP| ../../../../include/tst_fuzzy_sync.h:497: TINFO: Delay range is [-305, 136]
+LTP| ../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1075, delay_bias = 0
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -80ns, avg_dev =     8ns, dev_ratio = 0.10 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =   251ns, avg_dev =     3ns, dev_ratio = 0.01 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =   561ns, avg_dev =    18ns, dev_ratio = 0.03 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =  -390ns, avg_dev =    16ns, dev_ratio = 0.04 }
+LTP| ../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   212  , avg_dev =     3  , dev_ratio = 0.01 }
+LTP| ../../../../include/tst_fuzzy_sync.h:654: TINFO: Exceeded execution loops, requesting exit
+LTP| inotify09.c:90: TPASS: kernel survived inotify beating
+WALL| 39.97637s exit=0
+NR|  17 served=         0 forwarded=         3
+NR|  24 served=         0 forwarded=         1
+NR|  25 served=         0 forwarded=         5
+NR|  26 served=         0 forwarded=         1
+NR|  27 served=   2999999 forwarded=         1
+NR|  28 served=   2999809 forwarded=       191
+NR|  29 served=         0 forwarded=         1
+NR|  34 served=         0 forwarded=         1
+NR|  35 served=         0 forwarded=         3
+NR|  43 served=         0 forwarded=         1
+NR|  46 served=         0 forwarded=         1
+NR|  48 served=         0 forwarded=        12
+NR|  49 served=         0 forwarded=         1
+NR|  53 served=         0 forwarded=         2
+NR|  54 served=         0 forwarded=         1
+NR|  56 served=         0 forwarded=        26
+NR|  57 served=         0 forwarded=        28
+NR|  59 served=         0 forwarded=         1
+NR|  61 served=         0 forwarded=         2
+NR|  62 served=   2999974 forwarded=        26
+NR|  63 served=         2 forwarded=        14
+NR|  64 served=   2999946 forwarded=        85
+NR|  79 served=         0 forwarded=        11
+NR|  80 served=         0 forwarded=        20
+NR|  93 served=         0 forwarded=         1
+NR|  94 served=         0 forwarded=         5
+NR|  96 served=         0 forwarded=         5
+NR|  98 served=         0 forwarded=         1
+NR|  99 served=         7 forwarded=         0
+NR| 103 served=         0 forwarded=         5
+NR| 113 served=         0 forwarded=         1
+NR| 123 served=         0 forwarded=         1
+NR| 129 served=         0 forwarded=         3
+NR| 134 served=         0 forwarded=       108
+NR| 135 served=        15 forwarded=         0
+NR| 139 served=         0 forwarded=         5
+NR| 154 served=         0 forwarded=         1
+NR| 160 served=         0 forwarded=         1
+NR| 173 served=         0 forwarded=         9
+NR| 174 served=         0 forwarded=         3
+NR| 175 served=         0 forwarded=         6
+NR| 176 served=         0 forwarded=         4
+NR| 177 served=         0 forwarded=         3
+NR| 214 served=         0 forwarded=        15
+NR| 215 served=         1 forwarded=        16
+NR| 220 served=         0 forwarded=         5
+NR| 221 served=         0 forwarded=         8
+NR| 222 served=         0 forwarded=        33
+NR| 226 served=         0 forwarded=        21
+NR| 227 served=         0 forwarded=         1
+NR| 233 served=         0 forwarded=         1
+NR| 260 served=         0 forwarded=        10
+NR| 261 served=         0 forwarded=         7
+NR| 278 served=         0 forwarded=         5
+NR| 293 served=         0 forwarded=         5
+NR| 435 served=         0 forwarded=         2
+POP| DelegationCounts { delegations: 7, recalls: 7, host_served: 82, tableless_publishes: 0, revalidated_records: 0, refusals: [(NotRootfs, 1), (FileTooLarge, 1), (Shared, 4), (Unregistered, 12)], recall_triggers: [("crates/carrick-kernel/src/kernel/objects.rs:1589", 5), ("crates/carrick-kernel/src/dispatch/mqueue.rs:680", 1), ("crates/carrick-kernel/src/el1_delegation.rs:1833", 1)] }
+ok
+test el1_inotify_loop_bench ... BENCH| loop_ns_per_iter=1811 getpid_ns=149
+BENCHERR| 
+BENCH| nr 27 served=201000 forwarded=1
+BENCH| nr 28 served=201001 forwarded=0
+BENCH| nr 62 served=201007 forwarded=4
+BENCH| nr 64 served=201000 forwarded=1
+BENCH| nr 172 served=0 forwarded=0
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.49s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/crash_parked_thread-667bf85f887654aa el1_ --nocapture
+
+running 1 test
+test crash_core_attributes_the_el1_parked_sibling_registers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_vcpu_lifetime-f6aee0a2867a25ac el1_ --nocapture
+
+running 1 test
+test el1_vcpus_live_for_the_vm_lifetime_across_a_second_root ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_ipc_routing-64baed2b43ce44b5 el1_ --nocapture
+
+running 1 test
+test el1_ipc_live_routing ... whole-run routing observation: served read=2054 write=2048, forwarded read=4 write=1
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_gic-0cd743e32a110130 el1_ --nocapture
+
+running 2 tests
+test el1_gic_el0_id_view_hides_the_gic ... el1-gic-id-view id_aa64pfr0_gic=0 CarrierGicSnapshot { gic: true, generation: 1, vcpus: 12, capacity: 256 }
+ok
+test el1_gic_vtimer_reaches_el1_without_host_exits ... el1-gic-vtimer VtimerProbeReport { armed: true, delivered: true, vcpu: 2, host_initiated_exits: 0, other_exits: 0 } vtimer_taken=1 kick_sgis_taken=0 lseek served=2001000 forwarded=0
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_kick_served_loop-edd1de42a9bf5917 el1_ --nocapture
+
+running 2 tests
+test el1_served_burst_surfaces_kicks_under_oversubscription ... el1-served-loop-kick mode=burst served loop kick max_ns=86889333 cycles=20000 lseeks=7579060 el1 lseek served=7579056 forwarded=4
+el1-served-loop-kick mode=burst served loop kick max_ns=90727625 cycles=20000 lseeks=9772802 el1 lseek served=9772794 forwarded=8
+el1-served-loop-kick mode=burst served loop kick max_ns=118334708 cycles=20000 lseeks=8567448 el1 lseek served=8567447 forwarded=1
+el1-served-loop-kick mode=burst served loop kick max_ns=100110250 cycles=20000 lseeks=7687397 el1 lseek served=7687394 forwarded=3
+el1-served-loop-kick mode=burst served loop kick max_ns=116488208 cycles=20000 lseeks=9499435 el1 lseek served=9499422 forwarded=13
+el1-served-loop-kick mode=burst served loop kick max_ns=116561416 cycles=20000 lseeks=11173236 el1 lseek served=11173229 forwarded=7
+el1-served-loop-kick mode=burst served loop kick max_ns=129346625 cycles=20000 lseeks=10964022 el1 lseek served=10964013 forwarded=9
+el1-served-loop-kick mode=burst served loop kick max_ns=107813375 cycles=20000 lseeks=10734296 el1 lseek served=10734286 forwarded=10
+el1-served-loop-kick mode=burst served loop kick max_ns=101020334 cycles=20000 lseeks=10399915 el1 lseek served=10399905 forwarded=10
+el1-served-loop-kick mode=burst served loop kick max_ns=186851667 cycles=20000 lseeks=10298757 el1 lseek served=10298746 forwarded=11
+el1-served-loop-kick mode=burst served loop kick max_ns=151621667 cycles=20000 lseeks=12091644 el1 lseek served=12091625 forwarded=19
+el1-served-loop-kick mode=burst served loop kick max_ns=184130709 cycles=20000 lseeks=9658512 el1 lseek served=9658493 forwarded=19
+el1-served-loop-kick mode=burst served loop kick max_ns=137013833 cycles=20000 lseeks=8793811 el1 lseek served=8793804 forwarded=7
+el1-served-loop-kick mode=burst served loop kick max_ns=112532958 cycles=20000 lseeks=10067832 el1 lseek served=10067824 forwarded=8
+el1-served-loop-kick mode=burst served loop kick max_ns=128349875 cycles=20000 lseeks=12556974 el1 lseek served=12556964 forwarded=10
+el1-served-loop-kick mode=burst served loop kick max_ns=113292000 cycles=20000 lseeks=11311275 el1 lseek served=11311264 forwarded=11
+el1-served-loop-kick mode=burst served loop kick max_ns=109271125 cycles=20000 lseeks=9704515 el1 lseek served=9704509 forwarded=6
+el1-served-loop-kick mode=burst served loop kick max_ns=126836042 cycles=20000 lseeks=8313371 el1 lseek served=8313369 forwarded=2
+el1-served-loop-kick mode=burst served loop kick max_ns=69954291 cycles=20000 lseeks=5939807 el1 lseek served=5939802 forwarded=5
+el1-served-loop-kick mode=burst served loop kick max_ns=189710291 cycles=20000 lseeks=7472561 el1 lseek served=7472553 forwarded=8
+el1-served-loop-kick mode=burst served loop kick max_ns=141981041 cycles=20000 lseeks=9149514 el1 lseek served=9149508 forwarded=6
+el1-served-loop-kick mode=burst served loop kick max_ns=133780958 cycles=20000 lseeks=8507376 el1 lseek served=8507368 forwarded=8
+el1-served-loop-kick mode=burst served loop kick max_ns=128717459 cycles=20000 lseeks=9266316 el1 lseek served=9266308 forwarded=8
+el1-served-loop-kick mode=burst served loop kick max_ns=125020917 cycles=20000 lseeks=9996314 el1 lseek served=9996304 forwarded=10
+el1-served-loop-kick mode=burst served loop kick max_ns=184569250 cycles=20000 lseeks=9641605 el1 lseek served=9641584 forwarded=21
+el1-served-loop-kick mode=burst served loop kick max_ns=186542375 cycles=20000 lseeks=9589796 el1 lseek served=9589785 forwarded=11
+el1-served-loop-kick mode=burst served loop kick max_ns=87180084 cycles=20000 lseeks=11674908 el1 lseek served=11674903 forwarded=5
+el1-served-loop-kick mode=burst served loop kick max_ns=114089833 cycles=20000 lseeks=8755743 el1 lseek served=8755734 forwarded=9
+el1-served-loop-kick mode=burst served loop kick max_ns=113591333 cycles=20000 lseeks=7555030 el1 lseek served=7555030 forwarded=0
+el1-served-loop-kick mode=burst served loop kick max_ns=122674125 cycles=20000 lseeks=9739096 el1 lseek served=9739090 forwarded=6
+ok
+test el1_served_loop_surfaces_kicks ... el1-served-loop-kick mode=loop served loop kick max_ns=9903709 cycles=2000 lseeks=238391 el1 lseek served=237883 forwarded=508
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 314.70s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_inotify-98ec9118281b3c87 el1_ --nocapture
+
+running 4 tests
+test el1_inotify09_contract ... ok
+test el1_inotify_contract ... el1_inotify_contract population: DelegationCounts { delegations: 28, recalls: 28, host_served: 0, tableless_publishes: 0, revalidated_records: 0, refusals: [(FileTooLarge, 3), (Unregistered, 4)], recall_triggers: [("crates/carrick-kernel/src/kernel/objects.rs:1589", 16), ("crates/carrick-kernel/src/el1_delegation.rs:1833", 12)] }
+el1_inotify_contract: add_watch served=1000, fwd=1; rm_watch served=1001, fwd=0; write served=1000; seek served=1026
+ok
+test el1_inotify_queue_shape ... ok
+test el1_inotify_recall_on_dir_watch ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 127.60s
+
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-67e2aabf7afcdc0d el1_ --nocapture
+
+running 52 tests
+test el1_anonymous_discard_and_exit_return_frames ... el1-sched anonymous-discard-and-exit pages=256 rounds=4 exits=229 grants=15 returns=15 reused=10 bytes_granted=12845056 bytes_returned=12845056 anonymous-discard-and-exit pages=256 rounds=4 dontneed_ok=true exit_ok=true zero_ok=true ok=true
+el1-sched anonymous-discard-and-exit pages=1024 rounds=4 exits=263 grants=39 returns=39 reused=28 bytes_granted=50593792 bytes_returned=50593792 anonymous-discard-and-exit pages=1024 rounds=4 dontneed_ok=true exit_ok=true zero_ok=true ok=true
+el1-sched anonymous-discard-and-exit pages=4096 rounds=4 exits=364 grants=111 returns=111 reused=99 bytes_granted=201588736 bytes_returned=201588736 anonymous-discard-and-exit pages=4096 rounds=4 dontneed_ok=true exit_ok=true zero_ok=true ok=true
+el1-sched anonymous-discard-and-exit slope 256->1024 pages rounds=4: exits_diff=34 slope=0.0111 exits/page/round
+el1-sched anonymous-discard-and-exit slope 1024->4096 pages rounds=4: exits_diff=101 slope=0.0082 exits/page/round
+ok
+test el1_anonymous_mapping_retirement_returns_and_reuses_frames ... el1-sched mapping-retirement pages=256 rounds=4 exits=41 served_munmap=5 forwarded_munmap=1 grants=7 returns=7 reused=3 bytes_granted=4325376 bytes_returned=4325376 mapping-retirement pages=256 rounds=4 base=0x6000006000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement pages=1024 rounds=4 exits=47 served_munmap=5 forwarded_munmap=1 grants=15 returns=15 reused=10 bytes_granted=16908288 bytes_returned=16908288 mapping-retirement pages=1024 rounds=4 base=0x6000006000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement pages=4096 rounds=4 exits=71 served_munmap=5 forwarded_munmap=1 grants=39 returns=39 reused=33 bytes_granted=67239936 bytes_returned=67239936 mapping-retirement pages=4096 rounds=4 base=0x6000006000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement slope 256->1024 pages rounds=4: exits_diff=6 slope=0.0020 exits/page/round
+el1-sched mapping-retirement slope 1024->4096 pages rounds=4: exits_diff=24 slope=0.0020 exits/page/round
+ok
+test el1_anonymous_permission_transitions_stay_in_guest ... el1-sched permission-transitions pages=256 rounds=4 exits=57 served_mprotect=16 forwarded_mprotect=1 faults=268 grants=4 returns=4 bytes_granted=1130496 bytes_returned=1130496 permission-transitions pages=256 rounds=4 write_faults=4 read_faults=4 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions pages=1024 rounds=4 exits=51 served_mprotect=16 forwarded_mprotect=1 faults=1038 grants=6 returns=6 bytes_granted=4308992 bytes_returned=4308992 permission-transitions pages=1024 rounds=4 write_faults=4 read_faults=4 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions pages=4096 rounds=4 exits=57 served_mprotect=16 forwarded_mprotect=1 faults=4116 grants=12 returns=12 bytes_granted=16891904 bytes_returned=16891904 permission-transitions pages=4096 rounds=4 write_faults=4 read_faults=4 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions pages=256 rounds=2 exits=41 served_mprotect=8 forwarded_mprotect=1 faults=264 grants=4 returns=4 bytes_granted=1130496 bytes_returned=1130496 permission-transitions pages=256 rounds=2 write_faults=2 read_faults=2 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions pages=256 rounds=18 exits=105 served_mprotect=72 forwarded_mprotect=1 faults=296 grants=4 returns=4 bytes_granted=1130496 bytes_returned=1130496 permission-transitions pages=256 rounds=18 write_faults=18 read_faults=18 signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true
+el1-sched permission-transitions page-slope 256->1024 rounds=4: exits_diff=-6 slope=-0.0020 exits/page/round
+el1-sched permission-transitions page-slope 1024->4096 rounds=4: exits_diff=6 slope=0.0005 exits/page/round
+el1-sched permission-transitions round-slope pages=256 2->18: exits_diff=64 slope=4.0000 exits/round
+ok
+test el1_anonymous_reservations_stay_in_guest ... el1-sched anonymous-reservations count=64 exits=277 served_mmap=0 forwarded_mmap=71 served_brk=0 forwarded_brk=5 anonymous-reservations count=64 pages=160 mmaps=65 brks=2 ok=true
+
+thread 'el1_anonymous_reservations_stay_in_guest' (75959355) panicked at crates/carrick-embed/tests/el1_sched.rs:3278:9:
+EL1 must serve every anonymous mmap: expected >= 64 served, got 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test el1_delegated_root_concurrent_vma_ops ... el1-sched delegated-root-vma rounds=8 exits=725 served[mmap,munmap,mprotect]=[0, 43, 32] forwarded[mmap,munmap,mprotect]=[50, 49, 17] delegated-root-vma role=child rounds=8 ops=80 map_mismatches=0 semantic_failures=0 ok=true
+delegated-root-vma role=parent rounds=8 ops=80 map_mismatches=0 semantic_failures=0 ok=true
+delegated-root-vma summary rounds=8 parent_ok=true child_ok=true
+
+thread 'el1_delegated_root_concurrent_vma_ops' (75959428) panicked at crates/carrick-embed/tests/el1_sched.rs:3384:13:
+EL1 must serve every delegated-MM mmap: expected >= 32 served, got 0 (forwarded 50)
+FAILED
+test el1_delegated_root_kick_then_first_read_publications ... el1-sched kick-first-read rounds=1 round=0 host_work_publications delta slot:0 all:0 task:0 file_table:0
+el1-sched kick-first-read rounds=4 round=0 host_work_publications delta slot:0 all:0 task:0 file_table:0
+el1-sched kick-first-read rounds=4 round=1 host_work_publications delta slot:0 all:0 task:0 file_table:0
+el1-sched kick-first-read rounds=4 round=2 host_work_publications delta slot:0 all:0 task:0 file_table:0
+el1-sched kick-first-read rounds=4 round=3 host_work_publications delta slot:0 all:0 task:0 file_table:0
+ok
+test el1_delegated_root_map_fixed_over_cow_pages ... el1-sched delegated-root-fixed-cow pages=64 rounds=4 exits=398 served_mmap[222]=0 forwarded_mmap=26 grants=23 returns=23 delegated-root-fixed-cow pages=64 rounds=4 fixed_maps=12 ok=true
+
+thread 'el1_delegated_root_map_fixed_over_cow_pages' (75959497) panicked at crates/carrick-embed/tests/el1_sched.rs:3457:9:
+EL1 must serve every MAP_FIXED replacement on a delegated MM: expected >= 12 served, got 0 (forwarded 26)
+FAILED
+test el1_epoll_eventfd_pingpong_stays_in_guest ... el1-sched epoll-pingpong iters=1000 exits=47 epoll_pwait_forwarded=0 exit_classes=canceled:1 idle:1 kick:0 syscall:43 metadata:0 maintenance:2 fault:0 other:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:0 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 carrier_cpu_ns=37713000 zone=ZoneCounts { el1_parks: 2393, el1_switches: 2393, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 2393, sgis: 76, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2398, wfi_entries: 81, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 0, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 1, host_executor_parks: 0 } epoll-pingpong iters=1000 rt_p50_ns=6542 rt_p99_ns=156000
+el1-sched epoll-pingpong iters=3000 exits=55 epoll_pwait_forwarded=1 exit_classes=canceled:4 idle:4 kick:0 syscall:45 metadata:0 maintenance:2 fault:0 other:0 el1_reasons=idle_host_work:3 idle_entry_host_work:0 service:1 interrupt_host_work:0 host_work=slot:1 all:0 task:0 file_table:0 carrier_cpu_ns=68100000 zone=ZoneCounts { el1_parks: 6376, el1_switches: 6376, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 6376, sgis: 102, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 6380, wfi_entries: 105, idle_exits: 3, misplaced: 0, steals: 1, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 0, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } epoll-pingpong iters=3000 rt_p50_ns=7208 rt_p99_ns=66292
+el1-sched epoll-pingpong iters=6000 exits=61 epoll_pwait_forwarded=0 exit_classes=canceled:6 idle:4 kick:2 syscall:47 metadata:0 maintenance:2 fault:0 other:0 el1_reasons=idle_host_work:3 idle_entry_host_work:0 service:1 interrupt_host_work:2 host_work=slot:2 all:5 task:0 file_table:0 carrier_cpu_ns=57550000 zone=ZoneCounts { el1_parks: 12400, el1_switches: 12399, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 5, wfi_entries: 2, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } epoll-pingpong iters=6000 rt_p50_ns=6625 rt_p99_ns=7542
+el1-sched epoll-pingpong 1000..3000 exits_per_rt=0.0040 epoll_pwait_forwarded_per_rt=0.0005 carrier_cpu_ns_per_rt=15194
+el1-sched epoll-pingpong 3000..6000 exits_per_rt=0.0020 epoll_pwait_forwarded_per_rt=-0.0003 carrier_cpu_ns_per_rt=-3517
+ok
+test el1_fork_cow_resolves_in_guest ... el1-sched fork-cow pages=16 guest_lane_selected=2 guest_lane_refused=0 refused[census,no_resolver,unsynced,hatch]=[0, 0, 0, 0] deferred=1
+el1-sched fork-cow pages=16 el1_cow_resolved=433 el1_cow_declined[unmapped,not_cow_armed,not_el1_private,no_write_intent,unreachable,pool_empty,editor_busy,refused]=[0, 0, 29, 0, 0, 70, 37, 0, 0] guest_cow_provisioned=527 guest_cow_settled=433 host_cow_resolutions=6 host_cow_by_path[stage_fault,syscall_copy_out,backing_maintenance,privileged_internal,foreign_publication]=[6, 0, 0, 0, 0] host_cow_max_per_mm=6 guest_lane_host_cow_by_path[same order]=[60, 0, 0, 20, 0] host_lane_samples[cause=never_selected,pending_no_backing,pending_no_manager,pending_unsynced_edits,pending_awaiting_bind,authority_mismatch][site=initial_bind,fork_plan,host_cow]=[[2, 0, 0], [0, 1, 6], [0, 0, 0], [1, 0, 0], [0, 0, 0], [0, 0, 0]]
+el1-sched fork-cow forks=20 pages=16 exits=3451 el1-memory cow guest_faults=633 host_cow_resolutions=6 host_cow_mms=21 host_fault_exits=0 exits=3451 grants=26 returns=26 bytes_granted=507904 bytes_returned=507904 ok=true
+el1-sched fork-cow pages=16 exit_classes=canceled:295 idle:371 kick:49 syscall:2479 metadata:0 maintenance:257 fault:0 other:0 forwarded_syscalls=[(57, 160), (59, 40), (64, 3), (73, 101), (93, 161), (94, 21), (96, 21), (98, 112), (103, 21), (122, 160), (134, 5), (178, 160), (214, 2), (215, 323), (220, 180), (222, 349), (226, 321), (260, 20)]
+
+thread 'el1_fork_cow_resolves_in_guest' (75959863) panicked at crates/carrick-embed/tests/el1_sched.rs:3180:37:
+invalid fork-cow report: per-page host exits detected: exits=3451 exceeds ceiling 144 for forks=20 pages=16
+fork-cow parent writers=4 forks=20 pages=16 verified_pages=320 ok=true
+fork-cow child writers=4 forks=20 pages=16 verified_pages=320 ok=true
+fork-cow forks=20 pages=16 cow_pages=640 isolation_ok=true ok=true
+el1-memory cow guest_faults=633 host_cow_resolutions=6 host_cow_mms=21 host_fault_exits=0 exits=3451 grants=26 returns=26 bytes_granted=507904 bytes_returned=507904 ok=true
+FAILED
+test el1_ipc_inherited_descriptor_lifetime ... IPC lifetime zone=ZoneCounts { el1_parks: 255, el1_switches: 254, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 253, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 274, wfi_entries: 10, idle_exits: 4, misplaced: 0, steals: 12, service_exits: 12, service_placements: 4, ready_placements: 1, service_adoptions: 4, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 1), (24, 1), (57, 10), (59, 2), (64, 1), (73, 1), (94, 2), (96, 2), (134, 5), (214, 2), (215, 1), (220, 1), (222, 5), (226, 1), (260, 1)] exit 0 signal None stdout "ipc-lifetime completed=128 reused=1 eof=1 child_exit=0\n" stderr ""
+ok
+test el1_ipc_mixed_venue_roundtrips ... IPC mixed pipe zone=ZoneCounts { el1_parks: 124, el1_switches: 36, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 467, wfi_entries: 264, idle_exits: 261, misplaced: 0, steals: 152, service_exits: 166, service_placements: 235, ready_placements: 58, service_adoptions: 235, exit_adoptions: 34, host_handbacks: 66, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 4), (59, 2), (64, 1), (65, 128), (66, 162), (73, 1), (93, 1), (94, 1), (96, 1), (134, 5), (178, 1), (214, 2), (215, 3), (220, 1), (222, 8), (226, 3)] exit 0 signal None stdout "ipc-mixed kind=pipe completed=128\n" stderr ""
+IPC mixed eventfd zone=ZoneCounts { el1_parks: 125, el1_switches: 21, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 471, wfi_entries: 244, idle_exits: 242, misplaced: 0, steals: 163, service_exits: 209, service_placements: 231, ready_placements: 53, service_adoptions: 231, exit_adoptions: 21, host_handbacks: 73, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 2), (57, 2), (64, 1), (65, 128), (66, 149), (73, 1), (93, 1), (94, 1), (96, 1), (98, 1), (134, 5), (178, 1), (214, 2), (215, 3), (220, 1), (222, 8), (226, 3)] exit 0 signal None stdout "ipc-mixed kind=eventfd completed=128\n" stderr ""
+ok
+test el1_ipc_pairs_blocking ... IPC pairs pipe n=1: zone=ZoneCounts { el1_parks: 260, el1_switches: 257, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 18, wfi_entries: 7, idle_exits: 5, misplaced: 0, steals: 6, service_exits: 9, service_placements: 3, ready_placements: 1, service_adoptions: 3, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 4), (59, 2), (64, 1), (73, 1), (93, 2), (94, 1), (96, 1), (98, 1), (134, 5), (178, 2), (214, 2), (215, 5), (220, 2), (222, 10), (226, 5)] ipc_leaves=[] host_work=slot:0 all:2 task:0 file_table:0 exits=canceled:5 idle:14 kick:0 syscall:50 metadata:0 maintenance:3 fault:0 other:0 el1_reasons=idle_host_work:5 idle_entry_host_work:0 service:9 interrupt_host_work:0 exit 0 signal None stdout "ipc-pairs kind=pipe pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs pipe n=1 served before=[0, 0] after=[511, 256]
+IPC pairs pipe n=8: zone=ZoneCounts { el1_parks: 2061, el1_switches: 2042, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 125, sgis: 91, preemptions: 1, migrations: 0, timeouts: 0, idle_entries: 77, wfi_entries: 31, idle_exits: 26, misplaced: 0, steals: 30, service_exits: 19, service_placements: 28, ready_placements: 0, service_adoptions: 28, exit_adoptions: 15, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 35), (59, 16), (64, 1), (73, 1), (93, 16), (94, 1), (96, 1), (98, 1), (134, 5), (178, 16), (214, 2), (215, 35), (220, 16), (222, 39), (226, 33)] ipc_leaves=[] host_work=slot:7 all:25 task:0 file_table:0 exits=canceled:39 idle:51 kick:10 syscall:258 metadata:0 maintenance:17 fault:0 other:0 el1_reasons=idle_host_work:32 idle_entry_host_work:0 service:19 interrupt_host_work:10 exit 0 signal None stdout "ipc-pairs kind=pipe pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs pipe n=8 served before=[511, 256] after=[4584, 2304]
+IPC pairs pipe n=64: zone=ZoneCounts { el1_parks: 16499, el1_switches: 16394, host_parks: 2, signal_claims: 0, control_claims: 0, cross_wakes: 128, sgis: 1, preemptions: 21, migrations: 0, timeouts: 0, idle_entries: 222, wfi_entries: 68, idle_exits: 69, misplaced: 0, steals: 36, service_exits: 227, service_placements: 180, ready_placements: 1, service_adoptions: 180, exit_adoptions: 38, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 258), (59, 128), (64, 1), (73, 1), (93, 128), (94, 1), (96, 1), (98, 3), (132, 1), (134, 5), (178, 128), (214, 2), (215, 269), (220, 143), (222, 278), (226, 259)] ipc_leaves=[] host_work=slot:6 all:25 task:0 file_table:0 exits=canceled:80 idle:296 kick:10 syscall:1668 metadata:0 maintenance:130 fault:0 other:0 el1_reasons=idle_host_work:69 idle_entry_host_work:0 service:227 interrupt_host_work:10 exit 0 signal None stdout "ipc-pairs kind=pipe pairs=64 rounds=128 completed=8192\n" stderr ""
+IPC pairs pipe n=64 served before=[4584, 2304] after=[37214, 18688]
+IPC pairs eventfd n=1: zone=ZoneCounts { el1_parks: 258, el1_switches: 257, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 257, sgis: 1, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 264, wfi_entries: 6, idle_exits: 6, misplaced: 0, steals: 1, service_exits: 2, service_placements: 5, ready_placements: 0, service_adoptions: 5, exit_adoptions: 0, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 2), (57, 2), (64, 1), (73, 1), (93, 2), (94, 1), (96, 1), (98, 1), (134, 5), (178, 2), (214, 2), (215, 5), (220, 2), (222, 10), (226, 5)] ipc_leaves=[] host_work=slot:0 all:1 task:0 file_table:0 exits=canceled:5 idle:8 kick:0 syscall:47 metadata:0 maintenance:3 fault:0 other:0 el1_reasons=idle_host_work:6 idle_entry_host_work:0 service:2 interrupt_host_work:0 exit 0 signal None stdout "ipc-pairs kind=eventfd pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs eventfd n=1 served before=[37214, 18688] after=[37725, 18944]
+IPC pairs eventfd n=8: zone=ZoneCounts { el1_parks: 2057, el1_switches: 2041, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 280, sgis: 265, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 63, wfi_entries: 25, idle_exits: 18, misplaced: 0, steals: 34, service_exits: 25, service_placements: 27, ready_placements: 0, service_adoptions: 27, exit_adoptions: 9, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 16), (57, 17), (64, 1), (73, 1), (93, 16), (94, 1), (96, 1), (98, 1), (134, 5), (178, 16), (214, 2), (215, 37), (220, 16), (222, 39), (226, 33)] ipc_leaves=[] host_work=slot:3 all:14 task:0 file_table:0 exits=canceled:23 idle:44 kick:4 syscall:233 metadata:0 maintenance:17 fault:0 other:0 el1_reasons=idle_host_work:19 idle_entry_host_work:0 service:25 interrupt_host_work:4 exit 0 signal None stdout "ipc-pairs kind=eventfd pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs eventfd n=8 served before=[37725, 18944] after=[41796, 20992]
+IPC pairs eventfd n=64: zone=ZoneCounts { el1_parks: 16500, el1_switches: 16374, host_parks: 3, signal_claims: 0, control_claims: 0, cross_wakes: 2, sgis: 1, preemptions: 3, migrations: 0, timeouts: 0, idle_entries: 341, wfi_entries: 153, idle_exits: 168, misplaced: 0, steals: 56, service_exits: 190, service_placements: 193, ready_placements: 1, service_adoptions: 193, exit_adoptions: 20, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 128), (57, 131), (64, 1), (73, 1), (93, 128), (94, 1), (96, 1), (98, 6), (134, 5), (178, 128), (214, 2), (215, 272), (220, 130), (222, 276), (226, 257)] ipc_leaves=[] host_work=slot:27 all:81 task:0 file_table:0 exits=canceled:206 idle:360 kick:28 syscall:1569 metadata:0 maintenance:130 fault:0 other:0 el1_reasons=idle_host_work:168 idle_entry_host_work:2 service:190 interrupt_host_work:28 exit 0 signal None stdout "ipc-pairs kind=eventfd pairs=64 rounds=128 completed=8192\n" stderr ""
+IPC pairs eventfd n=64 served before=[41796, 20992] after=[74422, 37376]
+ok
+test el1_ipc_pipe_blocking_roundtrips ... IPC blocking whole-run observation: exit 0 signal None stdout "pipe-pingpong iters=256 rt_p50_ns=3917 rt_p99_ns=6542\n" stderr ""
+ok
+test el1_ipc_two_processes_blocking ... IPC pairs pipe n=1: zone=ZoneCounts { el1_parks: 257, el1_switches: 255, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 255, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 270, wfi_entries: 14, idle_exits: 4, misplaced: 0, steals: 4, service_exits: 8, service_placements: 7, ready_placements: 0, service_adoptions: 7, exit_adoptions: 0, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 8), (59, 2), (64, 1), (73, 1), (93, 2), (94, 2), (96, 2), (98, 1), (134, 5), (178, 2), (214, 2), (215, 5), (220, 3), (222, 11), (226, 5), (260, 1)] ipc_leaves=[] host_work=slot:1 all:0 task:0 file_table:0 exits=canceled:6 idle:12 kick:0 syscall:71 metadata:0 maintenance:16 fault:0 other:0 el1_reasons=idle_host_work:4 idle_entry_host_work:0 service:8 interrupt_host_work:0 exit 0 signal None stdout "ipc-processes kind=pipe pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs pipe n=1 served before=[0, 0] after=[511, 256]
+IPC pairs pipe n=8: zone=ZoneCounts { el1_parks: 2054, el1_switches: 2013, host_parks: 5, signal_claims: 0, control_claims: 0, cross_wakes: 187, sgis: 10, preemptions: 1, migrations: 0, timeouts: 0, idle_entries: 236, wfi_entries: 23, idle_exits: 11, misplaced: 21, steals: 61, service_exits: 66, service_placements: 32, ready_placements: 2, service_adoptions: 32, exit_adoptions: 21, host_handbacks: 4, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 72), (59, 16), (64, 1), (73, 1), (93, 16), (94, 2), (96, 2), (98, 10), (134, 5), (178, 16), (214, 2), (215, 33), (220, 17), (222, 40), (226, 33), (260, 1)] ipc_leaves=[] host_work=slot:4 all:15 task:0 file_table:0 exits=canceled:26 idle:79 kick:5 syscall:324 metadata:0 maintenance:31 fault:0 other:0 el1_reasons=idle_host_work:13 idle_entry_host_work:0 service:66 interrupt_host_work:5 exit 0 signal None stdout "ipc-processes kind=pipe pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs pipe n=8 served before=[511, 256] after=[4568, 2304]
+IPC pairs pipe n=64: zone=ZoneCounts { el1_parks: 16384, el1_switches: 16160, host_parks: 23, signal_claims: 0, control_claims: 0, cross_wakes: 5, sgis: 2, preemptions: 62, migrations: 0, timeouts: 0, idle_entries: 195, wfi_entries: 9, idle_exits: 8, misplaced: 197, steals: 392, service_exits: 449, service_placements: 176, ready_placements: 10, service_adoptions: 176, exit_adoptions: 354, host_handbacks: 12, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(57, 619), (59, 128), (64, 1), (73, 1), (93, 133), (94, 2), (96, 2), (98, 64), (134, 5), (178, 128), (214, 2), (215, 266), (220, 153), (222, 281), (226, 262), (260, 1)] ipc_leaves=[] host_work=slot:31 all:136 task:0 file_table:0 exits=canceled:151 idle:478 kick:103 syscall:2431 metadata:0 maintenance:146 fault:0 other:0 el1_reasons=idle_host_work:26 idle_entry_host_work:3 service:449 interrupt_host_work:101 exit 0 signal None stdout "ipc-processes kind=pipe pairs=64 rounds=128 completed=8192\n" stderr ""
+IPC pairs pipe n=64 served before=[4568, 2304] after=[37022, 18688]
+IPC pairs eventfd n=1: zone=ZoneCounts { el1_parks: 258, el1_switches: 256, host_parks: 2, signal_claims: 0, control_claims: 0, cross_wakes: 2, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 13, wfi_entries: 11, idle_exits: 7, misplaced: 0, steals: 2, service_exits: 5, service_placements: 8, ready_placements: 0, service_adoptions: 8, exit_adoptions: 0, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 2), (57, 4), (64, 1), (73, 1), (93, 2), (94, 2), (96, 2), (98, 3), (134, 5), (178, 2), (214, 2), (215, 5), (220, 3), (222, 11), (226, 5), (260, 1)] ipc_leaves=[] host_work=slot:1 all:1 task:0 file_table:0 exits=canceled:9 idle:12 kick:0 syscall:70 metadata:0 maintenance:16 fault:0 other:0 el1_reasons=idle_host_work:7 idle_entry_host_work:0 service:5 interrupt_host_work:0 exit 0 signal None stdout "ipc-processes kind=eventfd pairs=1 rounds=128 completed=128\n" stderr ""
+IPC pairs eventfd n=1 served before=[37022, 18688] after=[37533, 18944]
+IPC pairs eventfd n=8: zone=ZoneCounts { el1_parks: 2051, el1_switches: 2025, host_parks: 4, signal_claims: 0, control_claims: 0, cross_wakes: 2, sgis: 2, preemptions: 3, migrations: 0, timeouts: 0, idle_entries: 45, wfi_entries: 10, idle_exits: 9, misplaced: 15, steals: 42, service_exits: 56, service_placements: 31, ready_placements: 0, service_adoptions: 31, exit_adoptions: 21, host_handbacks: 3, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 16), (57, 38), (64, 1), (73, 1), (93, 16), (94, 2), (96, 2), (98, 6), (134, 5), (178, 17), (214, 2), (215, 34), (220, 17), (222, 40), (226, 34), (260, 1)] ipc_leaves=[] host_work=slot:3 all:9 task:0 file_table:0 exits=canceled:18 idle:68 kick:5 syscall:278 metadata:0 maintenance:31 fault:0 other:0 el1_reasons=idle_host_work:12 idle_entry_host_work:0 service:56 interrupt_host_work:5 exit 0 signal None stdout "ipc-processes kind=eventfd pairs=8 rounds=128 completed=1024\n" stderr ""
+IPC pairs eventfd n=8 served before=[37533, 18944] after=[41600, 20992]
+IPC pairs eventfd n=64: zone=ZoneCounts { el1_parks: 16392, el1_switches: 16143, host_parks: 10, signal_claims: 0, control_claims: 0, cross_wakes: 39, sgis: 1, preemptions: 45, migrations: 0, timeouts: 0, idle_entries: 239, wfi_entries: 9, idle_exits: 8, misplaced: 213, steals: 374, service_exits: 449, service_placements: 181, ready_placements: 4, service_adoptions: 181, exit_adoptions: 352, host_handbacks: 3, host_queue_claims: 0, host_executor_parks: 0 } forwarded=[(19, 128), (57, 355), (64, 1), (73, 1), (93, 129), (94, 2), (96, 2), (98, 14), (134, 5), (178, 128), (214, 2), (215, 268), (220, 146), (222, 286), (226, 261), (260, 1)] ipc_leaves=[] host_work=slot:21 all:138 task:0 file_table:0 exits=canceled:126 idle:491 kick:98 syscall:2122 metadata:0 maintenance:146 fault:0 other:0 el1_reasons=idle_host_work:40 idle_entry_host_work:2 service:449 interrupt_host_work:97 exit 0 signal None stdout "ipc-processes kind=eventfd pairs=64 rounds=128 completed=8192\n" stderr ""
+IPC pairs eventfd n=64 served before=[41600, 20992] after=[74051, 37376]
+ok
+test el1_memory_fault_entry_preserves_context ... ok
+test el1_memory_first_touch_stays_in_guest ... el1-sched first-touch pages=256 exits=96 carrier_cpu_ns=27943000 wall_ms=30 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 13, wfi_entries: 9, idle_exits: 5, misplaced: 0, steals: 3, service_exits: 4, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=256 ok=true
+first-touch parent pages=256 child_ok=true ok=true
+el1-sched first-touch pages=1024 exits=106 carrier_cpu_ns=35672000 wall_ms=73 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 8, wfi_entries: 8, idle_exits: 8, misplaced: 0, steals: 0, service_exits: 0, service_placements: 8, ready_placements: 0, service_adoptions: 8, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=1024 ok=true
+first-touch parent pages=1024 child_ok=true ok=true
+el1-sched first-touch pages=4096 exits=128 carrier_cpu_ns=66171000 wall_ms=47 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 7, wfi_entries: 6, idle_exits: 6, misplaced: 0, steals: 1, service_exits: 1, service_placements: 7, ready_placements: 0, service_adoptions: 7, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=4096 ok=true
+first-touch parent pages=4096 child_ok=true ok=true
+el1-sched first-touch slope 256->1024 pages (added=1536): exits_diff=10 slope=0.0065 exits/page
+el1-sched first-touch slope 1024->4096 pages (added=6144): exits_diff=22 slope=0.0036 exits/page
+ok
+test el1_metadata_allocator_concurrent_growth ... ok
+test el1_metadata_allocator_grows_and_returns_extents ... metadata_grant_stats after growth: MetadataGrantStats { grants_requested: 1, grants_succeeded: 1, grants_denied: 0, returns_completed: 1, bytes_granted: 11010048, bytes_returned: 11010048, inline_hvc_traps: 0 }
+metadata_grant_stats final: MetadataGrantStats { grants_requested: 3, grants_succeeded: 2, grants_denied: 1, returns_completed: 2, bytes_granted: 13631488, bytes_returned: 13631488, inline_hvc_traps: 0 }
+ok
+test el1_metadata_allocator_host_wait_requires_unmasked_irq ... ok
+test el1_sched_cross_vcpu_handoff_has_no_host_exits ... el1-sched pinned-pingpong iters=2000 work_us=5 exits=55 carrier_cpu_ns=73361000 wall_ms=48 zone=ZoneCounts { el1_parks: 4402, el1_switches: 4402, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 4402, sgis: 15, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4418, wfi_entries: 20, idle_exits: 1, misplaced: 0, steals: 10, service_exits: 11, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=2000 work_us=5 rt_p50_ns=6750 handoff_p50_ns=875 handoff_p99_ns=1375 rt_max_ns=202458
+el1-sched pinned-pingpong iters=22000 work_us=5 exits=52 carrier_cpu_ns=652485000 wall_ms=776 zone=ZoneCounts { el1_parks: 44393, el1_switches: 44391, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 44390, sgis: 3949, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 44394, wfi_entries: 3952, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 2, service_placements: 3, ready_placements: 1, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=22000 work_us=5 rt_p50_ns=6708 handoff_p50_ns=854 handoff_p99_ns=42458 rt_max_ns=79958375
+el1-sched pinned-pingpong iters=2000 work_us=5 exits=48 carrier_cpu_ns=72808000 wall_ms=48 zone=ZoneCounts { el1_parks: 4403, el1_switches: 4402, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 4401, sgis: 129, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4403, wfi_entries: 131, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=2000 work_us=5 rt_p50_ns=6708 handoff_p50_ns=854 handoff_p99_ns=31604 rt_max_ns=96417
+el1-sched pinned-pingpong iters=22000 work_us=5 exits=49 carrier_cpu_ns=611711000 wall_ms=718 zone=ZoneCounts { el1_parks: 44397, el1_switches: 44396, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 44394, sgis: 2446, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 44397, wfi_entries: 2448, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 1, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=22000 work_us=5 rt_p50_ns=6708 handoff_p50_ns=854 handoff_p99_ns=34750 rt_max_ns=30612042
+el1-sched cross-vcpu-handoff work_us=5 exits_per_round_trip=-0.0001 carrier_cpu_ns_per_round_trip=28956 handoff_p50_ns=854
+el1-sched cross-vcpu-handoff work_us=5 exits_per_round_trip=0.0001 carrier_cpu_ns_per_round_trip=26945 handoff_p50_ns=854
+el1-sched pinned-pingpong iters=300 work_us=200 exits=47 carrier_cpu_ns=253287000 wall_ms=277 zone=ZoneCounts { el1_parks: 1003, el1_switches: 1002, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1001, sgis: 1001, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 1003, wfi_entries: 1003, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=300 work_us=200 rt_p50_ns=268833 handoff_p50_ns=34417 handoff_p99_ns=212979 rt_max_ns=10752125
+el1-sched pinned-pingpong iters=3300 work_us=200 exits=48 carrier_cpu_ns=1657425000 wall_ms=2212 zone=ZoneCounts { el1_parks: 7002, el1_switches: 7001, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 7000, sgis: 6998, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 7002, wfi_entries: 7000, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=3300 work_us=200 rt_p50_ns=270042 handoff_p50_ns=35021 handoff_p99_ns=550396 rt_max_ns=80181417
+el1-sched pinned-pingpong iters=300 work_us=200 exits=51 carrier_cpu_ns=250789000 wall_ms=358 zone=ZoneCounts { el1_parks: 1003, el1_switches: 1002, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1001, sgis: 1001, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 1004, wfi_entries: 1004, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=300 work_us=200 rt_p50_ns=273833 handoff_p50_ns=36917 handoff_p99_ns=3590292 rt_max_ns=40791375
+el1-sched pinned-pingpong iters=3300 work_us=200 exits=49 carrier_cpu_ns=1646938000 wall_ms=2004 zone=ZoneCounts { el1_parks: 7002, el1_switches: 7001, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 7000, sgis: 6991, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 7002, wfi_entries: 6994, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 1, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } pinned-pingpong iters=3300 work_us=200 rt_p50_ns=272667 handoff_p50_ns=36333 handoff_p99_ns=711042 rt_max_ns=27628542
+el1-sched cross-vcpu-handoff work_us=200 exits_per_round_trip=0.0003 carrier_cpu_ns_per_round_trip=468046 handoff_p50_ns=35021
+el1-sched cross-vcpu-handoff work_us=200 exits_per_round_trip=-0.0007 carrier_cpu_ns_per_round_trip=465383 handoff_p50_ns=36333
+ok
+test el1_sched_deferred_handback_capture_observes_guest_records ... deferred handback real guest captures: [RecordRef { id: RecordId(1), incarnation: 9 }, RecordRef { id: RecordId(1), incarnation: 27 }, RecordRef { id: RecordId(1), incarnation: 61 }, RecordRef { id: RecordId(1), incarnation: 69 }, RecordRef { id: RecordId(1), incarnation: 97 }, RecordRef { id: RecordId(1), incarnation: 103 }, RecordRef { id: RecordId(1), incarnation: 107 }, RecordRef { id: RecordId(1), incarnation: 119 }, RecordRef { id: RecordId(1), incarnation: 157 }, RecordRef { id: RecordId(1), incarnation: 161 }, RecordRef { id: RecordId(1), incarnation: 173 }, RecordRef { id: RecordId(1), incarnation: 181 }, RecordRef { id: RecordId(1), incarnation: 197 }, RecordRef { id: RecordId(1), incarnation: 205 }, RecordRef { id: RecordId(1), incarnation: 271 }, RecordRef { id: RecordId(1), incarnation: 277 }, RecordRef { id: RecordId(1), incarnation: 279 }, RecordRef { id: RecordId(1), incarnation: 291 }, RecordRef { id: RecordId(1), incarnation: 297 }, RecordRef { id: RecordId(1), incarnation: 297 }, RecordRef { id: RecordId(1), incarnation: 303 }, RecordRef { id: RecordId(1), incarnation: 315 }, RecordRef { id: RecordId(1), incarnation: 319 }, RecordRef { id: RecordId(1), incarnation: 327 }, RecordRef { id: RecordId(1), incarnation: 343 }, RecordRef { id: RecordId(1), incarnation: 371 }, RecordRef { id: RecordId(1), incarnation: 381 }, RecordRef { id: RecordId(1), incarnation: 393 }, RecordRef { id: RecordId(1), incarnation: 411 }, RecordRef { id: RecordId(1), incarnation: 423 }, RecordRef { id: RecordId(1), incarnation: 431 }, RecordRef { id: RecordId(1), incarnation: 499 }, RecordRef { id: RecordId(1), incarnation: 505 }, RecordRef { id: RecordId(1), incarnation: 509 }, RecordRef { id: RecordId(1), incarnation: 521 }, RecordRef { id: RecordId(1), incarnation: 555 }, RecordRef { id: RecordId(1), incarnation: 579 }, RecordRef { id: RecordId(1), incarnation: 587 }, RecordRef { id: RecordId(1), incarnation: 593 }, RecordRef { id: RecordId(1), incarnation: 603 }, RecordRef { id: RecordId(1), incarnation: 607 }, RecordRef { id: RecordId(1), incarnation: 611 }, RecordRef { id: RecordId(1), incarnation: 623 }, RecordRef { id: RecordId(1), incarnation: 629 }, RecordRef { id: RecordId(1), incarnation: 631 }, RecordRef { id: RecordId(1), incarnation: 655 }, RecordRef { id: RecordId(1), incarnation: 657 }, RecordRef { id: RecordId(1), incarnation: 665 }, RecordRef { id: RecordId(1), incarnation: 713 }, RecordRef { id: RecordId(1), incarnation: 727 }, RecordRef { id: RecordId(1), incarnation: 735 }, RecordRef { id: RecordId(1), incarnation: 741 }, RecordRef { id: RecordId(1), incarnation: 745 }, RecordRef { id: RecordId(1), incarnation: 747 }, RecordRef { id: RecordId(1), incarnation: 787 }, RecordRef { id: RecordId(1), incarnation: 797 }, RecordRef { id: RecordId(1), incarnation: 815 }, RecordRef { id: RecordId(1), incarnation: 823 }, RecordRef { id: RecordId(1), incarnation: 827 }, RecordRef { id: RecordId(1), incarnation: 835 }, RecordRef { id: RecordId(1), incarnation: 847 }, RecordRef { id: RecordId(1), incarnation: 855 }, RecordRef { id: RecordId(1), incarnation: 863 }, RecordRef { id: RecordId(1), incarnation: 865 }, RecordRef { id: RecordId(1), incarnation: 867 }, RecordRef { id: RecordId(1), incarnation: 883 }, RecordRef { id: RecordId(1), incarnation: 891 }, RecordRef { id: RecordId(1), incarnation: 933 }, RecordRef { id: RecordId(1), incarnation: 937 }, RecordRef { id: RecordId(1), incarnation: 951 }, RecordRef { id: RecordId(1), incarnation: 967 }, RecordRef { id: RecordId(1), incarnation: 975 }, RecordRef { id: RecordId(1), incarnation: 991 }, RecordRef { id: RecordId(1), incarnation: 1033 }, RecordRef { id: RecordId(1), incarnation: 1037 }, RecordRef { id: RecordId(1), incarnation: 1061 }, RecordRef { id: RecordId(1), incarnation: 1075 }, RecordRef { id: RecordId(1), incarnation: 1085 }, RecordRef { id: RecordId(1), incarnation: 1105 }, RecordRef { id: RecordId(1), incarnation: 1115 }, RecordRef { id: RecordId(1), incarnation: 1117 }, RecordRef { id: RecordId(1), incarnation: 1121 }, RecordRef { id: RecordId(1), incarnation: 1141 }, RecordRef { id: RecordId(1), incarnation: 1161 }, RecordRef { id: RecordId(1), incarnation: 1167 }, RecordRef { id: RecordId(1), incarnation: 1169 }, RecordRef { id: RecordId(1), incarnation: 1185 }, RecordRef { id: RecordId(1), incarnation: 1211 }, RecordRef { id: RecordId(1), incarnation: 1255 }, RecordRef { id: RecordId(1), incarnation: 1259 }, RecordRef { id: RecordId(1), incarnation: 1279 }, RecordRef { id: RecordId(1), incarnation: 1291 }, RecordRef { id: RecordId(1), incarnation: 1313 }, RecordRef { id: RecordId(1), incarnation: 1321 }, RecordRef { id: RecordId(1), incarnation: 1327 }, RecordRef { id: RecordId(1), incarnation: 1333 }, RecordRef { id: RecordId(1), incarnation: 1339 }, RecordRef { id: RecordId(1), incarnation: 1365 }, RecordRef { id: RecordId(1), incarnation: 1371 }, RecordRef { id: RecordId(1), incarnation: 1417 }, RecordRef { id: RecordId(1), incarnation: 1443 }, RecordRef { id: RecordId(1), incarnation: 1447 }, RecordRef { id: RecordId(1), incarnation: 1529 }, RecordRef { id: RecordId(1), incarnation: 1533 }, RecordRef { id: RecordId(1), incarnation: 1579 }, RecordRef { id: RecordId(1), incarnation: 1579 }, RecordRef { id: RecordId(2), incarnation: 1 }, RecordRef { id: RecordId(2), incarnation: 1 }, RecordRef { id: RecordId(1), incarnation: 1607 }, RecordRef { id: RecordId(1), incarnation: 1613 }, RecordRef { id: RecordId(1), incarnation: 1633 }, RecordRef { id: RecordId(1), incarnation: 1639 }, RecordRef { id: RecordId(1), incarnation: 1665 }, RecordRef { id: RecordId(1), incarnation: 1673 }, RecordRef { id: RecordId(1), incarnation: 1677 }, RecordRef { id: RecordId(1), incarnation: 1683 }, RecordRef { id: RecordId(1), incarnation: 1687 }, RecordRef { id: RecordId(1), incarnation: 1689 }, RecordRef { id: RecordId(1), incarnation: 1701 }, RecordRef { id: RecordId(1), incarnation: 1775 }, RecordRef { id: RecordId(1), incarnation: 1787 }, RecordRef { id: RecordId(1), incarnation: 1791 }, RecordRef { id: RecordId(1), incarnation: 1801 }, RecordRef { id: RecordId(1), incarnation: 1835 }, RecordRef { id: RecordId(1), incarnation: 1847 }, RecordRef { id: RecordId(1), incarnation: 1867 }, RecordRef { id: RecordId(1), incarnation: 1875 }, RecordRef { id: RecordId(1), incarnation: 1883 }, RecordRef { id: RecordId(1), incarnation: 1885 }, RecordRef { id: RecordId(1), incarnation: 1913 }, RecordRef { id: RecordId(1), incarnation: 1933 }, RecordRef { id: RecordId(1), incarnation: 1945 }, RecordRef { id: RecordId(1), incarnation: 1949 }, RecordRef { id: RecordId(1), incarnation: 1961 }, RecordRef { id: RecordId(1), incarnation: 1987 }, RecordRef { id: RecordId(1), incarnation: 1991 }, RecordRef { id: RecordId(1), incarnation: 2039 }, RecordRef { id: RecordId(1), incarnation: 2049 }, RecordRef { id: RecordId(1), incarnation: 2057 }, RecordRef { id: RecordId(1), incarnation: 2089 }, RecordRef { id: RecordId(1), incarnation: 2103 }, RecordRef { id: RecordId(1), incarnation: 2107 }, RecordRef { id: RecordId(1), incarnation: 2129 }, RecordRef { id: RecordId(1), incarnation: 2139 }, RecordRef { id: RecordId(1), incarnation: 2155 }, RecordRef { id: RecordId(1), incarnation: 2165 }, RecordRef { id: RecordId(1), incarnation: 2175 }, RecordRef { id: RecordId(1), incarnation: 2201 }, RecordRef { id: RecordId(1), incarnation: 2221 }, RecordRef { id: RecordId(1), incarnation: 2233 }, RecordRef { id: RecordId(1), incarnation: 2259 }, RecordRef { id: RecordId(1), incarnation: 2279 }, RecordRef { id: RecordId(1), incarnation: 2289 }, RecordRef { id: RecordId(1), incarnation: 2293 }, RecordRef { id: RecordId(1), incarnation: 2363 }, RecordRef { id: RecordId(1), incarnation: 2381 }, RecordRef { id: RecordId(1), incarnation: 2383 }, RecordRef { id: RecordId(1), incarnation: 2395 }, RecordRef { id: RecordId(1), incarnation: 2401 }, RecordRef { id: RecordId(1), incarnation: 2451 }, RecordRef { id: RecordId(1), incarnation: 2479 }, RecordRef { id: RecordId(1), incarnation: 2493 }, RecordRef { id: RecordId(1), incarnation: 2503 }, RecordRef { id: RecordId(1), incarnation: 2519 }, RecordRef { id: RecordId(1), incarnation: 2521 }, RecordRef { id: RecordId(1), incarnation: 2563 }, RecordRef { id: RecordId(1), incarnation: 2571 }, RecordRef { id: RecordId(1), incarnation: 2571 }, RecordRef { id: RecordId(1), incarnation: 2575 }, RecordRef { id: RecordId(1), incarnation: 2577 }, RecordRef { id: RecordId(1), incarnation: 2595 }, RecordRef { id: RecordId(1), incarnation: 2605 }, RecordRef { id: RecordId(1), incarnation: 2659 }, RecordRef { id: RecordId(1), incarnation: 2705 }, RecordRef { id: RecordId(1), incarnation: 2711 }, RecordRef { id: RecordId(1), incarnation: 2723 }, RecordRef { id: RecordId(1), incarnation: 2731 }, RecordRef { id: RecordId(1), incarnation: 2747 }, RecordRef { id: RecordId(1), incarnation: 2767 }, RecordRef { id: RecordId(1), incarnation: 2787 }, RecordRef { id: RecordId(1), incarnation: 2837 }, RecordRef { id: RecordId(1), incarnation: 2891 }, RecordRef { id: RecordId(1), incarnation: 2919 }, RecordRef { id: RecordId(1), incarnation: 2923 }, RecordRef { id: RecordId(1), incarnation: 2947 }, RecordRef { id: RecordId(1), incarnation: 2959 }, RecordRef { id: RecordId(1), incarnation: 2963 }, RecordRef { id: RecordId(1), incarnation: 2987 }, RecordRef { id: RecordId(1), incarnation: 2999 }, RecordRef { id: RecordId(1), incarnation: 3031 }, RecordRef { id: RecordId(1), incarnation: 3085 }, RecordRef { id: RecordId(1), incarnation: 3109 }, RecordRef { id: RecordId(1), incarnation: 3115 }, RecordRef { id: RecordId(1), incarnation: 3145 }, RecordRef { id: RecordId(1), incarnation: 3159 }, RecordRef { id: RecordId(1), incarnation: 3227 }, RecordRef { id: RecordId(1), incarnation: 3241 }, RecordRef { id: RecordId(1), incarnation: 3273 }, RecordRef { id: RecordId(1), incarnation: 3287 }, RecordRef { id: RecordId(1), incarnation: 3333 }, RecordRef { id: RecordId(1), incarnation: 3335 }, RecordRef { id: RecordId(1), incarnation: 3341 }, RecordRef { id: RecordId(1), incarnation: 3369 }, RecordRef { id: RecordId(1), incarnation: 3375 }, RecordRef { id: RecordId(1), incarnation: 3381 }, RecordRef { id: RecordId(1), incarnation: 3387 }, RecordRef { id: RecordId(1), incarnation: 3401 }, RecordRef { id: RecordId(1), incarnation: 3423 }, RecordRef { id: RecordId(1), incarnation: 3479 }, RecordRef { id: RecordId(1), incarnation: 3487 }, RecordRef { id: RecordId(1), incarnation: 3533 }, RecordRef { id: RecordId(1), incarnation: 3545 }, RecordRef { id: RecordId(1), incarnation: 3573 }, RecordRef { id: RecordId(1), incarnation: 3651 }, RecordRef { id: RecordId(1), incarnation: 3655 }, RecordRef { id: RecordId(1), incarnation: 3713 }, RecordRef { id: RecordId(1), incarnation: 3727 }, RecordRef { id: RecordId(1), incarnation: 3733 }, RecordRef { id: RecordId(1), incarnation: 3755 }, RecordRef { id: RecordId(1), incarnation: 3763 }, RecordRef { id: RecordId(1), incarnation: 3765 }, RecordRef { id: RecordId(1), incarnation: 3767 }, RecordRef { id: RecordId(1), incarnation: 3811 }, RecordRef { id: RecordId(1), incarnation: 3813 }, RecordRef { id: RecordId(1), incarnation: 3821 }, RecordRef { id: RecordId(1), incarnation: 3849 }, RecordRef { id: RecordId(1), incarnation: 3859 }, RecordRef { id: RecordId(1), incarnation: 3877 }, RecordRef { id: RecordId(1), incarnation: 3901 }, RecordRef { id: RecordId(1), incarnation: 3921 }, RecordRef { id: RecordId(1), incarnation: 3937 }, RecordRef { id: RecordId(1), incarnation: 3941 }, RecordRef { id: RecordId(1), incarnation: 3971 }, RecordRef { id: RecordId(1), incarnation: 3979 }, RecordRef { id: RecordId(1), incarnation: 3993 }, RecordRef { id: RecordId(1), incarnation: 4025 }, RecordRef { id: RecordId(1), incarnation: 4073 }, RecordRef { id: RecordId(1), incarnation: 4089 }, RecordRef { id: RecordId(1), incarnation: 4099 }, RecordRef { id: RecordId(1), incarnation: 4101 }, RecordRef { id: RecordId(1), incarnation: 4123 }, RecordRef { id: RecordId(1), incarnation: 4141 }, RecordRef { id: RecordId(1), incarnation: 4147 }, RecordRef { id: RecordId(1), incarnation: 4159 }, RecordRef { id: RecordId(1), incarnation: 4161 }, RecordRef { id: RecordId(1), incarnation: 4173 }, RecordRef { id: RecordId(1), incarnation: 4205 }, RecordRef { id: RecordId(1), incarnation: 4211 }, RecordRef { id: RecordId(1), incarnation: 4231 }, RecordRef { id: RecordId(1), incarnation: 4235 }, RecordRef { id: RecordId(1), incarnation: 4265 }, RecordRef { id: RecordId(1), incarnation: 4273 }, RecordRef { id: RecordId(1), incarnation: 4353 }, RecordRef { id: RecordId(1), incarnation: 4357 }, RecordRef { id: RecordId(1), incarnation: 4373 }, RecordRef { id: RecordId(1), incarnation: 4399 }, RecordRef { id: RecordId(1), incarnation: 4409 }, RecordRef { id: RecordId(1), incarnation: 4425 }, RecordRef { id: RecordId(1), incarnation: 4439 }, RecordRef { id: RecordId(1), incarnation: 4441 }, RecordRef { id: RecordId(1), incarnation: 4443 }, RecordRef { id: RecordId(1), incarnation: 4451 }, RecordRef { id: RecordId(1), incarnation: 4453 }, RecordRef { id: RecordId(1), incarnation: 4461 }, RecordRef { id: RecordId(1), incarnation: 4479 }, RecordRef { id: RecordId(1), incarnation: 4495 }, RecordRef { id: RecordId(1), incarnation: 4515 }, RecordRef { id: RecordId(1), incarnation: 4521 }, RecordRef { id: RecordId(1), incarnation: 4529 }, RecordRef { id: RecordId(1), incarnation: 4539 }, RecordRef { id: RecordId(1), incarnation: 4595 }, RecordRef { id: RecordId(1), incarnation: 4601 }, RecordRef { id: RecordId(1), incarnation: 4605 }, RecordRef { id: RecordId(1), incarnation: 4643 }, RecordRef { id: RecordId(1), incarnation: 4647 }, RecordRef { id: RecordId(1), incarnation: 4651 }, RecordRef { id: RecordId(1), incarnation: 4655 }, RecordRef { id: RecordId(1), incarnation: 4667 }, RecordRef { id: RecordId(1), incarnation: 4677 }, RecordRef { id: RecordId(1), incarnation: 4693 }, RecordRef { id: RecordId(1), incarnation: 4725 }, RecordRef { id: RecordId(1), incarnation: 4751 }, RecordRef { id: RecordId(1), incarnation: 4765 }, RecordRef { id: RecordId(1), incarnation: 4805 }, RecordRef { id: RecordId(1), incarnation: 4825 }, RecordRef { id: RecordId(1), incarnation: 4827 }, RecordRef { id: RecordId(1), incarnation: 4835 }, RecordRef { id: RecordId(1), incarnation: 4843 }, RecordRef { id: RecordId(1), incarnation: 4847 }, RecordRef { id: RecordId(1), incarnation: 4853 }, RecordRef { id: RecordId(1), incarnation: 4863 }, RecordRef { id: RecordId(1), incarnation: 4885 }, RecordRef { id: RecordId(1), incarnation: 4901 }, RecordRef { id: RecordId(1), incarnation: 4905 }, RecordRef { id: RecordId(1), incarnation: 4909 }, RecordRef { id: RecordId(1), incarnation: 4915 }, RecordRef { id: RecordId(1), incarnation: 4923 }, RecordRef { id: RecordId(1), incarnation: 4931 }, RecordRef { id: RecordId(1), incarnation: 4953 }, RecordRef { id: RecordId(1), incarnation: 5039 }, RecordRef { id: RecordId(1), incarnation: 5047 }, RecordRef { id: RecordId(1), incarnation: 5049 }, RecordRef { id: RecordId(1), incarnation: 5059 }, RecordRef { id: RecordId(1), incarnation: 5095 }, RecordRef { id: RecordId(1), incarnation: 5111 }, RecordRef { id: RecordId(1), incarnation: 5201 }, RecordRef { id: RecordId(1), incarnation: 5223 }, RecordRef { id: RecordId(1), incarnation: 5275 }, RecordRef { id: RecordId(1), incarnation: 5291 }, RecordRef { id: RecordId(1), incarnation: 5307 }, RecordRef { id: RecordId(1), incarnation: 5317 }, RecordRef { id: RecordId(1), incarnation: 5321 }, RecordRef { id: RecordId(1), incarnation: 5349 }, RecordRef { id: RecordId(1), incarnation: 5357 }, RecordRef { id: RecordId(1), incarnation: 5365 }, RecordRef { id: RecordId(1), incarnation: 5373 }, RecordRef { id: RecordId(1), incarnation: 5377 }, RecordRef { id: RecordId(1), incarnation: 5379 }, RecordRef { id: RecordId(1), incarnation: 5389 }, RecordRef { id: RecordId(1), incarnation: 5391 }, RecordRef { id: RecordId(1), incarnation: 5393 }, RecordRef { id: RecordId(1), incarnation: 5395 }, RecordRef { id: RecordId(1), incarnation: 5413 }, RecordRef { id: RecordId(1), incarnation: 5419 }, RecordRef { id: RecordId(1), incarnation: 5453 }, RecordRef { id: RecordId(1), incarnation: 5469 }, RecordRef { id: RecordId(1), incarnation: 5493 }, RecordRef { id: RecordId(1), incarnation: 5497 }, RecordRef { id: RecordId(1), incarnation: 5539 }, RecordRef { id: RecordId(1), incarnation: 5541 }, RecordRef { id: RecordId(1), incarnation: 5547 }, RecordRef { id: RecordId(1), incarnation: 5553 }, RecordRef { id: RecordId(1), incarnation: 5575 }, RecordRef { id: RecordId(1), incarnation: 5579 }, RecordRef { id: RecordId(1), incarnation: 5603 }, RecordRef { id: RecordId(2), incarnation: 3 }, RecordRef { id: RecordId(1), incarnation: 5667 }, RecordRef { id: RecordId(1), incarnation: 5673 }, RecordRef { id: RecordId(1), incarnation: 5677 }, RecordRef { id: RecordId(1), incarnation: 5695 }, RecordRef { id: RecordId(1), incarnation: 5705 }, RecordRef { id: RecordId(1), incarnation: 5711 }, RecordRef { id: RecordId(1), incarnation: 5719 }, RecordRef { id: RecordId(1), incarnation: 5729 }, RecordRef { id: RecordId(1), incarnation: 5741 }, RecordRef { id: RecordId(1), incarnation: 5749 }, RecordRef { id: RecordId(1), incarnation: 5751 }, RecordRef { id: RecordId(1), incarnation: 5757 }, RecordRef { id: RecordId(1), incarnation: 5769 }, RecordRef { id: RecordId(1), incarnation: 5777 }, RecordRef { id: RecordId(1), incarnation: 5783 }, RecordRef { id: RecordId(1), incarnation: 5811 }, RecordRef { id: RecordId(1), incarnation: 5823 }, RecordRef { id: RecordId(1), incarnation: 5851 }, RecordRef { id: RecordId(1), incarnation: 5857 }, RecordRef { id: RecordId(1), incarnation: 5865 }, RecordRef { id: RecordId(1), incarnation: 5867 }, RecordRef { id: RecordId(1), incarnation: 5893 }, RecordRef { id: RecordId(1), incarnation: 5909 }, RecordRef { id: RecordId(1), incarnation: 5933 }, RecordRef { id: RecordId(1), incarnation: 5937 }, RecordRef { id: RecordId(1), incarnation: 5943 }, RecordRef { id: RecordId(1), incarnation: 5945 }, RecordRef { id: RecordId(1), incarnation: 5949 }, RecordRef { id: RecordId(1), incarnation: 5961 }, RecordRef { id: RecordId(1), incarnation: 5965 }, RecordRef { id: RecordId(1), incarnation: 5971 }, RecordRef { id: RecordId(1), incarnation: 5975 }, RecordRef { id: RecordId(1), incarnation: 5987 }, RecordRef { id: RecordId(1), incarnation: 5989 }, RecordRef { id: RecordId(1), incarnation: 6005 }, RecordRef { id: RecordId(1), incarnation: 6007 }, RecordRef { id: RecordId(1), incarnation: 6017 }, RecordRef { id: RecordId(1), incarnation: 6037 }, RecordRef { id: RecordId(1), incarnation: 6045 }, RecordRef { id: RecordId(1), incarnation: 6051 }, RecordRef { id: RecordId(1), incarnation: 6059 }, RecordRef { id: RecordId(1), incarnation: 6073 }, RecordRef { id: RecordId(1), incarnation: 6117 }, RecordRef { id: RecordId(1), incarnation: 6125 }, RecordRef { id: RecordId(1), incarnation: 6159 }, RecordRef { id: RecordId(1), incarnation: 6177 }, RecordRef { id: RecordId(1), incarnation: 6193 }, RecordRef { id: RecordId(1), incarnation: 6209 }, RecordRef { id: RecordId(1), incarnation: 6223 }, RecordRef { id: RecordId(1), incarnation: 6243 }, RecordRef { id: RecordId(1), incarnation: 6253 }, RecordRef { id: RecordId(1), incarnation: 6257 }, RecordRef { id: RecordId(1), incarnation: 6285 }, RecordRef { id: RecordId(1), incarnation: 6301 }, RecordRef { id: RecordId(1), incarnation: 6327 }, RecordRef { id: RecordId(1), incarnation: 6361 }, RecordRef { id: RecordId(1), incarnation: 6377 }, RecordRef { id: RecordId(1), incarnation: 6385 }, RecordRef { id: RecordId(1), incarnation: 6389 }, RecordRef { id: RecordId(1), incarnation: 6393 }, RecordRef { id: RecordId(1), incarnation: 6407 }, RecordRef { id: RecordId(1), incarnation: 6435 }, RecordRef { id: RecordId(1), incarnation: 6453 }, RecordRef { id: RecordId(1), incarnation: 6461 }, RecordRef { id: RecordId(1), incarnation: 6465 }, RecordRef { id: RecordId(1), incarnation: 6503 }, RecordRef { id: RecordId(1), incarnation: 6517 }, RecordRef { id: RecordId(1), incarnation: 6525 }, RecordRef { id: RecordId(1), incarnation: 6529 }, RecordRef { id: RecordId(1), incarnation: 6537 }, RecordRef { id: RecordId(1), incarnation: 6541 }, RecordRef { id: RecordId(1), incarnation: 6543 }, RecordRef { id: RecordId(1), incarnation: 6559 }, RecordRef { id: RecordId(1), incarnation: 6575 }, RecordRef { id: RecordId(1), incarnation: 6641 }, RecordRef { id: RecordId(1), incarnation: 6645 }, RecordRef { id: RecordId(1), incarnation: 6661 }, RecordRef { id: RecordId(1), incarnation: 6675 }, RecordRef { id: RecordId(1), incarnation: 6677 }, RecordRef { id: RecordId(1), incarnation: 6711 }, RecordRef { id: RecordId(1), incarnation: 6715 }, RecordRef { id: RecordId(1), incarnation: 6731 }, RecordRef { id: RecordId(1), incarnation: 6741 }, RecordRef { id: RecordId(1), incarnation: 6755 }, RecordRef { id: RecordId(1), incarnation: 6757 }, RecordRef { id: RecordId(1), incarnation: 6761 }, RecordRef { id: RecordId(1), incarnation: 6767 }, RecordRef { id: RecordId(1), incarnation: 6793 }, RecordRef { id: RecordId(1), incarnation: 6801 }, RecordRef { id: RecordId(1), incarnation: 6829 }, RecordRef { id: RecordId(1), incarnation: 6833 }, RecordRef { id: RecordId(1), incarnation: 6851 }, RecordRef { id: RecordId(1), incarnation: 6851 }, RecordRef { id: RecordId(1), incarnation: 6869 }, RecordRef { id: RecordId(1), incarnation: 6875 }, RecordRef { id: RecordId(1), incarnation: 6881 }, RecordRef { id: RecordId(1), incarnation: 6885 }, RecordRef { id: RecordId(1), incarnation: 6891 }, RecordRef { id: RecordId(1), incarnation: 6911 }, RecordRef { id: RecordId(1), incarnation: 6917 }, RecordRef { id: RecordId(1), incarnation: 6925 }, RecordRef { id: RecordId(1), incarnation: 6943 }, RecordRef { id: RecordId(1), incarnation: 6985 }, RecordRef { id: RecordId(1), incarnation: 6987 }, RecordRef { id: RecordId(1), incarnation: 7001 }, RecordRef { id: RecordId(1), incarnation: 7021 }, RecordRef { id: RecordId(1), incarnation: 7055 }, RecordRef { id: RecordId(1), incarnation: 7061 }, RecordRef { id: RecordId(1), incarnation: 7071 }, RecordRef { id: RecordId(1), incarnation: 7079 }, RecordRef { id: RecordId(1), incarnation: 7083 }, RecordRef { id: RecordId(1), incarnation: 7095 }, RecordRef { id: RecordId(1), incarnation: 7119 }, RecordRef { id: RecordId(1), incarnation: 7131 }, RecordRef { id: RecordId(1), incarnation: 7139 }, RecordRef { id: RecordId(1), incarnation: 7143 }, RecordRef { id: RecordId(1), incarnation: 7145 }, RecordRef { id: RecordId(1), incarnation: 7153 }, RecordRef { id: RecordId(1), incarnation: 7155 }, RecordRef { id: RecordId(1), incarnation: 7157 }, RecordRef { id: RecordId(1), incarnation: 7167 }, RecordRef { id: RecordId(1), incarnation: 7177 }, RecordRef { id: RecordId(1), incarnation: 7183 }, RecordRef { id: RecordId(1), incarnation: 7189 }, RecordRef { id: RecordId(1), incarnation: 7195 }, RecordRef { id: RecordId(1), incarnation: 7195 }, RecordRef { id: RecordId(1), incarnation: 7203 }, RecordRef { id: RecordId(1), incarnation: 7225 }, RecordRef { id: RecordId(1), incarnation: 7227 }, RecordRef { id: RecordId(1), incarnation: 7229 }, RecordRef { id: RecordId(1), incarnation: 7231 }, RecordRef { id: RecordId(1), incarnation: 7237 }, RecordRef { id: RecordId(1), incarnation: 7275 }, RecordRef { id: RecordId(1), incarnation: 7279 }, RecordRef { id: RecordId(1), incarnation: 7281 }, RecordRef { id: RecordId(1), incarnation: 7287 }, RecordRef { id: RecordId(1), incarnation: 7295 }, RecordRef { id: RecordId(1), incarnation: 7299 }, RecordRef { id: RecordId(1), incarnation: 7313 }, RecordRef { id: RecordId(1), incarnation: 7321 }, RecordRef { id: RecordId(1), incarnation: 7327 }, RecordRef { id: RecordId(1), incarnation: 7393 }, RecordRef { id: RecordId(1), incarnation: 7397 }, RecordRef { id: RecordId(1), incarnation: 7417 }, RecordRef { id: RecordId(1), incarnation: 7421 }, RecordRef { id: RecordId(1), incarnation: 7429 }, RecordRef { id: RecordId(1), incarnation: 7429 }, RecordRef { id: RecordId(1), incarnation: 7433 }, RecordRef { id: RecordId(1), incarnation: 7457 }, RecordRef { id: RecordId(1), incarnation: 7471 }, RecordRef { id: RecordId(1), incarnation: 7489 }, RecordRef { id: RecordId(1), incarnation: 7491 }, RecordRef { id: RecordId(1), incarnation: 7493 }, RecordRef { id: RecordId(1), incarnation: 7497 }, RecordRef { id: RecordId(1), incarnation: 7557 }, RecordRef { id: RecordId(1), incarnation: 7577 }, RecordRef { id: RecordId(1), incarnation: 7587 }, RecordRef { id: RecordId(1), incarnation: 7591 }, RecordRef { id: RecordId(1), incarnation: 7607 }, RecordRef { id: RecordId(1), incarnation: 7631 }, RecordRef { id: RecordId(1), incarnation: 7649 }, RecordRef { id: RecordId(1), incarnation: 7665 }, RecordRef { id: RecordId(1), incarnation: 7679 }, RecordRef { id: RecordId(1), incarnation: 7683 }, RecordRef { id: RecordId(1), incarnation: 7685 }, RecordRef { id: RecordId(1), incarnation: 7693 }, RecordRef { id: RecordId(1), incarnation: 7711 }, RecordRef { id: RecordId(1), incarnation: 7721 }, RecordRef { id: RecordId(1), incarnation: 7757 }, RecordRef { id: RecordId(1), incarnation: 7759 }, RecordRef { id: RecordId(1), incarnation: 7769 }, RecordRef { id: RecordId(1), incarnation: 7773 }, RecordRef { id: RecordId(1), incarnation: 7775 }, RecordRef { id: RecordId(1), incarnation: 7779 }, RecordRef { id: RecordId(1), incarnation: 7783 }, RecordRef { id: RecordId(1), incarnation: 7797 }, RecordRef { id: RecordId(1), incarnation: 7803 }, RecordRef { id: RecordId(1), incarnation: 7809 }, RecordRef { id: RecordId(1), incarnation: 7821 }, RecordRef { id: RecordId(1), incarnation: 7853 }, RecordRef { id: RecordId(1), incarnation: 7861 }, RecordRef { id: RecordId(1), incarnation: 7875 }, RecordRef { id: RecordId(1), incarnation: 7913 }, RecordRef { id: RecordId(1), incarnation: 7961 }, RecordRef { id: RecordId(1), incarnation: 7971 }, RecordRef { id: RecordId(1), incarnation: 7983 }, RecordRef { id: RecordId(1), incarnation: 7995 }, RecordRef { id: RecordId(1), incarnation: 8011 }, RecordRef { id: RecordId(1), incarnation: 8017 }, RecordRef { id: RecordId(2), incarnation: 5 }, RecordRef { id: RecordId(1), incarnation: 8061 }, RecordRef { id: RecordId(1), incarnation: 8067 }, RecordRef { id: RecordId(1), incarnation: 8069 }, RecordRef { id: RecordId(1), incarnation: 8111 }, RecordRef { id: RecordId(1), incarnation: 8125 }, RecordRef { id: RecordId(1), incarnation: 8169 }, RecordRef { id: RecordId(1), incarnation: 8185 }, RecordRef { id: RecordId(1), incarnation: 8199 }, RecordRef { id: RecordId(1), incarnation: 8217 }, RecordRef { id: RecordId(1), incarnation: 8229 }, RecordRef { id: RecordId(1), incarnation: 8253 }, RecordRef { id: RecordId(1), incarnation: 8261 }, RecordRef { id: RecordId(1), incarnation: 8267 }, RecordRef { id: RecordId(1), incarnation: 8269 }, RecordRef { id: RecordId(1), incarnation: 8277 }, RecordRef { id: RecordId(1), incarnation: 8279 }, RecordRef { id: RecordId(1), incarnation: 8287 }, RecordRef { id: RecordId(1), incarnation: 8297 }, RecordRef { id: RecordId(1), incarnation: 8309 }, RecordRef { id: RecordId(1), incarnation: 8317 }, RecordRef { id: RecordId(1), incarnation: 8341 }, RecordRef { id: RecordId(1), incarnation: 8345 }, RecordRef { id: RecordId(1), incarnation: 8367 }, RecordRef { id: RecordId(1), incarnation: 8369 }, RecordRef { id: RecordId(1), incarnation: 8387 }, RecordRef { id: RecordId(1), incarnation: 8389 }, RecordRef { id: RecordId(1), incarnation: 8403 }, RecordRef { id: RecordId(1), incarnation: 8407 }, RecordRef { id: RecordId(1), incarnation: 8421 }, RecordRef { id: RecordId(1), incarnation: 8431 }, RecordRef { id: RecordId(1), incarnation: 8433 }, RecordRef { id: RecordId(1), incarnation: 8437 }, RecordRef { id: RecordId(1), incarnation: 8457 }, RecordRef { id: RecordId(1), incarnation: 8481 }, RecordRef { id: RecordId(1), incarnation: 8511 }, RecordRef { id: RecordId(1), incarnation: 8513 }, RecordRef { id: RecordId(1), incarnation: 8529 }, RecordRef { id: RecordId(1), incarnation: 8531 }, RecordRef { id: RecordId(1), incarnation: 8541 }, RecordRef { id: RecordId(1), incarnation: 8553 }, RecordRef { id: RecordId(1), incarnation: 8559 }, RecordRef { id: RecordId(1), incarnation: 8567 }, RecordRef { id: RecordId(1), incarnation: 8617 }, RecordRef { id: RecordId(1), incarnation: 8619 }, RecordRef { id: RecordId(1), incarnation: 8627 }, RecordRef { id: RecordId(1), incarnation: 8649 }, RecordRef { id: RecordId(1), incarnation: 8671 }, RecordRef { id: RecordId(1), incarnation: 8675 }, RecordRef { id: RecordId(1), incarnation: 8685 }, RecordRef { id: RecordId(1), incarnation: 8691 }, RecordRef { id: RecordId(1), incarnation: 8753 }, RecordRef { id: RecordId(1), incarnation: 8757 }, RecordRef { id: RecordId(1), incarnation: 8827 }, RecordRef { id: RecordId(1), incarnation: 8831 }, RecordRef { id: RecordId(1), incarnation: 8849 }, RecordRef { id: RecordId(1), incarnation: 8869 }, RecordRef { id: RecordId(1), incarnation: 8901 }, RecordRef { id: RecordId(1), incarnation: 8907 }, RecordRef { id: RecordId(1), incarnation: 8915 }, RecordRef { id: RecordId(1), incarnation: 8927 }, RecordRef { id: RecordId(1), incarnation: 8931 }, RecordRef { id: RecordId(1), incarnation: 8939 }, RecordRef { id: RecordId(1), incarnation: 8961 }, RecordRef { id: RecordId(1), incarnation: 8967 }, RecordRef { id: RecordId(1), incarnation: 8971 }, RecordRef { id: RecordId(1), incarnation: 8991 }, RecordRef { id: RecordId(1), incarnation: 9001 }, RecordRef { id: RecordId(1), incarnation: 9011 }, RecordRef { id: RecordId(1), incarnation: 9021 }, RecordRef { id: RecordId(1), incarnation: 9025 }, RecordRef { id: RecordId(1), incarnation: 9029 }, RecordRef { id: RecordId(1), incarnation: 9041 }, RecordRef { id: RecordId(1), incarnation: 9045 }, RecordRef { id: RecordId(1), incarnation: 9051 }, RecordRef { id: RecordId(1), incarnation: 9057 }, RecordRef { id: RecordId(1), incarnation: 9063 }, RecordRef { id: RecordId(1), incarnation: 9067 }, RecordRef { id: RecordId(1), incarnation: 9083 }, RecordRef { id: RecordId(1), incarnation: 9099 }]
+ok
+test el1_sched_delayed_notification_survives_parent_reap ... el1 delayed notification ordering=["captured", "reaped", "released"] markers=1
+ok
+test el1_sched_exec_from_a_sibling_with_parked_threads ... el1-sched exec exec-child ok wall_ms=161 zone=ZoneCounts { el1_parks: 77568, el1_switches: 77560, host_parks: 0, signal_claims: 0, control_claims: 4, cross_wakes: 77122, sgis: 625, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 77164, wfi_entries: 328, idle_exits: 18, misplaced: 0, steals: 402, service_exits: 20, service_placements: 17, ready_placements: 3, service_adoptions: 17, exit_adoptions: 1, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exec exec-child ok wall_ms=202 zone=ZoneCounts { el1_parks: 75676, el1_switches: 75671, host_parks: 0, signal_claims: 0, control_claims: 4, cross_wakes: 74385, sgis: 623, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 74416, wfi_entries: 64, idle_exits: 14, misplaced: 0, steals: 1104, service_exits: 14, service_placements: 15, ready_placements: 2, service_adoptions: 15, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exec exec-child ok wall_ms=171 zone=ZoneCounts { el1_parks: 74208, el1_switches: 74203, host_parks: 0, signal_claims: 0, control_claims: 4, cross_wakes: 73616, sgis: 467, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 73645, wfi_entries: 45, idle_exits: 13, misplaced: 0, steals: 585, service_exits: 13, service_placements: 15, ready_placements: 0, service_adoptions: 15, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exec exec-child ok wall_ms=181 zone=ZoneCounts { el1_parks: 91496, el1_switches: 91490, host_parks: 0, signal_claims: 0, control_claims: 3, cross_wakes: 87025, sgis: 335, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 87060, wfi_entries: 69, idle_exits: 15, misplaced: 0, steals: 539, service_exits: 20, service_placements: 17, ready_placements: 1, service_adoptions: 17, exit_adoptions: 2, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exec exec-child ok wall_ms=173 zone=ZoneCounts { el1_parks: 116073, el1_switches: 116068, host_parks: 0, signal_claims: 0, control_claims: 4, cross_wakes: 41179, sgis: 502, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 41211, wfi_entries: 73, idle_exits: 12, misplaced: 0, steals: 558, service_exits: 16, service_placements: 14, ready_placements: 1, service_adoptions: 14, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+ok
+test el1_sched_exit_group_with_parked_threads ... el1-sched exit-group exit=42 wall_ms=148 zone=ZoneCounts { el1_parks: 169114, el1_switches: 169110, host_parks: 0, signal_claims: 0, control_claims: 3, cross_wakes: 13249, sgis: 5, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 13270, wfi_entries: 22, idle_exits: 9, misplaced: 0, steals: 9, service_exits: 9, service_placements: 12, ready_placements: 0, service_adoptions: 12, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exit-group exit=42 wall_ms=162 zone=ZoneCounts { el1_parks: 119853, el1_switches: 119849, host_parks: 0, signal_claims: 0, control_claims: 3, cross_wakes: 92863, sgis: 762, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 92878, wfi_entries: 253, idle_exits: 11, misplaced: 0, steals: 540, service_exits: 5, service_placements: 13, ready_placements: 1, service_adoptions: 13, exit_adoptions: 2, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exit-group exit=42 wall_ms=149 zone=ZoneCounts { el1_parks: 73298, el1_switches: 73291, host_parks: 0, signal_claims: 0, control_claims: 3, cross_wakes: 72990, sgis: 579, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 73009, wfi_entries: 515, idle_exits: 15, misplaced: 0, steals: 94, service_exits: 6, service_placements: 12, ready_placements: 4, service_adoptions: 12, exit_adoptions: 2, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exit-group exit=42 wall_ms=148 zone=ZoneCounts { el1_parks: 89723, el1_switches: 89716, host_parks: 0, signal_claims: 0, control_claims: 3, cross_wakes: 89465, sgis: 265, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 89484, wfi_entries: 237, idle_exits: 12, misplaced: 0, steals: 53, service_exits: 13, service_placements: 13, ready_placements: 1, service_adoptions: 13, exit_adoptions: 0, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 }
+el1-sched exit-group exit=42 wall_ms=147 zone=ZoneCounts { el1_parks: 60005, el1_switches: 59995, host_parks: 0, signal_claims: 0, control_claims: 2, cross_wakes: 57159, sgis: 2533, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 57192, wfi_entries: 243, idle_exits: 18, misplaced: 0, steals: 2840, service_exits: 13, service_placements: 12, ready_placements: 10, service_adoptions: 12, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 }
+ok
+test el1_sched_futex_handoff_has_no_host_exits ... el1-sched pingpong iters=5000 exits=64 host_classes=canceled:10 idle:4 kick:3 syscall:45 metadata:0 maintenance:2 fault:0 other:0 hvc_not_svc=8 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 8)],fsc:[(5, 1), (7, 7)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:2 idle_entry_host_work:0 service:2 interrupt_host_work:3 host_work=slot:4 all:7 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (93, 1), (94, 1), (96, 1), (98, 3), (122, 2), (134, 5), (178, 1), (214, 2), (215, 3), (220, 1), (222, 9), (226, 3)] carrier_cpu_ns=73528000 wall_ms=55 zone=ZoneCounts { el1_parks: 13637, el1_switches: 13637, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 13637, sgis: 9, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 13645, wfi_entries: 14, idle_exits: 2, misplaced: 0, steals: 1, service_exits: 2, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 0, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } pingpong iters=5000 p50_ns=4292 mean_ns=3482 max_ns=62458
+el1-sched pingpong iters=55000 exits=45 host_classes=canceled:1 idle:3 kick:0 syscall:39 metadata:0 maintenance:2 fault:0 other:0 hvc_not_svc=6 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 6)],fsc:[(5, 1), (7, 5)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:2 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (93, 1), (94, 1), (96, 1), (122, 2), (134, 5), (178, 1), (214, 2), (215, 3), (220, 1), (222, 9), (226, 3)] carrier_cpu_ns=88354000 wall_ms=101 zone=ZoneCounts { el1_parks: 114001, el1_switches: 114000, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2, wfi_entries: 1, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 2, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pingpong iters=55000 p50_ns=1208 mean_ns=1351 max_ns=7186542
+el1-sched pingpong iters=5000 exits=45 host_classes=canceled:1 idle:3 kick:0 syscall:39 metadata:0 maintenance:2 fault:0 other:0 hvc_not_svc=6 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 6)],fsc:[(5, 1), (7, 5)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:2 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (93, 1), (94, 1), (96, 1), (122, 2), (134, 5), (178, 1), (214, 2), (215, 3), (220, 1), (222, 9), (226, 3)] carrier_cpu_ns=27873000 wall_ms=25 zone=ZoneCounts { el1_parks: 14001, el1_switches: 14000, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2, wfi_entries: 1, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 2, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pingpong iters=5000 p50_ns=1250 mean_ns=1238 max_ns=17583
+el1-sched pingpong iters=55000 exits=45 host_classes=canceled:1 idle:3 kick:0 syscall:39 metadata:0 maintenance:2 fault:0 other:0 hvc_not_svc=6 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 6)],fsc:[(5, 1), (7, 5)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:2 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (93, 1), (94, 1), (96, 1), (122, 2), (134, 5), (178, 1), (214, 2), (215, 3), (220, 1), (222, 9), (226, 3)] carrier_cpu_ns=87425000 wall_ms=109 zone=ZoneCounts { el1_parks: 114001, el1_switches: 114000, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2, wfi_entries: 1, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 2, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pingpong iters=55000 p50_ns=1167 mean_ns=1380 max_ns=8122792
+el1-sched futex-handoff exits_per_round_trip=-0.0004 carrier_cpu_ns_per_round_trip=297 p50_ns=1208
+el1-sched futex-handoff exits_per_round_trip=0.0000 carrier_cpu_ns_per_round_trip=1191 p50_ns=1167
+ok
+test el1_sched_host_blocked_read_resumes_by_guest_scheduling ... el1-sched sock-pingpong iters=1000 exits=10271 carrier_cpu_ns=886648000 wall_ms=2363 zone=ZoneCounts { el1_parks: 1, el1_switches: 0, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2656, wfi_entries: 2321, idle_exits: 2546, misplaced: 0, steals: 75, service_exits: 106, service_placements: 2294, ready_placements: 0, service_adoptions: 2294, exit_adoptions: 0, host_handbacks: 2, host_queue_claims: 0, host_executor_parks: 0 } sock-pingpong iters=1000 pinned=false rt_p50_ns=281375 rt_p99_ns=20340042
+el1-sched sock-pingpong iters=6000 exits=52843 carrier_cpu_ns=4700669000 wall_ms=11701 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 13404, wfi_entries: 11807, idle_exits: 12704, misplaced: 0, steals: 499, service_exits: 700, service_placements: 11601, ready_placements: 0, service_adoptions: 11598, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } sock-pingpong iters=6000 pinned=false rt_p50_ns=337792 rt_p99_ns=17252708
+el1-sched sock-pingpong iters=1000 exits=10331 carrier_cpu_ns=952603000 wall_ms=2887 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2602, wfi_entries: 2296, idle_exits: 2489, misplaced: 0, steals: 89, service_exits: 113, service_placements: 2255, ready_placements: 0, service_adoptions: 2255, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } sock-pingpong iters=1000 pinned=false rt_p50_ns=337875 rt_p99_ns=20366208
+el1-sched sock-pingpong iters=6000 exits=53342 carrier_cpu_ns=4943993000 wall_ms=14307 zone=ZoneCounts { el1_parks: 1, el1_switches: 1, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 1, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 13370, wfi_entries: 11870, idle_exits: 12743, misplaced: 0, steals: 483, service_exits: 626, service_placements: 11753, ready_placements: 0, service_adoptions: 11752, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } sock-pingpong iters=6000 pinned=false rt_p50_ns=345042 rt_p99_ns=19370333
+el1-sched sock-pingpong host_queue_claims_per_rt=0.0000 host_executor_parks_per_rt=0.0000 service_adoptions_per_rt=1.861 host_handbacks_per_rt=-0.000 carrier_cpu_ns_per_rt=762804 rt_p50_ns=337792
+el1-sched sock-pingpong host_queue_claims_per_rt=0.0000 host_executor_parks_per_rt=0.0000 service_adoptions_per_rt=1.899 host_handbacks_per_rt=0.000 carrier_cpu_ns_per_rt=798278 rt_p50_ns=345042
+ok
+test el1_sched_host_woken_thread_preempts_a_compute_loop ... el1-sched pipe-compute exits=48 zone=ZoneCounts { el1_parks: 2, el1_switches: 2, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 2, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 12, wfi_entries: 8, idle_exits: 2, misplaced: 0, steals: 3, service_exits: 4, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-compute ms=300 a_count=7743653 b_count=40289686 b_first_ms=0.022
+el1-sched pipe-compute exits=45 zone=ZoneCounts { el1_parks: 2, el1_switches: 2, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 2, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 5, wfi_entries: 5, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 0, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-compute ms=300 a_count=4823316 b_count=25592315 b_first_ms=0.187
+el1-sched pipe-compute exits=45 zone=ZoneCounts { el1_parks: 2, el1_switches: 2, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 2, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 5, wfi_entries: 5, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 0, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-compute ms=300 a_count=5513739 b_count=30465370 b_first_ms=1.333
+ok
+test el1_sched_idle_carrier_costs_no_host_cpu ... el1-sched idle-carrier ms=500 exits=92 carrier_cpu_ns=27672000 wall_ms=562 zone=ZoneCounts { el1_parks: 6, el1_switches: 4, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 4, sgis: 4, preemptions: 0, migrations: 0, timeouts: 1, idle_entries: 21, wfi_entries: 17, idle_exits: 5, misplaced: 0, steals: 7, service_exits: 8, service_placements: 7, ready_placements: 0, service_adoptions: 7, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } idle-carrier ms=500 result=-110 elapsed_ms=509.694
+el1-sched idle-carrier ms=2500 exits=99 carrier_cpu_ns=30369000 wall_ms=2593 zone=ZoneCounts { el1_parks: 8, el1_switches: 4, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 2, sgis: 2, preemptions: 0, migrations: 0, timeouts: 1, idle_entries: 17, wfi_entries: 14, idle_exits: 13, misplaced: 0, steals: 1, service_exits: 2, service_placements: 14, ready_placements: 0, service_adoptions: 14, exit_adoptions: 3, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } idle-carrier ms=2500 result=-110 elapsed_ms=2502.253
+el1-sched idle-carrier ms=500 exits=88 carrier_cpu_ns=24994000 wall_ms=582 zone=ZoneCounts { el1_parks: 6, el1_switches: 3, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 4, sgis: 4, preemptions: 0, migrations: 0, timeouts: 1, idle_entries: 14, wfi_entries: 11, idle_exits: 7, misplaced: 0, steals: 6, service_exits: 6, service_placements: 12, ready_placements: 0, service_adoptions: 12, exit_adoptions: 2, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } idle-carrier ms=500 result=-110 elapsed_ms=507.732
+el1-sched idle-carrier ms=2500 exits=91 carrier_cpu_ns=26462000 wall_ms=2570 zone=ZoneCounts { el1_parks: 6, el1_switches: 3, host_parks: 3, signal_claims: 0, control_claims: 0, cross_wakes: 4, sgis: 4, preemptions: 0, migrations: 0, timeouts: 1, idle_entries: 14, wfi_entries: 12, idle_exits: 8, misplaced: 0, steals: 4, service_exits: 5, service_placements: 13, ready_placements: 0, service_adoptions: 13, exit_adoptions: 1, host_handbacks: 3, host_queue_claims: 0, host_executor_parks: 0 } idle-carrier ms=2500 result=-110 elapsed_ms=2504.756
+el1-sched idle-carrier cpu_fraction_of_one_core=0.00135 exits_per_idle_second=3.5
+el1-sched idle-carrier cpu_fraction_of_one_core=0.00073 exits_per_idle_second=1.5
+ok
+test el1_sched_mm_occupancy_two_processes ... el1-sched mm-occupancy exits=86183 carrier_cpu_ns=6104705000 wall_ms=9007 zone=ZoneCounts { el1_parks: 23423, el1_switches: 17795, host_parks: 131, signal_claims: 0, control_claims: 0, cross_wakes: 23, sgis: 21, preemptions: 661, migrations: 21, timeouts: 2, idle_entries: 7788, wfi_entries: 487, idle_exits: 2169, misplaced: 0, steals: 6203, service_exits: 11598, service_placements: 24769, ready_placements: 18, service_adoptions: 24769, exit_adoptions: 17792, host_handbacks: 62, host_queue_claims: 0, host_executor_parks: 0 } mprotect_enomem_sites=[none] alias_retirement_restarts=0 alias_stale_incarnation_co_holders=2 mm-occupancy parent writers=8 forks=150 edits=2044 edit_failures=0 edit_errors=none torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=2155 edit_failures=0 edit_errors=none torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+ok
+test el1_sched_pipe_pingpong_stays_in_guest ... el1-sched pipe-pingpong iters=1000 exits=47 carrier_cpu_ns=31275000 wall_ms=26 zone=ZoneCounts { el1_parks: 2399, el1_switches: 2399, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 2399, sgis: 4, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2406, wfi_entries: 9, idle_exits: 1, misplaced: 0, steals: 1, service_exits: 2, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-pingpong iters=1000 rt_p50_ns=3958 rt_p99_ns=4083
+el1-sched pipe-pingpong iters=6000 exits=54 carrier_cpu_ns=46395000 wall_ms=45 zone=ZoneCounts { el1_parks: 12400, el1_switches: 12399, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4, wfi_entries: 2, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 1, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-pingpong iters=6000 rt_p50_ns=4542 rt_p99_ns=4917
+el1-sched pipe-pingpong iters=1000 exits=46 carrier_cpu_ns=27757000 wall_ms=22 zone=ZoneCounts { el1_parks: 2399, el1_switches: 2399, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 2399, sgis: 2, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 2401, wfi_entries: 4, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 0, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-pingpong iters=1000 rt_p50_ns=3917 rt_p99_ns=4083
+el1-sched pipe-pingpong iters=6000 exits=46 carrier_cpu_ns=71486000 wall_ms=45 zone=ZoneCounts { el1_parks: 12390, el1_switches: 12390, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 12390, sgis: 102, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 12392, wfi_entries: 104, idle_exits: 2, misplaced: 0, steals: 0, service_exits: 0, service_placements: 2, ready_placements: 0, service_adoptions: 2, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } pipe-pingpong iters=6000 rt_p50_ns=4000 rt_p99_ns=13792
+el1-sched pipe-pingpong host_queue_claims_per_rt=0.0000 host_executor_parks_per_rt=0.0000 service_adoptions_per_rt=0.000 host_handbacks_per_rt=0.000 carrier_cpu_ns_per_rt=3024 rt_p50_ns=4542
+el1-sched pipe-pingpong host_queue_claims_per_rt=0.0000 host_executor_parks_per_rt=0.0000 service_adoptions_per_rt=0.000 host_handbacks_per_rt=0.000 carrier_cpu_ns_per_rt=8746 rt_p50_ns=4000
+ok
+test el1_sched_preemption_reaches_compute_loops ... el1-sched compute-pair exits=53 wall_ms=349 zone=ZoneCounts { el1_parks: 2, el1_switches: 110, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 1, preemptions: 108, migrations: 0, timeouts: 0, idle_entries: 15, wfi_entries: 7, idle_exits: 2, misplaced: 0, steals: 6, service_exits: 8, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } compute-pair ms=300 a_count=4769548 b_count=29021610 b_first_ms=4.009
+el1-sched compute-pair exits=47 wall_ms=348 zone=ZoneCounts { el1_parks: 2, el1_switches: 104, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 1, preemptions: 102, migrations: 0, timeouts: 0, idle_entries: 5, wfi_entries: 4, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } compute-pair ms=300 a_count=4786420 b_count=27175001 b_first_ms=4.006
+el1-sched compute-pair exits=47 wall_ms=352 zone=ZoneCounts { el1_parks: 2, el1_switches: 128, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 1, sgis: 1, preemptions: 126, migrations: 0, timeouts: 0, idle_entries: 5, wfi_entries: 4, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 3, ready_placements: 0, service_adoptions: 3, exit_adoptions: 1, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } compute-pair ms=300 a_count=5336144 b_count=34106358 b_first_ms=4.005
+ok
+test el1_sched_pstate_seen_by_the_guest_is_unchanged ... el1-sched pstate pstate tgkill=0/0 sync_daif=0x3c0 async_daif=0x3c0 sync_el=0 async_el=0
+ok
+test el1_sched_signal_reaches_a_parked_thread ... el1-sched signal zone=ZoneCounts { el1_parks: 5, el1_switches: 3, host_parks: 1, signal_claims: 2, control_claims: 0, cross_wakes: 2, sgis: 1, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 35, wfi_entries: 29, idle_exits: 22, misplaced: 0, steals: 6, service_exits: 7, service_placements: 23, ready_placements: 0, service_adoptions: 23, exit_adoptions: 1, host_handbacks: 1, host_queue_claims: 0, host_executor_parks: 0 } signal eintr_result=-4 usr1_handled=1 restart_result=-4 usr2_handled=1
+ok
+test el1_sched_signal_reaches_a_wfi_parked_vcpu ... el1-sched wfi-signal exits=2620 wall_ms=1986 zone=ZoneCounts { el1_parks: 398, el1_switches: 197, host_parks: 0, signal_claims: 200, control_claims: 0, cross_wakes: 4, sgis: 4, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 617, wfi_entries: 700, idle_exits: 586, misplaced: 0, steals: 6, service_exits: 23, service_placements: 594, ready_placements: 0, service_adoptions: 594, exit_adoptions: 193, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } wfi-signal rounds=200 eintr=200 handled=200 wake_p50_us=8622.8 wake_max_us=20534.9
+ok
+test el1_sched_timed_wait_times_out_in_guest ... el1-sched timed-wait iters=200 exits=38 host_classes=canceled:1 idle:9 kick:0 syscall:26 metadata:0 maintenance:2 fault:0 other:0 hvc_not_svc=5 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 5)],fsc:[(5, 1), (7, 4)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:8 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (94, 1), (96, 1), (134, 5), (214, 2), (215, 2), (222, 6), (226, 1)] carrier_cpu_ns=32736000 wall_ms=321 zone=ZoneCounts { el1_parks: 200, el1_switches: 200, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 200, idle_entries: 213, wfi_entries: 403, idle_exits: 1, misplaced: 0, steals: 8, service_exits: 8, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } timed-wait iters=200 wrong=0 early=0 late_p50_ns=522875 late_p99_ns=584208 late_max_ns=2248917
+el1-sched timed-wait iters=1200 exits=30 host_classes=canceled:1 idle:1 kick:0 syscall:26 metadata:0 maintenance:2 fault:0 other:0 hvc_not_svc=5 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 5)],fsc:[(5, 1), (7, 4)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:0 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (94, 1), (96, 1), (134, 5), (214, 2), (215, 2), (222, 6), (226, 1)] carrier_cpu_ns=86058000 wall_ms=1838 zone=ZoneCounts { el1_parks: 1200, el1_switches: 1200, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 1200, idle_entries: 1201, wfi_entries: 2385, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 0, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } timed-wait iters=1200 wrong=0 early=0 late_p50_ns=519625 late_p99_ns=1113875 late_max_ns=4741833
+el1-sched timed-wait iters=200 exits=30 host_classes=canceled:1 idle:1 kick:0 syscall:26 metadata:0 maintenance:2 fault:0 other:0 hvc_not_svc=5 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 5)],fsc:[(5, 1), (7, 4)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:0 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (94, 1), (96, 1), (134, 5), (214, 2), (215, 2), (222, 6), (226, 1)] carrier_cpu_ns=27452000 wall_ms=320 zone=ZoneCounts { el1_parks: 200, el1_switches: 200, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 200, idle_entries: 201, wfi_entries: 400, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 0, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } timed-wait iters=200 wrong=0 early=0 late_p50_ns=521167 late_p99_ns=1158750 late_max_ns=5390583
+el1-sched timed-wait iters=1200 exits=30 host_classes=canceled:1 idle:1 kick:0 syscall:26 metadata:0 maintenance:2 fault:0 other:0 hvc_not_svc=5 hvc_not_svc_reasons=hvc_fn:2,ec:[(36, 5)],fsc:[(5, 1), (7, 4)],sysreg:cntfrq:0|cntvct:0|ctr:0|dczid:0|feature_id:0|other:0,emulated_sys64:0 el1_reasons=idle_host_work:1 idle_entry_host_work:0 service:0 interrupt_host_work:0 host_work=slot:0 all:0 task:0 file_table:0 forwarded_by_nr=[(64, 1), (73, 1), (94, 1), (96, 1), (134, 5), (214, 2), (215, 2), (222, 6), (226, 1)] carrier_cpu_ns=87551000 wall_ms=1826 zone=ZoneCounts { el1_parks: 1200, el1_switches: 1200, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 1200, idle_entries: 1201, wfi_entries: 2394, idle_exits: 1, misplaced: 0, steals: 0, service_exits: 0, service_placements: 1, ready_placements: 0, service_adoptions: 1, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } timed-wait iters=1200 wrong=0 early=0 late_p50_ns=520875 late_p99_ns=655167 late_max_ns=5669417
+el1-sched timed-wait exits_per_wait=-0.0080 late_p50_ns=519625
+el1-sched timed-wait exits_per_wait=0.0000 late_p50_ns=520875
+ok
+test el1_sched_two_processes_share_vcpus ... el1-sched two-process iters=500 exits=155 carrier_cpu_ns=32119000 wall_ms=96 zone=ZoneCounts { el1_parks: 29, el1_switches: 17, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 16, sgis: 12, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 42, wfi_entries: 32, idle_exits: 14, misplaced: 0, steals: 8, service_exits: 16, service_placements: 21, ready_placements: 3, service_adoptions: 21, exit_adoptions: 4, host_handbacks: 11, host_queue_claims: 0, host_executor_parks: 0 } two-process child round_trips=500 ms=66.1
+two-process parent round_trips=500 ms=57.6 child_ok=true
+el1-sched two-process iters=3000 exits=787 carrier_cpu_ns=79495000 wall_ms=82 zone=ZoneCounts { el1_parks: 6913, el1_switches: 6906, host_parks: 2, signal_claims: 0, control_claims: 0, cross_wakes: 6593, sgis: 770, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 6184, wfi_entries: 423, idle_exits: 8, misplaced: 30, steals: 35, service_exits: 9, service_placements: 15, ready_placements: 285, service_adoptions: 15, exit_adoptions: 171, host_handbacks: 7, host_queue_claims: 0, host_executor_parks: 0 } two-process child round_trips=3000 ms=52.0
+two-process parent round_trips=3000 ms=64.1 child_ok=true
+el1-sched two-process iters=500 exits=97 carrier_cpu_ns=35994000 wall_ms=68 zone=ZoneCounts { el1_parks: 1416, el1_switches: 1416, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 1416, sgis: 108, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 1419, wfi_entries: 97, idle_exits: 5, misplaced: 0, steals: 0, service_exits: 0, service_placements: 5, ready_placements: 0, service_adoptions: 5, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } two-process child round_trips=500 ms=20.5
+two-process parent round_trips=500 ms=4.9 child_ok=true
+el1-sched two-process iters=3000 exits=351 carrier_cpu_ns=52605000 wall_ms=106 zone=ZoneCounts { el1_parks: 6733, el1_switches: 6707, host_parks: 1, signal_claims: 0, control_claims: 0, cross_wakes: 6613, sgis: 258, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 6474, wfi_entries: 140, idle_exits: 12, misplaced: 15, steals: 15, service_exits: 21, service_placements: 38, ready_placements: 81, service_adoptions: 38, exit_adoptions: 49, host_handbacks: 25, host_queue_claims: 0, host_executor_parks: 0 } two-process child round_trips=3000 ms=81.3
+two-process parent round_trips=3000 ms=78.9 child_ok=true
+el1-sched two-process exits_per_rt=0.126 cross_wakes_per_rt=1.315 service_exits_per_rt=-0.001 host_queue_claims_per_rt=0.0000 carrier_cpu_ns_per_rt=9475
+el1-sched two-process exits_per_rt=0.051 cross_wakes_per_rt=1.039 service_exits_per_rt=0.004 host_queue_claims_per_rt=0.0000 carrier_cpu_ns_per_rt=3322
+ok
+test el1_task_load_costs_no_host_round_trip ... el1-sched task-load-budget sock-pingpong iters=100 loads=617 maintenance_exits=2 exits=1534
+el1-sched task-load-budget sock-pingpong iters=400 loads=1241 maintenance_exits=2 exits=3065
+el1-sched task-load-budget loads 617->1241: maintenance 2->2 (+0)
+ok
+test el1_thread_lifecycle_cleartid_tid_reuse ... el1-sched tid-reuse ["100"] exits=9617 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 401], [0, 400], [1613, 0], [1203, 0], [0, 0], [0, 800]]
+tid-reuse role=parent rounds=100 listed_after_join=0 reused=0 stuck=0 failures=0 ok=true
+tid-reuse role=child rounds=100 listed_after_join=0 reused=0 stuck=0 failures=0 ok=true
+tid-reuse summary parent_ok=true child_ok=true ok=true
+ok
+test el1_thread_lifecycle_exit_group_and_exec_during_clone_storm ... el1-sched exit-group-storm ["4"] exits=5550 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 353], [0, 282], [1368, 0], [978, 0], [0, 0], [0, 651]]
+exit-group-storm rounds=4 failures=0 ok=true
+el1-sched exec-storm ["4"] exits=5518 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 360], [0, 283], [1381, 0], [992, 0], [0, 0], [0, 650]]
+exec-storm-child tasks=[2] ok=true
+exec-storm-child tasks=[107] ok=true
+exec-storm-child tasks=[198] ok=true
+exec-storm-child tasks=[285] ok=true
+exec-storm rounds=4 failures=0 ok=true
+ok
+test el1_thread_lifecycle_fork_during_clone_storm ... el1-sched fork-storm ["16"] exits=9820 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 498], [0, 479], [2004, 0], [1431, 0], [0, 0], [0, 477]]
+fork-storm forks=16 storm_spawned=452 bad=0 child_thread_counts=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] ok=true
+ok
+test el1_thread_lifecycle_mask_storm_exactly_once ... el1-sched mask-storm ["2000"] exits=10615 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 2], [0, 1], [946349, 0], [6, 0], [0, 0], [0, 1]]
+mask-storm role=child sends=2000 send_failures=0 ok=true
+mask-storm role=parent sends=2000 delivered=2000 missing=0 duplicated=0 flips=471167 complete=true sender_done=true ok=true
+mask-storm summary parent_ok=true child_ok=true ok=true
+el1-sched signal-retarget ["32"] exits=758 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 3], [0, 2], [277, 0], [9, 0], [0, 0], [0, 74]]
+signal-retarget role=child rounds=32 main_tid=2 wrong_target=0 ok=true
+signal-retarget role=parent rounds=32 main_tid=1 wrong_target=0 ok=true
+signal-retarget summary parent_ok=true child_ok=true ok=true
+ok
+test el1_thread_lifecycle_parked_threads_beyond_executor_pool ... el1-sched futex-flood ["192"] exits=6641 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 393], [0, 386], [1549, 0], [1155, 0], [0, 0], [0, 385]]
+futex-flood role=child threads=192 futex_waiters=96 pipe_waiters=96 done=192 spawn_failures=0 ok=true
+futex-flood role=parent threads=192 futex_waiters=96 pipe_waiters=96 done=192 spawn_failures=0 ok=true
+futex-flood summary parent_ok=true child_ok=true ok=true
+ok
+test el1_thread_lifecycle_ptrace_traceclone ... el1-sched ptrace-clone [] exits=97 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 2], [0, 1], [16, 0], [6, 0], [0, 0], [0, 1]]
+ptrace-clone initial_stop=true options_ok=false options_errno=Some(38) clone_event=false new_tid=0 new_thread_stopped=[] exit=Some(0)  ok=false
+
+thread 'el1_thread_lifecycle_ptrace_traceclone' (75977275) panicked at crates/carrick-embed/tests/el1_sched.rs:3945:5:
+ptrace-clone: exit 1 signal None stdout "ptrace-clone initial_stop=true options_ok=false options_errno=Some(38) clone_event=false new_tid=0 new_thread_stopped=[] exit=Some(0)  ok=false\n" stderr ""
+FAILED
+test el1_thread_lifecycle_rlimit_nproc_exact ... el1-sched nproc-limit [] exits=281 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 14], [0, 7], [68, 0], [24, 0], [0, 0], [0, 7]]
+nproc-limit role=parent uid=34567 phase1=true phase3=true clone_errno=Some(11) fork_errno=Some(11) peer_forked=true lmin=3 stable=true existing=2 limit3=5 admitted=3 refused_at=Some(4) refused_errno=Some(11) freed=true ok=true
+nproc-limit role=child peer_forks=1 ok=true
+nproc-limit summary parent_ok=true child_ok=true ok=true
+ok
+test el1_thread_lifecycle_seccomp_clone_filter ... el1-sched seccomp-clone [] exits=600 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 36], [0, 32], [149, 0], [99, 0], [0, 0], [0, 32]]
+seccomp-clone role=parent raw_clone=-1 spawn_errno=Some(11) tasks_before=Some(1) tasks_after=Some(1) fork_ok=true peer_done=true ok=true
+seccomp-clone role=child unfiltered_spawn_failures=0 ok=true
+seccomp-clone summary parent_ok=true child_ok=true ok=true
+ok
+test el1_thread_lifecycle_spawn_slope ... el1-sched thread-spawn-slope ["4", "16"] exits=1714 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 129], [0, 128], [525, 0], [387, 0], [0, 0], [0, 128]]
+thread-spawn-slope role=parent n=4 rounds=16 threads=64 failures=0 ok=true
+thread-spawn-slope role=child n=4 rounds=16 threads=64 failures=0 ok=true
+thread-spawn-slope summary parent_ok=true child_ok=true ok=true
+el1-sched thread-spawn-slope ["4", "64"] exits=6423 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 514], [0, 515], [2061, 0], [1539, 0], [0, 0], [0, 512]]
+thread-spawn-slope role=child n=4 rounds=64 threads=256 failures=0 ok=true
+thread-spawn-slope role=parent n=4 rounds=64 threads=256 failures=0 ok=true
+thread-spawn-slope summary parent_ok=true child_ok=true ok=true
+el1-sched thread-spawn-slope ["4", "256"] exits=25259 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 2050], [0, 2051], [8205, 0], [6147, 0], [0, 0], [0, 2048]]
+thread-spawn-slope role=parent n=4 rounds=256 threads=1024 failures=0 ok=true
+thread-spawn-slope role=child n=4 rounds=256 threads=1024 failures=0 ok=true
+thread-spawn-slope summary parent_ok=true child_ok=true ok=true
+el1-sched thread-spawn-slope threads 128->512 forwarded-per-added-thread [clone=1.0026 exit=1.0078 rt_sigprocmask=0.0000 sigaltstack=0.0000 set_robust_list=0.0000 gettid=1.0000] exits_per_thread=12.2630
+
+thread 'el1_thread_lifecycle_spawn_slope' (75977364) panicked at crates/carrick-embed/tests/el1_sched.rs:3998:9:
+forwarded thread exits per added thread 1.0078 must be < 0.05 (threads 128->512: exit forwarded 128 -> 515)
+FAILED
+test el1_thread_lifecycle_tgkill_right_after_clone ... el1-sched tgkill-after-clone ["16"] exits=820 served/forwarded[clone,exit,rt_sigprocmask,sigaltstack,set_robust_list,gettid]=[[0, 17], [0, 16], [7, 0], [3, 0], [0, 0], [0, 32]]
+tgkill-after-clone role=child rounds=16 bad=0 ok=true
+tgkill-after-clone role=parent rounds=16 failures=0 ok=true
+tgkill-after-clone summary parent_ok=true child_ok=true ok=true
+ok
+test el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation ... el1-sched cross-vcpu-stale exits=3885 maintenance_exits=2 cross-vcpu-stale rounds=300 write_faults=300 read_faults=300 stale_reads=0 errors=0 timeouts=0 ok=true
+ok
+test el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation_on_any_thread ... el1-sched tlb-stale-threads exits=5177 maintenance_exits=3 tlb-stale-threads rounds=300 workers=2 expected_faults=600 faults=[600, 600] stale=0 errors=0 timeouts=0 ok=true
+ok
+test el1_tlb_fork_and_exec_leave_no_stale_translation ... el1-sched tlb-fork-stale exits=1515 tlb-fork-stale rounds=50 child_failures=0 parent_failures=0 errors=0 timeouts=0 ok=true
+el1-sched tlb-exec-stale exits=92 tlb-exec-stale faults=1 stale_reads=0 seen=0x0 errors=0 timeouts=0 ok=true
+ok
+test el1_tlb_frame_grant_publication_costs_no_maintenance ... el1-sched tlb-budget mapping-retirement pages=256 rounds=4 grants=7 maintenance_exits=2 exits=42
+el1-sched tlb-budget mapping-retirement pages=2048 rounds=4 grants=23 maintenance_exits=2 exits=55
+el1-sched tlb-budget grants 7->23: maintenance 2->2 (+0) over 4 rounds
+ok
+test el1_tlb_running_thread_mm_edits_cost_no_maintenance ... el1-sched tlb-edit-budget rounds=4 owed=14 issued_on_return=14 issued_by_host=2 maintenance_exits=2 exits=70 tlb-edit-budget rounds=4 errors=0 ok=true
+el1-sched tlb-edit-budget rounds=36 owed=110 issued_on_return=110 issued_by_host=1 maintenance_exits=2 exits=196 tlb-edit-budget rounds=36 errors=0 ok=true
+el1-sched tlb-edit-budget over 32 added rounds: owed +96, issued by host +0, maintenance exits +0
+ok
+
+failures:
+
+failures:
+    el1_anonymous_reservations_stay_in_guest
+    el1_delegated_root_concurrent_vma_ops
+    el1_delegated_root_map_fixed_over_cow_pages
+    el1_fork_cow_resolves_in_guest
+    el1_thread_lifecycle_ptrace_traceclone
+    el1_thread_lifecycle_spawn_slope
+
+test result: FAILED. 46 passed; 6 failed; 0 ignored; 0 measured; 32 filtered out; finished in 96.41s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_sched-67e2aabf7afcdc0d
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/el1_files-c6e40446cda4a643 el1_ --nocapture
+
+running 13 tests
+test el1_files_blocking_survives_task_reschedule ... ok
+test el1_files_contract ... ok
+test el1_files_cross_process_readers_contract ... ok
+test el1_files_exit_group_stress ... ok
+test el1_files_inode_exclusivity_two_processes ... ok
+test el1_files_kick_delivery_spin_loop ... ok
+test el1_files_kick_delivery_spin_loop_signal ... ok
+test el1_files_memfd_never_delegated_and_seals_hold ... ok
+test el1_files_path_mutation_contract ... ok
+test el1_files_recall_on_teardown ... ok
+test el1_files_shared_inode_contract ... ok
+test el1_files_signal_stress ... ok
+test el1_zone_entry_at_open_contract ... el1_zone_entry_at_open_contract: served pwrite64=500 lseek=2 write=0 read=1 pread64=500; forwarded lseek=2004 write=1001 read=1004; population DelegationCounts { delegations: 16, recalls: 16, host_served: 0, tableless_publishes: 0, revalidated_records: 0, refusals: [(FileTooLarge, 3), (Unregistered, 4)], recall_triggers: [("crates/carrick-kernel/src/kernel/objects.rs:1589", 15), ("crates/carrick-kernel/src/el1_delegation.rs:1833", 1)] }
+ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.81s
+
+/Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/entitlement_negative-2b32ac058a7ccd99.noent.3965: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/wt-meta-alloc/target/release/deps/entitlement_negative-2b32ac058a7ccd99.noent.3965
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id meta-alloc-characterize-1) = 0
+remaining carrick procs (run-id meta-alloc-characterize-1-cli) = 0
+error: recipe `lease` failed on line 92 with exit code 1

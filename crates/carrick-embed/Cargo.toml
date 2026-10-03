@@ -74,3 +74,6 @@ flate2.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+carrick-vmm-hvf = { path = "../carrick-vmm-hvf", features = ["metadata-grant-test-support"] }
